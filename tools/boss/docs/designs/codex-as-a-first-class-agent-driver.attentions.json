@@ -1,8 +1,8 @@
 [
   {
     "question_type": "yes_no",
-    "prompt": "Approve relocating Boss's command-level guardrails (checkleft push guard, revision-PR guard, direct-push blocks, editorial enforcement) from Claude PreToolUse hooks into PATH shims in BOSS_BIN_DIR, landing on the live Claude path BEFORE any Codex worker runs? This is the design's load-bearing decision: it makes guardrails driver-agnostic and closes a subshell-evasion hole, but it changes live guardrails on the driver that runs everything today, and it lands before any Codex value is visible.",
-    "anchor": "guardrail-integrity"
+    "prompt": "Under the operator decision recorded in this doc, Codex carries Boss's command guardrails on its own PreToolUse hook -- the same mechanism the Claude path uses today -- and the PATH-shim relocation becomes a follow-on project rather than a prerequisite. That decision leaves exactly one consequence needing a call: Codex's inline `gh --body \"...\"` editorial rewrite is unreachable (updatedInput requires permissionDecision:allow, which Codex rejects), so the design handles it by DENYING with a reason telling the worker to re-issue with --body-file. The safety property holds -- unreviewed prose still never reaches GitHub -- at the cost of one agent round-trip, and worker rules already forbid inline --body. Approve deny-instead-of-rewrite for the Codex editorial path?",
+    "anchor": "the-editorial-case-precisely"
   },
   {
     "question_type": "multiple_choice",
@@ -17,7 +17,7 @@
   },
   {
     "question_type": "yes_no",
-    "prompt": "Should the Codex hook trust-provisioning spike (T-01) be treated as a hard gate before Phase 2 (design/investigation kinds), rather than as informational? Hooks demonstrably DO fire under `codex exec` on 0.145.0 and a PreToolUse deny genuinely blocks a command pre-execution -- but that alone does not let ToolUseInterception be declared, because an untrusted hook (and a hook whose command is missing) is skipped in complete silence. T-01 is what settles whether Boss can provision `trusted_hash` deterministically and observe a hook that did not run; only then could the capability be declared and hooks become defence-in-depth alongside the PATH shims.",
+    "prompt": "Confirm that the Codex hook trust-provisioning spike (T-01) gates the FIRST Codex worker, not just Phase 2? The operator decision makes hooks Codex's guardrail carrier, which is what promoted this from informational to load-bearing: hooks demonstrably fire on 0.145.0 and a PreToolUse deny genuinely blocks pre-execution, but an untrusted hook (and a hook whose command is missing) is skipped in complete silence, so the guarantee rests entirely on Boss provisioning `trusted_hash` deterministically AND being able to observe a hook that did not run. T-01 is `small` and replaces the withdrawn 'PATH shims must land first' constraint. If T-01 finds trust cannot be provisioned deterministically, the fallback is promoting the PATH-shim project back ahead of Codex -- a scope call that would come back to you.",
     "anchor": "oq-1-hook-trust-provisioning"
   },
   {

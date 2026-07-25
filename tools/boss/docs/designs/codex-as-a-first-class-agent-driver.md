@@ -7,6 +7,7 @@
 - **Boss tree verified at:** `7859b6c4` (`main`), 2026-07-24
 - **Codex verified at:** `codex-cli 0.145.0`, `macos-aarch64`, standalone install, `~/.local/bin/codex`
 - **Previously verified at:** `codex-cli 0.137.0` — every claim re-run on 0.145.0; see [Version delta](#version-delta-01370--01450)
+- **Revised by operator decision, 2026-07-24:** hook-based `ToolUseInterception` is the chosen guardrail mechanism for Codex; the `PATH`-shim relocation becomes a follow-on project sequenced after this one. This overturns the recommendation the doc originally reached — see [Operator decision](#operator-decision)
 
 ## TL;DR / verdict
 
@@ -16,11 +17,11 @@ The brief's highest-severity claim — _"Codex has no Stop hook, so a Codex work
 
 The real blocker is one layer down: **Boss's only progress ingress is a unix socket fed by the `boss-event` shim, which only exists because Claude can be made to run a command on every hook.** Codex's signal arrives on the worker's _stdout_, which the engine currently does not read at all. So the gap is not "Codex lacks turn boundaries" — it is **"`ProgressObservation` abstracts event _normalisation_ but not event _transport_."** That is the single amendment that most changes P1422's remaining work.
 
-Second finding, revised on 0.145.0: **Codex hooks do fire under `codex exec`, and `PreToolUse` deny genuinely blocks a command before it runs.** On 0.137.0 no hook fired in nine configurations; on 0.145.0 the _identical_ configuration fires reliably. That resolves the original OQ-1 — but it does **not** change the chosen design, because hooks fail **open and silently** in two independent ways: an untrusted hook is skipped with no warning, and a hook whose command does not exist produces no diagnostic. A guardrail carrier that can silently evaporate is not one Boss can rely on. See [OQ-1](#oq-1-hook-trust-provisioning).
+Second finding, revised on 0.145.0: **Codex hooks do fire under `codex exec`, and `PreToolUse` deny genuinely blocks a command before it runs.** On 0.137.0 no hook fired in nine configurations; on 0.145.0 the _identical_ configuration fires reliably, with Claude-shaped payloads. **This is the mechanism the Codex driver uses.** `ToolUseInterception` is therefore Codex's chosen guardrail carrier, not a degraded fallback: Codex reaches parity on the mechanism already running in production for Claude, with no new guardrail substrate to build, validate, and cut over first. That is the simplest incremental path, and it is the one being taken — by [operator decision](#operator-decision), which overturned this doc's original recommendation.
 
-**The `PATH`-shim design is therefore retained, and is now better justified than when hooks appeared not to work at all**: shims are the load-bearing guardrail, and hooks become defence-in-depth that Boss may additionally declare.
+What that leaves to settle is narrower, and it is real: hooks fail **open and silently** in two independent ways — an untrusted hook is skipped with no warning, and a hook whose command does not exist produces no diagnostic. So the guarantee rests on Boss provisioning hook trust deterministically and being able to tell when a hook did not run. That is [OQ-1](#oq-1-hook-trust-provisioning) / [T-01](#t-01-codex-hook-trust-provisioning), which the decision moves onto the critical path ahead of the first Codex worker.
 
-Third finding: that mechanism already half-exists. Boss prepends `BOSS_BIN_DIR` to the worker's `PATH` (`engine/core/src/runner/pane_spawn.rs:382`). Moving Boss's command-level guardrails from `PreToolUse` hooks into **`PATH` shims** makes them driver-agnostic, closes a real hole in the Claude path (a hook cannot see a command run inside a subshell), and is the reason most work-item kinds can be Codex-eligible without hooks at all.
+Third finding, now scoped to a project of its own: a stronger guardrail mechanism already half-exists. Boss prepends `BOSS_BIN_DIR` to the worker's `PATH` (`engine/core/src/runner/pane_spawn.rs:382`). Moving Boss's command-level guardrails from `PreToolUse` hooks into **`PATH` shims** would make them driver-agnostic, make them fail **closed**, and close a real hole in the Claude path — a hook cannot see a command run inside a subshell. That argument stands on its own merits and the analysis below is retained in full. It is a **follow-on project sequenced after this one**, not a prerequisite for it. See [Guardrail integrity](#guardrail-integrity).
 
 ## Goals
 
@@ -87,16 +88,16 @@ Three details matter more than the headline:
 - **`transcript_path` _is_ stamped on hook payloads.** [G-9](#g-9-transcriptaccess) and [A-6](#proposed-p1422-amendments) assumed Codex offers no such field and the path must be derived from `thread_id` + `CODEX_HOME`. That derivation is still needed for the hookless path, but it is no longer the only option.
 - The hook payload's `session_id` and the stream's `thread_id` carried the **identical value** (`019f95c2-f090-7910-b9cc-8d8363aeb9c3`). The doc previously inferred these were the same concept under two names; that is now observed, not inferred.
 
-**Why this does not change the chosen approach.** Hooks fail **open, silently, in two independent ways**:
+**What this delta settled, and what it left open.** D-2 is what makes hook-based interception available to Codex at all, and by [operator decision](#operator-decision) it is the mechanism the driver uses. It does not, on its own, make that mechanism _reliable_: hooks fail **open, silently, in two independent ways**:
 
 | Failure mode                | Observed behaviour                                                                   |
 | --------------------------- | ------------------------------------------------------------------------------------ |
 | Hook not trusted            | Command runs normally. **No warning, no stream event, no log line.**                 |
 | Hook command does not exist | Turn completes normally. **No diagnostic** — the 0.137.0 control reproduces exactly. |
 
-Hooks run only under `--dangerously-bypass-hook-trust` or a persisted trust record — `[hooks] trusted_hash`, a real key (`--strict-config` accepts it; `HookStateToml.trusted_hash` _(binary)_). A wrong or stale hash is indistinguishable from no hooks at all. For a guardrail carrier that is disqualifying: Boss rewrites worker config per run, so a hash that goes stale would silently disarm every guardrail with no signal. `PATH` shims fail **closed** — a missing shim means the real binary is not on `PATH` and the command errors loudly.
+Hooks run only under `--dangerously-bypass-hook-trust` or a persisted trust record — `[hooks] trusted_hash`, a real key (`--strict-config` accepts it; `HookStateToml.trusted_hash` _(binary)_). A wrong or stale hash is indistinguishable from no hooks at all, and Boss rewrites worker config per run, so a hash that goes stale would silently disarm every guardrail with no signal. That is the residual risk the design carries, and closing it is [T-01](#t-01-codex-hook-trust-provisioning) — a gate on the first Codex worker, not a reason to route guardrails elsewhere. `PATH` shims fail **closed** by comparison, which is why the shim argument survives as a [follow-on project](#guardrail-integrity) rather than being discarded.
 
-So [Guardrail integrity](#guardrail-integrity) stands unchanged, and [Alternative 1](#alternative-1-replicate-the-claude-architecture--make-codex-emit-hook-callbacks) is still rejected — now on fail-open semantics rather than on non-functioning hooks, which is a stronger reason.
+[Alternative 1](#alternative-1-replicate-the-claude-architecture--make-codex-emit-hook-callbacks) is still rejected on these same fail-open semantics — but note that it concerns **progress ingress**, not interception, and the two are not symmetric: progress has an unconditional trust-free channel (stdout) and interception has none.
 
 **Deny-only is unchanged**, so nothing in [G-6](#g-6-tooluseinterception) about rewriting relaxes: `unsupported permissionDecision:allow` and `unsupported permissionDecision:ask` are both still present _(binary)_, and `updatedInput` still requires the rejected `allow`. Tool-input rewriting remains unreachable via Codex hooks.
 
@@ -253,13 +254,13 @@ What Codex offers instead is arguably stronger for the _filesystem_ half and abs
 
 Fidelity mapping for the rules Boss expresses today:
 
-| Boss rule                                            | Codex equivalent                                                                                  | Fidelity                                        |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| Reviewer read-only                                   | `--sandbox read-only`                                                                             | **Exact**, and OS-enforced rather than advisory |
-| Deny writes to `~/Library/Application Support/Boss/` | `workspace-write` — the Boss data dir is outside the workspace, so it is denied _by construction_ | **Stronger than today**                         |
-| Deny `rm -rf`, `sudo`                                | none                                                                                              | **Lost** — no per-command grammar               |
-| Deny `bossctl`                                       | none                                                                                              | **Lost** as a rule; recoverable via `PATH` shim |
-| Block `jj git push` / `gh pr create`                 | none                                                                                              | **Lost** as a rule; recoverable via `PATH` shim |
+| Boss rule                                            | Codex equivalent                                                                                  | Fidelity                                         |
+| ---------------------------------------------------- | ------------------------------------------------------------------------------------------------- | ------------------------------------------------ |
+| Reviewer read-only                                   | `--sandbox read-only`                                                                             | **Exact**, and OS-enforced rather than advisory  |
+| Deny writes to `~/Library/Application Support/Boss/` | `workspace-write` — the Boss data dir is outside the workspace, so it is denied _by construction_ | **Stronger than today**                          |
+| Deny `rm -rf`, `sudo`                                | none                                                                                              | **Lost** — no per-command grammar                |
+| Deny `bossctl`                                       | none                                                                                              | **Lost** as a rule; carried by `PreToolUse` deny |
+| Block `jj git push` / `gh pr create`                 | none                                                                                              | **Lost** as a rule; carried by `PreToolUse` deny |
 
 The two "lost" rows are what [Guardrail integrity](#guardrail-integrity) resolves.
 
@@ -303,9 +304,9 @@ Handlers may also live in a per-layer `hooks.json`; both in one layer loads both
 
 **The trust gate is the operative constraint, and it fails open.** Hooks run only if trusted. Trust comes from either `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash` record (`HookStateToml` _(binary)_; `--strict-config` accepts the key, so it is real). Without trust, the hook is **skipped in complete silence** — the command runs, and there is no warning, no stream event, and no log line. Separately, a hook whose command does not exist also produces **no diagnostic**: the 0.137.0 control (`command = "/definitely/not/a/real/binary-xyz"`) reproduces exactly on 0.145.0, completing the turn as if nothing were configured.
 
-Both failure modes are silent and fail-open. That is why this resolution does **not** move guardrails onto hooks: Boss regenerates worker config every run, so a `trusted_hash` that goes stale — or a shim path that moves — would disarm every guardrail with nothing to observe. `PATH` shims fail closed, which is the property a guardrail needs.
+Both failure modes are silent and fail-open. Boss regenerates worker config every run, so a `trusted_hash` that goes stale would disarm every guardrail with nothing to observe. This doc originally concluded that this disqualified hooks as a guardrail carrier outright; the [operator decision](#operator-decision) is that it does not — it makes trust provisioning a **prerequisite to solve**, not a mechanism to abandon, since the alternative is building an entire second guardrail substrate before Codex can run at all.
 
-**What remains open is trust _provisioning_, not activation:** how to compute and persist `trusted_hash` so a Boss worker gets hooks without shipping `--dangerously-bypass-hook-trust`. That flag is not an acceptable default — it also trusts **project-local** `.codex/` hooks from the repository under work, which in Boss's threat model is attacker-controllable content. See [OQ-1](#oq-1-hook-trust-provisioning) and the re-scoped [T-01](#t-01-codex-hook-trust-provisioning).
+**What remains open is therefore trust _provisioning_, not activation:** how to compute and persist `trusted_hash` so a Boss worker gets hooks without shipping `--dangerously-bypass-hook-trust`. That flag is not an acceptable default — it also trusts **project-local** `.codex/` hooks from the repository under work, which in Boss's threat model is attacker-controllable content. Under the chosen approach this is on the critical path rather than beside it: it gates the first Codex worker. See [OQ-1](#oq-1-hook-trust-provisioning) and [T-01](#t-01-codex-hook-trust-provisioning).
 
 ### Model and effort
 
@@ -334,7 +335,7 @@ Classification per the brief: **(a)** implementable against the current trait, *
 | G-3  | `PermissionPolicy`      | 3 sandbox modes, `writable_roots`, `.rules`    | **(b)**  | Trait is a file path; Codex needs argv+env |
 | G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)**  | Blocked only by T3326                      |
 | G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)**  | **Transport is not abstracted** — top gap  |
-| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(d)**† | Degrade; relocate guardrails               |
+| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(a)**† | Declared deny-only; gated on T-01          |
 | G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)**  | Native, but no trait method                |
 | G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)**  | Better than Claude's; no trait method      |
 | G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)**  | Trait method exists but is dead code       |
@@ -342,7 +343,7 @@ Classification per the brief: **(a)** implementable against the current trait, *
 | G-11 | `ToolProvisioning`      | MCP, plugins, skills                           | **(a)**  | Unused in v1, as designed                  |
 | G-12 | `PromptComposition`     | `AGENTS.md` + preamble                         | **(b)**  | Shared body asserts Claude mechanics       |
 
-† **G-6 is (d) _by choice_, not by absence.** Codex's `PreToolUse` exists and works on 0.145.0 — the four-way legend has no code for "available but not declarable". Boss declines to declare the capability because the mechanism fails open and silently, so it is not one Boss can promise to enforce. See [G-6](#g-6-tooluseinterception).
+† **G-6 was classified (d) in the original pass; the [operator decision](#operator-decision) reclassifies it (a).** Codex's `PreToolUse` exists, fires, and blocks pre-execution on 0.145.0, and it is implementable against the current trait — the earlier (d) recorded Boss _declining_ to declare a working mechanism, which the legend has no code for. Two qualifications survive the reclassification: the capability is **deny-only** (tool-input rewriting is unreachable), and it is **gated on [T-01](#t-01-codex-hook-trust-provisioning)** because hooks fail open when untrusted. See [G-6](#g-6-tooluseinterception).
 
 ### G-1 `Spawn`
 
@@ -356,7 +357,7 @@ Worse, `spawn_invocation` returns a `String` that the engine wraps at `engine/co
 
 The `unset ANTHROPIC_API_KEY` is a Claude-ism in shared code (also asserted in tests at `:868,870,942`). It is harmless for Codex but wrong in principle, and it is the wrong shape: Codex needs `CODEX_HOME=<dir>` _exported_, which a string-returning method cannot express cleanly.
 
-**Fix (in the abstraction):** replace the positional Claude-shaped parameters with an opaque `SpawnRequest` struct, and have `spawn_invocation` return a structured `SpawnPlan { env: Vec<(String,String)>, argv_or_shell: String }` so environment mutation is driver-supplied rather than hardcoded in `pane_spawn.rs`. The `PATH`/`BOSS_BIN_DIR` prepend stays engine-side — it is Boss policy, not Claude policy, and [Guardrail integrity](#guardrail-integrity) makes it load-bearing for both drivers.
+**Fix (in the abstraction):** replace the positional Claude-shaped parameters with an opaque `SpawnRequest` struct, and have `spawn_invocation` return a structured `SpawnPlan { env: Vec<(String,String)>, argv_or_shell: String }` so environment mutation is driver-supplied rather than hardcoded in `pane_spawn.rs`. The `PATH`/`BOSS_BIN_DIR` prepend stays engine-side — it is Boss policy, not Claude policy, and the [follow-on `PATH`-shim project](#the-path-shim-design--retained-as-a-follow-on-project) will make it load-bearing for both drivers.
 
 ### G-2 `WorkspaceProvisioning`
 
@@ -414,18 +415,22 @@ Finally, `progress_fidelity()` (`engine/driver/src/claude.rs:482`) still has **n
 
 ### G-6 `ToolUseInterception`
 
-Codex hooks **do** fire on 0.145.0 and `PreToolUse` deny genuinely blocks a command pre-execution ([D-2](#deltas-that-change-the-design)). Nonetheless the Codex driver **does not declare this capability** in v1, landing on the default disposition `Degrade` (`engine/driver/src/lib.rs:92`) — because a capability Boss declares is one Boss promises to enforce, and Codex hooks fail **open and silently** when untrusted or misconfigured. Declaring `ToolUseInterception` on a mechanism that can evaporate without a signal would be a worse outcome than declaring it absent and carrying the guardrails somewhere that fails closed.
+Codex hooks **do** fire on 0.145.0 and `PreToolUse` deny genuinely blocks a command pre-execution ([D-2](#deltas-that-change-the-design)). **The Codex driver declares this capability, deny-only** — it is the same mechanism the Claude path enforces with today, reached without building anything new.
 
-This is a change of _reason_, not of _decision_: the original basis was "hooks appear not to work at all", and the current basis is "hooks work but cannot be relied upon to have worked". Both land on `PATH` shims as the guardrail carrier.
+That is a reversal of what this doc originally recommended, and the reasoning is recorded at [Operator decision](#operator-decision). The short form: declining to declare a working mechanism only pays off if something better is already in place to carry the guardrails instead, and nothing is — the alternative was to build, validate, and cut over an entire second substrate before the first Codex worker could run.
 
-That default disposition is nevertheless dangerous as things stand: the degrade path exists as **types only**. `PostHocInterceptionFn` and `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) have **zero engine callers** — re-verified. A driver landing on `Degrade` today silently loses editorial enforcement, the path guard, the revision-PR guard, and the checkleft push guard. **Silent loss of guardrails is not acceptable**, per the brief and per basic prudence.
+Two things the declaration does **not** wave away.
 
-Even now that hooks fire, Codex's `PreToolUse` is still **deny-only** — re-verified on 0.145.0, where `unsupported permissionDecision:allow` and `unsupported permissionDecision:ask` both persist _(binary)_ — so the _rewrite_ half of editorial enforcement (`PreToolUseDecision::AllowWithRewrite`, `engine/core/src/editorial_hook.rs:78-81`) is unreachable regardless. Usefully, that enum already distinguishes two rewrite paths:
+**It is gated on trust provisioning.** A capability Boss declares is one Boss promises to enforce, and Codex hooks fail **open and silently** when untrusted or misconfigured. So the declaration is contingent on [T-01](#t-01-codex-hook-trust-provisioning) establishing that Boss can stamp `trusted_hash` deterministically and observe a hook that did not run. This is the residual risk of the chosen path, stated plainly rather than designed around.
 
-- `AllowWithRewrite { updated_command: Some(cmd) }` — needs `updatedInput`. **Unavailable under Codex.**
-- `AllowWithRewrite { updated_command: None }` — the redaction landed in a `--body-file` overwritten on disk. **Works without any rewrite capability.**
+**It is deny-only.** Re-verified on 0.145.0: `unsupported permissionDecision:allow` and `unsupported permissionDecision:ask` both persist _(binary)_, and `updatedInput` requires the rejected `allow`. So the _rewrite_ half of editorial enforcement (`PreToolUseDecision::AllowWithRewrite`, `engine/core/src/editorial_hook.rs:78-81`) is unreachable. That enum distinguishes two rewrite paths, and they fare differently:
 
-That distinction is what makes the `PATH`-shim relocation in [Guardrail integrity](#guardrail-integrity) viable rather than a downgrade.
+- `AllowWithRewrite { updated_command: None }` — the redaction landed in a `--body-file` overwritten on disk. **Works**: the hook rewrites the file and returns no decision, so the command proceeds.
+- `AllowWithRewrite { updated_command: Some(cmd) }` — the inline `--body "..."` case, which needs `updatedInput`. **Unreachable under Codex hooks.** It is handled by denying with a reason instructing the worker to use `--body-file`; see [the editorial case](#the-editorial-case-precisely).
+
+The `PATH`-shim design recovers the inline case properly, since a shim can rewrite argv freely. That is one of the reasons it remains worth doing as a [follow-on project](#guardrail-integrity).
+
+Separately, and independent of Codex: the `Degrade` disposition (`engine/driver/src/lib.rs:92`) remains dangerous for whoever lands on it next, because the degrade path exists as **types only**. `PostHocInterceptionFn` and `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) have **zero engine callers** — re-verified. A driver landing on `Degrade` today silently loses editorial enforcement, the path guard, the revision-PR guard, and the checkleft push guard. Codex no longer lands there, so this is not a Codex blocker; it is a latent abstraction bug, filed as [A-8](#proposed-p1422-amendments) / [T-19](#t-19-implement-the-post-hoc-interception-degrade-path-a-8) and deferred.
 
 ### G-7 `TurnBoundary`
 
@@ -454,7 +459,7 @@ Two consequences:
 
 Codex rollouts are also JSONL, so the tailer is reusable — but path discovery is the problem. Claude's path is discovered because Claude stamps `transcript_path` on hook payloads (`engine/core/src/events_socket.rs`, `live_status_loop.rs`). Codex's `--json` stream does **not** carry `transcript_path` (verified — no such field in any captured envelope). It is derivable as `$CODEX_HOME/sessions/<Y>/<M>/<D>/rollout-*-<thread_id>.jsonl`, and since the driver owns `CODEX_HOME` it can compute it from `thread_id` on `thread.started`.
 
-Codex's **hook** payloads _do_ carry `transcript_path` — confirmed on 0.145.0 ([D-2](#deltas-that-change-the-design)) — but that is not a usable discovery route here, because this design deliberately does not depend on hooks having fired. Derivation from `thread_id` stays the primary mechanism precisely because it works whether or not hooks are trusted.
+Codex's **hook** payloads _do_ carry `transcript_path` — confirmed on 0.145.0 ([D-2](#deltas-that-change-the-design)) — and the design now does wire hooks, so this is a live option rather than a hypothetical one. It is still not the right discovery route: a hook payload only arrives once the worker uses a tool, and only if hooks were trusted, whereas `thread.started` is the stream's first envelope and the driver owns `CODEX_HOME`. Derivation from `thread_id` stays the primary mechanism because it is unconditional; the hook field is a cross-check, not a dependency.
 
 **Fix:** add a `transcript_path_for_session(&self, session_id) -> Option<PathBuf>` to the trait so discovery is driver-supplied rather than hook-derived, and actually **call** `normalize_transcript_entry` in `live_status.rs` — otherwise Codex transcript lines reach Claude-shaped redaction and summarisation logic.
 
@@ -474,25 +479,37 @@ Unused in v1 for any driver, as P1422 intended. Codex has a rich surface here (M
 
 Only the preamble is driver-supplied (`engine/driver/src/claude.rs:602-604`). The shared prompt body still asserts Claude's _mechanism_ — `"A PreToolUse hook blocks these"` at `engine/core/src/worker_setup.rs:309` and `:372`, plus `engine/core/src/runner.rs` and the editorial-enforcement sentence.
 
-For a Codex worker these sentences **assert a guarantee that is false**. That is not cosmetic: the worker is being told an enforcement mechanism exists that will not stop it. Under the [`PATH`-shim design](#guardrail-integrity) the sentences become true again for both drivers, but the wording must come from the driver, not from shared prose.
+The original pass rated this a correctness defect on the grounds that these sentences assert a guarantee that is false for a Codex worker. **Under the chosen hook-based mechanism they are true.** A Codex worker really is running behind a `PreToolUse` hook that blocks these commands, so the existing wording is accurate for both drivers as they stand, and the [operator decision](#operator-decision) removes the urgency here entirely.
+
+What survives is hygiene, not correctness: the shared prompt body still hardcodes one driver's _mechanism name_ into prose every driver receives. That is wrong in principle and will become wrong in fact twice over — for a third driver that blocks commands some other way, and for both drivers once the [`PATH`-shim project](#guardrail-integrity) changes what the enforcing mechanism actually is. The wording should come from the driver; it is no longer something that must land before Codex runs. See [A-10](#proposed-p1422-amendments) / [T-20](#t-20-driver-supplied-enforcement-wording-in-prompts-a-10).
 
 ---
 
 ## Guardrail integrity
 
-Boss's safety properties are enforced today through Claude's `PreToolUse` hook. The brief requires an explicit refuse-vs-degrade call per guardrail. My answer for four of the five is **neither** — relocate the enforcement to a mechanism that does not depend on hooks.
+Boss's safety properties are enforced today through Claude's `PreToolUse` hook. The brief requires an explicit refuse-vs-degrade call per guardrail. The answer for all five is **neither refuse nor degrade**: Codex carries them on the same `PreToolUse` mechanism, plus its OS sandbox where that is stronger.
 
-This section is unchanged by the 0.145.0 finding that Codex hooks _do_ work ([D-2](#deltas-that-change-the-design)). The requirement was never "use whatever mechanism exists"; it is that a guardrail must fail **closed**. Codex hooks fail open and silently when untrusted or misconfigured, so they can supplement the shims but must not be what the guarantee rests on.
+<a id="operator-decision"></a>
 
-### The `PATH`-shim insight
+### Operator decision — hooks carry Codex's guardrails; `PATH` shims become a follow-on project
 
-Boss already prepends `BOSS_BIN_DIR` to every worker's `PATH` (`engine/core/src/runner/pane_spawn.rs:382`). A guard implemented as an executable named `gh` / `jj` / `git` in `BOSS_BIN_DIR`, which evaluates the invocation and then delegates to the real binary, is:
+This doc originally reached the opposite conclusion, and the operator refuted it:
 
-- **driver-agnostic** — it needs no hook, no settings file, no per-agent wire format;
-- **strictly more robust than the hook** — a `PreToolUse` hook sees the top-level `Bash` tool call, so `sh -c 'gh pr create ...'` nested in a script or a subshell evades it; a `PATH` shim catches every invocation regardless of nesting;
-- **already the enforcement point Boss tells workers to use** — `.claude/CLAUDE.md` instructs workers to use `cube pr create`, which is itself a Boss-controlled binary.
+> I think the guardrails moving to PATH shims should be a separate project, and we shouldn't try to tackle that at the same time as everything else (it's going to make the scope too large) — we confirmed that codex can use tooluseinterception the way we do with claude today, and that's the simplest incremental path.
 
-This is not a Codex workaround. It closes a real hole in the Claude path, and it should be adopted for both drivers.
+**What the doc originally recommended** (retained below, and not withdrawn on its merits): reject both options P1422 framed for the `ToolUseInterception` absence policy — post-hoc degrade ([Alternative 2](#alternative-2-post-hoc-only-guardrails-via-the-existing-degrade-path)) and refuse — and instead relocate all command-level guardrails to `PATH` shims in `BOSS_BIN_DIR`, on the grounds that a guardrail must fail **closed** and Codex hooks fail **open and silently** when untrusted or misconfigured. From that it derived a hard scheduling edge: the shims had to land and be verified on the Claude path _before any Codex worker ran_, because they would be Codex's sole guardrail carrier.
+
+**What was decided instead**, and why:
+
+1. **Codex can use `ToolUseInterception` the way Claude does today.** This is not a concession — it is what this doc's own evidence establishes. Codex ships a stable, Claude-wire-compatible hooks system; it was verified live on codex-cli 0.145.0 with payload captures in [D-2](#deltas-that-change-the-design), including a `PreToolUse` deny that blocked a command before execution with the reason reaching the model. Hook-based interception is the **chosen mechanism** for the Codex driver, not a degraded fallback.
+2. **It is the simplest incremental path.** Codex reaches parity on the guardrail mechanism already running in production, with nothing new to build, validate, and cut over first. The rejected ordering required a full second guardrail substrate to land on the live Claude path before Codex could produce any value at all.
+3. **Scope.** Bundling a rewrite of Boss's live guardrail enforcement into the Codex driver project made that project too large. The shim work is real work and gets its own project.
+
+**What is withdrawn.** The derived scheduling constraint — that shipping the Codex driver before the shims would ship it "unguarded" — **is no longer accurate and does not stand.** Under hook-based interception a Codex worker is guarded by the same class of mechanism that guards a Claude worker today. The `PATH` shims do not gate the first Codex worker.
+
+**What replaces it.** A narrower gate, in the same place in the graph: hooks fail open when untrusted, so [T-01](#t-01-codex-hook-trust-provisioning) (trust provisioning, and detecting a hook that did not run) moves onto the critical path ahead of the first Codex worker. That is a `small` investigation, not a `large` rewrite of live guardrails — which is precisely the scope difference the decision is about.
+
+**What is not withdrawn.** The argument for `PATH` shims stands on its own merits, unchanged: they are driver-agnostic, they fail **closed**, and they close a real hole that exists on the Claude path _today_ — a `PreToolUse` hook sees only the top-level `Bash` tool call, so a command nested in a subshell evades it. The analysis is retained in full [below](#the-path-shim-design--retained-as-a-follow-on-project), reframed from prerequisite to follow-on. It is sequenced **after** this project.
 
 ### Per-guardrail calls
 
@@ -500,23 +517,41 @@ This is not a Codex workaround. It closes a real hole in the Claude path, and it
 | -------------------------------------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | **Boss data-dir path guard**           | `PreToolUse` deny (`PATH_GUARD_SCRIPT`, `worker_setup.rs:918`)            | `--sandbox workspace-write`: the Boss data dir is outside the workspace and denied by the OS | **Preserved, strengthened.** Advisory hook → kernel-enforced boundary. |
 | **Reviewer read-only**                 | per-kind deny rules (`reviewer_deny_rules`)                               | `--sandbox read-only`                                                                        | **Preserved, strengthened.** Exact semantic match, OS-enforced.        |
-| **checkleft push guard**               | `PreToolUse` deny (`CHECKLEFT_PUSH_GUARD_SCRIPT`, `worker_setup.rs:1072`) | `PATH` shim on `jj` / `git`                                                                  | **Preserved via relocation.**                                          |
-| **Revision-PR guard / no direct push** | `PreToolUse` deny                                                         | `PATH` shim on `jj` / `git` / `gh`                                                           | **Preserved via relocation.**                                          |
-| **Editorial enforcement**              | `PreToolUse` deny **and rewrite**                                         | `PATH` shim on `gh`: deny works; rewrite works **only via `--body-file`**                    | **Partially preserved — this one needs a decision.**                   |
+| **checkleft push guard**               | `PreToolUse` deny (`CHECKLEFT_PUSH_GUARD_SCRIPT`, `worker_setup.rs:1072`) | `PreToolUse` deny, same script, Codex hook config                                            | **Preserved, same mechanism.**                                         |
+| **Revision-PR guard / no direct push** | `PreToolUse` deny                                                         | `PreToolUse` deny, same script, Codex hook config                                            | **Preserved, same mechanism.**                                         |
+| **Editorial enforcement**              | `PreToolUse` deny **and rewrite**                                         | `PreToolUse` deny; the inline-`--body` rewrite is unreachable and becomes a deny             | **Preserved by deny-instead-of-rewrite** — see below.                  |
+
+The first two rows are unaffected by the decision: they were never hook-relocations, and Codex's OS sandbox enforces them more strongly than Claude's hook does. The middle two are now a straight reuse of the existing guard scripts behind Codex's hook config rather than a rewrite into shims. Only the editorial row changes character.
 
 ### The editorial case, precisely
 
-`PreToolUseDecision` has three outcomes (`engine/core/src/editorial_hook.rs:70-84`). Under a `PATH` shim:
+`PreToolUseDecision` has three outcomes (`engine/core/src/editorial_hook.rs:70-84`). Under Codex's deny-only `PreToolUse` hook:
 
-- `Deny { reason }` — works. The shim exits non-zero with the reason on stderr; the agent reads it and retries.
-- `AllowWithRewrite { updated_command: None }` — works. The redaction is written into the `--body-file` on disk; the shim then execs the real `gh` with the unchanged argv.
-- `AllowWithRewrite { updated_command: Some(cmd) }` — the inline `--body "..."` case. A shim _can_ rewrite argv before delegating (more easily than a hook can, in fact). So this works too.
+- `Deny { reason }` — **works.** Codex's deny carries `permissionDecisionReason` to the model, verified in [D-2](#deltas-that-change-the-design).
+- `AllowWithRewrite { updated_command: None }` — **works.** The redaction is written into the `--body-file` on disk and the hook returns no decision, so the command proceeds against the corrected file.
+- `AllowWithRewrite { updated_command: Some(cmd) }` — the inline `--body "..."` case. **Unreachable**: it needs `updatedInput`, which requires `permissionDecision:allow`, which Codex rejects ([G-6](#g-6-tooluseinterception)).
 
-So editorial enforcement is **fully preserved** under a `PATH` shim — better than under Codex hooks, where `updatedInput` is unreachable. The residual risk is that a worker invokes the GitHub API without going through `gh` (raw `curl`, or a language binding). That risk exists identically today with the hook, so it is not a regression; Boss's repo conventions already mandate `cube pr create`.
+**The call: deny instead of rewrite.** The third case becomes a `Deny` whose reason instructs the worker to re-issue with `--body-file`. The safety property is fully preserved — unreviewed prose still never reaches GitHub, which is the whole point of the control — at the cost of one extra agent round-trip. This is also already what Boss's worker rules mandate (`.claude/CLAUDE.md` forbids inline `--body` outright, because the shell evaluates backticks inside it), so the deny is enforcing a documented convention rather than inventing a restriction.
+
+The `PATH`-shim project recovers the inline rewrite properly, since a shim can rewrite argv before delegating. That is a genuine improvement, and it is one of the things the follow-on project buys — not something Codex needs first.
+
+The residual risk in every row is that a worker reaches the GitHub API without going through `gh` (raw `curl`, or a language binding). That risk exists identically today on the Claude path, so it is not a Codex regression.
 
 **Net: no guardrail requires refusing Codex, and none is silently degraded.** The `KindRequirements` escalation mechanism stays unused for guardrail reasons in v1 — but see [Codex-eligible kinds](#which-work-item-kinds-are-codex-eligible) for kinds refused on _other_ grounds.
 
-**Hard sequencing constraint:** the `PATH` shims must land and be verified on the **Claude** path before any Codex worker runs, because they are the only guardrail carrier for Codex. Shipping the Codex driver first would mean shipping it unguarded. This ordering is reflected in the task graph.
+### The `PATH`-shim design — retained as a follow-on project
+
+Kept in full because the argument does not depend on Codex, and because a design doc that deletes the road not taken is less useful than one that records it. **Sequenced after this project; it does not gate any Codex work.**
+
+Boss already prepends `BOSS_BIN_DIR` to every worker's `PATH` (`engine/core/src/runner/pane_spawn.rs:382`). A guard implemented as an executable named `gh` / `jj` / `git` in `BOSS_BIN_DIR`, which evaluates the invocation and then delegates to the real binary, is:
+
+- **driver-agnostic** — it needs no hook, no settings file, no per-agent wire format, and no trust record;
+- **fail-closed** — a missing shim means the real binary is not on `PATH` and the command errors loudly, where a missing or untrusted hook is skipped in silence;
+- **strictly more robust than the hook** — a `PreToolUse` hook sees the top-level `Bash` tool call, so `sh -c 'gh pr create ...'` nested in a script or a subshell evades it; a `PATH` shim catches every invocation regardless of nesting;
+- **already the enforcement point Boss tells workers to use** — `.claude/CLAUDE.md` instructs workers to use `cube pr create`, which is itself a Boss-controlled binary;
+- **able to rewrite argv**, which recovers the inline-`--body` editorial case that neither Claude's nor Codex's hook can reach cleanly.
+
+This is not a Codex workaround and never was. It closes a real hole in the Claude path that exists whether or not Codex is ever adopted, and it should be adopted for both drivers — on its own schedule. The work is scoped in [T-02](#t-02-relocate-command-guardrails-to-path-shims-follow-on-project) and [T-03](#t-03-relocate-editorial-enforcement-to-a-gh-path-shim-follow-on-project).
 
 ---
 
@@ -528,11 +563,15 @@ Configure Codex hooks to invoke the existing `boss-event` shim, reusing the unix
 
 **Rejected — and the 0.145.0 delta strengthens the rejection rather than weakening it.** This was originally rejected partly because no hook could be made to fire. Hooks now demonstrably do fire ([D-2](#deltas-that-change-the-design)), so that objection is gone — but the decisive one remains and is now better evidenced: an untrusted or misconfigured hook is skipped in **complete silence**. Routing progress ingress through that mechanism would mean a worker that silently reports nothing and never completes, with no signal to distinguish it from a hung agent. It is the wrong dependency for the same underlying reason it was before: it makes Boss's progress ingress contingent on the most fragile, least-observable part of Codex's surface, when Codex is _already_ handing Boss a typed, in-band, structural event stream on stdout that requires no installation, no trust record, and cannot be silently skipped. It would also entrench the assumption that progress arrives via callback, which is exactly the abstraction gap ([G-5](#g-5-progressobservation--the-top-gap)) this project exists to surface.
 
+**Note the asymmetry with interception, which _does_ use hooks** ([operator decision](#operator-decision)). These are not in tension. For progress there is an unconditional, trust-free alternative already on the wire — stdout JSONL — so depending on hooks would be choosing the fragile channel over the robust one for no gain. For interception there is no such alternative short of building one, which is the follow-on `PATH`-shim project. Hooks being wired for interception does make the marginal cost of _additional_ hook events low, so a driver may later declare them as defence-in-depth; that is not a reason to make progress ingress contingent on them.
+
 ### Alternative 2: Post-hoc-only guardrails via the existing `Degrade` path
 
 Declare `ToolUseInterception` absent, land on `AbsenceDisposition::Degrade`, and implement the already-typed `PostHocInterceptionFn` / `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) to check after the fact — scan the transcript for a push that should not have happened, then flag or revert.
 
-**Rejected.** Post-hoc detection of an _already-pushed_ commit or an _already-posted_ GitHub comment is not enforcement; the side effect is public. For editorial controls specifically the whole point is that unreviewed prose never reaches GitHub. The `PATH`-shim approach gets genuine pre-execution enforcement for the same effort, and works for both drivers. The post-hoc types should still be implemented — they are the right answer for a _future_ driver with neither hooks nor a shimmable command surface — but they are not the answer here, and leaving them as uncalled types while a driver silently degrades onto them is the actual bug.
+**Rejected, and the [operator decision](#operator-decision) does not revive it.** Post-hoc detection of an _already-pushed_ commit or an _already-posted_ GitHub comment is not enforcement; the side effect is public. For editorial controls specifically the whole point is that unreviewed prose never reaches GitHub. Codex's `PreToolUse` deny is genuine **pre-execution** enforcement and is available now, so the degrade path is not what Codex lands on — it is not the second-best option here, it is the wrong shape of option.
+
+The post-hoc types should still be implemented eventually: they are the right answer for a _future_ driver that has neither hooks nor a shimmable command surface, and leaving them as uncalled types while some driver silently degrades onto them is a live trap in the abstraction. But with Codex declaring `ToolUseInterception`, that trap is **no longer Codex-adjacent** — it is a latent gap for a hypothetical third driver, and it is reclassified as deferred accordingly ([A-8](#proposed-p1422-amendments), [T-19](#t-19-implement-the-post-hoc-interception-degrade-path-a-8)).
 
 ### Alternative 3: Drive `codex app-server` over JSON-RPC
 
@@ -544,7 +583,7 @@ Instead of `codex exec`, run the persistent `codex app-server` and drive it over
 
 ## Chosen approach
 
-Drive `codex exec --json` as a pane-embedded worker, with **stdout JSONL as the progress transport**, `--output-last-message` + the existing `BOSS_STRUCTURED_OUTPUT` file contract for structured results, per-worker `CODEX_HOME` for isolation, Codex's OS sandbox for filesystem guardrails, and **`PATH` shims for command guardrails**.
+Drive `codex exec --json` as a pane-embedded worker, with **stdout JSONL as the progress transport**, `--output-last-message` + the existing `BOSS_STRUCTURED_OUTPUT` file contract for structured results, per-worker `CODEX_HOME` for isolation, Codex's OS sandbox for filesystem guardrails, and **Codex's `PreToolUse` hook for command guardrails** — the same mechanism the Claude path enforces with today ([operator decision](#operator-decision)).
 
 ### Execution shape
 
@@ -571,19 +610,24 @@ Sandbox stays `workspace-write` (not `danger-full-access`) — that is what make
 1. **A stdout JSONL progress reader.** New. Feeds the same normaliser and the same activity machine as the socket path. This is the `ProgressIngress::StdoutJsonl` arm from [G-5](#g-5-progressobservation--the-top-gap). PR-URL capture rides on it, scanning `command_execution` items' `aggregated_output`.
 2. **A `TurnBoundary` trait method.** `turn.completed` → `WorkerEvent::Stop`, so `completion/stop.rs` stops being hardwired to a Claude hook.
 3. **Driver-supplied transcript path discovery**, replacing hook-stamped `transcript_path`, plus actually calling `normalize_transcript_entry`.
-4. **`PATH`-shim guardrails**, replacing `PreToolUse` guard scripts, landed on the Claude path first.
+4. **Codex hook config carrying Boss's existing guard scripts.** Not a new engine seam so much as a driver-supplied one: the guard-script emission at `worker_setup.rs:918,1072` currently writes Claude settings-file grammar, and must become driver-supplied so the same scripts can be wired into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML. Gated on [T-01](#t-01-codex-hook-trust-provisioning) for trust provisioning; landed in [T-11](#t-11-codexdriver-spawn-and-workspace-provisioning).
 
 ### Capability declaration for `CodexDriver` (v1)
 
-Provided: `Spawn`, `WorkspaceProvisioning`, `PermissionPolicy`, `ModelAndEffortMenu`, `ProgressObservation`, `TurnBoundary`, `StructuredOutput`, `TranscriptAccess`, `ControlVerbs`, `PromptComposition`.
+Provided: `Spawn`, `WorkspaceProvisioning`, `PermissionPolicy`, `ModelAndEffortMenu`, `ProgressObservation`, `TurnBoundary`, `StructuredOutput`, `TranscriptAccess`, `ControlVerbs`, `PromptComposition`, **`ToolUseInterception` (deny-only)**.
 
-Not provided: `ToolUseInterception` (→ `Degrade`, guardrails carried by `PATH` shims), `ToolProvisioning` (→ `Degrade`, unused for every driver).
+Not provided: `ToolProvisioning` (→ `Degrade`, unused for every driver).
 
-Hooks firing on 0.145.0 does **not** by itself upgrade `ToolUseInterception`. The upgrade condition is not "do hooks fire" — that is now answered — but **"can Boss provision hook trust deterministically, and detect when a hook did not run"**. Until [T-01](#t-01-codex-hook-trust-provisioning) settles that, a declared capability would be a promise Boss cannot keep, because an untrusted hook is silently skipped. If T-01 succeeds, `ToolUseInterception` upgrades to provided-with-deny-only and hooks become defence-in-depth alongside the shims; nothing above needs revisiting either way.
+`ToolUseInterception` is declared because hooks fire and `PreToolUse` deny blocks pre-execution on 0.145.0 ([D-2](#deltas-that-change-the-design)), and because that is the [chosen mechanism](#operator-decision). Two conditions attach to it, and both are the driver's to satisfy rather than caveats on the declaration:
+
+- **Deny-only.** `permissionDecision:allow`, `:ask`, and `updatedInput` are all rejected, so the trait's rewrite path is unreachable and the inline-`--body` editorial case is handled by denying with a corrective reason ([the editorial case](#the-editorial-case-precisely)).
+- **Gated on [T-01](#t-01-codex-hook-trust-provisioning).** An untrusted hook is skipped in silence, so the declaration is only honest once Boss can provision `trusted_hash` deterministically and detect a hook that did not run. T-01 therefore gates the first Codex worker — it is the one hard sequencing edge this design carries, and it is a `small` investigation.
+
+If T-01 established that trust cannot be provisioned deterministically, the fallback is the `PATH`-shim project promoted back ahead of Codex — i.e. the ordering this doc originally recommended. That is the contingency, not the plan.
 
 ### Which work-item kinds are Codex-eligible
 
-Phased, with an acceptance criterion per phase. Refusals here are expressed through `KindRequirements`, and they are about **output-contract maturity**, not guardrails — guardrails are handled uniformly by the shims.
+Phased, with an acceptance criterion per phase. Refusals here are expressed through `KindRequirements`, and they are about **output-contract maturity**, not guardrails — guardrails are carried uniformly by the `PreToolUse` hook on both drivers.
 
 **Phase 1 — chores and project tasks.** The plain "make a change, open a PR" loop. Acceptance: 10 consecutive chores dispatched `--driver codex` reach an open PR with green CI, no engine intervention, and the PR URL captured on the primary path (not a `jj log` reconstruction fallback).
 
@@ -607,20 +651,22 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 - **Config collisions.** Solved by per-worker `CODEX_HOME`. Without it, concurrent workers race on `~/.codex/config.toml`'s project-trust registry.
 - **Workspace layout.** Codex uses `AGENTS.md` and `.codex/`; Claude uses `CLAUDE.md` and `.claude/`. They do not collide _by name_ — but Codex's `external_agent_config.detect` actively looks for `.claude/settings.json`, `CLAUDE.md`, and `hooks.json` and offers to import them. The Codex driver must disable that import (`external_config_migration_prompts`). A workspace that has run both drivers will contain both `.claude/` and `.codex/`; both must be engine-gitignored.
 - **A second import vector, new in 0.145.0.** Alongside config import, 0.145.0 adds an `external_agent_memory_import` feature (currently _under development_, default off) and an `external_agent_config_imports` table in `state_5.sqlite`. Suppressing config-migration prompts is therefore not a one-time fix — the surface is growing, and the Codex driver should assert its intended import posture explicitly rather than relying on a single flag's default. Per-worker `CODEX_HOME` limits the blast radius, since the import bookkeeping lives in the run's own state DB.
-- **Cube.** Nothing in `cube`'s workspace provisioning assumes an agent — it manages jj workspaces, leases, and PRs. `cube pr create` is agent-neutral and is, usefully, the enforcement point the [`PATH`-shim design](#guardrail-integrity) leans on. **No cube changes required**, which is a genuinely good outcome and worth stating explicitly.
+- **Cube.** Nothing in `cube`'s workspace provisioning assumes an agent — it manages jj workspaces, leases, and PRs. `cube pr create` is agent-neutral and is, usefully, the enforcement point both the current hook guards and the [follow-on `PATH`-shim project](#the-path-shim-design--retained-as-a-follow-on-project) lean on. **No cube changes required**, which is a genuinely good outcome and worth stating explicitly.
 
 ---
 
 ## Risks / open questions
 
 <a id="oq-1-hook-trust-provisioning"></a>
-**OQ-1 — How does Boss provision Codex hook trust, and detect a hook that did not run?** The original form of this question ("do hooks fire under `codex exec`?") is **answered: they do, on 0.145.0**, and `PreToolUse` deny genuinely blocks. What replaces it is narrower and more operational. Hooks run only when trusted, via `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash`; an untrusted hook is skipped in complete silence, as is a hook whose command is missing. The bypass flag is not an acceptable default because it would also trust project-local `.codex/` hooks originating in the repository under work. So: what is `trusted_hash` computed over, can Boss stamp it deterministically when it regenerates worker config, and is there any observable signal that a configured hook did not fire? Until that last part has an answer, hooks cannot carry a guardrail. → [T-01](#t-01-codex-hook-trust-provisioning).
+**OQ-1 — How does Boss provision Codex hook trust, and detect a hook that did not run?** The original form of this question ("do hooks fire under `codex exec`?") is **answered: they do, on 0.145.0**, and `PreToolUse` deny genuinely blocks. What replaces it is narrower and more operational. Hooks run only when trusted, via `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash`; an untrusted hook is skipped in complete silence, as is a hook whose command is missing. The bypass flag is not an acceptable default because it would also trust project-local `.codex/` hooks originating in the repository under work. So: what is `trusted_hash` computed over, can Boss stamp it deterministically when it regenerates worker config, and is there any observable signal that a configured hook did not fire?
+
+**This question is now load-bearing rather than exploratory.** The [operator decision](#operator-decision) makes hooks Codex's guardrail carrier, so the answer here is what the guarantee rests on — it gates the first Codex worker, and it is the single hard sequencing edge in the graph. → [T-01](#t-01-codex-hook-trust-provisioning).
 
 <a id="oq-2"></a>
 **OQ-2 — Version pinning and churn. Now evidenced rather than precautionary.** The `--json` stream still carries **no schema version**, and re-running this analysis across 0.137.0 → 0.145.0 produced four concrete breaks in eight minor versions: a removed flag that would have made the prescribed launch command fail (`-a`), an added `usage` field, a changed item-ID base, a second meaning for `error` items, plus four new `TurnItem` variants and a new hook event. None of it was announced on the wire. This is no longer a hypothetical risk — it is the observed release cadence. Recommendation firms up accordingly: **pin the tested version, add `--strict-config` for the config half, and gate upgrades on the conformance harness (T1483 / [T-22](#t-22-extend-the-reference-driver-conformance-harness-a-12-amends-t1483))**. Note `--strict-config` covers config keys only; nothing validates the event stream, so the harness remains the sole defence there. "Pin the agent CLI version" is still a policy decision with operational cost, and still the operator's call.
 
 <a id="oq-3-what-is-the-codex-rules-execpolicy-format"></a>
-**OQ-3 — What is the Codex `.rules` execpolicy format?** On 0.145.0 `--ignore-rules` is a **documented** `codex exec` flag (_"Do not load user or project execpolicy `.rules` files"_) rather than the binary-string inference it was on 0.137.0, which raises confidence that the system is real and reachable. It might restore some per-command deny fidelity natively, reducing reliance on `PATH` shims. Still unexamined — I did not want to design against a surface I had not run.
+**OQ-3 — What is the Codex `.rules` execpolicy format?** On 0.145.0 `--ignore-rules` is a **documented** `codex exec` flag (_"Do not load user or project execpolicy `.rules` files"_) rather than the binary-string inference it was on 0.137.0, which raises confidence that the system is real and reachable. It might restore some per-command deny fidelity natively — as a fail-closed, config-declared alternative to the hook that carries Codex's guardrails today, and potentially a cheaper answer than the follow-on shim project. Still unexamined — I did not want to design against a surface I had not run.
 
 **OQ-4 — Rollout disk growth.** `~/.codex` on this host holds 279 active + 241 archived rollouts at ~865 MB. Per-worker `CODEX_HOME` multiplies this across workspaces. `--ephemeral` avoids it entirely but would forfeit `TranscriptAccess`. Needs a retention policy; not a v1 blocker.
 
@@ -629,7 +675,11 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 <a id="oq-6-codex-exec-review"></a>
 **OQ-6 — Is `codex exec review` a better substrate for Boss's review kind than a plain read-only exec run?** New in this pass ([D-3](#delta-that-changes-a-tasks-scope)). It is purpose-built, takes `--base` / `--commit` / `--uncommitted`, and has a dedicated `codex-auto-review` model. It may also impose its own output shape that does not match Boss's `ReviewResult`. Unexamined; folded into [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds).
 
-**Risk — the `PATH`-shim relocation is a change to the Claude path.** It touches live guardrails on the driver that runs everything today. It is a net improvement (it closes the subshell-evasion hole) but it is not risk-free, and it lands before any Codex value is visible. I think this ordering is correct and non-negotiable — shipping Codex first means shipping it unguarded — but it is worth a human agreeing before [T-02](#t-02-relocate-command-guardrails-to-path-shims-claude-path) starts.
+**Risk — the `PATH`-shim relocation is a change to the Claude path.** It touches live guardrails on the driver that runs everything today. It is a net improvement (it closes the subshell-evasion hole) but it is not risk-free.
+
+The original pass paired that risk with a claim that has since been **withdrawn**: that the ordering was "correct and non-negotiable — shipping Codex first means shipping it unguarded". That is not accurate under hook-based interception, where a Codex worker is guarded by the same class of mechanism as a Claude worker. The risk is real; the scheduling consequence drawn from it was not. Both the risk and its mitigation now belong to the [follow-on `PATH`-shim project](#the-path-shim-design--retained-as-a-follow-on-project) — where it should still be a human's call before [T-02](#t-02-relocate-command-guardrails-to-path-shims-follow-on-project) starts, just not a call that blocks Codex.
+
+**Risk — Codex's guardrails inherit Claude's fail-open hook semantics, plus a trust gate Claude does not have.** This is the cost of the incremental path, stated in one place: Boss's command guardrails on Codex are exactly as strong as its hook wiring, and Codex adds a silent trust failure mode on top. [T-01](#t-01-codex-hook-trust-provisioning) is what makes this acceptable, and it must genuinely answer the detection half — "can Boss tell a hook did not run" — not just the provisioning half. A T-01 that provisions trust but cannot observe a skipped hook leaves this risk open.
 
 ---
 
@@ -646,9 +696,9 @@ Discrete, filed-work-item-sized. Boss work items **cannot** be created from this
 | A-5  | `StructuredOutput` trait method + driver-supplied PR-URL extraction                  | `medium`  | **Amends T1476** (adds PR-URL; T1476's own scope is sufficient as far as it goes) | `StructuredOutput` (`lib.rs:43`) has no trait method. More urgently, PR-URL capture is derived from `PostToolUse` hook events (`pr_url_capture.rs:1-6`) and is out of T1476's scope — under Codex it breaks completely, and the PR URL is the acceptance criterion for nearly every work item. Codex's `command_execution` items carry `aggregated_output`, so the same regex works against the stream. Make extraction driver-supplied. Also surface `--output-schema`, which is a stronger contract than the env-var file.           |
 | A-6  | `TranscriptAccess`: driver-supplied path discovery, and actually call the normaliser | `small`   | **New**                                                                           | `normalize_transcript_entry` (`claude.rs:606-616`) has never been called — `live_status.rs` passes raw JSONL to redaction. Path discovery depends on Claude stamping `transcript_path` on hook payloads; Codex's stream has no such field, though the path is derivable from `thread_id` + `CODEX_HOME`. Add `transcript_path_for_session()` and wire the normaliser in.                                                                                                                                                               |
 | A-7  | `ControlVerbs`: put probe/interrupt/stop/reap on the trait and call `classify_error` | `medium`  | **New**                                                                           | The trait has only `classify_error` (`lib.rs:644`) and it is never called — `transient_recovery.rs` calls `classify_claude_error` directly. probe/interrupt/stop/reap are absent entirely, yet probe is precisely where Claude and Codex diverge (live-session message vs `codex exec resume`). Error classification is provider-specific and must not route through Claude's classifier.                                                                                                                                              |
-| A-8  | Implement the post-hoc interception degrade path                                     | `medium`  | **New**                                                                           | `PostHocInterceptionFn` / `PostHocInterceptionAction` (`lib.rs:497-525`) have zero engine callers, so any driver landing on `AbsenceDisposition::Degrade` for `ToolUseInterception` **silently loses every guardrail**. This project routes guardrails through `PATH` shims instead, so it is not a Codex blocker — but leaving a live silent-degrade path in the abstraction is a latent safety bug that the next driver will fall into.                                                                                              |
+| A-8  | Implement the post-hoc interception degrade path                                     | `medium`  | **New** — deferred                                                                | `PostHocInterceptionFn` / `PostHocInterceptionAction` (`lib.rs:497-525`) have zero engine callers, so any driver landing on `AbsenceDisposition::Degrade` for `ToolUseInterception` **silently loses every guardrail**. Codex declares the capability and does not land there, so this is **not Codex-adjacent at all** — it is a latent safety bug awaiting a hypothetical third driver with neither hooks nor a shimmable command surface. Deferred on that basis, not closed.                                                       |
 | A-9  | Widen `WorkerEvent` session identity and `SessionStartSource`                        | `small`   | **New**                                                                           | `WorkerEvent` requires `session_id` on every variant (`protocol/src/worker_event.rs`) and `SessionStartSource` mirrors Claude's `startup\|resume\|compact`. Codex's identity is `thread_id` and its trigger set is `startup\|resume\|clear\|compact` — a superset. Note the trap: Codex's _hooks_ say `session_id` while its _stream_ says `thread_id`.                                                                                                                                                                                |
-| A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New**                                                                           | `worker_setup.rs:309,372` tell the worker _"A PreToolUse hook blocks these"_. For a Codex worker this asserts a guarantee that is false. The sentence must come from the driver. Cheap, and it is a correctness issue in what Boss tells a worker, not a wording nit.                                                                                                                                                                                                                                                                  |
+| A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New** — deferred                                                                | `worker_setup.rs:309,372` tell the worker _"A PreToolUse hook blocks these"_. The original pass rated this a correctness defect because the sentence was false for a Codex worker; under hook-based interception **it is true for both drivers**, so the defect is gone and this is hygiene. Still worth doing — the shared body hardcodes one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces. Deferred, not closed.                                                  |
 | A-11 | Resolve or delete `progress_fidelity()`                                              | `trivial` | **New**                                                                           | `claude.rs:482` — re-verified to have no callers anywhere. Either the fidelity tiers mean something and the engine should consult them, or the method should go. A Codex driver would declare `Rich` into a void.                                                                                                                                                                                                                                                                                                                      |
 | A-12 | Extend T1483's conformance harness to cover transport and turn boundaries            | `medium`  | **Amends T1483**                                                                  | T1483 (blocked on T1476 + T1479) was scoped against a Claude-shaped driver. It must also assert: stdout-JSONL ingress produces the same `WorkerEvent` sequence as hook ingress; a turn boundary drives completion identically from either source; and a pinned agent-CLI version is verified, given Codex's unversioned stream ([OQ-2](#oq-2)).                                                                                                                                                                                        |
 
@@ -705,7 +755,7 @@ To reproduce the deny path, have the handler emit:
 
 The command is blocked before execution and the reason reaches the model.
 
-The original 0.137.0 control still reproduces as a **silent** failure on 0.145.0 — swap the handler for `command = "/definitely/not/a/real/binary-xyz"` and the turn completes with no error, no warning, and no stream event. Together these two silences ([OQ-1](#oq-1-hook-trust-provisioning)) are why hooks do not carry guardrails in this design.
+The original 0.137.0 control still reproduces as a **silent** failure on 0.145.0 — swap the handler for `command = "/definitely/not/a/real/binary-xyz"` and the turn completes with no error, no warning, and no stream event. Together these two silences are the residual risk in hook-carried guardrails, and reproducing them is the starting point for [T-01](#t-01-codex-hook-trust-provisioning): the task's real question is whether _anything_ distinguishes these runs from a healthy one ([OQ-1](#oq-1-hook-trust-provisioning)).
 
 ### Version-delta harness
 
@@ -728,27 +778,31 @@ Dependency-ordered. Effort hints are per-entry, each sized to one reviewable PR 
 
 ### T-01 Codex hook trust provisioning
 
-**Re-scoped by the 0.145.0 delta pass.** The original question — do hooks fire under `codex exec`? — is answered: they do, and `PreToolUse` deny blocks pre-execution ([D-2](#deltas-that-change-the-design)). What remains is trust provisioning. Determine what `[hooks] trusted_hash` is computed over (`HookStateToml`), whether Boss can stamp it deterministically when it regenerates worker config each run, and — the part that actually gates the capability — whether there is **any** observable signal distinguishing "hook ran and allowed" from "hook was silently skipped". Also assess the blast radius of `--dangerously-bypass-hook-trust`, which trusts project-local `.codex/` hooks from the repo under work. Check `$CODEX_HOME/hook_outputs` and the binary's `hook_started` / `hook_completed` / `hook_denied` / `hook_run_id` telemetry vocabulary as candidate signals. Output is a written finding plus a reproducible harness, not code. Gates whether `ToolUseInterception` can be declared for Codex; does not gate the rest of v1, which does not rely on hooks.
+**Re-scoped by the 0.145.0 delta pass, and promoted to a hard gate by the [operator decision](#operator-decision).** The original question — do hooks fire under `codex exec`? — is answered: they do, and `PreToolUse` deny blocks pre-execution ([D-2](#deltas-that-change-the-design)). What remains is trust provisioning. Determine what `[hooks] trusted_hash` is computed over (`HookStateToml`), whether Boss can stamp it deterministically when it regenerates worker config each run, and — the part that actually gates the capability — whether there is **any** observable signal distinguishing "hook ran and allowed" from "hook was silently skipped". Also assess the blast radius of `--dangerously-bypass-hook-trust`, which trusts project-local `.codex/` hooks from the repo under work. Check `$CODEX_HOME/hook_outputs` and the binary's `hook_started` / `hook_completed` / `hook_denied` / `hook_run_id` telemetry vocabulary as candidate signals. Output is a written finding plus a reproducible harness, not code.
+
+**This is the one hard sequencing edge in the graph.** Hooks are Codex's guardrail carrier, so this must land and answer both halves — provisioning _and_ detection — before the first Codex worker runs. It replaces the withdrawn "shims must land first" constraint, at a fraction of the scope. If the answer is that trust cannot be provisioned deterministically, escalate: the fallback is promoting the `PATH`-shim project ([T-02](#t-02-relocate-command-guardrails-to-path-shims-follow-on-project), [T-03](#t-03-relocate-editorial-enforcement-to-a-gh-path-shim-follow-on-project)) back ahead of Codex, which is a scope decision for the operator, not for this task.
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope:** in-scope
+- **Scope:** in-scope — **gates [T-11](#t-11-codexdriver-spawn-and-workspace-provisioning) and everything downstream of it**
 
-### T-02 Relocate command guardrails to `PATH` shims (Claude path)
+### T-02 Relocate command guardrails to `PATH` shims (follow-on project)
 
-Move the checkleft push guard, revision-PR guard, and direct-push blocks out of the `PreToolUse` guard scripts (`worker_setup.rs:918`, `:1072`) into executables in `BOSS_BIN_DIR` that evaluate the invocation and delegate to the real binary. Claude path only; behaviour-preserving from the worker's perspective. This also closes the subshell-evasion hole the hook has today. Must land and be verified before any Codex worker runs, because it is the sole guardrail carrier for Codex.
+Move the checkleft push guard, revision-PR guard, and direct-push blocks out of the `PreToolUse` guard scripts (`worker_setup.rs:918`, `:1072`) into executables in `BOSS_BIN_DIR` that evaluate the invocation and delegate to the real binary. Behaviour-preserving from the worker's perspective, and it closes the subshell-evasion hole the hook has today on **both** drivers.
+
+**Moved out of this project by [operator decision](#operator-decision).** It was originally scoped as a Claude-path prerequisite that had to land before any Codex worker ran; that constraint is withdrawn, because Codex carries the same guardrails on its own `PreToolUse` hook. Bundling a rewrite of live guardrail enforcement made the Codex project too large. The technical case is undiminished — see [the retained analysis](#the-path-shim-design--retained-as-a-follow-on-project) — and this belongs to a follow-on project sequenced after this one. Listed here so the argument and its scope stay attached to the analysis that produced them.
 
 - **Effort:** `large`
 - **Depends on:** none
-- **Scope:** in-scope
+- **Scope:** follow-on project (sequenced after this project; gates nothing here)
 
-### T-03 Relocate editorial enforcement to a `gh` `PATH` shim (Claude path)
+### T-03 Relocate editorial enforcement to a `gh` `PATH` shim (follow-on project)
 
-Move `editorial_hook.rs` evaluation from the `PreToolUse` hook to a `gh` shim, preserving all three `PreToolUseDecision` outcomes including inline `--body` argv rewriting. Separate PR from T-02: different subsystem (`boss-editorial` + audit log), different risk profile, and T-02's shims are the prerequisite mechanism.
+Move `editorial_hook.rs` evaluation from the `PreToolUse` hook to a `gh` shim, preserving all three `PreToolUseDecision` outcomes including inline `--body` argv rewriting — the one outcome no hook can reach on either driver, and the concrete thing this buys beyond the hook path. Separate PR from T-02: different subsystem (`boss-editorial` + audit log), different risk profile, and T-02's shims are the prerequisite mechanism.
 
 - **Effort:** `medium`
 - **Depends on:** T-02
-- **Scope:** in-scope
+- **Scope:** follow-on project (with T-02; Codex handles the inline-`--body` case by denying with a corrective reason in the meantime)
 
 ### T-04 `ProgressObservation` transport abstraction (P1422 amendment A-1)
 
@@ -810,8 +864,10 @@ The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet
 
 Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `auth.json` symlink, `AGENTS.md`, pre-stamped project trust, `external_config_migration_prompts` disabled). Produces a Codex worker that starts, but whose progress is not yet observed.
 
+**Includes Codex's guardrail wiring**, which the [operator decision](#operator-decision) puts here rather than in a separate shim project: emit Boss's existing guard scripts (`worker_setup.rs:918`, `:1072`) plus editorial enforcement into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML, and stamp hook trust per T-01's finding. The guard-script emission is currently hardcoded to Claude settings-file grammar and must become driver-supplied — the scripts themselves are reusable as-is, since Codex's payloads carry `tool_name: "Bash"` and Claude's `tool_input` shape ([D-2](#deltas-that-change-the-design)). Handle the inline-`--body` editorial case as a `Deny` with a corrective reason, per [the editorial case](#the-editorial-case-precisely).
+
 - **Effort:** `large`
-- **Depends on:** T-10
+- **Depends on:** T-01, T-10
 - **Scope:** in-scope
 
 ### T-12 `CodexDriver` progress normaliser
@@ -874,19 +930,23 @@ The synthesize-from-a-lower-fidelity-channel path, for a future driver with neit
 
 ### T-19 Implement the post-hoc interception degrade path (A-8)
 
-Wire `PostHocInterceptionFn` / `PostHocInterceptionAction`, which currently have zero callers, so a driver landing on `Degrade` does not silently lose guardrails. Not a Codex blocker under the `PATH`-shim design, but it removes a latent safety bug from the abstraction.
+Wire `PostHocInterceptionFn` / `PostHocInterceptionAction`, which currently have zero callers, so a driver landing on `Degrade` does not silently lose guardrails. It removes a latent safety bug from the abstraction.
+
+**Reclassified from Codex-adjacent to plain deferred.** Under the [operator decision](#operator-decision) Codex declares `ToolUseInterception` and does not land on `Degrade` at all, so this is not about Codex in any form — it is the trap waiting for a hypothetical third driver with neither hooks nor a shimmable command surface. Its dependency on T-03 is dropped along with T-03's move to the follow-on project; nothing gates it.
 
 - **Effort:** `medium`
-- **Depends on:** T-03
-- **Scope:** deferred (future / not a v1 blocker) — `PATH` shims carry Codex's guardrails; this closes the trap for the next driver
+- **Depends on:** none
+- **Scope:** deferred (future / not a v1 blocker) — no current or planned driver lands on `Degrade`; this closes the trap for the next one
 
 ### T-20 Driver-supplied enforcement wording in prompts (A-10)
 
-Replace the hardcoded _"A PreToolUse hook blocks these"_ at `worker_setup.rs:309,372` with driver-supplied wording, so Boss does not assert a false guarantee to a Codex worker. Must be re-checked after T-02/T-03, since the shims change what is true for Claude too.
+Replace the hardcoded _"A PreToolUse hook blocks these"_ at `worker_setup.rs:309,372` with driver-supplied wording.
+
+**Downgraded from correctness to hygiene by the [operator decision](#operator-decision).** The original justification was that this sentence asserts a false guarantee to a Codex worker; under hook-based interception it is **true** for a Codex worker, so nothing false is being told to anyone and this no longer blocks Codex. It is still worth doing — shared prompt prose should not hardcode one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces, so re-check it then.
 
 - **Effort:** `small`
-- **Depends on:** T-03, T-10
-- **Scope:** in-scope
+- **Depends on:** T-10
+- **Scope:** deferred (future / not a v1 blocker) — the existing wording is accurate for both drivers as they stand
 
 ### T-21 Resolve or delete `progress_fidelity()` (A-11)
 
@@ -940,11 +1000,11 @@ Attach per-driver in-flight accounting at the dispatch gate and record Codex's p
 
 ### T-27 Codex `.rules` execpolicy investigation
 
-Investigate Codex's execpolicy `.rules` system ([OQ-3](#oq-3-what-is-the-codex-rules-execpolicy-format)) to see whether it restores native per-command deny fidelity and could reduce reliance on `PATH` shims. Discovery task, sequenced independently.
+Investigate Codex's execpolicy `.rules` system ([OQ-3](#oq-3-what-is-the-codex-rules-execpolicy-format)) to see whether it restores native per-command deny fidelity in a fail-closed form. If it does, it is a candidate hardening for the hook-carried guardrails and possibly a cheaper answer than the follow-on shim project. Discovery task, sequenced independently.
 
 - **Effort:** `small`
 - **Depends on:** none
-- **Scope:** deferred (future / not a v1 blocker) — `PATH` shims already cover the requirement; this is a potential simplification
+- **Scope:** deferred (future / not a v1 blocker) — the `PreToolUse` hook covers the requirement in v1; this is a potential simplification
 
 ### T-28 Remote/SSH dispatch for Codex
 
@@ -966,15 +1026,16 @@ Replace or supplement `codex exec` with the persistent app-server protocol, givi
 
 At the same depth, these may run in parallel:
 
-- **Depth 0:** T-01, T-02, T-04, T-07, T-27 — genuinely independent; different subsystems and files.
-- **Depth 1:** T-03 and T-05/T-06 are parallel (editorial/shims vs. progress transport). T-08 follows T-07.
+- **Depth 0:** T-01, T-04, T-07, T-27 — genuinely independent; different subsystems and files. **Start T-01 first regardless of slack:** it is the only hard gate, it is `small`, and T-11 cannot land without it.
+- **Depth 1:** T-05/T-06 (progress transport). T-08 follows T-07.
 - **Depth 2:** T-13, T-14, T-16, T-17, T-21 all depend on T-12 and are otherwise independent.
+- **Not in this graph:** T-02 and T-03 belong to the follow-on `PATH`-shim project and are independent of everything above.
 
 **File-overlap cautions — order these rather than running them concurrently:**
 
 - **T-04 and T-06** both edit `engine/driver/src/lib.rs`'s trait surface and `engine/core/src/worker_setup.rs`. Land T-04 first; T-06 forward-ports its enum preservingly.
 - **T-07 and T-08** both edit `engine/core/src/runner/pane_spawn.rs` and the driver trait's spawn/permission signatures. The dependency edge already serialises them; keep it.
 - **T-12 and T-13** both edit the driver normalisers. Land T-12 first; T-13 integrates rather than replaces its mappings.
-- **T-02 and T-03** both edit `worker_setup.rs` guard-script emission and `BOSS_BIN_DIR` provisioning. The dependency edge serialises them; keep it.
+- **T-02 and T-03** both edit `worker_setup.rs` guard-script emission and `BOSS_BIN_DIR` provisioning. The dependency edge serialises them; keep it. Both also collide with **T-11**, which makes the same guard-script emission driver-supplied — a further reason the shim work is better done as a follow-on project than concurrently.
 
 T-09 is a deliberate barrier: it touches nearly every engine call site, so nothing else should be in flight against those files while it lands.
