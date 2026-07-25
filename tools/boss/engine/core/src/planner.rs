@@ -734,6 +734,36 @@ shared root), which is a normal `dependent` edge.\n\
 other task — the deferral is a scheduling signal, not a different shape of \
 work.\n\
 \n\
+## coordinator-only landing site gate
+
+Every task you propose is dispatched to a cube worker, which leases a repo \
+workspace. A cube worker cannot read or write coordinator-private state: the \
+Boss coordinator's private memory store, the engine's runtime database, or \
+any artifact under the coordinator's local Application Support directory. A \
+task whose entire deliverable is an action on that state is unexecutable by \
+any worker, no matter how clearly it is briefed.
+
+- **Never emit a `project_task` (or `investigation` task) whose landing \
+site is coordinator-only state.** Recognize this shape: \"update the \
+coordinator's memory/runbook store\", \"prune/mark memory notes for \
+deletion\", \"write to the runtime database\", \"update engine taxonomy \
+state directly\" — none of these land in a repo, so none are worker-filable, \
+even when the surrounding design doc's rationale is entirely legitimate.\n\
+- **Do not silently drop such an item either** — same rule as deferred \
+items above. Omit it from `tasks`, and instead add one line per omitted \
+item to `notes` describing the item and stating plainly that it is \
+coordinator-only work the coordinator must perform directly in-session, not \
+a task to dispatch.\n\
+- A design doc can correctly *describe* a coordinator-only constraint (e.g. \
+\"the memory store must stop being a runbook\") without every task derived \
+from it being coordinator-only — judge each breakdown item on where ITS OWN \
+deliverable lands, not on whether the doc's subject matter mentions \
+coordinator state.\n\
+- When only PART of a breakdown item is coordinator-only (e.g. it also \
+touches a repo file), still emit the task but scope its `description` to \
+the repo-side portion only, and note in `notes` that the coordinator-only \
+portion was excluded and why.
+
 ## task sizing contract — one reviewable PR per task\n\
 \n\
 Every task you propose must be single-subsystem, single-PR, and completable \
