@@ -143,13 +143,11 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: prURL), "a failed latest attempt must not clear an existing badge")
     }
 
-    /// T3271/PR#2303 postmortem: the "ci failing" chip is keyed off
-    /// `ciFailureBadges`, a separate map from `recentlyClearedCIPRs`. It was
-    /// only ever added to by the reconciliation loop above, never removed —
-    /// so once a `ciRemediationStarted`/`ciRemediationExhausted` push set an
-    /// `in_flight` chip, a missed `ciRemediationSucceeded` push stranded it
-    /// even after CI went green. The list refresh must clear a stale
-    /// `in_flight` chip whenever the PR's latest attempt succeeded.
+    /// The "ci failing" chip is keyed off `ciFailureBadges`, a separate map
+    /// from `recentlyClearedCIPRs`. A missed `ciRemediationSucceeded` push
+    /// can strand an `in_flight` chip after CI goes green (seen on PR
+    /// #2303), so the list refresh must clear it whenever the PR's latest
+    /// attempt succeeded.
     func testSucceededLatestAttemptClearsStaleFailureChipWithoutSucceededPush() {
         let model = makeModel()
         let prURL = "https://github.com/x/y/pull/3271"

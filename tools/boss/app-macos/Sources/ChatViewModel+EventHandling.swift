@@ -314,7 +314,10 @@ extension ChatViewModel {
                     }
                     recentlyClearedCIPRs.removeValue(forKey: row.prURL)
                 case "succeeded":
-                    if ciFailureBadges[row.prURL]?.state == .inFlight {
+                    // Skip only the sticky `.exhausted` state so any future
+                    // non-sticky `CiFailureBadge.State` case defaults to
+                    // clearable here, rather than silently stranding it.
+                    if ciFailureBadges[row.prURL]?.state != .exhausted {
                         ciFailureBadges.removeValue(forKey: row.prURL)
                     }
                     if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
