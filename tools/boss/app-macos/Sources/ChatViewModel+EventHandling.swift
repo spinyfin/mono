@@ -284,15 +284,22 @@ extension ChatViewModel {
             //    was missed (T2764: the push is the only other writer of
             //    `recentlyClearedCIPRs`, so a dropped push stranded the
             //    badge for up to the full freshness window).
-            //  - latest succeeded and still fresh: (re)stamp the
-            //    "ci auto-fixed" chip using the engine's own timestamp
-            //    rather than local observation time, so a missed
-            //    `ciRemediationSucceeded` push self-heals on the next
-            //    list refresh instead of never showing the chip at all.
+            //  - latest succeeded: the attempt that was fixing this PR is
+            //    done, so an `in_flight` failure chip is now stale even if
+            //    the `ciRemediationSucceeded` push that would normally
+            //    clear it was missed — drop it here so the chip can't
+            //    outlive the condition it represents. If still fresh,
+            //    (re)stamp the "ci auto-fixed" chip using the engine's own
+            //    timestamp rather than local observation time, so this same
+            //    missed push self-heals the auto-fixed badge too.
             // Exhausted chips are sticky until the user clears them via
             // retry — they are not derivable from the row list alone (the
             // engine tracks them via `task_blocked_signals`), so we leave
-            // pre-existing exhausted chips alone.
+            // pre-existing exhausted chips alone. Terminal failed/abandoned
+            // attempts also leave the `in_flight` chip alone: the parent PR
+            // is still `blocked: ci_failure` until the engine retries or
+            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
+            // handling below), so the chip is still accurate.
             var seenPRs = Set<String>()
             for row in attempts {
                 guard seenPRs.insert(row.prURL).inserted else { continue }
@@ -307,6 +314,12 @@ extension ChatViewModel {
                     }
                     recentlyClearedCIPRs.removeValue(forKey: row.prURL)
                 case "succeeded":
+                    // Skip only the sticky `.exhausted` state so any future
+                    // non-sticky `CiFailureBadge.State` case defaults to
+                    // clearable here, rather than silently stranding it.
+                    if ciFailureBadges[row.prURL]?.state != .exhausted {
+                        ciFailureBadges.removeValue(forKey: row.prURL)
+                    }
                     if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
                        Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
                         recentlyClearedCIPRs[row.prURL] = observedAt

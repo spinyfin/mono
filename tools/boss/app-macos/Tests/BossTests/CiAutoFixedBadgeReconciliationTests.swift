@@ -143,6 +143,79 @@ final class CiAutoFixedBadgeReconciliationTests: XCTestCase {
         XCTAssertTrue(model.showsCIAutoFixedBadge(forPR: prURL), "a failed latest attempt must not clear an existing badge")
     }
 
+    /// The "ci failing" chip is keyed off `ciFailureBadges`, a separate map
+    /// from `recentlyClearedCIPRs`. A missed `ciRemediationSucceeded` push
+    /// can strand an `in_flight` chip after CI goes green (seen on PR
+    /// #2303), so the list refresh must clear it whenever the PR's latest
+    /// attempt succeeded.
+    func testSucceededLatestAttemptClearsStaleFailureChipWithoutSucceededPush() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3271"
+
+        model.applyEventForTest(.ciRemediationStarted(
+            productID: "prod_test", workItemID: "task_1", attemptID: "cir_10", prURL: prURL, attemptKind: "fix"
+        ))
+        XCTAssertNotNil(model.ciFailureBadge(forPR: prURL))
+
+        // The engine's `ciRemediationSucceeded` push for this attempt never
+        // arrived — only a subsequent list refresh (e.g. Engine-tab entry)
+        // observes the attempt is now `succeeded`.
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "cir_10", prURL: prURL, status: "succeeded", finishedAt: nil),
+        ]))
+
+        XCTAssertNil(
+            model.ciFailureBadge(forPR: prURL),
+            "a succeeded latest attempt must clear a stale in-flight failure chip on list reconciliation"
+        )
+    }
+
+    /// Exhausted chips are sticky by design (cleared only via explicit
+    /// retry/`ciFailureCleared`) — the list refresh must leave them alone
+    /// even when the latest row for that PR shows `succeeded`, since
+    /// exhaustion isn't derivable from the row list alone.
+    func testSucceededLatestAttemptLeavesExhaustedChipUntouched() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3272"
+
+        model.applyEventForTest(.ciRemediationExhausted(
+            productID: "prod_test", workItemID: "task_1", prURL: prURL, attemptsUsed: 3, budget: 3
+        ))
+        XCTAssertEqual(model.ciFailureBadge(forPR: prURL)?.state, .exhausted)
+
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "cir_11", prURL: prURL, status: "succeeded", finishedAt: nil),
+        ]))
+
+        XCTAssertEqual(
+            model.ciFailureBadge(forPR: prURL)?.state,
+            .exhausted,
+            "an exhausted chip must stay sticky through list reconciliation, not be cleared by a succeeded row"
+        )
+    }
+
+    /// A failed/abandoned latest attempt must not itself clear the failure
+    /// chip — the parent PR stays `blocked: ci_failure` until the engine
+    /// retries or exhausts, so the chip is still accurate.
+    func testFailedLatestAttemptLeavesFailureChipUntouched() {
+        let model = makeModel()
+        let prURL = "https://github.com/x/y/pull/3273"
+
+        model.applyEventForTest(.ciRemediationStarted(
+            productID: "prod_test", workItemID: "task_1", attemptID: "cir_12", prURL: prURL, attemptKind: "fix"
+        ))
+        XCTAssertNotNil(model.ciFailureBadge(forPR: prURL))
+
+        model.applyEventForTest(.ciRemediationsList(attempts: [
+            makeRemediation(id: "cir_12", prURL: prURL, status: "failed", finishedAt: nil),
+        ]))
+
+        XCTAssertNotNil(
+            model.ciFailureBadge(forPR: prURL),
+            "a failed latest attempt must not clear an existing in-flight failure chip"
+        )
+    }
+
     // MARK: - Helpers
 
     private func makeModel() -> ChatViewModel {
