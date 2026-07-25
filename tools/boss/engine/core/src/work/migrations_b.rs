@@ -950,6 +950,38 @@ pub(crate) fn migrate_tasks_merge_queue_detail_column(conn: &Connection) -> Resu
     Ok(())
 }
 
+/// Add `tasks.pr_merge_state_status` and `tasks.pr_head_sha` — two fields
+/// the merge poller's `gh pr view` probe already fetches every sweep
+/// (`PrLifecycleProbe::raw_merge_state_status` / `head_ref_oid`) but
+/// previously discarded after routing the CI/conflict/merge-queue
+/// dispatch decision. Persisting them costs no additional GitHub call —
+/// see `sweep::update_pr_poll_state`, which now writes both alongside the
+/// existing `pr_mergeable_state` write.
+///
+/// `pr_merge_state_status` is GitHub's raw `mergeStateStatus` enum
+/// (`"CLEAN"`, `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`,
+/// `"UNKNOWN"`) — distinct from `pr_mergeable_state`, which is Boss's own
+/// normalized `mergeable`/`conflicting`/`unknown` derived from GitHub's
+/// separate `mergeable` field. `pr_head_sha` is the PR's `headRefOid` at
+/// last poll. Both back `boss pr status` (`app::pr_status`), which reads
+/// them as the "Boss already observed this" snapshot instead of every
+/// worker re-fetching the same state via `gh pr view`.
+/// Idempotent — guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_pr_status_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "pr_merge_state_status",
+            "ALTER TABLE tasks ADD COLUMN pr_merge_state_status TEXT",
+        ),
+        ("pr_head_sha", "ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT"),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Add the external-tracker binding columns to `products` and the
 /// per-work-item upstream-ref columns to `tasks`, plus the two partial
 /// indices that support efficient lookup and uniqueness enforcement.

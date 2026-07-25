@@ -1496,6 +1496,9 @@ pub(crate) async fn update_pr_poll_state(
             merge_queue_detail: merge_queue_detail.as_deref(),
             preserve_merge_queue_state,
             pr_mergeable_state: mergeable_state,
+            pr_merge_state_status: (!probe.raw_merge_state_status.is_empty())
+                .then_some(probe.raw_merge_state_status.as_str()),
+            pr_head_sha: probe.head_ref_oid.as_deref(),
         },
     ) {
         Ok(outcome) => outcome,

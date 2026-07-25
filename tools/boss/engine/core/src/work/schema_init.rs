@@ -630,6 +630,10 @@ impl WorkDb {
         // `revision` intent value (nothing downstream ever branched on which
         // of the two a comment carried). Data-only, no schema change.
         migrate_collapse_directive_larger_change_intent(conn)?;
+        // `tasks.pr_merge_state_status` / `tasks.pr_head_sha`: two fields the
+        // merge poller's probe already fetches every sweep but previously
+        // discarded. Backs `boss pr status` — see migration doc comment.
+        migrate_tasks_pr_status_columns(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

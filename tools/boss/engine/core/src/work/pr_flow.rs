@@ -1049,14 +1049,18 @@ impl WorkDb {
                  review_required_detail = ?5,
                  merge_queue_state      = CASE WHEN ?8 THEN merge_queue_state ELSE ?6 END,
                  merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END,
-                 pr_mergeable_state     = ?9
+                 pr_mergeable_state     = ?9,
+                 pr_merge_state_status  = ?10,
+                 pr_head_sha            = ?11
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
                     OR (NOT ?8 AND (COALESCE(merge_queue_state, '') != COALESCE(?6, '')
                                     OR COALESCE(merge_queue_detail, '') != COALESCE(?7, '')))
-                    OR COALESCE(pr_mergeable_state, '') != ?9)",
+                    OR COALESCE(pr_mergeable_state, '') != ?9
+                    OR COALESCE(pr_merge_state_status, '') != COALESCE(?10, '')
+                    OR COALESCE(pr_head_sha, '') != COALESCE(?11, ''))",
             params![
                 work_item_id,
                 input.ci_required_state,
@@ -1067,6 +1071,8 @@ impl WorkDb {
                 input.merge_queue_detail,
                 preserve,
                 input.pr_mergeable_state,
+                input.pr_merge_state_status,
+                input.pr_head_sha,
             ],
         )?;
         tx.commit()?;
@@ -1075,6 +1081,62 @@ impl WorkDb {
             prior_ci_state,
             prior_merge_queue_state,
         })
+    }
+
+    /// The PR-status snapshot backing `boss pr status` (`app::pr_status`):
+    /// exactly the columns the merge poller already wrote for this task's
+    /// PR, as of its last probe — no GitHub call. Returns `Ok(None)` only
+    /// when the row itself is gone (deleted); a task with no PR yet, or one
+    /// the poller hasn't probed, comes back with every field `None` except
+    /// `pr_url` if set.
+    pub fn get_pr_status_snapshot(&self, work_item_id: &str) -> Result<Option<PrStatusSnapshot>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT pr_url, pr_mergeable_state, pr_merge_state_status, pr_head_sha, pr_state_polled_at
+             FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| {
+                Ok(PrStatusSnapshot {
+                    pr_url: row.get(0)?,
+                    mergeable: row.get(1)?,
+                    merge_state_status: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    observed_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading pr status snapshot")
+    }
+
+    /// Persist a fresh `boss pr status --refresh` observation directly from
+    /// a live `MergeProbe::probe` result, bypassing the CI/review/merge-queue
+    /// bookkeeping [`Self::update_task_pr_poll_state`] otherwise couples to
+    /// the same write — a refresh is a single bounded on-demand mergeability
+    /// check, not a full sweep pass. Always writes (no changed-guard): a
+    /// caller that paid for a live `gh` round trip wants the row to reflect
+    /// it unconditionally. Stamps `pr_state_polled_at` to `observed_at` so
+    /// the next unrefreshed `boss pr status` sees the same timestamp this
+    /// call returns.
+    pub fn set_pr_status_observation(
+        &self,
+        work_item_id: &str,
+        mergeable_state: &str,
+        merge_state_status: Option<&str>,
+        head_sha: Option<&str>,
+        observed_at: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+             SET pr_mergeable_state    = ?2,
+                 pr_merge_state_status = ?3,
+                 pr_head_sha           = ?4,
+                 pr_state_polled_at    = ?5
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, mergeable_state, merge_state_status, head_sha, observed_at],
+        )?;
+        Ok(())
     }
 
     /// Write the Merging-UI columns for `work_item_id` directly — the
@@ -1155,12 +1217,36 @@ pub struct PrPollStateInput<'a> {
     /// treating an empty string as "not yet probed" at the DB layer (the
     /// protocol layer instead normalizes empty to `None`, per `map_task`).
     pub pr_mergeable_state: &'a str,
+    /// GitHub's raw `mergeStateStatus` for this probe (`"CLEAN"`,
+    /// `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`, `"UNKNOWN"`) — see
+    /// `tasks.pr_merge_state_status`'s migration doc for the stored column.
+    /// `None` when the probe didn't carry one (rare). Backs `boss pr status`.
+    pub pr_merge_state_status: Option<&'a str>,
+    /// The PR's `headRefOid` at probe time. `None` when GitHub didn't
+    /// report one. Backs `boss pr status`'s `head_sha` field with the
+    /// current observed head, distinct from
+    /// `WorkExecution::pr_head_before` (the snapshot at a specific
+    /// execution's run start).
+    pub pr_head_sha: Option<&'a str>,
     /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
     /// untouched regardless of the values above — set by the caller for a
     /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
     /// the Trunk submission flow rather than this GitHub probe. Defaults to
     /// `false` (the pre-existing behaviour) via `#[derive(Default)]`.
     pub preserve_merge_queue_state: bool,
+}
+
+/// Result of [`WorkDb::get_pr_status_snapshot`] — the columns the merge
+/// poller (or a `boss pr status --refresh` call) last observed for a task's
+/// PR. Every field beyond `pr_url` is `None` until at least one probe has
+/// run. `app::pr_status` maps this into the wire-level `PrStatusView`.
+#[derive(Debug, Clone, Default)]
+pub struct PrStatusSnapshot {
+    pub pr_url: Option<String>,
+    pub mergeable: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
 }
 
 /// Outcome of [`WorkDb::update_task_pr_poll_state`].
