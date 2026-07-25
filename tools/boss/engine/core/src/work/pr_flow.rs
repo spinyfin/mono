@@ -92,8 +92,9 @@ impl WorkDb {
             params![task.id, new_status.as_str(), pr_url_for_task, now, blocked_reason_for_task],
         )?;
 
+        let mut pending = PendingEvents::new();
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }
 
         // Comment-intent-classification design §"Reconciliation": a
@@ -146,7 +147,6 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
@@ -232,8 +232,9 @@ impl WorkDb {
             params![task.id, new_status.as_str(), now],
         )?;
 
+        let mut pending = PendingEvents::new();
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }
 
         tx.execute(
@@ -267,7 +268,6 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        let mut pending = PendingEvents::new();
         stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
@@ -769,6 +769,7 @@ impl WorkDb {
     pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
         };
@@ -822,7 +823,7 @@ impl WorkDb {
              WHERE id = ?1",
             params![task.id, pr_url, now],
         )?;
-        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
         // merge_order sequencing (direction 2): order the pair. Any in-flight
         // merge_order sibling of this just-merged task is now the "later" side
         // and owes a preserving forward-port when its base moves. This never
@@ -839,7 +840,7 @@ impl WorkDb {
         // (todo / active / waiting_dependency / blocked-for-another-reason)
         // can never push to the merged PR.  Block them now so the
         // scheduler stops dispatching them and the kanban shows why.
-        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         // Comment-intent-classification design §"Reconciliation" (task
         // 2c): resolve any comments whose `[Revise]` batch was dispatched
         // directly to this task (the plain-chore vehicle of the
@@ -850,7 +851,7 @@ impl WorkDb {
         comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(updated))
     }
 
@@ -881,6 +882,7 @@ impl WorkDb {
     pub fn mark_chore_pr_closed_unmerged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
         };
@@ -903,12 +905,12 @@ impl WorkDb {
                AND pr_url = ?2",
             params![task.id, pr_url, now],
         )?;
-        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
         flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
-        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(updated))
     }
 

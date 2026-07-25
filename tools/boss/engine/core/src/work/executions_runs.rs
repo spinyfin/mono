@@ -523,6 +523,7 @@ impl WorkDb {
         let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
         let mut result = ExecutionReconcileResult::default();
+        let mut pending = PendingEvents::new();
 
         // Per-row repo resolution lives inside
         // `reconcile_work_item_execution` now — the product default
@@ -590,7 +591,7 @@ impl WorkDb {
                 // is auto-blocked here rather than dispatched.
                 TaskKind::Revision => {
                     if task_accepts_execution(&task) {
-                        reconcile_revision_execution(&tx, &mut result, &task)?;
+                        reconcile_revision_execution(&mut pending, &tx, &mut result, &task)?;
                     }
                 }
                 TaskKind::ProjectTask | TaskKind::Design => {
@@ -644,7 +645,7 @@ impl WorkDb {
             }
         }
 
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(result)
     }
 

@@ -218,8 +218,9 @@ impl WorkDb {
     pub fn create_revision(&self, input: CreateRevisionInput, pr_checker: &dyn PrStateChecker) -> Result<Task> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let task = assert_parent_revisable_and_insert(&tx, input, pr_checker)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let task = assert_parent_revisable_and_insert(&mut pending, &tx, input, pr_checker)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task)
     }
 

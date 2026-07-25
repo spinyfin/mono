@@ -505,10 +505,11 @@ impl WorkDb {
                AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
+        let mut pending = PendingEvents::new();
         if n > 0 {
-            cascade_dependents_after_prereq_status_change(&tx, work_item_id, "done", &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, work_item_id, "done", &now)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(n > 0)
     }
 

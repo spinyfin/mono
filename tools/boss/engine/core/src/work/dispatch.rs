@@ -49,8 +49,9 @@ impl WorkDb {
         }
         ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
         let tx = conn.transaction()?;
-        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(execution)
     }
 
@@ -475,8 +476,9 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
-        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(execution))
     }
 
@@ -510,6 +512,7 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut redispatched = Vec::new();
+        let mut pending = PendingEvents::new();
         for work_item_id in candidate_ids {
             // Decide whether this work item needs a fresh ready
             // execution. The candidate cases are:
@@ -549,6 +552,7 @@ impl WorkDb {
                 .filter(|_| is_orphaned_predecessor)
                 .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
+                &mut pending,
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
@@ -559,7 +563,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(redispatched)
     }
 
@@ -606,6 +610,7 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut redispatched = Vec::new();
+        let mut pending = PendingEvents::new();
         for (work_item_id, autostart) in candidates {
             if !autostart {
                 continue;
@@ -624,6 +629,7 @@ impl WorkDb {
                 continue;
             }
             request_execution_in_tx_with_live_check(
+                &mut pending,
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
@@ -636,7 +642,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(redispatched)
     }
 
@@ -1380,7 +1386,7 @@ impl WorkDb {
             params![task_id, now],
         )?;
         if task_rows > 0 {
-            cascade_dependents_after_prereq_status_change(&tx, task_id, "in_review", &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
         }
         commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(task_rows > 0)

@@ -176,14 +176,23 @@ pub(crate) fn apply_create_time_dependencies(
     prerequisite_ids: &[String],
     now: &str,
 ) -> Result<()> {
+    // `dependent_id` is always freshly created in the same transaction as
+    // this call (see the comment above), so it can never have a live
+    // execution attached yet — `add_dependency_edge_in_tx`'s cancelled-
+    // execution channel is guaranteed empty and `pending` stays empty too.
+    let mut pending = PendingEvents::new();
     for prerequisite_id in prerequisite_ids {
         let prerequisite_id = prerequisite_id.trim();
         if prerequisite_id.is_empty() {
             continue;
         }
-        add_dependency_edge_in_tx(conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
+        add_dependency_edge_in_tx(&mut pending, conn, dependent_id, prerequisite_id, RELATION_BLOCKS, now)
             .with_context(|| format!("declaring create-time dependency on `{prerequisite_id}`"))?;
     }
+    debug_assert!(
+        pending.is_empty(),
+        "freshly-created work item cannot have a live execution"
+    );
     Ok(())
 }
 
