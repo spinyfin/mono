@@ -1,7 +1,7 @@
 import XCTest
 @testable import Boss
 
-/// T2764: the `"✅ ci auto-fixed"` PR-card chip is push-only —
+/// The `"✅ ci auto-fixed"` PR-card chip is push-only —
 /// `recentlyClearedCIPRs` is normally set by `ciRemediationSucceeded` and
 /// cleared by `ciRemediationStarted`/`ciRemediationExhausted`. If either
 /// push is dropped (e.g. the app was unsubscribed from the product topic

@@ -281,7 +281,7 @@ extension ChatViewModel {
             //    "ci auto-fixed" chip — a fresh attempt means the prior
             //    auto-fix claim no longer holds even if the
             //    `ciRemediationStarted` push that would normally clear it
-            //    was missed (T2764: the push is the only other writer of
+            //    was missed (the push is the only other writer of
             //    `recentlyClearedCIPRs`, so a dropped push stranded the
             //    badge for up to the full freshness window).
             //  - latest succeeded: the attempt that was fixing this PR is
