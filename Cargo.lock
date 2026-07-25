@@ -419,6 +419,7 @@ dependencies = [
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
+ "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utils",
  "boss-engine-worker-policy",
@@ -515,9 +516,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-engine-structured-output",
  "boss-engine-transient-error",
+ "boss-engine-utils",
  "boss-protocol",
  "boss-ssh-transport",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -585,6 +589,17 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-structured-output"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-utils",
+ "regex",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -724,7 +739,7 @@ name = "boss-pr-review"
 version = "0.1.0"
 dependencies = [
  "bon",
- "boss-engine-utils",
+ "boss-engine-structured-output",
  "serde",
  "serde_json",
 ]

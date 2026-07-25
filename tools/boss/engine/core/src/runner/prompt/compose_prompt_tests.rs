@@ -46,6 +46,106 @@ fn chore_with_pr(pr_url: &str) -> WorkItem {
 }
 
 #[test]
+fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
+    // Both acceptance-criterion variants (fresh PR, resumed PR) must carry
+    // the file contract *and* the final-message convention: the file is the
+    // primary channel, the printed line is the driver's fallback.
+    for work_item in [chore_without_pr(), chore_with_pr("https://github.com/org/repo/pull/42")] {
+        let execution = base_execution();
+        let prompt = compose_execution_prompt(
+            ExecutionPromptParams::builder()
+                .execution(&execution)
+                .work_item(&work_item)
+                .workspace_path(std::path::Path::new("/tmp/workspace"))
+                .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+                .build(),
+        );
+        let expected_path = crate::structured_output::default_path_string(&execution.id, StructuredOutputKind::PrUrl);
+        assert!(
+            prompt.contains(&expected_path),
+            "prompt must name the PR-URL artifact path ({expected_path}):\n{prompt}",
+        );
+        assert!(
+            prompt.contains("$BOSS_PR_URL_OUTPUT"),
+            "prompt must name the env var carrying that path:\n{prompt}",
+        );
+        assert!(
+            prompt.contains("Print the PR URL on its own line"),
+            "the final-message fallback convention must survive:\n{prompt}",
+        );
+    }
+}
+
+#[test]
+fn designated_output_kind_matches_the_prompt_each_execution_kind_renders() {
+    // The env var must name the payload the prompt actually asks for.
+    assert_eq!(
+        designated_output_kind(&base_execution(), &chore_without_pr()),
+        Some(StructuredOutputKind::Followups),
+    );
+
+    let mut reviewer = base_execution();
+    reviewer.kind = ExecutionKind::PrReview;
+    assert_eq!(
+        designated_output_kind(&reviewer, &chore_without_pr()),
+        Some(StructuredOutputKind::ReviewResult),
+    );
+
+    let mut triage = base_execution();
+    triage.kind = ExecutionKind::AutomationTriage;
+    assert_eq!(
+        designated_output_kind(&triage, &chore_without_pr()),
+        Some(StructuredOutputKind::TriageDecision),
+    );
+
+    // ProjectDesign splits on the *task's* kind, mirroring the directive branch.
+    let mut design = base_execution();
+    design.kind = ExecutionKind::ProjectDesign;
+    assert_eq!(designated_output_kind(&design, &chore_without_pr()), None);
+    let postmortem = match chore_without_pr() {
+        WorkItem::Chore(mut t) => {
+            t.kind = TaskKind::DesignPostmortem;
+            WorkItem::Task(t)
+        }
+        other => other,
+    };
+    assert_eq!(
+        designated_output_kind(&design, &postmortem),
+        Some(StructuredOutputKind::PostmortemFollowups),
+    );
+}
+
+#[test]
+fn structured_output_env_always_carries_the_pr_url_path() {
+    let execution = base_execution();
+    let dir = std::path::Path::new("/tmp/boss-worker-output");
+    let env = structured_output_env_vars(dir, &execution, &chore_without_pr());
+    let lookup = |key: &str| {
+        env.iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        lookup("BOSS_PR_URL_OUTPUT"),
+        "/tmp/boss-worker-output/exec_abc123_01.pr-url.json",
+    );
+    assert_eq!(
+        lookup("BOSS_STRUCTURED_OUTPUT"),
+        "/tmp/boss-worker-output/exec_abc123_01.followups.json",
+        "the designated payload for an implementer is its followups manifest",
+    );
+
+    // A kind with no designated payload still gets the PR-URL path, and
+    // must not export a stale/ambiguous BOSS_STRUCTURED_OUTPUT.
+    let mut answer_agent = base_execution();
+    answer_agent.kind = ExecutionKind::AnswerAgent;
+    let env = structured_output_env_vars(dir, &answer_agent, &chore_without_pr());
+    assert_eq!(env.len(), 1, "only the PR-URL path is exported: {env:?}");
+    assert_eq!(env[0].0, "BOSS_PR_URL_OUTPUT");
+}
+
+#[test]
 fn no_resume_directive_when_pr_url_is_absent() {
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()

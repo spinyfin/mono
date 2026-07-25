@@ -165,6 +165,124 @@ impl WorkerCompletionHandler {
         branch_ok.then_some(staged_url)
     }
 
+    /// Stage a PR URL the worker delivered over the **structured-output file
+    /// contract** — the driver-agnostic primary channel (design: agent-driver
+    /// abstraction §1.6). Returns `true` when a URL was newly staged.
+    ///
+    /// The artifact is read and gated exactly like a hook-captured URL
+    /// (product-repo check here, branch verification in
+    /// [`Self::verified_staged_pr_url`]), then handed to the same staging
+    /// cache, so everything downstream is identical no matter which channel
+    /// produced it. First-writer-wins is preserved: a URL the `PostToolUse`
+    /// stream already captured from `gh pr create`'s own stdout is stronger
+    /// evidence than a file the worker wrote by hand, and stays.
+    pub(super) fn stage_pr_url_from_artifact(&self, execution: &crate::work::WorkExecution) -> bool {
+        let payload = match crate::structured_output::read_json::<crate::structured_output::PrUrlPayload>(
+            &self.structured_output_dir,
+            &execution.id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ) {
+            Ok(Some(payload)) => payload,
+            Ok(None) => return false,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    error = %err,
+                    "pr_url_capture: PR-URL artifact present but did not validate; ignoring",
+                );
+                return false;
+            }
+        };
+        if !self.stage_validated_pr_url(execution, &payload.pr_url, "structured-output artifact") {
+            return false;
+        }
+        PR_URL_CAPTURE_ARTIFACT_HIT.inc(&self.metrics);
+        true
+    }
+
+    /// Stage a PR URL recovered from the worker's prose by the **driver's**
+    /// fallback producer — for Claude, the "print the PR URL on its own line
+    /// as the final thing in your final response" convention. Returns `true`
+    /// when a URL was newly staged.
+    ///
+    /// Consulted only after the artifact and the hook stream have both come up
+    /// empty, and only for a parked worker, because it costs a transcript read
+    /// and the alternative it competes with is the far more expensive cold-path
+    /// `detect_pr` reconstruction.
+    async fn stage_pr_url_from_driver_prose(&self, execution: &crate::work::WorkExecution) -> bool {
+        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+            return false;
+        };
+        let candidates = crate::driver::ClaudeDriver
+            .structured_output_fallback(crate::structured_output::StructuredOutputKind::PrUrl, &text);
+        let staged = candidates
+            .iter()
+            .filter_map(|c| serde_json::from_str::<crate::structured_output::PrUrlPayload>(&c.payload).ok())
+            .any(|payload| self.stage_validated_pr_url(execution, &payload.pr_url, "driver final-message producer"));
+        if staged {
+            PR_URL_CAPTURE_DRIVER_FALLBACK_HIT.inc(&self.metrics);
+        }
+        staged
+    }
+
+    /// Gate a **self-reported** `pr_url` (artifact or final message) and stage
+    /// it. Returns `true` only when this call is what put a URL in the cache.
+    ///
+    /// Two gates, then the shared staging cache:
+    ///
+    /// 1. **Never for a revision.** A `revision_implementation` worker pushes
+    ///    to the chain root's existing PR, so it can name that URL truthfully
+    ///    while having pushed nothing — and a staged URL finalises the
+    ///    revision. Push evidence for a revision comes from the SHA-delta gate
+    ///    comparing GitHub's head SHA, which is exactly the "revision tasks
+    ///    that do nothing" stall these channels must not reopen. The
+    ///    `PostToolUse` capture is different in kind: it sees a real
+    ///    `cube pr update` invocation, not a claim about one.
+    /// 2. **Product-repo gate**, mirroring the `PostToolUse` capture path: a
+    ///    worker running tests can emit fixture URLs, and without this check
+    ///    those would bind to the work item as if they were real PRs.
+    fn stage_validated_pr_url(&self, execution: &crate::work::WorkExecution, pr_url: &str, source: &str) -> bool {
+        if execution.kind == ExecutionKind::RevisionImplementation {
+            tracing::debug!(
+                execution_id = %execution.id,
+                pr_url = %pr_url,
+                source,
+                "pr_url_capture: ignoring self-reported URL for a revision — push evidence comes from the SHA-delta gate",
+            );
+            return false;
+        }
+        if let Err(reason) = crate::pr_url_capture::validate_pr_url(pr_url, &execution.repo_remote_url) {
+            tracing::info!(
+                execution_id = %execution.id,
+                rejected_url = %pr_url,
+                %reason,
+                source,
+                "pr_url_capture: dropping URL — failed product-repo gate",
+            );
+            return false;
+        }
+        match self.staged_pr_urls.record_if_unset(&execution.id, pr_url) {
+            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
+                tracing::info!(
+                    execution_id = %execution.id,
+                    pr_url = %pr_url,
+                    source,
+                    "pr_url_capture: staged PR URL",
+                );
+                true
+            }
+            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    pr_url = %pr_url,
+                    source,
+                    "pr_url_capture: ignoring URL (one is already staged for this execution)",
+                );
+                false
+            }
+        }
+    }
+
     pub(super) async fn on_stop_inner(&self, execution_id: &str) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
@@ -300,7 +418,14 @@ impl WorkerCompletionHandler {
             }
         }
 
-        // Primary path: a PR URL was already captured from a
+        // Primary channel: the structured-output PR-URL artifact the worker
+        // wrote (file contract — no transcript or hook-stream knowledge
+        // needed, so every driver can satisfy it). It fills the same staging
+        // cache the hook path does, and loses to an already-staged URL, so
+        // this only takes effect where the hook stream produced nothing.
+        self.stage_pr_url_from_artifact(&execution);
+
+        // Next: a PR URL already captured from a
         // `PostToolUse` Bash hook event (`gh pr create` /
         // `gh pr view` / `gh pr edit` stdout) while the worker was
         // still running. Layer-2 defence-in-depth: verify the staged
@@ -430,6 +555,32 @@ impl WorkerCompletionHandler {
                 "stop event: no staged URL and execution is not waiting_human — skipping fallback (running-status gate)",
             );
             return StopOutcome::RunningNoStagedPr;
+        }
+
+        // Neither the artifact nor the hook stream carried a URL, and the
+        // worker is parked. Ask the driver whether its final message did — for
+        // Claude, the "print the PR URL on its own line" convention. This runs
+        // ahead of the cold-path `detect_pr` reconstruction (jj revset + a
+        // GitHub API walk) because it is strictly cheaper and reads evidence
+        // the worker itself produced.
+        if self.stage_pr_url_from_driver_prose(&execution).await
+            && let Some(recovered_url) = self
+                .verified_staged_pr_url(execution_id, &execution, "stop event (driver fallback)")
+                .await
+        {
+            tracing::info!(
+                execution_id,
+                pr_url = %recovered_url,
+                "stop event: using PR URL recovered by the driver's final-message producer; skipping detector",
+            );
+            return self
+                .finalize_pr_transition(
+                    execution_id,
+                    recovered_url,
+                    WorkerPrCompletionTarget::InReview,
+                    "stop_driver_fallback",
+                )
+                .await;
         }
 
         // Resume-bounce SHA-delta gate: when the chore already has a

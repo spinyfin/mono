@@ -37,7 +37,14 @@ impl WorkerCompletionHandler {
         if execution.kind == ExecutionKind::PrReview {
             return StopOutcome::AlreadyTerminal;
         }
-        // Primary path mirror: if the PostToolUse dispatcher already
+        // Primary channel mirror: the structured-output PR-URL artifact. It
+        // matters even more here than on Stop — the staging cache is
+        // in-memory, so an engine restart between the worker's push and its
+        // Stop loses a hook-captured URL entirely, while the artifact is on
+        // disk and still readable on the next sweep.
+        self.stage_pr_url_from_artifact(&execution);
+
+        // Then: if the PostToolUse dispatcher already
         // captured this execution's PR URL from the worker's hook
         // stream, finalize via that URL and skip the detector. Layer-2
         // defence-in-depth: verify the staged PR's headRefName matches

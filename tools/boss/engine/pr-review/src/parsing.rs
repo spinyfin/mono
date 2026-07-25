@@ -2,7 +2,7 @@
 //! [`classify_changed_files`], [`extract_review_result`],
 //! [`extract_review_result_verbose`], and [`passes_severity_gate`].
 
-use boss_engine_utils::json_extract::extract_balanced_object;
+use boss_engine_structured_output::fallback::{FallbackCandidate, json_object_candidates};
 
 use crate::types::*;
 
@@ -53,106 +53,69 @@ fn is_docs_file(path: &str) -> bool {
 /// Extract and parse the first `ReviewResult` from a reviewer's final
 /// assistant message.
 ///
-/// Tries three strategies in order, returning the first successful parse:
-///
-/// 1. Fenced ` ```json ` block — the canonical happy-path shape.
-/// 2. Plain ` ``` ` block (no language tag).
-/// 3. Bare/unfenced JSON — scans for the last balanced `{…}` object in the
-///    text and validates it against the `ReviewResult` schema. This handles the
-///    observed failure mode where the model emits valid JSON inline after prose
-///    without a code fence (e.g. "Key findings below.\n\n{ … }").
+/// Convenience wrapper over [`review_result_from_candidates`] fed by the
+/// shared JSON-block scanner. The engine itself goes through the *driver's*
+/// structured-output fallback producer (which uses the same scanner) so the
+/// transcript conventions stay with the driver; this entry point remains for
+/// callers holding raw reviewer text.
 ///
 /// Returns `None` when no parseable `ReviewResult` is found (reviewer may
 /// have crashed or emitted malformed output — the caller should fall back to
 /// advancing without revision).
 ///
-/// To also receive the serde error from the last failed parse attempt (useful
-/// for surfacing in a re-prompt), use [`extract_review_result_verbose`].
+/// To also receive the serde error from a failed parse attempt (useful for
+/// surfacing in a re-prompt), use [`extract_review_result_verbose`].
 pub fn extract_review_result(text: &str) -> Option<ReviewResult> {
     extract_review_result_verbose(text).0
 }
 
-/// Like [`extract_review_result`] but also returns the last serde parse error
-/// when all strategies fail.
+/// Like [`extract_review_result`] but also returns the serde parse error from
+/// the most-preferred candidate that looked like a `ReviewResult` and failed.
 ///
 /// The error string names the specific field path and type mismatch so the
 /// caller can include it verbatim in a reviewer re-prompt, giving the reviewer
 /// signal about exactly what is wrong rather than a generic "write valid JSON"
 /// message. Returns `(None, None)` when the text contains no JSON-like content
-/// at all (the error is only `Some` when a JSON block was present but failed to
-/// deserialize as a `ReviewResult`).
+/// at all.
 pub fn extract_review_result_verbose(text: &str) -> (Option<ReviewResult>, Option<String>) {
-    let mut last_error: Option<String> = None;
+    review_result_from_candidates(&json_object_candidates(text))
+}
 
-    // Strategy 1: ```json fenced blocks
-    let mut rest = text;
-    while let Some(fence_start) = rest.find("```json") {
-        let after_fence = &rest[fence_start + 7..];
-        let trimmed = after_fence.trim_start_matches('\n');
-        if let Some(end) = trimmed.find("```") {
-            let json_str = trimmed[..end].trim();
-            match ReviewResult::from_json(json_str) {
-                Ok(result) => return (Some(result), None),
-                Err(e) => last_error = Some(e.to_string()),
-            }
-        }
-        rest = &rest[fence_start + 7..];
-    }
-
-    // Strategy 2: plain ``` fenced blocks (no language tag)
-    let mut rest = text;
-    while let Some(fence_start) = rest.find("```") {
-        let after_fence = &rest[fence_start + 3..];
-        // Skip if this is actually a ```json or ```jsonc block (already handled)
-        let peek = after_fence.trim_start_matches('\n');
-        if peek.starts_with("json") {
-            rest = &rest[fence_start + 3..];
-            continue;
-        }
-        let trimmed = after_fence.trim_start_matches('\n');
-        if let Some(end) = trimmed.find("```") {
-            let json_str = trimmed[..end].trim();
-            match ReviewResult::from_json(json_str) {
-                Ok(result) => return (Some(result), None),
-                Err(e) => last_error = Some(e.to_string()),
-            }
-        }
-        rest = &rest[fence_start + 3..];
-    }
-
-    // Strategy 3: bare/unfenced JSON — find the last balanced { … } object
-    // that validates as a ReviewResult. Scanning from the end handles the
-    // common "prose then trailing JSON" shape.
-    let bytes = text.as_bytes();
-    let mut last_result: Option<ReviewResult> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'{'
-            && let Some(json_str) = extract_balanced_object(&text[i..])
-        {
-            match ReviewResult::from_json(json_str) {
-                Ok(result) => {
-                    last_result = Some(result);
+/// Validate structured-output fallback candidates against the `ReviewResult`
+/// schema, keeping the first that parses.
+///
+/// `candidates` come from a driver's
+/// `AgentDriver::structured_output_fallback` for
+/// `StructuredOutputKind::ReviewResult` — the *fallback* channel, used when
+/// the reviewer's file artifact is absent. They are ordered most-preferred
+/// first (fenced blocks the reviewer plainly meant as output, then bare
+/// objects found in prose, latest first).
+///
+/// The returned error prefers the first failing candidate that carries the
+/// `revision_warranted` field — the strongest signal that it *was* the
+/// reviewer's `ReviewResult` rather than an unrelated JSON object quoted in
+/// prose — and only falls back to the first failing explicitly-fenced
+/// candidate when no `revision_warranted`-bearing candidate failed. This
+/// keeps a plain non-JSON fenced block (which `json_object_candidates` also
+/// marks explicit) from shadowing the real `ReviewResult` parse error that
+/// should reach the reviewer re-prompt.
+pub fn review_result_from_candidates(candidates: &[FallbackCandidate]) -> (Option<ReviewResult>, Option<String>) {
+    let mut named_error: Option<String> = None;
+    let mut explicit_error: Option<String> = None;
+    for candidate in candidates {
+        match ReviewResult::from_json(&candidate.payload) {
+            Ok(result) => return (Some(result), None),
+            Err(err) => {
+                if named_error.is_none() && candidate.payload.contains("revision_warranted") {
+                    named_error = Some(err.to_string());
                 }
-                Err(e) => {
-                    // Only surface errors from blocks that look like ReviewResults
-                    // (contain "revision_warranted") to avoid noise from unrelated
-                    // JSON objects in the reviewer's prose.
-                    if json_str.contains("revision_warranted") {
-                        last_error = Some(e.to_string());
-                    }
+                if explicit_error.is_none() && candidate.explicit {
+                    explicit_error = Some(err.to_string());
                 }
             }
-            // Advance past this object to find any later one
-            i += json_str.len();
-            continue;
         }
-        i += 1;
     }
-    if last_result.is_some() {
-        return (last_result, None);
-    }
-    (None, last_error)
+    (None, named_error.or(explicit_error))
 }
 
 /// Engine severity gate.
@@ -550,6 +513,32 @@ mod tests {
         assert!(result.is_none(), "malformed JSON must not produce a result");
         let err_text = err.expect("error text must be returned for a malformed fenced block");
         assert!(!err_text.is_empty(), "error text must not be empty; got: {err_text}",);
+    }
+
+    /// Regression: a plain (non-JSON) fenced block earlier in the message
+    /// must not shadow the real `ReviewResult` parse error from a later
+    /// malformed bare `ReviewResult` — the reviewer re-prompt needs the
+    /// specific field error, not a generic "expected value" from the junk
+    /// fenced prose.
+    #[test]
+    fn extract_review_result_verbose_prefers_named_error_over_unrelated_fenced_block() {
+        let text = concat!(
+            "```\n",
+            "not json\n",
+            "```\n\n",
+            "{\"pr_url\":\"https://github.com/org/repo/pull/1\",",
+            "\"head_sha\":\"abc\",\"summary\":\"s\",\"revision_warranted\":true,",
+            "\"findings\":\"not-an-array\",",
+            "\"regression_check\":{\"performed\":true,\"suspected_deletions\":[]}}\n",
+        );
+        let (result, err) = extract_review_result_verbose(text);
+        assert!(result.is_none(), "malformed JSON must not produce a result");
+        let err_text = err.expect("error text must be returned");
+        assert!(
+            err_text.contains("not-an-array"),
+            "error must name the malformed ReviewResult field's bad value, not a generic \
+             \"expected value\" error from the junk fenced block; got: {err_text}",
+        );
     }
 
     fn make_finding(severity: ReviewFindingSeverity, category: ReviewFindingCategory) -> ReviewFinding {

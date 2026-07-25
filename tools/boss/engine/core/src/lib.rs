@@ -124,7 +124,7 @@ pub use boss_ssh_transport as ssh_transport;
 pub mod stacked_pr_structuring;
 pub mod stale_worker_sweep;
 pub mod stranded_answering_sweep;
-pub mod structured_output;
+pub use boss_engine_structured_output as structured_output;
 pub mod supersession_scan;
 pub(crate) mod sweep_loop;
 pub mod syspolicyd_monitor;

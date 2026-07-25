@@ -444,10 +444,11 @@ impl WorkerCompletionHandler {
                 }
             }
         }
-        // Reap the engine-owned followups artifact regardless of outcome (it
-        // lives in the system temp dir, but delete eagerly rather than waiting
-        // on OS reaping).
-        crate::structured_output::clear(&self.structured_output_dir, execution_id);
+        // Reap every engine-owned structured-output artifact this execution
+        // produced (followups, PR URL) regardless of outcome — they live in
+        // the system temp dir, but delete eagerly rather than waiting on OS
+        // reaping.
+        crate::structured_output::clear_all(&self.structured_output_dir, execution_id);
 
         if merged {
             tracing::info!(

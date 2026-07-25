@@ -17,6 +17,7 @@ use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::{ExecutionKind, ExecutionStatus, WorkItemBinding};
 
+use super::prompt::structured_output_env_vars;
 use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
@@ -327,16 +328,17 @@ impl ExecutionRunner for PaneSpawnRunner {
                 )
             })?;
 
-        // Structured-output artifact (review findings / task followups): create
-        // the engine-owned scratch dir and clear any stale file from a prior
-        // run of this exact execution id, then hand the worker its absolute
-        // path via `BOSS_STRUCTURED_OUTPUT`. The same path is embedded in the
-        // worker prompt (see `compose_worker_spawn`); the completion handler
-        // reads + validates it. Best-effort: a prepare failure is non-fatal
-        // (the worker falls back to the transcript-scrape contract).
+        // Structured-output artifacts (PR URL / review findings / triage
+        // decision / followups): create the engine-owned scratch dir and clear
+        // every stale file from a prior run of this exact execution id, then
+        // hand the worker the absolute paths it may write. The same paths are
+        // embedded in the worker prompt (see `compose_worker_spawn`); the
+        // completion handler reads + validates them. Best-effort: a prepare
+        // failure is non-fatal — the engine still falls back to the driver's
+        // transcript-sentinel producer.
         let structured_output_dir = crate::structured_output::default_dir();
-        let structured_output_path = match crate::structured_output::prepare(&structured_output_dir, &execution.id) {
-            Ok(path) => Some(path.display().to_string()),
+        let structured_output_env = match crate::structured_output::prepare_all(&structured_output_dir, &execution.id) {
+            Ok(()) => structured_output_env_vars(&structured_output_dir, execution, work_item),
             Err(err) => {
                 tracing::warn!(
                     execution_id = %execution.id,
@@ -345,7 +347,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                     "spawn: could not prepare structured-output dir; worker will rely on \
                      the transcript-scrape fallback",
                 );
-                None
+                Vec::new()
             }
         };
 
@@ -433,9 +435,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
                 initial_input,
-                extra_env: structured_output_path
-                    .map(|p| vec![(crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(), p)])
-                    .unwrap_or_default(),
+                extra_env: structured_output_env,
                 title_summary,
                 task_title: Some(work_item_name(work_item).to_owned()),
                 work_item_binding,
