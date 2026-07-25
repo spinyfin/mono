@@ -44,6 +44,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::driver::{AgentDriver, ClaudeDriver};
 use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::metrics::Registry;
@@ -948,7 +949,18 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
             match t.poll().await {
                 Ok(new_lines) => {
                     new_lines_count = new_lines.len();
-                    transcript_buffer.extend(new_lines);
+                    // Normalise through the run's driver before anything
+                    // downstream (redaction, summarisation) sees the entry.
+                    // The engine is Claude-default today; once the dispatch
+                    // gate selects a driver per run, this picks the run's
+                    // driver instead of hardcoding `ClaudeDriver`. For Claude
+                    // this is a no-op passthrough — see
+                    // `ClaudeDriver::normalize_transcript_entry`.
+                    transcript_buffer.extend(
+                        new_lines
+                            .into_iter()
+                            .map(|raw| ClaudeDriver.normalize_transcript_entry(&raw)),
+                    );
                 }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");

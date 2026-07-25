@@ -622,6 +622,16 @@ impl AgentDriver for ClaudeDriver {
         CLAUDE_AGENT_RULES_PREAMBLE
     }
 
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
+        // Claude stamps the absolute path to the session's JSONL transcript
+        // on every hook payload it emits —
+        // `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Empty
+        // strings are treated as missing so callers never end up trying to
+        // open a path `tokio::fs::File::open` would reject anyway.
+        let s = raw.get("transcript_path")?.as_str()?;
+        if s.is_empty() { None } else { Some(s.to_owned()) }
+    }
+
     fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
         // Claude's transcript JSONL is already in the canonical redactable
         // field shape (tool_name / tool_input / tool_response at the top level,
@@ -1041,6 +1051,28 @@ mod tests {
     }
 
     // ── TranscriptAccess ─────────────────────────────────────────────────────
+
+    #[test]
+    fn transcript_path_for_session_reads_field_from_payload() {
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "hook_event_name": "Stop",
+            "transcript_path": "/home/u/.claude/projects/foo/sess-1.jsonl",
+        });
+        assert_eq!(
+            ClaudeDriver.transcript_path_for_session(&raw).as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+        );
+    }
+
+    #[test]
+    fn transcript_path_for_session_is_none_when_missing_or_empty() {
+        let missing = serde_json::json!({"session_id": "sess-1"});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&missing), None);
+
+        let empty = serde_json::json!({"transcript_path": ""});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&empty), None);
+    }
 
     #[test]
     fn normalize_transcript_entry_is_identity_for_claude_format() {

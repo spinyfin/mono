@@ -42,13 +42,14 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// payload, which the event-shim embeds whenever `BOSS_RUN_ID` is set
 /// in its environment. The worker-spawn flow always sets this.
 ///
-/// `transcript_path` is the verbatim `transcript_path` field claude
-/// stamps on every hook payload — `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
-/// We surface it here so the engine can persist it on `WorkRun` the
-/// first time we see it; the live-status summarizer loop reads that
-/// row to know which file to tail. Without this, `transcript_path`
-/// stays NULL forever and the summarizer never gets past its
-/// "no transcript path yet" early-out.
+/// `transcript_path` comes from the run's driver via
+/// [`crate::driver::AgentDriver::transcript_path_for_session`] (the Claude
+/// driver reads its `transcript_path` field, stamped on every hook payload
+/// as `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`). We surface it
+/// here so the engine can persist it on `WorkRun` the first time we see it;
+/// the live-status summarizer loop reads that row to know which file to
+/// tail. Without this, `transcript_path` stays NULL forever and the
+/// summarizer never gets past its "no transcript path yet" early-out.
 #[derive(Debug, Clone)]
 pub struct IncomingHookEvent {
     pub peer_pid: Option<libc::pid_t>,
@@ -239,13 +240,13 @@ pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, 
     } else {
         payload_run_id
     };
-    let transcript_path = extract_transcript_path_from_payload(&raw);
-    // Decode through the Claude driver's ProgressObservation capability: the
-    // raw hook payload becomes a typed `WorkerEvent`. The engine is
-    // Claude-default today; once the dispatch gate selects a driver per run
-    // (design Depth 3), this picks the run's driver instead of hardcoding
-    // `ClaudeDriver`. The decoded event drives the (driver-agnostic) activity
-    // machine downstream, unchanged.
+    // Decode through the Claude driver's ProgressObservation and
+    // TranscriptAccess capabilities. The engine is Claude-default today;
+    // once the dispatch gate selects a driver per run (design Depth 3),
+    // this picks the run's driver instead of hardcoding `ClaudeDriver`. The
+    // decoded event drives the (driver-agnostic) activity machine
+    // downstream, unchanged.
+    let transcript_path = ClaudeDriver.transcript_path_for_session(&raw);
     let event = ClaudeDriver.normalize_progress_event(&raw)?;
     Ok(IncomingHookEvent {
         peer_pid: peer_pid_value,
@@ -308,17 +309,6 @@ pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHook
 /// `BOSS_RUN_ID=` doesn't poison correlation with an empty id.
 fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
     let s = raw.get("_boss_run_id")?.as_str()?;
-    if s.is_empty() { None } else { Some(s.to_owned()) }
-}
-
-/// Pull `transcript_path` out of the raw hook payload. Claude stamps
-/// the absolute path to the session's JSONL transcript on every hook
-/// payload it emits; the boss-event shim forwards the payload
-/// unchanged, so we read the field straight off the wire. Empty
-/// strings are treated as missing so we never persist a path that
-/// `tokio::fs::File::open` would reject anyway.
-fn extract_transcript_path_from_payload(raw: &serde_json::Value) -> Option<String> {
-    let s = raw.get("transcript_path")?.as_str()?;
     if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
