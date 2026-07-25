@@ -1121,14 +1121,14 @@ pub async fn serve_with_merge_probe(
     // showing "Thinking…" in the sidebar, and excluded from both the
     // `[Revise]` banner's count and its candidate query. This sweep is
     // comment-driven and DB-backed, so it clears strandings left by a
-    // previous engine process on boot.
-    let answer_agent_died = server_state
-        .event_bus
-        .subscribe(TopicFilter::kind(EventKind::AnswerAgentDied));
+    // previous engine process on boot. It also subscribes to
+    // `AnswerAgentDied` so a comment clears the instant the answer-agent
+    // session ends; the 60s pass remains the backstop for hard pane kills
+    // and dropped events.
     let _stranded_answering_sweep_handle = crate::stranded_answering_sweep::spawn_loop(
         server_state.work_db.clone(),
         crate::stranded_answering_sweep::DEFAULT_INTERVAL,
-        answer_agent_died,
+        server_state.event_bus.clone(),
     );
 
     // Periodic remote-lease reconciler: the cross-host analogue of the

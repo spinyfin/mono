@@ -76,9 +76,9 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use boss_event_bus::{Event, Subscription};
+use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{
     ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_ANSWERING, ExecutionKind,
     WorkComment,
@@ -119,54 +119,73 @@ impl SweepOutcome for StrandedAnsweringSweepOutcome {
     }
 }
 
-/// Spawn a tokio task that runs [`run_one_pass`] every `interval` (firing
-/// immediately on spawn so strandings left by the crash that preceded a
-/// restart clear at boot) and additionally reconciles a comment immediately
-/// whenever `answer_agent_died` delivers an [`Event::AnswerAgentDied`] for
+/// Spawn a [`boss_event_bus::spawn_supervised`] subscriber task that runs
+/// [`run_one_pass`] every `interval` (firing immediately on spawn — and on
+/// every post-panic restart — so strandings left by the crash that preceded
+/// a restart clear at boot) and additionally reconciles a comment
+/// immediately whenever the bus delivers an [`Event::AnswerAgentDied`] for
 /// its bound execution — see [`reconcile_on_event`]. The periodic pass
 /// remains the backstop: a dropped/coalesced event, a hard pane kill (no
 /// `SessionEnd` hook fires at all), or a subscription closed by the bus
 /// being torn down all still clear within one `interval`.
-pub fn spawn_loop(
-    work_db: Arc<WorkDb>,
-    interval: Duration,
-    mut answer_agent_died: Subscription,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        // Two-pass confirmation memory for the periodic pass, local to this
-        // task — nothing else touches it.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut sub_closed = false;
-        loop {
-            let outcome = run_one_pass(work_db.as_ref(), &mut seen).await;
-            if outcome.has_activity() {
-                outcome.log();
-            }
+///
+/// Supervised (unlike the merge poller, which predates
+/// [`boss_event_bus::spawn_supervised`] and has its own restart story) so a
+/// panic anywhere in a pass or in event handling doesn't silently kill the
+/// only thing that clears a stranded `answering` comment: the supervisor
+/// restarts the attempt, which redoes its full reconcile pass and thereby
+/// re-subscribes, catching whatever the dead attempt missed. Takes
+/// `Arc<EventBus>` rather than a pre-built [`boss_event_bus::Subscription`]
+/// because a `Subscription` cannot be cloned into the restartable closure
+/// `spawn_supervised` requires — each attempt re-subscribes for itself.
+pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration, event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()> {
+    boss_event_bus::spawn_supervised("stranded_answering_sweep", move || {
+        let work_db = Arc::clone(&work_db);
+        let mut answer_agent_died = event_bus.subscribe(TopicFilter::kind(EventKind::AnswerAgentDied));
+        async move {
+            // Two-pass confirmation memory for the periodic pass, local to
+            // this attempt — a restart after a panic starts it fresh, which
+            // is fine: the reconcile pass that follows re-derives strandings
+            // from the DB rather than relying on this memory surviving.
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut sub_closed = false;
+            loop {
+                let outcome = run_one_pass(work_db.as_ref(), &mut seen).await;
+                if outcome.has_activity() {
+                    outcome.log();
+                }
+                let last_run_at = Instant::now();
 
-            'wait: loop {
-                tokio::select! {
-                    _ = tokio::time::sleep(interval) => break 'wait,
-                    event = answer_agent_died.recv(), if !sub_closed => {
-                        match event {
-                            Some(Event::AnswerAgentDied { execution_id }) => {
-                                reconcile_on_event(work_db.as_ref(), &execution_id).await;
-                            }
-                            Some(_) => {
-                                tracing::warn!(
-                                    "stranded-answering sweep: subscription received an unexpected event \
-                                     kind (the subscribing filter should have excluded it)",
-                                );
-                            }
-                            None => {
-                                sub_closed = true;
-                                tracing::warn!(
-                                    "stranded-answering sweep: AnswerAgentDied subscription closed (event \
-                                     bus dropped) — the periodic sweep remains the backstop",
-                                );
+                'wait: loop {
+                    // Recomputed every iteration so handling an event (which
+                    // never breaks 'wait — it is not a full pass) doesn't
+                    // restart the sleep from a full `interval`: without this,
+                    // a steady stream of `AnswerAgentDied` deliveries (one
+                    // per worker `SessionEnd`, not just answer-agent ones)
+                    // could push the periodic backstop out indefinitely.
+                    let remaining = interval.saturating_sub(last_run_at.elapsed());
+                    tokio::select! {
+                        _ = tokio::time::sleep(remaining) => break 'wait,
+                        event = answer_agent_died.recv(), if !sub_closed => {
+                            match event {
+                                Some(Event::AnswerAgentDied { execution_id }) => {
+                                    reconcile_on_event(work_db.as_ref(), &execution_id).await;
+                                }
+                                Some(_) => {
+                                    tracing::warn!(
+                                        "stranded-answering sweep: subscription received an unexpected event \
+                                         kind (the subscribing filter should have excluded it)",
+                                    );
+                                }
+                                None => {
+                                    sub_closed = true;
+                                    tracing::warn!(
+                                        "stranded-answering sweep: AnswerAgentDied subscription closed (event \
+                                         bus dropped) — the periodic sweep remains the backstop",
+                                    );
+                                }
                             }
                         }
-                        // Event handling never breaks 'wait — it is not a
-                        // full pass and must not reset the interval clock.
                     }
                 }
             }
@@ -645,6 +664,56 @@ mod tests {
         reconcile_on_event(&db, "exec_does_not_exist").await;
 
         assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "answering");
+    }
+
+    /// A steady stream of `AnswerAgentDied` deliveries — faster than the
+    /// periodic interval — must not starve the periodic backstop. Before the
+    /// fix, handling an event fell back through to a fresh
+    /// `tokio::time::sleep(interval)` every time, so an event arriving
+    /// faster than `interval` pushed the next periodic pass out
+    /// indefinitely; a comment with no execution bound to it (so no event
+    /// ever names it) would then never get recovered.
+    #[tokio::test]
+    async fn a_steady_stream_of_events_does_not_starve_the_periodic_backstop() {
+        let inner_db = mem_db();
+        // Stranded with no execution ever created for it — only the
+        // periodic pass, never an event, can recover this one.
+        let comment_id = seed_answering(&inner_db, INTENT_QUESTION);
+        let db = Arc::new(inner_db);
+
+        let bus = Arc::new(EventBus::new());
+        let interval = Duration::from_millis(30);
+        let handle = spawn_loop(Arc::clone(&db), interval, Arc::clone(&bus));
+
+        // Publish an unrelated AnswerAgentDied far faster than `interval`,
+        // for well past the two periodic passes two-pass confirmation needs.
+        let publisher_bus = Arc::clone(&bus);
+        let publisher = tokio::spawn(async move {
+            for _ in 0..60 {
+                publisher_bus.publish(Event::AnswerAgentDied {
+                    execution_id: "exec_unrelated".to_owned(),
+                });
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let recovered = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if db.get_comment(&comment_id).unwrap().unwrap().status == "answered" {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        publisher.abort();
+        handle.abort();
+        assert!(
+            recovered.is_ok(),
+            "the periodic backstop must still recover an event-less stranded comment despite a steady \
+             stream of unrelated AnswerAgentDied events",
+        );
     }
 
     /// A stale event about a prior run must never recover a comment a

@@ -291,27 +291,52 @@ impl WorkDb {
     /// `running`) and `stranded_answering_sweep::recover` (Stop never fired at
     /// all) — the two paths differ only in `error_kind` and whether `run_id`
     /// is still around to mark `failed`.
+    ///
+    /// `finalize_answer_agent` and the stranded-answering sweep's event path
+    /// run on independently spawned connection tasks (Stop and SessionEnd),
+    /// so both can read the same `running` run and race into this function
+    /// for the same comment. `complete_answer_agent_run`'s `WHERE status =
+    /// 'running'` guard means only one of them actually transitions the run
+    /// — the other's call returns an error because the row is already
+    /// terminal. The apology thread entry is posted only by whichever call
+    /// won that transition (or when there was no run row to race over at
+    /// all, i.e. `run_id` is `None`), so a losing racer never double-posts
+    /// an apology the winner already recorded.
     pub(crate) fn recover_unanswered_comment(
         &self,
         comment_id: &str,
         run_id: Option<&str>,
         error_kind: &str,
     ) -> Result<WorkComment> {
-        if let Some(run_id) = run_id
-            && let Err(err) =
-                self.complete_answer_agent_run(run_id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind))
-        {
-            tracing::warn!(comment_id, run_id, ?err, "failed to mark the stranded run 'failed'");
-        }
+        let won_transition = match run_id {
+            Some(run_id) => {
+                match self.complete_answer_agent_run(run_id, ANSWER_AGENT_RUN_STATUS_FAILED, None, Some(error_kind)) {
+                    Ok(_) => true,
+                    Err(err) => {
+                        tracing::warn!(
+                            comment_id,
+                            run_id,
+                            ?err,
+                            "failed to mark the stranded run 'failed' — a concurrent recovery already \
+                         completed it; skipping the apology entry to avoid a duplicate",
+                        );
+                        false
+                    }
+                }
+            }
+            None => true,
+        };
 
-        if let Err(err) = self.create_comment_thread_entry(
-            comment_id,
-            THREAD_ENTRY_KIND_ANSWER,
-            THREAD_ENTRY_AUTHOR_ENGINE,
-            ANSWER_AGENT_NO_REPLY_BODY,
-            None,
-            run_id,
-        ) {
+        if won_transition
+            && let Err(err) = self.create_comment_thread_entry(
+                comment_id,
+                THREAD_ENTRY_KIND_ANSWER,
+                THREAD_ENTRY_AUTHOR_ENGINE,
+                ANSWER_AGENT_NO_REPLY_BODY,
+                None,
+                run_id,
+            )
+        {
             tracing::warn!(comment_id, ?err, "failed to post the no-reply-posted thread entry");
         }
 
@@ -513,5 +538,40 @@ mod tests {
         // A different comment's history is isolated.
         let other = make_comment(&db, "t2");
         assert!(db.list_answer_agent_runs_for_comment(&other).unwrap().is_empty());
+    }
+
+    /// Two concurrent recoveries of the same stranded comment — e.g.
+    /// `finalize_answer_agent`'s Stop-triggered recovery racing
+    /// `stranded_answering_sweep::reconcile_on_event`'s SessionEnd-triggered
+    /// recovery — both read the same `running` run id before either commits.
+    /// Only the winner's `complete_answer_agent_run` call actually
+    /// transitions the row; the loser must not also post the apology thread
+    /// entry, or the thread ends up with two.
+    #[test]
+    fn recover_unanswered_comment_posts_the_apology_only_once_under_a_race() {
+        let db = mem_db();
+        let comment = make_comment(&db, "t1");
+        db.transition_comment_to_answering(&comment).unwrap();
+        let run = db
+            .create_answer_agent_run(&comment, "work_item", "t1", "v0", 0)
+            .unwrap();
+
+        // Both racers observed the same `running` run id before either
+        // committed its completion.
+        let winner = db.recover_unanswered_comment(&comment, Some(&run.id), "stranded_no_stop");
+        assert!(winner.is_ok());
+
+        // The loser's transition attempt on the run fails (already
+        // terminal) and its comment transition attempt also fails (the
+        // winner already moved it out of `answering`) — both are expected,
+        // benign no-ops, not a second apology.
+        let _ = db.recover_unanswered_comment(&comment, Some(&run.id), "no_reply_posted");
+
+        let entries = db.list_comment_thread_entries(&comment).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a losing racer must not post a duplicate apology entry"
+        );
     }
 }
