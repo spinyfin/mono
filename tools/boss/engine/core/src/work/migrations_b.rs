@@ -2311,3 +2311,66 @@ pub(crate) fn migrate_automation_runs_first_attempted_at_column(conn: &Connectio
     }
     Ok(())
 }
+
+/// Create `github_api_calls`: one append-only row per GitHub API call the
+/// engine makes, with the caller subsystem, the API bucket, and the
+/// `rateLimit` reading the response carried.
+///
+/// This is the persistence half of the `gh` / GitHub API instrumentation.
+/// The in-memory counters (`github_api.*`, via the metrics framework)
+/// answer "how much, cumulatively"; these rows answer "how much, by whom,
+/// in which hour" — the question that could previously only be inferred
+/// from the handful of threshold-crossing log lines that fire when the
+/// remaining budget crosses the low-water mark.
+///
+/// ## Timestamps are INTEGER epoch milliseconds
+///
+/// Deliberately NOT the `TEXT` convention most tables here use, and
+/// deliberately not epoch seconds stored as a string — which is what
+/// `editorial_actions.created_at` does, where a natural-looking
+/// `created_at >= '2026-07-24'` filter silently returns zero rows instead
+/// of erroring. `started_at_ms` and `reset_at_ms` are INTEGER epoch
+/// milliseconds, so range filters and `strftime('%s', …)` conversions are
+/// unambiguous and a wrong-typed comparison fails loudly rather than
+/// quietly.
+///
+/// `points_cost` / `points_remaining` / `points_limit` are `NULL` when the
+/// response carried no reading (a REST call to an endpoint that omits the
+/// headers, a failed call, or a GraphQL query that didn't request the
+/// block) — distinguishable from a genuine zero, which matters when the
+/// zero means "budget exhausted".
+///
+/// Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`.
+pub(crate) fn migrate_github_api_calls_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS github_api_calls (
+             id               INTEGER PRIMARY KEY,
+             -- Epoch MILLISECONDS (integer), not a string. See the doc
+             -- comment on migrate_github_api_calls_table.
+             started_at_ms    INTEGER NOT NULL,
+             -- Subsystem that made the call ('merge_poller.sweep',
+             -- 'ci_watch', …), or 'unattributed' when no scope was active.
+             caller           TEXT NOT NULL,
+             -- 'graphql' | 'rest' | 'cli'. GraphQL and REST are metered
+             -- against separate hourly buckets and must not be summed.
+             api              TEXT NOT NULL,
+             verb             TEXT NOT NULL,
+             endpoint         TEXT NOT NULL,
+             -- 'ok' | 'error' | 'rate_limited'.
+             outcome          TEXT NOT NULL,
+             duration_ms      INTEGER NOT NULL,
+             -- GraphQL points this call cost (REST: 1 request). NULL when
+             -- the response carried no reading.
+             points_cost      INTEGER,
+             points_remaining INTEGER,
+             points_limit     INTEGER,
+             -- Epoch MILLISECONDS (integer) of the quota-window reset.
+             reset_at_ms      INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS github_api_calls_started_idx
+             ON github_api_calls(started_at_ms);
+         CREATE INDEX IF NOT EXISTS github_api_calls_caller_idx
+             ON github_api_calls(caller, started_at_ms);",
+    )?;
+    Ok(())
+}

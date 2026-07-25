@@ -392,19 +392,28 @@ pub fn spawn_loop(
             // the release job, ad-hoc `gh`) — not just the poller's own last
             // batch — and so the first sweep on boot isn't blind at the
             // `i64::MAX` sentinel. Free (0 GraphQL points) and best-effort.
-            refresh_rate_limit_budget().await;
+            gh_scope(callers::MERGE_POLLER_BUDGET_REFRESH, refresh_rate_limit_budget()).await;
+            // Scoped so every GitHub call this pass makes — including the
+            // ones inside helpers the adaptive path also uses — is
+            // attributed to the batched full sweep rather than blended
+            // with the per-PR path below. The two have very different
+            // per-point efficiency, and a single "merge_poller" bucket
+            // would confirm whichever culprit you already suspected.
             let outcome = run_pass_within_budget(
                 "full_sweep",
                 budget,
                 interval,
                 &metrics,
-                run_one_pass(
-                    work_db.as_ref(),
-                    probe.as_ref(),
-                    publisher.as_ref(),
-                    Some(cube_client.as_ref()),
-                    Some(completion_handler.as_ref()),
-                    Some(&remediation),
+                gh_scope(
+                    callers::MERGE_POLLER_SWEEP,
+                    run_one_pass(
+                        work_db.as_ref(),
+                        probe.as_ref(),
+                        publisher.as_ref(),
+                        Some(cube_client.as_ref()),
+                        Some(completion_handler.as_ref()),
+                        Some(&remediation),
+                    ),
                 ),
             )
             .await
@@ -443,12 +452,15 @@ pub fn spawn_loop(
             if completion_handler.speculative_conflict_prediction_enabled() {
                 match work_db.list_chores_pending_merge_check() {
                     Ok(candidates) => {
-                        crate::speculative_conflict::run_speculative_pass(
-                            work_db.as_ref(),
-                            cube_client.as_ref(),
-                            &metrics,
-                            &mut spec_schedule,
-                            &candidates,
+                        gh_scope(
+                            callers::SPECULATIVE_CONFLICT,
+                            crate::speculative_conflict::run_speculative_pass(
+                                work_db.as_ref(),
+                                cube_client.as_ref(),
+                                &metrics,
+                                &mut spec_schedule,
+                                &candidates,
+                            ),
                         )
                         .await;
                     }
@@ -470,13 +482,16 @@ pub fn spawn_loop(
             if completion_handler.stacked_pr_auto_structuring_enabled() && stacking_schedule.pass_due(Instant::now()) {
                 match work_db.list_chores_pending_merge_check() {
                     Ok(candidates) => {
-                        crate::stacked_pr_structuring::run_stacking_pass(
-                            work_db.as_ref(),
-                            publisher.as_ref(),
-                            &stacking_fetcher,
-                            &metrics,
-                            &mut stacking_schedule,
-                            &candidates,
+                        gh_scope(
+                            callers::STACKED_PR_STRUCTURING,
+                            crate::stacked_pr_structuring::run_stacking_pass(
+                                work_db.as_ref(),
+                                publisher.as_ref(),
+                                &stacking_fetcher,
+                                &metrics,
+                                &mut stacking_schedule,
+                                &candidates,
+                            ),
                         )
                         .await;
                     }
@@ -527,13 +542,19 @@ pub fn spawn_loop(
                         break 'wait;
                     }
                     _ = tokio::time::sleep(trunk_wait) => {
-                        let outcome = trunk_probe.run_pass(
-                            &crate::trunk_queue_poller::TrunkSweepContext {
-                                work_db: work_db.as_ref(),
-                                publisher: publisher.as_ref(),
-                                api: trunk_queue_api.as_ref(),
-                            },
-                            Instant::now(),
+                        // Rides the poller's loop but ticks on its own
+                        // faster cadence, so it gets its own bucket
+                        // rather than inflating the sweep's.
+                        let outcome = gh_scope(
+                            callers::TRUNK_QUEUE_POLLER,
+                            trunk_probe.run_pass(
+                                &crate::trunk_queue_poller::TrunkSweepContext {
+                                    work_db: work_db.as_ref(),
+                                    publisher: publisher.as_ref(),
+                                    api: trunk_queue_api.as_ref(),
+                                },
+                                Instant::now(),
+                            ),
                         ).await;
                         crate::trunk_queue_poller::record_pass_metrics(&metrics, &outcome);
                         if outcome.is_noteworthy() {
@@ -555,16 +576,25 @@ pub fn spawn_loop(
                             // the wait `select!`, so an unbounded reconcile
                             // stalls the trunk observer, the activation kick,
                             // and every other PR's adaptive timer with it.
+                            //
+                            // The un-batched per-PR path: one reconcile
+                            // probes a single PR, so its cost per PR is
+                            // far higher than the batched sweep's. Its
+                            // own scope is what makes that comparable
+                            // from data instead of arguable from code.
                             let Some((outcome, tier)) = reconcile_one_within_budget(
                                 &metrics,
-                                reconcile_one(
-                                    work_db.as_ref(),
-                                    probe.as_ref(),
-                                    publisher.as_ref(),
-                                    Some(cube_client.as_ref()),
-                                    Some(completion_handler.as_ref()),
-                                    Some(&remediation),
-                                    &pr_url,
+                                gh_scope(
+                                    callers::MERGE_POLLER_ADAPTIVE,
+                                    reconcile_one(
+                                        work_db.as_ref(),
+                                        probe.as_ref(),
+                                        publisher.as_ref(),
+                                        Some(cube_client.as_ref()),
+                                        Some(completion_handler.as_ref()),
+                                        Some(&remediation),
+                                        &pr_url,
+                                    ),
                                 ),
                                 &pr_url,
                             )
@@ -626,14 +656,17 @@ pub fn spawn_loop(
                                     );
                                     let Some((outcome, tier)) = reconcile_one_within_budget(
                                         &metrics,
-                                        reconcile_one(
-                                            work_db.as_ref(),
-                                            probe.as_ref(),
-                                            publisher.as_ref(),
-                                            Some(cube_client.as_ref()),
-                                            Some(completion_handler.as_ref()),
-                                            Some(&remediation),
-                                            &pr_url,
+                                        gh_scope(
+                                            callers::MERGE_POLLER_REQUESTED,
+                                            reconcile_one(
+                                                work_db.as_ref(),
+                                                probe.as_ref(),
+                                                publisher.as_ref(),
+                                                Some(cube_client.as_ref()),
+                                                Some(completion_handler.as_ref()),
+                                                Some(&remediation),
+                                                &pr_url,
+                                            ),
                                         ),
                                         &pr_url,
                                     )

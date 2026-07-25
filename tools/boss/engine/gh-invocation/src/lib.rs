@@ -175,14 +175,32 @@ pub fn is_cube_pr_create(command: &str) -> bool {
 }
 
 /// Fast pre-filter for the editorial PreToolUse audit path. Returns `true`
-/// when `command` could be a `gh pr|issue {create,edit,comment,review}` or
-/// PR-creating `cube pr {create,ensure}` invocation — the two surfaces the
-/// editorial hook covers.
+/// for any `gh` invocation, and for a PR-creating `cube pr {create,ensure}`.
 ///
 /// This is a cheap substring check; the heavier [`classify`] /
 /// [`is_cube_pr_create`] parsing follows only when this returns `true`.
+///
+/// # It gates recording, not verdicts
+///
+/// The `gh` arm is deliberately just `gh ` — not `gh ` *and* ` pr `/
+/// ` issue ` as it once was. The narrower form left a measurable blind
+/// spot: on 2026-07-24, 302 of 1,545 worker `gh` invocations (~19.5%)
+/// never reached `editorial_actions` at all, 265 of them `gh api` calls
+/// that landed in the log only when their path happened to contain the
+/// literal ` pr `. Since these rows are the only per-command record of
+/// what workers spend against the GitHub API, that gap made ~a fifth of
+/// worker traffic unattributable.
+///
+/// Widening this predicate cannot change any editorial *verdict*. The
+/// caller inserts a row for every candidate regardless of outcome, but
+/// the decision itself comes from [`crate::classify`] and
+/// [`is_cube_pr_create`], both untouched here: a command this predicate
+/// newly admits (`gh api …`, `gh repo view`, `gh auth status`) does not
+/// classify as a `pr`/`issue` invocation, so the editorial evaluator has
+/// no body or title to inspect and fails open to `allow`. The effect is
+/// strictly "more is recorded", never "more is blocked or rewritten".
 pub fn is_editorial_candidate(command: &str) -> bool {
-    (command.contains("gh ") && (command.contains(" pr ") || command.contains(" issue ")))
+    command.contains("gh ")
         || (command.contains("cube ")
             && command.contains(" pr ")
             && (command.contains("create") || command.contains("ensure")))
@@ -359,6 +377,65 @@ mod tests {
     fn rejects_token_ending_in_cube() {
         // `notcube pr create` must not match.
         assert!(!is_cube_pr_create("notcube pr create --branch b"));
+    }
+
+    // ── is_editorial_candidate ───────────────────────────────────────────
+
+    #[test]
+    fn admits_bare_gh_api_invocations() {
+        // The measured blind spot: `gh api` calls were only recorded when
+        // their path happened to contain the literal " pr ".
+        assert!(is_editorial_candidate("gh api rate_limit"));
+        assert!(is_editorial_candidate("gh api graphql -f query='{ viewer { login } }'"));
+        assert!(is_editorial_candidate("gh api repos/spinyfin/mono/commits/abc/status"));
+    }
+
+    #[test]
+    fn admits_non_pr_gh_nouns() {
+        assert!(is_editorial_candidate("gh repo view spinyfin/mono"));
+        assert!(is_editorial_candidate("gh auth status"));
+        assert!(is_editorial_candidate("gh release list"));
+    }
+
+    #[test]
+    fn still_admits_everything_it_admitted_before() {
+        for command in [
+            "gh pr create --title x",
+            "gh issue comment 9 --body hi",
+            "GIT_DIR=.jj/repo/store/git gh pr edit 42 --body z",
+            "cube pr create --branch b",
+            "cube pr ensure --branch b",
+        ] {
+            assert!(is_editorial_candidate(command), "{command} must remain a candidate");
+        }
+    }
+
+    #[test]
+    fn still_rejects_commands_with_no_gh_or_cube_pr_create() {
+        for command in [
+            "jj describe -m 'msg'",
+            "bazel test //tools/boss/...",
+            "cube pr update --branch b",
+        ] {
+            assert!(!is_editorial_candidate(command), "{command} must not be a candidate");
+        }
+    }
+
+    #[test]
+    fn widening_records_more_but_never_changes_a_verdict() {
+        // The verdict path is `classify` / `is_cube_pr_create`, neither of
+        // which this widening touches. Every newly-admitted command still
+        // classifies as "not a pr/issue invocation", so the evaluator has
+        // nothing to act on and fails open.
+        for command in ["gh api rate_limit", "gh repo view spinyfin/mono", "gh auth status"] {
+            assert!(is_editorial_candidate(command), "newly recorded: {command}");
+            assert_eq!(
+                classify(command),
+                None,
+                "{command} must not classify as a pr/issue invocation",
+            );
+            assert!(!is_cube_pr_create(command), "{command} must not read as a PR create");
+        }
     }
 
     // ── false-positive regression tests ──────────────────────────────────

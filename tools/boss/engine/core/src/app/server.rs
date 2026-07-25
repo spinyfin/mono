@@ -413,6 +413,24 @@ pub async fn serve_with_merge_probe(
         None,
     )?;
 
+    // GitHub API usage telemetry: install the process-wide sink and start
+    // its batching writer.
+    //
+    // Placed here, immediately after `ServerState` exists and before any
+    // subsystem loop is spawned, for two reasons. It must come *after*
+    // `ServerState::new` (which runs `metrics_init::init_all`), because
+    // the sink increments static handles and the registry panics on an
+    // unregistered increment. And it must come *before* the sweep loops
+    // below, several of which fire a pass the instant they are spawned —
+    // installing later would silently drop each of those first passes
+    // from the usage profile.
+    //
+    // Not in `ServerState`'s constructor itself: this spawns a task, and
+    // that constructor also runs from synchronous unit tests with no
+    // Tokio reactor.
+    let _github_api_usage_handle =
+        crate::github_api_usage::install(server_state.metrics.clone(), server_state.work_db.clone());
+
     // A socket file with a live process behind it must never be unlinked;
     // only a crashed engine's leftover is safe to rebind. Same probe as the
     // events socket below — the frontend socket is what the macOS app and

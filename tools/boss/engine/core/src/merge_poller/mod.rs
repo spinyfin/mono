@@ -63,6 +63,12 @@ use crate::work::TaskStatus;
 use crate::work::{GhPrStateChecker, LatePrCandidate, PendingMergeCheck, PrPollStateInput, PrStateChecker, WorkDb};
 use boss_engine_gh_invocation::gh_output;
 use boss_engine_utils::iso8601::parse_iso8601_lenient;
+// GitHub-call attribution. Every path in this module that reaches GitHub
+// runs inside a `gh_scope`, because "the merge poller" is not a fine
+// enough answer: the batched full sweep and the un-batched per-PR
+// adaptive reconcile spend very differently, and the instrumentation has
+// to tell them apart or it will confirm the wrong culprit.
+use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::gh_runner::pr_merge_queue_entry;
 use boss_github::pr_url::{parse_pr_url_parts, pr_number_from_url, repo_from_pr_url};
 #[cfg(test)]

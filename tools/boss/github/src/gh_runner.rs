@@ -8,12 +8,25 @@
 //! This module also exports the lower-level [`gh_output`] and [`run_gh`]
 //! primitives used by call sites that need raw subprocess output or a
 //! simple `Result<String>` with conventional error messages.
+//!
+//! ## Telemetry
+//!
+//! Every path in this module that spawns `gh` is instrumented through
+//! [`boss_gh_telemetry`], which records the calling subsystem, the API
+//! bucket (GraphQL vs REST — they are metered separately), the verb and
+//! endpoint, and the `rateLimit` block GitHub folds into a GraphQL
+//! response. There are four such paths ([`gh_output`],
+//! [`gh_output_blocking`], [`execute_gh`], and the streaming POST in
+//! [`CommandGhRunner::rest_post`]) and all four must stay instrumented:
+//! an instrumentation that sees only some of them under-reports, which
+//! is worse than none because it reads as a complete picture.
 
 use std::process::Output;
 use std::process::Stdio;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_gh_telemetry::{GhCallTimer, GhOutcome};
 use serde_json::Value;
 use tokio::process::Command;
 
@@ -96,15 +109,48 @@ pub trait GhRunner: Send + Sync {
 /// exit-code or stderr handling so each call site keeps its own tailored
 /// logic on top. The returned `io::Result` is the spawn result — callers
 /// apply their own context (`.with_context(...)`, `.ok()?`, `.map_err(...)`).
+///
+/// Records one [`boss_gh_telemetry`] sample per invocation, attributed
+/// to whichever [`boss_gh_telemetry::scope`] the caller is running
+/// under. Recording happens on every outcome including a spawn failure:
+/// a call that never left the box is still an attempt, and dropping it
+/// would make the failure invisible in exactly the situation (quota
+/// exhaustion causing knock-on errors) the counter exists to explain.
 pub async fn gh_output(args: &[&str]) -> std::io::Result<Output> {
-    Command::new("gh")
+    let timer = GhCallTimer::start_args(args);
+    let result = Command::new("gh")
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .output()
-        .await
+        .await;
+    timer.finish_process(&result);
+    result
+}
+
+/// Blocking counterpart to [`gh_output`] for the handful of call sites
+/// that run outside an async context (synchronous trait impls, startup
+/// capability probes).
+///
+/// Exists so those sites don't reach for a bare
+/// `std::process::Command::new("gh")`, which would spend real quota
+/// while remaining invisible to the counter — the precise blind spot
+/// this instrumentation closes. Wrap the call in
+/// [`boss_gh_telemetry::scope_blocking`] to attribute it; without that
+/// it lands in the `unattributed` bucket, identifiable only by its
+/// `verb`/`endpoint` in the persisted rows.
+pub fn gh_output_blocking(args: &[&str]) -> std::io::Result<Output> {
+    let timer = GhCallTimer::start_args(args);
+    let result = std::process::Command::new("gh")
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+    timer.finish_process(&result);
+    result
 }
 
 /// Spawn `gh` via [`gh_output`] and return the trimmed stdout on success.
@@ -155,10 +201,19 @@ pub struct MergeQueueEntry {
 /// `--json` field in all installed versions of the `gh` CLI; the GraphQL API
 /// is stable across versions. Degrades gracefully (returns `None`) so callers
 /// can treat "not in queue" and "couldn't tell" identically.
+///
+/// The query folds in [`boss_gh_telemetry::RATE_LIMIT_SELECTION`] at the
+/// top level. `rateLimit` is charged 0 points and is not counted as a
+/// call, so this is free — and it matters here specifically: this probe
+/// fires once per PR on the un-batched per-PR reconcile path, which is
+/// the suspected dominant GraphQL consumer. Without the block its spend
+/// would be counted as calls but contribute 0 to the points total,
+/// under-attributing exactly the path under investigation.
 pub async fn pr_merge_queue_entry(pr_url: &str) -> Option<MergeQueueEntry> {
     let (owner, repo, number) = crate::pr_url::parse_pr_url_parts(pr_url)?;
+    let rate_limit = boss_gh_telemetry::RATE_LIMIT_SELECTION;
     let query = format!(
-        r#"{{ repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state position enqueuedAt }} }} }} }}"#
+        r#"{{ {rate_limit} repository(owner: "{owner}", name: "{repo}") {{ pullRequest(number: {number}) {{ mergeQueueEntry {{ state position enqueuedAt }} }} }} }}"#
     );
     let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
     let out = output.ok()?;
@@ -253,16 +308,25 @@ fn finalize_gh(output: std::process::Output) -> std::result::Result<std::process
 /// return its captured [`Output`](std::process::Output) once the exit status is
 /// verified. Spawn failures map to transient errors; non-zero exits map via
 /// [`gh_status_error`].
+///
+/// Instrumented alongside [`gh_output`]: this is the path
+/// `boss_github_tracker` takes for every GraphQL query and REST
+/// GET/PATCH it issues, so leaving it out would hide the whole external
+/// issue-tracker reconciler from the usage profile.
 async fn execute_gh(args: &[String], token: Option<&str>) -> std::result::Result<std::process::Output, GhRunnerError> {
-    let output = gh_command(token)
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let timer = GhCallTimer::start_args(&arg_refs);
+    let result = gh_command(token)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .output()
-        .await
-        .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
+        .await;
+    timer.finish_process(&result);
+
+    let output = result.map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
 
     finalize_gh(output)
 }
@@ -326,25 +390,33 @@ impl GhRunner for CommandGhRunner {
         use tokio::io::AsyncWriteExt as _;
         let stdin_bytes = serde_json::to_vec(body)
             .map_err(|e| GhRunnerError::transient(format!("failed to serialize POST body: {e}")))?;
+        // The streaming POST can't reuse `execute_gh` (it needs a piped
+        // stdin), so it carries its own timer rather than being the one
+        // spawn path that escapes the count.
+        let args = ["api", "-X", "POST", "--input", "-", path];
+        let timer = GhCallTimer::start_args(&args);
         let mut cmd = gh_command(token);
-        cmd.args(["api", "-X", "POST", "--input", "-", path])
+        cmd.args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| GhRunnerError::transient(format!("failed to spawn gh: {e}")))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&stdin_bytes)
-                .await
-                .map_err(|e| GhRunnerError::transient(format!("failed to write POST body: {e}")))?;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                timer.finish(GhOutcome::Error, None);
+                return Err(GhRunnerError::transient(format!("failed to spawn gh: {e}")));
+            }
+        };
+        if let Some(mut stdin) = child.stdin.take()
+            && let Err(e) = stdin.write_all(&stdin_bytes).await
+        {
+            timer.finish(GhOutcome::Error, None);
+            return Err(GhRunnerError::transient(format!("failed to write POST body: {e}")));
         }
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
+        let result = child.wait_with_output().await;
+        timer.finish_process(&result);
+        let output = result.map_err(|e| GhRunnerError::transient(format!("failed to wait for gh: {e}")))?;
 
         let output = finalize_gh(output)?;
 

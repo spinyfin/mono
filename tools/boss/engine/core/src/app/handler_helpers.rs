@@ -724,10 +724,12 @@ pub(super) async fn open_review_terminal_async(
 /// return the head branch name. Mirrors the approach in
 /// `design_detector::do_scan_pr` but requests only the one field we need.
 pub(super) async fn get_pr_head_branch(pr_url: &str) -> Result<String> {
-    let output =
-        boss_engine_gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"])
-            .await
-            .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
+    let output = boss_gh_telemetry::scope(
+        boss_gh_telemetry::callers::REQUEST_HANDLER,
+        boss_engine_gh_invocation::gh_output(&["pr", "view", pr_url, "--json", "headRefName", "--jq", ".headRefName"]),
+    )
+    .await
+    .with_context(|| format!("failed to spawn gh pr view for {pr_url}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

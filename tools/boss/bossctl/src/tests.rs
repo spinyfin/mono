@@ -287,3 +287,40 @@ fn format_state_summary_reports_paused_with_and_without_since() {
     assert_eq!(format_state_summary(true, None), "paused");
     assert_eq!(format_state_summary(false, None), "running");
 }
+
+// ── metrics github: rate arithmetic ──────────────────────────────────────
+//
+// The rate is the whole reason this subcommand exists — GitHub's budget is
+// 5000 units per rolling hour, and a monotonic counter cannot express that.
+// These pin the denominator, which is the part that is easy to get wrong in
+// a way that silently understates a drain.
+
+#[test]
+fn points_per_hour_divides_by_the_observed_span() {
+    // 100 units over 30 observed minutes is 200/hr — regardless of how
+    // many hours of look-back were requested.
+    assert_eq!(points_per_hour(100, 30 * 60 * 1000), Some(200.0));
+}
+
+#[test]
+fn points_per_hour_matches_the_merge_poller_estimate_shape() {
+    // The figure this instrumentation exists to confirm or refute:
+    // 6780 units observed over exactly one hour reads as 6780/hr, which
+    // is over the 5000/hr budget.
+    let rate = points_per_hour(6780, 3_600_000).expect("one hour is a usable span");
+    assert!((rate - 6780.0).abs() < 0.001);
+    assert!(rate > GITHUB_HOURLY_BUDGET, "6780/hr must read as over budget");
+}
+
+#[test]
+fn points_per_hour_refuses_a_span_shorter_than_a_minute() {
+    // Extrapolating one burst across an hour would produce a confident
+    // wrong number; reporting nothing is the honest answer.
+    assert_eq!(points_per_hour(500, 10_000), None);
+    assert_eq!(points_per_hour(500, 0), None);
+}
+
+#[test]
+fn points_per_hour_handles_zero_spend_over_a_real_span() {
+    assert_eq!(points_per_hour(0, 3_600_000), Some(0.0));
+}

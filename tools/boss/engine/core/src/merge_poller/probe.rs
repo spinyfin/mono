@@ -568,9 +568,16 @@ pub(crate) type BatchAliasMap = Vec<(String, Vec<(String, String)>)>;
 /// `pullRequest(...)` block's selection set (callers pass [`PR_PROBE_FIELDS`]
 /// for lifecycle probing or [`DEQUEUE_EVENTS_FIELDS`] for merge-queue
 /// dequeue-event polling — same aliasing/grouping logic, different payload).
-/// Also requests `rateLimit { remaining }` at the query's top level so every
-/// batched call doubles as a quota reading for [`record_rate_limit`], at
-/// zero extra cost (querying `rateLimit` itself doesn't consume quota).
+/// Also requests [`boss_gh_telemetry::RATE_LIMIT_SELECTION`] at the query's
+/// top level so every batched call doubles as a quota reading, at zero extra
+/// cost (querying `rateLimit` itself doesn't consume quota).
+///
+/// The selection is the full block (`cost limit remaining used resetAt`),
+/// not just `remaining` as it used to be. `remaining` alone tells you the
+/// shared budget moved but not who moved it or by how much; `cost` is the
+/// per-call number that makes the spend attributable to this sweep rather
+/// than inferable from the gap between two readings.
+///
 /// Returns the query alongside the alias map needed to walk the response
 /// back out.
 ///
@@ -588,7 +595,7 @@ pub(crate) fn build_batch_query(
         by_repo.entry((owner.clone(), repo.clone())).or_default().push(url);
     }
 
-    let mut query = String::from("{ rateLimit { remaining }");
+    let mut query = format!("{{ {}", boss_gh_telemetry::RATE_LIMIT_SELECTION);
     let mut alias_map: BatchAliasMap = Vec::new();
     for (repo_idx, ((owner, repo), urls)) in by_repo.iter().enumerate() {
         let repo_alias = format!("repo{repo_idx}");

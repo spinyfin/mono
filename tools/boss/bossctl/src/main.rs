@@ -730,6 +730,21 @@ enum MetricsAction {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// GitHub API usage attributed by subsystem: calls, quota units
+    /// spent, and the implied hourly rate against the 5000/hour budget.
+    ///
+    /// Reads the per-call `github_api_calls` rows in `state.db` directly
+    /// (same resolution as `metrics list`), which is what the `github_api.*`
+    /// counters cannot answer on their own: a counter is a monotonic
+    /// total, and the GitHub budget is a rate over a rolling hour.
+    Github {
+        /// Look back this many hours (default 24).
+        #[arg(long, default_value_t = 24)]
+        hours: u32,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Reset one or all metrics to zero (both in-memory and in
     /// `state.db`) via engine RPC. Counters are truly monotonic
     /// across the framework's lifetime unless reset explicitly; this
@@ -1074,6 +1089,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 metrics_show(cli.json, state_root, &name)
             }
         }
+        Command::Metrics {
+            action: MetricsAction::Github { hours, state_root },
+        } => metrics_github(cli.json, state_root, hours),
         Command::Metrics {
             action: MetricsAction::Reset { name, all },
         } => {
@@ -2411,6 +2429,144 @@ fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntr
             }
         }
     }
+}
+
+/// GitHub's hourly quota for a personal token, on each of the two
+/// independently-metered buckets. Rates are printed against this so the
+/// table answers "over or under budget" without the reader doing the
+/// division.
+const GITHUB_HOURLY_BUDGET: f64 = 5000.0;
+
+/// Convert a spend and an observed span into a points-per-hour rate.
+///
+/// Divides by the span the data *actually* covers, not by the requested
+/// look-back: an engine that has been running the instrumented build for
+/// 20 minutes, queried with `--hours 24`, would otherwise report a rate
+/// ~70x under the truth. A span shorter than a minute is not a usable
+/// denominator (one burst would extrapolate to an absurd rate), so it
+/// reports `None` rather than a confident wrong number.
+fn points_per_hour(points: i64, span_ms: i64) -> Option<f64> {
+    if span_ms < 60_000 {
+        return None;
+    }
+    Some(points as f64 * 3_600_000.0 / span_ms as f64)
+}
+
+/// Per-subsystem GitHub API attribution over a time window.
+fn metrics_github(json: bool, state_root: Option<PathBuf>, hours: u32) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let since_ms = now_epoch_ms() as i64 - (hours as i64) * 3_600_000;
+
+    let buckets = db
+        .github_api_usage_by_caller(since_ms)
+        .context("reading github_api_calls from state.db")?;
+    let window = db
+        .github_api_usage_window(since_ms)
+        .context("reading github_api_calls window from state.db")?;
+    // A single sample spans zero time; treat the observed span as at
+    // least the gap between first and last row.
+    let span_ms = window.map(|(min, max)| max - min).unwrap_or(0);
+
+    if json {
+        let entries: Vec<serde_json::Value> = buckets
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "caller": b.caller,
+                    "api": b.api,
+                    "calls": b.calls,
+                    "points": b.points,
+                    "calls_without_reading": b.calls_without_reading,
+                    "errors": b.errors,
+                    "rate_limited": b.rate_limited,
+                    "points_per_hour": points_per_hour(b.points, span_ms),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "since_epoch_ms": since_ms,
+                "observed_span_ms": span_ms,
+                "hourly_budget": GITHUB_HOURLY_BUDGET,
+                "usage": entries,
+            })
+        );
+        return Ok(());
+    }
+
+    if buckets.is_empty() {
+        println!("no github_api_calls rows in the last {hours}h (engine may not have made a call yet)");
+        return Ok(());
+    }
+
+    let span_hours = span_ms as f64 / 3_600_000.0;
+    println!("GitHub API usage — {span_hours:.2}h observed (requested {hours}h look-back)");
+    println!();
+    let name_width = buckets.iter().map(|b| b.caller.len()).max().unwrap_or(10).max(10);
+    println!(
+        "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
+        "SUBSYSTEM",
+        "API",
+        "CALLS",
+        "UNITS",
+        "UNITS/HR",
+        "ERRORS",
+        "429s",
+        width = name_width,
+    );
+    for b in &buckets {
+        let rate = match points_per_hour(b.points, span_ms) {
+            Some(rate) => format!("{rate:.0}"),
+            None => "—".to_owned(),
+        };
+        println!(
+            "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
+            b.caller,
+            b.api,
+            b.calls,
+            b.points,
+            rate,
+            b.errors,
+            b.rate_limited,
+            width = name_width,
+        );
+    }
+
+    // Per-bucket totals: GraphQL and REST have separate 5000/hour
+    // budgets, so a combined total would compare against a limit that
+    // does not exist.
+    println!();
+    for api in ["graphql", "rest", "cli"] {
+        let points: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.points).sum();
+        let calls: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.calls).sum();
+        if calls == 0 {
+            continue;
+        }
+        match points_per_hour(points, span_ms) {
+            Some(rate) => {
+                let pct = rate / GITHUB_HOURLY_BUDGET * 100.0;
+                let verdict = if rate > GITHUB_HOURLY_BUDGET {
+                    "OVER BUDGET"
+                } else {
+                    "within budget"
+                };
+                println!("{api:>8}: {calls} calls, {points} units → {rate:.0}/hr ({pct:.0}% of 5000/hr) — {verdict}");
+            }
+            None => println!("{api:>8}: {calls} calls, {points} units (window too short for a rate)"),
+        }
+    }
+
+    let unmeasured: i64 = buckets.iter().map(|b| b.calls_without_reading).sum();
+    if unmeasured > 0 {
+        println!();
+        println!(
+            "note: {unmeasured} call(s) carried no rateLimit reading — their spend is counted \
+             as calls but contributes 0 units, so the rates above are a lower bound.",
+        );
+    }
+    Ok(())
 }
 
 async fn metrics_reset(socket_path: &Option<String>, json: bool, name: Option<String>) -> Result<()> {

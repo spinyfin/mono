@@ -50,6 +50,11 @@ pub fn init_all(registry: &Registry) {
     crate::app::proposals::register_metrics(registry);
     // Worker-proposal API: proposal_channel_error detection counter.
     crate::proposal_channel_error::register_metrics(registry);
+    // GitHub API usage telemetry: call/points/rate-limit totals and the
+    // remaining-quota gauges. The per-caller breakdown is registered
+    // dynamically on first use (the caller x bucket axis isn't a
+    // compile-time-known set), so only the statics land here.
+    crate::github_api_usage::register_metrics(registry);
 }
 
 #[cfg(test)]
@@ -199,13 +204,28 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // GitHub API usage telemetry: the static totals. The per-caller
+        // breakdown is registered dynamically on first use.
+        for expected in [
+            "github_api.calls.total",
+            "github_api.points.total",
+            "github_api.rate_limited.total",
+            "github_api.calls.unattributed",
+            "github_api.calls.without_reading",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         assert_eq!(
             names.len(),
-            76,
+            81,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 12 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
-             9 worker_proposals submit + 1 worker_proposals channel_error counters"
+             9 worker_proposals submit + 1 worker_proposals channel_error + \
+             5 github_api counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
@@ -220,8 +240,11 @@ mod tests {
                 "dispatch.queue_oldest_wait_seconds.automation",
                 "dispatch.queue_oldest_wait_seconds.main",
                 "dispatch.queue_oldest_wait_seconds.review",
+                "github_api.graphql.remaining",
+                "github_api.rest.remaining",
             ],
-            "init_all must register the dep_unblock gauge and the queue-level dispatch gauges",
+            "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
+             and the GitHub remaining-quota gauges",
         );
     }
 }

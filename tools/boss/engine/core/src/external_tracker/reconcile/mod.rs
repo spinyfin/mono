@@ -291,12 +291,20 @@ pub fn spawn_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            let outcome = run_one_pass(
-                work_db.as_ref(),
-                registry.as_ref(),
-                metrics.as_ref(),
-                publisher.as_ref(),
-                credential_resolver.as_ref(),
+            // The reconciler's GitHub calls go out through `GhRunner`
+            // (`gh api graphql` / `gh api`), which is instrumented but
+            // has no idea who is driving it. Scoping the whole pass is
+            // what separates tracker traffic from the merge poller's in
+            // the usage profile.
+            let outcome = boss_gh_telemetry::scope(
+                boss_gh_telemetry::callers::EXTERNAL_TRACKER,
+                run_one_pass(
+                    work_db.as_ref(),
+                    registry.as_ref(),
+                    metrics.as_ref(),
+                    publisher.as_ref(),
+                    credential_resolver.as_ref(),
+                ),
             )
             .await;
             if outcome.products_processed > 0

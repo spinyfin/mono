@@ -186,6 +186,65 @@ fn github_headers(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         .header("User-Agent", USER_AGENT)
 }
 
+/// Send an already-built GitHub request, recording one telemetry sample
+/// for it.
+///
+/// This is the direct-HTTP counterpart to `gh_runner`'s subprocess
+/// instrumentation. These calls never touch the `gh` binary, so a
+/// counter that only watched `gh` subprocesses would miss them
+/// entirely — and an instrumentation that under-reports is worse than
+/// none, because it reads as complete.
+///
+/// Public so `boss_github_tracker`'s own `reqwest` calls against
+/// `api.github.com` reuse this one implementation rather than growing a
+/// second copy of the outcome/quota classification.
+///
+/// The quota reading comes from the `x-ratelimit-*` response headers
+/// (GraphQL-over-HTTP responses carry them too), so these calls land in
+/// the same time series as the `gh` ones without needing a `rateLimit`
+/// selection folded into the query — which a GraphQL *mutation* like
+/// `addProjectV2ItemById` could not carry anyway, `rateLimit` being a
+/// Query-root field.
+pub async fn send_instrumented(
+    builder: reqwest::RequestBuilder,
+    method: &str,
+    url: &str,
+) -> reqwest::Result<reqwest::Response> {
+    let api = if url.trim_end_matches('/').ends_with("/graphql") {
+        boss_gh_telemetry::GhApi::Graphql
+    } else {
+        boss_gh_telemetry::GhApi::Rest
+    };
+    let timer = boss_gh_telemetry::GhCallTimer::start(boss_gh_telemetry::GhCallShape {
+        api,
+        verb: method.to_owned(),
+        endpoint: boss_gh_telemetry::normalize_endpoint(url),
+    });
+    let result = builder.send().await;
+    match &result {
+        Err(_) => timer.finish_with(boss_gh_telemetry::GhOutcome::Error, None),
+        Ok(resp) => {
+            let rate_limit =
+                boss_gh_telemetry::parse_rate_limit_headers(|name| resp.headers().get(name)?.to_str().ok());
+            let status = resp.status();
+            // GitHub answers a REST rate-limit rejection with 403 or 429
+            // *and* `x-ratelimit-remaining: 0`. Keying on the header as
+            // well as the status avoids filing an ordinary permission
+            // 403 as budget evidence.
+            let exhausted = rate_limit.is_some_and(|rl| rl.remaining <= 0);
+            let outcome = if status.is_success() {
+                boss_gh_telemetry::GhOutcome::Ok
+            } else if exhausted || status.as_u16() == 429 {
+                boss_gh_telemetry::GhOutcome::RateLimited
+            } else {
+                boss_gh_telemetry::GhOutcome::Error
+            };
+            timer.finish_with(outcome, rate_limit);
+        }
+    }
+    result
+}
+
 /// On a non-2xx response, read the body and `bail!` with
 /// `{context} returned {status}: {body}`, optionally followed by a
 /// `hint` line. On success the response is returned for further
@@ -214,8 +273,7 @@ async fn fetch_installation_token(
         api_base.trim_end_matches('/'),
         installation_id
     );
-    let resp = github_headers(client.post(&url).bearer_auth(jwt))
-        .send()
+    let resp = send_instrumented(github_headers(client.post(&url).bearer_auth(jwt)), "POST", &url)
         .await
         .with_context(|| format!("POST {url}"))?;
 
@@ -257,11 +315,13 @@ async fn create_issue(
         body: &attributed_body,
         labels: &effective_labels,
     };
-    let resp = github_headers(client.post(&url).bearer_auth(token))
-        .json(&payload)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let resp = send_instrumented(
+        github_headers(client.post(&url).bearer_auth(token)).json(&payload),
+        "POST",
+        &url,
+    )
+    .await
+    .with_context(|| format!("POST {url}"))?;
 
     let resp = ensure_success(resp, "issue create", None).await?;
     resp.json::<IssueResponse>()
@@ -317,11 +377,13 @@ pub async fn add_issue_to_project(
             "contentId": issue_node_id,
         }),
     };
-    let resp = github_headers(client.post(&url).bearer_auth(token))
-        .json(&payload)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let resp = send_instrumented(
+        github_headers(client.post(&url).bearer_auth(token)).json(&payload),
+        "POST",
+        &url,
+    )
+    .await
+    .with_context(|| format!("POST {url}"))?;
 
     let resp = ensure_success(
         resp,

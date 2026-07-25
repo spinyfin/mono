@@ -638,6 +638,10 @@ impl WorkDb {
         // existing `pr_body_before`. Backs `boss pr body` returning title
         // and body together.
         migrate_work_executions_pr_title_before(conn)?;
+        // `github_api_calls`: per-call GitHub API usage telemetry (caller
+        // subsystem, API bucket, rateLimit reading). Independent of every
+        // other table and additive-only. Rides the current schema marker.
+        migrate_github_api_calls_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

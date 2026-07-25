@@ -437,12 +437,15 @@ pub fn spawn_loop(
         let failure_counts = Arc::clone(&failure_counts);
         async move {
             let mut failure_counts = failure_counts.lock().await;
-            run_one_pass(
-                work_db.as_ref(),
-                pr_detector.as_ref(),
-                pr_creator.as_ref(),
-                dispatch_events.as_ref(),
-                &mut failure_counts,
+            boss_gh_telemetry::scope(
+                boss_gh_telemetry::callers::ABANDONED_BRANCH_SWEEP,
+                run_one_pass(
+                    work_db.as_ref(),
+                    pr_detector.as_ref(),
+                    pr_creator.as_ref(),
+                    dispatch_events.as_ref(),
+                    &mut failure_counts,
+                ),
             )
             .await
         }

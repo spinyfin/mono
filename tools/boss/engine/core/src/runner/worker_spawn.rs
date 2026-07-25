@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use boss_engine_gh_invocation::gh_output;
+use boss_gh_telemetry::{callers, scope as gh_scope};
 
 use crate::coordinator::pool_model_override_for_worker_id;
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
@@ -166,7 +167,9 @@ async fn fetch_pr_review_context(pr_url: &str) -> Option<crate::pr_review::PrRev
 /// caller is responsible for deciding whether the diff is small enough to
 /// embed.
 async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
-    let output = gh_output(&["pr", "diff", pr_url]).await.ok()?;
+    let output = gh_scope(callers::WORKER_SPAWN, gh_output(&["pr", "diff", pr_url]))
+        .await
+        .ok()?;
 
     if !output.status.success() {
         tracing::warn!(

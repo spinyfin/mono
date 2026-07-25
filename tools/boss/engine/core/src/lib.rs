@@ -57,6 +57,7 @@ pub mod execution_liveness;
 pub mod execution_retention_sweep;
 pub mod external_tracker;
 pub use boss_feature_flags as feature_flags;
+pub mod github_api_usage;
 pub mod host_adapter;
 pub mod host_reconcile;
 pub mod host_registry;

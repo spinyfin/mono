@@ -79,8 +79,10 @@ fn build_batch_query_with_dequeue_events_fields_requests_timeline_items() {
 
     assert_eq!(alias_map.len(), 1);
     assert!(
-        query.contains("rateLimit { remaining }"),
-        "quota reading must ride along for free"
+        query.contains(boss_gh_telemetry::RATE_LIMIT_SELECTION),
+        "quota reading must ride along for free — and must be the FULL block, \
+         since `cost` is what attributes the spend to this query rather than \
+         leaving it inferable from the gap between two `remaining` readings"
     );
     assert!(query.contains("REMOVED_FROM_MERGE_QUEUE_EVENT"));
     assert!(

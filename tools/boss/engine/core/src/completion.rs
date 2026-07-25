@@ -70,6 +70,7 @@ use crate::work::{CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem,
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
 
 // The inherent `impl WorkerCompletionHandler` is split across the submodules
@@ -592,11 +593,14 @@ impl BranchVerifier for CommandBranchVerifier {
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
 /// file-content changes). Used by the no-op skip gate.
 async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
-    let trimmed = gh_compare_jq(
-        repo_slug,
-        base,
-        head,
-        "(.files // []) | map(.additions + .deletions) | add // 0",
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(
+            repo_slug,
+            base,
+            head,
+            "(.files // []) | map(.additions + .deletions) | add // 0",
+        ),
     )
     .await?;
     let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
@@ -614,19 +618,22 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
 async fn fetch_pr_title_and_body_cmd(repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
     let pr_str = pr_number.to_string();
     let display = format!("gh pr view {pr_number} -R {repo_slug} --json title,body");
-    let stdout = run_gh(
-        &[
-            "pr",
-            "view",
-            &pr_str,
-            "-R",
-            repo_slug,
-            "--json",
-            "title,body",
-            "--jq",
-            "[.title, .body]",
-        ],
-        &display,
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "-R",
+                repo_slug,
+                "--json",
+                "title,body",
+                "--jq",
+                "[.title, .body]",
+            ],
+            &display,
+        ),
     )
     .await?;
     let mut fields: Vec<String> =
@@ -737,24 +744,27 @@ fn classify_pr(pr: ApiPr) -> PrStatus {
 /// — if multiple historical rows happen to exist, we want the most
 /// recent (which `gh pr list` returns first).
 async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<ApiPr>> {
-    let stdout = run_gh(
-        &[
-            "pr",
-            "list",
-            "-R",
-            repo_slug,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "url,state,mergedAt,changedFiles,additions,deletions",
-            "--jq",
-            r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
-        ],
-        &format!("gh pr list -R {repo_slug} --head {branch}"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions",
+                "--jq",
+                r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --head {branch}"),
+        ),
     )
     .await?;
     let trimmed = stdout.trim();
@@ -788,22 +798,25 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
         return Ok(None);
     }
     const SCAN_LIMIT: usize = 100;
-    let stdout = run_gh(
-        &[
-            "pr",
-            "list",
-            "-R",
-            repo_slug,
-            "--state",
-            "all",
-            "--limit",
-            "100",
-            "--json",
-            "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
-            "--jq",
-            r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
-        ],
-        &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--state",
+                "all",
+                "--limit",
+                "100",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
+                "--jq",
+                r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+        ),
     )
     .await?;
     let mut rows = 0usize;
@@ -861,16 +874,19 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
 async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
     let pr_number = pr_number_from_url(pr_url).ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
-    let stdout = run_gh(
-        &[
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            "((.additions // 0) + (.deletions // 0))",
-        ],
-        &format!("gh api {endpoint}"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github+json",
+                "--jq",
+                "((.additions // 0) + (.deletions // 0))",
+            ],
+            &format!("gh api {endpoint}"),
+        ),
     )
     .await?;
     let total: i64 = stdout

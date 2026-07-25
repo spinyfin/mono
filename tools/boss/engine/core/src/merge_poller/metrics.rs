@@ -279,7 +279,8 @@ pub(crate) fn record_rate_limit_remaining(remaining: i64, source: &str) {
 /// the budget unchanged (see [`record_rate_limit`]), exactly like a batched
 /// response that never carried the field.
 pub(crate) async fn refresh_rate_limit_budget() {
-    let Ok(output) = gh_output(&["api", "graphql", "-f", "query={ rateLimit { remaining } }"]).await else {
+    let query = format!("query={{ {} }}", boss_gh_telemetry::RATE_LIMIT_SELECTION);
+    let Ok(output) = gh_output(&["api", "graphql", "-f", &query]).await else {
         return;
     };
     if !output.status.success() {

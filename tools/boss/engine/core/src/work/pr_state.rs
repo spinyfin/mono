@@ -71,10 +71,15 @@ pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
-        let output = std::process::Command::new("gh")
-            .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
-            .output()
-            .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
+        // Via `gh_output_blocking` rather than a bare
+        // `Command::new("gh")`: this spends real quota from the shared
+        // token, and a raw spawn here would be invisible to the usage
+        // counter — precisely the kind of blind spot that made the
+        // GraphQL exhaustion unattributable.
+        let output = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
+            boss_github::gh_runner::gh_output_blocking(&["pr", "view", pr_url, "--json", "state,mergedAt"])
+        })
+        .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("`gh pr view` failed for {pr_url}: {stderr}");

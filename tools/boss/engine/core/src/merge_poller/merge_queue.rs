@@ -59,7 +59,15 @@ pub(crate) async fn fetch_merge_queue_dequeue_events_batch(
     }
 
     let (query, alias_map) = build_batch_query(&order, &parsed, DEQUEUE_EVENTS_FIELDS);
-    let output = gh_output(&["api", "graphql", "-f", &format!("query={query}")]).await;
+    // Its own bucket rather than the enclosing sweep's: this is a
+    // second, separately-shaped GraphQL query issued per pass, and
+    // folding it into the sweep's total would hide a distinct cost
+    // behind an aggregate.
+    let output = gh_scope(
+        callers::MERGE_POLLER_MERGE_QUEUE,
+        gh_output(&["api", "graphql", "-f", &format!("query={query}")]),
+    )
+    .await;
     let body: serde_json::Value = match output {
         Ok(o) if o.status.success() => match serde_json::from_slice(&o.stdout) {
             Ok(v) => v,

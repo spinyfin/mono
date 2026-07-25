@@ -230,13 +230,14 @@ fn discover_local_capabilities() -> Vec<(String, String)> {
 
     // gh auth state (per design open-question: catches credential drift
     // hours earlier than waiting for a `gh pr create` failure in a worker)
-    let gh_authed = std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // `gh auth status` validates the token against the API, so it spends
+    // from the same shared budget as everything else and goes through the
+    // instrumented spawn rather than a bare `Command`.
+    let gh_authed = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::HOST_REGISTRY, || {
+        boss_github::gh_runner::gh_output_blocking(&["auth", "status"])
+    })
+    .map(|out| out.status.success())
+    .unwrap_or(false);
     caps.push((format!("gh-authed={gh_authed}"), "auto".to_owned()));
 
     caps
