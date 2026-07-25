@@ -77,6 +77,34 @@ pub struct PermissionInput {
     pub is_remote: bool,
 }
 
+/// What a driver's [`Capability::PermissionPolicy`] rendering produces,
+/// broken out by how the spawn flow must apply it — a single settings-file
+/// path is not general enough to express every backend's policy shape.
+///
+/// Claude Code's policy is one settings file passed via `--settings`:
+/// `config_files` holds that one path, `extra_args`/`env` are empty. A
+/// backend like Codex needs all three: `--sandbox <mode>` / `--ignore-rules`
+/// flags (`extra_args`), `CODEX_HOME` (`env`), and `[sandbox_workspace_write]
+/// writable_roots` config (`config_files`) — none of which fits in a single
+/// returned path.
+///
+/// `env` composes with whatever mechanism the spawn flow uses to pass
+/// driver-supplied environment variables to the worker process; it is not a
+/// second, competing channel.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionArtifacts {
+    /// Config file(s) written to the destination directory (e.g. `settings.json`
+    /// for Claude). Order matters when a backend takes multiple `--config`-style
+    /// flags naming files in a specific sequence.
+    pub config_files: Vec<PathBuf>,
+    /// Extra CLI arguments the spawn flow must append to the worker invocation
+    /// (e.g. Codex's `--sandbox <mode>`).
+    pub extra_args: Vec<String>,
+    /// Extra environment variables the spawn flow must set on the worker
+    /// process (e.g. Codex's `CODEX_HOME`).
+    pub env: Vec<(String, String)>,
+}
+
 /// A named capability Boss needs from an agent driver.
 ///
 /// A driver declares, per capability, that it provides that capability; for
@@ -632,14 +660,21 @@ pub trait AgentDriver: Send + Sync {
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
     /// Write the driver's permission/hooks config to `dest_dir` and return the
-    /// path to the settings file (passed as `--settings` or equivalent to the
-    /// worker CLI).
+    /// [`PermissionArtifacts`] the spawn flow must apply: config file path(s)
+    /// (passed as `--settings` or equivalent), extra CLI args, and extra env.
     ///
     /// `input` carries the abstract deny-set + autonomy-mode that the driver
     /// renders into its backend-specific format. For Claude Code this produces a
     /// `settings.json` with `permissions.deny` rules and `defaultMode: "auto"`,
-    /// plus `boss-event` hook wiring for every hook event.
-    async fn write_permission_config(&self, input: &PermissionInput, dest_dir: &Path) -> anyhow::Result<PathBuf>;
+    /// plus `boss-event` hook wiring for every hook event, returned as the sole
+    /// entry in `config_files` with `extra_args`/`env` empty. A backend like
+    /// Codex needs all three fields (design doc: sandbox mode + ignore-rules
+    /// flags, `CODEX_HOME`, and writable-roots config).
+    async fn write_permission_config(
+        &self,
+        input: &PermissionInput,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PermissionArtifacts>;
 
     // ── ProgressObservation capability ──────────────────────────────────────
 
@@ -986,7 +1021,7 @@ mod tests {
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PathBuf> {
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
             unimplemented!()
         }
         fn progress_fidelity(&self) -> ProgressFidelity {
