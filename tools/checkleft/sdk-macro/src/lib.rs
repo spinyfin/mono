@@ -702,11 +702,19 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         line: l.line,
                         column: l.column,
                     }),
+                    surface: f.surface.map(to_wit_surface),
                     remediations: f.remediations,
                     suggested_fix: f.suggested_fix.map(|sf| W::SuggestedFix {
                         description: sf.description,
                         edits: sf.edits.into_iter().map(to_wit_file_edit).collect(),
                     }),
+                }
+            }
+
+            fn to_wit_surface(s: ::checkleft_check_sdk::Surface) -> W::Surface {
+                match s {
+                    ::checkleft_check_sdk::Surface::PrDescription => W::Surface::PrDescription,
+                    ::checkleft_check_sdk::Surface::CommitMessage => W::Surface::CommitMessage,
                 }
             }
 

@@ -112,6 +112,7 @@ mod tests {
                     line: Some(3),
                     column: Some(15),
                 }),
+                surface: None,
                 remediations: vec!["Use canonical spelling instead".to_owned()],
                 suggested_fix: Some(SuggestedFix {
                     description: "Replace typo".to_owned(),

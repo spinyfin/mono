@@ -45,6 +45,7 @@ pub(super) fn analyze_java_file(path: &Path, contents: &str, rules: &[CompiledNo
                 line: Some(matched.location.line),
                 column: Some(matched.location.column),
             }),
+            surface: None,
             remediations: matched.rule.remediation.iter().cloned().collect(),
             suggested_fix: None,
         })

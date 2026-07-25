@@ -76,6 +76,7 @@ impl ConfiguredCheck for CompiledWorkflowActionVersionConfig {
                             line: None,
                             column: None,
                         }),
+                        surface: None,
                         remediations: vec![self.remediation.clone()],
                         suggested_fix: None,
                     });

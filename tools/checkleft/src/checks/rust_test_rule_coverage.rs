@@ -63,6 +63,7 @@ impl ConfiguredCheck for RustTestRuleCoverageCheck {
                     line: None,
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![
                     "Add a Bazel `rust_test(...)` target in the nearest BUILD/BUILD.bazel package.".to_owned(),
                 ],

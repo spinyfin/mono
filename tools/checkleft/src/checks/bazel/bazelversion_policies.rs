@@ -142,6 +142,7 @@ impl CompiledAllowedVersionPatternsRule {
                 line: Some(1),
                 column: Some(1),
             }),
+            surface: None,
             remediations: vec![self.remediation.clone().unwrap_or_else(|| {
                 format!(
                     "Update `.bazelversion` so it matches one of the approved patterns: {}.",

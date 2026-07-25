@@ -201,6 +201,7 @@ fn lift_finding_maps_all_fields() {
             line: Some(42),
             column: Some(7),
         }),
+        surface: None,
         remediations: vec!["fix it".to_owned()],
         suggested_fix: Some(super::wit_types::SuggestedFix {
             description: "auto-fix".to_owned(),
@@ -232,6 +233,7 @@ fn lift_finding_with_no_location_or_fix() {
         severity: super::wit_types::Severity::Warning,
         message: "minor issue".to_owned(),
         location: None,
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     };
@@ -1100,6 +1102,7 @@ fn make_big_struct_finding(path: &str) -> Finding {
             line: Some(1),
             column: None,
         }),
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }

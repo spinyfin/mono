@@ -172,7 +172,10 @@ fn locationless_summary_lines(results: &[CheckResult]) -> Vec<String> {
                     // message can't blow the overall summary size on its own.
                     let collapsed = finding.message.split_whitespace().collect::<Vec<_>>().join(" ");
                     let message = truncate_chars(&collapsed, MAX_SUMMARY_BULLET_MESSAGE_CHARS);
-                    format!("- `{}`: {message}", result.check_id)
+                    match finding.surface {
+                        Some(surface) => format!("- `{}` {}: {message}", result.check_id, surface.render_label()),
+                        None => format!("- `{}`: {message}", result.check_id),
+                    }
                 })
         })
         .collect();
@@ -402,7 +405,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use super::*;
-    use crate::output::{Finding, Location, Severity};
+    use crate::output::{Finding, Location, Severity, Surface};
 
     fn finding(severity: Severity, message: &str, file: &str, line: Option<u32>, column: Option<u32>) -> Finding {
         Finding {
@@ -414,6 +417,7 @@ mod tests {
                 line,
                 column,
             }),
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }
@@ -425,6 +429,7 @@ mod tests {
             severity,
             message: message.to_owned(),
             location: None,
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }
@@ -544,6 +549,20 @@ mod tests {
             summary,
             "checkleft found 2 findings: 2 errors, 0 warnings, 0 notices.\n\n\
              - `boss/no-boss-isms`: PR description leaks a work-item id"
+        );
+    }
+
+    #[test]
+    fn summary_bullet_includes_surface_label_for_changeset_scoped_finding() {
+        let mut finding = finding_no_location(Severity::Error, "PR description leaks a work-item id");
+        finding.surface = Some(Surface::PrDescription);
+        let results = vec![result("boss/no-boss-isms", vec![finding])];
+        let counts = count_findings(&results);
+        let summary = output_summary(counts, &results);
+        assert_eq!(
+            summary,
+            "checkleft found 1 finding: 1 error, 0 warnings, 0 notices.\n\n\
+             - `boss/no-boss-isms` <pr description>: PR description leaks a work-item id"
         );
     }
 

@@ -81,16 +81,16 @@ Any check instance or repo configured with a broad `**` or `*` exclusion would s
 [annot] virtual(no line) -> path="<pr-description>" start_line=1 col=None
 ```
 
-| Surface                     | Bare locationless                             | Synthetic path (if it survived scoping)               |
-| --------------------------- | --------------------------------------------- | ----------------------------------------------------- |
-| Terminal (`render_finding`) | renders; location shows as `--> <unknown>`    | renders; location shows as `--> <pr-description>`     |
-| `--format=json`             | renders faithfully with `location: null`      | renders with the synthetic path                       |
-| Exit code                   | counted; an error finding still fails the run | counted                                               |
-| SARIF results               | **dropped** — 0 results _and_ 0 rules         | 1 result, `artifactLocation.uri` = the synthetic path |
-| Check-run annotations       | **dropped** — 0 annotations                   | 1 annotation with `path` = the synthetic path         |
-| Check-run conclusion        | still `failure`                               | `failure`                                             |
-| Check-run summary counts    | counted — "1 finding: 1 error"                | counted                                               |
-| GHA workflow commands       | **dropped**                                   | `::error file=<pr-description>,line=1,…`              |
+| Surface                     | Bare locationless                                                                                                                                                               | Synthetic path (if it survived scoping)               |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| Terminal (`render_finding`) | renders; location shows as `--> <unknown>`, or `--> <pr description>` / `--> <commit message>` once the finding's `surface` field is set (implemented after this investigation) | renders; location shows as `--> <pr-description>`     |
+| `--format=json`             | renders faithfully with `location: null`                                                                                                                                        | renders with the synthetic path                       |
+| Exit code                   | counted; an error finding still fails the run                                                                                                                                   | counted                                               |
+| SARIF results               | **dropped** — 0 results _and_ 0 rules                                                                                                                                           | 1 result, `artifactLocation.uri` = the synthetic path |
+| Check-run annotations       | **dropped** — 0 annotations                                                                                                                                                     | 1 annotation with `path` = the synthetic path         |
+| Check-run conclusion        | still `failure`                                                                                                                                                                 | `failure`                                             |
+| Check-run summary counts    | counted — "1 finding: 1 error"                                                                                                                                                  | counted                                               |
+| GHA workflow commands       | **dropped**                                                                                                                                                                     | `::error file=<pr-description>,line=1,…`              |
 
 The check-run row is the important asymmetry, and it is worth stating plainly. A run whose only finding is locationless posts a **red check with no visible explanation**:
 
@@ -130,7 +130,7 @@ The GHA workflow-command path has no such problem: `escape_workflow_property` en
 
 A path-shaped alternative such as `.checkleft/pr-description` would avoid the URI question entirely. It does not avoid Findings 1–3.
 
-Note also that the terminal renderer already prints `<unknown>` for a locationless finding, so angle-bracket pseudo-syntax is established in checkleft's _human_ output. That precedent does not extend to machine surfaces that expect real paths.
+Note also that the terminal renderer already prints `<unknown>` for a locationless finding, so angle-bracket pseudo-syntax is established in checkleft's _human_ output. That precedent does not extend to machine surfaces that expect real paths. (Implemented after this investigation: a locationless finding can carry a `surface` field naming the PR description or commit message as a human-readable identifier — not a path — so `<unknown>` renders as `<pr description>` / `<commit message>` instead; see `Finding::on_surface` in the check SDK.)
 
 ## Recommendation for the changeset-scheduling task
 

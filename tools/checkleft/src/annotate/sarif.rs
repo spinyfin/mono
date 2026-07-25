@@ -129,6 +129,7 @@ mod tests {
                 line,
                 column: col,
             }),
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }
@@ -140,6 +141,7 @@ mod tests {
             severity,
             message: msg.to_owned(),
             location: None,
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }

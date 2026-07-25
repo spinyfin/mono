@@ -2177,11 +2177,11 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         style.paint_message(&message)
     ));
 
-    let location = finding
-        .location
-        .as_ref()
-        .map(format_location)
-        .unwrap_or_else(|| "<unknown>".to_owned());
+    let location = match (finding.location.as_ref(), finding.surface) {
+        (Some(location), _) => format_location(location),
+        (None, Some(surface)) => surface.render_label().to_owned(),
+        (None, None) => "<unknown>".to_owned(),
+    };
     out.push_str(&format!("  --> {location}\n"));
 
     if let Some(ref path) = dump_path {

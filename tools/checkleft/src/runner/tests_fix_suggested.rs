@@ -137,6 +137,7 @@ fn finding_with_fix(file: &str, line: Option<u32>, old_text: &str, new_text: &st
             line,
             column: None,
         }),
+        surface: None,
         remediations: vec![],
         suggested_fix: Some(SuggestedFix {
             description: "auto-fix".to_owned(),
@@ -195,6 +196,7 @@ fn apply_suggested_fixes_refuses_non_unique_without_position() {
                 line: None,
                 column: None,
             }),
+            surface: None,
             remediations: vec![],
             suggested_fix: Some(SuggestedFix {
                 description: "fix".to_owned(),
@@ -281,6 +283,7 @@ fn apply_suggested_fixes_refused_edit_does_not_block_other_files() {
                     line: None,
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![],
                 suggested_fix: Some(SuggestedFix {
                     description: "fix a".to_owned(),
@@ -301,6 +304,7 @@ fn apply_suggested_fixes_refused_edit_does_not_block_other_files() {
                     line: None,
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![],
                 suggested_fix: Some(SuggestedFix {
                     description: "fix b".to_owned(),

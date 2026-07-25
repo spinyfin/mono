@@ -287,6 +287,7 @@ fn analyze_file(changed_file: &ChangedFile, changeset: &ChangeSet) -> FileAnalys
                     line: None,
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             };
@@ -474,6 +475,7 @@ fn broken_target_finding(
             line: Some(block.ifchange_line as u32),
             column: Some(1),
         }),
+        surface: None,
         remediations: vec![
             "Update the linked file or block in the same change, or bypass the check with a documented reason."
                 .to_owned(),
@@ -809,6 +811,7 @@ fn evaluate_coupling(coupling: &Coupling, changeset: &ChangeSet) -> Vec<Finding>
                 line: None,
                 column: None,
             }),
+            surface: None,
             remediations: vec![remediation.clone()],
             suggested_fix: None,
         })
@@ -829,6 +832,7 @@ fn config_error_finding(detail: &str) -> Finding {
         severity: Severity::Error,
         message: format!("ifchange config error: {detail}"),
         location: None,
+        surface: None,
         remediations: vec!["Fix the check configuration in the CHECKS file.".to_owned()],
         suggested_fix: None,
     }
