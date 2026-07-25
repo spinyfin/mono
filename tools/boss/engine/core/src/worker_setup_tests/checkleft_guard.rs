@@ -74,14 +74,20 @@ fn remote_workers_omit_checkleft_push_guard() {
 fn checkleft_push_guard_script_has_the_load_bearing_logic() {
     // Guard against an accidental edit that guts the script. The gate
     // hinges on: detecting a push command, resolving checkleft (env
-    // override → bin/checkleft → PATH), running `checkleft run`, gating
-    // on the exit code, and surfacing the BYPASS_ guidance on a block.
+    // override → repobin exec → bin/checkleft → PATH), running
+    // `checkleft run`, gating on the exit code, and surfacing the
+    // BYPASS_ guidance on a block.
     let s = CHECKLEFT_PUSH_GUARD_SCRIPT;
     assert!(s.contains("is_push_command"), "must detect push commands");
     assert!(s.contains("BOSS_CHECKLEFT_BIN"), "must honour the binary override");
     assert!(
+        s.contains("resolve_repobin") && s.contains("\"exec\""),
+        "must prefer dispatching through `repobin exec checkleft` so the gate never \
+         runs a stale checkleft resolved from a bare PATH lookup",
+    );
+    assert!(
         s.contains("bin") && s.contains("checkleft"),
-        "must resolve the repobin-installed checkleft path",
+        "must fall back to the repobin-installed checkleft path",
     );
     assert!(s.contains("returncode"), "must gate on checkleft's exit code");
     assert!(
@@ -213,6 +219,137 @@ fn run_push_guard(command: &str, cwd: &Path, checkleft_bin: &Path) -> serde_json
             String::from_utf8_lossy(&out.stderr),
         )
     })
+}
+
+/// Directory containing the `python3` resolvable via the current process's
+/// `PATH`. Overriding `PATH` for the guard subprocess (to control what
+/// `shutil.which` sees) would otherwise also break Rust's own executable
+/// lookup for `Command::new("python3")`, since that lookup is performed
+/// against the *child's* env, not the test process's ambient one.
+fn python3_dir() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH must be set for tests");
+    std::env::split_paths(&path)
+        .find(|dir| dir.join("python3").is_file())
+        .expect("python3 must be resolvable on PATH")
+}
+
+/// Like [`run_push_guard`] but does not set `BOSS_CHECKLEFT_BIN`, exercising
+/// the repobin/PATH-based resolution chain instead. `path_dirs` are
+/// prepended (in order) to a `PATH` built for the guard subprocess, so
+/// callers can plant fake `repobin`/`checkleft` binaries to observe which
+/// one the guard picks.
+fn run_push_guard_resolving(command: &str, cwd: &Path, path_dirs: &[&Path]) -> serde_json::Value {
+    use std::io::Write as _;
+    let script_dir = TempDir::new().unwrap();
+    let script_path = script_dir.path().join(CHECKLEFT_PUSH_GUARD_SCRIPT_NAME);
+    std::fs::write(&script_path, CHECKLEFT_PUSH_GUARD_SCRIPT).unwrap();
+
+    let payload = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "cwd": cwd.display().to_string(),
+    })
+    .to_string();
+
+    // Fake checkleft/repobin scripts are `#!/bin/sh` scripts that use basic
+    // shell builtins/utilities (`cat`, `printf`) -- include the standard
+    // system dirs so those resolve, alongside python3's own dir. Neither
+    // `/bin` nor `/usr/bin` will ever contain a `checkleft` or `repobin`
+    // binary, so this does not undermine what's being isolated.
+    let mut dirs: Vec<PathBuf> = path_dirs.iter().map(|p| p.to_path_buf()).collect();
+    dirs.push(python3_dir());
+    dirs.push(PathBuf::from("/bin"));
+    dirs.push(PathBuf::from("/usr/bin"));
+    let path_var = std::env::join_paths(&dirs).unwrap();
+
+    let mut child = std::process::Command::new("python3")
+        .arg(&script_path)
+        .env_remove("BOSS_CHECKLEFT_BIN")
+        .env("PATH", &path_var)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!(
+            "push guard produced invalid JSON for {command:?}: {e}\nstdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr),
+        )
+    })
+}
+
+/// Write an executable fake `repobin` under `bin_dir` that records the argv
+/// it was called with (one arg per line) into `argv_out`, then exits 0 with
+/// no output — modelling a clean `repobin exec checkleft run`.
+fn write_fake_repobin_recording_argv(bin_dir: &Path, argv_out: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin_dir).unwrap();
+    let path = bin_dir.join("repobin");
+    let script = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nexit 0\n",
+        shell_quote(&argv_out.display().to_string())
+    );
+    std::fs::write(&path, script).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+#[test]
+fn push_guard_dispatches_through_repobin_exec_when_repobin_is_installed() {
+    // A `repobin` binary at `<repo-root>/bin/repobin` must be preferred over
+    // any direct `checkleft` lookup -- this is the fix for the fleet-wide
+    // "unknown implementation" failures caused by a stale `checkleft`
+    // resolved from a bare PATH search (e.g. an old `cargo install
+    // checkleft`). Verify the guard actually shells out to
+    // `repobin exec checkleft run`, not some other invocation shape.
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    let argv_out = dir.path().join("argv.txt");
+    write_fake_repobin_recording_argv(&bin_dir, &argv_out);
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[]);
+    assert_eq!(
+        decision["decision"], "approve",
+        "a clean repobin-dispatched checkleft must allow the push: {decision}"
+    );
+
+    let argv = std::fs::read_to_string(&argv_out).expect("fake repobin must have recorded its argv");
+    let args: Vec<&str> = argv.lines().collect();
+    assert_eq!(
+        args,
+        vec!["exec", "checkleft", "run"],
+        "guard must dispatch via `repobin exec checkleft run`: {argv:?}"
+    );
+}
+
+#[test]
+fn push_guard_falls_back_to_repo_root_checkleft_when_no_repobin_found() {
+    // Repos without repobin (or a repobin not yet installed in this
+    // workspace) must still get the legacy `<repo-root>/bin/checkleft`
+    // resolution -- this fix must not regress that path.
+    let dir = TempDir::new().unwrap();
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let checkleft = write_fake_checkleft(&bin_dir, "checkleft", 1, "error[rustfmt]: needs formatting");
+    assert!(checkleft.starts_with(&bin_dir));
+
+    let decision = run_push_guard_resolving("jj git push -b boss/foo --allow-new", dir.path(), &[]);
+    assert_eq!(
+        decision["decision"], "block",
+        "must fall back to `<repo-root>/bin/checkleft` when no repobin is found: {decision}"
+    );
+    assert!(
+        decision["reason"].as_str().unwrap_or("").contains("error[rustfmt]"),
+        "block reason must come from the repo-root checkleft: {decision}"
+    );
 }
 
 #[test]

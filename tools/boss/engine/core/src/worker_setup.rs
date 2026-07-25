@@ -1066,9 +1066,25 @@ if __name__ == "__main__":
 /// behaviour means repos without convention checks are transparently
 /// allowed.
 ///
-/// The checkleft binary is resolved from (in order) `BOSS_CHECKLEFT_BIN`
-/// (an override used by tests), `<repo-root>/bin/checkleft` (the
-/// repobin-installed path), then a `checkleft` on `PATH`.
+/// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
+/// (an override used by tests, used as-is); `repobin exec checkleft` via a
+/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH` (repobin
+/// always rebuilds checkleft fresh from the current source tree per
+/// `REPOBIN.toml`, so this can never run a stale binary — see below);
+/// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
+/// bare `checkleft` on `PATH`.
+///
+/// repobin is preferred over a direct `checkleft` lookup because a bare
+/// `checkleft` on `PATH` can silently resolve to an unrelated, stale build —
+/// e.g. an old `cargo install checkleft` from crates.io — that predates
+/// checks the repo's current `CHECKS.yaml` configures. That binary still
+/// runs and still exits non-zero, so the gate does not fail open; it fails
+/// *closed* with `error[...]: configured check references unknown
+/// implementation`, blocking every push. `repobin exec` sidesteps this
+/// entirely: it dispatches through the same build-from-source path an
+/// interactive worker gets when it types `checkleft` at a shell backed by a
+/// `repobin`-installed symlink, so the gate always runs the exact checkleft
+/// the current workspace's source tree defines.
 const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Deterministic pre-push checkleft gate (Claude Code PreToolUse hook).
 
@@ -1087,9 +1103,16 @@ checkleft all approve -- so the gate can never wedge a session; its only
 deterministic action is to block a push that checkleft itself rejected.
 
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
-stdout. The checkleft binary is resolved from (in order) the BOSS_CHECKLEFT_BIN
-env var, `<repo-root>/bin/checkleft` (the repobin-installed path), and a
-`checkleft` on PATH.
+stdout. The checkleft invocation is resolved from (in order) the
+BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
+`repobin` found at `<repo-root>/bin/repobin` or on PATH, `<repo-root>/bin/checkleft`
+(a repobin-installed tool symlink), and finally a bare `checkleft` on PATH.
+repobin is preferred over a direct checkleft lookup because it always rebuilds
+checkleft fresh from the current source tree (per REPOBIN.toml) instead of
+trusting whatever binary happens to sit on PATH -- which can be a stale,
+unrelated build (e.g. an old `cargo install checkleft`) that runs, exits
+non-zero, and blocks every push with "unknown implementation" errors for
+checks it predates.
 """
 import json
 import os
@@ -1099,9 +1122,11 @@ import shutil
 import subprocess
 import sys
 
-# Warm-cache checkleft runs are seconds; cap the wait so a wedged checkleft can
-# never hang a push attempt. On timeout we fail open (approve) rather than
-# strand the session -- the cube verb gates are the belt for that rare case.
+# Warm-cache checkleft runs (including a `repobin exec` dispatch, which is a
+# no-op bazel build when the binary is already up to date) are seconds; cap
+# the wait so a wedged checkleft/bazel invocation can never hang a push
+# attempt. On timeout we fail open (approve) rather than strand the session
+# -- the cube verb gates are the belt for that rare case.
 CHECKLEFT_TIMEOUT_SECONDS = 240
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
@@ -1168,14 +1193,38 @@ def find_repo_root(start):
         cur = parent
 
 
-def resolve_checkleft(root):
-    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
-    if override:
-        return override if os.path.exists(override) else None
-    candidate = os.path.join(root, "bin", "checkleft")
+def resolve_repobin(root):
+    candidate = os.path.join(root, "bin", "repobin")
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
         return candidate
-    return shutil.which("checkleft")
+    return shutil.which("repobin")
+
+
+def resolve_checkleft_command(root):
+    """Return the argv prefix that runs checkleft's `run` subcommand.
+
+    Preferred over a bare `checkleft` lookup: `repobin exec checkleft`
+    dispatches through repobin's normal build-from-source path (per
+    REPOBIN.toml), so it can never run a binary older than the current
+    source tree. A plain PATH search for `checkleft` has no such
+    guarantee -- it can resolve an unrelated, stale build (e.g. an old
+    `cargo install checkleft`) that still runs and still exits non-zero,
+    which fails the gate *closed* with "unknown implementation" errors
+    for every check added since that build, rather than failing open.
+    """
+    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
+    if override:
+        return [override] if os.path.exists(override) else None
+
+    repobin = resolve_repobin(root)
+    if repobin:
+        return [repobin, "exec", "checkleft"]
+
+    candidate = os.path.join(root, "bin", "checkleft")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return [candidate]
+    which = shutil.which("checkleft")
+    return [which] if which else None
 
 
 def main():
@@ -1198,14 +1247,14 @@ def main():
 
     cwd = payload.get("cwd") or os.getcwd()
     root = find_repo_root(cwd)
-    checkleft = resolve_checkleft(root)
-    if not checkleft:
+    checkleft_cmd = resolve_checkleft_command(root)
+    if not checkleft_cmd:
         # No checkleft available -> nothing to enforce (repo may not use it).
         emit("approve")
 
     try:
         proc = subprocess.run(
-            [checkleft, "run"],
+            checkleft_cmd + ["run"],
             cwd=root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
