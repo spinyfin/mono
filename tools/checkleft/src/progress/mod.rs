@@ -255,6 +255,7 @@ mod tests {
                 line: None,
                 column: None,
             }),
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }

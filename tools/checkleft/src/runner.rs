@@ -325,6 +325,7 @@ impl Runner {
                                 line: None,
                                 column: None,
                             }),
+                            surface: None,
                             remediations: vec![
                                 "Register this check implementation in the binary or fix `check = ...` in CHECKS.yaml."
                                     .to_owned(),
@@ -432,6 +433,7 @@ impl Runner {
                                 line: None,
                                 column: None,
                             }),
+                            surface: None,
                             remediations: remediation.into_iter().collect(),
                             suggested_fix: None,
                         }],
@@ -465,6 +467,7 @@ impl Runner {
                             severity: Severity::Error,
                             message: format!("check execution failed: {err:#}"),
                             location: None,
+                            surface: None,
                             remediations: vec![],
                             suggested_fix: None,
                         }],
@@ -589,6 +592,7 @@ impl Runner {
                                 line,
                                 column: None,
                             }),
+                            surface: None,
                             remediations: vec![format!(
                                 "Remove `{}` from this check's exclusions in {}.",
                                 exclusion.entry,
@@ -690,6 +694,7 @@ impl Runner {
                                 line,
                                 column: None,
                             }),
+                            surface: None,
                             remediations: vec![format!(
                                 "Remove `{}` from this check's exclusions in {}.",
                                 exclusion.entry,
@@ -1398,6 +1403,7 @@ fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
             severity: Severity::Error,
             message: diagnostic.message.clone(),
             location: Some(diagnostic.location.clone()),
+            surface: None,
             remediations: diagnostic.remediation.iter().cloned().collect(),
             suggested_fix: None,
         }],

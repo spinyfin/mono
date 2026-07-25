@@ -87,9 +87,15 @@
 //! synthetic path (e.g. `<pr-description>`) would be dropped before it ever
 //! reached an output surface. Locationless findings are the one shape the
 //! framework explicitly preserves for a non-file subject; see the
-//! investigation doc above for the full analysis.
+//! investigation doc above for the full analysis. Each locationless finding
+//! from this check also carries a `surface` (`Surface::PrDescription` /
+//! `Surface::CommitMessage` from the check SDK, aliased here as
+//! `FindingSurface` to avoid colliding with this module's own `Surface`
+//! config enum) naming which changeset text it came from, so
+//! human-readable output renders `<pr description>` / `<commit message>`
+//! instead of `<unknown>`.
 
-use checkleft_check_sdk::{ChangeKind, ChangeSet, CheckInput, Finding, Severity, check};
+use checkleft_check_sdk::{ChangeKind, ChangeSet, CheckInput, Finding, Severity, Surface as FindingSurface, check};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -120,7 +126,14 @@ impl ChangesetSource {
     fn label(self) -> &'static str {
         match self {
             ChangesetSource::PrDescription => "PR description",
-            ChangesetSource::CommitDescription => "commit description",
+            ChangesetSource::CommitDescription => "commit message",
+        }
+    }
+
+    fn surface(self) -> FindingSurface {
+        match self {
+            ChangesetSource::PrDescription => FindingSurface::PrDescription,
+            ChangesetSource::CommitDescription => FindingSurface::CommitMessage,
         }
     }
 }
@@ -258,7 +271,7 @@ fn scan_changeset_text(text: &str, source: ChangesetSource, patterns: &[Compiled
         let line_number = index + 1;
         for pattern in patterns {
             for m in pattern.regex.find_iter(line) {
-                let finding = pattern.finding().with_remediation(format!(
+                let finding = pattern.finding().on_surface(source.surface()).with_remediation(format!(
                     "matched forbidden pattern `{}` in {} (line {line_number}): `{}`",
                     pattern.name,
                     source.label(),
@@ -578,6 +591,7 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].message, "Internal work-item ids must not leak.");
         assert!(findings[0].location.is_none());
+        assert_eq!(findings[0].surface, Some(FindingSurface::PrDescription));
         assert!(findings[0].remediations[0].contains("PR description"));
     }
 
@@ -591,7 +605,8 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert!(findings[0].location.is_none());
-        assert!(findings[0].remediations[0].contains("commit description"));
+        assert_eq!(findings[0].surface, Some(FindingSurface::CommitMessage));
+        assert!(findings[0].remediations[0].contains("commit message"));
         assert!(findings[0].remediations[0].contains("line 3"));
     }
 

@@ -45,6 +45,7 @@ impl ConfiguredCheck for StaticFindingCheck {
                     line: Some(1),
                     column: Some(1),
                 }),
+                surface: None,
                 remediations: self.remediation.iter().cloned().collect(),
                 suggested_fix: None,
             }],

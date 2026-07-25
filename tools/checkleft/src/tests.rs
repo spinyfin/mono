@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
+use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix, Surface};
 
 use checkleft::change_detection::environment::CiEnvironment;
 
@@ -30,6 +30,7 @@ fn human_output_includes_line_and_column() {
                     line: Some(12),
                     column: Some(5),
                 }),
+                surface: None,
                 remediations: vec!["Replace typo.".to_owned()],
                 suggested_fix: None,
             }],
@@ -59,6 +60,7 @@ fn human_output_omits_ansi_when_color_is_disabled() {
                     line: Some(200),
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![],
                 suggested_fix: Some(SuggestedFix {
                     description: "Split file by module.".to_owned(),
@@ -82,6 +84,58 @@ fn human_output_omits_ansi_when_color_is_disabled() {
 }
 
 #[test]
+fn human_output_renders_surface_for_changeset_scoped_finding() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "text/forbidden-pattern".to_owned(),
+            findings: vec![
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "Do not reference the brief in the PR description.".to_owned(),
+                    location: None,
+                    surface: Some(Surface::PrDescription),
+                    remediations: vec!["matched forbidden pattern `boss-brief-reference`".to_owned()],
+                    suggested_fix: None,
+                },
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "Do not reference the brief in the commit message.".to_owned(),
+                    location: None,
+                    surface: Some(Surface::CommitMessage),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+            ],
+        }],
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("  --> <pr description>\n"));
+    assert!(output.contains("  --> <commit message>\n"));
+}
+
+#[test]
+fn human_output_renders_unknown_for_locationless_finding_without_surface() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "some-check".to_owned(),
+            findings: vec![make_finding_no_location(Severity::Error)],
+        }],
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("  --> <unknown>\n"));
+}
+
+#[test]
 fn human_output_message_is_bold_when_color_enabled() {
     let output = render_human_results(
         &[CheckResult {
@@ -91,6 +145,7 @@ fn human_output_message_is_bold_when_color_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -117,6 +172,7 @@ fn human_output_help_body_uses_256_gray_when_color256_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -140,6 +196,7 @@ fn human_output_help_body_uses_truecolor_gray_when_truecolor_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -163,6 +220,7 @@ fn human_output_multi_line_remediation_renders_as_bullets() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![
                     "Do option A.".to_owned(),
                     "Do option B.".to_owned(),
@@ -194,6 +252,7 @@ fn human_output_multi_line_remediation_uses_circle_bullet_when_color_enabled() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -218,6 +277,7 @@ fn finding_with_multiple_remediations_renders_as_bullet_list() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -243,6 +303,7 @@ fn finding_with_multiple_remediations_uses_circle_bullet_when_color_enabled() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -267,6 +328,7 @@ fn finding_with_single_remediation_renders_inline() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix the issue.".to_owned()],
                 suggested_fix: None,
             }],
@@ -292,6 +354,7 @@ fn human_output_check_id_is_gray_when_color_enabled() {
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -316,6 +379,7 @@ fn human_output_check_id_is_plain_when_color_disabled() {
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -356,6 +420,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -367,6 +432,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -389,6 +455,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -397,6 +464,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Info,
                 message: "info finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -405,6 +473,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -683,6 +752,7 @@ fn snapshot_results() -> Vec<CheckResult> {
                 line: Some(3),
                 column: Some(5),
             }),
+            surface: None,
             remediations: vec!["Fix it.".to_owned()],
             suggested_fix: None,
         }],
@@ -890,6 +960,7 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
             severity: Severity::Error,
             message: huge_message.clone(),
             location: None,
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }],
@@ -928,6 +999,7 @@ fn make_finding(severity: Severity, path: &str) -> Finding {
             line: None,
             column: None,
         }),
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }
@@ -939,6 +1011,7 @@ fn make_finding_no_location(severity: Severity) -> Finding {
         severity,
         message: "no location".to_owned(),
         location: None,
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }
@@ -1480,6 +1553,7 @@ fn make_fixable_finding(severity: Severity, path: &str) -> Finding {
             line: None,
             column: None,
         }),
+        surface: None,
         remediations: vec!["Run `checkleft fix` to apply this automatically.".to_owned()],
         suggested_fix: None,
     }

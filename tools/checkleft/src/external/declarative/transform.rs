@@ -182,6 +182,7 @@ impl FindingTemplate {
             severity,
             message,
             location: Some(Location { path, line, column }),
+            surface: None,
             remediations,
             suggested_fix: None,
         })
@@ -271,6 +272,7 @@ impl LineListTransform {
                         line: None,
                         column: None,
                     }),
+                    surface: None,
                     remediations,
                     suggested_fix: None,
                 })

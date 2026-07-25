@@ -44,6 +44,7 @@ impl ConfiguredCheck for ChangesetInspectingCheck {
                 severity: Severity::Error,
                 message: "PR description leaks a work-item id".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             });

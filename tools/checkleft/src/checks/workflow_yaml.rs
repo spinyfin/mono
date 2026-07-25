@@ -89,6 +89,7 @@ pub(super) fn yaml_parse_finding(changed_file: &ChangedFile, message: String, re
             line: None,
             column: None,
         }),
+        surface: None,
         remediations: vec![remediation.to_owned()],
         suggested_fix: None,
     }
