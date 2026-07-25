@@ -277,9 +277,12 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            invocation on a timeout but the push had actually landed), it\n\
            returns that PR's URL instead of erroring. Use `cube pr update`\n\
            only when you have new commits to push onto an already-open PR;\n\
-           it errors if none does. Check first with:\n\
-           `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
-           or `gh pr view`.\n\
+           it errors if none does. Check first with `boss context` — it\n\
+           prints `PR URL` under **Your task** when Boss already has one on\n\
+           record for this work item. If no `PR URL` line appears, Boss has\n\
+           none recorded; `cube pr create` is safe to run in that case and\n\
+           returns the existing PR's URL if one already exists for your\n\
+           branch.\n\
          - Do not hard-wrap PR bodies.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
