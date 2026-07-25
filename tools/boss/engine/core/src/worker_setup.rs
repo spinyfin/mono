@@ -1135,15 +1135,20 @@ import sys
 # contention. Budget generously for it since it runs at most once per push
 # (repobin's dispatch cache is content-hash keyed, so a warm cache after the
 # probe means the subsequent `run` invocation below hits it too). On timeout
-# we fail open (approve) rather than strand the session -- the cube verb
-# gates are the belt for that rare case.
+# the probe is treated as failed and resolution falls through to the legacy
+# bin/checkleft / PATH lookup -- it does NOT fail open, since a fallback
+# checkleft may still exist and would otherwise be skipped for no reason.
 CHECKLEFT_PROBE_TIMEOUT_SECONDS = 240
 
 # Once the probe above has (if needed) warmed the dispatch cache, the actual
-# `checkleft run` is a fast, already-built invocation -- the PR's own
-# measurements put it at 85-95s -- so this budget stays tight and meaningful
-# instead of being swallowed by a build it no longer has to pay for.
-CHECKLEFT_TIMEOUT_SECONDS = 150
+# `checkleft run` is a fast, already-built invocation -- measured at 85-95s on
+# this repo -- but this budget is kept well above that measurement (roughly
+# 3x headroom) rather than trimmed close to it, because a run timeout takes
+# the fail-open path below and silently approves an unchecked push, which is
+# exactly the outcome this gate exists to prevent. On timeout we fail open
+# (approve) rather than strand the session -- the cube verb gates are the
+# belt for that rare case.
+CHECKLEFT_TIMEOUT_SECONDS = 300
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DELIMS = {"&&", "||", ";", "|", "&"}
