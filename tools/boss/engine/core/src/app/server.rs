@@ -1341,7 +1341,15 @@ pub async fn serve_with_merge_probe(
     // printed the error, ended its turn, and sits Idle while the chore
     // is unfinished) and auto-resumes them on the same workspace with
     // bounded retries + backoff, escalating non-retryable / cap-reached
-    // failures for human attention. Runs every 60s and fires on boot.
+    // failures for human attention. Runs every 60s and fires on boot;
+    // also subscribes to `TransientErrorIdle` (published by
+    // `events_socket.rs`'s hook-ingress path on a `Stop` hook whose
+    // transcript trails an API error) so a stalled worker gets nudged
+    // the moment the hook fires instead of waiting for the next tick —
+    // the 60s sweep remains the backstop for any dropped event.
+    let transient_error_idle = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::TransientErrorIdle));
     let _transient_recovery_handle = crate::transient_recovery::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
@@ -1349,6 +1357,7 @@ pub async fn serve_with_merge_probe(
         server_state.dispatch_events.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::WorkerNudger>,
         crate::transient_recovery::DEFAULT_INTERVAL,
+        transient_error_idle,
     );
 
     // Periodic abandoned-branch-PR reconciler: catches a terminated worker
