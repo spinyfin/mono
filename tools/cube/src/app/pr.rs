@@ -130,11 +130,16 @@ fn jj_is_empty(runner: &dyn CommandRunner, cwd: &Path, revision: &str) -> Result
 
 /// Push the branch to the github.com remote and verify the push reached
 /// GitHub (not just a local mirror).
-fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<()> {
+///
+/// `pr_description` is the PR body text about to be submitted (from
+/// `--body`/`--body-file`), when the caller has one to check — see
+/// [`run_checkleft_gate`] for why this must be resolved and passed in
+/// *before* the push, not looked up afterward.
+fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_description: Option<&str>) -> Result<()> {
     // Run checkleft against the outgoing changes before pushing. Refuses
     // (with the findings) if checkleft reports errors — no PR push reaches
     // GitHub with a known convention violation.
-    run_checkleft_gate(&ctx.cwd)?;
+    run_checkleft_gate(&ctx.cwd, pr_description)?;
 
     // --allow-new is idempotent: fine when the remote bookmark already exists.
     // --ignore-working-copy: we push the named `ctx.branch` bookmark, an
@@ -214,9 +219,55 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
         .map(str::to_string))
 }
 
+/// The PR body cube is about to submit, resolved once up front from
+/// whichever of `--body`/`--body-file` was supplied (or neither).
+///
+/// Resolving this once — rather than letting [`gh_create_pr`] re-derive it
+/// from `args` — matters for two reasons: (1) `--body-file` pointing at
+/// stdin/a pipe can only be read once, and (2) the checkleft push-gate needs
+/// the same text the PR is about to be created with, checked *before* the
+/// push, not re-read afterward.
+struct ResolvedPrBody {
+    /// Full body text, for the checkleft gate. `None` when neither --body
+    /// nor --body-file was supplied.
+    text: Option<String>,
+    /// Concrete file path to pass to `gh pr create --body-file`, when the
+    /// body came from --body-file (already materialised if it was a
+    /// stdin/pipe source — see [`resolve_body_file`]).
+    file_path: Option<String>,
+    /// Temp file created to materialise a piped body source, if any. The
+    /// caller must delete it after the `gh` subprocess exits.
+    tmp_path: Option<PathBuf>,
+}
+
+/// Resolve the PR body cube is about to submit from `--body`/`--body-file`.
+fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
+    if let Some(f) = &args.body_file {
+        let (resolved, tmp) = resolve_body_file(f)?;
+        let text = std::fs::read_to_string(&resolved).map_err(CubeError::Io)?;
+        return Ok(ResolvedPrBody {
+            text: Some(text),
+            file_path: Some(resolved),
+            tmp_path: tmp,
+        });
+    }
+    Ok(ResolvedPrBody {
+        text: args.body.clone(),
+        file_path: None,
+        tmp_path: None,
+    })
+}
+
 /// Open a new PR for `ctx.branch` via `gh pr create -R <owner/repo>` and
-/// return its URL.
-fn gh_create_pr(args: &PrCreateArgs, ctx: &PrContext, runner: &dyn CommandRunner) -> Result<String> {
+/// return its URL. `body` is the already-resolved PR body from
+/// [`resolve_pr_body`] — this must not re-read `args.body_file` itself,
+/// since a stdin/pipe source can only be consumed once.
+fn gh_create_pr(
+    args: &PrCreateArgs,
+    ctx: &PrContext,
+    runner: &dyn CommandRunner,
+    body: &ResolvedPrBody,
+) -> Result<String> {
     let mut create_args: Vec<&str> = vec![
         "pr",
         "create",
@@ -228,30 +279,17 @@ fn gh_create_pr(args: &PrCreateArgs, ctx: &PrContext, runner: &dyn CommandRunner
         "main",
     ];
     let title_ref;
-    let body_ref;
-    // Materialised path for --body-file (may differ from the original when
-    // the source was stdin / a pipe).  Keep `tmp_body_path` alive until after
-    // the gh subprocess exits so the temp file isn't deleted underneath it.
-    let body_file_resolved;
-    let tmp_body_path: Option<PathBuf>;
     if let Some(ref t) = args.title {
         title_ref = t.as_str();
         create_args.push("--title");
         create_args.push(title_ref);
     }
-    if let Some(ref b) = args.body {
-        body_ref = b.as_str();
-        create_args.push("--body");
-        create_args.push(body_ref);
-    }
-    if let Some(ref f) = args.body_file {
-        let (resolved, tmp) = resolve_body_file(f)?;
-        body_file_resolved = resolved;
-        tmp_body_path = tmp;
+    if let Some(ref f) = body.file_path {
         create_args.push("--body-file");
-        create_args.push(&body_file_resolved);
-    } else {
-        tmp_body_path = None;
+        create_args.push(f);
+    } else if let Some(ref t) = body.text {
+        create_args.push("--body");
+        create_args.push(t.as_str());
     }
     if args.draft {
         create_args.push("--draft");
@@ -264,7 +302,7 @@ fn gh_create_pr(args: &PrCreateArgs, ctx: &PrContext, runner: &dyn CommandRunner
     })?;
 
     // Clean up any temp file we created to materialise a piped body source.
-    if let Some(ref p) = tmp_body_path {
+    if let Some(ref p) = body.tmp_path {
         let _ = std::fs::remove_file(p);
     }
 
@@ -312,8 +350,9 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
         );
     }
 
-    push_branch_to_github(&ctx, runner)?;
-    let url = gh_create_pr(&args, &ctx, runner)?;
+    let body = resolve_pr_body(&args)?;
+    push_branch_to_github(&ctx, runner, body.text.as_deref())?;
+    let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
     let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
     RunResult::new(
@@ -326,6 +365,13 @@ pub(super) fn pr_create(args: PrCreateArgs, runner: &dyn CommandRunner) -> Resul
 ///
 /// Errors if no open PR exists for the branch — opening one is the job of
 /// `cube pr create`. Never creates a PR.
+///
+/// No PR body to check here: `PrUpdateArgs` has no `--body`/`--body-file` —
+/// this verb only pushes commits, it never changes the PR description. The
+/// checkleft gate is called with `pr_description: None`; this is not the
+/// `pr create` hole, because the PR already exists by the time this runs,
+/// so checkleft's own Level-3 branch→PR lookup resolves the real,
+/// already-published description via the GitHub API.
 pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Result<RunResult> {
     let ctx = resolve_pr_context(args.branch, runner)?;
 
@@ -341,7 +387,7 @@ pub(super) fn pr_update(args: PrUpdateArgs, runner: &dyn CommandRunner) -> Resul
         )));
     };
 
-    push_branch_to_github(&ctx, runner)?;
+    push_branch_to_github(&ctx, runner, None)?;
     let number = pr_number_from_url(&url);
     let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
     RunResult::new(
@@ -361,7 +407,8 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
     );
 
     let ctx = resolve_pr_context(args.branch.clone(), runner)?;
-    push_branch_to_github(&ctx, runner)?;
+    let body = resolve_pr_body(&args)?;
+    push_branch_to_github(&ctx, runner, body.text.as_deref())?;
 
     if let Some(url) = list_open_pr(&ctx, runner)? {
         let number = pr_number_from_url(&url);
@@ -372,7 +419,7 @@ pub(super) fn ensure_pr_deprecated(args: PrCreateArgs, runner: &dyn CommandRunne
         );
     }
 
-    let url = gh_create_pr(&args, &ctx, runner)?;
+    let url = gh_create_pr(&args, &ctx, runner, &body)?;
     let number = pr_number_from_url(&url);
     let pr_bookmark_name = set_pr_bookmark(runner, &ctx.cwd, number, &ctx.branch)?;
     RunResult::new(
@@ -565,8 +612,12 @@ pub(super) fn pr_push(args: PrPushArgs, runner: &dyn CommandRunner) -> Result<Ru
 
     // Run checkleft against the outgoing changes before either push path
     // (fast-forward or force-with-lease). Refuses with the findings when
-    // checkleft reports errors.
-    run_checkleft_gate(&cwd)?;
+    // checkleft reports errors. No PR body to pass here (`cube pr push`
+    // takes no --body/--body-file): the PR identified by `pr_number` above
+    // already exists, so checkleft's own branch/PR-number resolution finds
+    // the real, already-published description — same rationale as
+    // `cube pr update`.
+    run_checkleft_gate(&cwd, None)?;
 
     // For force-with-lease: skip the descendant check (lease verification is the safety instead).
     // For normal push: @ must be a descendant of pr/<n> (fast-forward enforcement).
