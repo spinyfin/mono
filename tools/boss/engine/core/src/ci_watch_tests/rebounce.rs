@@ -26,7 +26,7 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
         Some("feature-branch"),
         "synthetic-merge-sha-abc",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped, "rebounce detection must flip chore to ci_failure");
@@ -163,7 +163,7 @@ async fn rebounce_block_not_cleared_by_clean_head_branch_ci() {
         Some("feature-branch"),
         "synthetic-sha-xyz",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped);
@@ -218,7 +218,7 @@ async fn rebounce_block_not_cleared_by_inflight_head_branch_ci() {
         Some("feature-branch"),
         "synthetic-sha-inflight",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped);
@@ -278,7 +278,8 @@ async fn rebounce_does_not_flap_across_repeated_sweeps() {
     let mut bounce_count = 0;
     for cycle in 0..5 {
         // The rebounce pass re-sees the same dequeue event on every sweep.
-        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), sha, &[], &[]).await {
+        if on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), sha, &[], &one_failure()).await
+        {
             bounce_count += 1;
         }
         // The per-PR probe alternates between InFlight (supersede) and Clean
@@ -325,7 +326,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         Some("feature"),
         "sha-A",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     // Repeat for the same SHA (as would happen when the same dequeue event
@@ -337,7 +338,7 @@ async fn rebounce_detection_idempotent_on_same_sha() {
         Some("feature"),
         "sha-A",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(first, "first detection must flip the chore");
@@ -392,7 +393,7 @@ async fn rebounce_block_clears_after_worker_succeeds() {
         Some("feature"),
         "sha-Q",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
 

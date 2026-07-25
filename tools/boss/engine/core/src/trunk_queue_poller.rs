@@ -45,6 +45,7 @@
 //! conflict_watch / ci_watch".
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -55,6 +56,7 @@ use boss_trunk_client::{
 };
 
 use crate::coordinator::ExecutionPublisher;
+use crate::merge_poller::RequiredCheckFailure;
 use crate::metrics::Registry;
 use crate::trunk_merge::{TRUNK_INTENT_AWAITING_RESUBMIT, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT, trunk_repo_ref};
 use crate::work::{ActiveTrunkMergeIntent, PendingMergeCheck, WorkDb};
@@ -192,6 +194,11 @@ pub const TRUNK_QUEUE_NOT_RUNNING_ATTENTION_KIND: &str = "trunk_queue_not_runnin
 /// `work_attention_items.kind` for an entry that left the queue via
 /// cancellation rather than a merge or a test failure.
 pub const TRUNK_QUEUE_ENTRY_CANCELLED_ATTENTION_KIND: &str = "trunk_queue_entry_cancelled";
+/// `work_attention_items.kind` for an entry Trunk evicted *before testing*,
+/// because it could not construct the merge at all. Distinct from a test
+/// failure, which never files an attention item because it has a fix
+/// revision to speak for it.
+pub const TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND: &str = "trunk_queue_merge_failure";
 
 // ── Transport seam ────────────────────────────────────────────────────────
 
@@ -356,8 +363,13 @@ pub struct TrunkSweepOutcome {
     /// Attention items filed this pass.
     pub attentions_filed: usize,
     /// Trunk queue evictions handed to `ci_watch::on_trunk_queue_eviction_detected`
-    /// that flipped the parent to `blocked: ci_failure` this pass.
+    /// that flipped the parent to `blocked: ci_failure` this pass. Counts
+    /// only evictions classified as a genuine test failure.
     pub evictions_detected: usize,
+    /// Trunk queue evictions this pass that Trunk raised *before testing* —
+    /// it could not construct the merge — and which were therefore kept out
+    /// of the CI ledger entirely.
+    pub merge_side_evictions: usize,
     /// `submitPullRequest` calls issued this pass to auto-resubmit an
     /// intent whose eviction/conflict fix landed.
     pub resubmits: usize,
@@ -374,6 +386,7 @@ impl TrunkSweepOutcome {
             || self.probe_failures > 0
             || self.attentions_filed > 0
             || self.evictions_detected > 0
+            || self.merge_side_evictions > 0
             || self.resubmits > 0
             || self.queue_cancellations > 0
     }
@@ -443,15 +456,46 @@ impl QueueRuntime {
 }
 
 /// The Trunk-side merge-queue observer. Holds only cadence/backoff/
-/// attention-dedup state; everything durable lives in the DB.
-#[derive(Debug, Default)]
+/// attention-dedup state plus the eviction-evidence seam; everything durable
+/// lives in the DB.
 pub struct TrunkQueueProbe {
     queues: HashMap<QueueKey, QueueRuntime>,
+    /// How an eviction's cause is discovered. A seam rather than direct
+    /// shell-outs so the unit tests stay hermetic: both channels reach
+    /// outside the process (`bk`, `gh`), and a poller test that spawned
+    /// them would, on a developer machine with an authenticated `gh`, make
+    /// live network calls against whatever repo the fixture names.
+    evidence: Arc<dyn TrunkEvictionEvidence>,
+}
+
+impl std::fmt::Debug for TrunkQueueProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrunkQueueProbe").field("queues", &self.queues).finish()
+    }
+}
+
+impl Default for TrunkQueueProbe {
+    fn default() -> Self {
+        Self {
+            queues: HashMap::new(),
+            evidence: Arc::new(CliEvictionEvidence),
+        }
+    }
 }
 
 impl TrunkQueueProbe {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A probe whose eviction evidence is supplied by the caller. Tests only:
+    /// production always wants [`CliEvictionEvidence`].
+    #[cfg(test)]
+    fn with_evidence(evidence: Arc<dyn TrunkEvictionEvidence>) -> Self {
+        Self {
+            queues: HashMap::new(),
+            evidence,
+        }
     }
 
     /// When [`Self::run_pass`] next has something to do. Never later than
@@ -570,6 +614,10 @@ impl TrunkQueueProbe {
         }
         self.reconcile_queue_state_attention(ctx, key, members, &queue, outcome)
             .await;
+        // Cloned rather than borrowed so the member loop below doesn't hold
+        // an immutable borrow of `self` across the `&mut self` cadence write
+        // that follows it.
+        let evidence = Arc::clone(&self.evidence);
 
         // Position is the 1-based index into the queue as a whole (not
         // just the entries Boss tracks), matching the GitHub path's
@@ -609,7 +657,7 @@ impl TrunkQueueProbe {
                 // window where a failed/cancelled entry keeps rendering as
                 // a healthy queue member.
                 Some((_, entry)) => {
-                    apply_resolved_state(ctx, member, entry, outcome).await;
+                    apply_resolved_state(ctx, evidence.as_ref(), member, entry, outcome).await;
                     Some(entry.state.clone())
                 }
                 // The eviction/conflict fix landed — `ci_watch::on_ci_resolved`
@@ -629,7 +677,9 @@ impl TrunkQueueProbe {
                 // — so re-asking every cycle would buy nothing and never
                 // stop.
                 None if already_resolved_terminal(member) => None,
-                None => resolve_missing_entry(ctx, member, &repo_ref, &key.target_branch, outcome).await,
+                None => {
+                    resolve_missing_entry(ctx, evidence.as_ref(), member, &repo_ref, &key.target_branch, outcome).await
+                }
             };
             if observed.as_ref().is_some_and(is_fast_tier_state) {
                 tier = TrunkPollTier::Testing;
@@ -679,6 +729,7 @@ impl TrunkQueueProbe {
             return;
         }
         let since = runtime.last_reconciled_since.clone();
+        let evidence = Arc::clone(&self.evidence);
         // Stamped before the (possibly multi-page) round trip below, not
         // after: capturing it on return would leave a permanent gap for
         // anything Trunk concludes between this snapshot and the last
@@ -712,7 +763,7 @@ impl TrunkQueueProbe {
                             .iter()
                             .find(|member| member.intent.pr_number as u64 == pr.pr_number)
                         {
-                            apply_resolved_state(ctx, member, pr, outcome).await;
+                            apply_resolved_state(ctx, evidence.as_ref(), member, pr, outcome).await;
                         }
                     }
                     match response.next_cursor {
@@ -1141,6 +1192,7 @@ fn enqueued_at(member: &ActiveTrunkMergeIntent) -> Option<String> {
 /// the observed state, if any, so the caller can still tier on it.
 async fn resolve_missing_entry(
     ctx: &TrunkSweepContext<'_>,
+    evidence: &dyn TrunkEvictionEvidence,
     member: &ActiveTrunkMergeIntent,
     repo: &TrunkRepoRef,
     target_branch: &str,
@@ -1155,7 +1207,7 @@ async fn resolve_missing_entry(
     match ctx.api.get_submitted_pull_request(&lookup).await {
         Ok(pr) => {
             let state = pr.state.clone();
-            apply_resolved_state(ctx, member, &pr, outcome).await;
+            apply_resolved_state(ctx, evidence, member, &pr, outcome).await;
             Some(state)
         }
         Err(TrunkError::NotFound(detail)) => {
@@ -1315,10 +1367,25 @@ async fn cancel_intent(
 /// Apply one observed Trunk state to an intent, routing the terminal ones.
 async fn apply_resolved_state(
     ctx: &TrunkSweepContext<'_>,
+    evidence: &dyn TrunkEvictionEvidence,
     member: &ActiveTrunkMergeIntent,
     entry: &TrunkPullRequest,
     outcome: &mut TrunkSweepOutcome,
 ) {
+    // The conflict lane owns this slot — either `conflict_watch` saw the PR
+    // go CONFLICTING mid-queue, or `handle_trunk_queue_eviction` handed a
+    // merge-side eviction over to it. A terminal Trunk state observed
+    // afterwards is moot, and letting `record_observed_state` below run
+    // would be actively harmful: it overwrites the sentinel with `failed`,
+    // which `is_superseded_by_conflict` no longer matches, so
+    // `conflict_watch::on_resolved` could never advance the intent to
+    // `awaiting_resubmit` and the PR would never re-enter the queue. The
+    // `probe_queue` loop guards its own live-entry arm the same way; this
+    // covers the two routes that reach here without that check — the
+    // `listPullRequests` reconciliation backstop and `resolve_missing_entry`.
+    if is_superseded_by_conflict(member) || is_awaiting_resubmit(member) {
+        return;
+    }
     // Per-episode dedup, computed before `record_observed_state` below:
     // Trunk's live queue snapshot can keep reporting an already-resolved
     // terminal entry inline on every sweep (see the `already_resolved_terminal`
@@ -1352,17 +1419,23 @@ async fn apply_resolved_state(
         // cancelled the entry. Cancellation is a decision, not a failure:
         // no revision is spawned, the card just returns to Review.
         TrunkPrState::Cancelled => retire_intent(ctx, member, "cancelled", true, outcome).await,
-        // Eviction. Recorded and left `active` on purpose — the intent is
-        // what authorizes the resubmit after remediation lands.
+        // Eviction. Which remediation it needs depends on WHY Trunk gave
+        // up — a failed construction build and a failed *construction* are
+        // both reported as `failed` — so the routing decision belongs to
+        // `handle_trunk_queue_eviction`, which classifies first. Nothing is
+        // logged or concluded here: this arm used to assert "on a test
+        // failure" unconditionally, which is exactly the wrong conclusion
+        // for the merge-side half of the traffic.
         TrunkPrState::Failed | TrunkPrState::PendingFailure => {
-            tracing::info!(
-                work_item_id = %member.intent.work_item_id,
-                pr_url = %member.intent.pr_url,
-                state = %state_str,
-                "trunk queue poller: entry left the queue on a test failure; intent kept active for remediation",
-            );
-            if !already_handled_this_episode {
-                handle_trunk_queue_eviction(ctx, member, entry, outcome).await;
+            if already_handled_this_episode {
+                tracing::debug!(
+                    work_item_id = %member.intent.work_item_id,
+                    pr_url = %member.intent.pr_url,
+                    state = %state_str,
+                    "trunk queue poller: eviction episode already remediated; skipping",
+                );
+            } else {
+                handle_trunk_queue_eviction(ctx, evidence, member, entry, outcome).await;
             }
         }
         // A live state observed while the entry was missing from the queue
@@ -1372,25 +1445,266 @@ async fn apply_resolved_state(
     }
 }
 
+// ── Eviction cause classification ─────────────────────────────────────────
+
+/// Why a Trunk queue entry left the queue in `failed` / `pending_failure`.
+///
+/// Trunk's REST payload carries no reason field at all — `TrunkPullRequest`
+/// has no `reason`/`cause`/`error` — so the state alone cannot tell "the
+/// combined build went red" from "Trunk could not even construct the merge".
+/// Both arrive as `failed`, and routing on the state alone is what made a
+/// merge conflict read as a CI failure (T792/T793): the CI ledger was handed
+/// an episode with no failing build for a worker to point at, and the worker
+/// it dispatched force-pushed an empty commit over the PR's contents.
+///
+/// The GitHub-native arm has had the equivalent filter since T605
+/// (`merge_poller::merge_queue::parse_dequeue_event_nodes` drops every
+/// dequeue whose `reason` is not `failed_checks`); this is that filter for
+/// the Trunk arm, reconstructed from the channels that do carry a reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrunkEvictionCause {
+    /// Trunk built the construction branch and the build failed — or nothing
+    /// positively says otherwise. Routed to the CI ledger exactly as before
+    /// (T605): it is the only ledger that accepts off-head evidence, which a
+    /// build on an ephemeral `trunk-merge/pr-<N>/*` branch is.
+    TestFailure,
+    /// The PR no longer merges into the queue's target branch, so Trunk never
+    /// got as far as testing. Routed to the conflict lane: the cause is
+    /// head-vs-base, which is precisely the predicate `conflict_watch`
+    /// independently confirms, and it already owns the whole
+    /// detect → resolve → resubmit chain for it.
+    HeadConflict { evidence: String },
+    /// The PR is not pointed at the branch this queue merges into. Neither a
+    /// rebase nor a code change fixes that, so no automated remediation is
+    /// possible and none is attempted — the intent is retired and the
+    /// operator is told.
+    BaseBranchMismatch { pr_base: String },
+}
+
+impl TrunkEvictionCause {
+    /// Short, stable label for logs and metrics.
+    fn label(&self) -> &'static str {
+        match self {
+            TrunkEvictionCause::TestFailure => "test_failure",
+            TrunkEvictionCause::HeadConflict { .. } => "head_conflict",
+            TrunkEvictionCause::BaseBranchMismatch { .. } => "base_branch_mismatch",
+        }
+    }
+}
+
+/// `TrunkReadiness.git_hub_mergeability` values that positively assert the PR
+/// does not merge into its base. Trunk mirrors GitHub's own mergeability
+/// verdict here (the observed wire value on a healthy entry is the lowercased
+/// `"mergeable"`), so the conflicting spellings of both GitHub's GraphQL
+/// `mergeable` enum and its REST `mergeable_state` are accepted.
+///
+/// Deliberately a positive allowlist rather than `!= "mergeable"`: anything
+/// unrecognised — `"unknown"`, `"checking"`, a value Trunk adds later —
+/// is *inconclusive*, not evidence of a conflict, and must fall through to
+/// the unchanged [`TrunkEvictionCause::TestFailure`] arm.
+fn is_conflicting_mergeability(raw: &str) -> bool {
+    const CONFLICTING: [&str; 5] = ["conflicting", "conflict", "dirty", "not_mergeable", "unmergeable"];
+    CONFLICTING.iter().any(|marker| raw.eq_ignore_ascii_case(marker))
+}
+
+/// Classify an eviction from the facts already in hand, with no extra network
+/// call. Returns `None` when the payload is inconclusive, which is the only
+/// case that justifies consulting the `trunk-io[bot]` comment.
+///
+/// `has_build_evidence` wins outright and is checked first: a failing
+/// `trunk-merge/pr-<N>/*` build is episode-scoped proof that Trunk *did* get
+/// as far as testing, whereas `readiness` is a live snapshot with no episode
+/// attached — the target branch moving after a genuine test failure would
+/// otherwise flip a real CI failure into the conflict lane and lose the
+/// failing build.
+fn classify_trunk_eviction_from_payload(
+    entry: &TrunkPullRequest,
+    target_branch: &str,
+    has_build_evidence: bool,
+) -> Option<TrunkEvictionCause> {
+    if has_build_evidence {
+        return Some(TrunkEvictionCause::TestFailure);
+    }
+    let readiness = entry.readiness.as_ref();
+    // Base-branch mismatch first: it is the more specific diagnosis, and a
+    // PR pointed at the wrong branch will usually *also* look unmergeable.
+    // Both channels are checked — `pr_base_branch` is present on the entry
+    // itself, so this still fires when Trunk omits `readiness` entirely.
+    let base_mismatches = entry
+        .pr_base_branch
+        .as_deref()
+        .is_some_and(|base| !base.eq_ignore_ascii_case(target_branch));
+    if base_mismatches || readiness.is_some_and(|r| !r.does_base_branch_match) {
+        return Some(TrunkEvictionCause::BaseBranchMismatch {
+            pr_base: entry
+                .pr_base_branch
+                .clone()
+                .unwrap_or_else(|| "<unreported>".to_owned()),
+        });
+    }
+    if let Some(mergeability) = readiness.map(|r| r.git_hub_mergeability.as_str())
+        && is_conflicting_mergeability(mergeability)
+    {
+        return Some(TrunkEvictionCause::HeadConflict {
+            evidence: format!("Trunk readiness reported `gitHubMergeability: {mergeability}`"),
+        });
+    }
+    None
+}
+
+/// Phrases in a `trunk-io[bot]` comment that positively assert Trunk gave up
+/// *before* testing. The first is the verbatim string Trunk posted on
+/// flunge#1136 and #1137 ("❌ This pull request could not start testing
+/// because there was a merge conflict."); "could not start testing" alone is
+/// already conclusive, since an entry that never started testing cannot have
+/// been evicted by a test result.
+const BOT_MERGE_FAILURE_MARKERS: [&str; 2] = ["could not start testing", "merge conflict"];
+
+/// Match a `trunk-io[bot]` comment body against [`BOT_MERGE_FAILURE_MARKERS`],
+/// returning the marker that fired.
+///
+/// Comment text is the *corroborating* channel, never the sole input: it is
+/// consulted only after [`classify_trunk_eviction_from_payload`] came back
+/// inconclusive AND the Buildkite search found no failing construction build.
+/// That second condition is the load-bearing one — "no failed
+/// `trunk-merge/pr-<N>/*` build exists" is itself the signature of an
+/// eviction that never reached testing, so the comment is only ever being
+/// asked to name a cause we already have independent structural evidence
+/// for, not to establish one from prose. It is needed because the structured
+/// channel is not guaranteed: Trunk may omit `readiness` on a terminal
+/// entry, and its `gitHubMergeability` snapshot is not episode-scoped.
+fn bot_comment_merge_failure_marker(body: &str) -> Option<&'static str> {
+    let lowered = body.to_ascii_lowercase();
+    BOT_MERGE_FAILURE_MARKERS
+        .into_iter()
+        .find(|marker| lowered.contains(marker))
+}
+
+/// The `trunk-io[bot]` login, as it appears in `gh api` comment payloads.
+const TRUNK_BOT_LOGIN: &str = "trunk-io[bot]";
+
+/// The two external channels an eviction's cause is read from. Both leave the
+/// process, so they sit behind a trait: [`CliEvictionEvidence`] in production,
+/// a stub in tests.
+#[async_trait]
+pub trait TrunkEvictionEvidence: Send + Sync {
+    /// Failing jobs from the `trunk-merge/pr-<N>/*` construction build, if
+    /// Trunk got far enough to produce one. Empty on any failure — including
+    /// "no such build", which is itself the signature of an eviction that
+    /// never reached testing.
+    async fn failing_construction_build(&self, pr_number: u64) -> Vec<RequiredCheckFailure>;
+
+    /// The newest `trunk-io[bot]` comment body on the PR, which is where
+    /// Trunk states the eviction reason in prose. `None` when unavailable.
+    async fn newest_trunk_bot_comment(&self, repo: &str, pr_number: i64) -> Option<String>;
+}
+
+/// Production evidence: shells out to `bk` and `gh`.
+///
+/// Deliberately untested end-to-end — neither binary is available and
+/// authenticated in CI, mirroring the pre-existing posture for
+/// `find_trunk_merge_eviction_build` and `ci_watch::fetch_and_store_log_excerpt`.
+/// The logic these methods wrap lives in pure, covered functions
+/// ([`newest_trunk_bot_comment`], [`bot_comment_merge_failure_marker`], and
+/// `boss_ci_log_reader`'s own parser); what is left here is argument
+/// assembly and error swallowing.
+pub struct CliEvictionEvidence;
+
+#[async_trait]
+impl TrunkEvictionEvidence for CliEvictionEvidence {
+    async fn failing_construction_build(&self, pr_number: u64) -> Vec<RequiredCheckFailure> {
+        match crate::ci_log_reader::find_trunk_merge_eviction_build(BK_BINARY, pr_number).await {
+            Ok(Some(build)) => {
+                tracing::info!(
+                    pr_number,
+                    pipeline = %build.pipeline_slug,
+                    build_number = %build.build_number,
+                    failed_jobs = build.failed_job_ids.len(),
+                    "trunk queue poller: discovered Buildkite evidence for eviction",
+                );
+                crate::ci_watch::trunk_eviction_failures_from_build(&build)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    pr_number,
+                    "trunk queue poller: no failed trunk-merge build found for eviction",
+                );
+                Vec::new()
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pr_number,
+                    ?err,
+                    "trunk queue poller: failed to discover Buildkite evidence for eviction",
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    async fn newest_trunk_bot_comment(&self, repo: &str, pr_number: i64) -> Option<String> {
+        let path = format!("repos/{repo}/issues/{pr_number}/comments?per_page=100");
+        let output = boss_github::gh_runner::gh_output(&["api", &path]).await.ok()?;
+        if !output.status.success() {
+            tracing::debug!(
+                repo,
+                pr_number,
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "trunk queue poller: gh api for the trunk-io[bot] comment failed; leaving the eviction unclassified",
+            );
+            return None;
+        }
+        newest_trunk_bot_comment(&output.stdout)
+    }
+}
+
+/// Pull the newest `trunk-io[bot]` comment body out of a
+/// `GET /repos/{owner}/{repo}/issues/{n}/comments` response.
+///
+/// Pure so the shape handling is unit-testable without `gh`. GitHub returns
+/// comments oldest-first, so the last bot comment is the newest — and Trunk
+/// writes (or updates) its status comment synchronously with the eviction,
+/// which is why the newest one is the relevant one.
+fn newest_trunk_bot_comment(body: &[u8]) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_slice(body).ok()?;
+    parsed
+        .as_array()?
+        .iter()
+        .filter(|comment| comment["user"]["login"].as_str() == Some(TRUNK_BOT_LOGIN))
+        .filter_map(|comment| comment["body"].as_str())
+        .next_back()
+        .map(str::to_owned)
+}
+
 /// The `bk` binary invoked to discover Buildkite evidence for a Trunk
-/// eviction. Not threaded through [`TrunkSweepContext`] (which would force
-/// updating every existing test construction site) — mirrors
-/// `ci_watch::fetch_and_store_log_excerpt`'s existing precedent of
-/// hardcoding `"bk"` in production and accepting that the shell-out itself
-/// goes untested (there is no `bk` binary in CI); the pure JSON parser and
-/// an end-to-end fake-binary test cover the discovery logic in
-/// `boss_ci_log_reader`.
+/// eviction. Hardcoded rather than configurable — mirrors
+/// `ci_watch::fetch_and_store_log_excerpt`'s existing precedent and accepts
+/// that the shell-out itself goes untested (there is no `bk` binary in CI);
+/// the pure JSON parser and an end-to-end fake-binary test cover the
+/// discovery logic in `boss_ci_log_reader`. Tests substitute the whole
+/// channel via [`TrunkEvictionEvidence`] instead.
 const BK_BINARY: &str = "bk";
 
-/// Fetch Buildkite evidence for a Trunk queue eviction and hand it to
-/// [`crate::ci_watch::on_trunk_queue_eviction_detected`]. Best-effort: a
-/// failed/empty Buildkite lookup still calls through with an empty
-/// `failures` slice (mirrors `check_merge_queue_rebounce`'s handling of an
-/// empty `fetch_failing_checks_for_commit` result) rather than skipping
-/// remediation outright — the worker can always fall back to discovering
-/// the build manually.
+/// Classify a Trunk queue eviction, then route it to the ledger that can
+/// actually remediate it.
+///
+/// Buildkite evidence is gathered first because its presence *is* the primary
+/// classification signal, not merely prompt material: a failing
+/// `trunk-merge/pr-<N>/*` build proves Trunk got as far as testing, and its
+/// absence is the signature of an eviction that never did. The reason is then
+/// pinned down by [`classify_trunk_eviction_from_payload`] and, only if that
+/// is inconclusive, the corroborating `trunk-io[bot]` comment.
+///
+/// - [`TrunkEvictionCause::TestFailure`] → [`crate::ci_watch::on_trunk_queue_eviction_detected`],
+///   unchanged from T605.
+/// - [`TrunkEvictionCause::HeadConflict`] → the conflict lane (see
+///   [`hand_eviction_to_conflict_lane`]). No `ci_remediations` row, so no CI
+///   attempt budget is consumed.
+/// - [`TrunkEvictionCause::BaseBranchMismatch`] → nothing automated is
+///   possible; retire and tell the operator.
 async fn handle_trunk_queue_eviction(
     ctx: &TrunkSweepContext<'_>,
+    evidence: &dyn TrunkEvictionEvidence,
     member: &ActiveTrunkMergeIntent,
     entry: &TrunkPullRequest,
     outcome: &mut TrunkSweepOutcome,
@@ -1416,54 +1730,237 @@ async fn handle_trunk_queue_eviction(
         }
     };
 
-    let failures =
-        match crate::ci_log_reader::find_trunk_merge_eviction_build(BK_BINARY, member.intent.pr_number as u64).await {
-            Ok(Some(build)) => {
-                tracing::info!(
-                    work_item_id = %member.intent.work_item_id,
-                    pipeline = %build.pipeline_slug,
-                    build_number = %build.build_number,
-                    failed_jobs = build.failed_job_ids.len(),
-                    "trunk queue poller: discovered Buildkite evidence for eviction",
-                );
-                crate::ci_watch::trunk_eviction_failures_from_build(&build)
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    work_item_id = %member.intent.work_item_id,
-                    pr_number = member.intent.pr_number,
-                    "trunk queue poller: no failed trunk-merge build found for eviction",
-                );
-                Vec::new()
-            }
-            Err(err) => {
-                tracing::warn!(
-                    work_item_id = %member.intent.work_item_id,
-                    pr_number = member.intent.pr_number,
-                    ?err,
-                    "trunk queue poller: failed to discover Buildkite evidence for eviction",
-                );
-                Vec::new()
-            }
-        };
+    let failures = evidence
+        .failing_construction_build(member.intent.pr_number as u64)
+        .await;
 
-    let candidate = PendingMergeCheck {
-        work_item_id: member.intent.work_item_id.clone(),
-        product_id: member.product_id.clone(),
-        pr_url: member.intent.pr_url.clone(),
+    // Only the inconclusive-and-no-build case pays for the extra `gh` call:
+    // a genuine test failure is already settled by the build evidence above.
+    let cause = match classify_trunk_eviction_from_payload(entry, &member.intent.target_branch, !failures.is_empty()) {
+        Some(cause) => cause,
+        None => {
+            match evidence
+                .newest_trunk_bot_comment(&member.intent.repo, member.intent.pr_number)
+                .await
+                .as_deref()
+                .and_then(bot_comment_merge_failure_marker)
+            {
+                Some(marker) => TrunkEvictionCause::HeadConflict {
+                    evidence: format!("the `{TRUNK_BOT_LOGIN}` comment on the PR says \"{marker}\""),
+                },
+                None => TrunkEvictionCause::TestFailure,
+            }
+        }
     };
-    if crate::ci_watch::on_trunk_queue_eviction_detected(
-        ctx.work_db,
-        ctx.publisher,
-        &candidate,
-        None, // head branch not tracked on the intent; mirrors the GH rebounce production callsite
-        &entry.id,
-        state_changed_at,
-        &failures,
-    )
-    .await
+    tracing::info!(
+        work_item_id = %member.intent.work_item_id,
+        pr_url = %member.intent.pr_url,
+        state = %String::from(entry.state.clone()),
+        cause = cause.label(),
+        failing_builds = failures.len(),
+        "trunk queue poller: entry left the queue; classified before routing",
+    );
+
+    match cause {
+        TrunkEvictionCause::TestFailure => {
+            let candidate = PendingMergeCheck {
+                work_item_id: member.intent.work_item_id.clone(),
+                product_id: member.product_id.clone(),
+                pr_url: member.intent.pr_url.clone(),
+            };
+            if crate::ci_watch::on_trunk_queue_eviction_detected(
+                ctx.work_db,
+                ctx.publisher,
+                &candidate,
+                None, // head branch not tracked on the intent; mirrors the GH rebounce production callsite
+                &entry.id,
+                state_changed_at,
+                &failures,
+            )
+            .await
+            {
+                outcome.evictions_detected += 1;
+            }
+        }
+        TrunkEvictionCause::HeadConflict { evidence } => {
+            hand_eviction_to_conflict_lane(ctx, member, &evidence, outcome).await;
+        }
+        TrunkEvictionCause::BaseBranchMismatch { pr_base } => {
+            retire_eviction_with_no_remediation(ctx, member, &pr_base, outcome).await;
+        }
+    }
+}
+
+/// Hand a merge-side eviction to the conflict lane.
+///
+/// The eviction is a *symptom*: Trunk could not construct the merge because
+/// the PR itself no longer merges into the target branch. That is head-vs-base
+/// — the exact predicate `conflict_watch` tests on its own sweep — so the
+/// remediation already exists and is already correct (on T792/T793 it produced
+/// "Resolve merge conflict against main" four minutes after the bogus CI
+/// revision). Nothing here duplicates it; this only transfers ownership.
+///
+/// The transfer has to be explicit rather than left to `conflict_watch`.
+/// `trunk_merge::needs_remediation` counts `last_trunk_state ∈ {failed,
+/// pending_failure}` as "an eviction episode owns this slot", which makes
+/// `mark_trunk_intent_superseded_by_conflict` a no-op after an eviction — and
+/// then `conflict_watch::on_resolved`'s
+/// `mark_trunk_intent_awaiting_resubmit(&[SUPERSEDED_BY_CONFLICT])` cannot fire
+/// either, because the intent is still sitting at `failed`. Only
+/// `ci_watch::on_ci_resolved` can advance a `failed` intent, and that is gated
+/// on a CI revision reaching `done` — which will never happen now that no CI
+/// revision is spawned. So writing the sentinel here is what keeps the PR's
+/// resubmit reachable: without it the conflict would be resolved and the PR
+/// would never re-enter the queue.
+///
+/// Single-shot without needing the `ci_remediations` dedup table: the sentinel
+/// is itself the dedup: `apply_resolved_state` returns early for a member
+/// carrying it, and `probe_queue` diverts to `cancel_intent` before the
+/// membership lookup.
+async fn hand_eviction_to_conflict_lane(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    evidence: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    if let Err(err) = ctx
+        .work_db
+        .record_trunk_merge_intent_state(&member.intent.id, TRUNK_INTENT_SUPERSEDED_BY_CONFLICT)
     {
-        outcome.evictions_detected += 1;
+        // Leaving the intent at `failed` would strand it, so this is worth a
+        // warning — but not a fallback into the CI ledger, which is the very
+        // misrouting being fixed. The next sweep re-observes the terminal
+        // entry and retries this write.
+        tracing::warn!(
+            intent_id = %member.intent.id,
+            work_item_id = %member.intent.work_item_id,
+            ?err,
+            "trunk queue poller: failed to hand a merge-side eviction to the conflict lane; retrying next cycle",
+        );
+        return;
+    }
+    outcome.merge_side_evictions += 1;
+    tracing::info!(
+        work_item_id = %member.intent.work_item_id,
+        pr_url = %member.intent.pr_url,
+        evidence,
+        "trunk queue poller: eviction was a merge failure, not a test failure; \
+         handed to the conflict lane (no CI attempt consumed)",
+    );
+    snap_card_back_to_review(ctx, member, "trunk_queue_merge_failure", outcome).await;
+    file_attention(
+        ctx,
+        &member.product_id,
+        &member.intent.work_item_id,
+        QueueAttention {
+            kind: TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND,
+            title: "Trunk could not merge this PR: it conflicts with the target branch".to_owned(),
+            body: format!(
+                "{pr} was evicted from the Trunk merge queue **before any test ran** — {evidence}.\n\n\
+                 This is a merge conflict, not a CI failure. The PR's own required checks are \
+                 unaffected, so Boss did **not** flip the card to `ci_failure`, did **not** spawn a \
+                 \"Fix failing CI\" revision, and consumed **no CI attempt budget**. The queue slot \
+                 has been handed to the conflict resolver: once `conflict_watch` observes the PR \
+                 CONFLICTING it spawns a conflict-resolution revision, and the PR is resubmitted to \
+                 the queue automatically once that lands.\n\n\
+                 If the card never picks up a merge-conflict block, GitHub does not consider the PR \
+                 head to conflict with its base — Trunk failed to construct a merge for another \
+                 reason (most likely a conflict with a sibling entry in the same batch). In that case \
+                 nothing on this PR needs fixing: click Merge again to requeue it.",
+                pr = member.intent.pr_url,
+            ),
+        },
+        outcome,
+    )
+    .await;
+}
+
+/// Terminate an eviction that no automated remediation can address: the PR is
+/// not pointed at the branch this queue merges into, so there is no failing
+/// build to fix and no conflict to resolve. Retire the intent (freeing the
+/// dedup slot so the operator can retarget the PR and click Merge again) and
+/// say exactly what is wrong.
+///
+/// Single-shot via `retire_trunk_merge_intent`'s own `status = 'active'`
+/// guard, the same mechanism that keeps the cancellation snap-back single-shot.
+async fn retire_eviction_with_no_remediation(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    pr_base: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    match ctx
+        .work_db
+        .retire_trunk_merge_intent(&member.intent.id, "base_branch_mismatch")
+    {
+        Ok(false) => return,
+        Ok(true) => {}
+        Err(err) => {
+            tracing::warn!(
+                intent_id = %member.intent.id,
+                ?err,
+                "trunk queue poller: failed to retire an eviction with no available remediation",
+            );
+            return;
+        }
+    }
+    outcome.intents_retired += 1;
+    outcome.merge_side_evictions += 1;
+    tracing::warn!(
+        work_item_id = %member.intent.work_item_id,
+        pr_url = %member.intent.pr_url,
+        pr_base,
+        target_branch = %member.intent.target_branch,
+        "trunk queue poller: eviction was a base-branch mismatch; no automated remediation exists",
+    );
+    snap_card_back_to_review(ctx, member, "trunk_queue_merge_failure", outcome).await;
+    file_attention(
+        ctx,
+        &member.product_id,
+        &member.intent.work_item_id,
+        QueueAttention {
+            kind: TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND,
+            title: "Trunk could not merge this PR: it targets the wrong branch".to_owned(),
+            body: format!(
+                "{pr} was evicted from the Trunk merge queue **before any test ran**: its base branch \
+                 is `{pr_base}`, but this queue merges into `{target}`.\n\n\
+                 No rebase or code change fixes that, so Boss spawned no revision and consumed no CI \
+                 attempt budget. Retarget the PR at `{target}` (`gh pr edit {pr} --base {target}`), \
+                 then click Merge again to requeue it.",
+                pr = member.intent.pr_url,
+                target = member.intent.target_branch,
+            ),
+        },
+        outcome,
+    )
+    .await;
+}
+
+/// Clear the Merging-lane columns so a card whose queue entry is definitively
+/// gone stops rendering a stale "queued" badge. Shared by the two merge-side
+/// eviction arms; `reason` is the `work_item_changed` change reason.
+async fn snap_card_back_to_review(
+    ctx: &TrunkSweepContext<'_>,
+    member: &ActiveTrunkMergeIntent,
+    reason: &str,
+    outcome: &mut TrunkSweepOutcome,
+) {
+    match ctx
+        .work_db
+        .set_task_merge_queue_state(&member.intent.work_item_id, None, None)
+    {
+        Ok(true) => {
+            outcome.state_writes += 1;
+            ctx.publisher
+                .publish_work_item_changed(&member.product_id, &member.intent.work_item_id, reason)
+                .await;
+        }
+        Ok(false) => {}
+        Err(err) => tracing::warn!(
+            work_item_id = %member.intent.work_item_id,
+            ?err,
+            "trunk queue poller: failed to clear the merge-queue columns after a merge-side eviction",
+        ),
     }
 }
 

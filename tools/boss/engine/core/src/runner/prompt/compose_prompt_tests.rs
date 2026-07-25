@@ -1567,6 +1567,79 @@ fn ci_remediation_prompt_offers_mark_noop_for_non_rebounce() {
     );
 }
 
+/// Compose the CI-fix revision fragment for a `trunk_queue_eviction`
+/// attempt whose `failed_checks` blob is `failed_checks_json`.
+fn trunk_eviction_revision_prompt(failed_checks_json: &str) -> String {
+    let work_item = revision_task_with_created_via(None, "ci-fix:crm_frag_01");
+    let mut attempt = sample_ci_attempt();
+    attempt.failure_kind = Some("trunk_queue_eviction".into());
+    attempt.failed_checks = failed_checks_json.into();
+    compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .ci_attempt(&attempt)
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    )
+}
+
+/// T792/T793: a Trunk eviction with no failing build attached is the shape
+/// that destroyed flunge#1137. The worker was told to find a build that did
+/// not exist, given no way out, and assured that "something landed on the
+/// target branch" — so it rebased and force-pushed an empty commit over the
+/// PR. The brief must instead offer a terminal and forbid the destructive
+/// move.
+#[test]
+fn trunk_eviction_prompt_offers_a_terminal_when_no_failing_build_was_captured() {
+    let prompt = trunk_eviction_revision_prompt("[]");
+
+    assert!(
+        prompt.contains("### If there is no failing build to find (STOP — do not invent one)"),
+        "an eviction with no evidence must offer a bail-out:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss engine ci mark-failed --attempt-id"),
+        "the bail-out must name the terminal the engine actually accepts:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("mark-noop"),
+        "mark-noop is rejected outright for queue-side attempts; offering it would be a dead end:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("zero-diff commit"),
+        "the brief must forbid pushing an empty commit to look productive:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("A Trunk queue eviction almost always means"),
+        "the unconditional 'something landed on the target branch' claim must be gone:\n{prompt}",
+    );
+}
+
+/// The other arm: when the engine DID identify the failing construction
+/// build, the rebase-and-fix playbook is correct and must survive — the
+/// bail-out is only for the evidence-free case.
+#[test]
+fn trunk_eviction_prompt_keeps_the_rebase_playbook_when_a_build_was_captured() {
+    let prompt = trunk_eviction_revision_prompt(
+        r#"[{"name":"Trunk merge queue: ci","conclusion":"FAILURE","target_url":"https://buildkite.com/o/p/builds/9","provider":"buildkite","provider_job_id":"job-9"}]"#,
+    );
+
+    assert!(
+        !prompt.contains("### If there is no failing build to find"),
+        "no bail-out when there is a real failing build to fix:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("### Action: rebase onto the target branch, then fix the semantic conflict"),
+        "the rebase-and-fix playbook must survive for a genuine test failure:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("Trunk merge queue: ci"),
+        "the captured failing check must still be rendered:\n{prompt}",
+    );
+}
+
 #[test]
 fn ci_remediation_prompt_omits_mark_noop_for_rebounce() {
     // A merge_queue_rebounce failure lives on the synthetic merge

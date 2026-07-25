@@ -2201,7 +2201,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     out.push_str(&format!("**Attempt id**: `{}`\n\n", attempt.id));
 
     out.push_str("### Failing required checks\n\n");
-    match render_failed_checks_markdown(&attempt.failed_checks) {
+    let captured_checks = render_failed_checks_markdown(&attempt.failed_checks);
+    // A Trunk eviction with nothing captured is the shape that destroyed
+    // flunge#1137: the engine could not name a failing build, the prompt
+    // asserted one existed anyway, and the bail-out below was gated off.
+    // `ci_watch::on_queue_side_failure_detected` now refuses to create such
+    // an attempt at all, so this should be unreachable — but a row created
+    // before that guard shipped can still be re-dispatched by the
+    // stranded-rescue path, so the prompt has to stay honest about it.
+    let trunk_eviction_without_evidence = is_trunk_eviction && captured_checks.is_none();
+    match captured_checks {
         Some(md) => out.push_str(&md),
         None => {
             if is_rebounce {
@@ -2238,6 +2247,34 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
 
     if let Some(bk_cmds) = render_bk_log_commands(&attempt.failed_checks) {
         out.push_str(&bk_cmds);
+    }
+
+    // The bail-out for "the engine cannot name a failing build". It is NOT
+    // `mark-noop`: `handle_mark_ci_remediation_noop` rejects every queue-side
+    // attempt outright, before it probes, because head-branch CI is green by
+    // construction for these and so cannot validate the claim. Pointing a
+    // worker at a verb the engine is guaranteed to refuse would be worse than
+    // saying nothing. `mark-failed` is the terminal the engine does accept —
+    // it is what the rejection message itself recommends.
+    if trunk_eviction_without_evidence {
+        out.push_str("### If there is no failing build to find (STOP — do not invent one)\n\n");
+        out.push_str(&format!(
+            "The engine could not identify a failing build for this eviction. Trunk reports the same \
+             `failed` state whether a construction build went red **or** it could not construct the \
+             merge at all, so it is entirely possible **nothing is broken on this PR**.\n\n\
+             Search once, using the Buildkite recipe above. If no failing `trunk-merge/pr-{pr_num}/*` \
+             build exists, that is your answer — Trunk never got as far as testing. Record it and stop:\n\n\
+             ```\n\
+             boss engine ci classify --attempt-id {attempt} --class unfixable\n\
+             boss engine ci mark-failed --attempt-id {attempt} --reason no-failing-build-found\n\
+             ```\n\n\
+             **Do NOT** rebase, reset, force-push, or \"resolve\" anything to make this attempt look \
+             addressed. There is no conflict on the head branch to resolve, and a revision whose head \
+             ends up with an empty diff has destroyed the PR's contents, not fixed them. If your work \
+             would produce a zero-diff commit, stop and mark the attempt failed instead.\n\n",
+            pr_num = attempt.pr_number,
+            attempt = attempt.id,
+        ));
     }
 
     if !is_queue_side_failure {
@@ -2287,10 +2324,16 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
         } else if is_trunk_eviction {
             out.push_str("### Action: rebase onto the target branch, then fix the semantic conflict\n\n");
             out.push_str(
-                "A Trunk queue eviction almost always means something landed on the target branch \
-                 between this PR's CI run and its queue turn that is **semantically incompatible**.\n\
-                 Fix is: rebase, look at the CI failure on Trunk's construction branch, add a focused \
-                 fix, push, and get the PR resubmitted to the queue.\n\n",
+                "A Trunk queue eviction **whose failing build the engine identified** (listed above) \
+                 means something landed on the target branch between this PR's CI run and its queue \
+                 turn that is **semantically incompatible**.\n\
+                 Fix is: rebase, look at that CI failure on Trunk's construction branch, add a focused \
+                 fix, push, and get the PR resubmitted to the queue.\n\n\
+                 This does NOT generalise to an eviction with no failing build attached. Trunk reports \
+                 the same `failed` state when it could not construct the merge at all, in which case \
+                 there is no build, no semantic conflict, and nothing here to fix — see the STOP \
+                 section above. Rebasing on that assumption is how a previous run force-pushed an \
+                 empty commit over a PR's entire contents.\n\n",
             );
         } else {
             out.push_str("### Action: rebase first, then fix\n\n");

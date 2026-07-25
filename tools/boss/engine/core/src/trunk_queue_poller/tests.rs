@@ -9,6 +9,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
+use boss_trunk_client::TrunkReadiness;
+
 use super::*;
 use crate::test_support::{RecordingPublisher, create_test_chore_manual, create_test_product_named};
 use crate::work::{TrunkMergeIntentInsertInput, WorkItemPatch};
@@ -205,6 +207,74 @@ impl TrunkQueueApi for StubTrunkApi {
     }
 }
 
+/// Stands in for the two shell-outs [`CliEvictionEvidence`] performs (`bk`
+/// and `gh`). Every test uses one, so no poller test ever spawns a
+/// subprocess or touches the network — with a real authenticated `gh` on a
+/// developer's PATH the production impl would otherwise issue live API calls
+/// against whatever repo/PR number the fixture happens to name.
+#[derive(Default)]
+struct StubEvictionEvidence {
+    /// Returned verbatim from `failing_construction_build`. Empty by default
+    /// — the common case, since Trunk usually leaves no build behind.
+    failing_jobs: Vec<RequiredCheckFailure>,
+    /// Returned from `newest_trunk_bot_comment`. `None` by default.
+    bot_comment: Option<String>,
+    /// Calls to `newest_trunk_bot_comment`, so a test can assert the
+    /// classifier short-circuits on the structured signal instead of
+    /// reaching for the comment.
+    bot_comment_calls: Mutex<usize>,
+}
+
+impl StubEvictionEvidence {
+    fn with_failing_job() -> Self {
+        Self {
+            failing_jobs: vec![RequiredCheckFailure {
+                name: "Trunk merge queue: flunge-ci".to_owned(),
+                conclusion: "failure".to_owned(),
+                target_url: "https://buildkite.com/flunge/flunge-ci/builds/2364#job-uuid".to_owned(),
+                provider: crate::merge_poller::CiProvider::Buildkite,
+                provider_job_id: Some("job-uuid".to_owned()),
+            }],
+            ..Self::default()
+        }
+    }
+
+    fn with_bot_comment(body: &str) -> Self {
+        Self {
+            bot_comment: Some(body.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    fn bot_comment_call_count(&self) -> usize {
+        *self.bot_comment_calls.lock().unwrap()
+    }
+}
+
+#[async_trait]
+impl TrunkEvictionEvidence for StubEvictionEvidence {
+    async fn failing_construction_build(&self, _pr_number: u64) -> Vec<RequiredCheckFailure> {
+        self.failing_jobs.clone()
+    }
+
+    async fn newest_trunk_bot_comment(&self, _repo: &str, _pr_number: i64) -> Option<String> {
+        *self.bot_comment_calls.lock().unwrap() += 1;
+        self.bot_comment.clone()
+    }
+}
+
+/// A probe with no eviction evidence available — the default for tests that
+/// are not about eviction classification at all.
+fn probe() -> TrunkQueueProbe {
+    TrunkQueueProbe::with_evidence(Arc::new(StubEvictionEvidence::default()))
+}
+
+/// A probe wired to `evidence`, kept alive by the returned `Arc` so a test
+/// can assert on the stub's call counters afterwards.
+fn probe_with(evidence: Arc<StubEvictionEvidence>) -> TrunkQueueProbe {
+    TrunkQueueProbe::with_evidence(evidence)
+}
+
 // ── Fixtures ──────────────────────────────────────────────────────────────
 
 fn entry_of(pr_number: u64, state: TrunkPrState) -> TrunkPullRequest {
@@ -227,6 +297,29 @@ fn entry_of_with_state_changed_at(pr_number: u64, state: TrunkPrState, state_cha
         .pr_number(pr_number)
         .state_changed_at(state_changed_at)
         .build()
+}
+
+/// An evicted entry carrying Trunk's `readiness` block — the structured
+/// channel `classify_trunk_eviction_from_payload` reads.
+fn evicted_entry_with_readiness(pr_number: u64, readiness: TrunkReadiness) -> TrunkPullRequest {
+    TrunkPullRequest::builder()
+        .id(format!("entry_{pr_number}"))
+        .state(TrunkPrState::Failed)
+        .pr_number(pr_number)
+        .state_changed_at("2026-07-25T03:54:24.000Z")
+        .readiness(readiness)
+        .build()
+}
+
+/// The `readiness` shape observed on a healthy entry against
+/// `github.com/brianduff/flunge`.
+fn healthy_readiness() -> TrunkReadiness {
+    TrunkReadiness {
+        has_impacted_targets: false,
+        requires_impacted_targets: false,
+        does_base_branch_match: true,
+        git_hub_mergeability: "mergeable".to_owned(),
+    }
 }
 
 fn queue_of(state: TrunkQueueState, entries: Vec<TrunkPullRequest>) -> TrunkQueue {
@@ -317,7 +410,7 @@ fn tier_intervals_match_the_design() {
 
 #[test]
 fn an_idle_probe_still_wakes_to_discover_new_intents() {
-    let probe = TrunkQueueProbe::new();
+    let probe = probe();
     let now = Instant::now();
     assert_eq!(probe.next_wake_at(now), now + IDLE_RESCAN_INTERVAL);
 }
@@ -327,7 +420,7 @@ async fn no_active_intents_means_no_trunk_traffic() {
     let (_tmp, db) = crate::test_support::open_db();
     let api = StubTrunkApi::default();
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     let outcome = probe
         .run_pass(
@@ -360,7 +453,7 @@ async fn intents_sharing_a_repo_and_branch_cost_one_get_queue_call() {
         ],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     let outcome = probe
         .run_pass(
@@ -389,7 +482,7 @@ async fn a_queue_is_not_re_probed_before_its_tier_interval_elapses() {
         vec![entry_of(978, TrunkPrState::Pending)],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -417,7 +510,7 @@ async fn a_testing_entry_pulls_the_queue_onto_the_fifteen_second_tier() {
         vec![entry_of(978, TrunkPrState::Testing)],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -448,7 +541,7 @@ async fn writes_queued_state_with_a_one_based_position_and_section_order() {
         ],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     let outcome = probe
         .run_pass(
@@ -509,7 +602,7 @@ async fn an_unchanged_queue_state_is_not_republished_every_cycle() {
         vec![entry_of(978, TrunkPrState::Pending)],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -541,7 +634,7 @@ async fn a_cancelled_entry_retires_the_intent_and_snaps_the_card_back_to_review(
     ]);
     api.set_entry(978, Ok(entry_of(978, TrunkPrState::Cancelled)));
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -587,7 +680,7 @@ async fn a_merged_entry_retires_the_intent_but_leaves_the_columns_to_the_github_
     ]);
     api.set_entry(978, Ok(entry_of(978, TrunkPrState::Merged)));
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -621,7 +714,9 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
     ]);
     api.set_entry(978, Ok(entry_of(978, TrunkPrState::Failed)));
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    // A failing construction build present: the test-failure arm, whose
+    // behaviour must be unchanged by eviction-cause classification.
+    let mut probe = probe_with(Arc::new(StubEvictionEvidence::with_failing_job()));
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -652,10 +747,12 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
 /// An evicted entry that carries `stateChangedAt` must be handed to
 /// `ci_watch::on_trunk_queue_eviction_detected`, which flips the owning
 /// chore to `blocked: ci_failure` and records a `trunk_queue_eviction`
-/// `ci_remediations` row. The Buildkite evidence fetch
-/// itself is best-effort and untestable here (no `bk` binary in this test
-/// environment — mirrors the existing `fetch_and_store_log_excerpt`
-/// precedent), so this only exercises the wiring, not the log excerpt.
+/// `ci_remediations` row.
+///
+/// The evidence channels are stubbed ([`StubEvictionEvidence`]) rather than
+/// shelled out, so this exercises the whole poller → classify → `ci_watch`
+/// wiring for the test-failure arm; the `bk`/`gh` invocations themselves stay
+/// untested, mirroring the `fetch_and_store_log_excerpt` precedent.
 #[tokio::test]
 async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
     let (_tmp, db) = crate::test_support::open_db();
@@ -676,7 +773,7 @@ async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
         )),
     );
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe_with(Arc::new(StubEvictionEvidence::with_failing_job()));
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -723,6 +820,420 @@ async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
     );
 }
 
+// ── Eviction cause classification (T792/T793) ─────────────────────────────
+
+/// Rows in `ci_remediations` for `task_id`, and the CI attempt budget it has
+/// consumed. Both must stay at zero for every merge-side eviction: the whole
+/// point is that a failure Trunk raised before testing never enters the CI
+/// ledger.
+fn ci_ledger_state(db: &WorkDb, task_id: &str) -> (i64, i64) {
+    // Scoped so the connection guard is released before `get_ci_attempts_used`
+    // asks `WorkDb` for one of its own — `connect()` is behind a mutex, so
+    // holding one across that call self-deadlocks.
+    let attempts: i64 = {
+        let conn = db.connect().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM ci_remediations WHERE work_item_id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    (attempts, db.get_ci_attempts_used(task_id).unwrap())
+}
+
+fn revision_count(db: &WorkDb, task_id: &str) -> i64 {
+    db.connect()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+            rusqlite::params![task_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+}
+
+fn task_status_of(db: &WorkDb, task_id: &str) -> (crate::work::TaskStatus, Option<String>) {
+    match db.get_work_item(task_id).unwrap() {
+        crate::work::WorkItem::Chore(t) => (t.status, t.blocked_reason),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Drive one enqueue → eviction cycle and return the last pass's outcome.
+async fn run_eviction(
+    db: &WorkDb,
+    pr_number: u64,
+    evicted: TrunkPullRequest,
+    evidence: Arc<StubEvictionEvidence>,
+) -> TrunkSweepOutcome {
+    let api = StubTrunkApi::with_queue(vec![
+        Ok(queue_of(
+            TrunkQueueState::Running,
+            vec![entry_of(pr_number, TrunkPrState::Testing)],
+        )),
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+    ]);
+    api.set_entry(pr_number, Ok(evicted));
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe_with(evidence);
+    let ctx = TrunkSweepContext {
+        work_db: db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+    probe.run_pass(&ctx, t0).await;
+    probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await
+}
+
+/// The T792/T793 bug, from the structured channel: Trunk evicted the PR
+/// before testing because it no longer merges into the target branch. That
+/// must not read as a CI failure — no `ci_remediations` row, no "Fix failing
+/// CI" revision, no CI budget spent — and the slot must be handed to the
+/// conflict resolver, which is what can actually fix it.
+#[tokio::test]
+async fn a_merge_conflict_eviction_is_handed_to_the_conflict_lane_not_to_ci() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-conflict", 1136);
+    let evidence = Arc::new(StubEvictionEvidence::default());
+    let entry = evicted_entry_with_readiness(
+        1136,
+        TrunkReadiness {
+            git_hub_mergeability: "conflicting".to_owned(),
+            ..healthy_readiness()
+        },
+    );
+
+    let outcome = run_eviction(&db, 1136, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(outcome.merge_side_evictions, 1);
+    assert_eq!(
+        outcome.evictions_detected, 0,
+        "a merge failure must never reach the CI ledger",
+    );
+    assert_eq!(
+        evidence.bot_comment_call_count(),
+        0,
+        "the structured readiness signal is conclusive; no `gh` round trip is owed",
+    );
+
+    assert_eq!(
+        ci_ledger_state(&db, &task_id),
+        (0, 0),
+        "no ci_remediations row and no CI attempt consumed",
+    );
+    assert_eq!(revision_count(&db, &task_id), 0, "no 'Fix failing CI' revision");
+    let (status, blocked_reason) = task_status_of(&db, &task_id);
+    assert_eq!(status, crate::work::TaskStatus::InReview);
+    assert_eq!(blocked_reason, None, "the row must not be flipped to ci_failure");
+
+    // Ownership transferred, so `conflict_watch::on_resolved` can advance the
+    // intent to `awaiting_resubmit` once the conflict is fixed. Left at
+    // `failed` the PR would be remediated and then never re-queued.
+    let intent = db
+        .get_active_trunk_merge_intent(&task_id)
+        .unwrap()
+        .expect("intent stays active for the resubmit");
+    assert_eq!(
+        intent.last_trunk_state.as_deref(),
+        Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+    );
+
+    let (queue_state, _) = stored_queue_state(&db, &task_id);
+    assert_eq!(queue_state, None, "the card leaves the Merging lane");
+    assert_eq!(
+        attention_kinds(&db, &task_id),
+        vec![TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND.to_owned()],
+        "the eviction is attributed, not silent",
+    );
+}
+
+/// Same outcome via the corroborating channel: Trunk omitted `readiness`, so
+/// the only positive reason signal is its bot comment — the verbatim string
+/// it posted on flunge#1136 and #1137. Consulted only because the Buildkite
+/// search also came back empty.
+#[tokio::test]
+async fn a_merge_conflict_eviction_is_recognised_from_the_trunk_bot_comment() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-bot-comment", 1137);
+    let evidence = Arc::new(StubEvictionEvidence::with_bot_comment(
+        "❌ This pull request could not start testing because there was a merge conflict.",
+    ));
+    let entry = entry_of_with_state_changed_at(1137, TrunkPrState::Failed, "2026-07-25T03:54:36.000Z");
+
+    let outcome = run_eviction(&db, 1137, entry, Arc::clone(&evidence)).await;
+
+    assert_eq!(outcome.merge_side_evictions, 1);
+    assert_eq!(outcome.evictions_detected, 0);
+    assert_eq!(evidence.bot_comment_call_count(), 1);
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0);
+    assert_eq!(
+        db.get_active_trunk_merge_intent(&task_id)
+            .unwrap()
+            .expect("still active")
+            .last_trunk_state
+            .as_deref(),
+        Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+    );
+}
+
+/// A PR pointed at a branch this queue does not merge into. No rebase and no
+/// code change fixes that, so nothing automated is attempted: the intent is
+/// retired (freeing the slot for a re-merge after the operator retargets)
+/// and the reason is filed.
+#[tokio::test]
+async fn a_base_branch_mismatch_eviction_retires_the_intent_with_no_remediation() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-wrong-base", 1200);
+    let entry = TrunkPullRequest::builder()
+        .id("entry_1200")
+        .state(TrunkPrState::Failed)
+        .pr_number(1200u64)
+        .state_changed_at("2026-07-25T03:54:24.000Z")
+        .pr_base_branch("release-2026")
+        .build();
+
+    let outcome = run_eviction(&db, 1200, entry, Arc::new(StubEvictionEvidence::default())).await;
+
+    assert_eq!(outcome.merge_side_evictions, 1);
+    assert_eq!(outcome.evictions_detected, 0);
+    assert_eq!(outcome.intents_retired, 1);
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0);
+    assert!(
+        db.get_active_trunk_merge_intent(&task_id).unwrap().is_none(),
+        "no remediation exists, so the intent is not left waiting for one",
+    );
+    assert_eq!(
+        attention_kinds(&db, &task_id),
+        vec![TRUNK_QUEUE_MERGE_FAILURE_ATTENTION_KIND.to_owned()],
+    );
+}
+
+/// Neither a failing build nor any positive merge-side signal. The
+/// classification falls through to the unchanged test-failure arm, and
+/// `on_queue_side_failure_detected`'s empty-`failures` guard then refuses the
+/// flip — an attempt with no failing check to name is one a worker cannot
+/// act on, and dispatching one anyway is what destroyed flunge#1137.
+#[tokio::test]
+async fn an_eviction_with_no_evidence_at_all_does_not_flip_the_row() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-no-evidence", 1300);
+    let entry = evicted_entry_with_readiness(1300, healthy_readiness());
+
+    let outcome = run_eviction(&db, 1300, entry, Arc::new(StubEvictionEvidence::default())).await;
+
+    assert_eq!(outcome.evictions_detected, 0);
+    assert_eq!(outcome.merge_side_evictions, 0);
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+    assert_eq!(revision_count(&db, &task_id), 0);
+    let (status, blocked_reason) = task_status_of(&db, &task_id);
+    assert_eq!(status, crate::work::TaskStatus::InReview);
+    assert_eq!(blocked_reason, None);
+}
+
+/// The sentinel a merge-side eviction writes must survive the
+/// `listPullRequests` reconciliation backstop re-observing the same terminal
+/// entry. `record_observed_state` would otherwise stamp `failed` back over
+/// it, and `trunk_merge::needs_remediation` treats `failed` as "an eviction
+/// episode owns this slot" — which would leave `conflict_watch::on_resolved`
+/// unable to ever mark the intent `awaiting_resubmit`.
+#[tokio::test]
+async fn a_conflict_handover_sentinel_survives_the_reconciliation_backstop() {
+    let (_tmp, db) = crate::test_support::open_db();
+    let (_, task_id) = seed_intent(&db, "evicted-sentinel", 1400);
+    let evicted = evicted_entry_with_readiness(
+        1400,
+        TrunkReadiness {
+            git_hub_mergeability: "conflicting".to_owned(),
+            ..healthy_readiness()
+        },
+    );
+    let api = StubTrunkApi::with_queue(vec![
+        Ok(queue_of(
+            TrunkQueueState::Running,
+            vec![entry_of(1400, TrunkPrState::Testing)],
+        )),
+        Ok(queue_of(TrunkQueueState::Running, Vec::new())),
+    ]);
+    api.set_entry(1400, Ok(evicted.clone()));
+    // The backstop re-reports the same terminal entry on its next window.
+    api.set_list_pull_requests(vec![Ok(ListPullRequestsResponse {
+        pull_requests: vec![evicted],
+        next_cursor: None,
+    })]);
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe();
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+    let t0 = Instant::now();
+
+    probe.run_pass(&ctx, t0).await;
+    probe.run_pass(&ctx, t0 + Duration::from_secs(31)).await;
+    // Past RECONCILE_INTERVAL, so the backstop runs.
+    probe
+        .run_pass(&ctx, t0 + RECONCILE_INTERVAL + Duration::from_secs(62))
+        .await;
+
+    assert_eq!(
+        db.get_active_trunk_merge_intent(&task_id)
+            .unwrap()
+            .expect("still active")
+            .last_trunk_state
+            .as_deref(),
+        Some(TRUNK_INTENT_SUPERSEDED_BY_CONFLICT),
+        "the backstop must not clobber the handover sentinel",
+    );
+    assert_eq!(ci_ledger_state(&db, &task_id), (0, 0));
+}
+
+// ── Pure classification helpers ───────────────────────────────────────────
+
+#[test]
+fn build_evidence_outranks_a_conflicting_readiness_snapshot() {
+    // `readiness` is a live snapshot with no episode attached: the target
+    // branch moving after a genuine test failure must not retroactively
+    // reclassify it and lose the failing build.
+    let entry = evicted_entry_with_readiness(
+        1,
+        TrunkReadiness {
+            git_hub_mergeability: "conflicting".to_owned(),
+            ..healthy_readiness()
+        },
+    );
+    assert_eq!(
+        classify_trunk_eviction_from_payload(&entry, "main", true),
+        Some(TrunkEvictionCause::TestFailure),
+    );
+}
+
+#[test]
+fn a_healthy_readiness_block_is_not_evidence_of_a_merge_failure() {
+    let entry = evicted_entry_with_readiness(1, healthy_readiness());
+    assert_eq!(classify_trunk_eviction_from_payload(&entry, "main", false), None);
+}
+
+#[test]
+fn an_unrecognised_mergeability_value_is_inconclusive_not_conflicting() {
+    for raw in ["unknown", "checking", "", "something_trunk_adds_later"] {
+        let entry = evicted_entry_with_readiness(
+            1,
+            TrunkReadiness {
+                git_hub_mergeability: raw.to_owned(),
+                ..healthy_readiness()
+            },
+        );
+        assert_eq!(
+            classify_trunk_eviction_from_payload(&entry, "main", false),
+            None,
+            "{raw:?} must fall through to the unchanged test-failure arm",
+        );
+    }
+}
+
+#[test]
+fn conflicting_mergeability_spellings_are_matched_case_insensitively() {
+    for raw in ["conflicting", "CONFLICTING", "Dirty", "not_mergeable", "unmergeable"] {
+        assert!(is_conflicting_mergeability(raw), "{raw:?}");
+    }
+    for raw in ["mergeable", "clean", "unknown", "behind", "blocked"] {
+        assert!(!is_conflicting_mergeability(raw), "{raw:?}");
+    }
+}
+
+#[test]
+fn a_base_branch_mismatch_is_read_from_either_channel() {
+    // From the entry's own `pr_base_branch`, with no `readiness` at all.
+    let entry = TrunkPullRequest::builder()
+        .id("e")
+        .state(TrunkPrState::Failed)
+        .pr_number(1u64)
+        .pr_base_branch("release")
+        .build();
+    assert_eq!(
+        classify_trunk_eviction_from_payload(&entry, "main", false),
+        Some(TrunkEvictionCause::BaseBranchMismatch {
+            pr_base: "release".to_owned()
+        }),
+    );
+
+    // From `readiness`, when Trunk did not report the base branch.
+    let entry = evicted_entry_with_readiness(
+        1,
+        TrunkReadiness {
+            does_base_branch_match: false,
+            ..healthy_readiness()
+        },
+    );
+    assert_eq!(
+        classify_trunk_eviction_from_payload(&entry, "main", false),
+        Some(TrunkEvictionCause::BaseBranchMismatch {
+            pr_base: "<unreported>".to_owned()
+        }),
+    );
+}
+
+#[test]
+fn a_matching_base_branch_is_compared_case_insensitively() {
+    let entry = TrunkPullRequest::builder()
+        .id("e")
+        .state(TrunkPrState::Failed)
+        .pr_number(1u64)
+        .pr_base_branch("Main")
+        .readiness(healthy_readiness())
+        .build();
+    assert_eq!(classify_trunk_eviction_from_payload(&entry, "main", false), None);
+}
+
+#[test]
+fn the_trunk_bot_eviction_phrase_is_recognised() {
+    assert_eq!(
+        bot_comment_merge_failure_marker(
+            "❌ This pull request could not start testing because there was a merge conflict."
+        ),
+        Some("could not start testing"),
+    );
+    assert_eq!(
+        bot_comment_merge_failure_marker("Blocked: this PR has a Merge Conflict with main."),
+        Some("merge conflict"),
+    );
+    assert_eq!(
+        bot_comment_merge_failure_marker("⏳ This pull request is queued for testing (position 3)."),
+        None,
+    );
+}
+
+#[test]
+fn only_the_newest_trunk_bot_comment_is_read() {
+    let body = serde_json::json!([
+        {"user": {"login": "someone"}, "body": "merge conflict incoming, heads up"},
+        {"user": {"login": "trunk-io[bot]"}, "body": "⏳ queued for testing"},
+        {"user": {"login": "trunk-io[bot]"}, "body": "❌ could not start testing because there was a merge conflict"},
+        {"user": {"login": "reviewer"}, "body": "lgtm"},
+    ])
+    .to_string();
+    assert_eq!(
+        newest_trunk_bot_comment(body.as_bytes()).as_deref(),
+        Some("❌ could not start testing because there was a merge conflict"),
+        "a human saying 'merge conflict' must not be mistaken for Trunk's verdict",
+    );
+}
+
+#[test]
+fn an_absent_or_unparseable_comment_payload_yields_nothing() {
+    assert_eq!(newest_trunk_bot_comment(b"not json"), None);
+    assert_eq!(newest_trunk_bot_comment(b"[]"), None);
+    assert_eq!(
+        newest_trunk_bot_comment(br#"[{"user":{"login":"human"},"body":"hi"}]"#),
+        None,
+    );
+}
+
 #[tokio::test]
 async fn a_resubmitted_entry_returns_to_the_merging_lane() {
     let (_tmp, db) = crate::test_support::open_db();
@@ -742,7 +1253,7 @@ async fn a_resubmitted_entry_returns_to_the_merging_lane() {
     ]);
     api.set_entry(978, Ok(entry_of(978, TrunkPrState::Failed)));
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -781,7 +1292,7 @@ async fn an_intent_awaiting_resubmit_is_resubmitted_and_returns_to_the_merging_l
 
     let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -823,7 +1334,7 @@ async fn a_failed_resubmit_leaves_the_sentinel_for_the_next_cycle() {
     let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
     api.set_submit_replies(vec![Err(StubError::Unavailable)]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -865,7 +1376,7 @@ async fn a_live_intent_superseded_by_conflict_is_cancelled_before_its_sentinel_c
         vec![entry_of(978, TrunkPrState::Pending)],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -904,7 +1415,7 @@ async fn an_intent_superseded_by_conflict_is_cancelled_and_the_sentinel_persists
 
     let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -942,7 +1453,7 @@ async fn a_cancel_that_finds_no_live_entry_is_not_a_probe_failure() {
     let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
     api.set_cancel_replies(vec![Err(StubError::NotFound)]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -962,7 +1473,7 @@ async fn an_entry_unknown_to_trunk_leaves_the_intent_untouched() {
     let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
     api.set_entry(978, Err(StubError::NotFound));
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     let outcome = probe
         .run_pass(
@@ -994,7 +1505,7 @@ async fn an_intent_whose_task_already_finished_is_retired_without_any_trunk_call
     .unwrap();
     let api = StubTrunkApi::default();
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     let outcome = probe
         .run_pass(
@@ -1021,7 +1532,7 @@ async fn repeated_failures_back_the_queue_off_before_the_next_probe() {
     seed_intent(&db, "down", 978);
     let api = StubTrunkApi::with_queue(vec![Err(StubError::Unavailable)]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1052,7 +1563,7 @@ async fn a_queue_unreachable_for_fifteen_minutes_files_exactly_one_attention_ite
     let (_, task_id) = seed_intent(&db, "unreachable", 978);
     let api = StubTrunkApi::with_queue(vec![Err(StubError::Unavailable)]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1085,7 +1596,7 @@ async fn a_rejected_token_is_reported_immediately_and_once() {
     let (_, task_id) = seed_intent(&db, "authfail", 978);
     let api = StubTrunkApi::with_queue(vec![Err(StubError::Auth)]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1121,7 +1632,7 @@ async fn recovery_re_arms_the_unreachable_attention_for_the_next_outage() {
         Err(StubError::Unavailable),
     ]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1166,7 +1677,7 @@ async fn a_paused_queue_files_one_attention_item_per_episode() {
         )),
     ]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1206,7 +1717,7 @@ async fn an_unparseable_repo_slug_parks_the_queue_instead_of_calling_trunk() {
     seed_intent_on(&db, "badrepo", 978, "not-a-slug", "main");
     let api = StubTrunkApi::default();
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1261,7 +1772,7 @@ async fn section_order_is_a_contiguous_rank_across_only_the_boss_tracked_members
         ],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
 
     probe
         .run_pass(
@@ -1300,7 +1811,7 @@ async fn a_stable_queue_does_not_re_renumber_every_pass() {
         ],
     ))]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1337,7 +1848,7 @@ async fn the_reconciliation_backstop_catches_a_transition_the_point_probes_misse
         next_cursor: None,
     })]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1375,7 +1886,7 @@ async fn the_reconciliation_backstop_does_not_fire_before_its_own_cadence() {
         next_cursor: None,
     })]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1410,7 +1921,7 @@ async fn a_failed_reconciliation_call_does_not_advance_the_since_cursor() {
         }),
     ]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,
@@ -1452,7 +1963,7 @@ async fn the_reconciliation_backstop_follows_next_cursor_into_a_second_page() {
         }),
     ]);
     let publisher = RecordingPublisher::default();
-    let mut probe = TrunkQueueProbe::new();
+    let mut probe = probe();
     let ctx = TrunkSweepContext {
         work_db: &db,
         publisher: &publisher,

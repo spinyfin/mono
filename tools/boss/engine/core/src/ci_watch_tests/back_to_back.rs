@@ -44,7 +44,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         Some("feature"),
         "sha-merge-1",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(first, "first rebounce must flip chore to ci_failure");
@@ -105,7 +105,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         Some("feature"),
         "sha-merge-1",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(
@@ -142,7 +142,7 @@ async fn back_to_back_rebounce_parks_execution_for_second_dequeue() {
         Some("feature"),
         "sha-merge-2",
         &[],
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(
