@@ -408,10 +408,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // failure mode (missing key, API error, cache miss) so a
         // slow or unreachable Anthropic never blocks the spawn.
         let api_key = self.cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
-        let title_summary = if execution.kind == ExecutionKind::CiRemediation {
-            pane_summary::ci_remediation_summary(work_item_name(work_item))
-        } else {
-            pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await
+        // `derived_title_summary` exhaustively matches `ExecutionKind` (its doc
+        // comment demands this — see `execution.rs`) to decide whether this kind
+        // needs a pure derived phrase or can use the cached/LLM path; see its
+        // doc comment for why some kinds can't share `get_or_generate`.
+        let title_summary = match pane_summary::derived_title_summary(&execution.kind, work_item_name(work_item)) {
+            Some(summary) => summary,
+            None => pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await,
         };
 
         let work_item_binding = Some(WorkItemBinding {
