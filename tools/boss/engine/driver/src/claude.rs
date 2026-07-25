@@ -622,12 +622,24 @@ impl AgentDriver for ClaudeDriver {
         CLAUDE_AGENT_RULES_PREAMBLE
     }
 
-    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
+        // Claude stamps the absolute path to the session's JSONL transcript
+        // on every hook payload it emits —
+        // `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Empty
+        // strings are treated as missing so callers never end up trying to
+        // open a path `tokio::fs::File::open` would reject anyway.
+        let s = raw.get("transcript_path")?.as_str()?;
+        if s.is_empty() { None } else { Some(s.to_owned()) }
+    }
+
+    fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
         // Claude's transcript JSONL is already in the canonical redactable
         // field shape (tool_name / tool_input / tool_response at the top level,
         // content[].type == "tool_use" blocks with name + input sub-fields).
-        // No remapping is needed; return the entry as-is.
-        raw.clone()
+        // No remapping is needed; return the entry as-is (moved, not cloned —
+        // this runs on every polled transcript line on the hot live-status
+        // path).
+        raw
     }
 
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
@@ -1043,6 +1055,28 @@ mod tests {
     // ── TranscriptAccess ─────────────────────────────────────────────────────
 
     #[test]
+    fn transcript_path_for_session_reads_field_from_payload() {
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "hook_event_name": "Stop",
+            "transcript_path": "/home/u/.claude/projects/foo/sess-1.jsonl",
+        });
+        assert_eq!(
+            ClaudeDriver.transcript_path_for_session(&raw).as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+        );
+    }
+
+    #[test]
+    fn transcript_path_for_session_is_none_when_missing_or_empty() {
+        let missing = serde_json::json!({"session_id": "sess-1"});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&missing), None);
+
+        let empty = serde_json::json!({"transcript_path": ""});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&empty), None);
+    }
+
+    #[test]
     fn normalize_transcript_entry_is_identity_for_claude_format() {
         // Claude's transcript is already in the canonical shape; the
         // normaliser must return the value unchanged.
@@ -1052,7 +1086,7 @@ mod tests {
             "tool_input": {"command": "ls"},
             "tool_response": "file.txt\n",
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]
@@ -1064,7 +1098,7 @@ mod tests {
                 "content": [{"type": "text", "text": "working on it"}],
             }
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]

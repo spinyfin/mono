@@ -722,6 +722,21 @@ pub trait AgentDriver: Send + Sync {
 
     // ── TranscriptAccess capability ──────────────────────────────────────────
 
+    /// Report where this driver's transcript for the current session lives,
+    /// given a raw progress-event payload (the same payload passed to
+    /// [`Self::normalize_progress_event`]).
+    ///
+    /// For the Claude driver this reads the `transcript_path` field Claude
+    /// stamps on every hook payload. A driver that does not fire Claude-style
+    /// hooks — or that locates its transcript some other way — implements
+    /// its own discovery here instead of relying on that field; the engine's
+    /// path-resolution path calls this rather than assuming the field's
+    /// presence.
+    ///
+    /// Returns `None` when the payload carries no (or an empty) transcript
+    /// path; the caller retries on a later payload.
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String>;
+
     /// Normalise a raw transcript JSONL entry to the canonical redactable
     /// field shape that `boss_engine_live_status_redact` and the live-status
     /// summariser expect: `tool_name` / `tool_input` / `tool_response` at the
@@ -731,7 +746,12 @@ pub trait AgentDriver: Send + Sync {
     /// For the Claude driver this is the identity — Claude's transcript already
     /// uses canonical names. Alternative drivers with different field shapes
     /// implement the remapping here so the redaction layer is unchanged.
-    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value;
+    ///
+    /// Takes `raw` by value: this runs on every polled transcript line on the
+    /// hot live-status path, and Claude's identity impl can then move it
+    /// straight through instead of deep-cloning a payload that may carry a
+    /// full `tool_response` body.
+    fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value;
 
     /// Extract the worker-halting API-error text from a normalised transcript
     /// tail, but only when it is the **last meaningful entry** (i.e. the worker
@@ -1063,8 +1083,11 @@ mod tests {
         fn agent_rules_preamble(&self) -> &'static str {
             unimplemented!()
         }
-        fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
-            raw.clone()
+        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
+            None
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
         }
         fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
             None
