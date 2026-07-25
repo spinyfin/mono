@@ -126,7 +126,7 @@ pub async fn run_one_pass(
     let claimed = coordinator.all_claimed_execution_ids().await;
 
     for work_item_id in candidates {
-        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff) {
+        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff, None) {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -342,7 +342,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..DISPATCH_FAILURE_RECOVERY_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(&work_item_id, "failed", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "failed", now_epoch - i)
                 .unwrap();
         }
 

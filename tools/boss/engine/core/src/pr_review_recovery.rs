@@ -150,10 +150,10 @@ pub async fn run_one_pass(
         // trip the guard immediately, parking the item and leaving the PR
         // permanently unreviewed instead of getting the retry this guard is
         // supposed to allow.
-        let recent_terminal = match work_db.count_recent_terminal_executions_for_kind(
+        let recent_terminal = match work_db.count_recent_terminal_executions(
             &work_item_id,
             churn_cutoff,
-            ExecutionKind::PrReview,
+            Some(ExecutionKind::PrReview),
         ) {
             Ok(n) => n,
             Err(err) => {
@@ -176,13 +176,14 @@ pub async fn run_one_pass(
                 "pr_review recovery: churn guard tripped; not auto-refiring — human attention required",
             );
             let failing_ids = work_db
-                .list_recent_terminal_execution_ids_for_kind(&work_item_id, churn_cutoff, ExecutionKind::PrReview)
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, Some(ExecutionKind::PrReview))
                 .unwrap_or_default();
             work_db.file_churn_guard_parked_attention(
                 &work_item_id,
                 "pr_review_recovery",
                 recent_terminal,
                 &failing_ids,
+                "terminal pr_review executions",
             );
             outcome.churn_skipped += 1;
             continue;
@@ -391,7 +392,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_pr_review_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
@@ -434,6 +435,37 @@ mod tests {
         );
     }
 
+    /// Regression: `list_dead_pr_review_candidates` treats `cancelled`
+    /// pr_review executions as dead-review candidates, so the churn guard
+    /// must count them too — otherwise a review that repeatedly ends
+    /// `cancelled` never accumulates toward the threshold and gets
+    /// refired by every sweep pass with the guard never tripping.
+    #[tokio::test]
+    async fn churn_guard_counts_cancelled_reviews() {
+        let (_dir, db) = open_db();
+        let (work_item_id, _dead_execution_id) =
+            create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/9");
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "cancelled", now_epoch - i)
+                .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(
+            outcome.churn_skipped, 1,
+            "cancelled pr_review executions must count toward the churn guard"
+        );
+        assert_eq!(outcome.refired, 0);
+    }
+
     #[tokio::test]
     async fn churn_guard_park_auto_clears_via_recovery_sweep_once_window_drains() {
         // Regression test for the real auto-recovery path: the sweep must
@@ -449,7 +481,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_pr_review_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
@@ -517,7 +549,7 @@ mod tests {
         // tripped the old unscoped guard (threshold - 1 plus the one dead
         // pr_review from create_chore_with_dead_review == threshold).
         for i in 0..(ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
-            db.insert_terminal_execution_for_test(&work_item_id, "failed", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "failed", now_epoch - i)
                 .unwrap();
         }
 

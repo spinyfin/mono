@@ -337,7 +337,7 @@ fn file_churn_guard_parked_attention_opens_an_item_naming_the_failures() {
     let (db, _product, chore) = chore_fixture("churn-open");
     let failing = vec!["exec_aaa".to_owned(), "exec_bbb".to_owned()];
 
-    db.file_churn_guard_parked_attention(&chore, "orphan_sweep", 4, &failing);
+    db.file_churn_guard_parked_attention(&chore, "orphan_sweep", 4, &failing, "terminal executions");
 
     let item = open_item_of_kind(&db, &chore, CHURN_GUARD_PARKED_ATTENTION_KIND).expect("guard files an open item");
     assert!(
@@ -356,8 +356,20 @@ fn file_churn_guard_parked_attention_opens_an_item_naming_the_failures() {
 fn file_churn_guard_parked_attention_folds_repeat_trips_and_refreshes_the_count() {
     let (db, _product, chore) = chore_fixture("churn-fold");
 
-    db.file_churn_guard_parked_attention(&chore, "orphan_sweep", 4, &["exec_aaa".to_owned()]);
-    db.file_churn_guard_parked_attention(&chore, "orphan_sweep", 9, &["exec_ccc".to_owned()]);
+    db.file_churn_guard_parked_attention(
+        &chore,
+        "orphan_sweep",
+        4,
+        &["exec_aaa".to_owned()],
+        "terminal executions",
+    );
+    db.file_churn_guard_parked_attention(
+        &chore,
+        "orphan_sweep",
+        9,
+        &["exec_ccc".to_owned()],
+        "terminal executions",
+    );
 
     let items = db.list_attention_items_for_work_item(&chore).unwrap();
     assert_eq!(items.len(), 1, "repeated trips must not pile up rows");
@@ -375,7 +387,7 @@ fn file_churn_guard_parked_attention_folds_repeat_trips_and_refreshes_the_count(
 fn file_churn_guard_parked_attention_swallows_an_unknown_work_item() {
     let (db, _product, _chore) = chore_fixture("churn-unknown");
 
-    db.file_churn_guard_parked_attention("task_nope", "orphan_sweep", 4, &[]);
+    db.file_churn_guard_parked_attention("task_nope", "orphan_sweep", 4, &[], "terminal executions");
 }
 
 // ── attention_merges ledger ────────────────────────────────────────────────
