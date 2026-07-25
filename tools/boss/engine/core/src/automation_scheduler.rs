@@ -74,14 +74,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use boss_event_bus::Subscription;
+use boss_event_bus::{Event, Subscription};
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
     AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, Automation, AutomationRun, AutomationTrigger,
 };
+use boss_timer_wheel::TimerWheel;
 
 use crate::automation_schedule::{next_occurrence_after, parse_cron, parse_timezone};
 use crate::work::{AutomationFireRecord, WorkDb};
+
+/// The timer-wheel deadline id the scheduler schedules its next wake under.
+/// Fixed (not per-automation) because the loop always wakes for the single
+/// earliest due occurrence across every automation — see
+/// [`next_sleep_secs`]. Scheduling under this id again before it elapses
+/// replaces the pending deadline rather than firing it twice (see
+/// [`TimerWheel::schedule_after`]), so an early wake via [`Event::AutomationMutation`]
+/// naturally supersedes a stale wake it raced with.
+const AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID: &str = "automation_scheduler";
 
 /// Maximum time the scheduler sleeps between passes. Caps the sleep so
 /// the loop wakes at least hourly as a safety net, even with no automations
@@ -301,11 +311,17 @@ fn is_retryable_hold(run: &AutomationRun) -> bool {
 /// - [`AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS`] when any enabled
 ///   automation still has `next_due_at IS NULL` (bootstrap case: initialise
 ///   the first occurrence promptly).
-/// - Immediate wake via `kick`, a [`boss_event_bus::Subscription`] to
-///   [`boss_event_bus::Event::AutomationMutation`], published by automation
+/// - Immediate wake via `kick`, a [`boss_event_bus::Subscription`] to both
+///   [`boss_event_bus::Event::AutomationMutation`] — published by automation
 ///   mutation handlers (create, update, enable, disable, delete) and by the
-///   pause/resume handler so the scheduler recomputes its sleep on every
-///   state change without waiting out the current interval.
+///   pause/resume handler, so the scheduler recomputes its sleep on every
+///   state change without waiting out the current interval — and
+///   [`boss_event_bus::Event::Timer`] carrying
+///   [`AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID`], published by `timer_wheel`
+///   when the sleep computed for the current pass elapses. The `Timer` wake
+///   replaces the old direct `tokio::time::sleep` for the pass's own
+///   cadence; `AutomationMutation` remains the separate event-driven wake
+///   for out-of-band state changes.
 ///
 /// ## While globally paused, the loop does not evaluate at all
 ///
@@ -331,6 +347,7 @@ pub fn spawn_loop(
     dispatcher: Arc<dyn TriageDispatcher>,
     mut kick: Subscription,
     is_paused: Arc<dyn Fn() -> bool + Send + Sync>,
+    timer_wheel: Arc<TimerWheel>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut was_paused = false;
@@ -376,12 +393,27 @@ pub fn spawn_loop(
                 let wait = (wake - now).clamp(1, AUTOMATION_SCHEDULER_MAX_SLEEP_SECS as i64) as u64;
                 sleep_secs = sleep_secs.min(wait);
             }
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
-                _ = kick.recv() => {}
-            }
+            timer_wheel.schedule_after(AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID, Duration::from_secs(sleep_secs));
+            wait_for_wake(&mut kick).await;
         }
     })
+}
+
+/// Block until an event actually relevant to this loop arrives: either an
+/// [`Event::AutomationMutation`], or the [`Event::Timer`] this loop's own
+/// deadline id — discarding (and continuing to wait past) any `Timer` for a
+/// *different* deadline id delivered over the same shared bus/wheel, and any
+/// other event kind `kick`'s filter admits in the future. Returns on a closed
+/// mailbox (`recv` returning `None`) too, matching the old `select!`'s
+/// behaviour of not blocking forever once the bus is gone.
+async fn wait_for_wake(kick: &mut Subscription) {
+    loop {
+        match kick.recv().await {
+            None => return,
+            Some(Event::Timer { deadline_id }) if deadline_id != AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID => continue,
+            Some(_) => return,
+        }
+    }
 }
 
 /// Compute how many seconds the scheduler should sleep before its next pass.
@@ -1565,15 +1597,20 @@ mod tests {
         db.initialize_automation_next_due_at(&automation.id, now - 5).unwrap();
 
         let paused = Arc::new(AtomicBool::new(true));
-        let bus = EventBus::new();
-        let kick = bus.subscribe(TopicFilter::kind(boss_event_bus::EventKind::AutomationMutation));
+        let bus = Arc::new(EventBus::new());
+        let kick = bus.subscribe(TopicFilter::kinds([
+            boss_event_bus::EventKind::AutomationMutation,
+            boss_event_bus::EventKind::Timer,
+        ]));
         let dispatcher = Arc::new(FakeDispatcher::dispatched());
         let paused_for_loop = paused.clone();
+        let timer_wheel = Arc::new(TimerWheel::spawn(bus.clone()));
         let _handle = spawn_loop(
             db.clone(),
             dispatcher.clone(),
             kick,
             Arc::new(move || paused_for_loop.load(Ordering::Acquire)),
+            timer_wheel,
         );
 
         // While paused the loop must evaluate nothing, however long it sits.
@@ -1603,6 +1640,62 @@ mod tests {
             fired.is_ok(),
             "resume must take effect promptly; the scheduler slept through the kick",
         );
+    }
+
+    /// Duplicate `Timer` wakes for the scheduler's own deadline id — e.g. a
+    /// redundant bus delivery, or a caller racing the wheel's own
+    /// reschedule-replaces-pending guarantee — must not bypass retry pacing
+    /// and re-dispatch the same held occurrence. `run_one_pass`'s retry-pacing
+    /// step (6) is what keeps this idempotent regardless of how many times the
+    /// loop is woken; this test pins that guarantee at the `spawn_loop`/Timer
+    /// level, not just at the pure `run_one_pass` level the other pacing test
+    /// (`held_occurrence_retries_are_paced`) covers.
+    #[tokio::test]
+    async fn duplicate_timer_wakes_do_not_bypass_retry_pacing() {
+        use boss_event_bus::{Event, EventBus, TopicFilter};
+
+        let (_d, db) = open_db_arc();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product);
+        // Park just behind real wall-clock now so the loop's immediate
+        // boot-time pass fires it right away.
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        db.initialize_automation_next_due_at(&automation.id, now - 5).unwrap();
+
+        let bus = Arc::new(EventBus::new());
+        let kick = bus.subscribe(TopicFilter::kinds([
+            boss_event_bus::EventKind::AutomationMutation,
+            boss_event_bus::EventKind::Timer,
+        ]));
+        let dispatcher = Arc::new(FakeDispatcher::transient());
+        let timer_wheel = Arc::new(TimerWheel::spawn(bus.clone()));
+        let _handle = spawn_loop(db.clone(), dispatcher.clone(), kick, Arc::new(|| false), timer_wheel);
+
+        // First pass fires immediately on boot and holds the occurrence for retry.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatcher.call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first pass must attempt the occurrence");
+        assert_eq!(dispatcher.call_count(), 1);
+
+        // Two more Timer wakes for the scheduler's own deadline id, both well
+        // inside AUTOMATION_RETRY_INTERVAL_SECS of the first attempt.
+        for _ in 0..2 {
+            bus.publish(Event::Timer {
+                deadline_id: AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID.to_owned(),
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            dispatcher.call_count(),
+            1,
+            "duplicate Timer wakes inside the retry interval must not re-dispatch"
+        );
+        let runs = db.list_automation_runs(&automation.id).unwrap();
+        assert_eq!(runs.len(), 1, "still exactly one held run row for the occurrence");
     }
 
     /// A held occurrence must not delay an unrelated automation that is

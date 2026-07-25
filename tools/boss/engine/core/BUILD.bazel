@@ -81,6 +81,7 @@ rust_library(
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/structured-output",
+        "//tools/boss/engine/timer-wheel",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/transient-error",

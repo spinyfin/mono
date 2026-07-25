@@ -44,6 +44,7 @@ boss-engine-proposal-validation = { path = "../proposal-validation" }
 boss-engine-recovery = { path = "../recovery" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
+boss-timer-wheel = { path = "../timer-wheel" }
 boss-engine-day-rotated-log = { path = "../day-rotated-log" }
 boss-event-bus = { path = "../event-bus" }
 boss-engine-stdout-progress = { path = "../stdout-progress" }

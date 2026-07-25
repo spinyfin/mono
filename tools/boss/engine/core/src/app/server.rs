@@ -1489,13 +1489,21 @@ pub async fn serve_with_merge_probe(
             Arc::new(move || coord_for_automation_triage.kick()),
             Arc::new(move || coord_for_automation_pause_check.is_automation_paused()),
         ));
+    // Shared timer-wheel: the scheduler schedules its own next-wake deadline
+    // here instead of a direct `tokio::time::sleep`, so a `Timer{deadline_id}`
+    // event on `server_state.event_bus` is what actually wakes it — the same
+    // bus the automation-mutation kick below already rides.
+    let automation_scheduler_timer_wheel =
+        Arc::new(boss_timer_wheel::TimerWheel::spawn(server_state.event_bus.clone()));
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
-        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kinds([
             boss_event_bus::EventKind::AutomationMutation,
-        )),
+            boss_event_bus::EventKind::Timer,
+        ])),
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
+        automation_scheduler_timer_wheel,
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
