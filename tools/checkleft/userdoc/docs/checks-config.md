@@ -98,6 +98,7 @@ Supported keys:
 - `severity` (optional `error|warning|info`): overrides finding severity for the check instance.
 - `allow_bypass` (optional boolean): enables BYPASS directives for the check instance.
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
+- `changed_lines_only` (optional boolean, default `false`): restrict this check's findings to PR-changed lines. See [Line-scoped findings](#line-scoped-findings).
 
 ## Changeset-scope checks
 
@@ -114,6 +115,31 @@ checks:
 Because there is no changed file to key directory-scoped config resolution on, a `scope: changeset` check must be declared in a `CHECKS` file that is the repo root (or an ancestor `external_checks_url` config) — a subdirectory `CHECKS.yaml` override is not consulted for these checks.
 
 A `scope: changeset` check that finds something has no file to attach the finding to, so it should emit a **locationless finding** (`location: None` / no `location` field), optionally naming which non-file surface it refers to via the `surface` field (`pr-description` or `commit-message`) so the terminal and GitHub check-run summary render `<pr description>` / `<commit message>` instead of `<unknown>`. Locationless findings are preserved by the framework — they still fail the build, still print in the terminal and `--format=json` output, and their check id and message are appended beneath the counts line in the GitHub check-run summary. They are the only shape available for a non-file subject: unlike a synthetic path (e.g. `<pr-description>`), a real file path is what every other output surface (SARIF, inline check-run annotations, GHA workflow commands) requires, so a synthetic one would be silently dropped before reaching any of them.
+
+## Line-scoped findings
+
+Change-scoping is file-granular by default: a check only runs against — and only reports findings on — the files a PR (or working tree) changed. It does not, by default, restrict findings any further to the specific lines that changed within those files; a content check enabled over whole file contents will flag pre-existing violations anywhere in a touched file, not just on the lines the PR actually added.
+
+Set `policy.changed_lines_only: true` on a check instance to additionally drop any line-anchored finding whose line falls outside the PR-changed (added) lines of its file:
+
+```yaml
+checks:
+  - id: text/forbidden-pattern
+    policy:
+      changed_lines_only: true
+```
+
+This is a strict narrowing on top of the existing file-level scoping, applied at the same choke point that produces every other finding-derived output (terminal, `--format=json`, SARIF, GitHub Check Run / inline annotations, the exit code, and the fix planner's finding set) — so a check opting in is filtered consistently everywhere, with no per-sink special-casing.
+
+Keep/drop rules:
+
+- A finding with no `location` (check-level / `scope: changeset` findings) is always kept — it isn't anchored to a file, let alone a line.
+- A finding with a `location` but no `line` (a whole-file finding, e.g. `file/size`'s line-count violation) is always kept — line-scoping only narrows line-anchored findings, and a whole-file property has no changed-line region to test against.
+- A finding with `location.line: Some(n)` is kept iff `n` lies inside one of the file's PR-added line ranges (the file's diff hunks, precisely — not the wider `-U3` context git includes around each hunk).
+- If the changeset carries no diff data for a file at all (`--all` / whole-repo mode, which never computes hunks), `changed_lines_only` is a no-op for that file — there is no changed-line data available, so every finding is kept, exactly like the file-level scope check's own `--all` no-op.
+- A file present in the changeset but with zero added lines (for example, a rename with no content changes) legitimately produces no changed-line findings for that file when `changed_lines_only` is set — that is not a bug.
+
+`changed_lines_only` defaults to `false`, so a check that does not set it behaves exactly as before — this is a strictly opt-in, additive filter. It only applies to the _detection_ side: fix application is unaffected, and a whole-file fix (e.g. a formatter rewrite) still rewrites the whole file even when its findings are filtered down to changed lines.
 
 ## Excluding files from checks
 

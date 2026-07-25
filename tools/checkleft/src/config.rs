@@ -125,6 +125,11 @@ pub struct CheckPolicyConfig {
     /// Per-check override of the stale-exclusion audit mode. `None` inherits the
     /// resolved global default (see [`ResolvedChecks::stale_exclusion_mode`]).
     pub stale_exclusion_mode: Option<StaleExclusionMode>,
+    /// When `true`, restrict this check's findings to lines inside a PR-changed
+    /// region of their file (in addition to the existing changed-*file*
+    /// scoping). Opt-in; defaults to `false`, which preserves today's
+    /// file-level-only scoping exactly.
+    pub changed_lines_only: bool,
 }
 
 /// How the stale-exclusion audit reports a dead exclusion. Defaults to
@@ -591,6 +596,9 @@ struct ParsedCheckPolicyConfig {
     bypass_name: Option<String>,
     #[serde(default)]
     stale_exclusion_severity: Option<String>,
+    /// `changed_lines_only`. See [`CheckPolicyConfig::changed_lines_only`].
+    #[serde(default)]
+    changed_lines_only: bool,
 }
 
 #[derive(Debug)]
@@ -953,6 +961,7 @@ fn parse_policy_config(
         allow_bypass: policy.allow_bypass,
         bypass_name,
         stale_exclusion_mode,
+        changed_lines_only: policy.changed_lines_only,
     })
 }
 

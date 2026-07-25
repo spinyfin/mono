@@ -71,6 +71,16 @@ impl ChangeSet {
         self
     }
 
+    /// The precise added-line ranges for `path`, or `None` when no diff data
+    /// exists for it in this changeset (e.g. `--all` mode, which carries no
+    /// hunk data at all). Callers should treat `None` as "no line restriction
+    /// available" rather than "no lines changed" — an empty-but-present range
+    /// list (e.g. a rename with no content change) legitimately means zero
+    /// changed lines.
+    pub fn changed_lines(&self, path: &Path) -> Option<&[(u32, u32)]> {
+        self.file_diffs.get(path).map(|diff| diff.added_line_ranges.as_slice())
+    }
+
     pub fn bypass_reason(&self, bypass_name: &str) -> Option<String> {
         parse_bypass_directives_from_descriptions(self.commit_description.as_deref(), self.pr_description.as_deref())
             .get(bypass_name)
@@ -88,6 +98,14 @@ pub struct FileLineDelta {
 pub struct FileDiff {
     #[serde(default)]
     pub hunks: Vec<DiffHunk>,
+    /// Precise post-image (new-file) line ranges, inclusive on both ends, that
+    /// this diff *added*. Unlike a `DiffHunk`'s `new_start..new_start+new_lines`
+    /// span (which includes unified-diff context lines), these ranges cover
+    /// exactly the `+` lines — built by tracking the post-image line counter
+    /// while walking the patch. Used by `ChangeSet::changed_lines` to filter
+    /// findings down to PR-changed lines.
+    #[serde(default)]
+    pub added_line_ranges: Vec<(u32, u32)>,
 }
 
 impl FileDiff {
@@ -98,6 +116,14 @@ impl FileDiff {
             delta.removed_lines = delta.removed_lines.saturating_add(hunk.removed_lines);
         }
         delta
+    }
+
+    /// Whether post-image line `line` (1-based) falls inside one of this diff's
+    /// added-line ranges.
+    pub fn contains_added_line(&self, line: u32) -> bool {
+        self.added_line_ranges
+            .iter()
+            .any(|&(start, end)| line >= start && line <= end)
     }
 }
 
