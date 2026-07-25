@@ -644,6 +644,22 @@ Notes:
 - Severity defaults to `error`. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass` (see
   [Bypass mechanism](bypass.md)).
+- The in-source marker scan (part 1 above) runs unconditionally over every
+  changed file whenever `file/ifchange` has _any_ enabled instance in
+  `CHECKS.yaml` — it ignores that instance's `trigger_globs` / `required_globs`
+  / `couplings` config entirely. "No instance config block" means "always
+  active", not "no `CHECKS.yaml` entry": checkleft has no default check set
+  (config resolution starts empty and only `CHECKS.yaml`-listed checks run —
+  see `base_resolution()` / `apply_local_config()` in
+  `tools/checkleft/src/config.rs`), so marker enforcement is entirely
+  contingent on some `file/ifchange` instance being enabled. Consequences:
+  a bare `- id: file/ifchange` instance is the durable way to guarantee marker
+  enforcement independent of any glob-coupling instance; if marker scanning
+  instead piggybacks on a glob-coupling instance, deleting that instance
+  silently disables marker scanning too, and marker violations report under
+  that instance's id (inheriting its `allow_bypass` setting). "checkleft run:
+  no findings" only proves marker enforcement happened if an instance is
+  actually enabled.
 
 ## `rust-test-rule-coverage`
 

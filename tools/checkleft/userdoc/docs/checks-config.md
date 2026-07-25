@@ -2,6 +2,8 @@
 
 `CHECKS.yaml` (preferred) or `CHECKS.toml` defines which checks run and how each check is configured. Both formats are equivalent; YAML is the recommended choice for new repos.
 
+checkleft has no default check set: config resolution starts empty, so only checks explicitly listed in a `CHECKS.yaml`/`CHECKS.toml` actually run.
+
 ## File location and hierarchy
 
 - Put a root `CHECKS.yaml` at repo root for default policy.
