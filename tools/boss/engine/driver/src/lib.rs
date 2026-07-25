@@ -15,6 +15,98 @@ use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
 
+/// Worker posture for the [`Capability::PermissionPolicy`] capability's
+/// deny-rule selection (reviewer read-only, triage no-work, answer-agent
+/// allowlist).
+///
+/// A deliberate local duplicate of `boss_engine::worker_setup::WorkerKind`:
+/// this crate has no dependency on `core` (only the reverse — `core` depends
+/// on `driver`), so the two cannot share one definition today. Consolidate
+/// once the settings/deny-rule rendering that `WorkerKind` selects between
+/// also moves into this crate (tracked alongside
+/// [`AgentDriver::write_permission_config`]'s real implementation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkerKind {
+    /// Normal implementation worker: write access to its workspace, may push
+    /// branches and open PRs.
+    #[default]
+    Standard,
+    /// Read-only reviewer worker (design §9).
+    Reviewer,
+    /// Automation triage worker: investigates and emits a decision marker,
+    /// no file edits/commits/pushes/PRs.
+    Triage,
+    /// Read-only "mini-coordinator" answer agent, enforced via allowlist
+    /// rather than blocklist.
+    AnswerAgent,
+}
+
+/// All inputs Boss provides to a driver for its [`Capability::PermissionPolicy`]:
+/// the abstract deny-set and autonomy mode rendered into backend-specific form
+/// (for Claude Code: settings.json deny rules + permission-mode; for a future
+/// Copilot driver: `--deny-tool` filters + equivalent autonomy flag).
+#[derive(bon::Builder, Debug, Clone)]
+#[builder(on(String, into))]
+pub struct PermissionInput {
+    /// Worker posture — determines the per-kind deny rules (reviewer read-only,
+    /// triage blanket-write deny, standard implementation no extras) and the
+    /// `fastMode` setting for latency-sensitive review passes.
+    pub worker_kind: WorkerKind,
+    /// Workspace path. Needed by the reviewer deny rules: file-write denies are
+    /// scoped to the workspace-parent so out-of-tree artifact writes are allowed.
+    pub workspace_path: PathBuf,
+    /// Absolute path to the engine events socket. Used to derive the Boss state
+    /// directory for sandbox deny globs and the deterministic path-guard hook.
+    /// Ignored (no sandbox installed) when `is_remote = true`.
+    pub events_socket_path: PathBuf,
+    /// Absolute path to the `boss-event` shim binary. Baked into every hook
+    /// command as the final argument so the shim fires regardless of `PATH`.
+    pub boss_event_path: PathBuf,
+    /// Run ID baked into every hook command as `BOSS_RUN_ID=<id>` so the engine
+    /// correlates hook events to runs even when env inheritance is unreliable.
+    pub run_id: String,
+    /// Cube lease ID baked into every hook command as `BOSS_LEASE_ID=<id>`.
+    pub lease_id: String,
+    /// Execution kind (e.g. `"revision_implementation"`). Triggers the revision
+    /// PR-creation guard when set to a revision value.
+    pub execution_kind: String,
+    /// Task kind (e.g. `"revision"`). Defense-in-depth for the revision PR guard:
+    /// the guard fires when either `execution_kind` or `task_kind` signals revision.
+    pub task_kind: Option<String>,
+    /// When `true`, omit the engine-data-dir sandbox (state-dir deny globs +
+    /// path-guard hook). Remote SSH workers set this because their
+    /// `events_socket_path` is a forwarded `/tmp` socket, not a Boss data dir.
+    pub is_remote: bool,
+}
+
+/// What a driver's [`Capability::PermissionPolicy`] rendering produces,
+/// broken out by how the spawn flow must apply it — a single settings-file
+/// path is not general enough to express every backend's policy shape.
+///
+/// Claude Code's policy is one settings file passed via `--settings`:
+/// `config_files` holds that one path, `extra_args`/`env` are empty. A
+/// backend like Codex needs all three: `--sandbox <mode>` / `--ignore-rules`
+/// flags (`extra_args`), `CODEX_HOME` (`env`), and `[sandbox_workspace_write]
+/// writable_roots` config (`config_files`) — none of which fits in a single
+/// returned path.
+///
+/// `env` composes with whatever mechanism the spawn flow uses to pass
+/// driver-supplied environment variables to the worker process; it is not a
+/// second, competing channel.
+#[derive(Debug, Clone, Default)]
+pub struct PermissionArtifacts {
+    /// Config file(s) written to the destination directory (e.g. `settings.json`
+    /// for Claude). Order matters when a backend takes multiple `--config`-style
+    /// flags naming files in a specific sequence.
+    pub config_files: Vec<PathBuf>,
+    /// Extra CLI arguments the spawn flow must append to the worker invocation
+    /// (e.g. Codex's `--sandbox <mode>`).
+    pub extra_args: Vec<String>,
+    /// Extra environment variables the spawn flow must set on the worker
+    /// process (e.g. Codex's `CODEX_HOME`).
+    pub env: Vec<(String, String)>,
+}
+
 /// A named capability Boss needs from an agent driver.
 ///
 /// A driver declares, per capability, that it provides that capability; for
@@ -570,9 +662,21 @@ pub trait AgentDriver: Send + Sync {
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
     /// Write the driver's permission/hooks config to `dest_dir` and return the
-    /// path to the settings file (passed as `--settings` or equivalent to the
-    /// worker CLI).
-    async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>;
+    /// [`PermissionArtifacts`] the spawn flow must apply: config file path(s)
+    /// (passed as `--settings` or equivalent), extra CLI args, and extra env.
+    ///
+    /// `input` carries the abstract deny-set + autonomy-mode that the driver
+    /// renders into its backend-specific format. For Claude Code this produces a
+    /// `settings.json` with `permissions.deny` rules and `defaultMode: "auto"`,
+    /// plus `boss-event` hook wiring for every hook event, returned as the sole
+    /// entry in `config_files` with `extra_args`/`env` empty. A backend like
+    /// Codex needs all three fields (design doc: sandbox mode + ignore-rules
+    /// flags, `CODEX_HOME`, and writable-roots config).
+    async fn write_permission_config(
+        &self,
+        input: &PermissionInput,
+        dest_dir: &Path,
+    ) -> anyhow::Result<PermissionArtifacts>;
 
     // ── ProgressObservation capability ──────────────────────────────────────
 
@@ -941,7 +1045,7 @@ mod tests {
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn write_permission_config(&self, _: &Path) -> anyhow::Result<PathBuf> {
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
             unimplemented!()
         }
         fn progress_fidelity(&self) -> ProgressFidelity {

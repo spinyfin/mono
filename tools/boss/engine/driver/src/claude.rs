@@ -15,8 +15,9 @@ use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_eve
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
-    ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
+    ProgressFidelity, ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, WorkerErrorClass,
 };
 
 pub mod structured_output;
@@ -478,9 +479,23 @@ impl AgentDriver for ClaudeDriver {
         Ok(())
     }
 
-    async fn write_permission_config(&self, _dest_dir: &Path) -> anyhow::Result<PathBuf> {
-        // TODO(@brianduff,2026-12-31): extract from worker_setup::render_settings_json
-        unimplemented!("extracted in the PermissionPolicy task")
+    async fn write_permission_config(
+        &self,
+        _input: &PermissionInput,
+        _dest_dir: &Path,
+    ) -> anyhow::Result<PermissionArtifacts> {
+        // TODO(@brianduff,2026-12-31): the settings/deny-rule rendering this
+        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`,
+        // the reviewer/triage/answer-agent rule builders, and the path-guard
+        // constants) lives in `boss_engine::worker_setup`. The dependency edge
+        // is one-way `core -> driver`, so this crate cannot reach it;
+        // implementing this method requires porting that rendering into this
+        // crate first (mirroring the `WorkspaceProvisioning` helpers already
+        // moved into this file). Once implemented, this returns a single
+        // settings file in `config_files` with `extra_args`/`env` empty —
+        // behaviourally identical to the pre-`PermissionArtifacts`
+        // single-`PathBuf` return.
+        unimplemented!("blocked on migrating worker_setup's settings/deny-rule rendering into the driver crate")
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
