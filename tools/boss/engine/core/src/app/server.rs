@@ -1489,10 +1489,15 @@ pub async fn serve_with_merge_probe(
             Arc::new(move || coord_for_automation_triage.kick()),
             Arc::new(move || coord_for_automation_pause_check.is_automation_paused()),
         ));
-    // Shared timer-wheel: the scheduler schedules its own next-wake deadline
-    // here instead of a direct `tokio::time::sleep`, so a `Timer{deadline_id}`
-    // event on `server_state.event_bus` is what actually wakes it — the same
-    // bus the automation-mutation kick below already rides.
+    // Timer-wheel private to the automation scheduler: the scheduler
+    // schedules its own next-wake deadline here, so a `Timer{deadline_id}`
+    // event on `server_state.event_bus` is what wakes it. `TimerWheel::spawn`
+    // requires a running Tokio reactor, so it is constructed here (in
+    // `serve`'s async context) rather than in `ServerState::new`, which many
+    // synchronous unit tests call directly. A future `Timer`-driven consumer
+    // (e.g. `envelope_watch`) needs either its own wheel spawned the same way
+    // or a refactor of `ServerState::new` to defer wheel construction until
+    // first async use.
     let automation_scheduler_timer_wheel =
         Arc::new(boss_timer_wheel::TimerWheel::spawn(server_state.event_bus.clone()));
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(

@@ -319,9 +319,17 @@ fn is_retryable_hold(run: &AutomationRun) -> bool {
 ///   [`boss_event_bus::Event::Timer`] carrying
 ///   [`AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID`], published by `timer_wheel`
 ///   when the sleep computed for the current pass elapses. The `Timer` wake
-///   replaces the old direct `tokio::time::sleep` for the pass's own
-///   cadence; `AutomationMutation` remains the separate event-driven wake
-///   for out-of-band state changes.
+///   drives the pass's own cadence; `AutomationMutation` wakes the loop for
+///   out-of-band state changes.
+///
+/// The wait also races a direct `tokio::time::sleep` floor of
+/// [`AUTOMATION_SCHEDULER_MAX_SLEEP_SECS`]. The `Timer` event is
+/// best-effort — the event bus drops events under mailbox pressure, and the
+/// wheel's background task could in principle die — so it cannot be the
+/// loop's only wake source; the design doc requires every bus-driven
+/// reconciler to retain a non-bus backstop for exactly this reason. The
+/// sleep floor is what keeps a lost `Timer` from wedging automations
+/// permanently instead of merely degrading to hourly polling.
 ///
 /// ## While globally paused, the loop does not evaluate at all
 ///
@@ -394,7 +402,10 @@ pub fn spawn_loop(
                 sleep_secs = sleep_secs.min(wait);
             }
             timer_wheel.schedule_after(AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID, Duration::from_secs(sleep_secs));
-            wait_for_wake(&mut kick).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(AUTOMATION_SCHEDULER_MAX_SLEEP_SECS)) => {}
+                _ = wait_for_wake(&mut kick) => {}
+            }
         }
     })
 }
@@ -404,8 +415,8 @@ pub fn spawn_loop(
 /// deadline id — discarding (and continuing to wait past) any `Timer` for a
 /// *different* deadline id delivered over the same shared bus/wheel, and any
 /// other event kind `kick`'s filter admits in the future. Returns on a closed
-/// mailbox (`recv` returning `None`) too, matching the old `select!`'s
-/// behaviour of not blocking forever once the bus is gone.
+/// mailbox (`recv` returning `None`) so the loop does not block forever once
+/// the bus is gone.
 async fn wait_for_wake(kick: &mut Subscription) {
     loop {
         match kick.recv().await {
@@ -1696,6 +1707,82 @@ mod tests {
         );
         let runs = db.list_automation_runs(&automation.id).unwrap();
         assert_eq!(runs.len(), 1, "still exactly one held run row for the occurrence");
+    }
+
+    /// End-to-end wiring check for the wheel-driven wake path: the test never
+    /// publishes `Event::Timer` itself (unlike
+    /// `duplicate_timer_wakes_do_not_bypass_retry_pacing`, which hand-publishes
+    /// one) — the deadline the loop scheduled on `timer_wheel` at boot must
+    /// itself elapse and drive a second pass once the automation becomes due.
+    #[tokio::test]
+    async fn wheel_deadline_elapsing_wakes_the_loop_for_a_second_pass() {
+        use boss_event_bus::{EventBus, TopicFilter};
+
+        let (_d, db) = open_db_arc();
+        let product = create_product(&db);
+        let automation = create_daily_automation(&db, &product);
+        // Not due yet at boot, so the first pass evaluates nothing; only the
+        // wheel's own deadline elapsing can wake the loop for the pass that
+        // actually fires it.
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        db.initialize_automation_next_due_at(&automation.id, now + 1).unwrap();
+
+        let bus = Arc::new(EventBus::new());
+        let kick = bus.subscribe(TopicFilter::kinds([
+            boss_event_bus::EventKind::AutomationMutation,
+            boss_event_bus::EventKind::Timer,
+        ]));
+        let dispatcher = Arc::new(FakeDispatcher::dispatched());
+        let timer_wheel = Arc::new(TimerWheel::spawn(bus.clone()));
+        let _handle = spawn_loop(db.clone(), dispatcher.clone(), kick, Arc::new(|| false), timer_wheel);
+
+        let fired = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if dispatcher.call_count() > 0 {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            fired.is_ok(),
+            "the wheel's own deadline elapsing must wake the loop and drive a dispatching pass"
+        );
+    }
+
+    /// Pins the `wait_for_wake` filter directly: a `Timer` for a deadline id
+    /// other than this loop's own must not return, but the loop's own
+    /// deadline id (and other event kinds `kick`'s filter admits) must. A
+    /// regression that returned on any `Timer` would pass every other test in
+    /// this file, since they all publish the scheduler's own deadline id.
+    #[tokio::test]
+    async fn wait_for_wake_discards_timer_events_for_other_deadline_ids() {
+        use boss_event_bus::{Event, EventBus, TopicFilter};
+
+        let bus = Arc::new(EventBus::new());
+        let mut kick = bus.subscribe(TopicFilter::kinds([
+            boss_event_bus::EventKind::AutomationMutation,
+            boss_event_bus::EventKind::Timer,
+        ]));
+
+        bus.publish(Event::Timer {
+            deadline_id: "some_other_subscriber".to_owned(),
+        });
+        let woke_on_foreign_deadline = tokio::time::timeout(Duration::from_millis(200), wait_for_wake(&mut kick)).await;
+        assert!(
+            woke_on_foreign_deadline.is_err(),
+            "a Timer for a different deadline id must not wake this loop"
+        );
+
+        bus.publish(Event::Timer {
+            deadline_id: AUTOMATION_SCHEDULER_TIMER_DEADLINE_ID.to_owned(),
+        });
+        let woke_on_own_deadline = tokio::time::timeout(Duration::from_millis(200), wait_for_wake(&mut kick)).await;
+        assert!(
+            woke_on_own_deadline.is_ok(),
+            "a Timer for this loop's own deadline id must wake it"
+        );
     }
 
     /// A held occurrence must not delay an unrelated automation that is
