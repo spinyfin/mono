@@ -194,12 +194,11 @@ fn claude_md_pr_section_is_front_and_centre() {
     );
     // Resuming-work guidance must mention how to detect an
     // existing PR rather than just letting the worker open a duplicate —
-    // via `boss context` (Boss already tracks `pr_url`), not a `gh` hunt.
-    assert!(rendered.contains("Check first with `boss context`"));
-    assert!(
-        !rendered.contains("gh pr list --head"),
-        "worker CLAUDE.md must not send workers to GitHub to find their own PR"
-    );
+    // via `boss pr status` (Boss already tracks the PR, and resolves it
+    // correctly even for revision tasks where `task.pr_url` is NULL), not
+    // a `gh` hunt. `gh pr list --head` may still appear as a last-resort
+    // fallback for when the engine itself is unreachable.
+    assert!(rendered.contains("Check first with `boss pr status`"));
     assert!(rendered.contains("not complete until a PR exists"));
     assert!(rendered.contains("PR URL on its own line"));
     // Empty-diff guard: the worker must verify the diff is non-empty
