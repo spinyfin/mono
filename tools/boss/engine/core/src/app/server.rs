@@ -1484,15 +1484,6 @@ pub async fn serve_with_merge_probe(
         );
     }
 
-    // Shared, incrementally-maintained view of every live dispatch timeline,
-    // used by both stall sweeps below. It reads `dispatch-events/current.jsonl`
-    // once and then tails only what is appended, which is what keeps their
-    // per-pass cost flat as dispatch history grows — see `dispatch_reader`'s
-    // `index` module for the profile that motivated it. Read-only; never
-    // modifies dispatcher behavior.
-    let dispatch_timeline_index =
-        crate::dispatch_reader::SharedTimelineIndex::new(server_state.dispatch_event_root.clone());
-
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
     // without progressing.
@@ -1515,6 +1506,22 @@ pub async fn serve_with_merge_probe(
         .with_override("cube_repo_ensure_attempted", Duration::from_secs(60))
         .with_override("cube_repo_ensured", Duration::from_secs(60))
         .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
+
+    // Shared, incrementally-maintained view of every live dispatch timeline,
+    // used by both stall sweeps below. It reads `dispatch-events/current.jsonl`
+    // once and then tails only what is appended, which is what keeps their
+    // per-pass cost flat as dispatch history grows — see `dispatch_reader`'s
+    // `index` module for the profile that motivated it. Read-only; never
+    // modifies dispatcher behavior. Eviction horizon is the larger of the
+    // widest per-stage threshold above and `STATE_EVICTION_HORIZON`, so
+    // memory is bounded by accumulated stalls within that window rather than
+    // by all never-terminated history — see `TimelineIndex::with_eviction_horizon_ms`.
+    let dispatch_timeline_index = crate::dispatch_reader::SharedTimelineIndex::with_eviction_horizon_ms(
+        server_state.dispatch_event_root.clone(),
+        stage_thresholds
+            .max_ms()
+            .max(crate::dispatch_stall_escalation::STATE_EVICTION_HORIZON.as_millis()),
+    );
     let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
         dispatch_timeline_index.clone(),
         server_state.dispatch_events.clone(),

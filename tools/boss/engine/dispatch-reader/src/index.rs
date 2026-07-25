@@ -34,7 +34,13 @@
 //!   re-anchor cannot corrupt state;
 //! - its decisions are **suffix-determined**, so an execution can be dropped
 //!   once it goes terminal and rebuilt from a single later record if one ever
-//!   arrives — which is what bounds memory to live timelines, not all history;
+//!   arrives. That alone bounds memory to *live* timelines rather than all
+//!   history, but "live" includes anything that stalls and never reaches a
+//!   terminal event — those accumulate forever with no age limit. The
+//!   eviction horizon in [`TimelineIndex::with_eviction_horizon_ms`] is what
+//!   actually caps that: resident state is in-flight dispatches plus
+//!   timelines that stalled within the horizon, not all never-terminated
+//!   history;
 //! - a record is only consumed once its terminating newline is on disk, so
 //!   the torn writes the corpus already contains (the sink appends the record
 //!   and its newline as two separate writes) are re-read whole on the next
@@ -137,6 +143,10 @@ pub struct TimelineIndex {
     states: HashMap<String, TimelineState>,
     cursor: Option<Cursor>,
     rebuilds: u64,
+    /// Age (relative to the `now_ms` passed to [`Self::evict_stale`]) past
+    /// which a live-but-never-progressing timeline is dropped. `None` (the
+    /// default) disables eviction — see [`Self::with_eviction_horizon_ms`].
+    eviction_horizon_ms: Option<u128>,
 }
 
 impl TimelineIndex {
@@ -146,7 +156,36 @@ impl TimelineIndex {
             states: HashMap::new(),
             cursor: None,
             rebuilds: 0,
+            eviction_horizon_ms: None,
         }
+    }
+
+    /// Bound resident memory to timelines that stalled within the last
+    /// `horizon_ms`, not to all history. Without this, a timeline that
+    /// stalls and never emits a terminal event is retained for the whole
+    /// process lifetime — it is *live* by [`TimelineState::is_live`] forever,
+    /// so [`apply_event`] never drops it — which means memory tracks
+    /// accumulated never-terminated timelines, not fleet size. Pick
+    /// `horizon_ms` well above any threshold a sweep uses to *report* a
+    /// stall, so a chronically stuck timeline is reported many times before
+    /// it is finally evicted.
+    pub fn with_eviction_horizon_ms(mut self, horizon_ms: u128) -> Self {
+        self.eviction_horizon_ms = Some(horizon_ms);
+        self
+    }
+
+    /// Drop live timelines whose last real event is older than the
+    /// configured eviction horizon. A no-op unless
+    /// [`Self::with_eviction_horizon_ms`] was called.
+    fn evict_stale(&mut self, now_ms: u128) {
+        let Some(horizon) = self.eviction_horizon_ms else {
+            return;
+        };
+        self.states.retain(|_, state| {
+            state
+                .elapsed_in_stage_ms(now_ms)
+                .is_none_or(|elapsed| elapsed <= horizon)
+        });
     }
 
     /// Live timelines currently held.
@@ -194,6 +233,16 @@ impl TimelineIndex {
         };
 
         if rebuilding {
+            // Clear the cursor before touching `states`, so a failure partway
+            // through the rebuild (either `fold_file` below or
+            // `fold_open_file` after it) leaves nothing resumable: the next
+            // pass sees no cursor and rebuilds again instead of tailing an
+            // empty `states` map from a stale offset. Without this, a
+            // mid-rebuild error triggered by truncation — as opposed to an
+            // identity change, which self-heals by re-triggering the mismatch
+            // — would silently lose every live timeline that existed before
+            // the truncation.
+            self.cursor = None;
             self.states.clear();
             self.rebuilds += 1;
             // Rotated segments are immutable history. They do not exist today
@@ -367,11 +416,13 @@ fn trim_record(line: &[u8]) -> &[u8] {
 
 /// Fold one event into `states`, keeping only live timelines resident.
 ///
-/// Dropping a timeline the moment it goes terminal is what bounds memory to
-/// in-flight dispatches rather than all 16k+ historical executions. It is
-/// safe because [`TimelineState`] is suffix-determined: if a dropped
-/// execution ever emits another record, folding that record alone reproduces
-/// exactly the state a full rescan would compute.
+/// Dropping a timeline the moment it goes terminal keeps memory from
+/// tracking all 16k+ historical executions — but a timeline that stalls and
+/// never reaches a terminal event stays live, and thus resident, forever;
+/// see [`TimelineIndex::with_eviction_horizon_ms`] for the actual cap on
+/// that. Dropping is safe because [`TimelineState`] is suffix-determined: if
+/// a dropped execution ever emits another record, folding that record alone
+/// reproduces exactly the state a full rescan would compute.
 fn apply_event(states: &mut HashMap<String, TimelineState>, event: &DispatchEvent) {
     if let Some(state) = states.get_mut(&event.execution_id) {
         state.apply(event);
@@ -403,6 +454,15 @@ impl SharedTimelineIndex {
         Self(Arc::new(Mutex::new(TimelineIndex::new(root))))
     }
 
+    /// Like [`Self::new`], but bounds resident memory to timelines that
+    /// stalled within `horizon_ms` — see
+    /// [`TimelineIndex::with_eviction_horizon_ms`].
+    pub fn with_eviction_horizon_ms(root: impl Into<PathBuf>, horizon_ms: u128) -> Self {
+        Self(Arc::new(Mutex::new(
+            TimelineIndex::new(root).with_eviction_horizon_ms(horizon_ms),
+        )))
+    }
+
     /// Refresh, then report the stalls the `stage_stalled` detector should
     /// emit. Refresh and query happen under one lock so the two sweeps can
     /// never interleave against a half-updated index.
@@ -412,7 +472,9 @@ impl SharedTimelineIndex {
         thresholds: &StageThresholds,
     ) -> Result<(RefreshStats, Vec<StalledStage>)> {
         self.with(|index| {
-            let stats = index.refresh()?;
+            let mut stats = index.refresh()?;
+            index.evict_stale(now_ms);
+            stats.tracked_timelines = index.tracked_timelines();
             Ok((stats, index.pending_stalls(now_ms, thresholds)))
         })
     }
@@ -424,7 +486,9 @@ impl SharedTimelineIndex {
         threshold_ms: u128,
     ) -> Result<(RefreshStats, Vec<StalledStage>)> {
         self.with(|index| {
-            let stats = index.refresh()?;
+            let mut stats = index.refresh()?;
+            index.evict_stale(now_ms);
+            stats.tracked_timelines = index.tracked_timelines();
             Ok((stats, index.persistently_stalled(now_ms, threshold_ms)))
         })
     }
@@ -785,6 +849,28 @@ mod tests {
         assert_eq!(trim_record(b"  {}\r\n"), b"{}");
         assert_eq!(trim_record(b"\n"), b"");
         assert_eq!(trim_record(b"{}"), b"{}");
+    }
+
+    /// A timeline that never terminates must not be retained past the
+    /// configured eviction horizon — otherwise resident memory tracks
+    /// accumulated never-terminated timelines forever, not fleet size.
+    #[tokio::test]
+    async fn a_timeline_past_the_eviction_horizon_is_dropped() {
+        let dir = TempDir::new().unwrap();
+        emit(dir.path(), Stage::CubeChangeCreated, Outcome::Ok, "exec-stuck", 0).await;
+        let shared = SharedTimelineIndex::with_eviction_horizon_ms(dir.path(), 10_000);
+
+        // Well within the horizon: still resident and still reported.
+        let (_, stalls) = shared.refresh_and_pending_stalls(5_000, &flat(1)).unwrap();
+        assert_eq!(stalls.len(), 1);
+        assert_eq!(shared.tracked_timelines(), 1);
+
+        // Past the horizon: evicted, so no longer reported even though it
+        // never reached a terminal event.
+        let (stats, stalls) = shared.refresh_and_pending_stalls(20_000, &flat(1)).unwrap();
+        assert!(stalls.is_empty());
+        assert_eq!(shared.tracked_timelines(), 0);
+        assert_eq!(stats.tracked_timelines, 0);
     }
 
     #[tokio::test]

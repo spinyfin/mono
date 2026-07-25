@@ -153,28 +153,26 @@ pub struct TimelineState {
 
 impl TimelineState {
     /// Fold one event into the state. Events are expected in append order;
-    /// a real event replaces `last_real` when its timestamp is at least the
-    /// incumbent's, which agrees with "last in file order" for the
-    /// non-decreasing timestamps the sink writes and stays deterministic if
-    /// two concurrent emits ever land out of order.
+    /// a real event unconditionally replaces `last_real` — last-in-fold-order
+    /// wins, regardless of timestamp. This matches the pre-index semantics
+    /// (`events.iter().rev().find(...)`) and is what lets the incremental
+    /// index and the file-scan sweeps agree by construction even when an
+    /// out-of-order record lands (two emitters racing against the same
+    /// execution_id can append a record with an older timestamp after a
+    /// newer one): both paths fold in the same file order, so both land on
+    /// the same last real event either way.
     pub fn apply(&mut self, event: &DispatchEvent) {
         if event.stage == STAGE_STALLED {
             self.last_flag = Some((flagged_stage(event), flagged_ts(event)));
             return;
         }
-        let supersedes = self
-            .last_real
-            .as_ref()
-            .is_none_or(|last| event.ts_epoch_ms >= last.ts_epoch_ms);
-        if supersedes {
-            self.last_real = Some(LastRealEvent {
-                work_item_id: event.work_item_id.clone(),
-                stage: event.stage.clone(),
-                outcome: event.outcome.clone(),
-                ts_epoch_ms: event.ts_epoch_ms,
-                terminal: is_terminal_event(event),
-            });
-        }
+        self.last_real = Some(LastRealEvent {
+            work_item_id: event.work_item_id.clone(),
+            stage: event.stage.clone(),
+            outcome: event.outcome.clone(),
+            ts_epoch_ms: event.ts_epoch_ms,
+            terminal: is_terminal_event(event),
+        });
     }
 
     /// Fold a whole timeline at once. Returns `None` for an empty slice so
@@ -460,6 +458,25 @@ mod tests {
             full.persistent_stall("exec-1", 10_000, 5_000),
             suffix.persistent_stall("exec-1", 10_000, 5_000)
         );
+    }
+
+    /// An out-of-order real event (older timestamp landing after a newer
+    /// one in file order — possible when two emitters race on the same
+    /// execution_id) must win on fold order, not timestamp, so the
+    /// incremental index and a full file-scan rescan always agree: both
+    /// fold the same file in the same order.
+    #[test]
+    fn apply_uses_fold_order_not_timestamp_for_out_of_order_real_events() {
+        let mut state = TimelineState::default();
+        state.apply(&ev(Stage::PaneSpawned, Outcome::Ok, 5_000));
+        assert!(!state.is_live(), "terminal event folded first");
+
+        state.apply(&ev(Stage::CubeChangeCreated, Outcome::Ok, 4_000));
+        assert!(
+            state.is_live(),
+            "an older real event folded later must still become last_real"
+        );
+        assert_eq!(state.elapsed_in_stage_ms(10_000), Some(6_000));
     }
 
     #[test]

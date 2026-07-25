@@ -41,6 +41,17 @@ use crate::work::{StallEscalation, WorkDb};
 /// to notice a multi-minute stall on their own.
 pub const PERSISTENT_STALL_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
+/// How long [`crate::dispatch_reader::SharedTimelineIndex`] keeps a
+/// never-terminating timeline resident before evicting it — see
+/// `TimelineIndex::with_eviction_horizon_ms`. Deliberately far above
+/// [`PERSISTENT_STALL_THRESHOLD`]: this sweep re-reports the same stuck
+/// timeline every tick on purpose (no dedupe against a prior attention
+/// item), so the horizon has to stay well past that threshold or eviction
+/// would cut off re-reporting almost immediately after it starts. 24h still
+/// bounds resident memory to a day's worth of accumulated stalls instead of
+/// all of history.
+pub const STATE_EVICTION_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Default cadence for [`spawn_loop`]. Slower than the 15s
 /// `stage_stalled` detector — this sweep only matters once a stall has
 /// already run for [`PERSISTENT_STALL_THRESHOLD`], so there is no value
