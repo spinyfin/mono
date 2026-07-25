@@ -170,6 +170,7 @@ fn lower_changeset_maps_fields_to_wit_types() {
                 added_lines: 2,
                 removed_lines: 1,
             }],
+            added_line_ranges: vec![(1, 2)],
         },
     );
 

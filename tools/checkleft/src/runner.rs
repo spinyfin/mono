@@ -61,13 +61,17 @@ struct EffectiveCheckPolicy {
     /// that opt into dynamic severity via `SeverityTemplate::Dynamic`. An explicit
     /// `severity_override` still takes precedence and flattens all findings.
     preserve_finding_severity: bool,
+    /// When true, `apply_policy_to_result` additionally drops line-anchored
+    /// findings that fall outside a PR-changed region of their file. See
+    /// [`crate::config::CheckPolicyConfig::changed_lines_only`].
+    changed_lines_only: bool,
 }
 
 impl EffectiveCheckPolicy {
     fn fingerprint(&self) -> String {
         format!(
-            "severity={:?};allow_bypass={};bypass_name={}",
-            self.severity_override, self.allow_bypass, self.bypass_name
+            "severity={:?};allow_bypass={};bypass_name={};changed_lines_only={}",
+            self.severity_override, self.allow_bypass, self.bypass_name, self.changed_lines_only
         )
     }
 }
@@ -1306,6 +1310,7 @@ impl Runner {
             allow_bypass,
             bypass_name,
             preserve_finding_severity: false,
+            changed_lines_only: check.policy.changed_lines_only,
         }
     }
 
@@ -1469,6 +1474,46 @@ fn drop_excluded_findings(result: &mut CheckResult, exclusion: &ExclusionMatcher
     });
 }
 
+/// Drop line-anchored findings outside a PR-changed region, for checks that
+/// opt into `policy.changed_lines_only`. Runs after both `scope_findings_to_changeset`
+/// (file-level) and `drop_excluded_findings`, so it only ever sees findings that
+/// already survived those — it narrows, never resurrects.
+///
+/// Keep rules mirror the file-level filter's treatment of `None`, plus the
+/// `--all`-mode no-op the file filter gets for free:
+/// - `location: None` (check-level finding) — keep.
+/// - `location.line: None` (whole-file finding, e.g. `file/size`) — keep; such
+///   findings have no line to test and opt out of line-scoping by nature.
+/// - `changeset.changed_lines(path)` is `None` (no diff data for this file —
+///   `--all` mode, which carries no hunks at all) — keep; no restriction is
+///   possible without hunk data.
+/// - Otherwise: keep iff the finding's line falls inside one of the file's
+///   added-line ranges. A file present in the changeset with zero added lines
+///   (e.g. a content-identical rename) legitimately drops all its line findings.
+fn scope_findings_to_changed_lines(result: &mut CheckResult, changeset: &ChangeSet) {
+    let before = result.findings.len();
+    result.findings.retain(|finding| {
+        let Some(location) = &finding.location else {
+            return true;
+        };
+        let Some(line) = location.line else {
+            return true;
+        };
+        match changeset.changed_lines(location.path.as_path()) {
+            None => true,
+            Some(ranges) => ranges.iter().any(|(start, end)| line >= *start && line <= *end),
+        }
+    });
+    let suppressed = before - result.findings.len();
+    if suppressed > 0 {
+        tracing::debug!(
+            check = %result.check_id,
+            suppressed,
+            "changed_lines_only suppressed findings on unchanged lines"
+        );
+    }
+}
+
 fn apply_policy_to_result(
     mut result: CheckResult,
     policy: &EffectiveCheckPolicy,
@@ -1477,6 +1522,9 @@ fn apply_policy_to_result(
 ) -> CheckResult {
     scope_findings_to_changeset(&mut result, changeset);
     drop_excluded_findings(&mut result, exclusion);
+    if policy.changed_lines_only {
+        scope_findings_to_changed_lines(&mut result, changeset);
+    }
 
     if result.findings.is_empty() {
         return result;
