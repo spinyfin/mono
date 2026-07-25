@@ -1486,8 +1486,7 @@ pub async fn serve_with_merge_probe(
 
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
-    // without progressing. Read-only against the per-execution
-    // dispatch.jsonl mirrors; never modifies dispatcher behavior.
+    // without progressing.
     //
     // Per-stage overrides: the early dispatch handoffs (worker
     // claim → cube repo ensure → cube workspace lease) should
@@ -1507,21 +1506,38 @@ pub async fn serve_with_merge_probe(
         .with_override("cube_repo_ensure_attempted", Duration::from_secs(60))
         .with_override("cube_repo_ensured", Duration::from_secs(60))
         .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
-    let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
+
+    // Shared, incrementally-maintained view of every live dispatch timeline,
+    // used by both stall sweeps below. It reads `dispatch-events/current.jsonl`
+    // once and then tails only what is appended, which is what keeps their
+    // per-pass cost flat as dispatch history grows — see `dispatch_reader`'s
+    // `index` module for the profile that motivated it. Read-only; never
+    // modifies dispatcher behavior. Eviction horizon is the larger of the
+    // widest per-stage threshold above and `STATE_EVICTION_HORIZON`, so
+    // memory is bounded by accumulated stalls within that window rather than
+    // by all never-terminated history — see `TimelineIndex::with_eviction_horizon_ms`.
+    let dispatch_timeline_index = crate::dispatch_reader::SharedTimelineIndex::with_eviction_horizon_ms(
         server_state.dispatch_event_root.clone(),
+        stage_thresholds
+            .max_ms()
+            .max(crate::dispatch_stall_escalation::STATE_EVICTION_HORIZON.as_millis()),
+    );
+    let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
+        dispatch_timeline_index.clone(),
         server_state.dispatch_events.clone(),
         stage_thresholds,
         Duration::from_secs(15),
     );
 
     // Persistent-stall escalation: on a slower cadence than the detector
-    // above, re-scan the same per-execution dispatch.jsonl mirrors for
-    // stages stuck past a much larger threshold and file a durable
-    // `dispatch_stage_stalled` attention item — the `stage_stalled` event
-    // above is write-only telemetry with nothing surfacing it to an
-    // operator. See `dispatch_stall_escalation.rs`.
+    // above, re-check the same timelines for stages stuck past a much larger
+    // threshold and file a durable `dispatch_stage_stalled` attention item —
+    // the `stage_stalled` event above is write-only telemetry with nothing
+    // surfacing it to an operator. Shares the index with the detector, so the
+    // dispatch stream is tailed once per pass rather than once per sweep.
+    // See `dispatch_stall_escalation.rs`.
     let _dispatch_stall_escalation_handle = crate::dispatch_stall_escalation::spawn_loop(
-        server_state.dispatch_event_root.clone(),
+        dispatch_timeline_index,
         server_state.work_db.clone(),
         crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD,
         crate::dispatch_stall_escalation::DEFAULT_INTERVAL,

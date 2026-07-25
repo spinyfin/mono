@@ -9,13 +9,31 @@
 //! file-scan-only: it does NOT touch the engine RPC, so it works
 //! when the engine is wedged.
 //!
-//! All readers are synchronous: the JSONL files are append-only and
-//! small enough to scan in one pass per call. Each `read_current` /
+//! All readers here are synchronous: the JSONL files are append-only
+//! and small enough to scan in one pass per call. Each `read_current` /
 //! `read_execution` returns a `Vec<DispatchEvent>` in the order they
 //! were appended (lines that fail to parse are skipped with a
 //! diagnostic on stderr — a half-written line at the tail of the
 //! file is the common failure mode and we'd rather show what we have
 //! than blow up).
+//!
+//! ## Two read paths, one definition of "stalled"
+//!
+//! The functions above are *pull*, one-shot, and unbounded: fine for a CLI
+//! invocation, ruinous for a sweep that runs every 15 seconds forever. The
+//! engine's stall detectors used to use them that way and ended up rescanning
+//! all ~103 MB of dispatch history, spread over 16k per-execution mirrors,
+//! twice a minute — see [`index`] for the profile and the fix. Those sweeps
+//! now go through [`TimelineIndex`], which tails only what was appended since
+//! the previous pass.
+//!
+//! Both paths reduce a timeline to the same [`TimelineState`] before deciding
+//! anything, so "stalled" has exactly one definition no matter which one you
+//! came in through; [`pending_stalls`] and [`persistently_stalled`] remain
+//! available as the file-scan-only equivalents and are asserted to agree.
+
+mod index;
+mod timeline;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -29,46 +47,8 @@ use serde::Serialize;
 
 use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
-/// Per-stage stalled-detection thresholds. The watchdog used to apply
-/// a single global threshold to every stage, but the cube-lease
-/// hang incident (`exec_18aec07893bd2e30_29`, 2026-05-12) showed that
-/// a 120s default is too coarse for the early dispatch stages — the
-/// engine had wedged in `worker_claimed` for 46 seconds without any
-/// `stage_stalled` event firing, because the global threshold hadn't
-/// elapsed yet. Per-stage overrides let us flag the early handoffs
-/// (worker_claimed → cube_repo_ensured → cube_workspace_leased)
-/// faster while keeping the longer pane-spawn stages on a generous
-/// threshold.
-#[derive(Debug, Clone)]
-pub struct StageThresholds {
-    default_ms: u128,
-    overrides: BTreeMap<String, u128>,
-}
-
-impl StageThresholds {
-    pub fn new(default: Duration) -> Self {
-        Self {
-            default_ms: default.as_millis(),
-            overrides: BTreeMap::new(),
-        }
-    }
-
-    /// Override the threshold for a specific stage. Pass the wire
-    /// stage name (e.g. `"worker_claimed"`) — the watchdog matches
-    /// against `DispatchEvent::stage`.
-    pub fn with_override(mut self, stage: impl Into<String>, threshold: Duration) -> Self {
-        self.overrides.insert(stage.into(), threshold.as_millis());
-        self
-    }
-
-    pub fn for_stage(&self, stage: &str) -> u128 {
-        self.overrides.get(stage).copied().unwrap_or(self.default_ms)
-    }
-
-    pub fn default_ms(&self) -> u128 {
-        self.default_ms
-    }
-}
+pub use index::{RefreshStats, SharedTimelineIndex, TimelineIndex};
+pub use timeline::{StageThresholds, StalledStage, TimelineState, is_terminal_event};
 
 /// Default Boss state root used by the file-scan readers when the
 /// caller didn't override it. Mirrors the writer's default (see
@@ -164,6 +144,36 @@ pub struct GhostActiveEntry {
 /// but the per-execution mirrors are cheaper to bucket and survive
 /// rotation of the flat stream (if we ever add that).
 pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Result<Vec<GhostActiveEntry>> {
+    let mut entries = for_each_timeline(root, |execution_id, events| {
+        let last = events.last()?;
+        if is_terminal_event(last) {
+            return None;
+        }
+        let elapsed = now_ms.saturating_sub(last.ts_epoch_ms);
+        Some(GhostActiveEntry {
+            execution_id: execution_id.to_owned(),
+            work_item_id: last.work_item_id.clone(),
+            last_stage: last.stage.clone(),
+            last_outcome: last.outcome.clone(),
+            last_ts_epoch_ms: last.ts_epoch_ms,
+            elapsed_since_last_ms: elapsed,
+            stalled: elapsed >= stalled_threshold_ms,
+        })
+    })?;
+    entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_since_last_ms));
+    Ok(entries)
+}
+
+/// Walk every per-execution mirror under `root` and collect whatever `visit`
+/// returns for each timeline. Directories with no `dispatch.jsonl` (and
+/// non-directory entries) are skipped.
+///
+/// Shared by all three file-scan sweeps so the walk, the missing-file
+/// handling, and the id-from-directory-name rule are defined once. Note that
+/// this is O(every execution ever dispatched) by construction — that is
+/// exactly why the engine's periodic detectors no longer come through here;
+/// see [`TimelineIndex`].
+fn for_each_timeline<T>(root: &Path, mut visit: impl FnMut(&str, &[DispatchEvent]) -> Option<T>) -> Result<Vec<T>> {
     let executions_dir = root.join("executions");
     let read_dir = match fs::read_dir(&executions_dir) {
         Ok(rd) => rd,
@@ -173,7 +183,7 @@ pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Re
         }
     };
 
-    let mut entries = Vec::new();
+    let mut out = Vec::new();
     for dirent in read_dir {
         let dirent = dirent.with_context(|| format!("reading {}", executions_dir.display()))?;
         let path = dirent.path();
@@ -188,40 +198,11 @@ pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Re
             continue;
         }
         let events = read_jsonl(&dispatch_path)?;
-        let Some(last) = events.last() else {
-            continue;
-        };
-        if is_terminal_event(last) {
-            continue;
+        if let Some(item) = visit(execution_id, &events) {
+            out.push(item);
         }
-        let elapsed = now_ms.saturating_sub(last.ts_epoch_ms);
-        entries.push(GhostActiveEntry {
-            execution_id: execution_id.to_owned(),
-            work_item_id: last.work_item_id.clone(),
-            last_stage: last.stage.clone(),
-            last_outcome: last.outcome.clone(),
-            last_ts_epoch_ms: last.ts_epoch_ms,
-            elapsed_since_last_ms: elapsed,
-            stalled: elapsed >= stalled_threshold_ms,
-        });
     }
-    entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_since_last_ms));
-    Ok(entries)
-}
-
-/// An event is "terminal" — i.e., the dispatch timeline for that
-/// execution is officially over — when it is either a successful
-/// `pane_spawned` (the slot is up and the worker is now driving),
-/// or any explicit error (we won't get a follow-up; the
-/// `record_start_failure` / `pane_spawn_failed` paths have run).
-pub fn is_terminal_event(event: &DispatchEvent) -> bool {
-    if event.outcome == "error" {
-        return true;
-    }
-    if event.stage == "pane_spawned" && event.outcome == "ok" {
-        return true;
-    }
-    false
+    Ok(out)
 }
 
 /// Per-execution duration breakdown: time spent in each stage,
@@ -516,25 +497,6 @@ fn percentile_ms(sorted_ascending: &[u128], pct: f64) -> u128 {
     sorted_ascending[idx]
 }
 
-/// One stage stall the detector wants to surface as a
-/// `stage_stalled` event. Carries enough context for the writer to
-/// emit a fully-populated `DispatchEvent` without re-reading the
-/// timeline.
-#[derive(Debug, Clone, PartialEq, Eq, bon::Builder)]
-#[builder(on(String, into))]
-pub struct StalledStage {
-    pub execution_id: String,
-    pub work_item_id: Option<String>,
-    /// The dispatch stage that hasn't progressed (e.g.
-    /// `cube_change_created`). This is the last non-`stage_stalled`
-    /// stage in the timeline — a previously-emitted stage_stalled
-    /// event doesn't itself count as the stage that's stuck.
-    pub stalled_stage: String,
-    pub stalled_outcome: String,
-    pub last_ts_epoch_ms: u128,
-    pub elapsed_in_stage_ms: u128,
-}
-
 /// Walk every per-execution mirror under `root` and return the
 /// stalls that haven't yet been surfaced. An execution is stalled
 /// when its last "real" stage event (any non-`stage_stalled` event)
@@ -542,37 +504,16 @@ pub struct StalledStage {
 /// `thresholds`. To avoid duplicate `stage_stalled` lines for the
 /// same wedge, we skip executions whose timeline already contains a
 /// `stage_stalled` line referencing the current stalled stage.
+///
+/// This is the **file-scan-only** form: it reads every mirror on disk and
+/// holds no state between calls, so it works against a state root belonging
+/// to a wedged or stopped engine. The engine's own 15s detector uses
+/// [`TimelineIndex::pending_stalls`] instead, which answers the same question
+/// incrementally; the two are asserted to agree.
 pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -> Result<Vec<StalledStage>> {
-    let executions_dir = root.join("executions");
-    let read_dir = match fs::read_dir(&executions_dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("opening {}", executions_dir.display()));
-        }
-    };
-
-    let mut out = Vec::new();
-    for dirent in read_dir {
-        let dirent = dirent.with_context(|| format!("reading {}", executions_dir.display()))?;
-        let path = dirent.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(execution_id) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let dispatch_path = path.join("dispatch.jsonl");
-        if !dispatch_path.exists() {
-            continue;
-        }
-        let events = read_jsonl(&dispatch_path)?;
-        let Some(stall) = stall_to_emit_for(execution_id, &events, now_ms, thresholds) else {
-            continue;
-        };
-        out.push(stall);
-    }
-    Ok(out)
+    for_each_timeline(root, |execution_id, events| {
+        TimelineState::from_events(events)?.stall_to_emit(execution_id, now_ms, thresholds)
+    })
 }
 
 /// Walk every per-execution mirror under `root` and return timelines
@@ -591,51 +532,13 @@ pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -
 /// re-including an already-surfaced stall here is what lets that sweep
 /// refresh the item's elapsed-time text on each tick instead of freezing
 /// it at the first trip.
+///
+/// As with [`pending_stalls`], this is the file-scan-only form; the engine's
+/// escalation sweep uses [`TimelineIndex::persistently_stalled`].
 pub fn persistently_stalled(root: &Path, now_ms: u128, threshold_ms: u128) -> Result<Vec<StalledStage>> {
-    let executions_dir = root.join("executions");
-    let read_dir = match fs::read_dir(&executions_dir) {
-        Ok(rd) => rd,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(err).with_context(|| format!("opening {}", executions_dir.display()));
-        }
-    };
-
-    let mut out = Vec::new();
-    for dirent in read_dir {
-        let dirent = dirent.with_context(|| format!("reading {}", executions_dir.display()))?;
-        let path = dirent.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(execution_id) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let dispatch_path = path.join("dispatch.jsonl");
-        if !dispatch_path.exists() {
-            continue;
-        }
-        let events = read_jsonl(&dispatch_path)?;
-        let Some(last_real) = events.iter().rev().find(|e| e.stage != "stage_stalled") else {
-            continue;
-        };
-        if is_terminal_event(last_real) {
-            continue;
-        }
-        let elapsed = now_ms.saturating_sub(last_real.ts_epoch_ms);
-        if elapsed < threshold_ms {
-            continue;
-        }
-        out.push(StalledStage {
-            execution_id: execution_id.to_owned(),
-            work_item_id: last_real.work_item_id.clone(),
-            stalled_stage: last_real.stage.clone(),
-            stalled_outcome: last_real.outcome.clone(),
-            last_ts_epoch_ms: last_real.ts_epoch_ms,
-            elapsed_in_stage_ms: elapsed,
-        });
-    }
-    Ok(out)
+    for_each_timeline(root, |execution_id, events| {
+        TimelineState::from_events(events)?.persistent_stall(execution_id, now_ms, threshold_ms)
+    })
 }
 
 /// Convert a [`StalledStage`] into a fully-populated
@@ -654,19 +557,45 @@ pub fn build_stalled_event(stall: &StalledStage) -> DispatchEvent {
     }))
 }
 
-/// Run one pass of [`pending_stalls`] and emit a `stage_stalled`
-/// event per stall via `sink`. Designed to be called on a cadence by
+/// Run one detector pass against `index` and emit a `stage_stalled` event
+/// per stall via `sink`. Designed to be called on a cadence by
 /// [`spawn_stage_stalled_detector`].
+///
+/// The scan runs on a blocking thread: even the incremental path touches the
+/// filesystem, and the initial build reads the whole stream once. Parking
+/// that on a tokio worker is how this sweep came to dominate a 60s sample of
+/// one in the first place.
+///
+/// Each emitted event is folded straight back into the index, so the pass
+/// dedupes against its own output immediately rather than waiting for the
+/// record to come back around through the file tail.
 pub async fn run_stage_stalled_pass(
-    root: &Path,
+    index: &SharedTimelineIndex,
     thresholds: &StageThresholds,
     sink: &dyn DispatchEventSink,
 ) -> Result<usize> {
     let now_ms = boss_engine_utils::epoch_time::now_epoch_ms();
-    let stalls = pending_stalls(root, now_ms, thresholds)?;
+    let scan = {
+        let index = index.clone();
+        let thresholds = thresholds.clone();
+        tokio::task::spawn_blocking(move || index.refresh_and_pending_stalls(now_ms, &thresholds))
+    };
+    let (stats, stalls) = scan.await.context("stage_stalled detector: scan task panicked")??;
+
+    tracing::debug!(
+        bytes_scanned = stats.bytes_scanned,
+        records_applied = stats.records_applied,
+        malformed_lines = stats.malformed_lines,
+        rebuilt = stats.rebuilt,
+        tracked_timelines = stats.tracked_timelines,
+        "stage_stalled detector: incremental scan",
+    );
+
     let count = stalls.len();
-    for stall in stalls {
-        sink.emit(build_stalled_event(&stall)).await;
+    for stall in &stalls {
+        let event = build_stalled_event(stall);
+        sink.emit(event.clone()).await;
+        index.apply(&event);
     }
     Ok(count)
 }
@@ -674,8 +603,11 @@ pub async fn run_stage_stalled_pass(
 /// Spawn a tokio task that runs [`run_stage_stalled_pass`] every
 /// `interval`. The task has no shutdown path — engine process exit
 /// drops the handle (same pattern as the merge poller).
+///
+/// `index` is shared with the persistent-stall escalation sweep, so the
+/// dispatch stream is tailed once per pass rather than once per sweep.
 pub fn spawn_stage_stalled_detector(
-    root: PathBuf,
+    index: SharedTimelineIndex,
     sink: Arc<dyn DispatchEventSink>,
     thresholds: StageThresholds,
     interval: Duration,
@@ -685,7 +617,7 @@ pub fn spawn_stage_stalled_detector(
         // sweep while the rest of init is still running.
         tokio::time::sleep(interval).await;
         loop {
-            match run_stage_stalled_pass(&root, &thresholds, sink.as_ref()).await {
+            match run_stage_stalled_pass(&index, &thresholds, sink.as_ref()).await {
                 Ok(emitted) if emitted > 0 => {
                     tracing::info!(
                         emitted,
@@ -700,49 +632,6 @@ pub fn spawn_stage_stalled_detector(
             }
             tokio::time::sleep(interval).await;
         }
-    })
-}
-
-/// Reusable per-timeline core for [`pending_stalls`]. Returns the
-/// `StalledStage` the caller should emit for `events`, or `None`
-/// when the timeline is fresh, terminal, or already has a
-/// `stage_stalled` line covering the current stalled stage.
-fn stall_to_emit_for(
-    execution_id: &str,
-    events: &[DispatchEvent],
-    now_ms: u128,
-    thresholds: &StageThresholds,
-) -> Option<StalledStage> {
-    let last_real = events.iter().rev().find(|e| e.stage != "stage_stalled")?;
-    if is_terminal_event(last_real) {
-        return None;
-    }
-    let elapsed = now_ms.saturating_sub(last_real.ts_epoch_ms);
-    let threshold_ms = thresholds.for_stage(&last_real.stage);
-    if elapsed < threshold_ms {
-        return None;
-    }
-    let already_flagged = events.iter().any(|e| {
-        e.stage == "stage_stalled"
-            && e.details
-                .get("stalled_stage")
-                .and_then(|v| v.as_str())
-                .is_some_and(|s| s == last_real.stage)
-            && e.details
-                .get("stalled_at_ts_epoch_ms")
-                .and_then(|v| v.as_u64())
-                .is_some_and(|t| t as u128 == last_real.ts_epoch_ms)
-    });
-    if already_flagged {
-        return None;
-    }
-    Some(StalledStage {
-        execution_id: execution_id.to_owned(),
-        work_item_id: last_real.work_item_id.clone(),
-        stalled_stage: last_real.stage.clone(),
-        stalled_outcome: last_real.outcome.clone(),
-        last_ts_epoch_ms: last_real.ts_epoch_ms,
-        elapsed_in_stage_ms: elapsed,
     })
 }
 
@@ -1014,26 +903,6 @@ mod tests {
         assert_eq!(stalls.len(), 1);
         assert_eq!(stalls[0].execution_id, "exec-claimed");
         assert_eq!(stalls[0].stalled_stage, "worker_claimed");
-    }
-
-    #[test]
-    fn stage_thresholds_falls_back_to_default_for_unknown_stages() {
-        let t = StageThresholds::new(Duration::from_secs(120)).with_override("worker_claimed", Duration::from_secs(30));
-        assert_eq!(t.for_stage("worker_claimed"), 30_000);
-        assert_eq!(t.for_stage("cube_repo_ensured"), 120_000);
-        assert_eq!(t.for_stage("anything_else"), 120_000);
-    }
-
-    #[test]
-    fn is_terminal_event_recognises_terminal_shapes() {
-        let req = DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "e");
-        assert!(!is_terminal_event(&req));
-        let pane_ok = DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "e");
-        assert!(is_terminal_event(&pane_ok));
-        let run_err = DispatchEvent::new(Stage::RunStarted, Outcome::Error, "e");
-        assert!(is_terminal_event(&run_err));
-        let pane_err = DispatchEvent::new(Stage::PaneSpawned, Outcome::Error, "e");
-        assert!(is_terminal_event(&pane_err));
     }
 
     fn ev(stage: Stage, outcome: Outcome, execution_id: &str, ts: u128, details: serde_json::Value) -> DispatchEvent {
@@ -1412,5 +1281,112 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let stalls = persistently_stalled(dir.path(), 1_000_000, 300_000).unwrap();
         assert!(stalls.is_empty());
+    }
+
+    /// End-to-end detector pass over the incremental index: a genuine stall
+    /// must still land a `stage_stalled` record on disk, in both the flat
+    /// stream and the per-execution mirror, carrying exactly the `details`
+    /// payload downstream consumers (and the planned `bossctl doctor`
+    /// signature spec) pin against.
+    #[tokio::test]
+    async fn run_stage_stalled_pass_emits_the_unchanged_record_shape() {
+        let dir = TempDir::new().unwrap();
+        let mut wedged = DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-wedged");
+        // Long in the past, so the pass's real `now` is far past any threshold.
+        wedged.ts_epoch_ms = 1_700_000_000_000;
+        wedged.work_item_id = Some("task-42".to_owned());
+        write(&JsonlFileSink::new(dir.path()), wedged).await;
+
+        let index = SharedTimelineIndex::new(dir.path());
+        let sink: Arc<dyn DispatchEventSink> = Arc::new(JsonlFileSink::new(dir.path()));
+        let thresholds =
+            StageThresholds::new(Duration::from_secs(120)).with_override("worker_claimed", Duration::from_secs(30));
+
+        assert_eq!(
+            run_stage_stalled_pass(&index, &thresholds, sink.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let mirror = read_execution(dir.path(), "exec-wedged").unwrap();
+        assert_eq!(mirror.len(), 2, "the flag must reach the per-execution mirror");
+        assert_eq!(read_current(dir.path()).unwrap().len(), 2, "and the flat stream");
+
+        let flagged = &mirror[1];
+        assert_eq!(flagged.stage, "stage_stalled");
+        assert_eq!(flagged.outcome, "ok");
+        assert_eq!(flagged.execution_id, "exec-wedged");
+        assert_eq!(flagged.work_item_id.as_deref(), Some("task-42"));
+
+        let mut keys: Vec<&str> = flagged
+            .details
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "elapsed_in_stage_ms",
+                "stalled_at_ts_epoch_ms",
+                "stalled_outcome",
+                "stalled_stage"
+            ]
+        );
+        assert_eq!(flagged.details["stalled_stage"], serde_json::json!("worker_claimed"));
+        assert_eq!(flagged.details["stalled_outcome"], serde_json::json!("ok"));
+        assert_eq!(
+            flagged.details["stalled_at_ts_epoch_ms"],
+            serde_json::json!(1_700_000_000_000_u64)
+        );
+        assert!(flagged.details["elapsed_in_stage_ms"].as_u64().unwrap() >= 30_000);
+
+        // The pass must dedupe against its own output rather than re-flagging
+        // the same wedge every 15 seconds.
+        assert_eq!(
+            run_stage_stalled_pass(&index, &thresholds, sink.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(read_execution(dir.path(), "exec-wedged").unwrap().len(), 2);
+    }
+
+    /// A stall that appears *after* the index is already tailing must be
+    /// caught on the next pass — the incremental path has to notice new
+    /// executions, not just track the ones present at startup.
+    #[tokio::test]
+    async fn run_stage_stalled_pass_catches_a_stall_that_starts_mid_stream() {
+        let dir = TempDir::new().unwrap();
+        let index = SharedTimelineIndex::new(dir.path());
+        let sink: Arc<dyn DispatchEventSink> = Arc::new(JsonlFileSink::new(dir.path()));
+        let thresholds = StageThresholds::new(Duration::from_secs(30));
+
+        assert_eq!(
+            run_stage_stalled_pass(&index, &thresholds, sink.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+
+        let mut late = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-late");
+        late.ts_epoch_ms = 1_700_000_000_000;
+        write(&JsonlFileSink::new(dir.path()), late).await;
+
+        assert_eq!(
+            run_stage_stalled_pass(&index, &thresholds, sink.as_ref())
+                .await
+                .unwrap(),
+            1
+        );
+        let mirror = read_execution(dir.path(), "exec-late").unwrap();
+        assert_eq!(mirror[1].stage, "stage_stalled");
+        assert_eq!(
+            mirror[1].details["stalled_stage"],
+            serde_json::json!("cube_change_created")
+        );
     }
 }
