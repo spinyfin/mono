@@ -75,7 +75,8 @@ pub(crate) struct TaskListCriteria<'a> {
     /// `statuses` explicitly asks for them — mirrors the deleted/restore
     /// contract (hidden by default, visible on request) rather than the
     /// show-everything default other statuses get. Both terminal statuses
-    /// share this flag: neither should linger on the default board.
+    /// share this flag: neither should linger in default `list` output.
+    /// (The engine-side kanban board still excludes only `archived`.)
     #[builder(default)]
     pub(crate) include_archived: bool,
 }

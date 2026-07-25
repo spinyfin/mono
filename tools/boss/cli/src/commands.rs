@@ -2070,11 +2070,12 @@ pub(crate) struct TaskListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived tasks in the listing. `archived` rows are hidden
-    /// from the default view (and from the kanban board) the same way
-    /// tombstoned rows are, but — unlike delete — they are never
-    /// resurrected; this flag is the only way to see them again short of
-    /// `--status archived`.
+    /// Include archived *and* cancelled tasks in the listing. Both are
+    /// terminal statuses hidden from the default view (and, for
+    /// `archived`, from the kanban board) the same way tombstoned rows
+    /// are, but — unlike delete — they are never resurrected; this flag
+    /// is the only way to see them again short of `--status archived` /
+    /// `--status cancelled`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2301,7 +2302,8 @@ pub(crate) struct RevisionListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived revisions in the listing. See `boss task list --help`.
+    /// Include archived/cancelled revisions in the listing. See
+    /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2392,7 +2394,8 @@ pub(crate) struct ChoreListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived chores in the listing. See `boss task list --help`.
+    /// Include archived/cancelled chores in the listing. See
+    /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 

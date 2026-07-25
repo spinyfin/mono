@@ -622,9 +622,7 @@ pub(crate) async fn run_create_revision(
 /// contract, so a transient RPC hiccup must not fail an otherwise-successful
 /// creation.
 async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str, new_revision_id: &str) {
-    let Some(chain_root_id) = resolve_chain_root_id(client, parent_id).await else {
-        return;
-    };
+    let chain_root_id = resolve_chain_root_id(client, parent_id).await;
     let Ok(executions) = list_executions_for_chain(client, &chain_root_id).await else {
         return;
     };
@@ -646,30 +644,30 @@ async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str,
 /// Walk `parent_task_id` links up from `task_id` to the chain root — the
 /// first ancestor whose `kind` is not `revision`, or one with no
 /// `parent_task_id` — capped at 64 hops to mirror the engine's own
-/// chain-walk cap (`work/chain_helpers.rs::chain_root`). Returns `None`
-/// on any lookup failure for the starting id; a dangling hop mid-walk
-/// instead returns the last successfully-resolved id, matching the
-/// engine's broken-parent handling. Callers treat `None` as "skip the
-/// advisory", not an error.
-async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> Option<String> {
+/// chain-walk cap (`work/chain_helpers.rs::chain_root`). A lookup failure
+/// for the starting id or any hop mid-walk returns the last
+/// successfully-resolved id, matching the engine's broken-parent handling —
+/// this never fails, so `warn_if_chain_has_live_worker`'s downstream RPC
+/// failure is the only thing that can skip the advisory.
+async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> String {
     let mut current = task_id.to_owned();
     for _ in 0..64 {
         let Ok(item) = get_work_item(client, &current).await else {
-            return Some(current);
+            return current;
         };
         let (kind, parent_task_id) = match &item {
             WorkItem::Task(t) | WorkItem::Chore(t) => (t.kind.clone(), t.parent_task_id.clone()),
-            _ => return Some(current),
+            _ => return current,
         };
         if kind != boss_protocol::TaskKind::Revision {
-            return Some(current);
+            return current;
         }
         match parent_task_id {
             Some(parent) => current = parent,
-            None => return Some(current),
+            None => return current,
         }
     }
-    Some(current)
+    current
 }
 
 pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
