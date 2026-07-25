@@ -77,6 +77,19 @@ struct Inner {
     /// stale. No-op today (Claude is `Rich`), but a real gap for the first
     /// non-`Rich` driver.
     progress_fidelity: HashMap<u8, ProgressFidelity>,
+    /// Per-slot: does this run's driver declare
+    /// `Capability::AwaitingInputSignal`? Gates whether `apply_event`
+    /// trusts a `WorkerEvent::Notification` as a genuine "worker is
+    /// blocked on human input" signal.
+    ///
+    /// Defaults to `true` for every slot at `register_spawn` (Claude is
+    /// the only driver in production today, and it provides the
+    /// capability), so every existing caller's behaviour is unchanged
+    /// without having to thread this through. A caller that resolves a
+    /// driver lacking the capability calls `set_awaiting_input_capable`
+    /// to override it — see that method's doc for why the honest default
+    /// on absence is "never fake it", not a lower-fidelity guess.
+    awaiting_input_capable: HashMap<u8, bool>,
 }
 
 impl LiveWorkerStateRegistry {
@@ -105,6 +118,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
+        guard.awaiting_input_capable.insert(slot_id, true);
         guard
             .spawned_at
             .insert(slot_id, boss_engine_utils::epoch_time::now_epoch_secs());
@@ -137,6 +151,33 @@ impl LiveWorkerStateRegistry {
             .unwrap_or(ProgressFidelity::Rich)
     }
 
+    /// Record whether the driver spawned into `slot_id` declares
+    /// `Capability::AwaitingInputSignal`. `register_spawn` seeds every
+    /// slot `true` (Claude's historical behaviour); a caller that resolves
+    /// a driver without the capability calls this with `false` so
+    /// `apply_event` stops trusting a `WorkerEvent::Notification` for this
+    /// slot as an "awaiting human input" signal.
+    ///
+    /// Deliberately does not attempt to re-derive `WaitingForInput` from a
+    /// lower-fidelity channel when set to `false` — per the agent-driver
+    /// design's absence policy for this capability (Degrade, not
+    /// Synthesize), a driver that can't know this state must not have
+    /// Boss guess it. `apply_event` honours that by leaving activity
+    /// untouched on a `Notification` it doesn't trust, so the worker
+    /// reads as `Working`/`Idle` rather than a fabricated
+    /// `WaitingForInput`.
+    ///
+    /// A no-op (silently ignored, no entry created) if the slot has no
+    /// live entry — mirrors the benign-drop behaviour of the other
+    /// per-slot setters when a hook or wiring call races spawn/release.
+    pub fn set_awaiting_input_capable(&self, slot_id: u8, capable: bool) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        if !guard.by_slot.contains_key(&slot_id) {
+            return;
+        }
+        guard.awaiting_input_capable.insert(slot_id, capable);
+    }
+
     /// Drop the entry for `slot_id`. Called when the engine releases
     /// a pane (slot is recycled).
     ///
@@ -154,6 +195,7 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let removed = guard.by_slot.remove(&slot_id);
         guard.notification_pending.remove(&slot_id);
+        guard.awaiting_input_capable.remove(&slot_id);
         guard.spawned_at.remove(&slot_id);
         guard.progress_fidelity.remove(&slot_id);
         drop(guard);
@@ -260,6 +302,7 @@ impl LiveWorkerStateRegistry {
         let Inner {
             by_slot,
             notification_pending,
+            awaiting_input_capable,
             ..
         } = &mut *guard;
         let Some(state) = by_slot.get_mut(&slot_id) else {
@@ -302,9 +345,18 @@ impl LiveWorkerStateRegistry {
                 state.activity = WorkerActivity::Working;
             }
             WorkerEvent::Notification { .. } => {
-                state.activity = WorkerActivity::WaitingForInput;
-                state.current_tool = None;
-                notification_pending.insert(slot_id, true);
+                // Only trust this as an "awaiting human input" signal when
+                // the run's driver declared `Capability::AwaitingInputSignal`
+                // (see `set_awaiting_input_capable`). Absent that — a
+                // driver that doesn't back the signal, or emitted one it
+                // shouldn't have — leave activity untouched rather than
+                // guess: the "don't fake WaitingForInput" contract lives
+                // here, at the one place this event is interpreted.
+                if awaiting_input_capable.get(&slot_id).copied().unwrap_or(true) {
+                    state.activity = WorkerActivity::WaitingForInput;
+                    state.current_tool = None;
+                    notification_pending.insert(slot_id, true);
+                }
             }
             WorkerEvent::Stop { .. } => {
                 let was_pending = notification_pending.remove(&slot_id).unwrap_or(false);
@@ -690,6 +742,90 @@ mod tests {
         let state = reg.get(1).unwrap();
         // Stop without a fresh notification should now be Idle.
         assert_eq!(state.activity, WorkerActivity::Idle);
+    }
+
+    #[test]
+    fn awaiting_input_incapable_driver_never_shows_waiting_for_input() {
+        // A driver that doesn't declare `Capability::AwaitingInputSignal`
+        // must never produce `WaitingForInput`, even if a `Notification`
+        // event somehow arrives — the honest degrade is to leave activity
+        // untouched (Working here) so `Stop` falls through to `Idle`,
+        // never a fabricated `WaitingForInput`.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_awaiting_input_capable(1, false);
+        reg.apply_event(1, &pre_tool("Bash"));
+        let before = reg.get(1).unwrap();
+        assert_eq!(before.activity, WorkerActivity::Working);
+
+        reg.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "claude needs permission".into(),
+            },
+        );
+        let after_notification = reg.get(1).unwrap();
+        assert_eq!(
+            after_notification.activity,
+            WorkerActivity::Working,
+            "an untrusted Notification must not change activity"
+        );
+
+        reg.apply_event(1, &stop_event());
+        let after_stop = reg.get(1).unwrap();
+        assert_eq!(
+            after_stop.activity,
+            WorkerActivity::Idle,
+            "Stop must resolve to Idle, not a guessed WaitingForInput"
+        );
+    }
+
+    #[test]
+    fn awaiting_input_capable_defaults_true_matching_claude_behaviour() {
+        // Every existing caller of `register_spawn` (Claude is the only
+        // production driver today) must see byte-identical behaviour
+        // without calling `set_awaiting_input_capable` at all.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "claude needs permission".into(),
+            },
+        );
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    }
+
+    #[test]
+    fn release_slot_resets_awaiting_input_capable_to_default_on_respawn() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_awaiting_input_capable(1, false);
+        reg.release_slot(1);
+        reg.register_spawn(1, "run-2", "claude-opus-4-7", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "claude needs permission".into(),
+            },
+        );
+        assert_eq!(
+            reg.get(1).unwrap().activity,
+            WorkerActivity::WaitingForInput,
+            "a fresh spawn into a recycled slot must not inherit the prior run's flag"
+        );
+    }
+
+    #[test]
+    fn set_awaiting_input_capable_is_a_noop_for_unregistered_slot() {
+        let reg = LiveWorkerStateRegistry::new();
+        // Must not panic when no entry exists for the slot (event/wiring
+        // race ahead of spawn registration, or after release).
+        reg.set_awaiting_input_capable(7, false);
+        assert!(reg.get(7).is_none());
     }
 
     #[test]

@@ -437,6 +437,18 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         server_state
             .live_worker_states
             .register_spawn(slot_id, run_id, model, 0, binding);
+        // Remote workers are Claude-only today (the `model` fallback above
+        // is the literal label `"claude"` — see the driver-abstraction
+        // design doc's "Remote/SSH driver-awareness" future task), so this
+        // mirrors the local spawn path's derivation rather than relying on
+        // `register_spawn`'s capable-by-default seed.
+        use crate::driver::AgentDriver as _;
+        server_state.live_worker_states.set_awaiting_input_capable(
+            slot_id,
+            crate::driver::ClaudeDriver
+                .capabilities()
+                .provides(crate::driver::Capability::AwaitingInputSignal),
+        );
         tracing::info!(
             run_id,
             slot_id,

@@ -24,7 +24,7 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::{AgentDriver, Capability, ClaudeDriver};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -438,6 +438,16 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         // load-bearing the moment `write_workspace_files` above resolves a
         // non-Claude driver instead of the hardcoded one.
         live_states.set_progress_fidelity(slot_id, ClaudeDriver.progress_fidelity());
+        // Ask the driver, rather than assume: `register_spawn` seeds every
+        // slot capable-by-default (matching Claude), but deriving it here
+        // from the actual driver's declared capabilities means this call
+        // site needs no further change once spawning stops hardcoding
+        // `ClaudeDriver` (see the driver-abstraction design doc's
+        // "Extract the Claude Spawn capability" task).
+        live_states.set_awaiting_input_capable(
+            slot_id,
+            ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
+        );
         spawner.publish_live_worker_states().await;
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down

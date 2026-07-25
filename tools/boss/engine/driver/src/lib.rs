@@ -146,6 +146,22 @@ pub enum Capability {
     /// Driver supplies the agent-rules filename, hook-enforcement wording, and
     /// the final-output convention; the body is shared.
     PromptComposition,
+    /// The driver's [`Capability::ProgressObservation`] stream can positively
+    /// signal that the worker is blocked awaiting human input (as distinct
+    /// from busy/idle) — for Claude, a `WorkerEvent::Notification` preceding
+    /// `Stop`. This is a narrower claim than `ProgressObservation` itself:
+    /// a driver can produce a perfectly good event stream while having no
+    /// channel that ever means "I am specifically waiting on a human."
+    ///
+    /// Absence is **Degrade**, never Synthesize: Boss must not guess this
+    /// state from a lower-fidelity channel (e.g. "no events for N minutes").
+    /// A wedged autonomous worker on such a driver shows `Working`
+    /// indefinitely rather than a fabricated `WaitingForInput` — see the
+    /// agent-driver design doc's "Stop-reason richness loss" risk and the
+    /// `codex-progress-channel-decision` investigation, which found
+    /// `codex exec`'s one-turn-per-process model has no live "awaiting
+    /// input" state for this signal to attach to at all.
+    AwaitingInputSignal,
 }
 
 impl Capability {
@@ -168,6 +184,7 @@ impl Capability {
             Self::ControlVerbs,
             Self::ToolProvisioning,
             Self::PromptComposition,
+            Self::AwaitingInputSignal,
         ]
         .into_iter()
     }
@@ -189,6 +206,7 @@ impl Capability {
             Self::ControlVerbs => AbsenceDisposition::Degrade,
             Self::ToolProvisioning => AbsenceDisposition::Degrade,
             Self::PromptComposition => AbsenceDisposition::Refuse,
+            Self::AwaitingInputSignal => AbsenceDisposition::Degrade,
         }
     }
 }
@@ -1244,6 +1262,16 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_input_signal_degrades_when_absent_not_synthesizes() {
+        // Must never be Synthesize: Boss must not guess WaitingForInput
+        // from a lower-fidelity signal when the driver can't back it.
+        assert_eq!(
+            Capability::AwaitingInputSignal.default_absence_disposition(),
+            AbsenceDisposition::Degrade,
+        );
+    }
+
+    #[test]
     fn post_hoc_interception_action_variants_are_distinct() {
         assert_eq!(PostHocInterceptionAction::Accept, PostHocInterceptionAction::Accept);
         let edit = PostHocInterceptionAction::RequestEdit {
@@ -1324,7 +1352,7 @@ mod tests {
     fn all_capabilities_covers_every_variant() {
         let all: Vec<_> = Capability::all().collect();
         // Every variant must appear exactly once.
-        assert_eq!(all.len(), 12, "Capability::all() must cover all 12 variants");
+        assert_eq!(all.len(), 13, "Capability::all() must cover all 13 variants");
         // Spot-check a few to ensure the enum and all() stay in sync.
         assert!(all.contains(&Capability::Spawn));
         assert!(all.contains(&Capability::StructuredOutput));
