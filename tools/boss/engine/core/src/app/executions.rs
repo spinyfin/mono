@@ -535,6 +535,15 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "reap_run: marked execution orphaned (workspace preserved)",
                 );
+                // Manual-reap termination path: tear down any
+                // driver-owned state outside the workspace.
+                if let Some(workspace_path) = execution.workspace_path.as_deref() {
+                    crate::driver_teardown::teardown_driver_workspace(
+                        &execution.id,
+                        std::path::Path::new(workspace_path),
+                    )
+                    .await;
+                }
                 // The execution row is now terminal, but marking it so
                 // does nothing to the worker-pool claim or the
                 // `LiveWorkerStateRegistry` entry a live pane may still

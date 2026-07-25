@@ -249,7 +249,15 @@ pub async fn finalize_gone_execution(
     details: serde_json::Value,
 ) -> bool {
     match work_db.mark_execution_orphaned(&execution.id, reason) {
-        Ok(_) => {}
+        Ok(_) => {
+            // Reap termination path (dead-pane / lost-workspace reconcile):
+            // tear down any driver-owned state outside the workspace.
+            // `mark_execution_orphaned` preserves `workspace_path` on the
+            // row, so the pre-call value on `execution` is still current.
+            if let Some(workspace_path) = execution.workspace_path.as_deref() {
+                crate::driver_teardown::teardown_driver_workspace(&execution.id, Path::new(workspace_path)).await;
+            }
+        }
         Err(err) => {
             let already_terminal = work_db
                 .get_execution(&execution.id)

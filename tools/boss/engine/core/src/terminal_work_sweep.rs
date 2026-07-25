@@ -375,13 +375,25 @@ pub async fn run_one_pass(
         // the row. Best-effort: if the execution turns out already terminal
         // (a race with some other teardown) this is a conservative no-op.
         if candidate.work_item_missing {
-            if let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
-            {
-                tracing::warn!(
-                    run_id = %candidate.run_id,
-                    ?err,
-                    "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
-                );
+            match work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists") {
+                Ok(orphaned) => {
+                    // Reap termination path: tear down any driver-owned
+                    // state outside the workspace.
+                    if let Some(workspace_path) = orphaned.workspace_path.as_deref() {
+                        crate::driver_teardown::teardown_driver_workspace(
+                            &candidate.run_id,
+                            std::path::Path::new(workspace_path),
+                        )
+                        .await;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        run_id = %candidate.run_id,
+                        ?err,
+                        "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+                    );
+                }
             }
 
             // `mark_execution_orphaned` deliberately leaves the cube lease

@@ -15,12 +15,24 @@ pub(crate) fn content_checksum(title: &str, body: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// What [`WorkDb::clear_execution_workspace`] cleared, returned so the
+/// caller can both release the cube lease and (separately) tear down any
+/// driver-owned state that lived outside the workspace.
+pub struct ClearedExecutionWorkspace {
+    /// The lease id the caller must release via the cube CLI.
+    pub lease_id: String,
+    /// `workspace_path` as it stood immediately before being nulled, for
+    /// driver-workspace teardown. `None` if the row never recorded one.
+    pub workspace_path: Option<String>,
+}
+
 impl WorkDb {
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id
-    /// — `Some` means the caller is responsible for issuing the cube
-    /// `workspace release`, `None` means there was nothing to release
-    /// (already cleared by an earlier path or never leased).
+    /// (and the workspace path as it stood before clearing) — `Some`
+    /// means the caller is responsible for issuing the cube `workspace
+    /// release`, `None` means there was nothing to release (already
+    /// cleared by an earlier path or never leased).
     ///
     /// Used by the engine-side release path (manual chore-done update,
     /// `bossctl agents stop`) to claim ownership of the cube release
@@ -141,12 +153,12 @@ impl WorkDb {
         Ok((exec_cancelled, task_demoted))
     }
 
-    pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<String>> {
+    pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<ClearedExecutionWorkspace>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let prior = execution.cube_lease_id.clone();
-        if prior.is_some() {
+        if let Some(lease_id) = prior {
             tx.execute(
                 "UPDATE work_executions
                  SET cube_lease_id = NULL,
@@ -155,9 +167,15 @@ impl WorkDb {
                  WHERE id = ?1",
                 params![execution_id],
             )?;
+            tx.commit()?;
+            Ok(Some(ClearedExecutionWorkspace {
+                lease_id,
+                workspace_path: execution.workspace_path,
+            }))
+        } else {
+            tx.commit()?;
+            Ok(None)
         }
-        tx.commit()?;
-        Ok(prior)
     }
 
     /// Append an `effort_escalations` row recording a worker's

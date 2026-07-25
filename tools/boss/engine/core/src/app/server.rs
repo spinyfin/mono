@@ -799,6 +799,16 @@ pub async fn serve_with_merge_probe(
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "startup reaper: marked execution orphaned (workspace preserved for re-lease)",
                 );
+                // App-crash-reconciliation termination path (engine
+                // startup reaper): tear down any driver-owned state
+                // outside the workspace.
+                if let Some(workspace_path) = execution.workspace_path.as_deref() {
+                    crate::driver_teardown::teardown_driver_workspace(
+                        &execution.id,
+                        std::path::Path::new(workspace_path),
+                    )
+                    .await;
+                }
                 // Snapshot any uncommitted in-flight work to a durable
                 // patch before the workspace can be re-leased/reset.
                 // Best-effort and self-logging; never blocks the reaper.

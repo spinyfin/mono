@@ -180,6 +180,14 @@ async fn drain_execution(
     }
     outcome.reaped += 1;
 
+    // Host-offline reconciliation termination path: tear down any
+    // driver-owned state outside the workspace. `mark_execution_orphaned`
+    // preserves `workspace_path`, so the pre-call `execution` snapshot is
+    // still current.
+    if let Some(workspace_path) = execution.workspace_path.as_deref() {
+        crate::driver_teardown::teardown_driver_workspace(&execution.id, std::path::Path::new(workspace_path)).await;
+    }
+
     // Preserve the automation-triage open-task-recovery bookkeeping the
     // other reap paths do, so a triage that produced a task before its host
     // was disabled is recorded honestly rather than as a silent drop.

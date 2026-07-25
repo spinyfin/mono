@@ -40,6 +40,7 @@ pub use boss_dispatch_events as dispatch_events;
 pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_inflight;
 pub mod dispatch_metrics;
+pub mod driver_teardown;
 pub use boss_dispatch_reader as dispatch_reader;
 pub(crate) mod dispatch_spillover;
 pub mod dispatch_stall_escalation;

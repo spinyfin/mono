@@ -50,8 +50,8 @@ impl WorkerCompletionHandler {
         // Cube release: claim ownership of the lease id atomically by
         // clearing it from the DB row before calling the cube CLI.
         // A concurrent caller will see `None` and skip.
-        let lease_id = match self.work_db.clear_execution_workspace(execution_id) {
-            Ok(Some(lease_id)) => lease_id,
+        let cleared = match self.work_db.clear_execution_workspace(execution_id) {
+            Ok(Some(cleared)) => cleared,
             Ok(None) => return ForceReleaseOutcome::NoLeaseHeld,
             Err(err) => {
                 tracing::warn!(
@@ -62,6 +62,14 @@ impl WorkerCompletionHandler {
                 return ForceReleaseOutcome::WorkspaceColumnClearFailed;
             }
         };
+        let lease_id = cleared.lease_id;
+        // Stop termination path (force_release backs `bossctl agents stop`,
+        // cascade cancel, and every other explicit teardown): tear down any
+        // driver-owned state outside the workspace, using the path captured
+        // before `clear_execution_workspace` nulled it.
+        if let Some(workspace_path) = cleared.workspace_path.as_deref() {
+            crate::driver_teardown::teardown_driver_workspace(execution_id, std::path::Path::new(workspace_path)).await;
+        }
         if let Err(err) = self.cube_client.release_workspace(&lease_id).await {
             tracing::warn!(
                 execution_id,

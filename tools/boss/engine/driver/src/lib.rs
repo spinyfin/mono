@@ -665,6 +665,25 @@ pub trait AgentDriver: Send + Sync {
     /// and suppress the backend's first-run trust prompt.
     async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<()>;
 
+    /// Tear down whatever per-run state the driver created *outside* the cube
+    /// workspace — a per-worker config/cache dir, a socket, a temp credential
+    /// file. Paired with [`AgentDriver::provision_workspace`], but not its
+    /// mirror: this must NOT touch anything under `workspace` itself, since
+    /// cube owns that checkout's lifecycle.
+    ///
+    /// Called on every run-termination path (normal completion, stop, reap,
+    /// orphaned/husk recovery, app-crash reconciliation) — not just the happy
+    /// one, since those are exactly the paths where a driver's out-of-workspace
+    /// state would otherwise be orphaned. Callers must treat this as
+    /// best-effort: implementations must be idempotent, and callers log a
+    /// returned error rather than propagate it, so a teardown hiccup never
+    /// fails an otherwise-successful run.
+    ///
+    /// Must not perform real work — it can run while the process is shutting
+    /// down. `ClaudeDriver` implements this as a no-op: Claude creates no
+    /// state outside the workspace.
+    async fn teardown_workspace(&self, workspace: &Path, run_id: &str) -> anyhow::Result<()>;
+
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
     /// Write the driver's permission/hooks config to `dest_dir` and return the
@@ -850,6 +869,9 @@ pub mod test_support {
             unimplemented!()
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn teardown_workspace(&self, _: &Path, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
         async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {

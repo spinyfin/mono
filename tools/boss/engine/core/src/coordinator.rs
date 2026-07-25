@@ -6575,19 +6575,32 @@ impl ExecutionCoordinator {
                 // concurrent `force_release` and this branch can't issue
                 // a duplicate cube release against the same lease.
                 let released = match self.work_db.clear_execution_workspace(&execution.id) {
-                    Ok(Some(lease_id)) => match adapter.release_workspace(&lease_id).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            tracing::error!(
-                                ?err,
-                                execution_id = %execution.id,
-                                run_id = %run.id,
-                                lease_id = %lease_id,
-                                "failed to release deferred lease after mid-spawn cancel",
-                            );
-                            false
+                    Ok(Some(cleared)) => {
+                        // Stop termination path (mid-spawn cancel): tear
+                        // down any driver-owned state outside the
+                        // workspace, using the path captured before
+                        // `clear_execution_workspace` nulled it.
+                        if let Some(workspace_path) = cleared.workspace_path.as_deref() {
+                            crate::driver_teardown::teardown_driver_workspace(
+                                &execution.id,
+                                std::path::Path::new(workspace_path),
+                            )
+                            .await;
                         }
-                    },
+                        match adapter.release_workspace(&cleared.lease_id).await {
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::error!(
+                                    ?err,
+                                    execution_id = %execution.id,
+                                    run_id = %run.id,
+                                    lease_id = %cleared.lease_id,
+                                    "failed to release deferred lease after mid-spawn cancel",
+                                );
+                                false
+                            }
+                        }
+                    }
                     // Already cleared by a racing force_release that saw
                     // the slot mapped and reaped + released itself.
                     Ok(None) => false,
@@ -6780,6 +6793,15 @@ impl ExecutionCoordinator {
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
+                        // Pane-spawn-failure termination path: the run is
+                        // durably `failed`. Tear down any driver-owned state
+                        // outside the workspace, mirroring provision_workspace
+                        // (which may already have run before the spawn itself
+                        // failed).
+                        if released {
+                            crate::driver_teardown::teardown_driver_workspace(&execution.id, &lease.workspace_path)
+                                .await;
+                        }
                         // The execution is now durably `failed` in the DB —
                         // safe to have `pool_claim_sweep` own reclaiming this
                         // slot instead of releasing it immediately (see the
@@ -7255,6 +7277,14 @@ impl ExecutionCoordinator {
         } else {
             false
         };
+
+        // Normal-completion termination path: the workspace lease was
+        // released, so this run is genuinely over (not a live park handing
+        // off to a pane). Tear down any driver-owned state outside the
+        // workspace to match.
+        if released {
+            crate::driver_teardown::teardown_driver_workspace(&execution.id, &lease.workspace_path).await;
+        }
 
         let attention = outcome.attention.map(|attention| CreateAttentionItemInput {
             execution_id: Some(execution.id.clone()),

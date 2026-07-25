@@ -479,6 +479,14 @@ impl AgentDriver for ClaudeDriver {
         Ok(())
     }
 
+    /// No-op: Claude needs no teardown. It creates no per-run state outside
+    /// the cube workspace — the `.claude/` config dir `provision_workspace`
+    /// writes lives inside the workspace, which cube owns and tears down
+    /// itself.
+    async fn teardown_workspace(&self, _workspace: &Path, _run_id: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn write_permission_config(
         &self,
         _input: &PermissionInput,
@@ -1267,6 +1275,28 @@ mod tests {
             Some(v) => unsafe { std::env::set_var("HOME", v) },
             None => unsafe { std::env::remove_var("HOME") },
         }
+    }
+
+    #[tokio::test]
+    async fn teardown_workspace_is_a_no_op() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("marker.txt"), "untouched").unwrap();
+
+        ClaudeDriver
+            .teardown_workspace(workspace.path(), "run-1")
+            .await
+            .unwrap();
+
+        // Bit-identical to before: nothing in the workspace changed.
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker.txt")).unwrap(),
+            "untouched",
+        );
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            1,
+            "teardown must not create or remove any files in the workspace",
+        );
     }
 
     #[test]

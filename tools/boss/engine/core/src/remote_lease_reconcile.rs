@@ -256,7 +256,16 @@ async fn reap_dead_remote_execution(
     );
 
     match work_db.mark_execution_orphaned(&execution.id, &reason) {
-        Ok(_) => {}
+        Ok(_) => {
+            // Reap termination path (remote-lease reconcile): tear down
+            // any driver-owned state outside the workspace.
+            // `mark_execution_orphaned` preserves `workspace_path`, so the
+            // pre-call `execution` snapshot is still current.
+            if let Some(workspace_path) = execution.workspace_path.as_deref() {
+                crate::driver_teardown::teardown_driver_workspace(&execution.id, std::path::Path::new(workspace_path))
+                    .await;
+            }
+        }
         Err(err) => {
             // A concurrent sweep/completion may have finalized it between
             // our snapshot and now. If it is terminal now, treat as
