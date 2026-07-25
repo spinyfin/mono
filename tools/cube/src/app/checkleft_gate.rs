@@ -1,12 +1,12 @@
 //! The pre-push `checkleft` gate: locate the binary, run it, and refuse the
 //! push when it reports findings.
 
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::stage::run_stage;
+use crate::command_runner::{CommandInvocation, RealCommandRunner};
 
 /// Upper bound on the `repobin exec checkleft --version` probe, which pays a
 /// cold dispatch-cache miss (a full `bazel build //tools/checkleft:checkleft`)
@@ -23,51 +23,6 @@ const CHECKLEFT_PROBE_TIMEOUT: Duration = Duration::from_secs(240);
 /// bounded generously above the ~85-95s measured runtime while still
 /// guaranteeing the gate cannot hang a push forever on a wedged bazel.
 const CHECKLEFT_RUN_TIMEOUT: Duration = Duration::from_secs(300);
-
-/// Run `command`, waiting up to `timeout` for it to exit. Returns `Ok(None)`
-/// if the timeout elapses (the child is killed first); returns `Ok(Some(_))`
-/// with the collected output otherwise. Reads stdout/stderr on background
-/// threads so a chatty child cannot deadlock on a full pipe while we poll.
-fn run_with_timeout(
-    command: &mut std::process::Command,
-    timeout: Duration,
-) -> std::io::Result<Option<std::process::Output>> {
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = command.spawn()?;
-    let mut stdout = child.stdout.take().expect("stdout was piped");
-    let mut stderr = child.stderr.take().expect("stderr was piped");
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            return Ok(None);
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let stdout = stdout_handle.join().unwrap_or_default();
-    let stderr = stderr_handle.join().unwrap_or_default();
-    Ok(Some(std::process::Output { status, stdout, stderr }))
-}
 
 /// Run the repository's checkleft against the outgoing changes before a
 /// push, refusing the push when checkleft reports errors.
@@ -131,31 +86,54 @@ pub(super) fn run_checkleft_gate_impl(
         return Ok(());
     };
 
-    let mut command = std::process::Command::new(program);
-    command.args(leading_args).arg("run").current_dir(cwd);
-    if let Some(pr_description) = pr_description {
-        command.env("CHECKS_PR_DESCRIPTION", pr_description);
+    let mut args: Vec<String> = leading_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    args.push("run".to_string());
+    // Explicitly clear CHECKS_PR_DESCRIPTION rather than merely not-setting it
+    // when `pr_description` is `None`: without this, the subprocess would
+    // inherit whatever CHECKS_PR_DESCRIPTION happens to be set in cube's own
+    // environment (e.g. left over from a wrapper or an earlier step), silently
+    // overriding checkleft's own branch->PR lookup instead of falling through
+    // to it as documented.
+    let env = pr_description
+        .map(|pr_description| vec![("CHECKS_PR_DESCRIPTION".to_string(), pr_description.to_string())])
+        .unwrap_or_default();
+    let env_remove: &[&str] = if pr_description.is_some() {
+        &[]
     } else {
-        // Explicitly clear rather than merely not-setting: without this, the
-        // subprocess would inherit whatever CHECKS_PR_DESCRIPTION happens to
-        // be set in cube's own environment (e.g. left over from a wrapper or
-        // an earlier step), silently overriding checkleft's own branch->PR
-        // lookup instead of falling through to it as documented.
-        command.env_remove("CHECKS_PR_DESCRIPTION");
-    }
-    let output = match run_with_timeout(&mut command, CHECKLEFT_RUN_TIMEOUT) {
-        Ok(Some(output)) => output,
-        // Could not execute checkleft at all, or it ran past its budget
-        // (a wedged bazel build) — fail open rather than block a push on
-        // an infrastructure problem unrelated to the change.
-        Ok(None) | Err(_) => {
-            eprintln!(
-                "cube: checkleft run did not finish within {}s — push gate SKIPPED",
-                CHECKLEFT_RUN_TIMEOUT.as_secs()
-            );
-            return Ok(());
-        }
+        &["CHECKS_PR_DESCRIPTION"]
     };
+    let invocation = CommandInvocation {
+        cwd: cwd.to_path_buf(),
+        program: program.to_string_lossy().into_owned(),
+        args,
+        env,
+    };
+    let output =
+        match RealCommandRunner.run_with_timeout_capturing_output(&invocation, env_remove, CHECKLEFT_RUN_TIMEOUT) {
+            Ok(Some(output)) => output,
+            // Ran past its budget (a wedged bazel build) — fail open rather than
+            // block a push on an infrastructure problem unrelated to the change.
+            Ok(None) => {
+                eprintln!(
+                    "cube: checkleft run did not finish within {}s — push gate SKIPPED",
+                    CHECKLEFT_RUN_TIMEOUT.as_secs()
+                );
+                return Ok(());
+            }
+            // Could not execute checkleft at all (missing/non-executable binary,
+            // permission denied) — the process never started, so report that
+            // distinctly rather than implying it ran and timed out.
+            Err(e) => {
+                eprintln!(
+                    "cube: could not execute checkleft ({}): {e} — push gate SKIPPED",
+                    program.display()
+                );
+                return Ok(());
+            }
+        };
     if output.status.success() {
         return Ok(());
     }
@@ -245,9 +223,13 @@ fn resolve_repobin(cwd: &Path) -> Option<PathBuf> {
 /// needed) and shares the same on-disk dispatch cache as `run`, so probing
 /// with it first pays the build cost at most once and never twice.
 fn probe_repobin_checkleft(repobin: &Path, cwd: &Path) -> bool {
-    let mut command = std::process::Command::new(repobin);
-    command.args(["exec", "checkleft", "--version"]).current_dir(cwd);
-    match run_with_timeout(&mut command, CHECKLEFT_PROBE_TIMEOUT) {
+    let invocation = CommandInvocation {
+        cwd: cwd.to_path_buf(),
+        program: repobin.to_string_lossy().into_owned(),
+        args: vec!["exec".to_string(), "checkleft".to_string(), "--version".to_string()],
+        env: vec![],
+    };
+    match RealCommandRunner.run_with_timeout_capturing_output(&invocation, &[], CHECKLEFT_PROBE_TIMEOUT) {
         Ok(Some(output)) => output.status.success(),
         // Exec error or timeout (a wedged bazel build) -- treated as a
         // failed probe, same as a non-zero exit: resolution falls through
