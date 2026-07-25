@@ -17,7 +17,7 @@ use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::AgentDriver;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -227,7 +227,15 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// the worker's env). Every production event connection should carry
 /// this field. If missing, a warning is logged but the event is
 /// returned with `run_id: None`.
-pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, SocketError> {
+///
+/// This socket is inherently a [`crate::driver::ProgressIngress::HookCallback`]
+/// ingress — a `StdoutJsonl` driver never connects to it — but `driver` is
+/// still an injected parameter rather than a hardcoded `ClaudeDriver`
+/// reference: the caller resolves it via [`crate::driver::DriverRegistry`],
+/// so a second hook-callback driver (or per-run resolution once the dispatch
+/// gate selects a driver per run) only requires changing the caller's
+/// resolution, not this function.
+pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -240,14 +248,11 @@ pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, 
     } else {
         payload_run_id
     };
-    // Decode through the Claude driver's ProgressObservation and
-    // TranscriptAccess capabilities. The engine is Claude-default today;
-    // once the dispatch gate selects a driver per run (design Depth 3),
-    // this picks the run's driver instead of hardcoding `ClaudeDriver`. The
-    // decoded event drives the (driver-agnostic) activity machine
-    // downstream, unchanged.
-    let transcript_path = ClaudeDriver.transcript_path_for_session(&raw);
-    let event = ClaudeDriver.normalize_progress_event(&raw)?;
+    // Decode through the driver's ProgressObservation and TranscriptAccess
+    // capabilities. The decoded event drives the (driver-agnostic) activity
+    // machine downstream, unchanged.
+    let transcript_path = driver.transcript_path_for_session(&raw);
+    let event = driver.normalize_progress_event(&raw)?;
     Ok(IncomingHookEvent {
         peer_pid: peer_pid_value,
         run_id,
@@ -315,6 +320,7 @@ fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::ClaudeDriver;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -498,7 +504,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client_task.await.unwrap();
 
         match incoming.event {
@@ -531,7 +537,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(
@@ -560,7 +566,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -589,7 +595,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -615,7 +621,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
@@ -642,7 +648,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
 
         close_tx.send(()).ok();
@@ -664,7 +670,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream).await;
+        let result = handle_connection(stream, &ClaudeDriver).await;
         client.await.unwrap();
 
         match result {
@@ -689,7 +695,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream).await;
+        let result = handle_connection(stream, &ClaudeDriver).await;
         client.await.unwrap();
 
         match result {

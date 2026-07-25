@@ -16,7 +16,7 @@ use boss_ssh_transport::shell_quote;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig,
     ToolUseInterceptionWiring, WorkerErrorClass,
 };
 
@@ -504,7 +504,7 @@ impl AgentDriver for ClaudeDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring {
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
         // is load-bearing: without it the shim can't splice `_boss_run_id` and
         // the engine drops the event, pinning the worker at `Spawning`.
@@ -540,7 +540,7 @@ impl AgentDriver for ClaudeDriver {
         for event in CLAUDE_HOOK_EVENTS {
             hooks.insert((*event).to_owned(), serde_json::json!([forward_hook.clone()]));
         }
-        ProgressObservationWiring { hooks }
+        ProgressIngress::HookCallback(ProgressObservationWiring { hooks })
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
@@ -854,9 +854,19 @@ mod tests {
         assert_eq!(ClaudeDriver.progress_fidelity(), ProgressFidelity::Rich);
     }
 
+    /// Unwrap a [`ProgressIngress`] as the [`ProgressIngress::HookCallback`]
+    /// wiring it must be for `ClaudeDriver`, panicking with a clear message
+    /// if the driver ever regresses to `StdoutJsonl`.
+    fn expect_hook_callback(ingress: ProgressIngress) -> ProgressObservationWiring {
+        match ingress {
+            ProgressIngress::HookCallback(wiring) => wiring,
+            ProgressIngress::StdoutJsonl => panic!("ClaudeDriver must produce HookCallback wiring"),
+        }
+    }
+
     #[test]
     fn observation_wiring_covers_all_seven_lifecycle_events() {
-        let wiring = ClaudeDriver.progress_observation_wiring(&sample_config());
+        let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
         for name in [
             "SessionStart",
             "UserPromptSubmit",
@@ -876,7 +886,7 @@ mod tests {
 
     #[test]
     fn observation_wiring_threads_socket_lease_run_and_workspace_into_command() {
-        let wiring = ClaudeDriver.progress_observation_wiring(&sample_config());
+        let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
         let command = wiring.hooks["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         // Single-quote escaping must survive the space in "Application Support".
         assert!(command.contains("BOSS_EVENTS_SOCKET='/Users/x/Library/Application Support/Boss/events.sock'"));

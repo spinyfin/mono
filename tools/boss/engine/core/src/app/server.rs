@@ -2014,12 +2014,23 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
     if let Some(p) = local_addr.as_ref().and_then(|a| a.as_pathname()) {
         crate::audit::record_accept_loop_started("events", p);
     }
+    // This socket only ever hears from a `ProgressIngress::HookCallback`
+    // driver's `boss-event` shim (a `StdoutJsonl` driver never connects to
+    // it), so the engine default is the correct resolution today. Resolved
+    // through the registry — not a hardcoded `ClaudeDriver` reference — so
+    // per-run resolution (once the dispatch gate selects a driver per run)
+    // only requires changing this lookup.
+    let hook_callback_driver: std::sync::Arc<dyn crate::driver::AgentDriver> = crate::driver::DriverRegistry::default()
+        .get(crate::effort::ENGINE_DEFAULT_DRIVER)
+        .expect("engine default driver is always registered")
+        .clone();
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
+                let driver = hook_callback_driver.clone();
                 tokio::spawn(async move {
-                    match handle_connection(stream).await {
+                    match handle_connection(stream, driver.as_ref()).await {
                         Ok(incoming) => {
                             tracing::info!(
                                 peer_pid = ?incoming.peer_pid,
