@@ -488,11 +488,52 @@ fn remote_worker_model_override(item: &boss_protocol::WorkItem) -> Option<String
     }
 }
 
+/// DB-free gate for [`dispatch_editorial_on_pretooluse`]: decides whether a
+/// `PreToolUse` event should proceed to editorial evaluation, and if so
+/// returns the `(command, execution_id)` pair to evaluate. Split out so the
+/// `editorial_controls` flag gate can be pinned by a unit test without
+/// standing up a full `ServerState`/DB.
+fn editorial_pretooluse_candidate<'a>(
+    flag_enabled: bool,
+    event: &'a crate::protocol::WorkerEvent,
+    run_id: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    use crate::protocol::WorkerEvent;
+
+    if !flag_enabled {
+        return None;
+    }
+
+    let WorkerEvent::PreToolUse {
+        tool_name, tool_input, ..
+    } = event
+    else {
+        return None;
+    };
+    if tool_name != "Bash" {
+        return None;
+    }
+    let command = tool_input.get("command").and_then(|v| v.as_str())?;
+
+    // Fast path: only evaluate commands that match the editorial hook's scope.
+    if !boss_engine_gh_invocation::is_editorial_candidate(command) {
+        return None;
+    }
+
+    let execution_id = run_id?;
+    Some((command, execution_id))
+}
+
 /// On every `PreToolUse` event whose tool is `Bash` and whose command
 /// matches `gh pr|issue {create,edit,comment,review}` (or `cube pr ensure`),
 /// evaluate the command against the product's editorial rules and write the
 /// decision to `editorial_actions`. Emits a `work_editorial_action` topic
 /// event so subscribers (bossctl, kanban) can observe decisions live.
+///
+/// Gated on the `editorial_controls` feature flag: this is the single
+/// choke-point call site [`crate::editorial_hook::evaluate_gh_pretooluse`]'s
+/// docs describe, so when the flag is off this function returns immediately
+/// and no `editorial_actions` row is written for the event.
 ///
 /// Fails open on every error: a DB failure, a missing execution row, or an
 /// unresolvable product are all logged and dropped. The editorial controls are
@@ -501,30 +542,14 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
     use boss_editorial::CompiledRules;
     use std::path::Path;
 
-    let WorkerEvent::PreToolUse {
-        tool_name, tool_input, ..
-    } = &incoming.event
-    else {
-        return;
-    };
-    if tool_name != "Bash" {
-        return;
-    }
-    let command = match tool_input.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Fast path: only evaluate commands that match the editorial hook's scope.
-    if !boss_engine_gh_invocation::is_editorial_candidate(command) {
-        return;
-    }
-
-    let Some(execution_id) = incoming.run_id.as_deref() else {
+    let Some((command, execution_id)) = editorial_pretooluse_candidate(
+        server_state.feature_flags.is_enabled("editorial_controls"),
+        &incoming.event,
+        incoming.run_id.as_deref(),
+    ) else {
         return;
     };
 
@@ -1170,4 +1195,70 @@ pub(super) async fn dispatch_completion_on_stop(
     // zero log evidence because this was at debug — operators saw
     // `activity=idle` workers but no record of what `on_stop` returned.
     tracing::info!(run_id, ?outcome, "completion handler stop result");
+}
+
+#[cfg(test)]
+mod editorial_gate_tests {
+    use super::editorial_pretooluse_candidate;
+    use crate::protocol::WorkerEvent;
+    use serde_json::json;
+
+    fn gh_pretooluse_event() -> WorkerEvent {
+        WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({ "command": "gh pr create --title t --body b" }),
+        }
+    }
+
+    #[test]
+    fn flag_off_skips_even_a_matching_gh_command() {
+        let event = gh_pretooluse_event();
+        assert_eq!(editorial_pretooluse_candidate(false, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_matching_bash_gh_command_is_a_candidate() {
+        let event = gh_pretooluse_event();
+        assert_eq!(
+            editorial_pretooluse_candidate(true, &event, Some("exec_1")),
+            Some(("gh pr create --title t --body b", "exec_1"))
+        );
+    }
+
+    #[test]
+    fn flag_on_non_bash_tool_is_skipped() {
+        let event = WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Read".to_string(),
+            tool_input: json!({ "command": "gh pr create --title t --body b" }),
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_non_editorial_command_is_skipped() {
+        let event = WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({ "command": "ls -la" }),
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_missing_run_id_is_skipped() {
+        let event = gh_pretooluse_event();
+        assert_eq!(editorial_pretooluse_candidate(true, &event, None), None);
+    }
+
+    #[test]
+    fn flag_on_non_pretooluse_event_is_skipped() {
+        let event = WorkerEvent::Stop {
+            session_id: "sess-1".to_string(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
 }
