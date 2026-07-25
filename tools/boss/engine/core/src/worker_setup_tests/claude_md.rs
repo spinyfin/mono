@@ -193,8 +193,9 @@ fn claude_md_pr_section_is_front_and_centre() {
         "PR section must come before `## Your workspace`",
     );
     // Resuming-work guidance must mention how to detect an
-    // existing PR rather than just letting the worker open a duplicate.
-    assert!(rendered.contains("gh pr list --head"));
+    // existing PR rather than just letting the worker open a duplicate —
+    // via `boss context` (Boss already tracks `pr_url`), not a `gh` hunt.
+    assert!(rendered.contains("Check first with `boss context`"));
     assert!(rendered.contains("not complete until a PR exists"));
     assert!(rendered.contains("PR URL on its own line"));
     // Empty-diff guard: the worker must verify the diff is non-empty
