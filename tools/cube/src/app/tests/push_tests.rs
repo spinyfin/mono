@@ -1,11 +1,20 @@
+use super::checkleft_tests::CheckleftEnvGuard;
 use super::pr_push_tests::remote_list_github;
 use super::rebase_tests::{CONFLICT_TMPL, failing_cmd};
+use super::support::ENV_MUTEX;
 use super::support::{ExpectedCommand, FakeRunner};
 
 use crate::app::errors::Result;
 use crate::app::workspace_ops::workspace_push;
 
+/// `workspace_push` (the testable core of `cube workspace push`, including
+/// rung-0 conflict-ladder pushes) runs the real checkleft push gate against
+/// the real environment, not through `FakeRunner`. Disable it while holding
+/// `ENV_MUTEX` so concurrently-running checkleft-resolution tests that
+/// mutate global `PATH` / `CUBE_CHECKLEFT_BIN` can never make this test flaky.
 fn run_push(runner: &FakeRunner, bookmark: Option<&str>, pr: Option<u64>) -> Result<crate::app::errors::RunResult> {
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     workspace_push(None, runner, bookmark.map(str::to_string), pr)
 }
 

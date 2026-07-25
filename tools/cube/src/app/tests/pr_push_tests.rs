@@ -1,3 +1,5 @@
+use super::checkleft_tests::CheckleftEnvGuard;
+use super::support::ENV_MUTEX;
 use super::support::{ExpectedCommand, FakeRunner};
 use clap::Parser;
 
@@ -71,6 +73,8 @@ fn pr_push_happy_path_advance() {
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let result = run_with_dependencies(cli, None, &runner).expect("pr_push happy path");
     runner.assert_exhausted();
     assert_eq!(result.payload["action"], "pushed");
@@ -199,6 +203,8 @@ fn pr_push_detached_refusal() {
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse detached @");
     runner.assert_exhausted();
     assert!(
@@ -260,6 +266,8 @@ fn pr_push_stale_push_error() {
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push", "--pr", "42", "--branch", "boss/exec_abc"]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let err = run_with_dependencies(cli, None, &runner).expect_err("should surface push error");
     runner.assert_exhausted();
     assert!(
@@ -392,6 +400,8 @@ fn pr_push_force_with_lease_happy_path() {
         "boss/exec_abc",
         "--force-with-lease",
     ]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let result = run_with_dependencies(cli, None, &runner).expect("force-with-lease happy path");
     runner.assert_exhausted();
     assert_eq!(result.payload["action"], "pushed");
@@ -447,6 +457,8 @@ fn pr_push_force_with_lease_concurrent_advance_refusal() {
         "boss/exec_abc",
         "--force-with-lease",
     ]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let err = run_with_dependencies(cli, None, &runner).expect_err("should refuse concurrent advance");
     runner.assert_exhausted();
     assert!(
@@ -527,6 +539,8 @@ fn pr_push_infers_from_ancestry() {
     ]);
 
     let cli = Cli::parse_from(["cube", "pr", "push"]);
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let _env = CheckleftEnvGuard::with_gate_disabled();
     let result = run_with_dependencies(cli, None, &runner).expect("pr_push inferred from ancestry");
     runner.assert_exhausted();
     assert_eq!(result.payload["action"], "pushed");
