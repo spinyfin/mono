@@ -732,6 +732,69 @@ pub enum PostHocInterceptionAction {
 pub type PostHocInterceptionFn =
     fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
 
+/// Driver-neutral inputs for the [`Capability::Spawn`] capability.
+///
+/// Replaces the previous Claude-shaped positional parameters
+/// (`settings_path`, `non_opus_auto_mode`, `permission_mode_override`) that
+/// made `spawn_invocation` impossible for another driver to implement
+/// meaningfully. Every field here is a concept that holds across backends:
+/// the resolved model/effort, an optional rendered settings/config path, the
+/// corp-laptop auto-permissions override, and an optional forced permission
+/// mode.
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnRequest<'a> {
+    /// Resolved model slug (e.g. `"opus"`, `"sonnet"`).
+    pub model: &'a str,
+    /// Driver-specific effort knob value, resolved from the driver's
+    /// [`ModelMenu`]. `None` when the row carries no effort level.
+    pub effort: Option<&'a str>,
+    /// Absolute path to the driver's rendered settings/config file, when the
+    /// spawn flow has one to pass (e.g. Claude's `--settings`). `None` for
+    /// spawns that carry no settings path.
+    pub settings_path: Option<&'a Path>,
+    /// Corp-laptop override: force `--permission-mode auto` for non-Opus
+    /// models too, instead of the default `--dangerously-skip-permissions`.
+    pub non_opus_auto_mode: bool,
+    /// Forces a specific permission mode (e.g. `"dontAsk"` for the
+    /// capability-restricted answer agent), suppressing the model-derived
+    /// choice. `None` keeps the default per-model behaviour.
+    pub permission_mode_override: Option<&'a str>,
+}
+
+/// One environment adjustment a [`SpawnPlan`] applies to the worker pane
+/// shell before its `command` runs.
+///
+/// A plain `Vec<(String, String)>` of sets cannot express Claude's
+/// requirement to *unset* `ANTHROPIC_API_KEY` (so the worker authenticates
+/// via OAuth credentials instead of a stray API key inherited from the
+/// user's shell profile) — hence the two-variant shape instead of bare pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvDirective {
+    /// `export <0>=<1>` in the pane shell before `command` runs.
+    Set(String, String),
+    /// `unset <0>` in the pane shell before `command` runs.
+    Unset(String),
+}
+
+/// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
+/// the environment adjustments and command line the spawn flow applies to
+/// the worker pane, verbatim and in order.
+///
+/// Replaces the previous bare `String` return. A driver now owns both its
+/// command line and any environment requirements (e.g. Claude's unset
+/// `ANTHROPIC_API_KEY`, a future Codex driver's exported `CODEX_HOME`)
+/// instead of the engine hardcoding driver-specific env manipulation
+/// alongside a driver-opaque command string.
+#[derive(Debug, Clone, Default)]
+pub struct SpawnPlan {
+    /// Environment adjustments to apply in the pane shell, in order, before
+    /// `command` runs.
+    pub env: Vec<EnvDirective>,
+    /// The command line to run after `env` has been applied (e.g.
+    /// `claude --model … "$(cat …)"\n`).
+    pub command: String,
+}
+
 /// An agent driver: the abstraction layer between Boss and a coding-agent CLI.
 ///
 /// A driver declares its [`CapabilitySet`] and implements the behavioural
@@ -749,23 +812,17 @@ pub trait AgentDriver: Send + Sync {
 
     // ── Spawn capability ────────────────────────────────────────────────────
 
-    /// Build the worker invocation string written into the pane as the
-    /// spawn command. Replaces `boss_engine::effort::SpawnConfig::claude_invocation`
-    /// for the Claude driver.
+    /// Build the [`SpawnPlan`] — environment adjustments plus the command
+    /// line — written into the pane as the spawn command. Replaces
+    /// `boss_engine::effort::SpawnConfig::claude_invocation` for the Claude
+    /// driver.
     ///
-    /// `permission_mode_override`, when `Some`, forces `--permission-mode
-    /// <mode>` and suppresses the model-derived `auto` /
+    /// `request.permission_mode_override`, when `Some`, forces
+    /// `--permission-mode <mode>` and suppresses the model-derived `auto` /
     /// `--dangerously-skip-permissions` choice. Used by the capability-restricted
     /// answer agent to guarantee `dontAsk` (deny-by-default allowlist), which
     /// must not be downgradable. `None` keeps the default per-model behaviour.
-    fn spawn_invocation(
-        &self,
-        model: &str,
-        effort: Option<&str>,
-        settings_path: Option<&Path>,
-        non_opus_auto_mode: bool,
-        permission_mode_override: Option<&str>,
-    ) -> String;
+    fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan;
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
@@ -975,8 +1032,8 @@ pub mod test_support {
 
     use super::{
         AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, PostHocInterceptionFn,
-        ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
-        ToolUseInterceptionWiring, WorkerErrorClass,
+        ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest,
+        ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
     };
 
     /// Configurable [`AgentDriver`] stub. Every method beyond
@@ -1023,7 +1080,7 @@ pub mod test_support {
         fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
             self.post_hoc_interception_fn
         }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+        fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
             unimplemented!()
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {

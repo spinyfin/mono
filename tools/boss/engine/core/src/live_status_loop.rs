@@ -1106,7 +1106,8 @@ mod tests {
 
     use crate::driver::{
         CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress,
-        ProgressObservationConfig, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+        ProgressObservationConfig, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+        WorkerErrorClass,
     };
     use async_trait::async_trait;
     use boss_engine_structured_output::StructuredOutputKind;
@@ -1135,7 +1136,7 @@ mod tests {
         fn capabilities(&self) -> CapabilitySet {
             unimplemented!()
         }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+        fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
             unimplemented!()
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
