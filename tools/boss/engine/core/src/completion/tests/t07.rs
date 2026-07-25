@@ -213,7 +213,7 @@ async fn assert_sweep_reaps_nothing(
     context: &str,
 ) {
     let sweep_cube = SweepCubeClient;
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = std::collections::HashMap::new();
     for pass in 1..=3 {
         let outcome = terminal_work_sweep::run_one_pass(
             db.as_ref(),
@@ -223,6 +223,7 @@ async fn assert_sweep_reaps_nothing(
             sink.as_ref(),
             teardown_registry,
             &mut seen,
+            terminal_work_sweep::DEFAULT_INTERVAL,
         )
         .await;
         assert_eq!(
