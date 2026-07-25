@@ -8,3 +8,9 @@ workspace = "../../../.."
 bon = { workspace = true }
 boss-engine-driver = { path = "../driver" }
 boss-protocol = { path = "../../protocol" }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+boss-engine-structured-output = { path = "../structured-output" }
+serde_json = { workspace = true }

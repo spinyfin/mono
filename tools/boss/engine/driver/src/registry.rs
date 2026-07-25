@@ -26,6 +26,18 @@ impl Default for DriverRegistry {
 }
 
 impl DriverRegistry {
+    /// Register (or replace) the driver for `slug`. Chainable builder method.
+    ///
+    /// Production code uses this to add future built-in drivers
+    /// (`CopilotDriver`, `CodexDriver`) alongside the ones `Default`
+    /// constructs; tests use it to register a stub driver so multi-driver
+    /// resolution (e.g. `boss_engine_effort::menu_for_driver`) can be
+    /// exercised without a second real driver implementation.
+    pub fn with_driver(mut self, slug: &'static str, driver: Arc<dyn AgentDriver>) -> Self {
+        self.drivers.insert(slug, driver);
+        self
+    }
+
     /// Return the driver for `slug`, or `None` if the slug is unrecognised.
     pub fn get(&self, slug: &str) -> Option<&Arc<dyn AgentDriver>> {
         self.drivers.get(slug)

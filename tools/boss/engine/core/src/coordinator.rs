@@ -6690,7 +6690,7 @@ impl ExecutionCoordinator {
                 if let Some(spawn) = spawn_config_for_event {
                     details["spawn_config"] = serde_json::json!({
                         "effort_level": spawn.effort_level.map(|level| level.as_str()),
-                        "claude_effort": spawn.claude_effort,
+                        "effort_value": spawn.effort_value,
                         "model": spawn.model,
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
                     });
@@ -9889,7 +9889,7 @@ mod tests {
             slot_id: Some(1),
             spawn_config: Some(crate::effort::SpawnConfig {
                 effort_level: Some(crate::work::EffortLevel::Trivial),
-                claude_effort: Some("low"),
+                effort_value: Some("low"),
                 model: "sonnet".to_owned(),
                 driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
@@ -9917,7 +9917,7 @@ mod tests {
             )
         });
         assert_eq!(spawn["effort_level"], "trivial");
-        assert_eq!(spawn["claude_effort"], "low");
+        assert_eq!(spawn["effort_value"], "low");
         assert_eq!(spawn["model"], "sonnet");
         assert_eq!(spawn["prompt_addendum_applied"], false);
     }

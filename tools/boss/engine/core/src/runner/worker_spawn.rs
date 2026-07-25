@@ -622,7 +622,8 @@ pub(crate) async fn compose_worker_spawn(
         row_driver.as_deref(),
         product_default_driver.as_deref(),
         work_item_kind,
-    );
+    )
+    .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
 
     // Capability gate: fail closed before the pane spawns when the resolved
     // driver cannot satisfy the work-item kind's requirements. Products and
