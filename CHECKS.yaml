@@ -191,14 +191,14 @@ checks:
       changed_lines_only: true
     exclude:
       # This file's own tests exercise `BOSS_ID_RE` against literal
-      # `T<n>`/`P<n>` fixture strings (e.g. "T339", "T5Config", "T100") as
-      # its entire purpose — new test cases necessarily add more of them.
+      # id-shaped and near-miss fixture strings as their entire purpose —
+      # new test cases necessarily add more of them.
       - "tools/boss/engine/core/src/boss_construct_scan.rs"
     config:
       surfaces:
         - files
       patterns:
-        - name: boss-work-item-id
+        - name: boss-work-item-id-floored
           pattern: '\b[TP]\d{3,}\b'
           message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in source. Remove the reference; if provenance is genuinely needed, put it in the PR description instead."
           severity: warning
