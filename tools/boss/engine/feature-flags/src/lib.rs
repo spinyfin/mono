@@ -95,9 +95,9 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     FeatureFlagSpec {
         name: "editorial_controls",
         description: "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
-             [editorial-rules] block into worker prompts (T945), and gates the PreToolUse \
+             [editorial-rules] block into worker prompts, and gates the PreToolUse \
              editorial evaluation path so `editorial_actions` audit rows are only written when \
-             this flag is on (T946/T947). Does NOT block or enforce anything — no PreToolUse \
+             this flag is on. Does NOT block or enforce anything — no PreToolUse \
              hook currently blocks a gh pr|issue call, so a deny verdict is advisory only; \
              building that enforcement is separate, deferred work. With the flag off there is \
              no editorial telemetry at all. DEFAULT OFF — set to true to opt in. Kill switch: \

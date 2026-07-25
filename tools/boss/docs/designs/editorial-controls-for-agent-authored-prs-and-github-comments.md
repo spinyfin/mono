@@ -1080,6 +1080,8 @@ Scope added during implementation (not in the original chore list):
 - **macOS Editorial Controls sheet** (PR #1397) — Rules editor +
   Recent Actions audit tab.
 - **macOS Test tab + `EvaluateEditorialRules` RPC** (PR #1403).
+- **Flag-gating the audit path** (PR #2340) — `dispatch_editorial_on_pretooluse`
+  checks `editorial_controls` before evaluating or writing.
 
 Not yet shipped (open follow-ups, roughly in priority order):
 
@@ -1099,10 +1101,6 @@ Not yet shipped (open follow-ups, roughly in priority order):
 5. **(Optional) Sub-agent rewriter for `Advise`-tier template
    policy.** One-shot Claude call rewrites a body to fit the
    template; strictly opt-in.
-
-Shipped since the list above: **flag-gating the audit path**, to
-match PR #1113's stated contract — `dispatch_editorial_on_pretooluse`
-now checks `editorial_controls` before evaluating or writing.
 
 ---
 
