@@ -538,9 +538,8 @@ mod tests {
         assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
     }
 
-    /// Wiring coverage for `finalize_gone_execution` (finding: the ~15
-    /// teardown call sites had no test asserting teardown was actually
-    /// invoked).
+    /// Asserts that `finalize_gone_execution` invokes driver teardown
+    /// exactly once.
     #[tokio::test]
     async fn finalize_gone_execution_tears_down_driver_workspace() {
         crate::driver_teardown::test_hooks::reset();

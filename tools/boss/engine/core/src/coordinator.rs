@@ -8201,12 +8201,12 @@ mod tests {
         assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
     }
 
-    /// Wiring coverage for `record_run_completion` (finding: teardown must
-    /// fire on the normal-completion termination path, and exactly once —
-    /// not zero times, not once per retry). Drives a `Terminal` outcome
+    /// Asserts that the normal-completion termination path invokes driver
+    /// teardown exactly once — not zero times, not once per retry — driven
     /// through the real `coordinator.kick()` pipeline (dispatch →
-    /// `run_execution` → `record_run_completion`) rather than calling the
-    /// private method directly, so this also exercises the real call site.
+    /// `run_execution` → `record_run_completion`) rather than by calling
+    /// the private method directly, so this also exercises the real call
+    /// site.
     #[tokio::test]
     async fn record_run_completion_tears_down_driver_workspace_on_terminal_outcome() {
         crate::driver_teardown::test_hooks::reset();

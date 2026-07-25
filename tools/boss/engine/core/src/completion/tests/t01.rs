@@ -1387,8 +1387,7 @@ async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
     );
 }
 
-/// Wiring coverage for `force_release` (finding: the ~15 teardown call
-/// sites had no test asserting teardown was actually invoked).
+/// Asserts that `force_release` invokes driver teardown exactly once.
 #[tokio::test]
 async fn force_release_tears_down_driver_workspace() {
     crate::driver_teardown::test_hooks::reset();
