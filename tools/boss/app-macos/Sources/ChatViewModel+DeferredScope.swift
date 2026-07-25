@@ -14,9 +14,16 @@ extension ChatViewModel {
     }
 
     /// Accept an open `deferred_scope` attention item without filing a
-    /// followup task — the popup's "Accept" button.
+    /// followup task — the popup's "Accept" button. Guards against a
+    /// duplicate tap while the request is in flight; surfaces a failure
+    /// immediately (instead of silently doing nothing) when disconnected.
     func acceptDeferredScopeAttention(id: String) {
-        guard isConnected else { return }
+        guard !deferredScopeActionInFlightIDs.contains(id) else { return }
+        guard isConnected else {
+            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            return
+        }
+        deferredScopeActionInFlightIDs.insert(id)
         engine.sendAcceptDeferredScopeAttention(id: id)
     }
 
@@ -24,7 +31,12 @@ extension ChatViewModel {
     /// the popup's "Create task" button. The new task appears via the
     /// engine's `work_invalidated` push that the conversion RPC also fires.
     func createTaskFromDeferredScopeAttention(attentionID: String) {
-        guard isConnected else { return }
+        guard !deferredScopeActionInFlightIDs.contains(attentionID) else { return }
+        guard isConnected else {
+            workErrorMessage = "Not connected to the engine — reconnect and try again."
+            return
+        }
+        deferredScopeActionInFlightIDs.insert(attentionID)
         engine.sendCreateTaskFromDeferredScopeAttention(attentionID: attentionID)
     }
 
@@ -36,10 +48,12 @@ extension ChatViewModel {
     /// `WorkAttentionItem.workItemID`), so a full merge needs the same join
     /// `list_deferred_scope_attentions` already does server-side.
     func handleDeferredScopeAttentionLivePush(_ item: WorkAttentionItem) {
-        guard item.kind == DeferredScopeAttentionPresentation.kind,
-              let productID = currentSelectedProductID,
-              isConnected
-        else { return }
+        guard item.kind == DeferredScopeAttentionPresentation.kind else { return }
+        // The request that produced this push (if any) succeeded, so the
+        // row's disabled "acting" state can clear even if the refetch below
+        // is skipped (e.g. a different product is selected).
+        deferredScopeActionInFlightIDs.remove(item.id)
+        guard let productID = currentSelectedProductID, isConnected else { return }
         engine.sendListDeferredScopeAttentions(productId: productID)
     }
 

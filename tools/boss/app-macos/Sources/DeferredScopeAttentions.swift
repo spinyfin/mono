@@ -52,6 +52,11 @@ struct DeferredScopeAttentionPresentation: Equatable {
 /// popover listing every item with per-item actions.
 struct DeferredScopeCardBadge: View {
     let items: [DeferredScopeAttention]
+    /// Attention item ids with an accept/create-task request in flight —
+    /// see `ChatViewModel.deferredScopeActionInFlightIDs`. Threaded through
+    /// as data (rather than observing the view model directly) so this row
+    /// hierarchy stays a plain, closure-driven view like its siblings.
+    let actionInFlightIDs: Set<String>
     let onAccept: (String) -> Void
     let onCreateTask: (String) -> Void
 
@@ -75,13 +80,19 @@ struct DeferredScopeCardBadge: View {
         .help(items.count == 1 ? "1 deferred scope item" : "\(items.count) deferred scope items")
         .accessibilityLabel(items.count == 1 ? "1 deferred scope item" : "\(items.count) deferred scope items")
         .popover(isPresented: $isPopoverPresented, arrowEdge: .trailing) {
-            DeferredScopePopover(items: items, onAccept: onAccept, onCreateTask: onCreateTask)
+            DeferredScopePopover(
+                items: items,
+                actionInFlightIDs: actionInFlightIDs,
+                onAccept: onAccept,
+                onCreateTask: onCreateTask
+            )
         }
     }
 }
 
 struct DeferredScopePopover: View {
     let items: [DeferredScopeAttention]
+    let actionInFlightIDs: Set<String>
     let onAccept: (String) -> Void
     let onCreateTask: (String) -> Void
 
@@ -91,43 +102,59 @@ struct DeferredScopePopover: View {
                 .font(.headline)
                 .padding(.horizontal, 16)
                 .padding(.top, 14)
-                .padding(.bottom, 10)
+                .padding(.bottom, 16)
 
             Divider()
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     ForEach(items) { entry in
-                        DeferredScopeAttentionRow(entry: entry, onAccept: onAccept, onCreateTask: onCreateTask)
+                        DeferredScopeAttentionRow(
+                            entry: entry,
+                            isActing: actionInFlightIDs.contains(entry.item.id),
+                            onAccept: onAccept,
+                            onCreateTask: onCreateTask
+                        )
                         if entry.id != items.last?.id {
                             Divider()
                         }
                     }
                 }
-                .padding(16)
+                .padding(.leading, 16)
+                .padding(.trailing, 22)
+                .padding(.vertical, 16)
             }
-            .frame(minWidth: 340, maxWidth: 420, minHeight: 80, maxHeight: 440)
+            .scrollIndicators(.automatic)
         }
+        .frame(minWidth: 340, maxWidth: 420, minHeight: 80, maxHeight: 440)
     }
 }
 
 struct DeferredScopeAttentionRow: View {
+    /// Icon column width + icon-to-text spacing below, kept as one constant
+    /// so the hanging indent on the rationale and button row can't drift
+    /// out of sync with the icon if either changes.
+    private enum Layout {
+        static let iconWidth: CGFloat = 16
+        static let iconTextSpacing: CGFloat = 8
+        static let hangingIndent: CGFloat = iconWidth + iconTextSpacing
+    }
+
     let entry: DeferredScopeAttention
+    let isActing: Bool
     let onAccept: (String) -> Void
     let onCreateTask: (String) -> Void
-
-    @State private var isActing = false
 
     private var presentation: DeferredScopeAttentionPresentation? {
         DeferredScopeAttentionPresentation.forItem(entry.item)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .top, spacing: 8) {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .top, spacing: Layout.iconTextSpacing) {
                 Image(systemName: "scissors")
                     .foregroundStyle(.blue)
-                    .frame(width: 16)
+                    .frame(width: Layout.iconWidth)
                 Text(presentation?.summary ?? entry.item.title)
                     .font(.subheadline.weight(.medium))
                     .fixedSize(horizontal: false, vertical: true)
@@ -137,24 +164,24 @@ struct DeferredScopeAttentionRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                    .padding(.leading, 24)
+                    .padding(.leading, Layout.hangingIndent)
+                    .padding(.top, 4)
             }
             HStack(spacing: 8) {
                 Button("Create task") {
-                    isActing = true
                     onCreateTask(entry.item.id)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 Button("Accept") {
-                    isActing = true
                     onAccept(entry.item.id)
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
             }
             .disabled(isActing)
-            .padding(.leading, 24)
+            .padding(.leading, Layout.hangingIndent)
+            .padding(.top, 10)
         }
     }
 }

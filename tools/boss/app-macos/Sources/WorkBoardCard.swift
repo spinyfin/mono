@@ -260,6 +260,7 @@ struct WorkBoardCardItem: View {
                         ? { model.mergeWhenReady(for: task) }
                         : nil,
                     deferredScopeItems: column == .review ? model.deferredScopeAttentions(forWorkItemID: task.id) : [],
+                    deferredScopeActionInFlightIDs: model.deferredScopeActionInFlightIDs,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in model.createTaskFromDeferredScopeAttention(attentionID: id) }
                 )
@@ -622,6 +623,9 @@ struct WorkBoardCardView: View {
     /// Empty hides the badge entirely — callers only populate this for
     /// Review-lane cards (mirrors `ciRequiredState`'s column gate above).
     var deferredScopeItems: [DeferredScopeAttention] = []
+    /// Attention item ids with an accept/create-task request currently in
+    /// flight — see `ChatViewModel.deferredScopeActionInFlightIDs`.
+    var deferredScopeActionInFlightIDs: Set<String> = []
     /// Invoked with an attention item id when the popup's "Accept" button
     /// is tapped. `nil` when `deferredScopeItems` is always empty for this
     /// card kind.
@@ -855,6 +859,7 @@ struct WorkBoardCardView: View {
                     if !deferredScopeItems.isEmpty {
                         DeferredScopeCardBadge(
                             items: deferredScopeItems,
+                            actionInFlightIDs: deferredScopeActionInFlightIDs,
                             onAccept: { onAcceptDeferredScope?($0) },
                             onCreateTask: { onCreateTaskFromDeferredScope?($0) }
                         )

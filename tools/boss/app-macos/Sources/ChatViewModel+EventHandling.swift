@@ -151,6 +151,7 @@ extension ChatViewModel {
             openingLiveWorkspaceTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
+            deferredScopeActionInFlightIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
