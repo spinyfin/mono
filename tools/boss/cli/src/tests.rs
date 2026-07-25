@@ -109,6 +109,76 @@ fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
     );
 }
 
+#[test]
+fn cancelled_tasks_hidden_from_list_by_default_but_shown_on_request() {
+    let cancelled = Task::builder()
+        .id("task_cancelled")
+        .product_id("prod_1")
+        .kind(TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(TaskStatus::Cancelled)
+        .created_at("")
+        .updated_at("")
+        .build();
+    let live = Task::builder()
+        .id("task_live")
+        .product_id("prod_1")
+        .kind(TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(TaskStatus::Todo)
+        .created_at("")
+        .updated_at("")
+        .build();
+
+    // Default view: cancelled is hidden, live rows still show.
+    let visible = apply_task_list_filters(
+        vec![cancelled.clone(), live.clone()],
+        TaskListCriteria::builder()
+            .statuses(&[])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(false)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["task_live"]);
+
+    // `--include-archived` surfaces it alongside everything else.
+    let visible = apply_task_list_filters(
+        vec![cancelled.clone(), live.clone()],
+        TaskListCriteria::builder()
+            .statuses(&[])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(true)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(visible.len(), 2);
+
+    // An explicit `--status cancelled` filter also surfaces it, without
+    // needing `--include-archived` too.
+    let visible = apply_task_list_filters(
+        vec![cancelled, live],
+        TaskListCriteria::builder()
+            .statuses(&[TaskStatusArg::Cancelled])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(false)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(
+        visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["task_cancelled"]
+    );
+}
+
 /// Filter-test row: `dummy_task` with the fields the list filters
 /// actually read dialled in. Everything else keeps the
 /// `dummy_task` defaults.
