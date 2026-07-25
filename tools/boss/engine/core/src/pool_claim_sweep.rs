@@ -77,12 +77,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_event_bus::Event;
-
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::sweep_loop::SweepOutcome as _;
 use crate::work::WorkDb;
 
 /// How often the pool-claim reconciler runs. 60s mirrors the dead-pid
@@ -164,65 +161,29 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     interval: Duration,
-    mut execution_terminal_events: boss_event_bus::Subscription,
+    execution_terminal_events: boss_event_bus::Subscription,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut events_closed = false;
-        loop {
-            let outcome = run_one_pass(
-                work_db.as_ref(),
-                live_states.as_ref(),
-                coordinator.clone(),
-                dispatch_events.as_ref(),
-            )
-            .await;
-            if outcome.has_activity() {
-                outcome.log();
+    crate::sweep_loop::spawn_sweep_loop_with_events(
+        interval,
+        EVENT_QUIESCE,
+        execution_terminal_events,
+        "pool-claim sweep",
+        move || {
+            let work_db = Arc::clone(&work_db);
+            let live_states = Arc::clone(&live_states);
+            let coordinator = coordinator.clone();
+            let dispatch_events = Arc::clone(&dispatch_events);
+            async move {
+                run_one_pass(
+                    work_db.as_ref(),
+                    live_states.as_ref(),
+                    coordinator,
+                    dispatch_events.as_ref(),
+                )
+                .await
             }
-
-            let last_run_at = tokio::time::Instant::now();
-            'wait: loop {
-                let remaining = interval.saturating_sub(last_run_at.elapsed());
-                tokio::select! {
-                    _ = tokio::time::sleep(remaining) => break 'wait,
-                    event = execution_terminal_events.recv(), if !events_closed => {
-                        match event {
-                            Some(Event::ExecutionTerminal { execution_id, .. }) => {
-                                let since_last = last_run_at.elapsed();
-                                if since_last >= EVENT_QUIESCE {
-                                    tracing::debug!(
-                                        execution_id,
-                                        since_last_ms = since_last.as_millis(),
-                                        "pool-claim sweep: ExecutionTerminal received, running an immediate pass",
-                                    );
-                                    break 'wait;
-                                }
-                                tracing::debug!(
-                                    execution_id,
-                                    since_last_ms = since_last.as_millis(),
-                                    quiesce_ms = EVENT_QUIESCE.as_millis(),
-                                    "pool-claim sweep: ExecutionTerminal within quiesce window, absorbing",
-                                );
-                            }
-                            Some(_) => {
-                                tracing::warn!(
-                                    "pool-claim sweep: execution_terminal_events subscription received an \
-                                     unexpected event kind (the subscribing filter should have excluded it)",
-                                );
-                            }
-                            None => {
-                                events_closed = true;
-                                tracing::warn!(
-                                    "pool-claim sweep: execution_terminal_events subscription closed \
-                                     (event bus dropped) — the periodic sweep remains the backstop",
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    })
+        },
+    )
 }
 
 /// Run a single pool-claim reconciliation pass over both pools. Returns
