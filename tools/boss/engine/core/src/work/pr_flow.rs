@@ -1026,8 +1026,13 @@ impl WorkDb {
         // PR that stays CONFLICTING for an extended period). Without this,
         // pr_state_polled_at freezes the moment the state stabilises, making it
         // impossible to distinguish a frozen poller from an actively-polling one.
+        // `pr_status_observed_at` is stamped alongside it here (the poller
+        // side of that column's two writers — see
+        // `set_pr_status_observation` for the worker-refresh side); unlike
+        // `pr_state_polled_at`, it is not exclusively a poller liveness
+        // signal, so a worker refresh is allowed to advance it too.
         tx.execute(
-            "UPDATE tasks SET pr_state_polled_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            "UPDATE tasks SET pr_state_polled_at = ?2, pr_status_observed_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
         // Only write state columns (and count as changed) when CI, review,
@@ -1092,7 +1097,7 @@ impl WorkDb {
     pub fn get_pr_status_snapshot(&self, work_item_id: &str) -> Result<Option<PrStatusSnapshot>> {
         let conn = self.connect()?;
         conn.query_row(
-            "SELECT pr_url, pr_mergeable_state, pr_merge_state_status, pr_head_sha, pr_state_polled_at
+            "SELECT pr_url, pr_mergeable_state, pr_merge_state_status, pr_head_sha, pr_status_observed_at
              FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id],
             |row| {
@@ -1113,11 +1118,21 @@ impl WorkDb {
     /// a live `MergeProbe::probe` result, bypassing the CI/review/merge-queue
     /// bookkeeping [`Self::update_task_pr_poll_state`] otherwise couples to
     /// the same write — a refresh is a single bounded on-demand mergeability
-    /// check, not a full sweep pass. Always writes (no changed-guard): a
-    /// caller that paid for a live `gh` round trip wants the row to reflect
-    /// it unconditionally. Stamps `pr_state_polled_at` to `observed_at` so
-    /// the next unrefreshed `boss pr status` sees the same timestamp this
-    /// call returns.
+    /// check, not a full sweep pass. Always writes `pr_mergeable_state` and
+    /// `pr_status_observed_at` (no changed-guard): a caller that paid for a
+    /// live `gh` round trip wants the row to reflect it unconditionally.
+    /// `merge_state_status` / `head_sha` are `COALESCE`d against the stored
+    /// value instead of overwritten outright — the probe that reaches this
+    /// call is always `Open` (callers must gate on `PrLifecycleState::Open`
+    /// before calling), but GitHub can still omit either individual field on
+    /// a given response, and a missing field must not blank a previously
+    /// known-good one.
+    ///
+    /// Deliberately does NOT touch `pr_state_polled_at` — that column stays
+    /// the merge poller's own liveness diagnostic (see
+    /// `update_task_pr_poll_state`'s doc comment); a worker refresh advancing
+    /// it would make a wedged poller look alive. `pr_status_observed_at` is
+    /// the shared "last observed by anyone" timestamp both writers stamp.
     pub fn set_pr_status_observation(
         &self,
         work_item_id: &str,
@@ -1130,9 +1145,9 @@ impl WorkDb {
         conn.execute(
             "UPDATE tasks
              SET pr_mergeable_state    = ?2,
-                 pr_merge_state_status = ?3,
-                 pr_head_sha           = ?4,
-                 pr_state_polled_at    = ?5
+                 pr_merge_state_status = COALESCE(?3, pr_merge_state_status),
+                 pr_head_sha           = COALESCE(?4, pr_head_sha),
+                 pr_status_observed_at = ?5
              WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, mergeable_state, merge_state_status, head_sha, observed_at],
         )?;

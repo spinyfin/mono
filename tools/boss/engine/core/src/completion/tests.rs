@@ -108,6 +108,9 @@ struct StubBranchVerifier {
     /// never accidentally trigger a skip.
     diff_line_count_result: Mutex<Result<u64, String>>,
     body_result: Mutex<Result<String, String>>,
+    /// Title returned by `fetch_pr_title`. Defaults to empty, same as
+    /// `body_result` — tests that care override via `set_title`.
+    title_result: Mutex<Result<String, String>>,
 }
 
 impl StubBranchVerifier {
@@ -123,6 +126,7 @@ impl StubBranchVerifier {
             head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
             diff_line_count_result: Mutex::new(Ok(999)),
             body_result: Mutex::new(Ok(String::new())),
+            title_result: Mutex::new(Ok(String::new())),
         })
     }
 
@@ -157,6 +161,7 @@ impl StubBranchVerifier {
             head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
             diff_line_count_result: Mutex::new(Ok(999)),
             body_result: Mutex::new(Ok(String::new())),
+            title_result: Mutex::new(Ok(String::new())),
         })
     }
 }
@@ -190,6 +195,14 @@ impl BranchVerifier for StubBranchVerifier {
         let guard = self.body_result.lock().await;
         match &*guard {
             Ok(body) => Ok(body.clone()),
+            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_pr_title(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        let guard = self.title_result.lock().await;
+        match &*guard {
+            Ok(title) => Ok(title.clone()),
             Err(msg) => Err(anyhow::anyhow!(msg.clone())),
         }
     }

@@ -277,11 +277,15 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            invocation on a timeout but the push had actually landed), it\n\
            returns that PR's URL instead of erroring. Use `cube pr update`\n\
            only when you have new commits to push onto an already-open PR;\n\
-           it errors if none does. Check first with `boss context` (its\n\
-           `task.pr_url` field, or `PR URL:` in the default text output) —\n\
-           it is one local round trip against the engine, not GitHub. Fall\n\
-           back to `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
-           or `gh pr view` only if `boss context` is unreachable.\n\
+           it errors if none does. Check first with `boss pr status` — one\n\
+           local round trip against the engine, not GitHub. Do NOT rely on\n\
+           `boss context`'s `task.pr_url` field for this: it is NULL for a\n\
+           revision task by design (a revision never owns its own PR — the\n\
+           chain root does), so an empty `task.pr_url` does NOT mean \"no\n\
+           PR exists\" when you're a revision worker. `boss pr status`\n\
+           resolves your actually-bound PR correctly either way. Fall back\n\
+           to `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
+           or `gh pr view` only if the engine is unreachable.\n\
          - Do not hard-wrap PR bodies.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
@@ -297,11 +301,14 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          These read your own PR only — never another run's — and cost one\n\
          local round trip against the engine, not a GitHub API call:\n\
          \n\
-         - `boss context` — your own task, including `pr_url`. Cheapest way\n\
-           to answer \"do I already have a PR?\" before deciding between\n\
-           `cube pr create` and `cube pr update`.\n\
-         - `boss pr status` — `mergeable`, `merge_state_status`, `head_sha`,\n\
-           and `observed_at` for your own PR, e.g.:\n\
+         - `boss pr status` — includes your resolved `pr_url`, the\n\
+           cheapest way to answer \"do I already have a PR?\" before\n\
+           deciding between `cube pr create` and `cube pr update`. Prefer\n\
+           this over `boss context`'s `task.pr_url` field: that field is\n\
+           NULL for a revision task by design (the chain root owns the PR,\n\
+           not the revision), so it reads as \"no PR\" even when one exists.\n\
+           `boss pr status` also returns `mergeable`, `merge_state_status`,\n\
+           `head_sha`, and `observed_at` for your own PR, e.g.:\n\
            ```sh\n\
            boss pr status --json\n\
            ```\n\
@@ -322,12 +329,13 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            change: the engine's own merge poller is what watches your PR to\n\
            green after you push, not you — the same \"do not babysit CI\"\n\
            principle your task prompt states applies here too.\n\
-         - `boss pr body` — the PR body/description Boss snapshotted when\n\
-           this run started, for a read-modify-write of the description\n\
-           without a `gh pr view` round trip. If the response's `body` is\n\
-           null (`--json`) or says \"(none stored)\" (text), it means this\n\
-           run began a brand-new PR flow — there is nothing to diff against\n\
-           yet, you are about to write the first description via `cube pr\n\
+         - `boss pr body` — the PR title and body/description Boss\n\
+           snapshotted when this run started, for a read-modify-write of\n\
+           the description without a `gh pr view` round trip. If the\n\
+           response's `body` is null (`--json`) or says \"(none stored)\"\n\
+           (text), it means this run began a brand-new PR flow — there is\n\
+           nothing to diff against yet, you are about to write the first\n\
+           description via `cube pr\n\
            create --body-file`. It does NOT mean the PR has an empty\n\
            description; an intentionally empty one is stored as `\"\"`, not\n\
            null. Only fall back to `gh pr view --json body` if you must\n\

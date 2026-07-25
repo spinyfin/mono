@@ -634,6 +634,10 @@ impl WorkDb {
         // merge poller's probe already fetches every sweep but previously
         // discarded. Backs `boss pr status` — see migration doc comment.
         migrate_tasks_pr_status_columns(conn)?;
+        // `work_executions.pr_title_before`: PR title snapshot alongside the
+        // existing `pr_body_before`. Backs `boss pr body` returning title
+        // and body together.
+        migrate_work_executions_pr_title_before(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

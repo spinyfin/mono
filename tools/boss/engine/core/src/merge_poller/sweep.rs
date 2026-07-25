@@ -1380,7 +1380,7 @@ pub(crate) fn ci_state_str(ci: &OpenPrCiStatus) -> &'static str {
 }
 
 /// Derive the `pr_mergeable_state` string from a probe's raw GitHub
-/// mergeability (T3271 / mono#2303). This is the *only* signal that reflects
+/// mergeability (mono#2303). This is the *only* signal that reflects
 /// whether the PR's head actually merges cleanly into its base — CI status
 /// and merge-queue/auto-merge arming are both silent on that question, so a
 /// client must not infer mergeability from either of them.

@@ -19,6 +19,19 @@ impl WorkDb {
             .and_then(|t| t.pr_url)
             .filter(|u| !u.is_empty())
     }
+
+    /// For a `revision` task, walk the parent chain to the chain root and
+    /// return the chain root task's id — the row the merge poller actually
+    /// reads/writes `pr_mergeable_state` / `pr_merge_state_status` /
+    /// `pr_head_sha` / `pr_state_polled_at` for, since only the chain root
+    /// carries a bound `pr_url`. Used by `app::pr_status` so a revision
+    /// worker's `boss pr status`/`--refresh` reads and persists against the
+    /// same row the poller sweeps, instead of the revision task's own row
+    /// (which never has PR-state columns populated).
+    pub(crate) fn get_revision_chain_root_task_id(&self, task_id: &str) -> Option<String> {
+        let conn = self.connect().ok()?;
+        get_chain_root_task(&conn, task_id).ok().flatten().map(|t| t.id)
+    }
 }
 
 /// Return the id of the most-recently-created non-done revision that is a

@@ -171,6 +171,35 @@ impl WorkerCompletionHandler {
                 );
             }
         }
+
+        // Also snapshot the PR title, same baseline moment as the body —
+        // `boss pr body` returns both for a worker's read-modify-write on
+        // the description. Best-effort, independent of the body snapshot.
+        match self.branch_verifier.fetch_pr_title(&repo_slug, pr_number).await {
+            Ok(title) => {
+                if let Err(err) = self.work_db.set_execution_pr_title_before(execution_id, &title) {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "execution_started hook: failed to persist pr_title_before"
+                    );
+                } else {
+                    tracing::debug!(
+                        execution_id,
+                        bound_pr_url = %bound_pr_url,
+                        "execution_started hook: snapshotted pr_title_before"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url = %bound_pr_url,
+                    ?err,
+                    "execution_started hook: fetch PR title failed; skipping pr_title_before snapshot"
+                );
+            }
+        }
     }
 
     /// Result of [`Self::try_retire_cleared_blocking_signal`]. `NotRetired`

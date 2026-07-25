@@ -553,6 +553,11 @@ pub trait BranchVerifier: Send + Sync {
     /// the only evidence the worker contributed. An empty body is a
     /// valid value (not an error), unlike the head-ref fetches.
     async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns the title of PR `pr_number` in `repo_slug`. Snapshotted
+    /// alongside `fetch_pr_body` at execution start so `boss pr body` can
+    /// return both without a worker needing a second `gh pr view` call.
+    async fn fetch_pr_title(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -581,6 +586,10 @@ impl BranchVerifier for CommandBranchVerifier {
 
     async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
         fetch_pr_body_cmd(repo_slug, pr_number).await
+    }
+
+    async fn fetch_pr_title(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        fetch_pr_title_cmd(repo_slug, pr_number).await
     }
 }
 
@@ -615,6 +624,19 @@ async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
             "pr", "view", &pr_str, "-R", repo_slug, "--json", "body", "--jq", ".body",
         ],
         &format!("gh pr view {pr_number} -R {repo_slug} --json body"),
+    )
+    .await
+}
+
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title` and
+/// return the PR title. Same shape as `fetch_pr_body_cmd`, one field over.
+async fn fetch_pr_title_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
+    let pr_str = pr_number.to_string();
+    run_gh(
+        &[
+            "pr", "view", &pr_str, "-R", repo_slug, "--json", "title", "--jq", ".title",
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug} --json title"),
     )
     .await
 }

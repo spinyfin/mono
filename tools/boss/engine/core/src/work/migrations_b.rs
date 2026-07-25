@@ -974,6 +974,18 @@ pub(crate) fn migrate_tasks_pr_status_columns(conn: &Connection) -> Result<()> {
             "ALTER TABLE tasks ADD COLUMN pr_merge_state_status TEXT",
         ),
         ("pr_head_sha", "ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT"),
+        // `pr_status_observed_at`: the "last observed by anyone" timestamp
+        // `boss pr status` reports as `observed_at`, stamped by BOTH the
+        // merge poller sweep and a worker's `--refresh` call. Deliberately
+        // separate from `pr_state_polled_at`, which stays the poller's own
+        // liveness diagnostic (see `update_task_pr_poll_state`'s doc
+        // comment) — if a worker refresh could also advance
+        // `pr_state_polled_at`, a wedged poller with active worker refreshes
+        // would look alive when it isn't.
+        (
+            "pr_status_observed_at",
+            "ALTER TABLE tasks ADD COLUMN pr_status_observed_at TEXT",
+        ),
     ] {
         if !table_has_column(conn, "tasks", column)? {
             conn.execute(ddl, [])?;

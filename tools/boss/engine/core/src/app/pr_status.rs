@@ -22,14 +22,19 @@ use super::*;
 
 use boss_protocol::{PrBodyView, PrStatusView, ProposalErrorCode, ProposalSubmissionError};
 
+use crate::merge_poller::PrLifecycleState;
+
 /// Engine-wide bound on `boss pr status --refresh` probes: at most
 /// [`Self::MAX_PER_WINDOW`] live `gh pr view` calls per
-/// [`Self::WINDOW_SECS`]-second sliding window, shared across every worker
-/// in the pool. This is what stops a refresh flag from becoming a second
-/// polling loop layered on top of the merge poller's own — a worker fleet
-/// that all pass `--refresh` still cannot out-poll this cap. When the
-/// budget is exhausted, [`handle_get_pr_status`] returns the stored
-/// snapshot with `refresh_throttled: true` rather than blocking or
+/// [`Self::WINDOW_SECS`]-second **fixed** window, shared across every
+/// worker in the pool, PLUS a [`Self::PER_EXECUTION_COOLDOWN_SECS`] minimum
+/// spacing between two refreshes from the same execution. This is what
+/// stops a refresh flag from becoming a second polling loop layered on top
+/// of the merge poller's own: the per-execution cooldown stops any single
+/// worker from burning the whole engine-wide budget by looping `--refresh`
+/// itself, and the window cap bounds the fleet even if every worker plays
+/// nicely. When either limit is hit, [`handle_get_pr_status`] returns the
+/// stored snapshot with `refresh_throttled: true` rather than blocking or
 /// erroring — see that function's doc comment.
 #[derive(Default)]
 pub(super) struct PrStatusRefreshBudget {
@@ -40,28 +45,52 @@ pub(super) struct PrStatusRefreshBudget {
 struct RefreshWindow {
     window_start_secs: i64,
     count_in_window: u32,
+    /// Last refresh timestamp per execution id, for the per-execution
+    /// cooldown. Entries are never pruned: each is a few bytes and the
+    /// number of executions an engine ever sees is bounded, so a background
+    /// sweep isn't worth the complexity.
+    last_refresh_by_execution: HashMap<String, i64>,
 }
 
 impl PrStatusRefreshBudget {
+    /// Bucket width for the engine-wide cap. This is a **fixed** (tumbling)
+    /// window, not a sliding one: `now_secs` is bucketed into
+    /// `WINDOW_SECS`-second buckets and the counter resets at each bucket
+    /// boundary, so a burst straddling a boundary can in principle land up
+    /// to `2 * MAX_PER_WINDOW` probes within a short span. That looseness is
+    /// accepted for a soft, best-effort cap — the per-execution cooldown is
+    /// what actually bounds any single caller's contribution to a burst.
     const WINDOW_SECS: i64 = 60;
     /// `pub(super)`: exercised directly by `app::tests::pr_status`'s budget
     /// exhaustion test, so the test can burn exactly the real limit instead
     /// of a magic number that would silently drift from the real one.
     pub(super) const MAX_PER_WINDOW: u32 = 20;
+    /// Minimum spacing, in seconds, between two `--refresh` probes issued by
+    /// the SAME execution. `pub(super)` for the same reason as
+    /// `MAX_PER_WINDOW`.
+    pub(super) const PER_EXECUTION_COOLDOWN_SECS: i64 = 10;
 
-    /// Try to claim one refresh slot for `now_secs` (Unix epoch seconds).
-    /// Rolls the window forward and resets the count when `now_secs` has
-    /// moved past the current window; otherwise increments and admits
-    /// while under [`Self::MAX_PER_WINDOW`]. `false` means the caller
-    /// must fall back to the stored snapshot.
-    fn try_acquire(&self, now_secs: i64) -> bool {
+    /// Try to claim one refresh slot for `execution_id` at `now_secs` (Unix
+    /// epoch seconds). Checks the per-execution cooldown first (cheap, and
+    /// it must not itself consume a window slot), then the engine-wide
+    /// window. `false` means the caller must fall back to the stored
+    /// snapshot.
+    fn try_acquire(&self, execution_id: &str, now_secs: i64) -> bool {
         let mut window = self.window.lock().expect("pr status refresh budget mutex poisoned");
+        if let Some(&last) = window.last_refresh_by_execution.get(execution_id)
+            && now_secs - last < Self::PER_EXECUTION_COOLDOWN_SECS
+        {
+            return false;
+        }
         if now_secs - window.window_start_secs >= Self::WINDOW_SECS {
             window.window_start_secs = now_secs;
             window.count_in_window = 0;
         }
         if window.count_in_window < Self::MAX_PER_WINDOW {
             window.count_in_window += 1;
+            window
+                .last_refresh_by_execution
+                .insert(execution_id.to_owned(), now_secs);
             true
         } else {
             false
@@ -69,16 +98,49 @@ impl PrStatusRefreshBudget {
     }
 }
 
-/// Normalize GitHub's raw `mergeable` (`"MERGEABLE"` / `"CONFLICTING"` /
-/// `"UNKNOWN"`, case-insensitive) into Boss's stored vocabulary — the same
-/// three values [`crate::merge_poller::mergeable_state_str`] writes from
-/// the merge poller's own probe, so a `--refresh` response and a stored
-/// snapshot response are never spelled differently for the same state.
-fn normalize_mergeable(raw: &str) -> &'static str {
-    match raw.to_ascii_uppercase().as_str() {
-        "MERGEABLE" => "mergeable",
-        "CONFLICTING" => "conflicting",
-        _ => "unknown",
+/// The effective bound PR for the calling execution, and the task id whose
+/// `tasks` row carries the merge-poller-written PR-state columns
+/// (`pr_mergeable_state`, `pr_merge_state_status`, `pr_head_sha`,
+/// `pr_status_observed_at`) for it.
+///
+/// For an ordinary task/chore, the task's own bound `pr_url` answers both
+/// questions. A `revision_implementation` execution's task never owns a PR
+/// by design — `task.pr_url` is always NULL for `kind = 'revision'` — so
+/// the bound PR, and the row the merge poller actually polls, belong to the
+/// chain root instead. Mirrors the fallback chain already used by
+/// `completion::execution_started` / `completion::metadata_gate`:
+/// `task_bound_pr_url` -> `execution.pr_url` -> chain-root `pr_url`.
+/// Without this, every revision worker (the largest population of `boss pr
+/// status`/`boss pr body` callers) reads/writes a row that never has PR
+/// state on it.
+struct EffectivePr {
+    status_task_id: String,
+    pr_url: Option<String>,
+}
+
+fn resolve_effective_pr(work_db: &WorkDb, task: &Task, execution: &crate::work::WorkExecution) -> EffectivePr {
+    if let Some(url) = crate::runner::task_bound_pr_url(task) {
+        return EffectivePr {
+            status_task_id: task.id.clone(),
+            pr_url: Some(url.to_owned()),
+        };
+    }
+    if execution.kind == ExecutionKind::RevisionImplementation {
+        let pr_url = execution
+            .pr_url
+            .clone()
+            .filter(|u| !u.is_empty())
+            .or_else(|| work_db.get_revision_chain_root_pr_url(&task.id));
+        if pr_url.is_some() {
+            let status_task_id = work_db
+                .get_revision_chain_root_task_id(&task.id)
+                .unwrap_or_else(|| task.id.clone());
+            return EffectivePr { status_task_id, pr_url };
+        }
+    }
+    EffectivePr {
+        status_task_id: task.id.clone(),
+        pr_url: None,
     }
 }
 
@@ -108,12 +170,37 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
         }
     };
 
-    let snapshot = match work_db.get_pr_status_snapshot(&caller.work_item_id) {
+    let task = match own_task(&work_db, &caller.work_item_id) {
+        Ok(task) => task,
+        Err(err) => {
+            tracing::error!(work_item_id = %caller.work_item_id, ?err, "get_pr_status failed to read task");
+            return send_rejection(
+                &sink,
+                &request_id,
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read pr status: {err}")),
+            );
+        }
+    };
+    let execution = match work_db.get_execution(&caller.execution_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            tracing::error!(execution_id = %caller.execution_id, ?err, "get_pr_status failed to read execution");
+            return send_rejection(
+                &sink,
+                &request_id,
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read pr status: {err}")),
+            );
+        }
+    };
+    let effective = resolve_effective_pr(&work_db, &task, &execution);
+
+    let snapshot = match work_db.get_pr_status_snapshot(&effective.status_task_id) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             tracing::error!(
                 work_item_id = %caller.work_item_id,
-                "get_pr_status failed: attributed work item has no row",
+                status_task_id = %effective.status_task_id,
+                "get_pr_status failed: resolved status task has no row",
             );
             return send_rejection(
                 &sink,
@@ -130,15 +217,21 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
             );
         }
     };
+    // The resolved PR URL is authoritative over the status-task row's own
+    // `pr_url` column — normally identical, but the effective resolution
+    // can know about a bound PR the row hasn't caught up to yet (e.g. right
+    // after a revision's `execution.pr_url` was stamped, before the chain
+    // root row itself was touched).
+    let pr_url_for_display = effective.pr_url.clone().or_else(|| snapshot.pr_url.clone());
 
     // Nothing to refresh: no PR yet, or the caller didn't ask.
-    let Some(pr_url) = snapshot.pr_url.clone().filter(|_| refresh) else {
+    let Some(pr_url) = effective.pr_url.clone().filter(|_| refresh) else {
         return send_response(
             &sink,
             &request_id,
             FrontendEvent::PrStatusResult {
                 status: PrStatusView::builder()
-                    .maybe_pr_url(snapshot.pr_url)
+                    .maybe_pr_url(pr_url_for_display)
                     .maybe_mergeable(snapshot.mergeable)
                     .maybe_merge_state_status(snapshot.merge_state_status)
                     .maybe_head_sha(snapshot.head_sha)
@@ -149,7 +242,10 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
     };
 
     let now_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-    if !server_state.pr_status_refresh_budget.try_acquire(now_secs) {
+    if !server_state
+        .pr_status_refresh_budget
+        .try_acquire(&caller.execution_id, now_secs)
+    {
         tracing::debug!(
             work_item_id = %caller.work_item_id,
             pr_url = %pr_url,
@@ -196,14 +292,42 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
         }
     };
 
-    let mergeable = normalize_mergeable(&probe.raw_mergeable);
+    // Only a genuinely `Open` probe carries mergeability worth persisting —
+    // mirrors `merge_poller::sweep::update_pr_poll_state`'s own `Open`
+    // guard. A merged/closed/404 probe must not clobber the stored
+    // `pr_mergeable_state`/`pr_merge_state_status`/`pr_head_sha` with
+    // "unknown"/NULL: the merge poller (which keeps probing terminal PRs
+    // long enough to finalize them) is responsible for reconciling that
+    // transition, not this bounded refresh path.
+    let PrLifecycleState::Open(open) = &probe.state else {
+        tracing::debug!(
+            work_item_id = %caller.work_item_id,
+            pr_url = %pr_url,
+            "get_pr_status: refresh probe observed a non-open PR; returning stored snapshot without persisting",
+        );
+        return send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::PrStatusResult {
+                status: PrStatusView::builder()
+                    .pr_url(pr_url)
+                    .maybe_mergeable(snapshot.mergeable)
+                    .maybe_merge_state_status(snapshot.merge_state_status)
+                    .maybe_head_sha(snapshot.head_sha)
+                    .maybe_observed_at(snapshot.observed_at)
+                    .build(),
+            },
+        );
+    };
+
+    let mergeable = crate::merge_poller::mergeable_state_str(open.mergeability);
     let merge_state_status =
         (!probe.raw_merge_state_status.is_empty()).then_some(probe.raw_merge_state_status.as_str());
     let head_sha = probe.head_ref_oid.as_deref();
     use crate::work::now_string;
     let observed_at = now_string();
     if let Err(err) = work_db.set_pr_status_observation(
-        &caller.work_item_id,
+        &effective.status_task_id,
         mergeable,
         merge_state_status,
         head_sha,
@@ -270,6 +394,34 @@ pub(super) async fn handle_get_pr_body(ctx: Dispatch, req: FrontendRequest) {
             );
         }
     };
+    let execution = match work_db.get_execution(&caller.execution_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            tracing::error!(execution_id = %caller.execution_id, ?err, "get_pr_body failed to read execution");
+            return send_rejection(
+                &sink,
+                &request_id,
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read pr body: {err}")),
+            );
+        }
+    };
+    let effective = resolve_effective_pr(&work_db, &task, &execution);
+
+    let title = match work_db.get_execution_pr_title_before(&caller.execution_id) {
+        Ok(title) => title,
+        Err(err) => {
+            tracing::error!(
+                execution_id = %caller.execution_id,
+                ?err,
+                "get_pr_body failed to read execution title snapshot",
+            );
+            return send_rejection(
+                &sink,
+                &request_id,
+                ProposalSubmissionError::new(ProposalErrorCode::Internal, format!("failed to read pr body: {err}")),
+            );
+        }
+    };
 
     let body = match work_db.get_execution_pr_body_before(&caller.execution_id) {
         Ok(body) => body,
@@ -291,7 +443,11 @@ pub(super) async fn handle_get_pr_body(ctx: Dispatch, req: FrontendRequest) {
         &sink,
         &request_id,
         FrontendEvent::PrBodyResult {
-            body: PrBodyView::builder().maybe_pr_url(task.pr_url).maybe_body(body).build(),
+            body: PrBodyView::builder()
+                .maybe_pr_url(effective.pr_url)
+                .maybe_title(title)
+                .maybe_body(body)
+                .build(),
         },
     );
 }

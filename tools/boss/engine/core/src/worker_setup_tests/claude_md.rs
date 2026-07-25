@@ -254,8 +254,10 @@ fn claude_md_documents_pr_status_and_body_verbs() {
         "expected `boss pr body` to be introduced",
     );
     assert!(
-        rendered.contains("task.pr_url"),
-        "expected boss context's pr_url field to be pointed at as the cheapest PR-discovery check",
+        rendered.contains("boss pr status") && rendered.contains("NULL for a revision task"),
+        "expected `boss pr status` to be pointed at as the cheapest PR-discovery check, and \
+         `boss context`'s `task.pr_url` field to be called out as unreliable for revision \
+         workers (it is NULL by design — the chain root owns the PR, not the revision)",
     );
     // Semantics must be stated, not just the verb name: staleness and the
     // null-body case, per the design's requirement that a worker not

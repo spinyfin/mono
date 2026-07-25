@@ -70,6 +70,10 @@ pub struct PrStatusView {
 #[builder(on(String, into))]
 pub struct PrBodyView {
     pub pr_url: Option<String>,
+    /// The PR title Boss snapshotted when this execution's run started,
+    /// re-read verbatim (not edited since). Same `None` cases as `body`:
+    /// no baseline snapshot (new-PR flow) or a failed fetch at run start.
+    pub title: Option<String>,
     /// The PR body Boss snapshotted when this execution's run started,
     /// re-read verbatim (not edited since). `None` when: the execution
     /// began a brand-new PR flow (nothing to snapshot yet — you are about

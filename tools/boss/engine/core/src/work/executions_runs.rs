@@ -949,6 +949,38 @@ impl WorkDb {
         Ok(body)
     }
 
+    /// Snapshot the bound PR's title captured at run start, alongside
+    /// [`Self::set_execution_pr_body_before`] — same call site
+    /// (`execution_started`), same baseline semantics: `boss pr body`
+    /// returns both so a worker doing read-modify-write on the description
+    /// can see the title without a `gh pr view` round trip.
+    pub fn set_execution_pr_title_before(&self, execution_id: &str, title: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pr_title_before = ?2 WHERE id = ?1",
+            params![execution_id, title],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Read the PR title snapshot captured at run start, or `None` when no
+    /// snapshot was taken (new-PR flow, fetch failure, pre-migration row).
+    pub fn get_execution_pr_title_before(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT pr_title_before FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(title)
+    }
+
     /// Stamp the "metadata delta observed at a clean Stop boundary" marker
     /// for the metadata-only CI-fix finalize gate (issue #1252). Set ONLY
     /// by the on-Stop handler — never the merge poller — so it is positive

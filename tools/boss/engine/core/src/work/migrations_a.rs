@@ -87,6 +87,18 @@ pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) ->
     Ok(())
 }
 
+/// `pr_title_before`: the bound PR's title captured at the same moment as
+/// `pr_body_before` (execution start). Backs `boss pr body`, which returns
+/// both title and body so a worker doing read-modify-write on the
+/// description doesn't need a separate `gh pr view` for the title.
+/// Idempotent.
+pub(crate) fn migrate_work_executions_pr_title_before(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_title_before")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pr_title_before TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// `dispatch_wait_reason` + `dispatch_wait_since`: the dispatcher's
 /// current defer reason (`chain_serialized`, `pool_exhausted`, ...) for a
 /// `ready` execution that hasn't claimed a worker slot yet, and when that

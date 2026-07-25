@@ -111,11 +111,14 @@ async fn run_pr_body_command(ctx: &RunContext) -> Result<(), CliError> {
 }
 
 fn print_pr_body_human(body: &PrBodyView) {
-    let Some(pr_url) = &body.pr_url else {
-        println!("No PR bound to this work item yet.");
-        return;
-    };
-    println!("PR: {pr_url}");
+    match &body.pr_url {
+        Some(pr_url) => println!("PR: {pr_url}"),
+        None => println!("PR: (none bound to this work item yet)"),
+    }
+    match &body.title {
+        Some(title) => println!("Title: {title}"),
+        None => println!("Title: (none stored)"),
+    }
     match &body.body {
         Some(text) if text.is_empty() => println!("Body: (empty description)"),
         Some(text) => {
