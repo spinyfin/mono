@@ -258,16 +258,39 @@ fn checkleft_gate_exports_pr_description_to_checkleft_subprocess() {
 fn checkleft_gate_leaves_pr_description_unset_when_none() {
     // Callers with no PR body to check (cube pr update / pr push) must not
     // fabricate one — checkleft falls through to its own branch/PR-number
-    // resolution in that case.
+    // resolution in that case. Deliberately set an ambient
+    // CHECKS_PR_DESCRIPTION in cube's own process env first: `None` must
+    // actively clear it for the subprocess, not merely skip setting it —
+    // otherwise the subprocess would inherit this stale ambient value.
+    let _lock = ENV_MUTEX.lock().unwrap();
+    let prior = std::env::var("CHECKS_PR_DESCRIPTION").ok();
+    // SAFETY: ENV_MUTEX is held for the duration of this mutation and its
+    // restoration below, serializing this against every other test that
+    // touches process env.
+    unsafe {
+        std::env::set_var("CHECKS_PR_DESCRIPTION", "stale ambient value that must not leak");
+    }
+
     let dir = TempDir::new().unwrap();
     write_fake_checkleft_env_echo(dir.path());
     let checkleft = Some(dir.path().join("bin").join("checkleft"));
-    let err = run_checkleft_gate_impl(dir.path(), checkleft, None).expect_err("fake checkleft always exits 1");
+    let result = run_checkleft_gate_impl(dir.path(), checkleft, None);
+
+    // SAFETY: see above.
+    unsafe {
+        match prior {
+            Some(v) => std::env::set_var("CHECKS_PR_DESCRIPTION", v),
+            None => std::env::remove_var("CHECKS_PR_DESCRIPTION"),
+        }
+    }
+
+    let err = result.expect_err("fake checkleft always exits 1");
     let CubeError::InvalidArgument(msg) = err else {
         panic!("expected InvalidArgument, got {err:?}");
     };
     assert!(
         msg.contains("CHECKS_PR_DESCRIPTION=UNSET"),
-        "gate must not set CHECKS_PR_DESCRIPTION when no PR body was given: {msg}",
+        "gate must clear an ambient CHECKS_PR_DESCRIPTION when no PR body was given, not \
+         inherit it: {msg}",
     );
 }

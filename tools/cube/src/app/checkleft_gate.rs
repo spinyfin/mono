@@ -64,6 +64,13 @@ pub(super) fn run_checkleft_gate_impl(
     command.arg("run").current_dir(cwd).stdin(std::process::Stdio::null());
     if let Some(pr_description) = pr_description {
         command.env("CHECKS_PR_DESCRIPTION", pr_description);
+    } else {
+        // Explicitly clear rather than merely not-setting: without this, the
+        // subprocess would inherit whatever CHECKS_PR_DESCRIPTION happens to
+        // be set in cube's own environment (e.g. left over from a wrapper or
+        // an earlier step), silently overriding checkleft's own branch->PR
+        // lookup instead of falling through to it as documented.
+        command.env_remove("CHECKS_PR_DESCRIPTION");
     }
     let output = command.output();
     let output = match output {

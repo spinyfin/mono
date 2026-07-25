@@ -227,21 +227,32 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
 /// stdin/a pipe can only be read once, and (2) the checkleft push-gate needs
 /// the same text the PR is about to be created with, checked *before* the
 /// push, not re-read afterward.
-struct ResolvedPrBody {
+pub(super) struct ResolvedPrBody {
     /// Full body text, for the checkleft gate. `None` when neither --body
     /// nor --body-file was supplied.
-    text: Option<String>,
+    pub(super) text: Option<String>,
     /// Concrete file path to pass to `gh pr create --body-file`, when the
     /// body came from --body-file (already materialised if it was a
     /// stdin/pipe source — see [`resolve_body_file`]).
-    file_path: Option<String>,
-    /// Temp file created to materialise a piped body source, if any. The
-    /// caller must delete it after the `gh` subprocess exits.
+    pub(super) file_path: Option<String>,
+    /// Temp file created to materialise a piped body source, if any. Cleaned
+    /// up by `Drop` — see below — so it is removed on every exit path,
+    /// including a checkleft-gate refusal or an early return in
+    /// `ensure_pr_deprecated`'s already-exists branch, not just the
+    /// happy-path success in `gh_create_pr`.
     tmp_path: Option<PathBuf>,
 }
 
+impl Drop for ResolvedPrBody {
+    fn drop(&mut self) {
+        if let Some(p) = &self.tmp_path {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
 /// Resolve the PR body cube is about to submit from `--body`/`--body-file`.
-fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
+pub(super) fn resolve_pr_body(args: &PrCreateArgs) -> Result<ResolvedPrBody> {
     if let Some(f) = &args.body_file {
         let (resolved, tmp) = resolve_body_file(f)?;
         let text = std::fs::read_to_string(&resolved).map_err(CubeError::Io)?;
@@ -300,11 +311,6 @@ fn gh_create_pr(
             .run(&RealCommandRunner::invocation(&ctx.cwd, "gh", &create_args))
             .map_err(|e| CubeError::InvalidArgument(format!("failed to create PR: {e}")))
     })?;
-
-    // Clean up any temp file we created to materialise a piped body source.
-    if let Some(ref p) = body.tmp_path {
-        let _ = std::fs::remove_file(p);
-    }
 
     let url = create_output.trim().to_string();
     if url.is_empty() {
