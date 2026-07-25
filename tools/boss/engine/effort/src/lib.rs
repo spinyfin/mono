@@ -463,14 +463,14 @@ mod tests {
     // `DriverRegistry::with_driver` — so per-slug menu resolution is
     // exercised against more than one driver.
 
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use boss_engine_driver::{
-        Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu, ProgressFidelity,
-        ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-        WorkerErrorClass,
+        Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu, PermissionArtifacts,
+        PermissionInput, ProgressFidelity, ProgressObservationConfig, ProgressObservationWiring,
+        ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
     };
     use boss_engine_structured_output::StructuredOutputKind;
     use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -541,7 +541,7 @@ mod tests {
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn write_permission_config(&self, _: &Path) -> anyhow::Result<PathBuf> {
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
             unimplemented!()
         }
         fn progress_fidelity(&self) -> ProgressFidelity {
@@ -559,8 +559,11 @@ mod tests {
         fn agent_rules_preamble(&self) -> &'static str {
             unimplemented!()
         }
-        fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
-            raw.clone()
+        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
+            unimplemented!()
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
         }
         fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
             None
