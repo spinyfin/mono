@@ -45,11 +45,11 @@ struct DeferredScopeAttentionPresentation: Equatable {
 }
 
 /// Compact badge shown on a Review-lane kanban card with open
-/// `deferred_scope` attention items — the operator directive's "prominent
-/// in the kanban UI" affordance. A single icon+count chip (not a full
-/// label) to respect existing card row space (cf. the merge-queue badge
-/// truncation chore T2531 before adding more chrome). Clicking opens a
-/// popover listing every item with per-item actions.
+/// `deferred_scope` attention items, so they are visible without opening
+/// the card. A single icon+count chip rather than a full label, because
+/// card rows are already tight — adding wider chrome here truncates the
+/// merge-queue badge. Clicking opens a popover listing every item with
+/// per-item actions.
 struct DeferredScopeCardBadge: View {
     let items: [DeferredScopeAttention]
     /// Attention item ids with an accept/create-task request in flight —
@@ -91,6 +91,10 @@ struct DeferredScopeCardBadge: View {
 }
 
 struct DeferredScopePopover: View {
+    /// Trailing inset = the 16pt leading content inset plus ~6pt of gutter
+    /// for the macOS overlay scrollbar, so it doesn't sit on top of text.
+    private static let trailingScrollbarGutter: CGFloat = 22
+
     let items: [DeferredScopeAttention]
     let actionInFlightIDs: Set<String>
     let onAccept: (String) -> Void
@@ -121,10 +125,9 @@ struct DeferredScopePopover: View {
                     }
                 }
                 .padding(.leading, 16)
-                .padding(.trailing, 22)
+                .padding(.trailing, Self.trailingScrollbarGutter)
                 .padding(.vertical, 16)
             }
-            .scrollIndicators(.automatic)
         }
         .frame(minWidth: 340, maxWidth: 420, minHeight: 80, maxHeight: 440)
     }
@@ -182,6 +185,7 @@ struct DeferredScopeAttentionRow: View {
             .disabled(isActing)
             .padding(.leading, Layout.hangingIndent)
             .padding(.top, 10)
+            .padding(.bottom, 8)
         }
     }
 }

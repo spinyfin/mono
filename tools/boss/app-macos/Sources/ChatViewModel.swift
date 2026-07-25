@@ -92,8 +92,9 @@ final class ChatViewModel: ObservableObject {
     /// `work_error` has arrived yet. Drives the popover row's disabled
     /// "acting" state — published (unlike `mergingWhenReadyIDs`) because the
     /// row reads it directly to know when to re-enable. Cleared wholesale on
-    /// any `work_error` (see `ChatViewModel+EventHandling.swift`) so a failed
-    /// request never leaves a row stuck disabled.
+    /// any `work_error` and on `.disconnected` (see
+    /// `ChatViewModel+EventHandling.swift`) so a failed request or a dropped
+    /// connection never leaves a row stuck disabled.
     @Published var deferredScopeActionInFlightIDs: Set<String> = []
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
