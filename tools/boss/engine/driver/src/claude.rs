@@ -481,18 +481,16 @@ impl AgentDriver for ClaudeDriver {
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
         // TODO(@brianduff,2026-12-31): the settings/deny-rule rendering this
-        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`
-        // + the reviewer/triage/answer-agent rule builders and path-guard
-        // constants) still lives in `boss_engine::worker_setup` (core). It
-        // can no longer be called from here: `driver` was extracted into its
-        // own crate (main@0e2c856a1b1d) with a one-way `core -> driver`
-        // dependency, so this crate cannot depend back on core. Completing
-        // this method requires porting that rendering logic down into this
-        // crate (mirroring the `WorkspaceProvisioning` helpers already moved
-        // into this file), which is a separate migration from the interface
-        // change made here. Once implemented, this returns a single settings
-        // file in `config_files` with `extra_args`/`env` empty — behaviourally
-        // identical to the pre-`PermissionArtifacts` single-`PathBuf` return.
+        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`,
+        // the reviewer/triage/answer-agent rule builders, and the path-guard
+        // constants) lives in `boss_engine::worker_setup`. The dependency edge
+        // is one-way `core -> driver`, so this crate cannot reach it;
+        // implementing this method requires porting that rendering into this
+        // crate first (mirroring the `WorkspaceProvisioning` helpers already
+        // moved into this file). Once implemented, this returns a single
+        // settings file in `config_files` with `extra_args`/`env` empty —
+        // behaviourally identical to the pre-`PermissionArtifacts`
+        // single-`PathBuf` return.
         unimplemented!("blocked on migrating worker_setup's settings/deny-rule rendering into the driver crate")
     }
 
