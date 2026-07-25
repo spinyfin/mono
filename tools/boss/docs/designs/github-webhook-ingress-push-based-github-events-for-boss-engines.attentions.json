@@ -1,0 +1,38 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Cloudflare is recommended for the relay ($0 vs ~$15/mo, far less ops, and relay downtime degrades safely to polling), but Cloudflare's Rust path is wasm via workers-rs + wasm-bindgen, which integrates awkwardly with mono's bazel. If that friction exceeds its time-box during the deploy task, which fallback do you want taken?",
+    "choices": [
+      "Ship a TypeScript Worker, keep the wire format owned by the Rust relay_protocol crate (keeps $0 and the ops story; loses 'the service is Rust')",
+      "Move to Azure Container Apps with a plain axum Rust binary (keeps Rust end-to-end; costs ~$15/mo always-on plus a container registry and a second cloud's credentials in mono CI)",
+      "Stop and escalate rather than pick either — I want to decide with the actual friction in front of me"
+    ],
+    "anchor": "hosting-cloudflare-vs-azure"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "T3538's description currently reserves event-driving ('where GitHub can tell us (webhooks...), react to the event and drop the corresponding poll'), which this design absorbs. Should the 'Event-driving' paragraph be struck from T3538, leaving it scoped to 'scope + batch the poller' only? Retitling another active work item is not this design's call to make unilaterally.",
+    "anchor": "relationship-to-t3537-and-t3538"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "v1 is designed against a repo-level webhook on spinyfin/mono (one GitHub UI screen, one-click revocable, no App registration, no private key) with a GitHub App as a deferred follow-up that could unify with T3196's polling auth. Confirm or override?",
+    "choices": [
+      "Repo-level webhook for v1 as designed; revisit the App after Phase 1 soaks",
+      "Register the GitHub App up front and skip the repo-level webhook entirely, accepting the extra credential machinery in v1",
+      "Repo-level webhook for v1, but sequence the App migration immediately after v1 rather than leaving it deferred"
+    ],
+    "anchor": "auth-end-to-end"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Phase 2 relaxes the backstop sweep from 60s, which is the one real regression in this design: worst-case conflict-detection latency grows, because no webhook announces a PR becoming conflicted when main moves. What backstop cadence should Phase 2 target?",
+    "choices": [
+      "600s — ~200 pts/hr total (95-97% reduction), worst-case conflict detection ~10 min",
+      "300s — ~360 pts/hr total (~91% reduction), worst-case conflict detection ~5 min",
+      "Keep 60s permanently — v1's ~1,600 pts/hr (59-77% reduction) is enough; do not trade any conflict-detection latency",
+      "Relax the general sweep to 600s but keep a cheap mergeability-only probe at 60s (more implementation work; needs its own task)"
+    ],
+    "anchor": "cutover"
+  }
+]
