@@ -1756,6 +1756,31 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Same as [`Self::insert_terminal_execution_for_test`] but stamps
+    /// `kind = 'pr_review'` — used to test [`crate::pr_review_recovery`]'s
+    /// kind-scoped churn guard, which must only count terminal `pr_review`
+    /// executions, not the unrelated `chore_implementation`/
+    /// `revision_implementation` churn the generic helper inserts.
+    #[cfg(test)]
+    pub fn insert_terminal_pr_review_execution_for_test(
+        &self,
+        work_item_id: &str,
+        status: &str,
+        created_at_epoch: i64,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let id = format!("exec-test-pr-review-{}-{}", work_item_id, created_at_epoch);
+        conn.execute(
+            "INSERT INTO work_executions
+               (id, work_item_id, kind, status, repo_remote_url,
+                priority, created_at)
+             VALUES (?1, ?2, 'pr_review', ?3,
+                     'https://github.com/test/repo', 0, ?4)",
+            params![id, work_item_id, status, created_at_epoch.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// Rewrite `created_at` on every terminal execution for a work item to
     /// the given epoch. Lets a test simulate the churn guard's trailing
     /// window draining (a real re-check would just wait for wall-clock time

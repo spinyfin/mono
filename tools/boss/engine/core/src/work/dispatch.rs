@@ -856,6 +856,67 @@ impl WorkDb {
         Ok(out)
     }
 
+    /// Same as [`Self::count_recent_terminal_executions`] but scoped to a
+    /// single execution `kind`. [`crate::pr_review_recovery`]'s churn guard
+    /// uses this instead of the unscoped count: a work item routinely
+    /// accumulates terminal `chore_implementation`/`revision_implementation`
+    /// retries in the same trailing window a review is dispatched in (they
+    /// happen back-to-back as part of the same work session), and those are
+    /// unrelated to whether the *review* itself is healthy. Counting them
+    /// against the review's churn budget means a single transient review
+    /// failure (a `SlotBusy` desync, a spawn-ack timeout) can trip the guard
+    /// immediately — parking the item and leaving the PR permanently
+    /// unreviewed instead of getting the retry the guard is supposed to
+    /// allow. Every other `pr_review`-recovery query in this file (see
+    /// [`Self::list_dead_pr_review_candidates`]) is already scoped to
+    /// `kind = 'pr_review'` for the same reason.
+    pub fn count_recent_terminal_executions_for_kind(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: ExecutionKind,
+    ) -> Result<i64> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT COUNT(*) FROM work_executions
+              WHERE work_item_id = ?1
+                AND kind = ?2
+                AND status IN ('orphaned', 'abandoned', 'failed')
+                AND CAST(created_at AS INTEGER) >= ?3",
+            params![work_item_id, kind.as_str(), since_epoch_secs],
+            |row| row.get(0),
+        )
+        .map_err(Into::into)
+    }
+
+    /// Kind-scoped sibling of [`Self::list_recent_terminal_execution_ids`];
+    /// see [`Self::count_recent_terminal_executions_for_kind`] for why
+    /// [`crate::pr_review_recovery`] needs the `kind` filter.
+    pub fn list_recent_terminal_execution_ids_for_kind(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: ExecutionKind,
+    ) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+              WHERE work_item_id = ?1
+                AND kind = ?2
+                AND status IN ('orphaned', 'abandoned', 'failed')
+                AND CAST(created_at AS INTEGER) >= ?3
+              ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(params![work_item_id, kind.as_str(), since_epoch_secs], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn list_executions(&self, work_item_id: Option<&str>) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
         if let Some(work_item_id) = work_item_id {
