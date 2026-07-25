@@ -13,6 +13,7 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/driver:__pkg__",
+        "//tools/boss/engine/effort:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
     ],
     deps = [

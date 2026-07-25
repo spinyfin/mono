@@ -396,7 +396,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
             crate::driver::ClaudeDriver.spawn_invocation(
                 &spawn_config.model,
-                spawn_config.claude_effort,
+                spawn_config.effort_value,
                 Some(&worker_settings_path),
                 spawner.non_opus_auto_mode(),
                 permission_mode_override,
@@ -464,7 +464,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 .effort_level
                 .map(|level| level.as_str())
                 .unwrap_or("none"),
-            claude_effort = spawn_config.claude_effort.unwrap_or("default"),
+            effort_value = spawn_config.effort_value.unwrap_or("default"),
             model = %spawn_config.model,
             ack_timed_out = started.ack_timed_out,
             "pane spawned for execution",
@@ -1202,7 +1202,7 @@ mod pane_spawn_tests {
             .spawn_config
             .expect("PaneSpawnRunner should always populate spawn_config");
         assert_eq!(spawn.effort_level, Some(EffortLevel::Trivial));
-        assert_eq!(spawn.claude_effort, Some("low"));
+        assert_eq!(spawn.effort_value, Some("low"));
         // #746: trivial floors to Sonnet, never Haiku.
         assert_eq!(spawn.model, "sonnet");
         assert_eq!(spawn.prompt_addendum, None);

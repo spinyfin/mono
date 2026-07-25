@@ -262,6 +262,12 @@ pub struct ModelMenu {
     /// (e.g. `"low"`, `"medium"` for Claude Code's `--effort` flag).
     /// Returns `None` when the driver omits the effort flag for this level
     /// (e.g. a 3-value collapse that does not model `trivial` separately).
+    ///
+    /// `EffortLevel` has exactly five variants, so this is the domain: a
+    /// driver whose CLI exposes more reasoning levels than that (e.g.
+    /// codex-cli 0.145.0's six on `gpt-5.6-*`) is reachable only through its
+    /// top five — the remaining rungs of its ladder have no `EffortLevel` to
+    /// map from.
     pub effort_value_for_level: fn(EffortLevel) -> Option<&'static str>,
     /// Maps a Boss [`EffortLevel`] to the default model slug for this driver.
     pub default_model_for_level: fn(EffortLevel) -> &'static str,

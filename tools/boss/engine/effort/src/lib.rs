@@ -3,15 +3,40 @@
 //! live in each driver's static descriptor; this module owns the resolution
 //! precedence logic (design §Q2 / §Q3 / §Mix-and-match).
 
+use std::fmt;
 use std::path::Path;
 
 use boss_protocol::{EffortLevel, TaskKind};
 
-use boss_engine_driver::AgentDriver;
+use boss_engine_driver::{AgentDriver, DriverRegistry};
 
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
+
+/// A resolved driver slug names a driver the current binary's
+/// [`DriverRegistry`] does not recognise. Returned by [`menu_for_driver_in`] /
+/// [`resolve_spawn_config`] instead of silently falling back to the Claude
+/// menu — a silent fallback is exactly the bug this type exists to prevent
+/// (agent-driver design §Mix-and-match): dispatching an unregistered
+/// driver's work item against Claude's model table produces Claude model
+/// slugs the driver's CLI does not accept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnknownDriverError {
+    pub driver_slug: String,
+}
+
+impl fmt::Display for UnknownDriverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "driver '{}' is not registered; cannot resolve its model/effort menu",
+            self.driver_slug
+        )
+    }
+}
+
+impl std::error::Error for UnknownDriverError {}
 
 /// Resolved dispatch knobs for one worker spawn. The dispatcher
 /// builds this once from the row's `effort_level` / `model_override`,
@@ -27,11 +52,13 @@ pub struct SpawnConfig {
     /// spawn came from `effort_level = small` (deliberate) or from
     /// a fall-through.
     pub effort_level: Option<EffortLevel>,
-    /// Claude effort value to pass to `claude --effort`. `None` when
-    /// the row has no `effort_level` — per design §Q2 the dispatcher
-    /// omits the flag entirely in that case and lets `claude` fall
-    /// through to its own default of `high`.
-    pub claude_effort: Option<&'static str>,
+    /// Driver-specific effort knob value (e.g. `claude --effort`'s
+    /// `"low"`/`"medium"`/…), resolved from the selected driver's
+    /// [`boss_engine_driver::ModelMenu`]. `None` when the row has no
+    /// `effort_level` — per design §Q2 the dispatcher omits the flag
+    /// entirely in that case and lets the driver fall through to its own
+    /// default.
+    pub effort_value: Option<&'static str>,
     /// Resolved model slug. Always present: the dispatcher passes
     /// `--model <slug>` even for the engine-default fall-through so
     /// the choice is visible on the dispatch stream.
@@ -59,7 +86,7 @@ impl SpawnConfig {
         // `ClaudeDriver::spawn_invocation` directly (see `runner.rs`).
         boss_engine_driver::ClaudeDriver.spawn_invocation(
             &self.model,
-            self.claude_effort,
+            self.effort_value,
             settings_path,
             non_opus_auto_mode,
             None,
@@ -102,13 +129,31 @@ pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<
     ENGINE_DEFAULT_DRIVER.to_owned()
 }
 
-/// Return the [`boss_engine_driver::ModelMenu`] for the given driver slug.
-///
-/// Currently only `"claude"` is registered; unknown slugs fall back to the
-/// Claude menu until a driver registry is added (design §Mix-and-match,
+/// Resolve the [`boss_engine_driver::ModelMenu`] for the given driver slug
+/// via the caller-supplied [`DriverRegistry`] (design §Mix-and-match,
 /// "Copilot: its own menu, 3-value effort").
-fn menu_for_driver(_driver_slug: &str) -> &'static boss_engine_driver::ModelMenu {
-    &boss_engine_driver::ClaudeDriver.descriptor().model_menu
+///
+/// Returns [`UnknownDriverError`] when `driver_slug` names a driver the
+/// registry does not recognise, rather than falling back to the Claude
+/// menu: resolving a non-Claude driver's effort level against Claude's
+/// model table would produce Claude model slugs its CLI does not accept.
+///
+/// Takes the registry by reference rather than always constructing
+/// [`DriverRegistry::default`] so callers that also need the registry for
+/// their own purposes (e.g. [`resolve_spawn_config_in`]'s caller building
+/// one for a capability gate) can build it once and reuse it; tests use the
+/// same seam to register a second stub driver and assert resolution is
+/// genuinely per-slug rather than hardcoded to Claude.
+fn menu_for_driver_in(
+    registry: &DriverRegistry,
+    driver_slug: &str,
+) -> Result<boss_engine_driver::ModelMenu, UnknownDriverError> {
+    registry
+        .get(driver_slug)
+        .map(|driver| driver.descriptor().model_menu)
+        .ok_or_else(|| UnknownDriverError {
+            driver_slug: driver_slug.to_owned(),
+        })
 }
 
 /// True iff `kind` belongs to the design family — `Design`, `DesignPostmortem`,
@@ -151,6 +196,10 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 /// kind floor changes them (design §Q3: "a user who overrides to Haiku on a
 /// `medium` row is asking 'use Haiku for this one,' not 'treat this as a
 /// trivial.'").
+///
+/// Returns [`UnknownDriverError`] when the resolved driver slug (step 0,
+/// [`resolve_driver`]) is not registered in [`DriverRegistry`], rather than
+/// silently resolving against the Claude menu.
 pub fn resolve_spawn_config(
     effort_level: Option<EffortLevel>,
     model_override: Option<&str>,
@@ -159,9 +208,36 @@ pub fn resolve_spawn_config(
     task_driver: Option<&str>,
     product_default_driver: Option<&str>,
     kind: Option<&TaskKind>,
-) -> SpawnConfig {
+) -> Result<SpawnConfig, UnknownDriverError> {
+    resolve_spawn_config_in(
+        &DriverRegistry::default(),
+        effort_level,
+        model_override,
+        pool_model_override,
+        product_default_model,
+        task_driver,
+        product_default_driver,
+        kind,
+    )
+}
+
+/// [`resolve_spawn_config`], resolved against a caller-supplied registry
+/// instead of always constructing [`DriverRegistry::default`]. Lets a
+/// caller that also needs the registry for its own purposes (e.g.
+/// `compose_worker_spawn`'s capability gate) build it once and reuse it.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_spawn_config_in(
+    registry: &DriverRegistry,
+    effort_level: Option<EffortLevel>,
+    model_override: Option<&str>,
+    pool_model_override: Option<&str>,
+    product_default_model: Option<&str>,
+    task_driver: Option<&str>,
+    product_default_driver: Option<&str>,
+    kind: Option<&TaskKind>,
+) -> Result<SpawnConfig, UnknownDriverError> {
     let driver = resolve_driver(task_driver, product_default_driver);
-    let menu = menu_for_driver(&driver);
+    let menu = menu_for_driver_in(registry, &driver)?;
 
     let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
@@ -177,13 +253,13 @@ pub fn resolve_spawn_config(
         menu.engine_default.to_owned()
     };
 
-    SpawnConfig {
+    Ok(SpawnConfig {
         effort_level,
-        claude_effort: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
+        effort_value: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
         model,
         driver,
         prompt_addendum: effort_level.and_then(|l| (menu.prompt_addendum_for_level)(l)),
-    }
+    })
 }
 
 /// Heuristic-classification audit marker the Planner/materializer appends
@@ -381,11 +457,195 @@ mod tests {
 
     use super::*;
 
+    // --- menu_for_driver: registry-backed resolution ---
+    //
+    // These tests register a second, Codex-shaped stub driver — via
+    // `DriverRegistry::with_driver` — so per-slug menu resolution is
+    // exercised against more than one driver.
+
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use boss_engine_driver::{
+        Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu, PermissionArtifacts,
+        PermissionInput, ProgressFidelity, ProgressObservationConfig, ProgressObservationWiring,
+        ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+    };
+    use boss_engine_structured_output::StructuredOutputKind;
+    use boss_engine_structured_output::fallback::FallbackCandidate;
+    use boss_protocol::{NormalizeError, WorkerEvent};
+
+    /// Effort vocabulary for the stub driver below. Deliberately distinct
+    /// from Claude's `low/medium/high/xhigh/max` at every level, and its
+    /// `Max` value (`"ultra"`) names a tier Claude's table has no word for —
+    /// modelling a driver whose own reasoning ladder reaches further than
+    /// Claude's (verified against codex-cli 0.145.0, whose `gpt-5.6-*`
+    /// models expose six reasoning levels topping out above Boss's `Max`).
+    fn stub_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
+        Some(match level {
+            EffortLevel::Trivial => "minimal",
+            EffortLevel::Small => "low",
+            EffortLevel::Medium => "medium",
+            EffortLevel::Large => "high",
+            EffortLevel::Max => "ultra",
+        })
+    }
+
+    fn stub_default_model_for_level(_level: EffortLevel) -> &'static str {
+        "stub-model"
+    }
+
+    fn stub_prompt_addendum_for_level(_level: EffortLevel) -> Option<&'static str> {
+        None
+    }
+
+    fn stub_model_requires_auto_permissions(_model: &str) -> bool {
+        false
+    }
+
+    static STUB_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
+        name: "stub-codex",
+        label: "Stub Codex-shaped Driver",
+        binary: "stub",
+        config_dir: ".stub",
+        agent_rules_filename: "AGENTS.md",
+        initial_prompt_filename: "initial-prompt.txt",
+        model_menu: DriverModelMenu {
+            engine_default: "stub-model",
+            effort_value_for_level: stub_effort_value_for_level,
+            default_model_for_level: stub_default_model_for_level,
+            prompt_addendum_for_level: stub_prompt_addendum_for_level,
+            model_requires_auto_permissions: stub_model_requires_auto_permissions,
+        },
+    };
+
+    /// Minimal second driver, registered only in these tests, whose sole
+    /// purpose is to prove `menu_for_driver` resolves per-slug. Every method
+    /// beyond `descriptor`/`capabilities` is unused by these tests and left
+    /// `unimplemented!()`, mirroring `boss_engine_driver`'s own `StubDriver`
+    /// test fixture.
+    struct StubDriver;
+
+    #[async_trait]
+    impl AgentDriver for StubDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &STUB_DESCRIPTOR
+        }
+        fn capabilities(&self) -> CapabilitySet {
+            CapabilitySet::new([Capability::Spawn])
+        }
+        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+            unimplemented!()
+        }
+        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
+            unimplemented!()
+        }
+        fn progress_fidelity(&self) -> ProgressFidelity {
+            unimplemented!()
+        }
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+            unimplemented!()
+        }
+        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            unimplemented!()
+        }
+        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
+            unimplemented!()
+        }
+        fn agent_rules_preamble(&self) -> &'static str {
+            unimplemented!()
+        }
+        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
+            unimplemented!()
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
+        }
+        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
+            None
+        }
+        fn classify_error(&self, _: &str) -> WorkerErrorClass {
+            unimplemented!()
+        }
+        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
+            Vec::new()
+        }
+    }
+
+    fn registry_with_stub() -> DriverRegistry {
+        DriverRegistry::default().with_driver("stub-codex", Arc::new(StubDriver))
+    }
+
+    #[test]
+    fn menu_for_driver_resolves_per_slug_not_hardcoded_to_claude() {
+        // Two registered drivers must resolve to different menus.
+        let registry = registry_with_stub();
+        let claude_menu = menu_for_driver_in(&registry, "claude").unwrap();
+        let stub_menu = menu_for_driver_in(&registry, "stub-codex").unwrap();
+
+        assert_ne!(claude_menu.engine_default, stub_menu.engine_default);
+        assert_ne!(
+            (claude_menu.effort_value_for_level)(EffortLevel::Max),
+            (stub_menu.effort_value_for_level)(EffortLevel::Max),
+            "claude and stub-codex must resolve to distinct effort menus",
+        );
+    }
+
+    #[test]
+    fn menu_for_driver_preserves_a_drivers_own_effort_vocabulary() {
+        // The stub's top-tier value ("ultra") names a tier above anything in
+        // Claude's low/medium/high/xhigh/max vocabulary. A per-driver menu
+        // resolution must surface it as-is, not collapse/clamp it onto
+        // Claude's value set. Note this only exercises vocabulary, not
+        // ladder length: `EffortLevel` has exactly five variants, so a
+        // driver whose CLI exposes more than five reasoning levels (e.g.
+        // codex-cli's six) is reachable only through its top five — see the
+        // doc comment on `ModelMenu::effort_value_for_level`.
+        let registry = registry_with_stub();
+        let stub_menu = menu_for_driver_in(&registry, "stub-codex").unwrap();
+        assert_eq!((stub_menu.effort_value_for_level)(EffortLevel::Max), Some("ultra"));
+
+        let claude_menu = &boss_engine_driver::ClaudeDriver.descriptor().model_menu;
+        let claude_values: Vec<Option<&str>> = [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ]
+        .into_iter()
+        .map(|level| (claude_menu.effort_value_for_level)(level))
+        .collect();
+        assert!(
+            !claude_values.contains(&Some("ultra")),
+            "\"ultra\" must be the stub driver's own vocabulary, not something Claude's table also produces",
+        );
+    }
+
+    #[test]
+    fn menu_for_driver_errors_on_unregistered_slug_instead_of_falling_back_to_claude() {
+        // An unregistered slug must error rather than resolve to any
+        // driver's menu.
+        let err = menu_for_driver_in(&DriverRegistry::default(), "copilot").unwrap_err();
+        assert_eq!(err.driver_slug, "copilot");
+    }
+
+    #[test]
+    fn resolve_spawn_config_errors_on_unregistered_driver_instead_of_dispatching_on_claude() {
+        let err =
+            resolve_spawn_config(Some(EffortLevel::Large), None, None, None, Some("copilot"), None, None).unwrap_err();
+        assert_eq!(err.driver_slug, "copilot");
+    }
+
     #[test]
     fn null_row_falls_through_to_engine_default() {
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
         assert_eq!(cfg.effort_level, None);
-        assert_eq!(cfg.claude_effort, None);
+        assert_eq!(cfg.effort_value, None);
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
@@ -396,14 +656,14 @@ mod tests {
 
     #[test]
     fn null_row_with_product_default_uses_product_default() {
-        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None, None).unwrap();
         assert_eq!(cfg.model, "claude-sonnet-4-6");
-        assert_eq!(cfg.claude_effort, None);
+        assert_eq!(cfg.effort_value, None);
     }
 
     #[test]
     fn empty_product_default_does_not_satisfy_precedence_step_3() {
-        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None, None).unwrap();
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
@@ -415,35 +675,35 @@ mod tests {
     fn effort_level_alone_picks_level_default_model() {
         // #746: Trivial maps to Sonnet, not Haiku — only the effort
         // value stays `low`.
-        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None);
+        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None).unwrap();
         assert_eq!(trivial.model, "sonnet");
-        assert_eq!(trivial.claude_effort, Some("low"));
+        assert_eq!(trivial.effort_value, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
-        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None, None);
+        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None, None).unwrap();
         assert_eq!(small.model, "sonnet");
-        assert_eq!(small.claude_effort, Some("medium"));
+        assert_eq!(small.effort_value, Some("medium"));
         assert_eq!(small.prompt_addendum, None);
 
-        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, None);
+        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, None).unwrap();
         assert_eq!(medium.model, "sonnet");
-        assert_eq!(medium.claude_effort, Some("high"));
+        assert_eq!(medium.effort_value, Some("high"));
         assert!(
             medium.prompt_addendum.unwrap().starts_with("Sketch"),
             "medium addendum should be the 'sketch a plan' nudge",
         );
 
-        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None, None);
+        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None, None).unwrap();
         assert_eq!(large.model, "opus");
-        assert_eq!(large.claude_effort, Some("xhigh"));
+        assert_eq!(large.effort_value, Some("xhigh"));
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
-        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None);
+        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None).unwrap();
         // The effort-level→model table tops out at Opus for every level,
         // including Max — Fable is opt-in only via an explicit
         // model_override, never a table default.
         assert_eq!(max.model, "opus");
-        assert_eq!(max.claude_effort, Some("max"));
+        assert_eq!(max.effort_value, Some("max"));
         // large and max share the prompt addendum (design §Q2 table).
         assert_eq!(max.prompt_addendum, large.prompt_addendum);
     }
@@ -483,9 +743,10 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.claude_effort, Some("high"));
+        assert_eq!(cfg.effort_value, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
     }
 
@@ -499,9 +760,10 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
-        assert_eq!(cfg.claude_effort, None);
+        assert_eq!(cfg.effort_value, None);
         assert_eq!(cfg.prompt_addendum, None);
     }
 
@@ -512,7 +774,7 @@ mod tests {
         // canonicalises empty → NULL on insert, but the dispatcher
         // tolerates the looser shape so a hand-edited DB row doesn't
         // produce `claude --model ""`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
@@ -520,7 +782,7 @@ mod tests {
     fn null_row_invocation_matches_today_plus_explicit_model() {
         // Untagged rows fall through to the driver's engine_default (Opus for Claude).
         // Must carry --permission-mode auto (Opus) and no --effort.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -533,7 +795,7 @@ mod tests {
         // `--settings '<path>'`, positioned before the trailing prompt
         // arg so claude parses it as a flag, and single-quoted so a
         // path with spaces survives the pane shell.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
         let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
         let inv = cfg.claude_invocation(false, Some(path));
         assert!(
@@ -552,7 +814,7 @@ mod tests {
     fn trivial_invocation_includes_both_flags() {
         // #746: Trivial spawns Sonnet (never Haiku) at --effort low.
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -562,7 +824,7 @@ mod tests {
     #[test]
     fn medium_with_override_uses_override_model_and_medium_effort() {
         // model_override = "opus" → Opus family → --permission-mode auto.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None, None).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -578,7 +840,7 @@ mod tests {
             for non_opus_auto_mode in [false, true] {
                 let cfg = SpawnConfig {
                     effort_level: None,
-                    claude_effort: None,
+                    effort_value: None,
                     model: model.to_owned(),
                     driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                     prompt_addendum: None,
@@ -602,7 +864,7 @@ mod tests {
         for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
-                claude_effort: None,
+                effort_value: None,
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
@@ -625,7 +887,7 @@ mod tests {
         for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
-                claude_effort: None,
+                effort_value: None,
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
                 prompt_addendum: None,
@@ -682,7 +944,7 @@ mod tests {
             for non_opus_auto_mode in [false, true] {
                 let cfg = SpawnConfig {
                     effort_level: None,
-                    claude_effort: None,
+                    effort_value: None,
                     model: model.to_owned(),
                     driver: "claude".to_owned(),
                     prompt_addendum: None,
@@ -705,9 +967,9 @@ mod tests {
         // The effort-level→model table tops out at Opus for every level,
         // including Max. Fable is still reachable, but only via an explicit
         // model_override.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.claude_effort, Some("max"));
+        assert_eq!(cfg.effort_value, Some("max"));
         let inv = cfg.claude_invocation(false, None);
         assert!(inv.contains("--model opus"), "Max effort must use opus, got: {inv:?}",);
         assert!(
@@ -730,7 +992,7 @@ mod tests {
         // The hand-set, per-row opt-in: an explicit model_override is the
         // only way a spawn resolves to Fable now (precedence step 1, ahead
         // of the effort-level default).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None, None).unwrap();
         assert_eq!(cfg.model, "fable");
         let inv = cfg.claude_invocation(false, None);
         assert!(
@@ -843,9 +1105,9 @@ mod tests {
         // the pool override, but a task-level model_override still wins.
 
         // Pool override beats effort default (Small → Sonnet normally, Opus via pool).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.claude_effort, Some("medium"));
+        assert_eq!(cfg.effort_value, Some("medium"));
 
         // Task model_override beats pool override.
         let cfg = resolve_spawn_config(
@@ -856,19 +1118,20 @@ mod tests {
             None,
             None,
             None,
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "sonnet");
-        assert_eq!(cfg.claude_effort, Some("medium"));
+        assert_eq!(cfg.effort_value, Some("medium"));
     }
 
     #[test]
     fn pool_override_beats_product_default_and_engine_default() {
         // Pool override beats product default_model.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None, None);
+        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
 
         // Pool override beats engine default.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None, None);
+        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
@@ -876,7 +1139,7 @@ mod tests {
     fn empty_pool_override_falls_through_to_effort_default() {
         // An empty/whitespace pool override is the same as no override — the
         // effort default still applies.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None, None).unwrap();
         assert_eq!(cfg.model, "sonnet");
     }
 
@@ -884,9 +1147,9 @@ mod tests {
     fn pool_override_does_not_change_effort_or_addendum() {
         // Pool override changes the model only; effort + addendum still follow
         // effort_level (mirrors the task-level model_override rule in §Q3).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None, None);
+        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None, None).unwrap();
         assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.claude_effort, Some("high"));
+        assert_eq!(cfg.effort_value, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
     }
 
@@ -907,7 +1170,7 @@ mod tests {
                 EffortLevel::Large,
                 EffortLevel::Max,
             ] {
-                let cfg = resolve_spawn_config(Some(level), None, None, None, None, None, Some(&kind));
+                let cfg = resolve_spawn_config(Some(level), None, None, None, None, None, Some(&kind)).unwrap();
                 assert_eq!(
                     cfg.model, "opus",
                     "kind {kind:?} at effort {level:?} must floor to opus, got {:?}",
@@ -930,9 +1193,10 @@ mod tests {
             None,
             None,
             Some(&TaskKind::DesignPostmortem),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
-        assert_eq!(cfg.claude_effort, Some("high"));
+        assert_eq!(cfg.effort_value, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
     }
 
@@ -942,7 +1206,8 @@ mod tests {
         // must still resolve to Sonnet from the effort table — the floor is
         // scoped to the design family only.
         for kind in [TaskKind::Chore, TaskKind::Task, TaskKind::Revision, TaskKind::Followup] {
-            let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, Some(&kind));
+            let cfg =
+                resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, Some(&kind)).unwrap();
             assert_eq!(
                 cfg.model, "sonnet",
                 "kind {kind:?} at medium must still resolve to sonnet"
@@ -963,7 +1228,8 @@ mod tests {
             None,
             None,
             Some(&TaskKind::DesignPostmortem),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "sonnet");
     }
 
@@ -979,7 +1245,8 @@ mod tests {
             None,
             None,
             Some(&TaskKind::Investigation),
-        );
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
