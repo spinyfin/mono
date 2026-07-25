@@ -116,6 +116,16 @@ struct WorkTask: Identifiable, Hashable {
     /// `mergeQueueState` is non-nil. Parsed by `MergeQueueDetail.parse(json:)`
     /// for the Merging section's compact badge and sort order.
     var mergeQueueDetail: String? = nil
+    /// Raw GitHub mergeability at last poll, independent of CI, review, and
+    /// merge-queue state. One of `"mergeable"`, `"conflicting"`, or
+    /// `"unknown"`; `nil` until the first probe completes. This is the only
+    /// field that reflects whether the PR's head actually merges cleanly —
+    /// `mergeQueueState == "auto_merge_enabled"` means GitHub will merge the
+    /// PR *once it becomes mergeable*, not that it is mergeable now, so a
+    /// card can legitimately show both "auto-merge armed" and
+    /// `prMergeableState == "conflicting"` simultaneously (T3271 / mono#2303).
+    /// Mirrors `Task.pr_mergeable_state` on the wire.
+    var prMergeableState: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil

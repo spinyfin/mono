@@ -234,6 +234,7 @@ struct WorkBoardCardItem: View {
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
                     mergeQueueState: task.isInMergingSection ? task.mergeQueueState : nil,
                     mergeQueueDetail: task.isInMergingSection ? task.mergeQueueDetail : nil,
+                    prMergeableState: task.isInMergingSection ? task.prMergeableState : nil,
                     externalRefLink: externalRefLink,
                     ambiguousRepoNames: model.ambiguousVisibleRepoNames,
                     inReviewRevisions: inReviewRevisions,
@@ -571,6 +572,12 @@ struct WorkBoardCardView: View {
     /// `nil` unless `mergeQueueState` is non-nil. Parsed by `MergeQueueBadge`
     /// to render the queue position and readiness icon.
     var mergeQueueDetail: String? = nil
+    /// Raw GitHub mergeability for the Merging-section badge — mirrors
+    /// `WorkTask.prMergeableState`; supplied by the parent under the same
+    /// `task.isInMergingSection` condition as `mergeQueueState`. Lets
+    /// `MergeQueueBadge` render `unmergeable` on a conflicting PR even
+    /// when required CI has passed (T3271 / mono#2303).
+    var prMergeableState: String? = nil
     /// Upstream-link affordance derived from `task.externalRef`. `nil`
     /// when the task has no external binding — the affordance is hidden
     /// entirely in that state. Bound refs show an accent-colored `↗ #N`
@@ -874,7 +881,8 @@ struct WorkBoardCardView: View {
                         MergeQueueBadge(
                             mergeQueueState: mergeQueueState,
                             detail: mergeQueueDetail,
-                            ciRequiredState: ciRequiredState
+                            ciRequiredState: ciRequiredState,
+                            prMergeableState: prMergeableState
                         )
                         .layoutPriority(-1)
                     } else if let ciState = ciRequiredState {

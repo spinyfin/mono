@@ -891,11 +891,11 @@ pub(crate) fn migrate_backfill_autostart_consumed(conn: &Connection) -> Result<(
 }
 
 /// Add `ci_required_state`, `review_required_state`, `ci_required_detail`,
-/// `review_required_detail`, `pr_state_polled_at`, and `merge_queue_state`
-/// columns to the `tasks` table. These are populated by the merge poller on
-/// every Review-lane sweep and surfaced to the macOS kanban as CI, review,
-/// and merging indicators with tooltips. Idempotent — guarded by
-/// `tasks_has_column`.
+/// `review_required_detail`, `pr_state_polled_at`, `merge_queue_state`, and
+/// `pr_mergeable_state` columns to the `tasks` table. These are populated by
+/// the merge poller on every Review-lane sweep and surfaced to the macOS
+/// kanban as CI, review, merging, and mergeability indicators with tooltips.
+/// Idempotent — guarded by `tasks_has_column`.
 pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         (
@@ -921,6 +921,10 @@ pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
         (
             "merge_queue_state",
             "ALTER TABLE tasks ADD COLUMN merge_queue_state TEXT",
+        ),
+        (
+            "pr_mergeable_state",
+            "ALTER TABLE tasks ADD COLUMN pr_mergeable_state TEXT",
         ),
     ] {
         if !table_has_column(conn, "tasks", column)? {

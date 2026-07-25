@@ -385,19 +385,30 @@ struct MergeQueueBadge: View {
     /// not-yet-queued Merge-When-Ready case, where there is no
     /// `mergeQueueEntry.state` to read readiness from.
     var ciRequiredState: String?
+    /// Raw GitHub mergeability (`WorkTask.prMergeableState`) for the
+    /// not-yet-queued Merge-When-Ready case. `ciRequiredState` alone says
+    /// nothing about whether the PR's head actually merges cleanly — a PR
+    /// can have `ciRequiredState == "success"` while GitHub reports it
+    /// `CONFLICTING` (T3271 / mono#2303), so this must be checked ahead of
+    /// the CI-only fallback rather than inferred from CI passing.
+    var prMergeableState: String?
 
     @Environment(\.colorScheme) private var colorScheme
 
     private var parsed: MergeQueueDetail? { MergeQueueDetail.parse(detail) }
 
     private enum Readiness: Equatable {
-        case mergeable
+        /// Required checks have passed. Deliberately NOT named `mergeable`
+        /// — this says nothing about whether the PR's head merges cleanly
+        /// into its base, only that CI is green (or the queue/Trunk entry
+        /// reports readiness). See `prMergeableState` above.
+        case checksPassed
         case unmergeable
         case checksRunning
 
         var systemImage: String {
             switch self {
-            case .mergeable: return "checkmark.circle.fill"
+            case .checksPassed: return "checkmark.circle.fill"
             case .unmergeable: return "xmark.circle.fill"
             case .checksRunning: return "clock.fill"
             }
@@ -405,7 +416,7 @@ struct MergeQueueBadge: View {
 
         var label: String {
             switch self {
-            case .mergeable: return "mergeable"
+            case .checksPassed: return "checks passed"
             case .unmergeable: return "unmergeable"
             case .checksRunning: return "checks running"
             }
@@ -417,20 +428,28 @@ struct MergeQueueBadge: View {
     private var readiness: Readiness {
         if isTrunk {
             switch parsed?.state {
-            case "tests_passed": return .mergeable
+            case "tests_passed": return .checksPassed
             case "failed", "pending_failure": return .unmergeable
             default: return .checksRunning // pending, testing, not_ready, unknown, nil
             }
         }
         if mergeQueueState == "queued" {
             switch parsed?.state?.uppercased() {
-            case "MERGEABLE": return .mergeable
+            case "MERGEABLE": return .checksPassed
             case "UNMERGEABLE": return .unmergeable
             default: return .checksRunning // AWAITING_CHECKS, QUEUED, LOCKED, unknown
             }
         }
+        // Conflict pre-empts the CI-only fallback below: `ciRequiredState`
+        // reflects required-check status only, and auto-merge stays armed
+        // on GitHub while a conflict blocks it (mono#2023 "merge when
+        // ready" semantics), so CI alone must never render as mergeable
+        // when the PR is known to conflict (T3271 / mono#2303).
+        if prMergeableState == "conflicting" {
+            return .unmergeable
+        }
         switch ciRequiredState {
-        case "success": return .mergeable
+        case "success": return .checksPassed
         case "fail": return .unmergeable
         default: return .checksRunning // in_progress, unknown, nil
         }
@@ -503,7 +522,7 @@ struct MergeQueueBadge: View {
                 }
                 Image(systemName: readiness.systemImage)
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(readiness == .mergeable ? Color.green : Color.white)
+                    .foregroundStyle(readiness == .checksPassed ? Color.green : Color.white)
             }
             .foregroundStyle(Color.white)
             .padding(.horizontal, 6)
