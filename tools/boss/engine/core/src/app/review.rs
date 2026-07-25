@@ -114,7 +114,6 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 let request_id2 = request_id.clone();
                 let work_item_id2 = work_item_id.clone();
                 let pr_url2 = pr_url.clone();
-                let kick = server_state.pr_reconciler_kick.clone();
                 let event_bus = server_state.event_bus.clone();
                 let direct_merge_executor = server_state.direct_merge_executor.clone();
                 let work_db2 = work_db.clone();
@@ -123,16 +122,17 @@ pub(super) async fn handle_merge_when_ready(ctx: Dispatch, req: FrontendRequest)
                 tokio::spawn(async move {
                     match direct_merge_executor.execute(&pr_url2).await {
                         Ok(action) => {
-                            // Kick the PR reconciler so the kanban state
-                            // reflects the new merge-queue / auto-merge
-                            // state promptly without waiting for the next
-                            // periodic sweep. Publish the keyed
-                            // `PrReconcileRequested` event alongside the
-                            // broad kick so the merge poller can reconcile
-                            // just this PR instead of waiting on (or
-                            // triggering) a full sweep; the broad kick
-                            // stays wired as the backstop.
-                            kick.notify_one();
+                            // Publish the keyed `PrReconcileRequested` event
+                            // so the merge poller reconciles just this PR
+                            // promptly instead of waiting on the next
+                            // periodic sweep. Deliberately does NOT also
+                            // fire the broad `pr_reconciler_kick`: that
+                            // arm always breaks into a full sweep, which
+                            // would either absorb this keyed publish as a
+                            // no-op (within the quiesce window) or
+                            // reconcile this PR twice (outside it). The
+                            // periodic timer and the adaptive per-PR
+                            // schedule remain the backstop.
                             event_bus.publish(Event::PrReconcileRequested {
                                 pr_url: pr_url2.clone(),
                             });
@@ -1101,9 +1101,9 @@ mod trunk_queue_tests {
             .unwrap();
         let sink = make_session_sink();
 
-        // Subscribe before dispatching so the Direct-merge success path's
-        // `PrReconcileRequested` publish (added alongside the existing
-        // `pr_reconciler_kick` notify) has a live receiver to land in.
+        // Subscribe before dispatching: the bus has no replay, so the
+        // Direct-merge success path's `PrReconcileRequested` publish is
+        // only observable if a receiver exists first.
         let mut pr_reconcile_requests = state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
             boss_event_bus::EventKind::PrReconcileRequested,
         ));
