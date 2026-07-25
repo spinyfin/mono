@@ -15,13 +15,12 @@ use boss_engine_driver::{AgentDriver, DriverRegistry};
 pub const ENGINE_DEFAULT_DRIVER: &str = "claude";
 
 /// A resolved driver slug names a driver the current binary's
-/// [`DriverRegistry`] does not recognise. Returned by [`menu_for_driver`] /
+/// [`DriverRegistry`] does not recognise. Returned by [`menu_for_driver_in`] /
 /// [`resolve_spawn_config`] instead of silently falling back to the Claude
 /// menu — a silent fallback is exactly the bug this type exists to prevent
-/// (agent-driver design, T1477 follow-up "menu_for_driver must honour its
-/// driver slug argument"): dispatching an unregistered driver's work item
-/// against Claude's model table produces Claude model slugs the driver's
-/// CLI does not accept.
+/// (agent-driver design §Mix-and-match): dispatching an unregistered
+/// driver's work item against Claude's model table produces Claude model
+/// slugs the driver's CLI does not accept.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnknownDriverError {
     pub driver_slug: String,
@@ -131,22 +130,20 @@ pub fn resolve_driver(task_driver: Option<&str>, product_default_driver: Option<
 }
 
 /// Resolve the [`boss_engine_driver::ModelMenu`] for the given driver slug
-/// via the [`DriverRegistry`] (design §Mix-and-match, "Copilot: its own
-/// menu, 3-value effort").
+/// via the caller-supplied [`DriverRegistry`] (design §Mix-and-match,
+/// "Copilot: its own menu, 3-value effort").
 ///
 /// Returns [`UnknownDriverError`] when `driver_slug` names a driver the
-/// current binary's registry does not recognise, rather than silently
-/// falling back to the Claude menu — the fallback this function used to
-/// perform was itself the bug: a non-Claude work item's effort level would
-/// resolve against Claude's model table and produce Claude model slugs.
-fn menu_for_driver(driver_slug: &str) -> Result<boss_engine_driver::ModelMenu, UnknownDriverError> {
-    menu_for_driver_in(&DriverRegistry::default(), driver_slug)
-}
-
-/// [`menu_for_driver`], resolved against a caller-supplied registry instead
-/// of always constructing [`DriverRegistry::default`]. Split out so tests can
-/// register a second stub driver and assert `menu_for_driver`'s resolution
-/// is genuinely per-slug rather than hardcoded to Claude.
+/// registry does not recognise, rather than falling back to the Claude
+/// menu: resolving a non-Claude driver's effort level against Claude's
+/// model table would produce Claude model slugs its CLI does not accept.
+///
+/// Takes the registry by reference rather than always constructing
+/// [`DriverRegistry::default`] so callers that also need the registry for
+/// their own purposes (e.g. [`resolve_spawn_config_in`]'s caller building
+/// one for a capability gate) can build it once and reuse it; tests use the
+/// same seam to register a second stub driver and assert resolution is
+/// genuinely per-slug rather than hardcoded to Claude.
 fn menu_for_driver_in(
     registry: &DriverRegistry,
     driver_slug: &str,
@@ -212,8 +209,35 @@ pub fn resolve_spawn_config(
     product_default_driver: Option<&str>,
     kind: Option<&TaskKind>,
 ) -> Result<SpawnConfig, UnknownDriverError> {
+    resolve_spawn_config_in(
+        &DriverRegistry::default(),
+        effort_level,
+        model_override,
+        pool_model_override,
+        product_default_model,
+        task_driver,
+        product_default_driver,
+        kind,
+    )
+}
+
+/// [`resolve_spawn_config`], resolved against a caller-supplied registry
+/// instead of always constructing [`DriverRegistry::default`]. Lets a
+/// caller that also needs the registry for its own purposes (e.g.
+/// `compose_worker_spawn`'s capability gate) build it once and reuse it.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_spawn_config_in(
+    registry: &DriverRegistry,
+    effort_level: Option<EffortLevel>,
+    model_override: Option<&str>,
+    pool_model_override: Option<&str>,
+    product_default_model: Option<&str>,
+    task_driver: Option<&str>,
+    product_default_driver: Option<&str>,
+    kind: Option<&TaskKind>,
+) -> Result<SpawnConfig, UnknownDriverError> {
     let driver = resolve_driver(task_driver, product_default_driver);
-    let menu = menu_for_driver(&driver)?;
+    let menu = menu_for_driver_in(registry, &driver)?;
 
     let model = if let Some(m) = model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
@@ -433,13 +457,11 @@ mod tests {
 
     use super::*;
 
-    // --- menu_for_driver: registry-backed resolution (T1477 follow-up) ---
+    // --- menu_for_driver: registry-backed resolution ---
     //
-    // `menu_for_driver` used to ignore its `driver_slug` argument and always
-    // return Claude's menu (the bug this module fixes). These tests register
-    // a second, Codex-shaped stub driver — via `DriverRegistry::with_driver`
-    // — so multi-driver resolution can be exercised without a real second
-    // driver implementation existing yet.
+    // These tests register a second, Codex-shaped stub driver — via
+    // `DriverRegistry::with_driver` — so per-slug menu resolution is
+    // exercised against more than one driver.
 
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -458,9 +480,8 @@ mod tests {
     /// from Claude's `low/medium/high/xhigh/max` at every level, and its
     /// `Max` value (`"ultra"`) names a tier Claude's table has no word for —
     /// modelling a driver whose own reasoning ladder reaches further than
-    /// Claude's (agent-driver design Rider 2: verified against codex-cli
-    /// 0.145.0, whose `gpt-5.6-*` models expose six levels topping out above
-    /// Boss's `Max`).
+    /// Claude's (verified against codex-cli 0.145.0, whose `gpt-5.6-*`
+    /// models expose six reasoning levels topping out above Boss's `Max`).
     fn stub_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
         Some(match level {
             EffortLevel::Trivial => "minimal",
@@ -558,8 +579,7 @@ mod tests {
 
     #[test]
     fn menu_for_driver_resolves_per_slug_not_hardcoded_to_claude() {
-        // The bug: menu_for_driver ignored its slug and always returned
-        // Claude's menu. Two registered drivers must yield different menus.
+        // Two registered drivers must resolve to different menus.
         let registry = registry_with_stub();
         let claude_menu = menu_for_driver_in(&registry, "claude").unwrap();
         let stub_menu = menu_for_driver_in(&registry, "stub-codex").unwrap();
@@ -573,11 +593,15 @@ mod tests {
     }
 
     #[test]
-    fn menu_for_driver_does_not_truncate_a_drivers_ladder_to_claudes_vocabulary() {
+    fn menu_for_driver_preserves_a_drivers_own_effort_vocabulary() {
         // The stub's top-tier value ("ultra") names a tier above anything in
         // Claude's low/medium/high/xhigh/max vocabulary. A per-driver menu
         // resolution must surface it as-is, not collapse/clamp it onto
-        // Claude's value set.
+        // Claude's value set. Note this only exercises vocabulary, not
+        // ladder length: `EffortLevel` has exactly five variants, so a
+        // driver whose CLI exposes more than five reasoning levels (e.g.
+        // codex-cli's six) is reachable only through its top five — see the
+        // doc comment on `ModelMenu::effort_value_for_level`.
         let registry = registry_with_stub();
         let stub_menu = menu_for_driver_in(&registry, "stub-codex").unwrap();
         assert_eq!((stub_menu.effort_value_for_level)(EffortLevel::Max), Some("ultra"));
@@ -601,9 +625,9 @@ mod tests {
 
     #[test]
     fn menu_for_driver_errors_on_unregistered_slug_instead_of_falling_back_to_claude() {
-        // Before this fix, an unregistered slug silently resolved to
-        // Claude's menu. It must now error instead.
-        let err = menu_for_driver("copilot").unwrap_err();
+        // An unregistered slug must error rather than resolve to any
+        // driver's menu.
+        let err = menu_for_driver_in(&DriverRegistry::default(), "copilot").unwrap_err();
         assert_eq!(err.driver_slug, "copilot");
     }
 

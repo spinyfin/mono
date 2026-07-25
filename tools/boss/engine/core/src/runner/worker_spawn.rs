@@ -7,7 +7,7 @@ use std::path::Path;
 use boss_engine_gh_invocation::gh_output;
 
 use crate::coordinator::pool_model_override_for_worker_id;
-use crate::effort::{SpawnConfig, resolve_spawn_config};
+use crate::effort::{SpawnConfig, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
@@ -614,7 +614,9 @@ pub(crate) async fn compose_worker_spawn(
     // (`Design` / `DesignPostmortem` / `Investigation`) floor to Opus
     // regardless of effort level, and reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
-    let spawn_config = resolve_spawn_config(
+    let registry = crate::driver::DriverRegistry::default();
+    let spawn_config = resolve_spawn_config_in(
+        &registry,
         row_effort,
         row_model_override.as_deref(),
         pool_model_override_for_worker_id(worker_id),
@@ -629,7 +631,6 @@ pub(crate) async fn compose_worker_spawn(
     // driver cannot satisfy the work-item kind's requirements. Products and
     // projects do not have a TaskKind; only Task/Chore rows are gated.
     if let Some(kind) = work_item_kind {
-        let registry = crate::driver::DriverRegistry::default();
         match registry.resolver(&spawn_config.driver) {
             Some(resolver) => {
                 resolver
