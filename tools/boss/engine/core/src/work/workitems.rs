@@ -226,12 +226,19 @@ impl WorkDb {
     /// Best-effort: the caller has already logged the trip via
     /// `tracing::warn!`; a failure here is logged and swallowed rather than
     /// aborting the sweep pass.
+    ///
+    /// `counted_scope` describes what `recent_terminal` actually counted
+    /// (e.g. `"terminal executions"` for an unscoped sweep,
+    /// `"terminal pr_review executions"` for a kind-scoped one) so the
+    /// attention body doesn't overstate the count to an operator comparing
+    /// it against the item's full execution list.
     pub fn file_churn_guard_parked_attention(
         &self,
         work_item_id: &str,
         source: &str,
         recent_terminal: i64,
         failing_execution_ids: &[String],
+        counted_scope: &str,
     ) {
         let title = format!("Parked by churn guard — {recent_terminal} recent failures");
         let ids = if failing_execution_ids.is_empty() {
@@ -242,7 +249,7 @@ impl WorkDb {
         let window_hours = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600;
         let body = format!(
             "The `{source}` sweep stopped auto-redispatching this work item: it produced \
-             {recent_terminal} terminal executions within the trailing {window_hours}h window \
+             {recent_terminal} {counted_scope} within the trailing {window_hours}h window \
              (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD}), which usually means something \
              structural is broken (a bad host, a repo/config issue) rather than a one-off blip.\n\n\
              Failing executions: {ids}\n\n\

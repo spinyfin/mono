@@ -824,17 +824,46 @@ impl WorkDb {
     }
 
     /// Count how many terminal executions (`orphaned`, `abandoned`,
-    /// `failed`) the work item has produced within the trailing
-    /// `since_epoch_secs` window. Used by the orphan-active churn
-    /// guard to stop auto-redispatching a work item that keeps dying.
-    pub fn count_recent_terminal_executions(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<i64> {
+    /// `failed`, `cancelled`) the work item has produced within the
+    /// trailing `since_epoch_secs` window, optionally restricted to a
+    /// single execution `kind`. Used by the orphan-active and
+    /// `pr_review`-recovery churn guards to stop auto-redispatching a work
+    /// item that keeps dying.
+    ///
+    /// `kind = Some(ExecutionKind::PrReview)` is what
+    /// [`crate::pr_review_recovery`]'s churn guard passes instead of
+    /// `None`: a work item routinely accumulates terminal
+    /// `chore_implementation`/`revision_implementation` retries in the same
+    /// trailing window a review is dispatched in (they happen back-to-back
+    /// as part of the same work session), and those are unrelated to
+    /// whether the *review* itself is healthy. Counting them against the
+    /// review's churn budget means a single transient review failure (a
+    /// `SlotBusy` desync, a spawn-ack timeout) can trip the guard
+    /// immediately — parking the item and leaving the PR permanently
+    /// unreviewed instead of getting the retry the guard is supposed to
+    /// allow. Every other `pr_review`-recovery query in this file (see
+    /// [`Self::list_dead_pr_review_candidates`]) is already scoped to
+    /// `kind = 'pr_review'` for the same reason.
+    ///
+    /// `cancelled` is included alongside `orphaned`/`abandoned`/`failed` so
+    /// this counts the same dead-execution statuses
+    /// [`Self::list_dead_pr_review_candidates`] treats as review-dead;
+    /// otherwise a review that repeatedly ends `cancelled` would never
+    /// accumulate toward the guard and would be refired every sweep pass.
+    pub fn count_recent_terminal_executions(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: Option<ExecutionKind>,
+    ) -> Result<i64> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT COUNT(*) FROM work_executions
               WHERE work_item_id = ?1
-                AND status IN ('orphaned', 'abandoned', 'failed')
-                AND CAST(created_at AS INTEGER) >= ?2",
-            params![work_item_id, since_epoch_secs],
+                AND (?2 IS NULL OR kind = ?2)
+                AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                AND CAST(created_at AS INTEGER) >= ?3",
+            params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -845,16 +874,25 @@ impl WorkDb {
     /// churn-guard trip can point the operator at the specific failing
     /// runs instead of just a count. See
     /// [`Self::file_churn_guard_parked_attention`].
-    pub fn list_recent_terminal_execution_ids(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<Vec<String>> {
+    pub fn list_recent_terminal_execution_ids(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: Option<ExecutionKind>,
+    ) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM work_executions
               WHERE work_item_id = ?1
-                AND status IN ('orphaned', 'abandoned', 'failed')
-                AND CAST(created_at AS INTEGER) >= ?2
+                AND (?2 IS NULL OR kind = ?2)
+                AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                AND CAST(created_at AS INTEGER) >= ?3
               ORDER BY created_at DESC, id DESC",
         )?;
-        let rows = stmt.query_map(params![work_item_id, since_epoch_secs], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(
+            params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
+            |row| row.get::<_, String>(0),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);

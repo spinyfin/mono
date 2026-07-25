@@ -734,7 +734,7 @@ mod tests {
         // terminal executions to be one away from tripping the guard.
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..(crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
-            db.insert_terminal_execution_for_test(&wi, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&wi, "chore_implementation", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
