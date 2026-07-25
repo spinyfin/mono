@@ -985,6 +985,19 @@ pub enum FrontendEvent {
     PrReconcilersKicked {
         kicked: bool,
     },
+    /// Response to [`FrontendRequest::SetDispatchConcurrency`] and
+    /// [`FrontendRequest::GetDispatchConcurrency`]. `limit` is the current
+    /// effective interactive-pool concurrency cap; `max` is the hard
+    /// ceiling (`MAX_WORKER_POOL_SIZE`) any requested value clamps to.
+    /// `clamped_from` is `Some(requested)` when the most recent `Set` call
+    /// asked for more than `max` and got rounded down; always `None` on a
+    /// `Get` or an unclamped `Set`.
+    DispatchConcurrencyResult {
+        limit: usize,
+        max: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clamped_from: Option<usize>,
+    },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.

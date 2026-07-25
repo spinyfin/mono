@@ -997,12 +997,17 @@ pub(crate) async fn agents_pools(socket_path: &Option<String>, json: bool) -> Re
                 println!("{}", serde_json::json!({ "pools": pools }));
             } else {
                 for pool in &pools {
+                    let cap_suffix = pool
+                        .effective_cap
+                        .map(|cap| format!("  [concurrency cap: {cap}]"))
+                        .unwrap_or_default();
                     println!(
-                        "{}: {}/{} claimed ({} idle)",
+                        "{}: {}/{} claimed ({} idle){}",
                         pool.name,
                         pool.claims.len(),
                         pool.capacity,
                         pool.idle,
+                        cap_suffix,
                     );
                     for claim in &pool.claims {
                         let status = claim.execution_status.as_deref().unwrap_or("?");

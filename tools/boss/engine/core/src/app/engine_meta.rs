@@ -186,12 +186,14 @@ pub(super) async fn handle_worker_pool_summary(ctx: Dispatch, req: FrontendReque
                 });
             }
             let idle = capacity.saturating_sub(claims.len());
+            let effective_cap = (name == "main").then(|| coordinator.max_concurrent_interactive_workers());
             pools.push(
                 boss_protocol::WorkerPoolEntry::builder()
                     .name(name)
                     .capacity(capacity)
                     .idle(idle)
                     .claims(claims)
+                    .maybe_effective_cap(effective_cap)
                     .build(),
             );
         }
@@ -392,6 +394,105 @@ pub(super) async fn handle_kick_pr_reconcilers(ctx: Dispatch, req: FrontendReque
         tracing::debug!("merge poller: activation kick received from app");
         send_response(&sink, &request_id, FrontendEvent::PrReconcilersKicked { kicked: true });
     }
+}
+
+pub(super) async fn handle_get_dispatch_concurrency(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetDispatchConcurrency = req else {
+        unreachable!()
+    };
+    let limit = server_state.execution_coordinator.max_concurrent_interactive_workers();
+    let max = server_state
+        .execution_coordinator
+        .worker_pool()
+        .capacity_sync()
+        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::DispatchConcurrencyResult {
+            limit,
+            max,
+            clamped_from: None,
+        },
+    );
+}
+
+pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetDispatchConcurrency { limit } = req else {
+        unreachable!()
+    };
+    let coordinator = &server_state.execution_coordinator;
+    let previous = coordinator.max_concurrent_interactive_workers();
+    let outcome = match coordinator.set_max_concurrent_interactive_workers(limit) {
+        Ok(outcome) => outcome,
+        Err(message) => {
+            send_work_error(&sink, &request_id, message);
+            return;
+        }
+    };
+    let max = coordinator
+        .worker_pool()
+        .capacity_sync()
+        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
+    // Persist so the cap survives an engine restart — same pattern as
+    // `handle_set_dispatch_paused`.
+    if let Err(err) = work_db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, &outcome.applied.to_string()) {
+        tracing::warn!(
+            requested = limit,
+            applied = outcome.applied,
+            ?err,
+            "dispatch_concurrency: failed to persist to state.db — state is \
+             applied in-memory but will revert on engine restart",
+        );
+    }
+    if outcome.applied > previous {
+        // A bare store on the coordinator doesn't itself wake
+        // `drain_ready_queue`; kick it so newly-available capacity is used
+        // immediately instead of sitting idle until the next
+        // naturally-triggered drain pass.
+        coordinator.kick();
+        tracing::info!(
+            previous,
+            applied = outcome.applied,
+            "dispatch: interactive concurrency cap raised — scheduler kicked to use new capacity",
+        );
+    } else {
+        tracing::info!(
+            previous,
+            applied = outcome.applied,
+            "dispatch: interactive concurrency cap lowered"
+        );
+    }
+    if let Some(requested) = outcome.clamped_from {
+        tracing::warn!(
+            requested,
+            applied = outcome.applied,
+            max,
+            "dispatch_concurrency: requested value exceeded the worker-pool ceiling — clamped",
+        );
+    }
+    send_response(
+        &sink,
+        &request_id,
+        FrontendEvent::DispatchConcurrencyResult {
+            limit: outcome.applied,
+            max,
+            clamped_from: outcome.clamped_from,
+        },
+    );
 }
 
 pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendRequest) {

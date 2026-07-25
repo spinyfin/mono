@@ -138,17 +138,17 @@ use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
-    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
-    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
-    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
-    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
-    handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
-    load_dispatch_paused_state, load_live_status_disabled_slots, open_review_terminal_async,
-    persist_live_status_disabled_slots, publish_comment_invalidation, publish_work_invalidation, read_transcript_tail,
-    resolve_transcript_for_tail, segment_to_wire, send_push, send_response, send_response_with_revision,
-    send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
-    task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT,
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+    TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
+    build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
+    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
+    load_automation_paused_state, load_dispatch_concurrency_limit, load_dispatch_paused_state,
+    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
+    publish_comment_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
+    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
+    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
+    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -1201,6 +1201,30 @@ impl ServerState {
             );
         }
 
+        // Seed the interactive-pool concurrency cap from the engine metadata
+        // KV — independent of the pause flags above. Set before any
+        // scheduler kick so the cap is in place before the first drain pass.
+        let dispatch_concurrency_limit = load_dispatch_concurrency_limit(&server_state.work_db);
+        if dispatch_concurrency_limit != crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS {
+            // `load_dispatch_concurrency_limit` already filters out 0, so
+            // this can only fail to apply verbatim by clamping — never by
+            // rejecting outright.
+            match server_state
+                .execution_coordinator
+                .set_max_concurrent_interactive_workers(dispatch_concurrency_limit)
+            {
+                Ok(outcome) => tracing::info!(
+                    ?outcome,
+                    "dispatch: restoring persisted interactive concurrency cap from state.db",
+                ),
+                Err(err) => tracing::warn!(
+                    dispatch_concurrency_limit,
+                    %err,
+                    "dispatch: persisted interactive concurrency cap rejected — keeping compile-time default",
+                ),
+            }
+        }
+
         Ok(server_state)
     }
 
@@ -1744,6 +1768,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetDispatchConcurrency => engine_meta::handle_get_dispatch_concurrency(ctx, r).await,
             r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
             r @ FrontendRequest::GetEngineHealth => engine_meta::handle_get_engine_health(ctx, r).await,
             r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
@@ -1869,6 +1894,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
             r @ FrontendRequest::SetAutomationPaused { .. } => engine_meta::handle_set_automation_paused(ctx, r).await,
             r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
+            r @ FrontendRequest::SetDispatchConcurrency { .. } => {
+                engine_meta::handle_set_dispatch_concurrency(ctx, r).await
+            }
             r @ FrontendRequest::SetDispatchPaused { .. } => engine_meta::handle_set_dispatch_paused(ctx, r).await,
             r @ FrontendRequest::SetFeatureFlag { .. } => engine_meta::handle_set_feature_flag(ctx, r).await,
             r @ FrontendRequest::SetHostEnabled { .. } => hosts::handle_set_host_enabled(ctx, r).await,

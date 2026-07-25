@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -205,31 +205,37 @@ pub const MAX_REVIEW_POOL_SIZE: usize = 8;
 /// contention when many PRs land simultaneously.
 pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
 
-/// TEMPORARY hard cap on concurrently-live INTERACTIVE ("normal") pool
-/// workers — a *row dispatched from* the automation or review pool is never
-/// held by this gate; those pools' own sizes govern their own home-pool
-/// dispatch. That is NOT the same as saying automation never counts toward
-/// the number this cap compares against: `busy_count()` counts every claimed
+/// Default (and compile-time floor) for the interactive-pool concurrency
+/// cap on concurrently-live INTERACTIVE ("normal") pool workers — a *row
+/// dispatched from* the automation or review pool is never held by this
+/// gate; those pools' own sizes govern their own home-pool dispatch. That
+/// is NOT the same as saying automation never counts toward the number
+/// this cap compares against: `busy_count()` counts every claimed
 /// `worker_pool` slot, and a spilled automation run (one that overflowed its
 /// full home pool onto a Lower Decks interactive slot via `claim_worker_spill`)
 /// IS one of those slots, so it DOES count against this cap. That is a
 /// deliberate policy choice, not an oversight: counting spilled automation
-/// keeps the cap's load-bearing promise (never more than
-/// `MAX_CONCURRENT_INTERACTIVE_WORKERS` live interactive-pool workers, spilled
-/// automation included) intact, while the once-per-pass automation-preemption
-/// fallback in `drain_ready_queue` is what keeps mainline from starving behind
-/// spilled automation at the cap — a preemption is a trade (one live worker
-/// for another), so it can reclaim a slot from spilled automation without
-/// ever pushing the live count past the cap. The interactive pool has 16
-/// slots across two pages (Bridge Crew + Lower Decks), but the 2026-07-15
-/// full-fleet saturation experiment (22 live workers, load average ~152)
-/// pushed individual task times past an hour and broke pane spawn acks, so
-/// dispatch is held to one page's worth — the pre-Lower-Decks size — even
-/// though all 16 slots exist. Deliberately hardcoded per operator directive
-/// until remote workers / the dynamic pane-budget model land (see
-/// docs/designs/fleet-scaling-dynamic-panes-and-team-semantics.md); enforced
-/// in `drain_ready_queue`, deliberately NOT in `claim_worker_force` (an
-/// explicit operator `bossctl agents launch` may exceed the cap).
+/// keeps the cap's load-bearing promise (never more than the configured cap
+/// of live interactive-pool workers, spilled automation included) intact,
+/// while the once-per-pass automation-preemption fallback in
+/// `drain_ready_queue` is what keeps mainline from starving behind spilled
+/// automation at the cap — a preemption is a trade (one live worker for
+/// another), so it can reclaim a slot from spilled automation without ever
+/// pushing the live count past the cap. The interactive pool has 16 slots
+/// across two pages (Bridge Crew + Lower Decks); the 2026-07-15 full-fleet
+/// saturation experiment (22 live workers, load average ~152) pushed
+/// individual task times past an hour and broke pane spawn acks, which is
+/// why dispatch defaults to one page's worth — the pre-Lower-Decks size —
+/// even though all 16 slots exist.
+///
+/// The live cap is settable at runtime via
+/// [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+/// (`bossctl dispatch concurrency --set N`) and persisted in `state.db`, so
+/// it survives an engine restart. This constant is the value the coordinator
+/// seeds itself with at construction and the value tests get unless they
+/// override it. Any live value is clamped to `[1, MAX_WORKER_POOL_SIZE]` —
+/// enforced in `drain_ready_queue`, deliberately NOT in `claim_worker_force`,
+/// where an explicit `bossctl agents launch` may exceed the cap.
 pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
 
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
@@ -941,6 +947,10 @@ impl CubeClient for CommandCubeClient {
 #[derive(Debug, Clone)]
 pub struct WorkerPool {
     inner: Arc<Mutex<WorkerPoolInner>>,
+    /// Slot count, fixed at construction (slots are only ever claimed or
+    /// released, never added or removed). Cached outside the mutex so
+    /// [`WorkerPool::capacity_sync`] can be read without an `await`.
+    len: usize,
 }
 
 #[derive(Debug)]
@@ -1056,8 +1066,17 @@ impl WorkerPool {
             })
             .collect();
         Self {
+            len: clamped,
             inner: Arc::new(Mutex::new(WorkerPoolInner { workers })),
         }
+    }
+
+    /// Slot count, without locking. Equivalent to `capacity().await` but
+    /// usable from sync callers (e.g. clamping a requested concurrency cap
+    /// against the live pool size without threading `async` through every
+    /// caller of [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]).
+    pub fn capacity_sync(&self) -> usize {
+        self.len
     }
 
     /// Claim an idle worker for `execution_id`. Selection is deterministic and
@@ -1569,6 +1588,17 @@ impl DispatchPauseOrigin {
     }
 }
 
+/// Result of a successful [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+/// call. `applied` is the value actually stored; `clamped_from` is `Some(requested)`
+/// when the caller's request was above [`MAX_WORKER_POOL_SIZE`] and got rounded
+/// down, so the RPC/CLI layer can surface a clear message rather than
+/// pretending the request was honored verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetConcurrencyCapOutcome {
+    pub applied: usize,
+    pub clamped_from: Option<usize>,
+}
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionCoordinator {
@@ -1752,13 +1782,16 @@ pub struct ExecutionCoordinator {
     #[builder(default = Mutex::new(HashMap::new()))]
     refused_workspaces: Mutex<HashMap<String, Vec<String>>>,
     /// Ceiling used by the interactive-pool concurrency cap in
-    /// `drain_ready_queue`. Defaults to [`MAX_CONCURRENT_INTERACTIVE_WORKERS`];
-    /// tests that exercise automation spillover/preemption in isolation from
-    /// that unrelated, temporary cap raise it via
-    /// [`Self::with_max_concurrent_interactive_workers`] so the two features
-    /// don't collide at small pool sizes.
-    #[builder(default = MAX_CONCURRENT_INTERACTIVE_WORKERS)]
-    max_concurrent_interactive_workers: usize,
+    /// `drain_ready_queue`. Defaults to [`MAX_CONCURRENT_INTERACTIVE_WORKERS`].
+    /// Live-settable via [`Self::set_max_concurrent_interactive_workers`]
+    /// (an `AtomicUsize` so it can change on a shared `&self`, mirroring
+    /// `dispatch_paused`); `app.rs` seeds it from `state.db` at startup and
+    /// `bossctl dispatch concurrency --set N` changes it at runtime. Tests
+    /// that exercise automation spillover/preemption at small pool sizes
+    /// raise it via [`Self::with_max_concurrent_interactive_workers`] so the
+    /// cap doesn't collide with the path under test.
+    #[builder(default = AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS))]
+    max_concurrent_interactive_workers: AtomicUsize,
 }
 
 /// Check out a leased cube workspace to the head commit of a PR, so a reviewer
@@ -1850,7 +1883,7 @@ impl ExecutionCoordinator {
             automation_paused_since_epoch_s: AtomicU64::new(0),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
-            max_concurrent_interactive_workers: MAX_CONCURRENT_INTERACTIVE_WORKERS,
+            max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
         }
     }
 
@@ -2068,12 +2101,54 @@ impl ExecutionCoordinator {
     /// Override the interactive-pool concurrency cap ceiling (default
     /// [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]). Tests that exercise
     /// automation spillover/preemption at pool sizes at or near
-    /// [`WORKER_PAGE_SIZE`] raise this so the unrelated, temporary cap
-    /// doesn't hold mainline rows before they ever reach the spillover/
-    /// preemption path under test.
-    pub fn with_max_concurrent_interactive_workers(mut self, max: usize) -> Self {
-        self.max_concurrent_interactive_workers = max;
+    /// [`WORKER_PAGE_SIZE`] raise this so the cap doesn't hold mainline rows
+    /// before they reach the spillover/preemption path under test.
+    pub fn with_max_concurrent_interactive_workers(self, max: usize) -> Self {
+        self.max_concurrent_interactive_workers.store(max, Ordering::Release);
         self
+    }
+
+    /// Current interactive-pool concurrency cap.
+    pub fn max_concurrent_interactive_workers(&self) -> usize {
+        self.max_concurrent_interactive_workers.load(Ordering::Acquire)
+    }
+
+    /// Live-set the interactive-pool concurrency cap. `0` is rejected
+    /// outright with `Err` — it would wedge all mainline dispatch with no
+    /// error surface — and anything above the live main-pool capacity
+    /// (`self.worker_pool.capacity_sync()`, the same number
+    /// `handle_worker_pool_summary` reports and the value
+    /// `config.worker_pool_size`/`BOSS_WORKER_POOL_SIZE` produces at
+    /// construction) is clamped down to it, since there are no backing slots
+    /// or panes above that on this instance. Clamping against the live pool
+    /// rather than the compile-time [`MAX_WORKER_POOL_SIZE`] ceiling avoids
+    /// accepting a cap the configured pool can never fill, which would
+    /// otherwise reproduce the same capacity-vs-cap contradiction a
+    /// shrunk-and-capped pool is meant to avoid. Reported via
+    /// `Ok(SetConcurrencyCapOutcome::clamped_from)` so the caller can still
+    /// surface a clear message instead of pretending the request was
+    /// honored verbatim.
+    ///
+    /// The caller is responsible for persisting the new value to `state.db`
+    /// (see `handle_set_dispatch_concurrency` in `app/engine_meta.rs`) so it
+    /// survives an engine restart, and for calling [`Self::kick`] afterward
+    /// when raising the cap — a bare store here does not itself wake
+    /// `drain_ready_queue`, so a raised cap would otherwise sit unused until
+    /// the next naturally-triggered drain pass.
+    pub fn set_max_concurrent_interactive_workers(&self, requested: usize) -> Result<SetConcurrencyCapOutcome, String> {
+        if requested == 0 {
+            return Err(
+                "interactive concurrency cap must be at least 1 (0 would wedge all mainline dispatch)".to_string(),
+            );
+        }
+        let ceiling = self.worker_pool.capacity_sync().min(MAX_WORKER_POOL_SIZE);
+        let applied = requested.min(ceiling);
+        self.max_concurrent_interactive_workers
+            .store(applied, Ordering::Release);
+        Ok(SetConcurrencyCapOutcome {
+            applied,
+            clamped_from: (applied != requested).then_some(requested),
+        })
     }
 
     /// Install a dispatch-event sink. The production engine threads
@@ -3137,16 +3212,16 @@ impl ExecutionCoordinator {
                 continue;
             }
 
-            // TEMPORARY interactive-pool concurrency cap (operator directive,
-            // 2026-07-15): main-pool rows are held once the interactive
-            // pool's live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`],
-            // even though the pool has 16 slots. Automation and review rows
-            // dispatched from their OWN home pools are never held by this
-            // gate — their pools' own sizes govern them. Spilled automation
-            // is a different story: it claims an interactive-pool slot (see
-            // `claim_worker_spill`), so it DOES count toward the live number
-            // this cap compares against — see the constant's doc for why
-            // that's intentional.
+            // Interactive-pool concurrency cap (operator-settable — see
+            // `bossctl dispatch concurrency`, default [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]):
+            // main-pool rows are held once the interactive pool's live
+            // workers reach the configured cap, even though the pool has 16
+            // slots. Automation and review rows dispatched from their OWN
+            // home pools are never held by this gate — their pools' own
+            // sizes govern them. Spilled automation is a different story: it
+            // claims an interactive-pool slot (see `claim_worker_spill`), so
+            // it DOES count toward the live number this cap compares against
+            // — see the constant's doc for why that's intentional.
             //
             // Checked BEFORE `request_recorded` (same invariant the earlier,
             // pre-preemption gate carried): a capped row must never enter
@@ -3164,13 +3239,14 @@ impl ExecutionCoordinator {
             // its own `WorkerClaimed` emit); a capped row that doesn't is
             // deferred here with the `interactive_concurrency_cap` reason
             // and never touches the pipeline below. See the constant's doc
-            // for rationale and removal criteria.
+            // for rationale.
             let live_workers_at_cap_check = if is_main {
                 Some(self.worker_pool.busy_count().await)
             } else {
                 None
             };
-            let capped = live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers);
+            let capped =
+                live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
 
             if capped {
                 let claimed = if preempted_this_pass {
@@ -3188,7 +3264,7 @@ impl ExecutionCoordinator {
                 };
                 let Some(worker_id) = claimed else {
                     let live_workers = live_workers_at_cap_check.unwrap_or_default();
-                    let cap = self.max_concurrent_interactive_workers;
+                    let cap = self.max_concurrent_interactive_workers();
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -3197,6 +3273,18 @@ impl ExecutionCoordinator {
                         cap,
                         "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
                     );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "reason": "interactive_concurrency_cap",
+                                    "pool": pool_label,
+                                    "live_workers": live_workers,
+                                    "cap": cap,
+                                })),
+                        )
+                        .await;
                     self.record_dispatch_wait_reason(
                         &execution.id,
                         &format!(
@@ -3586,7 +3674,7 @@ impl ExecutionCoordinator {
                 .claim_worker_spill(
                     &execution.id,
                     preferred_workspace_id.as_deref(),
-                    self.max_concurrent_interactive_workers,
+                    self.max_concurrent_interactive_workers(),
                 )
                 .await
             else {
@@ -3595,7 +3683,7 @@ impl ExecutionCoordinator {
                 // row waits, exactly as it did before spillover existed.
                 let pool_capacity = self.automation_pool.capacity().await;
                 let live_workers = self.worker_pool.busy_count().await;
-                let cap = self.max_concurrent_interactive_workers;
+                let cap = self.max_concurrent_interactive_workers();
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -8144,7 +8232,7 @@ mod tests {
         );
     }
 
-    /// The temporary interactive-pool concurrency cap
+    /// The interactive-pool concurrency cap
     /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
     /// already carries the capped number of live workers, a drain pass holds
     /// every main-pool `ready` row — no run starts, no cube work happens, the
@@ -8172,6 +8260,7 @@ mod tests {
         });
         // Pool has idle slots beyond the cap — the cap, not slot
         // availability, must be what holds the row.
+        let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
         let coordinator = Arc::new(
             ExecutionCoordinator::new(
                 db.clone(),
@@ -8179,7 +8268,8 @@ mod tests {
                 cube.clone(),
                 runner.clone(),
             )
-            .with_pre_start_retry_delays(Vec::new()),
+            .with_pre_start_retry_delays(Vec::new())
+            .with_dispatch_events(recording.clone()),
         );
         for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
             coordinator
@@ -8202,6 +8292,37 @@ mod tests {
             "wait reason should name the cap, got: {reason}",
         );
 
+        // `bossctl dispatch stats` derives the held-row view entirely from
+        // this event — assert it, not just the DB-level wait reason above,
+        // so a future refactor that drops the emit fails a test instead of
+        // silently going unobserved.
+        let events = recording.events_for(&execution.id).await;
+        let cap_event = events
+            .iter()
+            .find(|e| {
+                e.stage == crate::dispatch_events::Stage::WorkerClaimed.as_str()
+                    && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str()
+            })
+            .expect("a WorkerClaimed/Skipped event must be emitted for the cap-held execution");
+        assert_eq!(
+            cap_event.details.get("reason").and_then(|v| v.as_str()),
+            Some("interactive_concurrency_cap"),
+            "details.reason must name the cap as the hold reason, got: {:?}",
+            cap_event.details,
+        );
+        assert_eq!(
+            cap_event.details.get("live_workers").and_then(|v| v.as_u64()),
+            Some(MAX_CONCURRENT_INTERACTIVE_WORKERS as u64),
+            "details.live_workers must record the live count at the cap check, got: {:?}",
+            cap_event.details,
+        );
+        assert_eq!(
+            cap_event.details.get("cap").and_then(|v| v.as_u64()),
+            Some(MAX_CONCURRENT_INTERACTIVE_WORKERS as u64),
+            "details.cap must record the active cap, got: {:?}",
+            cap_event.details,
+        );
+
         // One worker frees → the next drain dispatches the held row.
         coordinator.worker_pool().release_worker("worker-1", None).await;
         coordinator.drain_ready_queue().await;
@@ -8209,6 +8330,136 @@ mod tests {
         assert!(
             !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
             "row must dispatch once the pool drops below the cap",
+        );
+    }
+
+    /// [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+    /// rejects `0` outright and clamps anything above
+    /// [`MAX_WORKER_POOL_SIZE`] down to it, reporting which happened via
+    /// [`SetConcurrencyCapOutcome`] rather than silently doing something
+    /// other than what was asked. Uses a full-size pool so the ceiling
+    /// under test is the compile-time [`MAX_WORKER_POOL_SIZE`], not the
+    /// live pool capacity (see
+    /// `set_max_concurrent_interactive_workers_clamps_to_live_pool_capacity`
+    /// for the shrunk-pool case).
+    #[tokio::test]
+    async fn set_max_concurrent_interactive_workers_rejects_zero_and_clamps_overflow() {
+        use crate::coordinator::{MAX_CONCURRENT_INTERACTIVE_WORKERS, MAX_WORKER_POOL_SIZE};
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = ExecutionCoordinator::new(db, WorkerPool::new(MAX_WORKER_POOL_SIZE), cube, runner);
+
+        let err = coordinator
+            .set_max_concurrent_interactive_workers(0)
+            .expect_err("0 must be rejected, not silently clamped to 1");
+        assert!(err.contains("at least 1"), "error should explain the floor, got: {err}");
+        assert_eq!(
+            coordinator.max_concurrent_interactive_workers(),
+            MAX_CONCURRENT_INTERACTIVE_WORKERS,
+            "a rejected set must not change the live value",
+        );
+
+        let outcome = coordinator
+            .set_max_concurrent_interactive_workers(MAX_WORKER_POOL_SIZE + 5)
+            .expect("above-ceiling values clamp rather than error");
+        assert_eq!(outcome.applied, MAX_WORKER_POOL_SIZE);
+        assert_eq!(outcome.clamped_from, Some(MAX_WORKER_POOL_SIZE + 5));
+        assert_eq!(coordinator.max_concurrent_interactive_workers(), MAX_WORKER_POOL_SIZE);
+
+        let outcome = coordinator
+            .set_max_concurrent_interactive_workers(12)
+            .expect("an in-range value applies verbatim");
+        assert_eq!(outcome.applied, 12);
+        assert_eq!(outcome.clamped_from, None);
+        assert_eq!(coordinator.max_concurrent_interactive_workers(), 12);
+    }
+
+    /// On a `BOSS_WORKER_POOL_SIZE`-shrunk instance (a test instance, e.g.
+    /// pool size 2), the clamp ceiling must be the live pool capacity, not
+    /// the compile-time [`MAX_WORKER_POOL_SIZE`] — otherwise `--set 16` is
+    /// accepted unclamped and `bossctl agents pools` prints a cap the pool
+    /// can never fill, reproducing the exact capacity-vs-cap contradiction
+    /// this clamp exists to prevent.
+    #[tokio::test]
+    async fn set_max_concurrent_interactive_workers_clamps_to_live_pool_capacity() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner::default());
+        let coordinator = ExecutionCoordinator::new(db, WorkerPool::new(2), cube, runner);
+
+        let outcome = coordinator
+            .set_max_concurrent_interactive_workers(16)
+            .expect("above-capacity values clamp rather than error");
+        assert_eq!(
+            outcome.applied, 2,
+            "clamp must use the live 2-slot pool capacity, not MAX_WORKER_POOL_SIZE"
+        );
+        assert_eq!(outcome.clamped_from, Some(16));
+        assert_eq!(coordinator.max_concurrent_interactive_workers(), 2);
+    }
+
+    /// Raising the interactive-pool concurrency cap live — without
+    /// recreating the coordinator, mirroring what `bossctl dispatch
+    /// concurrency --set N` does against a running engine — lets a row
+    /// already held at the old cap dispatch on the very next drain pass.
+    /// This is the behavior the `SetDispatchConcurrency` RPC handler's
+    /// `kick()` call exists for: a bare atomic store is not itself
+    /// observed until something re-runs `drain_ready_queue`.
+    #[tokio::test]
+    async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
+        use crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS;
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Held then unblocked");
+        db.reconcile_product_executions(&product.id).unwrap();
+        let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Ready);
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(
+            ExecutionCoordinator::new(
+                db.clone(),
+                WorkerPool::new(MAX_CONCURRENT_INTERACTIVE_WORKERS + 4),
+                cube,
+                runner,
+            )
+            .with_pre_start_retry_delays(Vec::new()),
+        );
+        for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
+            coordinator
+                .worker_pool()
+                .claim_worker(&format!("exec-busy-{i}"), None)
+                .await
+                .expect("idle slot below the cap");
+        }
+
+        coordinator.drain_ready_queue().await;
+        assert!(
+            db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+            "row must be held at the cap before it is raised",
+        );
+
+        // Raise the cap live (no new coordinator, no released worker) —
+        // exactly what the RPC handler does — then re-drain without
+        // freeing any of the already-claimed slots.
+        let outcome = coordinator
+            .set_max_concurrent_interactive_workers(MAX_CONCURRENT_INTERACTIVE_WORKERS + 1)
+            .expect("in-range raise applies verbatim");
+        assert_eq!(outcome.applied, MAX_CONCURRENT_INTERACTIVE_WORKERS + 1);
+        coordinator.drain_ready_queue().await;
+
+        wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+        assert!(
+            !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+            "row must dispatch once the live cap is raised, with no slot ever released",
         );
     }
 

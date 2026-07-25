@@ -236,6 +236,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::MetricsListLiveResult { .. }
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
+        | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::AutomationStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }

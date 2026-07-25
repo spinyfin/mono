@@ -58,6 +58,14 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 /// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
 pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
 
+/// Metadata key for the interactive-pool concurrency cap (`bossctl dispatch
+/// concurrency --set N`). Stores the decimal `usize` limit; absent or
+/// unparseable defaults to
+/// [`crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS`]. Persisted on
+/// every `SetDispatchConcurrency` call so the cap survives an engine restart
+/// — see `handle_set_dispatch_concurrency` in `app/engine_meta.rs`.
+pub(super) const METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT: &str = "dispatch_concurrency_limit";
+
 /// Metadata key for the global automation-pause flag — independent of
 /// [`METADATA_KEY_DISPATCH_PAUSED`]. `"1"` = paused, `"0"` or absent =
 /// running. Persisted at every toggle so the pause survives an engine
@@ -368,6 +376,21 @@ pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64) {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     (paused, since_epoch_s)
+}
+
+/// Read the persisted interactive-pool concurrency cap from the metadata KV.
+/// On first boot, or if absent/unparseable, defaults to
+/// [`crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS`] — the same
+/// default the coordinator's own field carries, so an engine that has never
+/// had the cap changed behaves identically with or without this call.
+pub(super) fn load_dispatch_concurrency_limit(work_db: &WorkDb) -> usize {
+    work_db
+        .get_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&limit| limit > 0)
+        .unwrap_or(crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS)
 }
 
 /// Downcast `err` to `DuplicateTaskError` and return a structured

@@ -1616,6 +1616,15 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "automation_state_result",
         },
+        TagCase {
+            label: "DispatchConcurrencyResult",
+            event: FrontendEvent::DispatchConcurrencyResult {
+                limit: 8,
+                max: 16,
+                clamped_from: None,
+            },
+            expected_tag: "dispatch_concurrency_result",
+        },
     ]
 }
 
@@ -1754,6 +1763,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsListLiveResult { .. }
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
+        | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }

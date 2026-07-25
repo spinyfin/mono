@@ -317,6 +317,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DebugLiveStatusPipeline
         | FrontendRequest::ExecutionTranscript { .. }
         | FrontendRequest::FocusWorkerPane { .. }
+        | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
         | FrontendRequest::GetSettings
@@ -340,6 +341,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }
         | FrontendRequest::SendInputToWorker { .. }
+        | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetLiveStatusEnabled { .. }
