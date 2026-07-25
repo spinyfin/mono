@@ -86,6 +86,16 @@ final class ChatViewModel: ObservableObject {
     /// Open `deferred_scope` attention items keyed by product id. See
     /// `ChatViewModel+DeferredScope.swift`.
     @Published var deferredScopeAttentionsByProductID: [String: [DeferredScopeAttention]] = [:]
+    /// Attention item ids for which `accept_deferred_scope_attention` or
+    /// `create_task_from_deferred_scope_attention` has been sent but neither
+    /// the success push (`attentionItemUpdated`/`attentionItemConverted`) nor
+    /// `work_error` has arrived yet. Drives the popover row's disabled
+    /// "acting" state — published (unlike `mergingWhenReadyIDs`) because the
+    /// row reads it directly to know when to re-enable. Cleared wholesale on
+    /// any `work_error` and on `.disconnected` (see
+    /// `ChatViewModel+EventHandling.swift`) so a failed request or a dropped
+    /// connection never leaves a row stuck disabled.
+    @Published var deferredScopeActionInFlightIDs: Set<String> = []
     /// Attention *groups* keyed by product id — the agent-authored
     /// notification feature (attentions.md), distinct from the operational
     /// `attentionItemsByWorkItemID` store above. Loaded on product selection /

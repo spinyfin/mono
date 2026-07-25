@@ -42,8 +42,8 @@ extension ChatViewModel {
             if let productID = currentSelectedProductID {
                 // Cold-start population of the restored product. NOTE: the
                 // `.productsList` handler below fetches this same product a
-                // SECOND time (the confirmed cold-start double-fetch, T2101
-                // R2) — the per-product fetch counter makes both visible.
+                // SECOND time (a confirmed cold-start double-fetch) — the
+                // per-product fetch counter makes both visible.
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
@@ -66,6 +66,10 @@ extension ChatViewModel {
                     automationsFetchStateByProductID[productID] = .failed("Connection lost")
                 }
             }
+            // A request in flight when the link drops can never complete;
+            // without this, a disconnect mid-request leaves the row
+            // permanently disabled since no work_error will ever arrive.
+            deferredScopeActionInFlightIDs.removeAll()
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, _):
             if CommentEngineBridge.isCommentTopic(topic) {
@@ -151,6 +155,7 @@ extension ChatViewModel {
             openingLiveWorkspaceTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
+            deferredScopeActionInFlightIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
