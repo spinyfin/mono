@@ -24,7 +24,7 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::driver::ClaudeDriver;
+use crate::driver::{AgentDriver, ClaudeDriver};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -430,6 +430,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             shell_pid,
             input.work_item_binding,
         );
+        // Declare this slot's driver-reported progress fidelity so
+        // `stale_worker_sweep` judges cadence-based staleness against the
+        // driver that is actually running, not an assumed Claude rhythm
+        // (see `ProgressFidelity::stale_threshold_secs`). `ClaudeDriver`
+        // always declares `Rich`, so this is a no-op today; it becomes
+        // load-bearing the moment `write_workspace_files` above resolves a
+        // non-Claude driver instead of the hardcoded one.
+        live_states.set_progress_fidelity(slot_id, ClaudeDriver.progress_fidelity());
         spawner.publish_live_worker_states().await;
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down

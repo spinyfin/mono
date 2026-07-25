@@ -505,12 +505,77 @@ pub enum WorkerErrorClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressFidelity {
     /// Per-tool events plus lifecycle. Claude provides this from its hook
-    /// stream — `PreToolUse`/`PostToolUse` give per-tool granularity.
+    /// stream — `PreToolUse`/`PostToolUse` give per-tool granularity. A
+    /// stdout-JSONL driver whose stream carries the same per-tool-call
+    /// boundary (e.g. `item.started`/`item.completed`) also declares this
+    /// tier — the tier is about resolution, not transport.
     Rich,
     /// Turn + lifecycle boundaries only, with no per-tool granularity.
     Coarse,
     /// Process alive/exited only — no in-run signal.
     Minimal,
+}
+
+impl ProgressFidelity {
+    /// Cadence-based staleness threshold this tier can support, given the
+    /// threshold Claude's `Rich` tier uses today (`stale_worker_sweep`'s
+    /// `DEFAULT_STALE_THRESHOLD_SECS`). `None` means this tier must **not**
+    /// be judged by event cadence at all — the caller should exempt it from
+    /// [`crate`]'s stale-worker sweep and rely on a different backstop
+    /// (process liveness).
+    ///
+    /// ## The decision this encodes
+    ///
+    /// The sweep's `current_tool.is_some()` guard already protects any
+    /// `Rich`-tier driver through an arbitrarily long single tool call — a
+    /// `Rich` driver reports a start/end boundary around every tool, so
+    /// `Rich` reuses Claude's existing threshold unchanged (this is what
+    /// keeps "Claude's sweep behaviour must be unchanged" true by
+    /// construction: Claude declares `Rich`, so `default_stale_threshold_secs`
+    /// passes straight through).
+    ///
+    /// `Coarse` has no such guard: a coarse-tier driver reports only turn
+    /// boundaries, so `current_tool` never gets set and a legitimately-busy
+    /// worker mid-turn (e.g. deep in a long build with no per-tool event to
+    /// report) looks identical to a hung one under cadence alone. There is
+    /// no empirically-grounded per-tier threshold to substitute — picking
+    /// one would be guessing a number that either still false-positives on
+    /// a slow-but-healthy turn or is so generous it stops backstopping
+    /// anything. Given the task's own ordering ("erring toward 'too lax' is
+    /// recoverable by a human; erring toward 'too eager' destroys work"),
+    /// `Coarse` is exempted rather than assigned a guessed threshold.
+    /// `Minimal` (process-alive-only) has no event stream to key cadence
+    /// off at all, so it is exempted for the same reason the design doc's
+    /// risk register already named: "hold `Working` while alive, and exempt
+    /// minimal-tier drivers from the staleness sweep."
+    ///
+    /// Exempting `Coarse`/`Minimal` here does not leave those workers with
+    /// no liveness backstop at all — `dead_pid_sweep` still catches a
+    /// worker whose OS process has actually exited; what it can't catch is
+    /// a live-but-wedged one, which is the gap the design doc's risk
+    /// register already accepted for these tiers pending a future
+    /// liveness-only sweep (tracked separately, not part of this decision).
+    ///
+    /// ## The rejected alternative
+    ///
+    /// A blanket "stdout-JSONL drivers are exempt from cadence staleness"
+    /// rule was considered and rejected: Codex's stdout stream carries
+    /// `item.started`/`item.completed` around each tool call — the same
+    /// granularity Claude's hooks give — so a Codex driver correctly
+    /// declaring `Rich` gets the exact same protection Claude gets today.
+    /// Exempting it wholesale because its transport is stdout rather than
+    /// hooks would blind the sweep to a genuinely hung Codex worker for no
+    /// reason tied to the actual signal it emits — the row's own brief
+    /// names that failure mode ("a genuinely hung Codex worker is never
+    /// swept, holds its slot, and wedges dispatch") as a live risk this
+    /// exemption would reintroduce. The fidelity tier — not the transport —
+    /// is what determines whether cadence-based judgement is valid.
+    pub fn stale_threshold_secs(self, default_stale_threshold_secs: i64) -> Option<i64> {
+        match self {
+            ProgressFidelity::Rich => Some(default_stale_threshold_secs),
+            ProgressFidelity::Coarse | ProgressFidelity::Minimal => None,
+        }
+    }
 }
 
 /// Inputs the rich-tier ProgressObservation wiring needs to point a worker's
@@ -744,6 +809,11 @@ pub trait AgentDriver: Send + Sync {
 
     /// Fidelity tier of the [`WorkerEvent`] stream this driver produces.
     /// Claude declares [`ProgressFidelity::Rich`] (per-tool hook events).
+    ///
+    /// Consumed by the engine's stale-worker sweep (`stale_worker_sweep.rs`)
+    /// via [`ProgressFidelity::stale_threshold_secs`] to decide whether — and
+    /// at what threshold — a slot running this driver is eligible for
+    /// cadence-based staleness detection at all.
     fn progress_fidelity(&self) -> ProgressFidelity;
 
     /// Build the driver's event-source wiring so the worker emits a lifecycle
@@ -1084,6 +1154,21 @@ mod tests {
         assert!(config.is_revision);
         assert!(config.is_standard_worker);
         assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
+    }
+
+    #[test]
+    fn rich_fidelity_reuses_the_passed_in_default_threshold_unchanged() {
+        // Claude declares Rich; the sweep must reuse whatever threshold it is
+        // configured with (30 min in production) so its behaviour is
+        // unchanged by this mapping existing.
+        assert_eq!(ProgressFidelity::Rich.stale_threshold_secs(1_800), Some(1_800));
+        assert_eq!(ProgressFidelity::Rich.stale_threshold_secs(42), Some(42));
+    }
+
+    #[test]
+    fn coarse_and_minimal_fidelity_are_exempt_from_cadence_staleness() {
+        assert_eq!(ProgressFidelity::Coarse.stale_threshold_secs(1_800), None);
+        assert_eq!(ProgressFidelity::Minimal.stale_threshold_secs(1_800), None);
     }
 
     #[test]
