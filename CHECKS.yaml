@@ -150,3 +150,55 @@ checks:
           pattern: "(?i)\\brevision cycle\\b"
           message: "Do not reference Boss's internal revision-cycle vocabulary (\"revision cycle\") in the PR description or commit message; describe the change itself."
           severity: warning
+
+  # File-content sibling of boss-ism/pr-text-leakage: catches a leaked Boss
+  # work-item id (e.g. a stray provenance comment) landing directly in source,
+  # not just PR-visible text. Left at the framework's default `scope: files`
+  # (NOT `scope: changeset`) — a changeset-scope run carries no file diffs, so
+  # `config.surfaces: [files]` would scan nothing and `changed_lines_only`
+  # would silently no-op.
+  #
+  # Carries only the work-item-id pattern, not the "the operator" / "per the
+  # brief" / "this chore" / "revision cycle" patterns from the changeset
+  # instance above — those are ordinary English with real hits in file
+  # content (source comments, docs) that a file scan can't disambiguate from
+  # a leak the way a changeset-text scan can.
+  #
+  # `policy.changed_lines_only: true` scopes findings to lines the PR itself
+  # adds or modifies, so this repo's own hundreds of pre-existing, legitimate
+  # `T<n>`/`P<n>` provenance comments (this is Boss's own tracker vocabulary,
+  # used correctly throughout engine/core and tools/checkleft) do not need a
+  # blanket exclusion — they simply never come up as changed lines. This is a
+  # documented no-op under `checkleft run --all` (no hunk data to scope
+  # against, so an `--all` run reports every existing occurrence, expected
+  # behaviour for a manual full-repo sweep, not a regression).
+  #
+  # `\d{3,}` floors the id at 3 digits (vs. the changeset instance's
+  # unfloored `\d+`) to avoid false positives on new lines this pattern would
+  # otherwise catch: ISO-8601 "T" time separators (`2024-01-01T00:00:00`),
+  # percentile labels (`P25`/`P75`), and short tie-placement notation. Chosen
+  # to match flunge's `boss-ism/file-text-leakage` instance (see
+  # brianduff/flunge#1133) for consistency across the two repos.
+  #
+  # Severity is `warning`, not `error`: unlike a PR description (which is
+  # trivial to edit before merge), a false-positive-shaped id landing in a
+  # source comment is not worth hard-blocking the push gate over — a human
+  # reviewer can weigh in without this becoming red CI.
+  - id: boss-ism/file-text-leakage
+    check: text/forbidden-pattern
+    policy:
+      severity: warning
+      changed_lines_only: true
+    exclude:
+      # This file's own tests exercise `BOSS_ID_RE` against literal
+      # `T<n>`/`P<n>` fixture strings (e.g. "T339", "T5Config", "T100") as
+      # its entire purpose — new test cases necessarily add more of them.
+      - "tools/boss/engine/core/src/boss_construct_scan.rs"
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: boss-work-item-id
+          pattern: '\b[TP]\d{3,}\b'
+          message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in source. Remove the reference; if provenance is genuinely needed, put it in the PR description instead."
+          severity: warning
