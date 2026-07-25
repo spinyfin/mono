@@ -22,7 +22,7 @@ async fn trunk_eviction_flips_in_review_to_blocked_ci_failure() {
         Some("feature-branch"),
         "36883b5b-bbae-4841-b239-a554d73e6f30",
         "2026-07-23T01:32:50.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped, "eviction detection must flip chore to ci_failure");
@@ -131,7 +131,7 @@ async fn trunk_eviction_detection_idempotent_on_same_episode() {
         Some("feature"),
         "entry-A",
         "2026-07-23T02:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     let second = on_trunk_queue_eviction_detected(
@@ -141,7 +141,7 @@ async fn trunk_eviction_detection_idempotent_on_same_episode() {
         Some("feature"),
         "entry-A",
         "2026-07-23T02:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(first, "first detection must flip the chore");
@@ -180,7 +180,7 @@ async fn trunk_eviction_new_state_changed_at_on_same_entry_id_is_a_new_episode()
         Some("feature"),
         "entry-stable",
         "2026-07-23T03:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(first);
@@ -192,7 +192,7 @@ async fn trunk_eviction_new_state_changed_at_on_same_entry_id_is_a_new_episode()
         Some("feature"),
         "entry-stable",
         "2026-07-23T04:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(second, "a new stateChangedAt on the same entry id must bounce again");
@@ -231,7 +231,7 @@ async fn trunk_eviction_lands_exhausted_when_budget_is_zero() {
         Some("feature"),
         "entry-exhausted",
         "2026-07-23T05:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped);
@@ -269,7 +269,7 @@ async fn trunk_eviction_honors_manual_suppression() {
         Some("feature"),
         "entry-suppressed",
         "2026-07-23T06:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(!flipped, "manually suppressed episode must not flip the chore");
@@ -297,7 +297,7 @@ async fn trunk_eviction_block_is_not_cleared_by_head_branch_ci() {
         Some("feature"),
         "entry-noclear",
         "2026-07-23T07:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
 
@@ -359,7 +359,7 @@ async fn trunk_eviction_block_clears_once_the_revision_lands() {
         Some("feature"),
         "entry-lands",
         "2026-07-23T08:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
 
@@ -439,7 +439,7 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
         Some("feature"),
         "entry-exhaust",
         "2026-07-23T09:00:00.000Z",
-        &[],
+        &one_failure(),
     )
     .await;
     assert!(flipped, "budget-exhausted episode still flips the parent");
@@ -462,4 +462,62 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
         .unwrap()
     };
     assert!(state.is_none(), "the card must leave the Merging lane");
+}
+
+/// Defence in depth for the T792/T793 shape: a queue-side episode carrying
+/// no failing check must not flip the row.
+///
+/// `trunk_queue_poller` now classifies the eviction before routing, so this
+/// should be unreachable in production — but the combination it guards
+/// against (a CI-fix attempt with nothing to fix) is what dispatched a worker
+/// that force-pushed an empty commit over flunge#1137's contents, so the
+/// shared queue-side helper refuses it regardless of caller. Applies to both
+/// arms: `merge_queue_rebounce` gets the same treatment.
+#[tokio::test]
+async fn a_queue_side_episode_with_no_failing_checks_does_not_flip_the_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1137";
+    let (product, chore) = make_in_review(&db, "C-queue-side-no-checks", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cand = candidate(&product, &chore, pr);
+
+    let evicted = on_trunk_queue_eviction_detected(
+        &db,
+        pub_.as_ref(),
+        &cand,
+        Some("feature"),
+        "entry-no-evidence",
+        "2026-07-25T03:54:24.000Z",
+        &[],
+    )
+    .await;
+    assert!(!evicted, "a Trunk eviction with no failing build must not flip");
+
+    let rebounced =
+        on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), "synthetic-sha", &[], &[]).await;
+    assert!(!rebounced, "a rebounce with no failing checks must not flip either");
+
+    let (status, reason) = chore_state(&db, &chore);
+    assert_eq!(status, TaskStatus::InReview, "the row stays where it was");
+    assert_eq!(reason, None);
+    assert!(
+        db.active_ci_remediation_for_work_item(&chore).unwrap().is_none(),
+        "no attempt row is created",
+    );
+    assert_eq!(
+        db.get_ci_attempts_used(&chore).unwrap(),
+        0,
+        "no CI attempt budget is consumed",
+    );
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let rev_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE kind = 'revision' AND parent_task_id = ?1",
+            rusqlite::params![&chore],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(rev_count, 0, "no 'Fix failing CI' revision is spawned");
 }

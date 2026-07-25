@@ -913,6 +913,34 @@ async fn on_queue_side_failure_detected(
         failure_kind,
         labels,
     } = episode;
+    if failures.is_empty() {
+        // Defence in depth, mirroring `on_ci_failure_detected`'s guard.
+        //
+        // A queue-side failure with no failing check to name is not a CI
+        // failure we can act on: `failed_checks` lands empty, the worker
+        // prompt has nothing to point at, and a CI attempt is spent on a
+        // task that cannot be completed. On T792/T793 that combination did
+        // real damage — the worker, told to find a build that did not exist
+        // and denied any bail-out, force-pushed an empty commit over the
+        // PR's entire contents. Refuse the flip instead.
+        //
+        // This should now be unreachable from the Trunk arm:
+        // `trunk_queue_poller::handle_trunk_queue_eviction` classifies the
+        // eviction first and only routes here when it has build evidence or
+        // no positive merge-side signal. Kept because a silent, budget-
+        // consuming misroute is a far worse failure mode than a refusal,
+        // and because `warn!` makes any future caller that trips it visible
+        // rather than mysterious.
+        tracing::warn!(
+            work_item_id = %candidate.work_item_id,
+            pr_url = %candidate.pr_url,
+            discriminator,
+            failure_kind,
+            "ci_watch: queue-side failure carried no failing checks; refusing to flip the row \
+             (nothing for a fix revision to act on)",
+        );
+        return false;
+    }
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;
     }

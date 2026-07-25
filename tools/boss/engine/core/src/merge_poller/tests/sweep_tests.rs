@@ -2062,7 +2062,16 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
         Some("feature-branch"),
         "synthetic-merge-sha",
         &[],
-        &[],
+        // A failing check from the synthetic merge commit: a queue-side
+        // failure with none is refused outright (there would be nothing for
+        // the fix revision to act on).
+        &[RequiredCheckFailure {
+            name: "ci/test".to_owned(),
+            conclusion: "FAILURE".to_owned(),
+            target_url: "https://buildkite.com/foo/bar/builds/42#job-uuid".to_owned(),
+            provider: CiProvider::Buildkite,
+            provider_job_id: Some("job-uuid".to_owned()),
+        }],
     )
     .await;
     assert!(flipped, "rebounce must be detected");
