@@ -746,7 +746,12 @@ pub trait AgentDriver: Send + Sync {
     /// For the Claude driver this is the identity — Claude's transcript already
     /// uses canonical names. Alternative drivers with different field shapes
     /// implement the remapping here so the redaction layer is unchanged.
-    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value;
+    ///
+    /// Takes `raw` by value: this runs on every polled transcript line on the
+    /// hot live-status path, and Claude's identity impl can then move it
+    /// straight through instead of deep-cloning a payload that may carry a
+    /// full `tool_response` body.
+    fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value;
 
     /// Extract the worker-halting API-error text from a normalised transcript
     /// tail, but only when it is the **last meaningful entry** (i.e. the worker
@@ -1081,8 +1086,8 @@ mod tests {
         fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
             None
         }
-        fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
-            raw.clone()
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
         }
         fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
             None

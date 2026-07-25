@@ -743,6 +743,18 @@ impl LiveStatusManager {
     }
 }
 
+/// Route freshly-polled transcript lines through the run's driver before
+/// they reach the redaction/summarizer pipeline. Pulled out of
+/// `run_slot_loop` so the wiring itself — not just
+/// `AgentDriver::normalize_transcript_entry` in isolation — has test
+/// coverage.
+fn normalize_lines<D: AgentDriver>(driver: &D, lines: Vec<Value>) -> Vec<Value> {
+    lines
+        .into_iter()
+        .map(|raw| driver.normalize_transcript_entry(raw))
+        .collect()
+}
+
 /// Per-slot loop body. Receives triggers on `rx`, runs the
 /// summarizer when appropriate, and writes the result back into the
 /// registry + broadcasts.
@@ -956,11 +968,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     // driver instead of hardcoding `ClaudeDriver`. For Claude
                     // this is a no-op passthrough — see
                     // `ClaudeDriver::normalize_transcript_entry`.
-                    transcript_buffer.extend(
-                        new_lines
-                            .into_iter()
-                            .map(|raw| ClaudeDriver.normalize_transcript_entry(&raw)),
-                    );
+                    transcript_buffer.extend(normalize_lines(&ClaudeDriver, new_lines));
                 }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");
@@ -1091,6 +1099,90 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex as TokioMutex;
+
+    use crate::driver::{
+        CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity,
+        ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+        WorkerErrorClass,
+    };
+    use async_trait::async_trait;
+    use boss_engine_structured_output::StructuredOutputKind;
+    use boss_engine_structured_output::fallback::FallbackCandidate;
+    use boss_protocol::{NormalizeError, WorkerEvent};
+    use std::path::Path;
+
+    /// Stub driver whose `normalize_transcript_entry` rewrites a marker
+    /// field, so `normalize_lines` tests can assert the wiring actually
+    /// routes lines through the driver rather than passing them through
+    /// untouched. Every other method is unreachable from these tests.
+    struct MarkingDriver;
+
+    #[async_trait]
+    impl AgentDriver for MarkingDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            unimplemented!()
+        }
+        fn capabilities(&self) -> CapabilitySet {
+            unimplemented!()
+        }
+        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+            unimplemented!()
+        }
+        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
+            unimplemented!()
+        }
+        fn progress_fidelity(&self) -> ProgressFidelity {
+            unimplemented!()
+        }
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+            unimplemented!()
+        }
+        fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            unimplemented!()
+        }
+        fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
+            unimplemented!()
+        }
+        fn agent_rules_preamble(&self) -> &'static str {
+            unimplemented!()
+        }
+        fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
+            unimplemented!()
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            let mut raw = raw;
+            raw["marked"] = serde_json::Value::Bool(true);
+            raw
+        }
+        fn extract_error_from_transcript(&self, _: &[serde_json::Value]) -> Option<String> {
+            unimplemented!()
+        }
+        fn classify_error(&self, _: &str) -> WorkerErrorClass {
+            unimplemented!()
+        }
+        fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn normalize_lines_routes_through_the_driver() {
+        // The regression this pins: the live-status loop must actually
+        // call `AgentDriver::normalize_transcript_entry` on polled lines,
+        // not just pass them through unchanged.
+        let lines = vec![
+            serde_json::json!({"tool_name": "Bash"}),
+            serde_json::json!({"tool_name": "Read"}),
+        ];
+        let out = normalize_lines(&MarkingDriver, lines);
+        assert_eq!(out.len(), 2);
+        for line in &out {
+            assert_eq!(line["marked"], serde_json::Value::Bool(true));
+        }
+    }
 
     #[derive(Default)]
     struct CountingBroadcaster {

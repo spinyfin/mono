@@ -632,12 +632,14 @@ impl AgentDriver for ClaudeDriver {
         if s.is_empty() { None } else { Some(s.to_owned()) }
     }
 
-    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+    fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
         // Claude's transcript JSONL is already in the canonical redactable
         // field shape (tool_name / tool_input / tool_response at the top level,
         // content[].type == "tool_use" blocks with name + input sub-fields).
-        // No remapping is needed; return the entry as-is.
-        raw.clone()
+        // No remapping is needed; return the entry as-is (moved, not cloned —
+        // this runs on every polled transcript line on the hot live-status
+        // path).
+        raw
     }
 
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
@@ -1084,7 +1086,7 @@ mod tests {
             "tool_input": {"command": "ls"},
             "tool_response": "file.txt\n",
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]
@@ -1096,7 +1098,7 @@ mod tests {
                 "content": [{"type": "text", "text": "working on it"}],
             }
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]
