@@ -1203,10 +1203,7 @@ impl ServerState {
 
         // Seed the interactive-pool concurrency cap from the engine metadata
         // KV — independent of the pause flags above. Set before any
-        // scheduler kicks so the cap is in place before the first drain
-        // pass; unlike the pause flags there is no "restoring an active
-        // state" log line needed since a cap change is not itself a
-        // notable/attention-worthy event the way a persisted pause is.
+        // scheduler kick so the cap is in place before the first drain pass.
         let dispatch_concurrency_limit = load_dispatch_concurrency_limit(&server_state.work_db);
         if dispatch_concurrency_limit != crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS {
             // `load_dispatch_concurrency_limit` already filters out 0, so

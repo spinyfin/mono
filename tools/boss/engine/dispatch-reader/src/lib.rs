@@ -367,11 +367,24 @@ pub fn compute_wait_stats(events: &[DispatchEvent], now_ms: u128, since_ms: Opti
             Some(ready) => (ready.ts_epoch_ms, ready.work_item_id.clone()),
             None => (evs[0].ts_epoch_ms, evs[0].work_item_id.clone()),
         };
+        // A row held before it ever reaches `request_recorded` — e.g. by
+        // the interactive concurrency cap, which skips it before that
+        // point — still carries `details.pool` on its `worker_claimed`/
+        // `skipped` event. Fall back to that before giving up on
+        // `"unknown"`, so a cap-held row still rolls up under its real
+        // pool in `summarize_queue_by_pool`.
         let pool = evs
             .iter()
             .find(|e| e.stage == "request_recorded")
             .and_then(|e| e.details.get("pool"))
             .and_then(|v| v.as_str())
+            .or_else(|| {
+                evs.iter()
+                    .rev()
+                    .find(|e| e.stage == "worker_claimed" && e.outcome == "skipped")
+                    .and_then(|e| e.details.get("pool"))
+                    .and_then(|v| v.as_str())
+            })
             .unwrap_or("unknown")
             .to_owned();
 
@@ -1182,6 +1195,27 @@ mod tests {
         )];
         let report = compute_wait_stats(&events, 1_000, None);
         assert_eq!(report.blocked_now[0].pool, "automation");
+    }
+
+    /// A row held by the interactive concurrency cap is skipped before it
+    /// ever emits `request_recorded` (see `coordinator.rs`'s cap-hold
+    /// path), so `pool` must fall back to the `worker_claimed`/`skipped`
+    /// event's own `details.pool` instead of defaulting to `"unknown"`.
+    #[test]
+    fn compute_wait_stats_falls_back_to_worker_claimed_pool_when_no_request_recorded() {
+        let events = vec![ev(
+            Stage::WorkerClaimed,
+            Outcome::Skipped,
+            "exec-cap-held",
+            0,
+            serde_json::json!({"reason": "interactive_concurrency_cap", "pool": "main"}),
+        )];
+        let report = compute_wait_stats(&events, 1_000, None);
+        assert_eq!(report.blocked_now.len(), 1);
+        assert_eq!(
+            report.blocked_now[0].pool, "main",
+            "no request_recorded event, but the skip event's own details.pool must still be used"
+        );
     }
 
     #[test]

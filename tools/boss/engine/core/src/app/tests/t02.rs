@@ -2243,6 +2243,54 @@ fn automation_paused_state_non_one_flag_is_not_paused() {
     );
 }
 
+// ── dispatch concurrency limit persistence ───────────────────────────────
+
+#[test]
+fn dispatch_concurrency_limit_defaults_when_absent() {
+    let (_dir, db) = open_temp_work_db();
+    assert_eq!(
+        load_dispatch_concurrency_limit(&db),
+        crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS,
+        "with no metadata key set, the limit defaults to MAX_CONCURRENT_INTERACTIVE_WORKERS"
+    );
+}
+
+#[test]
+fn dispatch_concurrency_limit_reads_persisted_value() {
+    let (_dir, db) = open_temp_work_db();
+    db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, "12").unwrap();
+    assert_eq!(
+        load_dispatch_concurrency_limit(&db),
+        12,
+        "a well-formed persisted value must parse verbatim"
+    );
+}
+
+#[test]
+fn dispatch_concurrency_limit_zero_falls_back_to_default() {
+    let (_dir, db) = open_temp_work_db();
+    // `0` would wedge all mainline dispatch, so it is filtered out just
+    // like an absent key rather than being honored verbatim.
+    db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, "0").unwrap();
+    assert_eq!(
+        load_dispatch_concurrency_limit(&db),
+        crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS,
+        "a persisted 0 must fall back to the default, not wedge dispatch at 0"
+    );
+}
+
+#[test]
+fn dispatch_concurrency_limit_garbage_falls_back_to_default() {
+    let (_dir, db) = open_temp_work_db();
+    db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, "not-a-number")
+        .unwrap();
+    assert_eq!(
+        load_dispatch_concurrency_limit(&db),
+        crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS,
+        "an unparseable persisted value must fall back to the default"
+    );
+}
+
 // ── duplicate_or_work_error ──────────────────────────────────────────────
 
 #[test]

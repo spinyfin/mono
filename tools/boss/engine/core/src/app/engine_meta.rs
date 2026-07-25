@@ -407,12 +407,17 @@ pub(super) async fn handle_get_dispatch_concurrency(ctx: Dispatch, req: Frontend
         unreachable!()
     };
     let limit = server_state.execution_coordinator.max_concurrent_interactive_workers();
+    let max = server_state
+        .execution_coordinator
+        .worker_pool()
+        .capacity_sync()
+        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
     send_response(
         &sink,
         &request_id,
         FrontendEvent::DispatchConcurrencyResult {
             limit,
-            max: crate::coordinator::MAX_WORKER_POOL_SIZE,
+            max,
             clamped_from: None,
         },
     );
@@ -438,6 +443,10 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
             return;
         }
     };
+    let max = coordinator
+        .worker_pool()
+        .capacity_sync()
+        .min(crate::coordinator::MAX_WORKER_POOL_SIZE);
     // Persist so the cap survives an engine restart — same pattern as
     // `handle_set_dispatch_paused`.
     if let Err(err) = work_db.set_metadata(METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, &outcome.applied.to_string()) {
@@ -471,7 +480,7 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
         tracing::warn!(
             requested,
             applied = outcome.applied,
-            max = crate::coordinator::MAX_WORKER_POOL_SIZE,
+            max,
             "dispatch_concurrency: requested value exceeded the worker-pool ceiling — clamped",
         );
     }
@@ -480,11 +489,10 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
         &request_id,
         FrontendEvent::DispatchConcurrencyResult {
             limit: outcome.applied,
-            max: crate::coordinator::MAX_WORKER_POOL_SIZE,
+            max,
             clamped_from: outcome.clamped_from,
         },
     );
-    server_state.broadcast_engine_health().await;
 }
 
 pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendRequest) {
