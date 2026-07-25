@@ -683,12 +683,15 @@ rollout posture ("baked-ins active everywhere from day one") into an
 operator opt-in: nothing about worker prompts changes until
 `editorial_controls = true` is set in `feature-flags.toml`.
 
-One as-built wrinkle: the flag gates only the prompt block. The
-audit path (`dispatch_editorial_on_pretooluse`) runs unconditionally
-— `editorial_actions` rows are written whether or not the flag is
-on, despite PR #1113's stated intent that audit writes be gated too.
-Harmless (the audit is observe-only) but inconsistent with the
-flag's documented contract.
+Fixed after PR #1113: the flag originally gated only the prompt
+block, leaving the audit path (`dispatch_editorial_on_pretooluse`)
+running unconditionally — `editorial_actions` rows were written
+whether or not the flag was on, despite PR #1113's stated intent
+that audit writes be gated too. `dispatch_editorial_on_pretooluse`
+now checks `editorial_controls` at entry, so with the flag off the
+PreToolUse editorial evaluation is skipped entirely and no audit row
+is written — matching the flag's documented contract. The tradeoff:
+with the flag off there is no editorial telemetry at all.
 
 ### Default rules — every product gets the baked-ins
 
@@ -1090,14 +1093,16 @@ Not yet shipped (open follow-ups, roughly in priority order):
    `template_body: None`, so `Enforce`-tier template findings never
    fire outside the prompt.
 3. **`TrailerPolicy` enforcement** (or removal of the inert knob).
-4. **Flag-gating the audit path**, to match PR #1113's stated
-   contract.
-5. **(Optional) `boss admin audit-pr-bodies <product>`.** Scan open
+4. **(Optional) `boss admin audit-pr-bodies <product>`.** Scan open
    PRs against the rules and emit a `WorkAttentionItem` per
    violation; the cleanup path for fail-open windows.
-6. **(Optional) Sub-agent rewriter for `Advise`-tier template
+5. **(Optional) Sub-agent rewriter for `Advise`-tier template
    policy.** One-shot Claude call rewrites a body to fit the
    template; strictly opt-in.
+
+Shipped since the list above: **flag-gating the audit path**, to
+match PR #1113's stated contract — `dispatch_editorial_on_pretooluse`
+now checks `editorial_controls` before evaluating or writing.
 
 ---
 

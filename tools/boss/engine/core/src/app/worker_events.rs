@@ -494,6 +494,11 @@ fn remote_worker_model_override(item: &boss_protocol::WorkItem) -> Option<String
 /// decision to `editorial_actions`. Emits a `work_editorial_action` topic
 /// event so subscribers (bossctl, kanban) can observe decisions live.
 ///
+/// Gated on the `editorial_controls` feature flag: this is the single
+/// choke-point call site [`crate::editorial_hook::evaluate_gh_pretooluse`]'s
+/// docs describe, so when the flag is off this function returns immediately
+/// and no `editorial_actions` row is written for the event.
+///
 /// Fails open on every error: a DB failure, a missing execution row, or an
 /// unresolvable product are all logged and dropped. The editorial controls are
 /// advisory-in-a-partition — never a hard block on the event loop.
@@ -504,6 +509,10 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     use crate::protocol::WorkerEvent;
     use boss_editorial::CompiledRules;
     use std::path::Path;
+
+    if !server_state.feature_flags.is_enabled("editorial_controls") {
+        return;
+    }
 
     let WorkerEvent::PreToolUse {
         tool_name, tool_input, ..
