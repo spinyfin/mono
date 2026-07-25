@@ -353,9 +353,11 @@ pub(crate) async fn reap_never_started_spawn(
     // current. Best-effort: a never-started spawn typically means
     // `provision_workspace` ran but `teardown_workspace` still gets its
     // chance regardless.
-    if let Some(workspace_path) = execution.workspace_path.as_deref() {
-        crate::driver_teardown::teardown_driver_workspace(execution_id, std::path::Path::new(workspace_path)).await;
-    }
+    crate::driver_teardown::teardown_driver_workspace(
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
 
     // Snapshot any uncommitted workspace work to a durable patch before the
     // slot is released and the workspace becomes eligible for re-lease/reset.

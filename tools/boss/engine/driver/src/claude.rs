@@ -483,7 +483,7 @@ impl AgentDriver for ClaudeDriver {
     /// the cube workspace — the `.claude/` config dir `provision_workspace`
     /// writes lives inside the workspace, which cube owns and tears down
     /// itself.
-    async fn teardown_workspace(&self, _workspace: &Path, _run_id: &str) -> anyhow::Result<()> {
+    async fn teardown_workspace(&self, _workspace: Option<&Path>, _run_id: &str) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1283,7 +1283,7 @@ mod tests {
         std::fs::write(workspace.path().join("marker.txt"), "untouched").unwrap();
 
         ClaudeDriver
-            .teardown_workspace(workspace.path(), "run-1")
+            .teardown_workspace(Some(workspace.path()), "run-1")
             .await
             .unwrap();
 
@@ -1297,6 +1297,14 @@ mod tests {
             1,
             "teardown must not create or remove any files in the workspace",
         );
+    }
+
+    #[tokio::test]
+    async fn teardown_workspace_succeeds_with_no_workspace_path() {
+        // Callers pass `None` when the workspace path was never recorded or
+        // was already cleared by a racing teardown; the no-op impl must not
+        // require a path to succeed.
+        ClaudeDriver.teardown_workspace(None, "run-1").await.unwrap();
     }
 
     #[test]

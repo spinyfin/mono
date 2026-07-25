@@ -67,9 +67,11 @@ impl WorkerCompletionHandler {
         // cascade cancel, and every other explicit teardown): tear down any
         // driver-owned state outside the workspace, using the path captured
         // before `clear_execution_workspace` nulled it.
-        if let Some(workspace_path) = cleared.workspace_path.as_deref() {
-            crate::driver_teardown::teardown_driver_workspace(execution_id, std::path::Path::new(workspace_path)).await;
-        }
+        crate::driver_teardown::teardown_driver_workspace(
+            execution_id,
+            cleared.workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         if let Err(err) = self.cube_client.release_workspace(&lease_id).await {
             tracing::warn!(
                 execution_id,

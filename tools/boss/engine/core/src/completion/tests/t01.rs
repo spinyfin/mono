@@ -1387,6 +1387,25 @@ async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
     );
 }
 
+/// Wiring coverage for `force_release` (finding: the ~15 teardown call
+/// sites had no test asserting teardown was actually invoked).
+#[tokio::test]
+async fn force_release_tears_down_driver_workspace() {
+    crate::driver_teardown::test_hooks::reset();
+
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    handler.force_release(&execution_id).await;
+
+    assert_eq!(
+        crate::driver_teardown::test_hooks::count(),
+        1,
+        "force_release must invoke driver teardown exactly once",
+    );
+}
+
 #[tokio::test]
 async fn force_release_no_lease_skips_cube_release() {
     let workspace = tempdir().unwrap();

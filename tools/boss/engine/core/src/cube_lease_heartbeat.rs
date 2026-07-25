@@ -773,9 +773,11 @@ async fn auto_reap_dead_lease(
     // any driver-owned state outside the workspace.
     // `mark_execution_orphaned` preserves `workspace_path`, so the
     // pre-call `execution` snapshot is still current.
-    if let Some(workspace_path) = execution.workspace_path.as_deref() {
-        crate::driver_teardown::teardown_driver_workspace(&execution.id, std::path::Path::new(workspace_path)).await;
-    }
+    crate::driver_teardown::teardown_driver_workspace(
+        &execution.id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
 
     if execution.kind == ExecutionKind::AutomationTriage {
         crate::execution_liveness::finalize_dead_automation_triage_run(

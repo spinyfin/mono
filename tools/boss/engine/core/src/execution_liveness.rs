@@ -254,9 +254,11 @@ pub async fn finalize_gone_execution(
             // tear down any driver-owned state outside the workspace.
             // `mark_execution_orphaned` preserves `workspace_path` on the
             // row, so the pre-call value on `execution` is still current.
-            if let Some(workspace_path) = execution.workspace_path.as_deref() {
-                crate::driver_teardown::teardown_driver_workspace(&execution.id, Path::new(workspace_path)).await;
-            }
+            crate::driver_teardown::teardown_driver_workspace(
+                &execution.id,
+                execution.workspace_path.as_deref().map(Path::new),
+            )
+            .await;
         }
         Err(err) => {
             let already_terminal = work_db
@@ -534,6 +536,39 @@ mod tests {
         let runs = db.list_automation_runs(&automation).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
+    }
+
+    /// Wiring coverage for `finalize_gone_execution` (finding: the ~15
+    /// teardown call sites had no test asserting teardown was actually
+    /// invoked).
+    #[tokio::test]
+    async fn finalize_gone_execution_tears_down_driver_workspace() {
+        crate::driver_teardown::test_hooks::reset();
+
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
+        seed_dispatch_run(&db, &automation, &exec.id);
+
+        let sink = RecordingDispatchEventSink::new();
+        let reconciled = finalize_gone_execution(
+            &db,
+            &sink,
+            &exec,
+            "reconcile for teardown wiring coverage",
+            "its cube workspace is gone",
+            Stage::LostWorkspaceReconcile,
+            reap_details(),
+        )
+        .await;
+
+        assert!(reconciled);
+        assert_eq!(
+            crate::driver_teardown::test_hooks::count(),
+            1,
+            "finalize_gone_execution must invoke driver teardown exactly once",
+        );
     }
 
     /// Still-live retry path (the `Err`-arm `!already_terminal` branch). When

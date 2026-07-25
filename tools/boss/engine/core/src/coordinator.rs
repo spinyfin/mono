@@ -6579,14 +6579,15 @@ impl ExecutionCoordinator {
                         // Stop termination path (mid-spawn cancel): tear
                         // down any driver-owned state outside the
                         // workspace, using the path captured before
-                        // `clear_execution_workspace` nulled it.
-                        if let Some(workspace_path) = cleared.workspace_path.as_deref() {
-                            crate::driver_teardown::teardown_driver_workspace(
-                                &execution.id,
-                                std::path::Path::new(workspace_path),
-                            )
-                            .await;
-                        }
+                        // `clear_execution_workspace` nulled it. Called
+                        // unconditionally (not gated on a workspace path)
+                        // since a driver may key its out-of-workspace state
+                        // by run id alone.
+                        crate::driver_teardown::teardown_driver_workspace(
+                            &execution.id,
+                            cleared.workspace_path.as_deref().map(std::path::Path::new),
+                        )
+                        .await;
                         match adapter.release_workspace(&cleared.lease_id).await {
                             Ok(()) => true,
                             Err(err) => {
@@ -6720,6 +6721,16 @@ impl ExecutionCoordinator {
                     .await;
             }
             Err(err) => {
+                // Pane-spawn-failure termination path: the run is
+                // unconditionally terminal from here (marked `failed`
+                // below regardless of whether the cube release below
+                // succeeds), so tear down any driver-owned state outside
+                // the workspace now — before the cube release, matching
+                // `force_release`'s ordering, so a driver that derives
+                // out-of-workspace state from the workspace path never
+                // races a concurrent re-lease of the same workspace once
+                // cube has it back.
+                crate::driver_teardown::teardown_driver_workspace(&execution.id, Some(&lease.workspace_path)).await;
                 let released = match adapter.release_workspace(&lease.lease_id).await {
                     Ok(()) => true,
                     Err(release_err) => {
@@ -6793,15 +6804,8 @@ impl ExecutionCoordinator {
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
-                        // Pane-spawn-failure termination path: the run is
-                        // durably `failed`. Tear down any driver-owned state
-                        // outside the workspace, mirroring provision_workspace
-                        // (which may already have run before the spawn itself
-                        // failed).
-                        if released {
-                            crate::driver_teardown::teardown_driver_workspace(&execution.id, &lease.workspace_path)
-                                .await;
-                        }
+                        // Driver teardown for this termination path already
+                        // ran unconditionally above, before the cube release.
                         // The execution is now durably `failed` in the DB —
                         // safe to have `pool_claim_sweep` own reclaiming this
                         // slot instead of releasing it immediately (see the
@@ -7260,6 +7264,20 @@ impl ExecutionCoordinator {
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<()> {
         let release_workspace = outcome.wait_state.release_workspace();
+
+        // Normal-completion termination path: `release_workspace` (not
+        // `released` below) is the actual terminality signal — a park
+        // (`release_workspace == false`) correctly skips teardown, but a
+        // release that is *attempted* and merely fails to reach cube is
+        // still a terminated run, so teardown must not be gated on the cube
+        // call's own success. Runs before the cube release (matching
+        // `force_release`'s ordering) so a driver that derives
+        // out-of-workspace state from the workspace path never races a
+        // concurrent re-lease of the same workspace once cube has it back.
+        if release_workspace {
+            crate::driver_teardown::teardown_driver_workspace(&execution.id, Some(&lease.workspace_path)).await;
+        }
+
         let released = if release_workspace {
             match adapter.release_workspace(&lease.lease_id).await {
                 Ok(()) => true,
@@ -7277,14 +7295,6 @@ impl ExecutionCoordinator {
         } else {
             false
         };
-
-        // Normal-completion termination path: the workspace lease was
-        // released, so this run is genuinely over (not a live park handing
-        // off to a pane). Tear down any driver-owned state outside the
-        // workspace to match.
-        if released {
-            crate::driver_teardown::teardown_driver_workspace(&execution.id, &lease.workspace_path).await;
-        }
 
         let attention = outcome.attention.map(|attention| CreateAttentionItemInput {
             execution_id: Some(execution.id.clone()),
@@ -7999,6 +8009,11 @@ mod tests {
         /// Handle used by the `cancelled_during_spawn` path to cancel the
         /// row before returning. `None` for the default fake.
         work_db: Option<Arc<WorkDb>>,
+        /// Overrides the default outcome's `wait_state` (`WaitingHuman`).
+        /// Used by teardown-wiring tests that need a `Terminal` /
+        /// `WaitingDependency` outcome to drive the coordinator down the
+        /// workspace-release path.
+        wait_state: Option<RunWaitState>,
     }
 
     impl Default for FakeExecutionRunner {
@@ -8013,6 +8028,7 @@ mod tests {
                 cancelled_during_spawn: false,
                 ack_timed_out: false,
                 work_db: None,
+                wait_state: None,
             }
         }
     }
@@ -8082,7 +8098,7 @@ mod tests {
             }
 
             Ok(RunOutcome {
-                wait_state: RunWaitState::WaitingHuman,
+                wait_state: self.wait_state.unwrap_or(RunWaitState::WaitingHuman),
                 result_summary: Some(format!("finished {}", execution.kind)),
                 attention: Some(RunAttention {
                     kind: "review_required".to_owned(),
@@ -8183,6 +8199,49 @@ mod tests {
         assert_eq!(cube.create_calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await.len(), 1);
         assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
+    }
+
+    /// Wiring coverage for `record_run_completion` (finding: teardown must
+    /// fire on the normal-completion termination path, and exactly once —
+    /// not zero times, not once per retry). Drives a `Terminal` outcome
+    /// through the real `coordinator.kick()` pipeline (dispatch →
+    /// `run_execution` → `record_run_completion`) rather than calling the
+    /// private method directly, so this also exercises the real call site.
+    #[tokio::test]
+    async fn record_run_completion_tears_down_driver_workspace_on_terminal_outcome() {
+        crate::driver_teardown::test_hooks::reset();
+
+        let dir = tempdir().unwrap();
+        let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+        db.reconcile_product_executions(&product.id).unwrap();
+
+        let cube = Arc::new(FakeCubeClient::default());
+        let runner = Arc::new(FakeExecutionRunner {
+            wait_state: Some(RunWaitState::Terminal),
+            ..FakeExecutionRunner::default()
+        });
+        let coordinator = Arc::new(ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(1),
+            cube.clone(),
+            runner.clone(),
+        ));
+        coordinator.kick();
+        wait_for_execution_status(
+            db.as_ref(),
+            &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+            ExecutionStatus::Completed,
+        )
+        .await;
+
+        assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+        assert_eq!(
+            crate::driver_teardown::test_hooks::count(),
+            1,
+            "driver teardown must fire exactly once on the normal-completion termination path",
+        );
     }
 
     /// Host-adapter provider that records every host the dispatch loop

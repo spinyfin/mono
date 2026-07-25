@@ -314,9 +314,11 @@ pub async fn run_one_pass(
         // driver-owned state outside the workspace. `mark_execution_orphaned`
         // preserves `workspace_path`, so the pre-call `execution` snapshot
         // is still current.
-        if let Some(workspace_path) = execution.workspace_path.as_deref() {
-            crate::driver_teardown::teardown_driver_workspace(execution_id, std::path::Path::new(workspace_path)).await;
-        }
+        crate::driver_teardown::teardown_driver_workspace(
+            execution_id,
+            execution.workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
 
         // Snapshot the wedged worker's uncommitted workspace work to a
         // durable patch before the slot is released and the workspace

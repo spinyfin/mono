@@ -537,13 +537,11 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                 );
                 // Manual-reap termination path: tear down any
                 // driver-owned state outside the workspace.
-                if let Some(workspace_path) = execution.workspace_path.as_deref() {
-                    crate::driver_teardown::teardown_driver_workspace(
-                        &execution.id,
-                        std::path::Path::new(workspace_path),
-                    )
-                    .await;
-                }
+                crate::driver_teardown::teardown_driver_workspace(
+                    &execution.id,
+                    execution.workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
                 // The execution row is now terminal, but marking it so
                 // does nothing to the worker-pool claim or the
                 // `LiveWorkerStateRegistry` entry a live pane may still

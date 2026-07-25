@@ -515,13 +515,11 @@ pub async fn run_one_pass(
                     Ok(orphaned) => {
                         // Reap termination path: tear down any driver-owned
                         // state outside the workspace.
-                        if let Some(workspace_path) = orphaned.workspace_path.as_deref() {
-                            crate::driver_teardown::teardown_driver_workspace(
-                                &execution_id,
-                                std::path::Path::new(workspace_path),
-                            )
-                            .await;
-                        }
+                        crate::driver_teardown::teardown_driver_workspace(
+                            &execution_id,
+                            orphaned.workspace_path.as_deref().map(std::path::Path::new),
+                        )
+                        .await;
                     }
                     Err(err) => {
                         tracing::debug!(

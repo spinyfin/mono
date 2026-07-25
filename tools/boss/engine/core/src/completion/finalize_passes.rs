@@ -257,13 +257,11 @@ impl WorkerCompletionHandler {
                 // Stop-driven completion termination path: tear down any
                 // driver-owned state outside the workspace, captured before
                 // `complete_pane_parked_execution` nulls `workspace_path`.
-                if let Some(workspace_path) = workspace_path.as_deref() {
-                    crate::driver_teardown::teardown_driver_workspace(
-                        &execution.id,
-                        std::path::Path::new(workspace_path),
-                    )
-                    .await;
-                }
+                crate::driver_teardown::teardown_driver_workspace(
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
             }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
@@ -373,13 +371,11 @@ impl WorkerCompletionHandler {
                 // Stop-driven completion termination path: tear down any
                 // driver-owned state outside the workspace, captured before
                 // `complete_pane_parked_execution` nulls `workspace_path`.
-                if let Some(workspace_path) = workspace_path.as_deref() {
-                    crate::driver_teardown::teardown_driver_workspace(
-                        &execution.id,
-                        std::path::Path::new(workspace_path),
-                    )
-                    .await;
-                }
+                crate::driver_teardown::teardown_driver_workspace(
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
             }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
