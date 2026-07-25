@@ -39,6 +39,7 @@ use sha2::{Digest, Sha256};
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 use crate::work::{WorkDb, WorkItem};
+use boss_protocol::ExecutionKind;
 
 /// Sonnet 4.6: latest released Sonnet at the time of writing — the
 /// design doc explicitly calls it out as the right speed/cost
@@ -142,6 +143,66 @@ pub fn ci_remediation_summary(task_name: &str) -> Option<String> {
         Some("fixing CI".to_owned())
     } else {
         Some(format!("fixing CI for {}", short.join(" ")))
+    }
+}
+
+/// Pane summary for `pr_review` workers. A reviewer's `work_item_id` is
+/// bound to the *reviewed* task (see `coordinator.rs`), so routing it
+/// through [`get_or_generate`] would read/overwrite the implementer's
+/// cached gerund for that same row — flapping both panes. Use a pure
+/// derived phrase instead, mirroring [`ci_remediation_summary`], so the
+/// pane reads `"<Name> is reviewing the PR for <task-name>"` rather than
+/// the implementer's own "addressing …" gerund.
+pub fn pr_review_summary(task_name: &str) -> Option<String> {
+    let short: Vec<String> = task_name.split_whitespace().take(4).map(|w| w.to_lowercase()).collect();
+    if short.is_empty() {
+        Some("reviewing a pull request".to_owned())
+    } else {
+        Some(format!("reviewing the PR for {}", short.join(" ")))
+    }
+}
+
+/// Pane summary for `answer_agent` workers. The synthetic work item's
+/// name/description are derived straight from the comment being answered
+/// (up to 600 raw chars of someone else's text as the "description") —
+/// feeding either through [`get_or_generate`] risks steering Claude toward
+/// the comment's own verb instead of "answering". A fixed derived phrase
+/// sidesteps the model call entirely, mirroring [`ci_remediation_summary`].
+pub fn answer_agent_summary() -> Option<String> {
+    Some("answering a doc comment".to_owned())
+}
+
+/// Route an execution kind to a *derived* pane-titlebar phrase, bypassing
+/// [`get_or_generate`] entirely — or `None` to say "fall through to the
+/// cached/LLM path".
+///
+/// `pane_summaries` is keyed by `work_item_id` alone, and `PrReview` and
+/// `ConflictResolution` executions bind `work_item_id` to the *reviewed/
+/// conflicted* task's own row (see `coordinator.rs`), same as
+/// `CiRemediation`. Routing any of them through `get_or_generate` — even
+/// with a kind-aware prompt — would read and overwrite the implementer's
+/// cached summary for that row, flapping both panes. `AnswerAgent`'s
+/// synthetic row has a different problem: its "description" is the raw
+/// body of the comment being answered, which can steer the model toward
+/// the comment's own verb instead of "answering". All four get a pure
+/// derived phrase instead, computed from data already in hand — no cache,
+/// no model call.
+///
+/// Matches [`ExecutionKind`] exhaustively per its doc comment so a new
+/// variant forces a decision here rather than silently falling through.
+pub fn derived_title_summary(kind: &ExecutionKind, task_name: &str) -> Option<Option<String>> {
+    match kind {
+        ExecutionKind::CiRemediation => Some(ci_remediation_summary(task_name)),
+        ExecutionKind::ConflictResolution => Some(conflict_resolution_summary(task_name)),
+        ExecutionKind::PrReview => Some(pr_review_summary(task_name)),
+        ExecutionKind::AnswerAgent => Some(answer_agent_summary()),
+        ExecutionKind::AutomationTriage
+        | ExecutionKind::ChoreImplementation
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::ProductDesign
+        | ExecutionKind::ProjectDesign
+        | ExecutionKind::RevisionImplementation
+        | ExecutionKind::TaskImplementation => None,
     }
 }
 
@@ -421,6 +482,86 @@ mod tests {
             conflict_resolution_summary("   ").as_deref(),
             Some("resolving merge conflicts"),
         );
+    }
+
+    #[test]
+    fn ci_remediation_summary_uses_first_three_words_of_task_name() {
+        assert_eq!(
+            ci_remediation_summary("Fix flaky fencer scraper test").as_deref(),
+            Some("fixing CI for fix flaky fencer"),
+        );
+    }
+
+    #[test]
+    fn ci_remediation_summary_handles_empty_task_name() {
+        assert_eq!(ci_remediation_summary("").as_deref(), Some("fixing CI"));
+        assert_eq!(ci_remediation_summary("   ").as_deref(), Some("fixing CI"));
+    }
+
+    #[test]
+    fn pr_review_summary_uses_first_four_words_of_task_name() {
+        assert_eq!(
+            pr_review_summary("Address automated PR review findings").as_deref(),
+            Some("reviewing the PR for address automated pr review"),
+        );
+    }
+
+    #[test]
+    fn pr_review_summary_handles_empty_task_name() {
+        assert_eq!(pr_review_summary("").as_deref(), Some("reviewing a pull request"));
+        assert_eq!(pr_review_summary("   ").as_deref(), Some("reviewing a pull request"));
+    }
+
+    #[test]
+    fn answer_agent_summary_is_fixed() {
+        assert_eq!(answer_agent_summary().as_deref(), Some("answering a doc comment"));
+    }
+
+    #[test]
+    fn derived_title_summary_routes_cache_hazard_kinds_to_derived_phrases() {
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::CiRemediation, "Fix flaky test")
+                .unwrap()
+                .as_deref(),
+            Some("fixing CI for fix flaky test"),
+        );
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::ConflictResolution, "Fix flaky test")
+                .unwrap()
+                .as_deref(),
+            Some("resolving merge conflicts for fix flaky test"),
+        );
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::PrReview, "Fix flaky test")
+                .unwrap()
+                .as_deref(),
+            Some("reviewing the PR for fix flaky test"),
+        );
+        assert_eq!(
+            derived_title_summary(&ExecutionKind::AnswerAgent, "Answer comment: anything")
+                .unwrap()
+                .as_deref(),
+            Some("answering a doc comment"),
+        );
+    }
+
+    #[test]
+    fn derived_title_summary_falls_through_for_llm_backed_kinds() {
+        for kind in [
+            ExecutionKind::AutomationTriage,
+            ExecutionKind::ChoreImplementation,
+            ExecutionKind::InvestigationImplementation,
+            ExecutionKind::ProductDesign,
+            ExecutionKind::ProjectDesign,
+            ExecutionKind::RevisionImplementation,
+            ExecutionKind::TaskImplementation,
+        ] {
+            assert_eq!(
+                derived_title_summary(&kind, "Fix flaky test"),
+                None,
+                "{kind:?} should fall through to get_or_generate",
+            );
+        }
     }
 
     #[test]
