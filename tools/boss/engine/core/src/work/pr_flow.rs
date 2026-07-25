@@ -1046,13 +1046,15 @@ impl WorkDb {
                  ci_required_detail     = ?4,
                  review_required_detail = ?5,
                  merge_queue_state      = CASE WHEN ?8 THEN merge_queue_state ELSE ?6 END,
-                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END
+                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END,
+                 pr_mergeable_state     = ?9
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
                     OR (NOT ?8 AND (COALESCE(merge_queue_state, '') != COALESCE(?6, '')
-                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, ''))))",
+                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, '')))
+                    OR COALESCE(pr_mergeable_state, '') != ?9)",
             params![
                 work_item_id,
                 input.ci_required_state,
@@ -1062,6 +1064,7 @@ impl WorkDb {
                 input.merge_queue_state,
                 input.merge_queue_detail,
                 preserve,
+                input.pr_mergeable_state,
             ],
         )?;
         tx.commit()?;
@@ -1143,6 +1146,13 @@ pub struct PrPollStateInput<'a> {
     pub review_required_detail: Option<&'a str>,
     pub merge_queue_state: Option<&'a str>,
     pub merge_queue_detail: Option<&'a str>,
+    /// Raw GitHub mergeability (`"mergeable"` / `"conflicting"` / `"unknown"`)
+    /// for this probe, independent of CI/review/merge-queue state — see
+    /// `Task::pr_mergeable_state`. Defaults to `""` via `#[derive(Default)]`,
+    /// matching the `ci_required_state`/`review_required_state` convention of
+    /// treating an empty string as "not yet probed" at the DB layer (the
+    /// protocol layer instead normalizes empty to `None`, per `map_task`).
+    pub pr_mergeable_state: &'a str,
     /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
     /// untouched regardless of the values above — set by the caller for a
     /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by

@@ -199,10 +199,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_via: row.get(15)?,
         blocked_reason: row.get(16)?,
         blocked_attempt_id: row.get(17)?,
-        // Not part of the base 32-column SELECT; populated only by the
+        // Not part of the base 33-column SELECT; populated only by the
         // extended mappers below (mirrors archived_reason/dispatch_failed_*).
         blocked_detail: None,
-        // Not part of the base 32-column SELECT; populated only by
+        // Not part of the base 33-column SELECT; populated only by
         // map_task_with_parent_provenance_and_archived_reason when the
         // caller's query appends the trailing `archived_reason` column.
         archived_reason: None,
@@ -227,13 +227,14 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         merge_queue_state: row.get::<_, Option<String>>(29)?.filter(|s| !s.is_empty()),
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
+        pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
         // Standard queries omit the external_ref columns; the T8 methods
-        // use map_task_with_external_ref which adds columns 32-36.
+        // use map_task_with_external_ref which adds columns 33-37.
         // T1 schema columns; populated by T8 WorkDb methods when the migration
         // has run. Until then the protocol field carries None.
         external_ref: None,
         parent_task_id: None,
-        // completed_at is not in the base 32-column SELECT; extended
+        // completed_at is not in the base 33-column SELECT; extended
         // mappers (map_task_with_parent_and_provenance and
         // map_task_with_external_ref_parent_source_and_provenance) read it
         // from the appended column in their respective SELECTs.
@@ -286,52 +287,52 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
 }
 
 /// Like [`map_task`] but reads a trailing `source_automation_id` column
-/// at index 32 (after the `driver` column at 31). Used by
+/// at index 33 (after the `pr_mergeable_state` column at 32). Used by
 /// `list_tasks_for_automation` so produced tasks carry their provenance
 /// on the wire.
 pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    task.source_automation_id = row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty());
+    task.source_automation_id = row.get::<_, Option<String>>(33)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task`] but also reads a trailing `parent_task_id` column
-/// (index 32, i.e. appended right after `driver` at 31). Used by
+/// (index 33, i.e. appended right after `pr_mergeable_state` at 32). Used by
 /// `query_task` / `get_work_item_by_short_id`; the wider
 /// [`map_task_with_external_ref_and_parent`] reads `parent_task_id` from
-/// index 37 instead (after the external-ref columns at 32-36).
+/// index 38 instead (after the external-ref columns at 33-37).
 pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    task.parent_task_id = row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(33)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_parent`] but also reads `origin_task_short_id`
-/// (index 33), `origin_pr_number` (index 34), and `completed_at`
-/// (index 35). Used by `query_task`, `get_work_item_by_short_id`, and
+/// (index 34), `origin_pr_number` (index 35), and `completed_at`
+/// (index 36). Used by `query_task`, `get_work_item_by_short_id`, and
 /// `list_chores` when those columns are appended to the standard SELECT.
 pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent(row)?;
-    task.origin_task_short_id = row.get(33)?;
-    task.origin_pr_number = row.get(34)?;
-    task.completed_at = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
+    task.origin_task_short_id = row.get(34)?;
+    task.origin_pr_number = row.get(35)?;
+    task.completed_at = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
-/// `archived_reason` column (index 36), `dispatch_failed_*` (37-39),
-/// `blocked_detail` (40), and `deferred` (41). Used by `query_task` and
+/// `archived_reason` column (index 37), `dispatch_failed_*` (38-40),
+/// `blocked_detail` (41), and `deferred` (42). Used by `query_task` and
 /// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
 /// `get_work_item`) surface why the engine auto-archived a row, the
 /// verbatim blocked-status detail, and the future-scope classification.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
-    task.archived_reason = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_reason = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_error = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_at = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
-    task.blocked_detail = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
-    task.deferred = row.get::<_, i64>(41)? != 0;
+    task.archived_reason = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
+    task.blocked_detail = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
+    task.deferred = row.get::<_, i64>(42)? != 0;
     Ok(task)
 }
 
@@ -349,16 +350,16 @@ pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> Str
     String::new()
 }
 
-/// Like [`map_task`] but reads columns 32–36 carrying the external-ref
+/// Like [`map_task`] but reads columns 33–37 carrying the external-ref
 /// data and populates `Task.external_ref`. Used whenever the SELECT
 /// explicitly includes those columns (e.g. `get_work_tree`, `find_by_external_ref`).
-/// (Column 31 is `driver`, part of the base SELECT.)
+/// (Column 32 is `pr_mergeable_state`, part of the base SELECT.)
 pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    let kind: Option<String> = row.get(32)?;
-    let canonical_id: Option<String> = row.get(33)?;
+    let kind: Option<String> = row.get(33)?;
+    let canonical_id: Option<String> = row.get(34)?;
     if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
-        let raw_json: Option<String> = row.get(34)?;
+        let raw_json: Option<String> = row.get(35)?;
         let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
         let web_url = derive_external_ref_web_url(&kind, &canonical_id);
         task.external_ref = Some(WorkItemExternalRef {
@@ -366,49 +367,49 @@ pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task
             canonical_id,
             raw,
             web_url,
-            synced_at: row.get(35)?,
-            unbound_at: row.get(36)?,
+            synced_at: row.get(36)?,
+            unbound_at: row.get(37)?,
         });
     }
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref`] but also reads column 37 carrying
+/// Like [`map_task_with_external_ref`] but also reads column 38 carrying
 /// `parent_task_id`. Used in `get_work_tree` where the SELECT explicitly
-/// includes the external-ref columns (32–36) followed by `parent_task_id`.
+/// includes the external-ref columns (33–37) followed by `parent_task_id`.
 pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
-    task.parent_task_id = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref_and_parent`] but also reads column 38
+/// Like [`map_task_with_external_ref_and_parent`] but also reads column 39
 /// carrying `source_automation_id`. Used in `get_work_tree` so automation-
 /// produced tasks carry their provenance to the client (icon display + kanban
 /// filtering both key off this field).
 pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_and_parent(row)?;
-    task.source_automation_id = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
+    task.source_automation_id = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_external_ref_parent_and_source_automation_id`] but
-/// also reads `origin_task_short_id` (index 39), `origin_pr_number`
-/// (index 40), `completed_at` (index 41), the trailing
+/// also reads `origin_task_short_id` (index 40), `origin_pr_number`
+/// (index 41), `completed_at` (index 42), the trailing
 /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
-/// columns (indices 42-44), `blocked_detail` (index 45), and `deferred`
-/// (index 46). Used by `get_work_tree` for both task and chore queries,
+/// columns (indices 43-45), `blocked_detail` (index 46), and `deferred`
+/// (index 47). Used by `get_work_tree` for both task and chore queries,
 /// which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
-    task.origin_task_short_id = row.get(39)?;
-    task.origin_pr_number = row.get(40)?;
-    task.completed_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_reason = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_error = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_at = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
-    task.blocked_detail = row.get::<_, Option<String>>(45)?.filter(|s| !s.is_empty());
-    task.deferred = row.get::<_, i64>(46)? != 0;
+    task.origin_task_short_id = row.get(40)?;
+    task.origin_pr_number = row.get(41)?;
+    task.completed_at = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(45)?.filter(|s| !s.is_empty());
+    task.blocked_detail = row.get::<_, Option<String>>(46)?.filter(|s| !s.is_empty());
+    task.deferred = row.get::<_, i64>(47)? != 0;
     Ok(task)
 }
 

@@ -669,6 +669,26 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_detail: Option<String>,
 
+    /// Raw GitHub mergeability at last poll, independent of CI/review/merge-
+    /// queue state. One of `"mergeable"` (GitHub's `mergeable=MERGEABLE`),
+    /// `"conflicting"` (`mergeable=CONFLICTING` — the PR cannot be merged as
+    /// its head currently stands), or `"unknown"` (GitHub is still computing
+    /// mergeability, typically right after a base-branch move). `None` until
+    /// the merge poller has performed at least one successful probe on an
+    /// open PR.
+    ///
+    /// This is the only mergeability-derived signal on `Task` — unlike
+    /// `ci_required_state`, it says nothing about CI. A card can be
+    /// `merge_queue_state = Some("auto_merge_enabled")` (CI passing, auto-merge
+    /// armed) while this reads `"conflicting"`: that combination means "GitHub
+    /// will merge the moment the conflict clears," not "safe to merge now,"
+    /// and client badge logic must check both before claiming mergeability
+    /// (T3271 / mono#2303 — a card previously rendered a green "mergeable"
+    /// checkmark derived from CI alone while GitHub reported the PR
+    /// CONFLICTING).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_mergeable_state: Option<String>,
+
     /// Explicit model slug override. `None` → resolve via the design's
     /// Q3 precedence (effort default → product default → engine default).
     /// Stored verbatim — the engine does not validate the slug.

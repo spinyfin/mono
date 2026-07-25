@@ -1379,6 +1379,19 @@ pub(crate) fn ci_state_str(ci: &OpenPrCiStatus) -> &'static str {
     }
 }
 
+/// Derive the `pr_mergeable_state` string from a probe's raw GitHub
+/// mergeability (T3271 / mono#2303). This is the *only* signal that reflects
+/// whether the PR's head actually merges cleanly into its base — CI status
+/// and merge-queue/auto-merge arming are both silent on that question, so a
+/// client must not infer mergeability from either of them.
+pub(crate) fn mergeable_state_str(mergeability: OpenPrMergeability) -> &'static str {
+    match mergeability {
+        OpenPrMergeability::Clean => "mergeable",
+        OpenPrMergeability::Conflict => "conflicting",
+        OpenPrMergeability::Unknown => "unknown",
+    }
+}
+
 /// Build a compact JSON detail blob for failing CI checks (list of
 /// `{"name": "...", "conclusion": "..."}` objects). Returns `None`
 /// when the check list is empty so we don't write `"[]"` to the DB.
@@ -1425,6 +1438,7 @@ pub(crate) async fn update_pr_poll_state(
 
     let ci_state = ci_state_str(&open.ci);
     let review_state = probe.review.as_db_str();
+    let mergeable_state = mergeable_state_str(open.mergeability);
     let ci_detail = ci_detail_json(&open.ci);
     let review_detail = review_detail_json(probe.review.reviewers());
     let raw_merge_queue_state = merge_queue_state_str(probe.in_merge_queue, probe.auto_merge_enabled);
@@ -1481,6 +1495,7 @@ pub(crate) async fn update_pr_poll_state(
             merge_queue_state,
             merge_queue_detail: merge_queue_detail.as_deref(),
             preserve_merge_queue_state,
+            pr_mergeable_state: mergeable_state,
         },
     ) {
         Ok(outcome) => outcome,
