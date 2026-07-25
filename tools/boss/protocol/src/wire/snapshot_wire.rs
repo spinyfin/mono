@@ -95,6 +95,15 @@ pub struct WorkerPoolEntry {
     pub idle: usize,
     /// Every currently-claimed slot in this pool.
     pub claims: Vec<WorkerPoolClaimEntry>,
+    /// The live interactive-pool concurrency cap (see
+    /// `bossctl dispatch concurrency`), set only on the `"main"` pool entry.
+    /// `capacity` is the physical 16-slot pool size; this is the separate,
+    /// operator-settable ceiling `drain_ready_queue` actually enforces —
+    /// without it, a reader sees `capacity: 16` with no way to tell dispatch
+    /// is being held at a lower live-worker count. `None` for the
+    /// `"automation"` and `"review"` entries, which are not gated by this cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_cap: Option<usize>,
 }
 
 /// One claimed slot within a [`WorkerPoolEntry`].

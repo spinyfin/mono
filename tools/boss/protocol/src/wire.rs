@@ -700,6 +700,10 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Query the current interactive-pool concurrency cap without changing
+    /// it. Replies with [`FrontendEvent::DispatchConcurrencyResult`].
+    GetDispatchConcurrency,
+
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
     GetDispatchState,
@@ -1687,6 +1691,27 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency
+    /// cap that `drain_ready_queue` enforces separately from the underlying
+    /// 16-slot main worker pool (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`).
+    /// `limit` must be at least 1 — `0` is rejected with
+    /// [`FrontendEvent::WorkError`], since it would wedge all mainline
+    /// dispatch with no error surface; values above `MAX_WORKER_POOL_SIZE`
+    /// (there are no backing slots or panes above that) are clamped down to
+    /// it. Persisted to `state.db` so it survives an engine restart.
+    /// Raising the cap kicks the scheduler so newly-available capacity is
+    /// used immediately rather than sitting idle until the next
+    /// naturally-triggered drain pass; lowering it takes effect on the very
+    /// next drain pass, since the cap check is re-read live on every pass.
+    /// Spilled automation counts toward this cap exactly like mainline work
+    /// (see `claim_worker_spill`); the review pool is NOT gated by it and
+    /// keeps dispatching from its own pool regardless. Replies with
+    /// [`FrontendEvent::DispatchConcurrencyResult`] or
+    /// [`FrontendEvent::WorkError`] when `limit == 0`.
+    SetDispatchConcurrency {
+        limit: usize,
     },
 
     /// Pause or resume global dispatch. When `paused = true` the engine
