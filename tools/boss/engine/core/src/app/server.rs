@@ -1122,9 +1122,13 @@ pub async fn serve_with_merge_probe(
     // `[Revise]` banner's count and its candidate query. This sweep is
     // comment-driven and DB-backed, so it clears strandings left by a
     // previous engine process on boot.
+    let answer_agent_died = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::AnswerAgentDied));
     let _stranded_answering_sweep_handle = crate::stranded_answering_sweep::spawn_loop(
         server_state.work_db.clone(),
         crate::stranded_answering_sweep::DEFAULT_INTERVAL,
+        answer_agent_died,
     );
 
     // Periodic remote-lease reconciler: the cross-host analogue of the

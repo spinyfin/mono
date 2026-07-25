@@ -65,13 +65,24 @@
 //! ## Cadence
 //!
 //! Every [`DEFAULT_INTERVAL`], firing immediately on boot, so comments stranded
-//! by the crash that preceded a restart clear as the engine comes back up.
+//! by the crash that preceded a restart clear as the engine comes back up. In
+//! addition, [`spawn_loop`] subscribes to [`boss_event_bus::Event::AnswerAgentDied`]
+//! (published on the worker's `SessionEnd` hook) and clears the specific
+//! comment immediately via [`reconcile_on_event`] rather than waiting out the
+//! interval — see that function's doc comment for why it re-reads the
+//! comment's own state instead of reusing [`is_stranded`]'s terminality
+//! check. The periodic pass stays as the backstop for a dropped event, a
+//! hard pane kill (no `SessionEnd` fires), or an engine restart.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, WorkComment};
+use boss_event_bus::{Event, Subscription};
+use boss_protocol::{
+    ANSWER_AGENT_RUN_STATUS_REPLIED, ANSWER_AGENT_RUN_STATUS_SUPERSEDED, COMMENT_STATUS_ANSWERING, ExecutionKind,
+    WorkComment,
+};
 
 use crate::sweep_loop::{SweepOutcome, confirm_two_pass};
 use crate::work::WorkDb;
@@ -108,22 +119,132 @@ impl SweepOutcome for StrandedAnsweringSweepOutcome {
     }
 }
 
-/// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`, firing
-/// immediately on spawn so strandings left by the crash that preceded a restart
-/// clear at boot.
-pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::JoinHandle<()> {
-    // Two-pass confirmation memory, held in an `Arc<Mutex>` the per-pass
-    // future can borrow each iteration — same shape as `terminal_work_sweep`,
-    // and uncontended since a single task ever takes the lock.
-    let seen: Arc<tokio::sync::Mutex<HashSet<String>>> = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-    crate::sweep_loop::spawn_sweep_loop(interval, move || {
-        let work_db = Arc::clone(&work_db);
-        let seen = Arc::clone(&seen);
-        async move {
-            let mut seen = seen.lock().await;
-            run_one_pass(work_db.as_ref(), &mut seen).await
+/// Spawn a tokio task that runs [`run_one_pass`] every `interval` (firing
+/// immediately on spawn so strandings left by the crash that preceded a
+/// restart clear at boot) and additionally reconciles a comment immediately
+/// whenever `answer_agent_died` delivers an [`Event::AnswerAgentDied`] for
+/// its bound execution — see [`reconcile_on_event`]. The periodic pass
+/// remains the backstop: a dropped/coalesced event, a hard pane kill (no
+/// `SessionEnd` hook fires at all), or a subscription closed by the bus
+/// being torn down all still clear within one `interval`.
+pub fn spawn_loop(
+    work_db: Arc<WorkDb>,
+    interval: Duration,
+    mut answer_agent_died: Subscription,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Two-pass confirmation memory for the periodic pass, local to this
+        // task — nothing else touches it.
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut sub_closed = false;
+        loop {
+            let outcome = run_one_pass(work_db.as_ref(), &mut seen).await;
+            if outcome.has_activity() {
+                outcome.log();
+            }
+
+            'wait: loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => break 'wait,
+                    event = answer_agent_died.recv(), if !sub_closed => {
+                        match event {
+                            Some(Event::AnswerAgentDied { execution_id }) => {
+                                reconcile_on_event(work_db.as_ref(), &execution_id).await;
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    "stranded-answering sweep: subscription received an unexpected event \
+                                     kind (the subscribing filter should have excluded it)",
+                                );
+                            }
+                            None => {
+                                sub_closed = true;
+                                tracing::warn!(
+                                    "stranded-answering sweep: AnswerAgentDied subscription closed (event \
+                                     bus dropped) — the periodic sweep remains the backstop",
+                                );
+                            }
+                        }
+                        // Event handling never breaks 'wait — it is not a
+                        // full pass and must not reset the interval clock.
+                    }
+                }
+            }
         }
     })
+}
+
+/// Reconcile the single comment bound to `execution_id`, immediately, on an
+/// [`Event::AnswerAgentDied`]. Events are hints, not commands: `SessionEnd`
+/// (the hook this event is published from) fires before the execution row
+/// is reaped to a terminal status by any other sweep, so this deliberately
+/// does *not* gate on execution terminality the way [`is_stranded`] does for
+/// the periodic pass. Instead it re-reads the comment's own authoritative
+/// state:
+///
+/// - the execution must be an `answer_agent` kind bound to a comment
+///   (`work_item_id`) that is still `answering` — otherwise there is nothing
+///   for this event to do;
+/// - the comment's *currently bound* live execution (if any) must still be
+///   this same execution id, so a stale/duplicate event about a prior run
+///   can never recover a comment a fresh answer-agent run has since picked
+///   back up.
+///
+/// [`recover`] itself already handles both "no reply ever came" and "the
+/// reply landed but the comment's transition didn't follow", so once those
+/// two checks pass this defers to it exactly like the periodic pass does.
+async fn reconcile_on_event(work_db: &WorkDb, execution_id: &str) {
+    let execution = match work_db.get_execution(execution_id) {
+        Ok(execution) => execution,
+        Err(err) => {
+            tracing::debug!(
+                execution_id,
+                ?err,
+                "stranded-answering sweep: AnswerAgentDied for an unknown execution; ignoring",
+            );
+            return;
+        }
+    };
+    if execution.kind != ExecutionKind::AnswerAgent {
+        return;
+    }
+    let comment_id = execution.work_item_id;
+    let comment = match work_db.get_comment(&comment_id) {
+        Ok(Some(comment)) => comment,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(
+                comment_id,
+                ?err,
+                "stranded-answering sweep: failed to look up the comment for an AnswerAgentDied event; \
+                 deferring to the periodic sweep",
+            );
+            return;
+        }
+    };
+    if comment.status != COMMENT_STATUS_ANSWERING {
+        return;
+    }
+    match work_db.live_answer_agent_execution_for_comment(&comment_id) {
+        Ok(Some(live)) if live.id != execution.id => return,
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                comment_id,
+                ?err,
+                "stranded-answering sweep: failed to probe the comment's bound execution for an \
+                 AnswerAgentDied event; deferring to the periodic sweep",
+            );
+            return;
+        }
+    }
+    if recover(work_db, &comment) {
+        tracing::info!(
+            comment_id,
+            execution_id,
+            "stranded-answering sweep: cleared 'answering' immediately on AnswerAgentDied",
+        );
+    }
 }
 
 /// Run a single recovery pass over every comment sitting `answering`.
@@ -458,5 +579,102 @@ mod tests {
         let outcome = run_one_pass(&db, &mut seen).await;
         assert_eq!(outcome.recovered, 0);
         assert!(seen.is_empty(), "no 'answering' comments means nothing left to confirm");
+    }
+
+    /// [`reconcile_on_event`] is the whole point of the `AnswerAgentDied`
+    /// subscription: it must clear the comment on the very first call,
+    /// without the two-pass wait [`run_one_pass`] imposes.
+    #[tokio::test]
+    async fn reconcile_on_event_recovers_immediately_without_two_pass_wait() {
+        let db = mem_db();
+        let comment_id = seed_answering(&db, INTENT_QUESTION);
+        let execution = db
+            .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
+            .unwrap();
+
+        reconcile_on_event(&db, &execution.id).await;
+
+        let recovered = db.get_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(recovered.status, "answered");
+        let run = db.latest_answer_agent_run_for_comment(&comment_id).unwrap().unwrap();
+        assert_eq!(run.status, ANSWER_AGENT_RUN_STATUS_FAILED);
+        assert_eq!(run.error_kind.as_deref(), Some(STRANDED_ERROR_KIND));
+    }
+
+    /// Idempotency: the event and the periodic sweep can both fire for the
+    /// same stranding (a `SessionEnd` event racing the next interval tick).
+    /// Whichever runs first must leave the comment recovered exactly once —
+    /// the other must see nothing left to do.
+    #[tokio::test]
+    async fn reconcile_on_event_is_idempotent_with_the_periodic_sweep() {
+        let db = mem_db();
+        let comment_id = seed_answering(&db, INTENT_QUESTION);
+        let execution = db
+            .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
+            .unwrap();
+
+        reconcile_on_event(&db, &execution.id).await;
+        // A duplicate/coalesced-then-redelivered event must also be a no-op.
+        reconcile_on_event(&db, &execution.id).await;
+
+        let mut seen = HashSet::new();
+        let first = run_one_pass(&db, &mut seen).await;
+        let second = run_one_pass(&db, &mut seen).await;
+        assert_eq!(
+            first.recovered + second.recovered,
+            0,
+            "the periodic sweep must not re-recover a comment the event already cleared"
+        );
+
+        let entries = db.list_comment_thread_entries(&comment_id).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "exactly one apology entry, however many times reconcile runs"
+        );
+    }
+
+    /// An event for an execution id the DB has never heard of (already
+    /// GC'd, or simply bogus) must be a silent no-op, not a panic or error
+    /// that would take the subscriber loop down.
+    #[tokio::test]
+    async fn reconcile_on_event_ignores_an_unknown_execution_id() {
+        let db = mem_db();
+        let comment_id = seed_answering(&db, INTENT_QUESTION);
+
+        reconcile_on_event(&db, "exec_does_not_exist").await;
+
+        assert_eq!(db.get_comment(&comment_id).unwrap().unwrap().status, "answering");
+    }
+
+    /// A stale event about a prior run must never recover a comment a
+    /// fresh answer-agent execution has since picked back up — the comment's
+    /// *currently bound* live execution must match the event's execution id.
+    #[tokio::test]
+    async fn reconcile_on_event_ignores_a_stale_event_once_a_fresh_execution_is_bound() {
+        let db = mem_db();
+        let comment_id = seed_answering(&db, INTENT_QUESTION);
+        let stale_execution = db
+            .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
+            .unwrap();
+        db.cancel_execution(&stale_execution.id).unwrap();
+        let fresh_execution = db
+            .create_answer_agent_execution(&comment_id, "git@github.com:o/r.git")
+            .unwrap();
+
+        reconcile_on_event(&db, &stale_execution.id).await;
+
+        assert_eq!(
+            db.get_comment(&comment_id).unwrap().unwrap().status,
+            "answering",
+            "a stale event must not recover a comment now bound to a fresh execution"
+        );
+        assert_eq!(
+            db.live_answer_agent_execution_for_comment(&comment_id)
+                .unwrap()
+                .unwrap()
+                .id,
+            fresh_execution.id
+        );
     }
 }
