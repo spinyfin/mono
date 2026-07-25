@@ -114,8 +114,9 @@ use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePane
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{
-    dispatch_completion_on_stop, dispatch_editorial_on_pretooluse, dispatch_live_worker_state, dispatch_probe_if_idle,
-    dispatch_probe_on_stop, dispatch_probe_reply_on_stop, dispatch_urgent_probe_on_post_tool_use,
+    dispatch_completion_on_stop, dispatch_editorial_on_pretooluse, dispatch_live_worker_state,
+    dispatch_post_hoc_interception_on_post_tool_use, dispatch_probe_if_idle, dispatch_probe_on_stop,
+    dispatch_probe_reply_on_stop, dispatch_urgent_probe_on_post_tool_use,
 };
 
 // Re-import verified pane-injection types so child modules can access them via `use super::*`.

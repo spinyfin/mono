@@ -432,6 +432,7 @@ mod design_postmortem;
 mod dispatch;
 mod dispatch_class;
 mod dispatch_helpers;
+mod driver_lookup;
 mod editorial;
 mod exec_status_helpers;
 mod exec_tail;

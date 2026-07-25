@@ -629,6 +629,15 @@ pub struct ToolUseInterceptionWiring {
 /// inspect the artefact after the tool has already run. No driver currently
 /// implements this — `ClaudeDriver` provides real-time PreToolUse hook
 /// interception via [`AgentDriver::tool_use_interception_wiring`].
+///
+/// **Post-hoc is not pre-hoc.** By the time the engine can call
+/// [`PostHocInterceptionFn`], the tool has already executed — a `RequestEdit`
+/// can only ask the worker to clean up after the fact, never prevent the
+/// call. A driver on this path ran without editorial enforcement, the path
+/// guard, the revision-PR guard, and the checkleft push guard for that call;
+/// the engine's post-hoc dispatch (`dispatch_post_hoc_interception_on_post_tool_use`)
+/// logs that loss explicitly rather than letting `Accept`/no-registered-fn
+/// read as "still guarded".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostHocInterceptionAction {
     /// The artefact is acceptable; no follow-up needed.
@@ -646,10 +655,15 @@ pub enum PostHocInterceptionAction {
 /// engine should take.
 ///
 /// This is the declared seam for future hookless drivers (e.g. Copilot,
-/// Codex). Not yet implemented for any driver: `ClaudeDriver` provides
+/// Codex). A driver registers one by overriding [`AgentDriver::post_hoc_interception`];
+/// the engine calls it from `dispatch_post_hoc_interception_on_post_tool_use`
+/// on the `PostToolUse` boundary for any driver whose `capabilities()` does
+/// not provide [`Capability::ToolUseInterception`] (the [`AbsenceDisposition::Degrade`]
+/// path). Not yet implemented for any driver: `ClaudeDriver` provides
 /// real-time PreToolUse interception and the engine's
 /// `dispatch_editorial_on_pretooluse` handles the editorial surface
-/// server-side.
+/// server-side, so it declares [`Capability::ToolUseInterception`] and never
+/// reaches this path.
 pub type PostHocInterceptionFn =
     fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
 
@@ -779,6 +793,20 @@ pub trait AgentDriver: Send + Sync {
     /// (degrade to [`PostHocInterceptionFn`] or refuse) applies instead.
     fn tool_use_interception_wiring(&self, config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring;
 
+    /// The [`PostHocInterceptionFn`] this driver registers for the
+    /// [`Capability::ToolUseInterception`] [`AbsenceDisposition::Degrade`]
+    /// path, or `None` to take the bare degrade (no post-hoc review at all,
+    /// just the engine's visible loss-of-guards signal).
+    ///
+    /// Only meaningful for a driver that does **not** declare
+    /// [`Capability::ToolUseInterception`] — a driver that does provide it
+    /// (Claude today) has real-time PreToolUse hooks and is never routed
+    /// through this seam, so its default (`None`) is correct and this method
+    /// need not be overridden.
+    fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
+        None
+    }
+
     // ── PromptComposition capability ────────────────────────────────────────
 
     /// Driver-specific preamble injected at the top of the agent-rules file,
@@ -876,9 +904,9 @@ pub mod test_support {
     use boss_protocol::{NormalizeError, WorkerEvent};
 
     use super::{
-        AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity,
-        ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-        WorkerErrorClass,
+        AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, PostHocInterceptionFn,
+        ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
+        ToolUseInterceptionWiring, WorkerErrorClass,
     };
 
     /// Configurable [`AgentDriver`] stub. Every method beyond
@@ -886,14 +914,31 @@ pub mod test_support {
     /// the methods that can't panic on the hot paths, like
     /// `normalize_transcript_entry`) — callers that need this fixture only
     /// ever exercise capability declaration and menu resolution against it.
+    ///
+    /// `post_hoc_interception_fn` defaults to `None` (same as the trait's
+    /// default); set it with [`StubDriver::with_post_hoc_interception`] to
+    /// exercise a downstream crate's `AbsenceDisposition::Degrade` dispatch
+    /// for [`super::Capability::ToolUseInterception`] without a second real
+    /// driver implementation.
     pub struct StubDriver {
         pub descriptor: DriverDescriptor,
         pub caps: CapabilitySet,
+        pub post_hoc_interception_fn: Option<PostHocInterceptionFn>,
     }
 
     impl StubDriver {
         pub fn new(descriptor: DriverDescriptor, caps: CapabilitySet) -> Self {
-            Self { descriptor, caps }
+            Self {
+                descriptor,
+                caps,
+                post_hoc_interception_fn: None,
+            }
+        }
+
+        /// Chainable: register the fixture's [`PostHocInterceptionFn`].
+        pub fn with_post_hoc_interception(mut self, f: PostHocInterceptionFn) -> Self {
+            self.post_hoc_interception_fn = Some(f);
+            self
         }
     }
 
@@ -904,6 +949,9 @@ pub mod test_support {
         }
         fn capabilities(&self) -> CapabilitySet {
             self.caps.clone()
+        }
+        fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
+            self.post_hoc_interception_fn
         }
         fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
             unimplemented!()
@@ -1064,6 +1112,39 @@ mod tests {
             reason: "bad content".to_owned(),
         };
         assert_ne!(PostHocInterceptionAction::Accept, edit);
+    }
+
+    #[test]
+    fn driver_default_registers_no_post_hoc_interception_fn() {
+        // A driver that never overrides `post_hoc_interception` (every driver
+        // today, including Claude) must resolve to `None` — the trait
+        // default. Degrade-path dispatch relies on this to mean "no
+        // registered fn" rather than a stale/leftover Some.
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([]));
+        assert!(driver.post_hoc_interception().is_none());
+    }
+
+    #[test]
+    fn stub_driver_registers_and_invokes_post_hoc_interception_fn() {
+        fn always_request_edit(
+            _tool_name: &str,
+            _tool_input: &serde_json::Value,
+            _tool_output: &serde_json::Value,
+        ) -> PostHocInterceptionAction {
+            PostHocInterceptionAction::RequestEdit {
+                reason: "fixture".to_owned(),
+            }
+        }
+
+        let driver =
+            StubDriver::new(stub_descriptor(), CapabilitySet::new([])).with_post_hoc_interception(always_request_edit);
+        let f = driver.post_hoc_interception().expect("fn was registered");
+        assert_eq!(
+            f("Bash", &serde_json::Value::Null, &serde_json::Value::Null),
+            PostHocInterceptionAction::RequestEdit {
+                reason: "fixture".to_owned(),
+            },
+        );
     }
 
     #[test]

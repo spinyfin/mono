@@ -681,6 +681,139 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
         .await;
 }
 
+/// DB-and-registry-free decision core for
+/// [`dispatch_post_hoc_interception_on_post_tool_use`]: given the driver
+/// resolved for an execution, decide whether the degrade path applies and,
+/// if so, what its registered [`crate::driver::PostHocInterceptionFn`]
+/// (or the implicit `Accept` when none is registered) decided. Split out so
+/// this decision logic is unit-testable against
+/// [`boss_engine_driver::test_support::StubDriver`] without a DB or a
+/// `ServerState`.
+///
+/// Returns `None` when `driver` declares real-time
+/// [`crate::driver::Capability::ToolUseInterception`] (Claude today) — the
+/// degrade path never applies and the caller must not log or act.
+fn post_hoc_interception_decision(
+    driver: &dyn crate::driver::AgentDriver,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> Option<crate::driver::PostHocInterceptionAction> {
+    use crate::driver::{Capability, PostHocInterceptionAction};
+
+    if driver.capabilities().provides(Capability::ToolUseInterception) {
+        return None;
+    }
+    Some(match driver.post_hoc_interception() {
+        Some(f) => f(tool_name, tool_input, tool_response),
+        None => PostHocInterceptionAction::Accept,
+    })
+}
+
+/// On the `PostToolUse` boundary, apply the post-hoc fallback for any driver
+/// that landed on [`crate::driver::AbsenceDisposition::Degrade`] for
+/// [`crate::driver::Capability::ToolUseInterception`] — i.e. a driver with no
+/// real-time PreToolUse hook surface, so [`dispatch_editorial_on_pretooluse`]
+/// (which only ever fires on a `PreToolUse` event) and the Claude-only path
+/// guard, revision-PR guard, and checkleft push guard never ran for this
+/// tool call.
+///
+/// **This is not equivalent to pre-hoc interception.** The tool has already
+/// executed by the time this fires — a driver-registered
+/// [`crate::driver::PostHocInterceptionFn`] can only flag the artefact for
+/// follow-up, never prevent the call. Every degrade-path call logs a visible
+/// warning naming exactly what was skipped, whether or not the driver
+/// registers a fn, so "this worker ran without editorial/path/revision-PR/
+/// checkleft guards" is never silent (design: agent-driver absence-policy
+/// model).
+///
+/// A driver that *does* declare `ToolUseInterception` (Claude today) is
+/// untouched — this returns immediately for it, before any logging, so
+/// Claude's behaviour and log volume are unchanged.
+pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::driver::{DriverRegistry, PostHocInterceptionAction};
+    use crate::protocol::WorkerEvent;
+
+    let WorkerEvent::PostToolUse {
+        tool_name,
+        tool_input,
+        tool_response,
+        ..
+    } = &incoming.event
+    else {
+        return;
+    };
+    let Some(execution_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+
+    let driver_slug = match server_state.work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => slug,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(
+                execution_id,
+                ?err,
+                "post_hoc_interception: could not resolve execution's driver; skipping",
+            );
+            return;
+        }
+    };
+
+    let registry = DriverRegistry::default();
+    let Some(driver) = registry.get(&driver_slug) else {
+        tracing::debug!(
+            execution_id,
+            driver = %driver_slug,
+            "post_hoc_interception: unregistered driver slug; skipping",
+        );
+        return;
+    };
+
+    let Some(action) = post_hoc_interception_decision(driver.as_ref(), tool_name, tool_input, tool_response) else {
+        // Driver declares real-time ToolUseInterception (Claude today):
+        // the path/revision-PR/checkleft guards and the editorial audit
+        // already ran for this exact call via the PreToolUse boundary — do
+        // not double-process it here, and do not change its behaviour.
+        return;
+    };
+
+    tracing::warn!(
+        execution_id,
+        driver = %driver_slug,
+        tool_name = %tool_name,
+        "post_hoc_interception: driver has no real-time PreToolUse hook surface — this tool call ran \
+         WITHOUT editorial enforcement, the path guard, the revision-PR guard, and the checkleft push \
+         guard. Post-hoc review can only detect problems after the tool already ran; it cannot prevent \
+         the call. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver crate.",
+    );
+
+    match action {
+        PostHocInterceptionAction::Accept => {
+            tracing::debug!(
+                execution_id,
+                driver = %driver_slug,
+                tool_name = %tool_name,
+                "post_hoc_interception: driver's post-hoc adapter accepted the tool output",
+            );
+        }
+        PostHocInterceptionAction::RequestEdit { reason } => {
+            tracing::warn!(
+                execution_id,
+                driver = %driver_slug,
+                tool_name = %tool_name,
+                reason = %reason,
+                "post_hoc_interception: driver's post-hoc adapter flagged this tool output for \
+                 revision — the underlying command has already run and cannot be undone; this is a \
+                 detect-after-the-fact signal for a human/operator, not an enforced block",
+            );
+        }
+    }
+}
+
 /// On `Stop` hook events, pop a pending probe for the run (if any)
 /// and `SendToPane` the text to the worker's slot. The injection
 /// arrives at the pane just as the worker becomes idle, so claude
@@ -1260,5 +1393,85 @@ mod editorial_gate_tests {
             stop_reason: crate::protocol::StopReason::Completed,
         };
         assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+}
+
+#[cfg(test)]
+mod post_hoc_interception_decision_tests {
+    use super::post_hoc_interception_decision;
+    use crate::driver::test_support::StubDriver;
+    use crate::driver::{Capability, CapabilitySet, DriverDescriptor, ModelMenu, PostHocInterceptionAction};
+    use serde_json::json;
+
+    fn descriptor(name: &'static str) -> DriverDescriptor {
+        DriverDescriptor {
+            name,
+            label: name,
+            binary: name,
+            config_dir: ".stub",
+            agent_rules_filename: "AGENTS.md",
+            initial_prompt_filename: "initial-prompt.txt",
+            model_menu: ModelMenu {
+                engine_default: "stub-model",
+                effort_value_for_level: |_| None,
+                default_model_for_level: |_| "stub-model",
+                prompt_addendum_for_level: |_| None,
+                model_requires_auto_permissions: |_| false,
+            },
+        }
+    }
+
+    fn always_request_edit(
+        _tool_name: &str,
+        _tool_input: &serde_json::Value,
+        _tool_output: &serde_json::Value,
+    ) -> PostHocInterceptionAction {
+        PostHocInterceptionAction::RequestEdit {
+            reason: "flagged by fixture".to_owned(),
+        }
+    }
+
+    /// A driver that declares real-time ToolUseInterception (Claude today)
+    /// never reaches the degrade path — the caller must not log or act.
+    #[test]
+    fn driver_with_tool_use_interception_is_not_applicable() {
+        let driver = StubDriver::new(
+            descriptor("claude-like"),
+            CapabilitySet::new([Capability::ToolUseInterception]),
+        );
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, None);
+    }
+
+    /// A driver without ToolUseInterception and no registered post-hoc fn
+    /// still hits the degrade path — the implicit decision is `Accept` (the
+    /// caller logs the loss-of-guards warning regardless).
+    #[test]
+    fn degraded_driver_without_registered_fn_implicitly_accepts() {
+        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]));
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, Some(PostHocInterceptionAction::Accept));
+    }
+
+    /// A degraded driver's registered fn is actually called, and its
+    /// decision passed through verbatim.
+    #[test]
+    fn degraded_driver_with_registered_fn_returns_its_decision() {
+        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]))
+            .with_post_hoc_interception(always_request_edit);
+        let outcome = post_hoc_interception_decision(
+            &driver,
+            "Bash",
+            &json!({"command": "rm -rf /"}),
+            &json!({"output": "ok"}),
+        );
+        assert_eq!(
+            outcome,
+            Some(PostHocInterceptionAction::RequestEdit {
+                reason: "flagged by fixture".to_owned(),
+            }),
+        );
     }
 }
