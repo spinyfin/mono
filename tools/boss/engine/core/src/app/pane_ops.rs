@@ -113,6 +113,24 @@ pub enum RetirePaneError {
          use `bossctl agents stop {run_id}` instead of retire-pane"
     )]
     LiveRunTracked { slot_id: u8, run_id: String },
+    /// The engine's bookkeeping says this slot is finished, but the OS and
+    /// the worker's own hook stream say otherwise: the shell process is
+    /// alive AND the worker either has a tool in flight or emitted a hook
+    /// recently. Retiring would kill a working worker.
+    ///
+    /// Distinct from [`Self::LiveRunTracked`], which is the *bookkeeping*
+    /// check. This one exists precisely because the bookkeeping can be
+    /// wrong — see the 2026-07-26 `SessionEnd` burst documented on
+    /// [`crate::husk_pane_sweep::live_process_evidence`].
+    #[error(
+        "slot {slot_id} holds a terminal entry for run {run_id}, but its worker process is still alive \
+         ({evidence}); refusing to retire — use `bossctl agents stop {run_id}` to tear it down deliberately"
+    )]
+    LiveProcessCorroborated {
+        slot_id: u8,
+        run_id: String,
+        evidence: String,
+    },
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -312,13 +330,36 @@ impl ServerState {
     /// stale `LiveWorkerState` entry a buggy terminal-fail path left
     /// behind).
     pub async fn retire_pane(&self, slot_id: u8) -> Result<(), RetirePaneError> {
-        if let Some(state) = self.live_worker_states.get(slot_id)
-            && !state.activity.is_terminal()
-        {
-            return Err(RetirePaneError::LiveRunTracked {
-                slot_id,
-                run_id: state.run_id,
-            });
+        if let Some(state) = self.live_worker_states.get(slot_id) {
+            // Guard 1 (bookkeeping): the engine still considers this run live.
+            if !state.activity.is_terminal() {
+                return Err(RetirePaneError::LiveRunTracked {
+                    slot_id,
+                    run_id: state.run_id,
+                });
+            }
+            // Guard 2 (reality): the engine considers the run finished, but
+            // the OS and the worker's hook stream disagree. This is the last
+            // check before an irreversible SIGTERM of the worker's process
+            // group, and it is deliberately independent of the bookkeeping
+            // guard above — the 2026-07-26 incident was precisely a case of
+            // the bookkeeping being uniformly wrong.
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            if let Some(evidence) = crate::husk_pane_sweep::live_process_evidence(&state, now) {
+                tracing::warn!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    activity = state.activity.as_str(),
+                    %evidence,
+                    "retire_pane: refusing to retire — the live-state entry is terminal but the worker \
+                     process is demonstrably alive; killing it would destroy in-flight work",
+                );
+                return Err(RetirePaneError::LiveProcessCorroborated {
+                    slot_id,
+                    run_id: state.run_id,
+                    evidence,
+                });
+            }
         }
         let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
             slot_id,
@@ -377,15 +418,48 @@ impl ServerState {
             Err(SendToAppError::NotRegistered) => return Ok(Vec::new()),
             Err(err) => return Err(RetirePaneError::Send(err)),
         };
-        let live_slots: std::collections::HashSet<u8> = self
+        let live_by_slot: std::collections::HashMap<u8, boss_protocol::LiveWorkerState> = self
             .live_worker_states_snapshot()
             .into_iter()
-            .filter(|state| !state.activity.is_terminal())
-            .map(|state| state.slot_id)
+            .map(|state| (state.slot_id, state))
             .collect();
-        Ok(hosted
-            .into_iter()
-            .filter(|pane| !live_slots.contains(&pane.slot_id))
-            .collect())
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+
+        let mut husks = Vec::new();
+        for pane in hosted {
+            match live_by_slot.get(&pane.slot_id) {
+                // The engine tracks a live run here — not a husk, same as
+                // this filter has always behaved.
+                Some(state) if !state.activity.is_terminal() => continue,
+                // A terminal entry for THIS run. The engine believes the run
+                // ended; before that belief is allowed to justify killing the
+                // pane's process, take a second opinion from the OS and the
+                // worker's own hook stream.
+                //
+                // The `run_id` match matters: if the entry names a different
+                // run, the slot was recycled and the app is hosting a pane
+                // for a run that really is gone — a genuine husk, and its
+                // liveness signals belong to the newer run, not this pane.
+                Some(state) if state.run_id == pane.run_id => {
+                    if let Some(evidence) = crate::husk_pane_sweep::live_process_evidence(state, now) {
+                        tracing::warn!(
+                            slot_id = pane.slot_id,
+                            run_id = %pane.run_id,
+                            activity = state.activity.as_str(),
+                            %evidence,
+                            "husk classification: slot has a TERMINAL live-state entry but the worker process \
+                             is demonstrably alive; NOT a husk. The engine's own bookkeeping is wrong for this \
+                             slot — something terminalized a run whose process kept working.",
+                        );
+                        continue;
+                    }
+                    husks.push(pane);
+                }
+                // No entry at all, or an entry for a different run: the
+                // classic husk shape this sweep exists for.
+                _ => husks.push(pane),
+            }
+        }
+        Ok(husks)
     }
 }

@@ -181,3 +181,205 @@ async fn list_husk_panes_filters_out_slots_the_engine_still_tracks_live() {
     assert_eq!(panes[0].slot_id, 6);
     assert_eq!(panes[0].run_id, "run-husk");
 }
+
+// ─── 2026-07-26 regression: terminal bookkeeping is not proof of death ──────
+//
+// Six live workers received a synchronized `SessionEnd { reason: "other" }`
+// burst inside 250ms while their `claude` processes kept running. That flipped
+// each live-state entry to `Terminated`; `list_husk_panes` filtered terminal
+// entries out of its live set, so five slots classified as husks, and
+// `retire_pane` re-read the same wrong bookkeeping and agreed. Five workers
+// were SIGTERMed mid-work, three of them inside a foreground `bazel` build.
+//
+// Both the classifier and the retire guard now take a second opinion from the
+// OS and the worker's own hook stream before acting.
+
+/// Drive `slot_id` into the exact state the victims were in: a live worker
+/// with an unbalanced `PreToolUse` (a long foreground build) that then
+/// received a spurious `SessionEnd`. `shell_pid` is this test process, so
+/// `kill(pid, 0)` genuinely reports it alive.
+fn drive_spurious_session_end_mid_tool(server_state: &ServerState, slot_id: u8, run_id: &str) {
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, run_id, "claude-opus-4-7", std::process::id() as i32, None);
+    server_state.live_worker_states.apply_event(
+        slot_id,
+        &crate::protocol::WorkerEvent::PreToolUse {
+            session_id: "s".to_owned(),
+            tool_name: "Bash".to_owned(),
+            tool_input: serde_json::Value::Null,
+        },
+    );
+    server_state.live_worker_states.apply_event(
+        slot_id,
+        &crate::protocol::WorkerEvent::SessionEnd {
+            session_id: "s".to_owned(),
+            reason: "other".to_owned(),
+        },
+    );
+}
+
+#[tokio::test]
+async fn retire_pane_refuses_when_a_terminal_entry_still_has_a_live_worker_process() {
+    let (server_state, _dir) = test_server_state();
+    drive_spurious_session_end_mid_tool(&server_state, 3, "run-victim");
+
+    // Precondition: the engine's bookkeeping really does say "terminated" —
+    // the old `LiveRunTracked` guard would have waved this straight through.
+    let state = server_state.live_worker_states.get(3).expect("entry");
+    assert!(
+        state.activity.is_terminal(),
+        "precondition: bookkeeping must say terminal"
+    );
+
+    match server_state.retire_pane(3).await {
+        Err(RetirePaneError::LiveProcessCorroborated {
+            slot_id,
+            run_id,
+            evidence,
+        }) => {
+            assert_eq!(slot_id, 3);
+            assert_eq!(run_id, "run-victim");
+            assert!(
+                evidence.contains("Bash"),
+                "evidence should name the in-flight tool: {evidence}"
+            );
+        }
+        other => panic!("expected LiveProcessCorroborated, got {other:?}"),
+    }
+
+    // A refused retire must leave the slot completely untouched.
+    assert!(
+        server_state.live_worker_states.get(3).is_some(),
+        "a refused retire must not clear the live-state entry"
+    );
+}
+
+#[tokio::test]
+async fn retire_pane_still_retires_a_terminal_slot_with_no_live_process() {
+    // The sweep's reason for existing must survive: a terminal entry with no
+    // shell pid to corroborate (the classic husk left by a release RPC that
+    // never landed) is still reclaimed.
+    let (server_state, _dir) = test_server_state();
+    server_state
+        .live_worker_states
+        .register_spawn(4, "run-husk", "claude-opus-4-7", 0, None);
+    server_state.live_worker_states.apply_event(
+        4,
+        &crate::protocol::WorkerEvent::SessionEnd {
+            session_id: "s".to_owned(),
+            reason: "exit".to_owned(),
+        },
+    );
+
+    let result = server_state.retire_pane(4).await;
+    assert!(result.is_ok(), "a genuine husk must still be retired: {result:?}");
+    assert!(
+        server_state.live_worker_states.get(4).is_none(),
+        "retiring a genuine husk clears its slot"
+    );
+}
+
+#[tokio::test]
+async fn list_husk_panes_does_not_flag_a_terminal_slot_whose_worker_is_alive() {
+    // The classifier half. Slot 2 is the incident shape (terminal entry, live
+    // process); slot 6 is a genuine husk the engine has no entry for at all.
+    // Only slot 6 may be reported — a live worker must never even be flagged,
+    // since being flagged is what starts the two-pass clock toward the kill.
+    let (server_state, _dir) = test_server_state();
+    drive_spurious_session_end_mid_tool(&server_state, 2, "run-victim");
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![
+                        crate::protocol::HostedPaneEntry {
+                            slot_id: 2,
+                            run_id: "run-victim".to_owned(),
+                            summary: None,
+                            task_title: None,
+                        },
+                        crate::protocol::HostedPaneEntry {
+                            slot_id: 6,
+                            run_id: "run-husk".to_owned(),
+                            summary: None,
+                            task_title: None,
+                        },
+                    ],
+                }),
+            },
+        )
+        .await;
+
+    let panes = list.await.expect("list task").expect("expected Ok");
+    assert_eq!(
+        panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
+        vec![6],
+        "a terminal slot with a live worker process must not be classified as a husk: {panes:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive() {
+    // The `run_id` match in the classifier. The app is hosting a pane for
+    // `run-old`, but the engine's entry for that slot belongs to `run-new`.
+    // The slot was recycled: `run-new`'s liveness signals say nothing about
+    // `run-old`'s stray pane, which is a genuine husk and must be reported.
+    let (server_state, _dir) = test_server_state();
+    drive_spurious_session_end_mid_tool(&server_state, 5, "run-new");
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![crate::protocol::HostedPaneEntry {
+                        slot_id: 5,
+                        run_id: "run-old".to_owned(),
+                        summary: None,
+                        task_title: None,
+                    }],
+                }),
+            },
+        )
+        .await;
+
+    let panes = list.await.expect("list task").expect("expected Ok");
+    assert_eq!(
+        panes.iter().map(|pane| pane.run_id.as_str()).collect::<Vec<_>>(),
+        vec!["run-old"],
+        "a stray pane for a recycled run is still a husk: {panes:?}"
+    );
+}
