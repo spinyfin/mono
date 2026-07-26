@@ -1,25 +1,35 @@
-//! Primary-path PR URL capture from worker hook events.
+//! Primary-path PR URL capture from worker progress events.
 //!
 //! Background: the engine receives the URL of every PR a worker
-//! opens in real time, embedded in the `tool_response.stdout` of the
-//! `PostToolUse` hook event for the worker's `gh pr create` Bash
-//! call. Historically the engine ignored that and reconstructed the
-//! URL later by shelling out to `jj log` against the worker's cube
-//! workspace and querying the GitHub API for each candidate commit
-//! sha. That reconstruction path is fragile (it failed once when
-//! the worker did `jj new main` after pushing; it failed again when
-//! a date-format mismatch broke the bookmark-tip revset expansion)
-//! and unnecessary — the URL is literally already in the event
-//! stream.
+//! opens in real time, embedded in the tool-output surface of the
+//! worker's `gh pr create` / `cube pr create` call. For Claude that
+//! surface is `tool_response.stdout` on a `PostToolUse` hook event;
+//! for a stdout-JSONL driver (Codex) it is
+//! `command_execution.aggregated_output` on the same normalised
+//! `WorkerEvent::PostToolUse`. Historically the engine ignored the
+//! stream and reconstructed the URL later by shelling out to `jj log`
+//! against the worker's cube workspace and querying the GitHub API
+//! for each candidate commit sha. That reconstruction path is fragile
+//! (it failed once when the worker did `jj new main` after pushing; it
+//! failed again when a date-format mismatch broke the bookmark-tip
+//! revset expansion) and unnecessary — the URL is literally already
+//! in the event stream.
 //!
-//! This module exposes the two pieces the primary path needs:
+//! The driver owns the *shape* of the tool observation
+//! ([`boss_engine_driver::AgentDriver::pr_url_capture_feed`]); this
+//! module owns the *algorithm* and the staging cache:
 //!
-//! - [`extract_pr_url_from_bash_response`] — a pure regex scan over
-//!   a `tool_response` JSON value. Returns the first canonical
-//!   `https://github.com/<owner>/<repo>/pull/<N>` it finds in either
-//!   `stdout` or `stderr`. Pure, easy to test.
+//! - [`extract_pr_url_from_text`] / [`extract_pr_url_from_bash_response`]
+//!   — pure regex scans (the shared
+//!   [`boss_engine_structured_output::pr_url::find_first_pr_url`]) over
+//!   free text or a Claude-shaped `tool_response` object. There is
+//!   exactly one extraction algorithm; drivers only change what feeds
+//!   it.
+//! - [`is_gh_pr_command`] / [`is_gh_pr_command_str`] — Layer-1 gate so
+//!   arbitrary Bash/shell output that happens to mention a PR URL does
+//!   not stage the wrong PR.
 //! - [`StagedPrUrlCache`] — a thread-safe `HashMap<execution_id,
-//!   pr_url>` that callers populate from PostToolUse events and the
+//!   pr_url>` that callers populate from progress events and the
 //!   `on_stop` handler reads on Stop. First-writer-wins semantics
 //!   so a worker that re-runs `gh pr view` after `gh pr create`
 //!   can't overwrite the legitimate first URL.
@@ -31,6 +41,9 @@
 //! URL is lost from this cache (it lives in memory only) and the
 //! fallback path runs on the next sweep. The staging cache is the
 //! hot path; the reconstruction path is the cold path.
+//!
+//! **Not** a GitHub branch→PR poll: that is a different mechanism with
+//! different failure modes and must not mask a broken extraction path.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -85,7 +98,19 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
     Ok(())
 }
 
-/// Scan a `tool_response` JSON value for a GitHub PR URL.
+/// Scan free text for the first canonical GitHub PR URL.
+///
+/// Thin wrapper over the shared
+/// [`boss_engine_structured_output::pr_url::find_first_pr_url`] so every
+/// primary-path caller (Claude hook feed, Codex stream feed, tests)
+/// goes through one name in this module. Drivers must not reimplement
+/// this — they supply the text via
+/// [`boss_engine_driver::AgentDriver::pr_url_capture_feed`].
+pub fn extract_pr_url_from_text(text: &str) -> Option<String> {
+    find_first_pr_url(text)
+}
+
+/// Scan a Claude-shaped Bash `tool_response` JSON value for a GitHub PR URL.
 ///
 /// Reads the `stdout` and `stderr` fields (both are strings in the
 /// claude-code Bash tool response shape) and returns the first
@@ -93,6 +118,12 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
 /// one. `stdout` is checked first because `gh pr create` and
 /// `gh pr view` both print the URL there; `stderr` is the fallback
 /// for shell configurations / wrapper scripts that redirect.
+///
+/// The live capture path no longer calls this directly — it asks the
+/// driver for a [`boss_engine_driver::PrUrlCaptureFeed`] and runs
+/// [`extract_pr_url_from_text`] on the feed's text. This helper remains
+/// as the Claude-shape unit-test surface and as documentation of the
+/// historical object layout.
 ///
 /// The regex is anchored to `https://github.com/` — heuristic
 /// strings the worker might emit ("see the PR at …", "PR #458 is
@@ -102,7 +133,7 @@ pub fn validate_pr_url(pr_url: &str, product_repo_remote_url: &str) -> Result<()
 pub fn extract_pr_url_from_bash_response(tool_response: &serde_json::Value) -> Option<String> {
     let scan = |field: &str| -> Option<String> {
         let text = tool_response.get(field)?.as_str()?;
-        find_first_pr_url(text)
+        extract_pr_url_from_text(text)
     };
     scan("stdout").or_else(|| scan("stderr"))
 }
@@ -146,8 +177,8 @@ impl StagedRevisionPushCache {
     }
 }
 
-/// Check whether a Bash `tool_input` command is a push invocation that
-/// would advance the parent PR's branch on the remote. Used to populate the
+/// Check whether a shell command string is a push invocation that would
+/// advance the parent PR's branch on the remote. Used to populate the
 /// [`StagedRevisionPushCache`] for revision workers.
 ///
 /// Returns `true` for:
@@ -160,48 +191,146 @@ impl StagedRevisionPushCache {
 /// - `jj git push …` (excluding `--dry-run`) — kept for defence-in-depth /
 ///   older worker prompts that still push directly. Plain `git push` is
 ///   intentionally excluded — the worker fleet uses `jj` exclusively.
-pub fn is_revision_push_command(tool_input: &serde_json::Value) -> bool {
-    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
-        return false;
-    };
+pub fn is_revision_push_command_str(command: &str) -> bool {
     if command.contains("cube pr update") || command.contains("cube pr ensure") {
         return true;
     }
     command.contains("jj git push") && !command.contains("--dry-run")
 }
 
-/// Check whether a Bash `tool_input` command is a deliberate `gh pr`
-/// invocation (create, view, list, or edit).
-///
-/// Returns `true` only when the Bash command string is a
-/// `gh pr <subcommand>` invocation, where the subcommand is one of the
-/// forms that can legitimately surface a PR URL for the worker's own
-/// PR. Handles environment-variable prefixes such as
-/// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
-/// [`classify`] matcher.
-///
-/// Use this as the Layer-1 gate in the PostToolUse capture path:
-/// arbitrary Bash commands whose output happens to contain a PR URL
-/// (file reads, test runs, chore descriptions echoed via shell) must
-/// not stage a wrong PR against the running execution.
-pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
+/// Claude-shaped wrapper: read `tool_input.command` and delegate to
+/// [`is_revision_push_command_str`]. Prefer the string form when the
+/// command already came from a [`boss_engine_driver::PrUrlCaptureFeed`].
+pub fn is_revision_push_command(tool_input: &serde_json::Value) -> bool {
     let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
         return false;
     };
+    is_revision_push_command_str(command)
+}
+
+/// If `command` is a single shell `-c` / `-lc` wrapper whose remainder is
+/// one quoted script argument, return the script payload. Otherwise `None`.
+///
+/// Codex-shaped normalisers commonly emit `/bin/zsh -lc '…'` (or
+/// `bash -c "…"`). The shared [`classify`] matcher strips quoted string
+/// contents before matching so a `gh pr create` phrase inside a
+/// commit-message argument does not false-positive — but that same strip
+/// empties a payload that lives entirely inside the `-lc` argument. Peeling
+/// the envelope first lets Layer-1 gates classify the inner command.
+///
+/// Matched shapes (whole command, optional leading whitespace):
+/// - `/bin/zsh -lc 'gh pr create …'`
+/// - `/usr/bin/bash -c "cube pr update …"`
+/// - `zsh -lc '…'` / `bash -c '…'` / `sh -c '…'`
+///
+/// Flags must contain `c` (`-c`, `-lc`, `-cl`, …). Anything after the
+/// closing quote (other than trailing whitespace) rejects the peel so we
+/// do not mis-handle compound commands.
+fn peel_shell_c_payload(command: &str) -> Option<&str> {
+    let s = command.trim();
+    // Optional absolute path prefix for the shell binary.
+    let after_path = s
+        .strip_prefix("/usr/bin/")
+        .or_else(|| s.strip_prefix("/bin/"))
+        .unwrap_or(s);
+    // Shell name as a whole token (try longer names before `sh` so
+    // `shadow` / `bashful` do not false-match).
+    let mut after_shell = None;
+    for name in ["zsh", "bash", "sh"] {
+        if let Some(rest) = after_path.strip_prefix(name)
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            after_shell = Some(rest);
+            break;
+        }
+    }
+    let after_shell = after_shell?.trim_start();
+    // Flag group starting with `-` that includes the `-c` option letter.
+    if !after_shell.starts_with('-') {
+        return None;
+    }
+    let flags_end = after_shell[1..].find(|c: char| c.is_whitespace()).map(|i| i + 1)?;
+    let flags = &after_shell[..flags_end];
+    // `flags` is like `-lc` / `-c` / `-cl`; require a `c` option letter.
+    if !flags.as_bytes().get(1..).is_some_and(|b| b.contains(&b'c')) {
+        return None;
+    }
+    let after_flags = after_shell[flags_end..].trim_start();
+    if after_flags.len() < 2 {
+        return None;
+    }
+    let quote = after_flags.as_bytes()[0];
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let inner = &after_flags[1..];
+    let close = if quote == b'\'' {
+        // POSIX single quotes: no escapes; first `'` closes.
+        inner.find('\'')?
+    } else {
+        // Double quotes: honour `\"` so a title with quotes still peels.
+        let mut chars = inner.char_indices();
+        loop {
+            let (i, ch) = chars.next()?;
+            if ch == '\\' {
+                chars.next(); // skip escaped char
+            } else if ch == '"' {
+                break i;
+            }
+        }
+    };
+    let after_close = inner[close + 1..].trim();
+    if !after_close.is_empty() {
+        return None;
+    }
+    Some(&inner[..close])
+}
+
+/// Check whether a shell command string is a deliberate `gh pr` /
+/// `cube pr` invocation (create, view, list, or edit).
+///
+/// Returns `true` only when the command is a `gh pr <subcommand>`
+/// invocation whose subcommand can legitimately surface a PR URL for
+/// the worker's own PR, or a `cube pr create|update|ensure` wrapper.
+/// Handles environment-variable prefixes such as
+/// `GIT_DIR=.jj/repo/store/git gh pr create ...` via the shared
+/// [`classify`] matcher, and Codex-style shell wrappers
+/// (`/bin/zsh -lc 'gh pr …'`) via [`peel_shell_c_payload`].
+///
+/// Use this as the Layer-1 gate in the progress-event capture path:
+/// arbitrary shell commands whose output happens to contain a PR URL
+/// (file reads, test runs, chore descriptions echoed via shell) must
+/// not stage a wrong PR against the running execution.
+pub fn is_gh_pr_command_str(command: &str) -> bool {
     // `cube pr create` / `cube pr update` (and the deprecated `cube pr
     // ensure` alias) are the jj-aware wrappers that output a PR URL as their
     // only stdout line — treat them the same as `gh pr create` for capture
     // purposes. They are not `gh` invocations, so the shared classifier
-    // doesn't see them; check them directly.
+    // doesn't see them; check them directly. `.contains` also covers the
+    // Codex `/bin/zsh -lc 'cube pr …'` envelope without peeling.
     if command.contains("cube pr create") || command.contains("cube pr update") || command.contains("cube pr ensure") {
         return true;
     }
+    // Peel shell `-c`/`-lc` wrappers before classify: quote-stripping inside
+    // classify would otherwise empty a bare `gh pr …` that lives entirely
+    // inside the `-lc` argument (see `peel_shell_c_payload`).
+    let command = peel_shell_c_payload(command).unwrap_or(command);
     matches!(
         classify(command),
         Some(inv)
             if inv.noun == GhNoun::Pr
                 && matches!(inv.subcommand.as_str(), "create" | "view" | "list" | "edit")
     )
+}
+
+/// Claude-shaped wrapper: read `tool_input.command` and delegate to
+/// [`is_gh_pr_command_str`]. Prefer the string form when the command
+/// already came from a [`boss_engine_driver::PrUrlCaptureFeed`].
+pub fn is_gh_pr_command(tool_input: &serde_json::Value) -> bool {
+    let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    is_gh_pr_command_str(command)
 }
 
 /// Outcome of [`StagedPrUrlCache::record_if_unset`].
@@ -279,6 +408,71 @@ mod tests {
             extract_pr_url_from_bash_response(&response).as_deref(),
             Some("https://github.com/spinyfin/mono/pull/458"),
         );
+    }
+
+    #[test]
+    fn extract_from_text_is_the_same_regex_as_bash_response() {
+        // One algorithm: free-text feed (Codex aggregated_output) and the
+        // Claude tool_response helper must agree on the URL they find.
+        let text = "https://github.com/spinyfin/mono/pull/458\n";
+        assert_eq!(
+            extract_pr_url_from_text(text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+        );
+        assert_eq!(
+            extract_pr_url_from_text(text),
+            extract_pr_url_from_bash_response(&json!({ "stdout": text, "stderr": "" })),
+        );
+    }
+
+    #[test]
+    fn driver_feed_plus_shared_regex_captures_codex_aggregated_output() {
+        // End-to-end of the non-Claude primary path without a second
+        // extraction algorithm: driver feed → extract_pr_url_from_text
+        // → is_gh_pr_command_str. No GitHub poll.
+        let feed = crate::driver::default_pr_url_capture_feed(
+            "Bash",
+            &json!("/bin/zsh -lc 'cube pr create --branch boss/exec_x --title t'"),
+            &json!("Opening https://github.com/spinyfin/mono/pull/99\n"),
+        )
+        .expect("codex-shaped feed");
+        let url = extract_pr_url_from_text(&feed.output_text).expect("url");
+        assert_eq!(url, "https://github.com/spinyfin/mono/pull/99");
+        assert!(is_gh_pr_command_str(&feed.command));
+    }
+
+    #[test]
+    fn driver_feed_plus_shared_regex_captures_codex_zsh_lc_bare_gh_pr() {
+        // Codex shell-wraps bare `gh pr …` the same way as `cube pr …`.
+        // Without peeling the `-lc` payload, classify's quote strip empties
+        // the argument and Layer-1 rejects a real URL as not_a_gh_pr_command.
+        let feed = crate::driver::default_pr_url_capture_feed(
+            "Bash",
+            &json!("/bin/zsh -lc 'gh pr create --title t --body b'"),
+            &json!("https://github.com/spinyfin/mono/pull/101\n"),
+        )
+        .expect("codex-shaped gh feed");
+        let url = extract_pr_url_from_text(&feed.output_text).expect("url");
+        assert_eq!(url, "https://github.com/spinyfin/mono/pull/101");
+        assert!(
+            is_gh_pr_command_str(&feed.command),
+            "zsh -lc-wrapped bare gh pr must pass Layer-1 after peel"
+        );
+    }
+
+    #[test]
+    fn driver_feed_plus_shared_regex_matches_claude_bash_helper() {
+        let input = json!({ "command": "gh pr create --title t --body b" });
+        let response = json!({
+            "stdout": "https://github.com/spinyfin/mono/pull/458",
+            "stderr": "",
+        });
+        let feed = crate::driver::default_pr_url_capture_feed("Bash", &input, &response).expect("claude feed");
+        assert_eq!(
+            extract_pr_url_from_text(&feed.output_text),
+            extract_pr_url_from_bash_response(&response),
+        );
+        assert_eq!(is_gh_pr_command_str(&feed.command), is_gh_pr_command(&input));
     }
 
     #[test]
@@ -569,6 +763,54 @@ mod tests {
     #[test]
     fn null_tool_input_returns_false() {
         assert!(!is_gh_pr_command(&json!(null)));
+    }
+
+    #[test]
+    fn zsh_lc_wrapped_bare_gh_pr_create_is_a_gh_pr_command() {
+        // Codex envelope: whole command is `/bin/zsh -lc 'gh pr …'`.
+        // Peel must expose the inner gh invocation to classify.
+        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr create --title t --body b'"));
+        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr view'"));
+        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr list --state open'"));
+        assert!(is_gh_pr_command_str("/bin/zsh -lc 'gh pr edit 42 --add-label foo'"));
+    }
+
+    #[test]
+    fn bash_c_and_sh_c_wrapped_gh_pr_are_gh_pr_commands() {
+        assert!(is_gh_pr_command_str(r#"bash -c "gh pr create --title t""#));
+        assert!(is_gh_pr_command_str("/usr/bin/bash -c 'gh pr view'"));
+        assert!(is_gh_pr_command_str("sh -c 'gh pr list'"));
+    }
+
+    #[test]
+    fn zsh_lc_wrapped_non_gh_is_not_a_gh_pr_command() {
+        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'cat chore.md'"));
+        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'gh issue list'"));
+        assert!(!is_gh_pr_command_str("/bin/zsh -lc 'bossctl task show t'"));
+    }
+
+    #[test]
+    fn quoted_gh_pr_inside_commit_message_is_not_a_shell_c_peel_false_positive() {
+        // Not a shell -c wrapper: peel must not fire, and classify's quote
+        // strip must keep the commit-message phrase from matching.
+        assert!(!is_gh_pr_command_str(r#"jj describe -m "gh pr create --title t""#));
+        assert!(!is_gh_pr_command_str("jj describe -m 'gh pr create'"));
+    }
+
+    #[test]
+    fn peel_shell_c_payload_extracts_inner_script() {
+        assert_eq!(
+            peel_shell_c_payload("/bin/zsh -lc 'gh pr create --title t'"),
+            Some("gh pr create --title t"),
+        );
+        assert_eq!(
+            peel_shell_c_payload(r#"bash -c "cube pr update --branch b""#),
+            Some("cube pr update --branch b"),
+        );
+        // Not a shell -c wrapper.
+        assert_eq!(peel_shell_c_payload("gh pr create --title t"), None);
+        // Trailing junk after the quoted payload rejects the peel.
+        assert_eq!(peel_shell_c_payload("/bin/zsh -lc 'gh pr create' && echo done"), None,);
     }
 
     // ── is_revision_push_command ─────────────────────────────────

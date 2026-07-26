@@ -323,23 +323,31 @@ pub(super) async fn dispatch_live_worker_state(
             server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
         // Primary-path PR URL capture. Every worker that opens a
-        // PR does it via a Bash `gh pr create` (and also
-        // `gh pr view` / `gh pr edit`); the PR URL is printed
-        // on stdout. Catch it here, stage against the
-        // execution_id, and the on-Stop handler picks it up
-        // without ever shelling out to `jj log` to reconstruct
-        // it.
+        // PR does it via a shell `gh pr create` / `cube pr create`
+        // (and also `gh pr view` / `gh pr edit`); the PR URL is
+        // printed on the command's output. The *driver* supplies
+        // the free-text slice (and command string) via
+        // `AgentDriver::pr_url_capture_feed` — Claude from the
+        // PostToolUse `tool_response.{stdout,stderr}` object,
+        // Codex from `command_execution.aggregated_output` on the
+        // stdout-JSONL stream. The engine then runs the *shared*
+        // regex + command gates and stages against the
+        // execution_id so the on-Stop handler picks it up without
+        // shelling out to `jj log` or polling GitHub for the
+        // branch's PR.
         //
         // Layer-1 gate: only capture URLs from deliberate `gh pr`
-        // invocations. Arbitrary Bash output (file reads, test
-        // runs, chore descriptions printed via shell) can contain
-        // PR URLs from unrelated executions; filtering by command
+        // / `cube pr` invocations. Arbitrary shell output (file
+        // reads, test runs, chore descriptions) can contain PR
+        // URLs from unrelated executions; filtering by command
         // prevents those from staging the wrong PR.
-        if tool_name == "Bash" {
+        if let Some(feed) =
+            pr_url_capture_feed_for_execution(server_state, run_id, tool_name, tool_input, tool_response)
+        {
             // Check for any PR URL first so we can log a rejection
-            // when the command isn't a gh pr invocation.
-            if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response) {
-                if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
+            // when the command isn't a gh/cube pr invocation.
+            if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text) {
+                if !crate::pr_url_capture::is_gh_pr_command_str(&feed.command) {
                     tracing::info!(
                         execution_id = run_id,
                         rejected_url = %pr_url,
@@ -350,8 +358,8 @@ pub(super) async fn dispatch_live_worker_state(
                     // Gate the URL against the product's repo before
                     // staging. Workers running tests can emit fixture
                     // URLs (e.g. `https://github.com/foo/bar/pull/42`)
-                    // in tool_response.stdout; without this gate those
-                    // bind to the work_item as if they were real PRs.
+                    // in tool output; without this gate those bind
+                    // to the work_item as if they were real PRs.
                     let execution_id = run_id;
                     let repo_url_result = server_state
                         .work_db
@@ -387,7 +395,7 @@ pub(super) async fn dispatch_live_worker_state(
                                 tracing::info!(
                                     execution_id = run_id,
                                     pr_url = %pr_url,
-                                    "pr_url_capture: staged PR URL from worker hook stream",
+                                    "pr_url_capture: staged PR URL from worker progress stream",
                                 );
                             }
                             crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
@@ -412,7 +420,10 @@ pub(super) async fn dispatch_live_worker_state(
                 // `jj git push`) so the on_stop_inner SHA-delta gate can
                 // confirm the revision was the one that moved the PR
                 // head (not a concurrently-active parent worker).
-                if crate::pr_url_capture::is_revision_push_command(tool_input) {
+                // Nested under the URL-found branch intentionally —
+                // preserves the historical Claude control flow (a
+                // successful `cube pr update` always prints a PR URL).
+                if crate::pr_url_capture::is_revision_push_command_str(&feed.command) {
                     let execution_id = run_id;
                     match server_state.work_db.get_execution(execution_id) {
                         Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
@@ -423,31 +434,34 @@ pub(super) async fn dispatch_live_worker_state(
                     }
                 }
             }
+        }
 
-            // proposal_channel_error detection: a `boss propose <kind>`
-            // Bash invocation that failed. Staged in-memory against the
-            // execution id; `on_stop` files an attention and increments
-            // `worker_proposals.channel_error`. See
-            // `crate::proposal_channel_error`.
-            if crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
-                && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
+        // proposal_channel_error detection: a `boss propose <kind>`
+        // Bash invocation that failed. Staged in-memory against the
+        // execution id; `on_stop` files an attention and increments
+        // `worker_proposals.channel_error`. See
+        // `crate::proposal_channel_error`.
+        // Still Claude-shaped (`tool_input.command` object): proposal
+        // channel capture is out of scope for this seam.
+        if tool_name == "Bash"
+            && crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
+            && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
+        {
+            let command = tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("boss propose")
+                .to_owned();
+            if server_state
+                .staged_proposal_channel_errors
+                .record_if_unset(run_id, &command, &error_text)
             {
-                let command = tool_input
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("boss propose")
-                    .to_owned();
-                if server_state
-                    .staged_proposal_channel_errors
-                    .record_if_unset(run_id, &command, &error_text)
-                {
-                    tracing::warn!(
-                        execution_id = run_id,
-                        command = %command,
-                        error_text = %error_text,
-                        "proposal_channel_error: staged a failed `boss propose` submission",
-                    );
-                }
+                tracing::warn!(
+                    execution_id = run_id,
+                    command = %command,
+                    error_text = %error_text,
+                    "proposal_channel_error: staged a failed `boss propose` submission",
+                );
             }
         }
     }
@@ -790,14 +804,51 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
         .await;
 }
 
-/// DB-and-registry-free decision core for
-/// [`dispatch_post_hoc_interception_on_post_tool_use`]: given the driver
-/// resolved for an execution, decide whether the degrade path applies and,
-/// if so, what its registered [`crate::driver::PostHocInterceptionFn`]
-/// (or the implicit `Accept` when none is registered) decided. Split out so
-/// this decision logic is unit-testable against
-/// [`boss_engine_driver::test_support::StubDriver`] without a DB or a
-/// `ServerState`.
+/// Resolve the driver's PR-URL capture feed for a completed tool observation.
+///
+/// Looks up the execution's driver slug and asks
+/// [`crate::driver::AgentDriver::pr_url_capture_feed`]. When the slug is
+/// unknown, unregistered, or the DB lookup fails, falls back to
+/// [`crate::driver::default_pr_url_capture_feed`] so Claude's historical
+/// object shape (and the Codex bare-string shape the default also
+/// understands) still capture — never poll GitHub for the branch's PR as
+/// a substitute.
+///
+/// Non-`Bash` tools never feed PR-URL capture under any current driver
+/// (the default feed and every override map command execution onto the
+/// Bash tool name). Return `None` before the DB/registry work so ordinary
+/// Read/Edit/etc. PostToolUse events do not pay a SQLite round-trip.
+fn pr_url_capture_feed_for_execution(
+    server_state: &ServerState,
+    execution_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> Option<crate::driver::PrUrlCaptureFeed> {
+    use crate::driver::{DriverRegistry, default_pr_url_capture_feed};
+
+    // Hot-path filter: match `default_pr_url_capture_feed`'s Bash gate
+    // before any execution-row lookup. Capture outcomes are unchanged.
+    if tool_name != "Bash" {
+        return None;
+    }
+
+    let registry = DriverRegistry::default();
+    match server_state.work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => match registry.get(&slug) {
+            Some(driver) => driver.pr_url_capture_feed(tool_name, tool_input, tool_response),
+            None => default_pr_url_capture_feed(tool_name, tool_input, tool_response),
+        },
+        Ok(None) | Err(_) => default_pr_url_capture_feed(tool_name, tool_input, tool_response),
+    }
+}
+
+/// Given a driver already resolved for an execution, decide whether the
+/// degrade path applies and, if so, what its registered
+/// [`crate::driver::PostHocInterceptionFn`] (or the implicit `Accept` when
+/// none is registered) decided. Split out so this decision logic is
+/// unit-testable against [`boss_engine_driver::test_support::StubDriver`]
+/// without a DB or a `ServerState`.
 ///
 /// Returns `None` when `driver`'s declared
 /// [`crate::driver::AbsenceDisposition`] for
