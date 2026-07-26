@@ -1,7 +1,8 @@
 - always use minimal bazel visibility, never default to public. Maintain bazel visibility health.
 - Documentation-only changes (markdown files, design docs, plans, READMEs) should be pushed directly to `main` instead of opening a PR.
 - **HARD RULE: always use Bazel for local builds and tests. Never invoke `cargo build`, `cargo test`, or any bare `cargo` command directly.** Direct `cargo` is slow, uncached, and does not match what CI builds. Bazel is the canonical, cached path — it is what CI runs, and it is what you must run locally. For the engine: `bazel test //tools/boss/engine/...`.
-- `checkleft` (the linter behind `checkleft --all`) lives in this repo, at `tools/checkleft/` — it is not a standalone external repo. Don't go hunting elsewhere for it; it's published to crates.io and released as prebuilt binaries from here (see `tools/checkleft/docs/buildkite-release-setup.md`).
+- `checkleft` (the linter) lives in this repo, at `tools/checkleft/` — it is not a standalone external repo. Don't go hunting elsewhere for it; it's published to crates.io and released as prebuilt binaries from here (see `tools/checkleft/docs/buildkite-release-setup.md`).
+- **Run `checkleft run` with no flags.** Its change detection scopes the run to what you actually touched, which is what makes it fast in a monorepo — no SHA or base-ref plumbing needed. **Do not run `checkleft --all`.** It is reserved for CI's dedicated integrity pipeline, for work that modifies checkleft itself, or for a case with a strong stated justification. `--all` is not a stricter superset of the default: checks with `changed_lines_only` become a no-op under it, so it reports every pre-existing violation in the repo and buries the findings that belong to your change.
 
 ## Prefer crates over modules for distinct units of functionality (Rust)
 
