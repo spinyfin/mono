@@ -1043,8 +1043,8 @@ struct ContentView: View {
 
     @ViewBuilder
     private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
-        // Column container owns observation of `LiveWorkerStateStore` and
-        // builds each card's `WorkCardSnapshot` (design entry 6). Cards
+        // Column container observes `ChatViewModel` + `LiveWorkerStateStore`
+        // and builds each card's `WorkCardSnapshot` (design entry 6). Cards
         // hold a non-observing model reference for action dispatch only.
         WorkBoardSectionItemsView(
             items: items,

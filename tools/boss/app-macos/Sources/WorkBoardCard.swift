@@ -13,17 +13,22 @@ private let kanbanDocLinkLog = Logger(
     category: "kanban-doc-link"
 )
 
-/// Column-local card list. Observes `LiveWorkerStateStore` so Doing-lane
-/// live-status ticks recompute snapshots without every card subscribing
-/// (design entry 6). Does **not** observe `ChatViewModel` — the parent
-/// `ContentView` already does; `model` is held for snapshot construction
-/// and passed non-observing into each card for action dispatch only.
+/// Column-local card list. Observes `ChatViewModel` so model publishes
+/// (selection, highlights, drag/merge notices, `taskRuntimesByID`, prereq
+/// caches, …) recompute per-card `WorkCardSnapshot`s once per column
+/// (design entry 6). Also observes `LiveWorkerStateStore` so Doing-lane
+/// live-status ticks rebuild snapshots without every card subscribing.
+/// Cards stay non-observing and receive snapshots as values —
+/// `.equatable()` skips bodies whose snapshot did not change.
 struct WorkBoardSectionItemsView: View {
     let items: [WorkTask]
     let column: WorkBoardColumnKey
     let boardStyle: KanbanBoardStyle
-    /// Non-observing. Parent `ContentView` owns `ChatViewModel` observation.
-    let model: ChatViewModel
+    /// Observed here so snapshot construction re-runs when model state
+    /// that feeds cards changes (including pure `taskRuntimesByID`
+    /// updates for Doing dispatch/slot status). Cards hold a
+    /// non-observing reference for action dispatch only.
+    @ObservedObject var model: ChatViewModel
     /// Observed here so live-state publishes rebuild Doing snapshots once
     /// per section instead of invalidating every mounted card.
     @ObservedObject var liveStates: LiveWorkerStateStore
