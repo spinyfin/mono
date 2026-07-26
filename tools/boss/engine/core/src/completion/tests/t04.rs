@@ -1280,10 +1280,26 @@ async fn revision_triggered_review_catches_motivating_duplication_case() {
         "follow-up revision instructions must carry the duplication finding: {}",
         followup_task.description,
     );
+    // even when PR-review runs against a revision work item, the
+    // follow-up revision parents to the chain root (the original chore),
+    // not to the reviewed revision — chains stay flat under the root.
+    let reviewed = match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    let chain_root_id = reviewed
+        .parent_task_id
+        .as_deref()
+        .expect("reviewed revision must have a chain-root parent");
     assert_eq!(
         followup_task.parent_task_id.as_deref(),
+        Some(chain_root_id),
+        "follow-up revision must parent to the chain root, not nest under the reviewed revision",
+    );
+    assert_ne!(
+        followup_task.parent_task_id.as_deref(),
         Some(revision_id.as_str()),
-        "follow-up revision must chain off the reviewed revision task",
+        "follow-up must not nest under the reviewed revision",
     );
 }
 

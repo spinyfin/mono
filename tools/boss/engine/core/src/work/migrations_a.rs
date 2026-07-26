@@ -151,6 +151,65 @@ pub(crate) fn migrate_tasks_parent_task_id_column(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Flatten nested revision parentage so every revision's `parent_task_id`
+/// points at the chain root (the original non-revision work item).
+///
+/// Historically, `create_revision` stored the caller's parent selector
+/// verbatim — so a revision filed against another revision (manual
+/// `create-revision --parent <rev>`, PR-review / CI / conflict producers
+/// against a revision work item) nested under that revision. The UI and
+/// `list_revisions --parent <root>` only surface direct children of the
+/// root, which hid nested revisions from the chain.
+///
+/// New inserts already canonicalize via [`assert_parent_revisable_and_insert`].
+/// This migration repairs existing nested rows in place: walks each
+/// revision whose parent is itself a revision up to the non-revision
+/// chain root and rewrites `parent_task_id`. Soft-deleted rows are
+/// included so a later restore cannot reintroduce nesting. Status,
+/// executions, PR association, dependency edges, and sequence order
+/// (creation-order R<n>) are untouched. Idempotent: a second pass finds
+/// no nested parents and is a no-op.
+pub(crate) fn migrate_flatten_nested_revision_parents(conn: &Connection) -> Result<()> {
+    // Collect candidates first so we don't hold a query open while
+    // rewriting (and so a long chain of nested rows is repaired in one
+    // pass even when an intermediate rewrite changes the join set).
+    let mut stmt = conn.prepare(
+        "SELECT child.id
+         FROM tasks child
+         JOIN tasks parent ON parent.id = child.parent_task_id
+         WHERE child.kind = 'revision'
+           AND parent.kind = 'revision'
+           AND child.parent_task_id IS NOT NULL",
+    )?;
+    let nested_ids: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+    drop(stmt);
+
+    for rev_id in nested_ids {
+        let root_id = chain_root(conn, &rev_id)?;
+        if root_id == rev_id {
+            // Corrupt cycle / broken parent: leave the row alone rather
+            // than inventing a parent. chain_root's cycle guard already
+            // returned a reachable id; if that id is the revision itself
+            // we have nowhere safe to reparent.
+            continue;
+        }
+        // Skip if the resolved root is still a revision (orphaned nested
+        // chain with no non-revision ancestor) — same leave-alone policy.
+        let root_kind: Option<String> = conn
+            .query_row("SELECT kind FROM tasks WHERE id = ?1", params![root_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if root_kind.as_deref() != Some("revision") {
+            conn.execute(
+                "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1 AND parent_task_id != ?2",
+                params![rev_id, root_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// Backfill revision `name` to first-line-of-description for existing rows.
 ///
 /// The original `insert_revision_in_tx` stored the full description in both
