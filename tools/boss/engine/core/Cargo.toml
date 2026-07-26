@@ -10,6 +10,8 @@ boss-build-provenance = { path = "../../build-provenance" }
 boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-claude-client = { path = "../../claude_client" }
 boss-comment-anchor = { path = "../../comment_anchor" }
+boss-engine-comment-classifier = { path = "../comment-classifier" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
 boss-github = { path = "../../github" }
 boss-github-tracker = { path = "../../github_tracker" }
 boss-trunk-auth = { path = "../../trunk_auth" }
@@ -24,6 +26,7 @@ git-utils = { path = "../../../../lib/rust/git_utils" }
 boss-conflict-diagnosis = { path = "../conflict-diagnosis" }
 boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-dispatch-events = { path = "../dispatch-events" }
+boss-dispatch-reader = { path = "../dispatch-reader" }
 boss-editorial = { path = "../editorial" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-driver = { path = "../driver" }
@@ -37,10 +40,15 @@ boss-engine-planner-validation = { path = "../planner-validation" }
 boss-pr-review = { path = "../pr-review" }
 boss-pr-template = { path = "../pr-template" }
 boss-engine-proposal-validation = { path = "../proposal-validation" }
+boss-engine-recovery = { path = "../recovery" }
 boss-protocol = { path = "../../protocol" }
 boss-ssh-transport = { path = "../ssh-transport" }
 boss-engine-day-rotated-log = { path = "../day-rotated-log" }
+boss-event-bus = { path = "../event-bus" }
+boss-engine-stdout-progress = { path = "../stdout-progress" }
+boss-engine-structured-output = { path = "../structured-output" }
 boss-engine-transient-error = { path = "../transient-error" }
+boss-engine-utility-model = { path = "../utility-model" }
 boss-engine-utils = { path = "../utils" }
 boss-engine-worker-policy = { path = "../worker-policy" }
 boss-transcript-tail = { path = "../transcript-tail" }

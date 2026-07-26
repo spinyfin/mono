@@ -1,0 +1,48 @@
+[0.0] === ghosttykit_spike start 2026-07-26T11:14:55Z ===
+[0.0] host: ghosttykit_spike (throwaway)
+codex_bin: /Users/brianduff/.local/bin/codex
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+date: 2026-07-26T11:14:55Z
+[0.1] codex --version: codex-cli 0.145.0
+[0.1] ghostty_init ok
+[0.1] ghostty_app_new ok
+[0.1] initial_input=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh
+[0.2] ghostty_surface_new ok
+[0.2] timers armed; waiting for codex in embed surface
+[0.7] viewport_bytes=216 fg_pid=6320 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[1.2] viewport_bytes=424 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[2.2] viewport_bytes=525 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[2.2] OBSERVED thread.started in surface text
+[6.2] viewport_bytes=637 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[6.2] INJECT mid_codex body=echo GKIT_INJECT_VIA_SURFACE_TEXT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/injected_side_effect.txt
+[6.2] INJECT mid_codex Return sent
+[6.7] viewport_bytes=853 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[7.2] viewport_bytes=1026 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[25.2] viewport_bytes=1196 fg_pid=6676 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[26.2] viewport_bytes=1753 fg_pid=6320 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[26.2] OBSERVED gkit-embed-done in surface text
+[26.2] SIDE_EFFECT after mid inject (interactive shell): GKIT_INJECT_VIA_SURFACE_TEXT
+[26.2] INJECT post_exit body=echo GKIT_POST_EXIT_INJECT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/post_exit_side_effect.txt
+[26.2] INJECT post_exit Return sent
+[26.7] viewport_bytes=1997 fg_pid=6320 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast 
+[29.2] finish reason=post_exit_window
+[29.2] SUMMARY written:
+reason: post_exit_window
+saw_thread_started: true
+saw_gkit_embed_done: true
+viewport_final_bytes: 1997
+screen_final_bytes: 1997
+viewport_contains_thread_started: true
+viewport_contains_gkit_embed_done: true
+viewport_contains_jsonl_turn: true
+mid_inject_side_effect: GKIT_INJECT_VIA_SURFACE_TEXT
+post_exit_side_effect: GKIT_POST_EXIT_INJECT
+codex_exit: 0
+shell_pid_file: 6676
+tty: /dev/ttys009
+foreground_pid_at_end: 6320
+snapshot_count: 9
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

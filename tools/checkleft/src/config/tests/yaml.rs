@@ -5,7 +5,7 @@ use tempfile::tempdir;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::config::{CheckConfigOrigin, ConfigResolver, ConfigResolverOptions};
+use crate::config::{CheckConfigOrigin, CheckScope, ConfigResolver, ConfigResolverOptions};
 
 #[test]
 fn resolves_yaml_config_file() {
@@ -496,6 +496,52 @@ checks:
         check.exclude_patterns,
         vec!["frontend/testdata/report-*.reference.html".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn external_config_parses_changeset_scope() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/external.yaml"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"
+checks:
+  - id: boss/no-boss-isms
+    scope: changeset
+"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let temp = tempdir().expect("create temp dir");
+    let external_url = format!("{}/external.yaml", server.uri());
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        format!(
+            r#"
+settings:
+  external_checks_url: "{external_url}"
+checks:
+  - id: file-size
+"#
+        ),
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new_with_options(
+        temp.path(),
+        ConfigResolverOptions {
+            external_checks_url: None,
+            external_checks_file: None,
+        },
+    )
+    .await
+    .expect("create resolver");
+
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+    let check = checks.get("boss/no-boss-isms").expect("check present");
+    assert_eq!(check.scope, CheckScope::Changeset);
 }
 
 #[tokio::test]

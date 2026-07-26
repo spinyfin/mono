@@ -117,6 +117,13 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
 
+    /// Flip the `deferred` (future-scope) classification. `None` → leave
+    /// unchanged. `Some(false)` approves the item (pulls it into scope so
+    /// it can be dispatched); `Some(true)` re-defers it. See
+    /// [`crate::Task::deferred`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred: Option<bool>,
+
     /// Set or clear the `blocked_reason` field. `None` → leave unchanged.
     /// `Some("")` → clear (write NULL). Any non-empty string is stored verbatim
     /// (e.g. `"merge_conflict"`, `"ci_failure"`). Manual escape hatch for
@@ -182,6 +189,15 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Reasoning mode to apply on this update. `None` → leave the existing
+    /// column value alone. `Some("")` → clear the column (write NULL, so the
+    /// row falls back to the dispatcher's legacy effort-table path). Any
+    /// other string is validated against the
+    /// [`ReasoningMode`](crate::ReasoningMode) enum at the engine boundary;
+    /// invalid values reject the entire patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
     /// Driver override. `None` → leave unchanged. `Some("")` → clear.
     /// Any other string is stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -200,6 +216,29 @@ pub struct WorkItemPatch {
     /// trailing `/`. See [`Product::worker_branch_prefix`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_branch_prefix: Option<String>,
+
+    /// Replace the full free-form tag set on a leaf work item. `None` →
+    /// leave unchanged. `Some(vec![])` → clear all tags. Applied before
+    /// [`add_tags`](Self::add_tags) / [`remove_tags`](Self::remove_tags)
+    /// when those are also set in the same patch. Only honoured on
+    /// task/chore updates; ignored for product/project. Validated
+    /// against [`crate::WORK_ITEM_TAG_MAX_LEN`] /
+    /// [`crate::WORK_ITEM_TAG_MAX_COUNT`] at the engine boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+
+    /// Tags to append (order-preserving, de-duplicated against the
+    /// current set). Applied after [`tags`](Self::tags) when both are
+    /// set. `None` → no adds. Only honoured on task/chore updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_tags: Option<Vec<String>>,
+
+    /// Tags to remove (exact string match). Applied after
+    /// [`tags`](Self::tags) / [`add_tags`](Self::add_tags). Unknown
+    /// names are ignored. `None` → no removes. Only honoured on
+    /// task/chore updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

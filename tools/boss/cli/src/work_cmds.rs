@@ -678,12 +678,14 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .deferred(args.deferred)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
                     .maybe_model_override(model_override)
+                    .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
                     .force_duplicate(args.force_duplicate)
                     .build(),
@@ -735,6 +737,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        TaskCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         TaskCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         TaskCommand::Reorder(args) => {
@@ -797,12 +800,14 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .name(name)
                     .maybe_description(description)
                     .autostart(!ctx.no_autostart)
+                    .deferred(args.deferred)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
                     .maybe_model_override(model_override)
+                    .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
                     .force_duplicate(args.force_duplicate)
                     .build(),
@@ -841,6 +846,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args, true).await,
         ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
         ChoreCommand::Restore(args) => run_restore_leaf(&mut client, ctx, args).await,
         ChoreCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
@@ -897,8 +903,12 @@ pub(crate) async fn run_comment_reply(ctx: &RunContext, args: CommentReplyArgs) 
 }
 
 /// Shared handler for `boss task show <id>` and `boss chore show <id>`.
-/// Routes any leaf work item id through the same path; the JSON key
-/// and human-mode label match the actual kind of the returned item.
+/// Routes any leaf work item id through the same path. The JSON row
+/// is *not* wrapped under a dynamic `task`/`chore` key — its fields
+/// (including `kind`, from the `Task` struct itself) sit at the top
+/// level alongside `dependencies`/`executions`/`attention_items`/
+/// `attention_groups`, so `.status` resolves the same way regardless
+/// of which kind the resolved item turned out to be.
 ///
 /// `chore_only`: when `true` (called from `boss chore show`), resolving
 /// a friendly short id to a non-chore task-table row produces a
@@ -938,30 +948,43 @@ pub(crate) async fn run_show_leaf(
     let runtime = get_task_runtime(client, &item.id).await?;
     let attention_items = list_attention_items_for_work_item(client, &item.id).await?;
     let attention_groups = list_attention_groups(client, &product.id, None, Some(item.id.clone()), None, None).await?;
-    let task_json = task_json_with_runtime(&item, &runtime)?;
-    print_entity(
-        ctx,
-        &serde_json::json!({
-            label: task_json,
-            "dependencies": detail,
-            "executions": executions,
-            "attention_items": attention_items,
-            "attention_groups": attention_groups,
-        }),
-        || {
-            print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
-            print_attention_items_section(&attention_items);
-            print_attention_groups_section(&attention_groups);
-            print_runtime_section(&runtime);
-            print_dependency_section(&detail);
-            print_executions_section(&executions);
-        },
-    )
+    let mut task_json = task_json_with_runtime(&item, &runtime)?;
+    // These keys share a namespace with `Task`'s own serialized fields, so a
+    // future `Task` field named `dependencies`/`executions`/`attention_items`/
+    // `attention_groups` would be silently overwritten by the insert below.
+    if let serde_json::Value::Object(map) = &mut task_json {
+        map.insert(
+            "dependencies".to_owned(),
+            serde_json::to_value(&detail).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "executions".to_owned(),
+            serde_json::to_value(&executions).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "attention_items".to_owned(),
+            serde_json::to_value(&attention_items).map_err(CliError::internal)?,
+        );
+        map.insert(
+            "attention_groups".to_owned(),
+            serde_json::to_value(&attention_groups).map_err(CliError::internal)?,
+        );
+    } else {
+        return Err(CliError::internal(anyhow::anyhow!("task JSON was not an object")));
+    }
+    print_entity(ctx, &task_json, || {
+        print_task_details(label_titlecase(label), &item, Some(&product), with_primary_id);
+        print_attention_items_section(&attention_items);
+        print_attention_groups_section(&attention_groups);
+        print_runtime_section(&runtime);
+        print_dependency_section(&detail);
+        print_executions_section(&executions);
+    })
 }
 
 /// Serialise `item` and splice the runtime's `current_execution_id`
 /// / `current_run_id` onto the resulting JSON object so a downstream
-/// `jq .task.current_execution_id` resolves to the engine's view of
+/// `jq .current_execution_id` resolves to the engine's view of
 /// the dispatched execution. Both fields land as `null` when no
 /// execution / run exists yet — the coordinator wants the keys
 /// present so it can distinguish "engine returned null" from "this
@@ -1045,6 +1068,11 @@ pub(crate) async fn run_update_leaf(
     } else {
         args.model
     };
+    let reasoning = if args.unset_reasoning {
+        Some(String::new())
+    } else {
+        args.reasoning.map(|r| r.as_str().to_owned())
+    };
     let driver = if args.unset_driver {
         Some(String::new())
     } else {
@@ -1054,6 +1082,26 @@ pub(crate) async fn run_update_leaf(
         args.driver.as_deref().filter(|_| !args.unset_driver),
         model_override.as_deref().filter(|s| !s.is_empty()),
     )?;
+    let tags = if args.clear_tags {
+        Some(Vec::new())
+    } else {
+        args.tags.map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
+    let add_tags = if args.add_tags.is_empty() {
+        None
+    } else {
+        Some(args.add_tags)
+    };
+    let remove_tags = if args.remove_tags.is_empty() {
+        None
+    } else {
+        Some(args.remove_tags)
+    };
     let patch = WorkItemPatch {
         name: args.name,
         description: args.description,
@@ -1067,8 +1115,13 @@ pub(crate) async fn run_update_leaf(
         repo_remote_url: args.repo_remote_url,
         effort_level,
         model_override,
+        reasoning,
         driver,
         autostart: args.autostart,
+        // `--deferred false` approves a future-scope item; `--deferred true`
+        // re-parks it. `None` (flag omitted) leaves the classification
+        // unchanged.
+        deferred: args.deferred,
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
         blocked_reason: args.blocked_reason,
@@ -1076,11 +1129,14 @@ pub(crate) async fn run_update_leaf(
         // maps to NULL in the engine (clears the field). The engine rejects
         // a non-empty detail with no accompanying blocked_reason.
         blocked_detail: args.blocked_detail,
+        tags,
+        add_tags,
+        remove_tags,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, --blocked-reason, or --blocked-detail",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {
@@ -1111,6 +1167,26 @@ pub(crate) async fn run_move_leaf(
     let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Moved {label}"), &item, None, false);
+    })
+}
+
+/// Shared handler for `boss task cancel` and `boss chore cancel`.
+/// Shorthand for `run_move_leaf` with a fixed `cancelled` target.
+pub(crate) async fn run_cancel_leaf(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskIdArg,
+) -> Result<(), CliError> {
+    let with_primary_id = args.with_primary_id;
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    let patch = WorkItemPatch {
+        status: Some("cancelled".to_owned()),
+        ..WorkItemPatch::default()
+    };
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
+    let item = with_display_status(item);
+    print_entity(ctx, &serde_json::json!({ label: item }), || {
+        print_task_details(&format!("Cancelled {label}"), &item, None, with_primary_id);
     })
 }
 

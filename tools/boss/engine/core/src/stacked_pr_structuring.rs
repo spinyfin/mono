@@ -221,7 +221,14 @@ pub struct GhPrChangedFiles;
 #[async_trait::async_trait]
 impl PrChangedFilesFetcher for GhPrChangedFiles {
     async fn changed_files(&self, pr_url: &str) -> Result<Vec<String>> {
-        boss_github::pr_files::fetch_pr_changed_files(pr_url).await
+        // Scoped here rather than only at the sweep that drives it: this
+        // fetcher is a trait impl other callers can reach, and an
+        // un-scoped path would silently land in `unattributed`.
+        boss_gh_telemetry::scope(
+            boss_gh_telemetry::callers::STACKED_PR_STRUCTURING,
+            boss_github::pr_files::fetch_pr_changed_files(pr_url),
+        )
+        .await
     }
 }
 

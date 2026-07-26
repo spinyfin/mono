@@ -86,8 +86,8 @@ async fn over_long_blocked_reason_is_rejected_and_names_blocked_detail() -> Resu
 
     // Nothing was written.
     let shown = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
-    assert_eq!(shown["chore"]["status"].as_str(), Some("todo"));
-    assert!(shown["chore"]["blocked_reason"].is_null());
+    assert_eq!(shown["status"].as_str(), Some("todo"));
+    assert!(shown["blocked_reason"].is_null());
 
     Ok(())
 }
@@ -172,7 +172,7 @@ async fn blocked_detail_round_trips_through_json_and_show() -> Result<()> {
     assert_eq!(updated["chore"]["blocked_detail"].as_str(), Some(detail));
 
     let shown = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
-    assert_eq!(shown["chore"]["blocked_detail"].as_str(), Some(detail));
+    assert_eq!(shown["blocked_detail"].as_str(), Some(detail));
 
     Ok(())
 }

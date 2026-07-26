@@ -92,8 +92,9 @@ impl WorkDb {
             params![task.id, new_status.as_str(), pr_url_for_task, now, blocked_reason_for_task],
         )?;
 
+        let mut pending = PendingEvents::new();
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }
 
         // Comment-intent-classification design §"Reconciliation": a
@@ -146,7 +147,8 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        tx.commit()?;
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -230,8 +232,9 @@ impl WorkDb {
             params![task.id, new_status.as_str(), now],
         )?;
 
+        let mut pending = PendingEvents::new();
         if new_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, &task.id, new_status.as_str(), &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, new_status.as_str(), &now)?;
         }
 
         tx.execute(
@@ -265,7 +268,8 @@ impl WorkDb {
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let updated_task = query_task(&tx, &work_item_id).require("task", &work_item_id)?;
-        tx.commit()?;
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(WorkerPrCompletion {
             execution: updated_execution,
             work_item: task_to_item(updated_task),
@@ -388,7 +392,9 @@ impl WorkDb {
         }
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(IdleAbandonmentCompletion {
             execution: updated_execution,
             work_item: task.map(task_to_item),
@@ -615,6 +621,142 @@ impl WorkDb {
         Ok(rows_changed > 0)
     }
 
+    /// Return terminated/abandoned executions whose engine-supplied branch
+    /// may have been pushed with no PR ever bound — the candidate set for
+    /// [`crate::abandoned_branch_pr_sweep`].
+    ///
+    /// Unlike [`Self::list_recently_terminal_executions_pending_pr_detection`]
+    /// this does **not** gate on `t.status = 'active'`. That gate is exactly
+    /// the gap behind the 2026-07-24 GitHub PR-creation-outage incident: a
+    /// terminated worker's execution can leave the task in `todo` (auto-demote
+    /// / churn-guard / plain fallback), not just `active`, and an
+    /// `active`-only query then treats it as indistinguishable from work
+    /// that never started. This detects the state directly off the
+    /// execution row — terminal, workspace-backed (a pane actually spawned
+    /// and could have pushed), no `pr_url` bound anywhere — independent of
+    /// whatever kanban status the task fell back to.
+    ///
+    /// `grace_secs` excludes executions that finished too recently: a
+    /// worker that just terminated may not have reached PR creation yet, and
+    /// the normal on-Stop / merge-poller paths are still the first line of
+    /// detection. `max_lookback_secs` bounds the scan on the old end — this
+    /// sweep runs frequently and retries indefinitely (see that module), so
+    /// once a row is older than the lookback it has already been through
+    /// many passes; the bound exists to keep the query cheap as the table
+    /// grows, not to give up on any specific row (a still-unresolved row
+    /// this old already has an open attention item from an earlier pass).
+    ///
+    /// Excludes `cancelled` executions (explicit human/engine cancel — no
+    /// business auto-recovering a PR for abandoned-on-purpose work) and
+    /// `t.status IN ('done', 'archived', 'cancelled')` (an explicit close
+    /// decision the auto-heal path must never overwrite). `workspace_path
+    /// IS NOT NULL` mirrors the late-PR query: the absence of a workspace
+    /// path means the execution never reached pane-spawn and therefore never
+    /// pushed anything.
+    ///
+    /// Single-live-worker guard: excludes any work item that currently has a
+    /// LIVE execution (any non-terminal [`ExecutionStatus`]). A terminated
+    /// execution's task commonly falls back to `todo` — the dispatchable
+    /// backlog status the reconcile sweep re-enqueues for autostart chores —
+    /// so a live execution frequently exists on the same work item shortly
+    /// after the terminal one that pushed the abandoned branch. Without this
+    /// guard the sweep would open a PR from the dead run's stale branch and
+    /// flip the task to `in_review` out from under the still-running worker
+    /// — the same race [`Self::advance_pending_review_task_to_in_review`]
+    /// guards against with an equivalent `NOT EXISTS` clause.
+    pub fn list_abandoned_pushed_branch_candidates(
+        &self,
+        grace_secs: i64,
+        max_lookback_secs: i64,
+    ) -> Result<Vec<LatePrCandidate>> {
+        let conn = self.connect()?;
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let grace_cutoff = (now - grace_secs).to_string();
+        let lookback_cutoff = (now - max_lookback_secs).to_string();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT we.id, we.work_item_id, we.repo_remote_url, we.branch_naming, we.worker_branch_prefix
+             FROM work_executions we
+             JOIN tasks t ON t.id = we.work_item_id
+             WHERE we.status IN ('orphaned', 'abandoned', 'failed', 'completed')
+               AND we.workspace_path IS NOT NULL
+               AND we.workspace_path != ''
+               AND (we.pr_url IS NULL OR we.pr_url = '')
+               AND we.finished_at IS NOT NULL
+               AND CAST(we.finished_at AS INTEGER) <= ?1
+               AND CAST(we.finished_at AS INTEGER) >= ?2
+               AND t.deleted_at IS NULL
+               AND t.kind IN ({CHORE_LIKE_KINDS_SQL})
+               AND t.status NOT IN ('done', 'archived', 'cancelled')
+               AND (t.pr_url IS NULL OR t.pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = we.work_item_id
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )
+             ORDER BY we.finished_at ASC, we.id ASC",
+        ))?;
+        let rows = stmt.query_map(params![grace_cutoff, lookback_cutoff], |row| {
+            let branch_naming: BranchNaming = deserialize_json_or_default(row.get::<_, Option<String>>(3)?.as_deref());
+            Ok(LatePrCandidate {
+                execution_id: row.get(0)?,
+                work_item_id: row.get(1)?,
+                repo_remote_url: row.get(2)?,
+                branch_naming,
+                worker_branch_prefix: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            })
+        })?;
+        collect_rows(rows)
+    }
+
+    /// Bind a PR to a task from a terminal execution regardless of the
+    /// task's current kanban status, so long as it isn't already closed.
+    ///
+    /// Like [`Self::bind_pr_to_active_task_from_terminal_execution`] but
+    /// relaxes the `status = 'active'` gate to `status NOT IN ('done',
+    /// 'archived', 'cancelled')` — [`crate::abandoned_branch_pr_sweep`]
+    /// detects state directly off the execution row and must be able to
+    /// recover a work item regardless of whether it fell back to `todo`,
+    /// stayed `active`, or is sitting `blocked`. Refuses only an explicit
+    /// close decision (`done`/`archived`/`cancelled`), which the auto-heal
+    /// path must never overwrite.
+    ///
+    /// Returns `Ok(true)` if the task was updated, `Ok(false)` if it was
+    /// already closed, already carried a `pr_url`, or a live execution has
+    /// appeared on the work item since the candidate query ran (idempotent
+    /// for concurrent sweeps, and a no-op guard against the same
+    /// single-live-worker race the candidate query itself excludes — see
+    /// [`Self::list_abandoned_pushed_branch_candidates`]).
+    pub fn bind_pr_to_task_from_terminal_execution(&self, work_item_id: &str, pr_url: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows_changed = conn.execute(
+            "UPDATE tasks
+             SET status            = 'in_review',
+                 pr_url            = ?2,
+                 updated_at        = ?3,
+                 last_status_actor = 'engine',
+                 blocked_reason    = NULL,
+                 blocked_attempt_id = NULL
+             WHERE id = ?1
+               AND deleted_at IS NULL
+               AND status NOT IN ('done', 'archived', 'cancelled')
+               AND (pr_url IS NULL OR pr_url = '')
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_executions live
+                 WHERE live.work_item_id = ?1
+                   AND live.status IN (
+                     'queued', 'ready', 'waiting_dependency', 'running',
+                     'waiting_human', 'waiting_review', 'waiting_merge'
+                   )
+               )",
+            params![work_item_id, pr_url, now],
+        )?;
+        Ok(rows_changed > 0)
+    }
+
     /// Move the chore or project_task identified by `work_item_id`
     /// from `in_review` to `done`, recording `pr_url` (no-op if it
     /// was already set to the same value). Returns the updated task
@@ -627,6 +769,7 @@ impl WorkDb {
     pub fn mark_chore_pr_merged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
         };
@@ -680,7 +823,7 @@ impl WorkDb {
              WHERE id = ?1",
             params![task.id, pr_url, now],
         )?;
-        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
         // merge_order sequencing (direction 2): order the pair. Any in-flight
         // merge_order sibling of this just-merged task is now the "later" side
         // and owes a preserving forward-port when its base moves. This never
@@ -697,7 +840,7 @@ impl WorkDb {
         // (todo / active / waiting_dependency / blocked-for-another-reason)
         // can never push to the merged PR.  Block them now so the
         // scheduler stops dispatching them and the kanban shows why.
-        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         // Comment-intent-classification design §"Reconciliation" (task
         // 2c): resolve any comments whose `[Revise]` batch was dispatched
         // directly to this task (the plain-chore vehicle of the
@@ -708,7 +851,7 @@ impl WorkDb {
         comments::reconcile_comments_for_task(&tx, &task.id, comments::CommentReconcileOutcome::Resolved, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(updated))
     }
 
@@ -739,6 +882,7 @@ impl WorkDb {
     pub fn mark_chore_pr_closed_unmerged(&self, work_item_id: &str, pr_url: &str) -> Result<Option<Task>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let Some(task) = query_task(&tx, work_item_id)? else {
             return Ok(None);
         };
@@ -761,12 +905,12 @@ impl WorkDb {
                AND pr_url = ?2",
             params![task.id, pr_url, now],
         )?;
-        cascade_dependents_after_prereq_status_change(&tx, &task.id, "done", &now)?;
+        cascade_dependents_after_prereq_status_change(&mut pending, &tx, &task.id, "done", &now)?;
         flip_in_review_revisions_to_done(&tx, &task.id, &now)?;
-        block_pending_revisions_on_parent_close(&tx, &task.id, &now)?;
+        block_pending_revisions_on_parent_close(&mut pending, &tx, &task.id, &now)?;
         let updated =
             query_task(&tx, work_item_id)?.with_context(|| format!("unknown task after update: {work_item_id}"))?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(Some(updated))
     }
 
@@ -882,8 +1026,13 @@ impl WorkDb {
         // PR that stays CONFLICTING for an extended period). Without this,
         // pr_state_polled_at freezes the moment the state stabilises, making it
         // impossible to distinguish a frozen poller from an actively-polling one.
+        // `pr_status_observed_at` is stamped alongside it here (the poller
+        // side of that column's two writers — see
+        // `set_pr_status_observation` for the worker-refresh side); unlike
+        // `pr_state_polled_at`, it is not exclusively a poller liveness
+        // signal, so a worker refresh is allowed to advance it too.
         tx.execute(
-            "UPDATE tasks SET pr_state_polled_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            "UPDATE tasks SET pr_state_polled_at = ?2, pr_status_observed_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
         // Only write state columns (and count as changed) when CI, review,
@@ -904,13 +1053,19 @@ impl WorkDb {
                  ci_required_detail     = ?4,
                  review_required_detail = ?5,
                  merge_queue_state      = CASE WHEN ?8 THEN merge_queue_state ELSE ?6 END,
-                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END
+                 merge_queue_detail     = CASE WHEN ?8 THEN merge_queue_detail ELSE ?7 END,
+                 pr_mergeable_state     = ?9,
+                 pr_merge_state_status  = ?10,
+                 pr_head_sha            = ?11
              WHERE id = ?1
                AND deleted_at IS NULL
                AND (COALESCE(ci_required_state, '') != ?2
                     OR COALESCE(review_required_state, '') != ?3
                     OR (NOT ?8 AND (COALESCE(merge_queue_state, '') != COALESCE(?6, '')
-                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, ''))))",
+                                    OR COALESCE(merge_queue_detail, '') != COALESCE(?7, '')))
+                    OR COALESCE(pr_mergeable_state, '') != ?9
+                    OR COALESCE(pr_merge_state_status, '') != COALESCE(?10, '')
+                    OR COALESCE(pr_head_sha, '') != COALESCE(?11, ''))",
             params![
                 work_item_id,
                 input.ci_required_state,
@@ -920,6 +1075,9 @@ impl WorkDb {
                 input.merge_queue_state,
                 input.merge_queue_detail,
                 preserve,
+                input.pr_mergeable_state,
+                input.pr_merge_state_status,
+                input.pr_head_sha,
             ],
         )?;
         tx.commit()?;
@@ -928,6 +1086,72 @@ impl WorkDb {
             prior_ci_state,
             prior_merge_queue_state,
         })
+    }
+
+    /// The PR-status snapshot backing `boss pr status` (`app::pr_status`):
+    /// exactly the columns the merge poller already wrote for this task's
+    /// PR, as of its last probe — no GitHub call. Returns `Ok(None)` only
+    /// when the row itself is gone (deleted); a task with no PR yet, or one
+    /// the poller hasn't probed, comes back with every field `None` except
+    /// `pr_url` if set.
+    pub fn get_pr_status_snapshot(&self, work_item_id: &str) -> Result<Option<PrStatusSnapshot>> {
+        let conn = self.connect()?;
+        conn.query_row(
+            "SELECT pr_url, pr_mergeable_state, pr_merge_state_status, pr_head_sha, pr_status_observed_at
+             FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| {
+                Ok(PrStatusSnapshot {
+                    pr_url: row.get(0)?,
+                    mergeable: row.get(1)?,
+                    merge_state_status: row.get(2)?,
+                    head_sha: row.get(3)?,
+                    observed_at: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .context("reading pr status snapshot")
+    }
+
+    /// Persist a fresh `boss pr status --refresh` observation directly from
+    /// a live `MergeProbe::probe` result, bypassing the CI/review/merge-queue
+    /// bookkeeping [`Self::update_task_pr_poll_state`] otherwise couples to
+    /// the same write — a refresh is a single bounded on-demand mergeability
+    /// check, not a full sweep pass. Always writes `pr_mergeable_state` and
+    /// `pr_status_observed_at` (no changed-guard): a caller that paid for a
+    /// live `gh` round trip wants the row to reflect it unconditionally.
+    /// `merge_state_status` / `head_sha` are `COALESCE`d against the stored
+    /// value instead of overwritten outright — the probe that reaches this
+    /// call is always `Open` (callers must gate on `PrLifecycleState::Open`
+    /// before calling), but GitHub can still omit either individual field on
+    /// a given response, and a missing field must not blank a previously
+    /// known-good one.
+    ///
+    /// Deliberately does NOT touch `pr_state_polled_at` — that column stays
+    /// the merge poller's own liveness diagnostic (see
+    /// `update_task_pr_poll_state`'s doc comment); a worker refresh advancing
+    /// it would make a wedged poller look alive. `pr_status_observed_at` is
+    /// the shared "last observed by anyone" timestamp both writers stamp.
+    pub fn set_pr_status_observation(
+        &self,
+        work_item_id: &str,
+        mergeable_state: &str,
+        merge_state_status: Option<&str>,
+        head_sha: Option<&str>,
+        observed_at: &str,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE tasks
+             SET pr_mergeable_state    = ?2,
+                 pr_merge_state_status = COALESCE(?3, pr_merge_state_status),
+                 pr_head_sha           = COALESCE(?4, pr_head_sha),
+                 pr_status_observed_at = ?5
+             WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id, mergeable_state, merge_state_status, head_sha, observed_at],
+        )?;
+        Ok(())
     }
 
     /// Write the Merging-UI columns for `work_item_id` directly — the
@@ -1001,12 +1225,43 @@ pub struct PrPollStateInput<'a> {
     pub review_required_detail: Option<&'a str>,
     pub merge_queue_state: Option<&'a str>,
     pub merge_queue_detail: Option<&'a str>,
+    /// Raw GitHub mergeability (`"mergeable"` / `"conflicting"` / `"unknown"`)
+    /// for this probe, independent of CI/review/merge-queue state — see
+    /// `Task::pr_mergeable_state`. Defaults to `""` via `#[derive(Default)]`,
+    /// matching the `ci_required_state`/`review_required_state` convention of
+    /// treating an empty string as "not yet probed" at the DB layer (the
+    /// protocol layer instead normalizes empty to `None`, per `map_task`).
+    pub pr_mergeable_state: &'a str,
+    /// GitHub's raw `mergeStateStatus` for this probe (`"CLEAN"`,
+    /// `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`, `"UNKNOWN"`) — see
+    /// `tasks.pr_merge_state_status`'s migration doc for the stored column.
+    /// `None` when the probe didn't carry one (rare). Backs `boss pr status`.
+    pub pr_merge_state_status: Option<&'a str>,
+    /// The PR's `headRefOid` at probe time. `None` when GitHub didn't
+    /// report one. Backs `boss pr status`'s `head_sha` field with the
+    /// current observed head, distinct from
+    /// `WorkExecution::pr_head_before` (the snapshot at a specific
+    /// execution's run start).
+    pub pr_head_sha: Option<&'a str>,
     /// When `true`, `merge_queue_state`/`merge_queue_detail` are left
     /// untouched regardless of the values above — set by the caller for a
     /// `trunk_queue`-mechanism task, whose merge-queue columns are owned by
     /// the Trunk submission flow rather than this GitHub probe. Defaults to
     /// `false` (the pre-existing behaviour) via `#[derive(Default)]`.
     pub preserve_merge_queue_state: bool,
+}
+
+/// Result of [`WorkDb::get_pr_status_snapshot`] — the columns the merge
+/// poller (or a `boss pr status --refresh` call) last observed for a task's
+/// PR. Every field beyond `pr_url` is `None` until at least one probe has
+/// run. `app::pr_status` maps this into the wire-level `PrStatusView`.
+#[derive(Debug, Clone, Default)]
+pub struct PrStatusSnapshot {
+    pub pr_url: Option<String>,
+    pub mergeable: Option<String>,
+    pub merge_state_status: Option<String>,
+    pub head_sha: Option<String>,
+    pub observed_at: Option<String>,
 }
 
 /// Outcome of [`WorkDb::update_task_pr_poll_state`].

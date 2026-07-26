@@ -139,6 +139,18 @@ pub(crate) enum Commands {
     ///
     /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
     Context,
+    /// Bounded, read-only PR-state verbs over state Boss already has
+    /// stored, for a worker session that would otherwise reach for `gh pr
+    /// view` / `gh pr list --head` just to check its own PR.
+    ///
+    /// Identity is resolved from the worker session the same way `boss
+    /// context` works — no work-item argument, no `--id` flag.
+    ///
+    /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
+    Pr {
+        #[command(subcommand)]
+        command: PrCommand,
+    },
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
@@ -354,7 +366,7 @@ pub(crate) enum ProjectCommand {
 
 /// Subcommands under `boss task ...`.
 ///
-/// The kind-agnostic verbs (`show`, `update`, `move`, `delete`,
+/// The kind-agnostic verbs (`show`, `update`, `move`, `cancel`, `delete`,
 /// `restore`, `depend`, `bind-pr`) operate on any leaf work item by id. A chore
 /// *is* a kind of task — the engine already knows the kind from the
 /// id, so the noun is permissive. The same verbs are mirrored under
@@ -409,6 +421,10 @@ pub(crate) enum TaskCommand {
     Update(TaskUpdateArgs),
     /// Move any leaf work item (task or chore) into a different status.
     Move(TaskMoveArgs),
+    /// Cancel any leaf work item (task or chore) by id. Shorthand for
+    /// `boss task move --to cancelled`: sets the terminal `Cancelled`
+    /// status without soft-deleting the row (unlike `delete`).
+    Cancel(TaskIdArg),
     /// Delete any leaf work item (task or chore) by id.
     Delete(TaskDeleteArgs),
     /// Restore a soft-deleted leaf work item (task or chore) — the
@@ -463,7 +479,11 @@ pub(crate) enum TaskCommand {
     /// The worker's deliverable is a new commit on the *parent task's*
     /// existing PR branch — no new PR is opened. Gated: the parent task
     /// must have an open, unmerged PR; the gate fires against the chain
-    /// root's PR even when `--parent` itself is a revision.
+    /// root's PR even when `--parent` itself is a revision. If a worker
+    /// elsewhere in the chain still looks live (`running`/`waiting_human`),
+    /// a stderr advisory is printed after creation — the new revision is
+    /// still created and queued to run after it; this is visibility only,
+    /// not a block.
     #[command(name = "create-revision")]
     CreateRevision(RevisionCreateArgs),
     /// List `kind = 'revision'` tasks for a product. Revisions are excluded
@@ -493,6 +513,8 @@ pub(crate) enum ChoreCommand {
     Update(TaskUpdateArgs),
     /// Alias for `boss task move`. Accepts any leaf work item id.
     Move(TaskMoveArgs),
+    /// Alias for `boss task cancel`. Accepts any leaf work item id.
+    Cancel(TaskIdArg),
     /// Alias for `boss task delete`. Accepts any leaf work item id.
     Delete(TaskDeleteArgs),
     /// Alias for `boss task restore`. Accepts any leaf work item id.
@@ -512,6 +534,34 @@ pub(crate) enum ChoreCommand {
     /// Alias for `boss task unlink-external`. Accepts any leaf work item id.
     #[command(name = "unlink-external")]
     UnlinkExternal(TaskIdArg),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PrCommand {
+    /// Boss's last-observed mergeability for your own PR: `mergeable`,
+    /// `merge_state_status`, `head_sha`, and `observed_at` — sourced from
+    /// the merge poller's stored state, not a live GitHub call, unless
+    /// `--refresh` is passed. `observed_at` is a Unix epoch seconds
+    /// timestamp: compare it against your own push time to tell whether
+    /// this snapshot predates a push you just made.
+    Status(PrStatusArgs),
+    /// Boss's snapshot of your own PR's body, taken when this execution's
+    /// run started. Never a live GitHub read; `cube pr update` (with
+    /// `--body-file`) remains the only write path. A `null`/absent body in
+    /// `--json` output means no baseline was snapshotted for this
+    /// execution — see the human-readable output for what that implies.
+    Body,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PrStatusArgs {
+    /// Request one bounded, engine-wide-rate-limited live GitHub check
+    /// instead of the stored snapshot — for the case where you just
+    /// pushed and need current state. Falls back silently to the stored
+    /// snapshot (with `refresh_throttled: true`) if the refresh budget is
+    /// exhausted; never blocks or errors on throttling.
+    #[arg(long)]
+    pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1957,6 +2007,15 @@ pub(crate) struct TaskCreateArgs {
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
 
+    /// What kind of thinking this needs: `standard` (well-articulated coding
+    /// work) or `investigation` (has to diagnose or design something before
+    /// it can decide what to change). Independent of `--effort`, which is
+    /// about size — do NOT reach for a bigger `--effort` to get a stronger
+    /// model. Omitted → derived from the kind (design/investigation kinds
+    /// default to `investigation`, everything else to `standard`).
+    #[arg(long, value_enum)]
+    pub(crate) reasoning: Option<ReasoningArg>,
+
     /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
     /// Stored verbatim. When set, the slug passed to `--model` must be
     /// valid for this driver; `--driver copilot --model claude-opus-4-7`
@@ -1981,6 +2040,15 @@ pub(crate) struct TaskCreateArgs {
     /// before its gate exists.
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub(crate) depends_on: Vec<String>,
+
+    /// File this task as deferred / future scope: created and visible in
+    /// the backlog but never auto-dispatched (on any path — normal
+    /// reconcile, dependency auto-unblock, or automation retry) until a
+    /// human explicitly approves it (`bossctl work start`, a kanban drag,
+    /// or `boss task update --deferred false`). Use for work that is real
+    /// but explicitly not yet in scope.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
 
     /// Mark this task as produced by an automation's triage phase. Accepts
     /// an automation selector — a canonical `auto_…` id (resolves on its
@@ -2051,11 +2119,12 @@ pub(crate) struct TaskListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived tasks in the listing. `archived` rows are hidden
-    /// from the default view (and from the kanban board) the same way
-    /// tombstoned rows are, but — unlike delete — they are never
-    /// resurrected; this flag is the only way to see them again short of
-    /// `--status archived`.
+    /// Include archived *and* cancelled tasks in the listing. Both are
+    /// terminal statuses hidden from the default view (and, for
+    /// `archived`, from the kanban board) the same way tombstoned rows
+    /// are, but — unlike delete — they are never resurrected; this flag
+    /// is the only way to see them again short of `--status archived` /
+    /// `--status cancelled`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2129,6 +2198,15 @@ pub(crate) struct ChoreCreateArgs {
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
 
+    /// What kind of thinking this needs: `standard` (well-articulated coding
+    /// work) or `investigation` (has to diagnose or design something before
+    /// it can decide what to change). Independent of `--effort`, which is
+    /// about size — do NOT reach for a bigger `--effort` to get a stronger
+    /// model. Omitted → derived from the kind (design/investigation kinds
+    /// default to `investigation`, everything else to `standard`).
+    #[arg(long, value_enum)]
+    pub(crate) reasoning: Option<ReasoningArg>,
+
     /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
     #[arg(long, value_name = "DRIVER")]
     pub(crate) driver: Option<String>,
@@ -2145,6 +2223,12 @@ pub(crate) struct ChoreCreateArgs {
     /// create→`depend add` race.
     #[arg(long = "depends-on", value_delimiter = ',')]
     pub(crate) depends_on: Vec<String>,
+
+    /// File this chore as deferred / future scope. See
+    /// `boss task create --deferred` for the full description: visible in
+    /// the backlog but never auto-dispatched until explicitly approved.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
 }
 
 /// Args for `boss task create-investigation`.
@@ -2178,11 +2262,20 @@ pub(crate) struct InvestigationCreateArgs {
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
 
+    /// See `boss task create --reasoning`. Omitted → derived from the kind.
+    #[arg(long, value_enum)]
+    pub(crate) reasoning: Option<ReasoningArg>,
+
     #[arg(long, value_name = "DRIVER")]
     pub(crate) driver: Option<String>,
 
     #[arg(long = "force-duplicate", default_value_t = false)]
     pub(crate) force_duplicate: bool,
+
+    /// File this investigation as deferred / future scope. See
+    /// `boss task create --deferred` for the full description.
+    #[arg(long = "deferred", default_value_t = false)]
+    pub(crate) deferred: bool,
 }
 
 /// Args for `boss task create-revision`.
@@ -2217,6 +2310,10 @@ pub(crate) struct RevisionCreateArgs {
 
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
+
+    /// See `boss task create --reasoning`. Omitted → derived from the kind.
+    #[arg(long, value_enum)]
+    pub(crate) reasoning: Option<ReasoningArg>,
 
     #[arg(long, value_name = "DRIVER")]
     pub(crate) driver: Option<String>,
@@ -2271,7 +2368,8 @@ pub(crate) struct RevisionListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived revisions in the listing. See `boss task list --help`.
+    /// Include archived/cancelled revisions in the listing. See
+    /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2362,7 +2460,8 @@ pub(crate) struct ChoreListArgs {
     #[arg(long = "deleted", alias = "include-deleted")]
     pub(crate) include_deleted: bool,
 
-    /// Include archived chores in the listing. See `boss task list --help`.
+    /// Include archived/cancelled chores in the listing. See
+    /// `boss task list --help`.
     #[arg(long = "include-archived")]
     pub(crate) include_archived: bool,
 
@@ -2501,6 +2600,17 @@ pub(crate) struct TaskUpdateArgs {
     #[arg(long = "unset-model")]
     pub(crate) unset_model: bool,
 
+    /// Set the reasoning mode (`standard`/`investigation`) — what kind of
+    /// thinking this needs, independent of `--effort`'s size. Mutually
+    /// exclusive with `--unset-reasoning`.
+    #[arg(long, value_enum, conflicts_with = "unset_reasoning")]
+    pub(crate) reasoning: Option<ReasoningArg>,
+
+    /// Clear the reasoning mode so the row falls back to the dispatcher's
+    /// legacy kind-floor / effort-table model resolution.
+    #[arg(long = "unset-reasoning")]
+    pub(crate) unset_reasoning: bool,
+
     /// Agent driver override (e.g. `claude`, `copilot`, `codex`).
     /// Mutually exclusive with `--unset-driver`.
     #[arg(long, value_name = "DRIVER", conflicts_with = "unset_driver")]
@@ -2516,6 +2626,14 @@ pub(crate) struct TaskUpdateArgs {
     /// `--autostart false` parks it in the backlog until you re-enable it.
     #[arg(long, value_name = "BOOL")]
     pub(crate) autostart: Option<bool>,
+
+    /// Mark or unmark this item as deferred / future scope. `--deferred
+    /// false` approves it — pulls it into scope so the engine can dispatch
+    /// it again; `--deferred true` parks it as future scope (auto-unblocked
+    /// and visible, but never auto-dispatched until approved). Distinct
+    /// from `--autostart`, which is a one-shot dispatch-timing pause.
+    #[arg(long, value_name = "BOOL")]
+    pub(crate) deferred: Option<bool>,
 
     /// Set or clear the blocked reason on this item. Accepts any engine
     /// reason value (`merge_conflict`, `ci_failure`, `ci_failure_exhausted`,
@@ -2535,6 +2653,28 @@ pub(crate) struct TaskUpdateArgs {
     /// the engine rejects a detail with no reason to attach it to.
     #[arg(long = "blocked-detail", value_name = "DETAIL", allow_hyphen_values = true)]
     pub(crate) blocked_detail: Option<String>,
+
+    /// Replace the full free-form tag set on this work item. Comma-separated
+    /// list (e.g. `--tags needs-human,ci-flake`). Empty string clears all
+    /// tags (same as `--clear-tags`). Mutually exclusive with `--clear-tags`.
+    /// Caps: 24 chars per tag, 5 tags per item (engine-enforced).
+    #[arg(long = "tags", value_name = "TAGS", conflicts_with = "clear_tags")]
+    pub(crate) tags: Option<String>,
+
+    /// Append one free-form tag (repeatable). De-duplicated against the
+    /// current set. May be combined with `--remove-tag` and/or `--tags`.
+    #[arg(long = "add-tag", value_name = "TAG", action = clap::ArgAction::Append)]
+    pub(crate) add_tags: Vec<String>,
+
+    /// Remove one free-form tag (repeatable, exact match). Unknown names
+    /// are ignored. May be combined with `--add-tag` and/or `--tags`.
+    #[arg(long = "remove-tag", value_name = "TAG", action = clap::ArgAction::Append)]
+    pub(crate) remove_tags: Vec<String>,
+
+    /// Clear every free-form tag on this work item. Mutually exclusive
+    /// with `--tags`.
+    #[arg(long = "clear-tags", conflicts_with = "tags")]
+    pub(crate) clear_tags: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -2615,246 +2755,4 @@ pub(crate) struct TaskReorderArgs {
 
     #[arg(long, value_delimiter = ',')]
     pub(crate) ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ProductStatus {
-    Active,
-    Paused,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ProjectStatusArg {
-    Planned,
-    Active,
-    Blocked,
-    Done,
-    Archived,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum ProjectPriority {
-    Low,
-    Medium,
-    High,
-}
-
-/// Priority enum for tasks and chores. Mirrors `ProjectPriority`
-/// exactly so kanban surfaces and CLI flags speak one vocabulary.
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub(crate) enum TaskPriority {
-    Low,
-    Medium,
-    High,
-}
-
-/// CLI surface for `tasks.effort_level` (design §Q1):
-/// `trivial | small | medium | large | max`. `max` is the human-only
-/// escape hatch — the coordinator's heuristic never emits it, but
-/// users can set it via `--effort max` to request Claude's maximum
-/// reasoning depth.
-#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
-pub(crate) enum EffortLevelArg {
-    Trivial,
-    Small,
-    Medium,
-    Large,
-    Max,
-}
-
-impl EffortLevelArg {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Trivial => "trivial",
-            Self::Small => "small",
-            Self::Medium => "medium",
-            Self::Large => "large",
-            Self::Max => "max",
-        }
-    }
-}
-
-impl From<EffortLevelArg> for boss_protocol::EffortLevel {
-    fn from(value: EffortLevelArg) -> Self {
-        match value {
-            EffortLevelArg::Trivial => boss_protocol::EffortLevel::Trivial,
-            EffortLevelArg::Small => boss_protocol::EffortLevel::Small,
-            EffortLevelArg::Medium => boss_protocol::EffortLevel::Medium,
-            EffortLevelArg::Large => boss_protocol::EffortLevel::Large,
-            EffortLevelArg::Max => boss_protocol::EffortLevel::Max,
-        }
-    }
-}
-
-/// Translation between the leaf work-item (task/chore) status taxonomy
-/// as the engine *stores* it and the names the kanban board *shows*.
-///
-/// The board lanes are Backlog / Doing / Review / Done / Blocked. The
-/// engine has always stored the left-hand legacy strings below. As of
-/// the taxonomy-alignment change the CLI speaks the board's vocabulary
-/// everywhere a human or `--json` consumer can see it, while the engine
-/// and stored rows keep the legacy strings untouched. The legacy names
-/// remain accepted on input as aliases (see [`TaskStatusArg`] /
-/// [`MoveTarget`]) so old scripts and stored data keep working.
-pub(crate) mod status_vocab {
-    /// `(stored, ui)` pairs for every status whose name differs between
-    /// the two vocabularies. `done` and `blocked` are identical in both
-    /// and so are absent here — [`to_ui`] passes them (and any unknown
-    /// value) through unchanged.
-    const RENAMED: [(&str, &str); 3] = [("todo", "backlog"), ("active", "doing"), ("in_review", "review")];
-
-    /// Map a stored status string to the board (UI) name shown to
-    /// humans and emitted in `--json`. Unknown values pass through so
-    /// the CLI never hides a status the engine starts emitting before
-    /// this table is updated.
-    pub fn to_ui(stored: &str) -> &str {
-        RENAMED.iter().find(|(s, _)| *s == stored).map_or(stored, |(_, ui)| *ui)
-    }
-
-    /// Map a board (UI) status name back to the stored string the engine
-    /// persists and filters on — the inverse of [`to_ui`]. `blocked`,
-    /// `done`, and `archived` are identical in both vocabularies and pass
-    /// through, as does any unknown value. This is the single source of
-    /// truth for the board→stored direction; both [`TaskStatusArg::as_str`]
-    /// and [`MoveTarget::as_status`] delegate here.
-    pub fn to_stored(ui: &str) -> &str {
-        RENAMED.iter().find(|(_, u)| *u == ui).map_or(ui, |(stored, _)| *stored)
-    }
-}
-
-/// Identity function kept for call-site symmetry: all display boundaries
-/// call `with_display_status` to mark the intent. The actual board (UI)
-/// label is produced at each display site via
-/// `task.status.display_label()` rather than by mutating the typed field.
-pub(crate) fn with_display_status(task: Task) -> Task {
-    task
-}
-
-/// [`with_display_status`] for the `WorkItem` envelope: passes through
-/// task/chore variants unchanged (display transformation happens at each
-/// display site); leaves products / projects untouched.
-pub(crate) fn work_item_with_display_status(item: WorkItem) -> WorkItem {
-    item
-}
-
-/// `boss task|chore update --status` and `--status` list filters.
-///
-/// The variants are the board (UI) names; the legacy stored names are
-/// accepted as hidden aliases for backward compatibility. [`Self::as_str`]
-/// always returns the stored string, so both the wire patch sent to the
-/// engine and the status-filter comparison stay in the stored vocabulary.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum TaskStatusArg {
-    #[value(alias = "todo")]
-    Backlog,
-    #[value(alias = "active")]
-    Doing,
-    Blocked,
-    #[value(alias = "in-review", alias = "in_review")]
-    Review,
-    Done,
-    Archived,
-}
-
-/// `boss task|chore move --to`. Same board-name-primary,
-/// legacy-name-alias scheme as [`TaskStatusArg`]; [`Self::as_status`]
-/// returns the stored string.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(crate) enum MoveTarget {
-    #[value(alias = "todo")]
-    Backlog,
-    #[value(alias = "active")]
-    Doing,
-    #[value(alias = "in-review", alias = "in_review")]
-    Review,
-    Done,
-    Blocked,
-    Archived,
-}
-
-impl ProductStatus {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Paused => "paused",
-            Self::Archived => "archived",
-        }
-    }
-}
-
-impl ProjectStatusArg {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Planned => "planned",
-            Self::Active => "active",
-            Self::Blocked => "blocked",
-            Self::Done => "done",
-            Self::Archived => "archived",
-        }
-    }
-}
-
-impl ProjectPriority {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
-}
-
-impl TaskPriority {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-        }
-    }
-}
-
-impl TaskStatusArg {
-    /// The stored status string sent to the engine and used for
-    /// status-filter comparisons. Maps the board (UI) variant name back
-    /// to the legacy stored vocabulary.
-    pub(crate) fn as_str(self) -> &'static str {
-        status_vocab::to_stored(self.board_name())
-    }
-
-    /// The board (UI) name for this variant, i.e. the primary spelling of
-    /// its `ValueEnum`. Fed to [`status_vocab::to_stored`] by [`Self::as_str`].
-    pub(crate) fn board_name(self) -> &'static str {
-        match self {
-            Self::Backlog => "backlog",
-            Self::Doing => "doing",
-            Self::Blocked => "blocked",
-            Self::Review => "review",
-            Self::Done => "done",
-            Self::Archived => "archived",
-        }
-    }
-}
-
-impl MoveTarget {
-    /// The stored status string the engine persists. Maps the board (UI)
-    /// variant name back to the legacy stored vocabulary via the shared
-    /// [`status_vocab::to_stored`] table.
-    pub(crate) fn as_status(self) -> &'static str {
-        status_vocab::to_stored(self.board_name())
-    }
-
-    /// The board (UI) name for this variant, i.e. the primary spelling of
-    /// its `ValueEnum`. Fed to [`status_vocab::to_stored`] by [`Self::as_status`].
-    pub(crate) fn board_name(self) -> &'static str {
-        match self {
-            Self::Backlog => "backlog",
-            Self::Doing => "doing",
-            Self::Review => "review",
-            Self::Done => "done",
-            Self::Blocked => "blocked",
-            Self::Archived => "archived",
-        }
-    }
 }

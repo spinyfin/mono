@@ -222,6 +222,7 @@ pub(crate) fn compute_gated_work_item_ids(conn: &Connection) -> Result<HashSet<S
 /// call this — see the comment on
 /// [`cascade_dependents_after_prereq_status_change`].
 pub(crate) fn maybe_engine_block_dependent(
+    pending: &mut PendingEvents,
     conn: &Connection,
     dependent_id: &str,
     now_epoch: &str,
@@ -259,7 +260,7 @@ pub(crate) fn maybe_engine_block_dependent(
         // returning the cancelled row tells it which execution to
         // reap. Projects (`proj_…`) have no executions, so this only
         // applies to tasks.
-        return cancel_live_execution_for_block_in_tx(conn, dependent_id, now_epoch);
+        return cancel_live_execution_for_block_in_tx(pending, conn, dependent_id, now_epoch);
     }
     Ok(None)
 }
@@ -275,6 +276,7 @@ pub(crate) fn maybe_engine_block_dependent(
 /// caller's job (it needs the engine app's completion handler, which
 /// the DB layer can't reach).
 fn cancel_live_execution_for_block_in_tx(
+    pending: &mut PendingEvents,
     conn: &Connection,
     work_item_id: &str,
     now_epoch: &str,
@@ -291,6 +293,7 @@ fn cancel_live_execution_for_block_in_tx(
     )?;
     let updated = query_execution(conn, &live.id)?
         .with_context(|| format!("execution vanished after block-cancel: {}", live.id))?;
+    stage_execution_terminal(pending, conn, &live.id, work_item_id)?;
     tracing::info!(
         work_item_id,
         execution_id = %live.id,
@@ -323,6 +326,7 @@ fn cancel_live_execution_for_block_in_tx(
 /// so a dependency declared atomically at create time gates dispatch
 /// identically to one added afterwards.
 pub(crate) fn add_dependency_edge_in_tx(
+    pending: &mut PendingEvents,
     conn: &Connection,
     dependent_id: &str,
     prerequisite_id: &str,
@@ -348,7 +352,7 @@ pub(crate) fn add_dependency_edge_in_tx(
         deps::insert_edge(conn, dependent_id, prerequisite_id, relation, now_epoch)?;
     // Auto-block (Q4): if the new edge introduces a gating prereq, flip
     // the dependent to `blocked` and (defect #2) reap any live worker.
-    let reaped = maybe_engine_block_dependent(conn, dependent_id, now_epoch)?;
+    let reaped = maybe_engine_block_dependent(pending, conn, dependent_id, now_epoch)?;
     Ok((edge, reaped))
 }
 
@@ -370,7 +374,12 @@ pub(crate) fn add_dependency_edge_in_tx(
 /// fact in the engine log — without it, an auto-unblock that races
 /// past a sleeping observer is invisible and the next bug report
 /// degenerates into "did the cascade fire or not?".
-pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &str, now_epoch: &str) -> Result<bool> {
+pub(crate) fn maybe_engine_unblock_dependent(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    dependent_id: &str,
+    now_epoch: &str,
+) -> Result<bool> {
     let current = match deps::lookup_work_item_status(conn, dependent_id)? {
         Some(s) => s,
         None => return Ok(false),
@@ -462,7 +471,7 @@ pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &s
                 // leaving a `ready` execution stranded on a row that's
                 // about to be archived out from under it.
                 if let Some(task) = query_task(conn, dependent_id)? {
-                    reconcile_revision_execution(conn, &mut reconcile_result, &task)?;
+                    reconcile_revision_execution(pending, conn, &mut reconcile_result, &task)?;
                 }
             } else {
                 reconcile_work_item_execution(conn, &mut reconcile_result, dependent_id, kind, ExecutionStatus::Ready)?;
@@ -489,6 +498,7 @@ pub(crate) fn maybe_engine_unblock_dependent(conn: &Connection, dependent_id: &s
 /// any future dispatch of its dependents — so the cascade can stay
 /// purely additive.
 pub(crate) fn cascade_dependents_after_prereq_status_change(
+    pending: &mut PendingEvents,
     conn: &Connection,
     prereq_id: &str,
     new_prereq_status: &str,
@@ -510,7 +520,7 @@ pub(crate) fn cascade_dependents_after_prereq_status_change(
     }
     let dependents = deps::dependents_of(conn, prereq_id, Some("blocks"))?;
     for edge in dependents {
-        maybe_engine_unblock_dependent(conn, &edge.dependent_id, now_epoch)?;
+        maybe_engine_unblock_dependent(pending, conn, &edge.dependent_id, now_epoch)?;
     }
     Ok(())
 }

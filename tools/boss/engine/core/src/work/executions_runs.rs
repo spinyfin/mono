@@ -63,7 +63,9 @@ impl WorkDb {
             reason = "explicit cancel",
             "execution terminalized: cancel",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(updated)
     }
 
@@ -138,7 +140,9 @@ impl WorkDb {
             reason = %reason,
             "execution terminalized: orphan reap",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(updated)
     }
 
@@ -405,7 +409,7 @@ impl WorkDb {
                     we.created_at, we.started_at, we.finished_at, \
                     we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
                     we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since \
+                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -433,7 +437,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -463,7 +467,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
@@ -498,7 +502,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -519,6 +523,7 @@ impl WorkDb {
         let _projects = list_projects_for_product(&tx, product_id)?;
         let tasks = list_tasks_for_product(&tx, product_id)?;
         let mut result = ExecutionReconcileResult::default();
+        let mut pending = PendingEvents::new();
 
         // Per-row repo resolution lives inside
         // `reconcile_work_item_execution` now — the product default
@@ -586,7 +591,7 @@ impl WorkDb {
                 // is auto-blocked here rather than dispatched.
                 TaskKind::Revision => {
                     if task_accepts_execution(&task) {
-                        reconcile_revision_execution(&tx, &mut result, &task)?;
+                        reconcile_revision_execution(&mut pending, &tx, &mut result, &task)?;
                     }
                 }
                 TaskKind::ProjectTask | TaskKind::Design => {
@@ -640,7 +645,7 @@ impl WorkDb {
             }
         }
 
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(result)
     }
 
@@ -749,20 +754,14 @@ impl WorkDb {
         // blocking those from ever reaching `active` again strands a
         // live worker with no Doing card anywhere on the board. So the
         // guard is lifted only for `kind = 'revision'`, and only when
-        // the revision has no non-terminal revision child of its own
-        // (a revision-of-a-revision defers to that child exactly like
-        // a base defers to it, per the same reasoning).
+        // the revision has no non-terminal revision child of its own.
         //
-        // The child check below is deliberately one level deep, not a
-        // full descendant walk: it matches only immediate children via
-        // `child.parent_task_id = ?1`. A revision-of-a-revision-of-a-
-        // revision (three levels) would not defer correctly if the
-        // middle link were terminal while the leaf were still live.
-        // This is accepted rather than fixed here because that shape is
-        // rare in practice and the chain-tail dependency gate already
-        // serializes deeper chains; widen this to the recursive CTE
-        // used in `revision_helpers.rs`/`chain_helpers.rs` if deeper
-        // chains turn out to matter.
+        // After flat-parentage every revision's `parent_task_id` is the chain
+        // root (never another revision), so the child check below is a
+        // no-op for well-formed data — siblings are sequenced by the
+        // chain-tail dependency gate, not nested parents. The check is
+        // retained for residual pre-migration nested rows until the
+        // flatten migration has run on every open DB.
         //
         // This relaxation also narrows the reverse transition (`active`
         // back to `in_review`) to two specific paths:
@@ -841,6 +840,50 @@ impl WorkDb {
             params![execution_id],
         )?;
         Ok(())
+    }
+
+    /// Persist the opaque [`boss_protocol::DriverRuntimeState`] returned by
+    /// [`boss_engine_driver::AgentDriver::provision_workspace`] onto the
+    /// execution row. Survives engine restart, orphan recovery, and
+    /// workspace release (`clear_execution_workspace` deliberately leaves
+    /// this column alone). Pass `None` to clear a previously recorded
+    /// value (idempotent teardown of Claude-shaped drivers that return
+    /// no state typically never calls this).
+    pub fn set_driver_runtime_state(
+        &self,
+        execution_id: &str,
+        state: Option<&boss_protocol::DriverRuntimeState>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let json = match state {
+            Some(s) => Some(serde_json::to_string(s).context("serialize driver_runtime_state")?),
+            None => None,
+        };
+        let affected = conn.execute(
+            "UPDATE work_executions SET driver_runtime_state = ?2 WHERE id = ?1",
+            params![execution_id, json],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Load the opaque driver-owned runtime state for `execution_id`.
+    /// `None` when the row is missing, the column is NULL (Claude /
+    /// pre-migration), or the stored JSON fails to parse (treated as
+    /// absent so a corrupt blob cannot block teardown).
+    pub fn get_driver_runtime_state(&self, execution_id: &str) -> Result<Option<boss_protocol::DriverRuntimeState>> {
+        let conn = self.connect()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT driver_runtime_state FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|s| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&s).ok()))
     }
 
     /// Return `true` if `on_stop_inner` has been called at least once for
@@ -944,6 +987,38 @@ impl WorkDb {
         Ok(body)
     }
 
+    /// Snapshot the bound PR's title captured at run start, alongside
+    /// [`Self::set_execution_pr_body_before`] — same call site
+    /// (`execution_started`), same baseline semantics: `boss pr body`
+    /// returns both so a worker doing read-modify-write on the description
+    /// can see the title without a `gh pr view` round trip.
+    pub fn set_execution_pr_title_before(&self, execution_id: &str, title: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let affected = conn.execute(
+            "UPDATE work_executions SET pr_title_before = ?2 WHERE id = ?1",
+            params![execution_id, title],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Read the PR title snapshot captured at run start, or `None` when no
+    /// snapshot was taken (new-PR flow, fetch failure, pre-migration row).
+    pub fn get_execution_pr_title_before(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let title: Option<String> = conn
+            .query_row(
+                "SELECT pr_title_before FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(title)
+    }
+
     /// Stamp the "metadata delta observed at a clean Stop boundary" marker
     /// for the metadata-only CI-fix finalize gate (issue #1252). Set ONLY
     /// by the on-Stop handler — never the merge poller — so it is positive
@@ -1033,7 +1108,9 @@ impl WorkDb {
             reason = %error_text,
             "execution terminalized: fail start",
         );
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run))
     }
 
@@ -1119,6 +1196,7 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        let mut pending = PendingEvents::new();
         if matches!(outcome, PreStartFailureOutcome::PermanentFail) {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(
@@ -1129,8 +1207,9 @@ impl WorkDb {
                 reason = %error_text,
                 "execution terminalized: pre-start failure exhausted retries",
             );
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run, outcome))
     }
 
@@ -1263,6 +1342,7 @@ impl WorkDb {
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let run = query_run(&tx, run_id).require("run", run_id)?;
+        let mut pending = PendingEvents::new();
         if execution_status.is_terminal() {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
             tracing::warn!(
@@ -1273,8 +1353,9 @@ impl WorkDb {
                 reason = "finish_execution_run",
                 "execution terminalized: run finish",
             );
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((execution, run, attention_item))
     }
 
@@ -1338,7 +1419,9 @@ impl WorkDb {
         )?;
 
         let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(updated))
     }
 
@@ -1724,22 +1807,28 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Inserts a terminal `work_executions` row with the given `kind` and
+    /// `status` — used to build up churn-guard fixtures. Callers testing
+    /// the kind-scoped guard (e.g. [`crate::pr_review_recovery`]) pass
+    /// `kind = "pr_review"`; callers testing the unscoped guard pass
+    /// whatever kind, typically `"chore_implementation"`.
     #[cfg(test)]
     pub fn insert_terminal_execution_for_test(
         &self,
         work_item_id: &str,
+        kind: &str,
         status: &str,
         created_at_epoch: i64,
     ) -> Result<()> {
         let conn = self.connect()?;
-        let id = format!("exec-test-{}-{}", work_item_id, created_at_epoch);
+        let id = format!("exec-test-{}-{}-{}", kind, work_item_id, created_at_epoch);
         conn.execute(
             "INSERT INTO work_executions
                (id, work_item_id, kind, status, repo_remote_url,
                 priority, created_at)
-             VALUES (?1, ?2, 'chore_implementation', ?3,
-                     'https://github.com/test/repo', 0, ?4)",
-            params![id, work_item_id, status, created_at_epoch.to_string()],
+             VALUES (?1, ?2, ?3, ?4,
+                     'https://github.com/test/repo', 0, ?5)",
+            params![id, work_item_id, kind, status, created_at_epoch.to_string()],
         )?;
         Ok(())
     }
@@ -1873,5 +1962,99 @@ impl WorkDb {
             bail!("unknown run: {run_id}");
         }
         query_run(&conn, run_id).require("run", run_id)
+    }
+}
+
+#[cfg(test)]
+mod event_bus_tests {
+    use boss_event_bus::TopicFilter;
+
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::work::CreateChoreInput;
+
+    fn ready_execution(db: &WorkDb) -> WorkExecution {
+        let product = create_test_product(db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        create_ready_chore_execution(db, chore.id)
+    }
+
+    #[tokio::test]
+    async fn cancel_execution_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.cancel_execution(&execution.id).unwrap();
+
+        let event = sub.recv().await.expect("ExecutionTerminal published after cancel");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_execution_orphaned_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_orphaned(&execution.id, "worker pane died").unwrap();
+
+        let event = sub.recv().await.expect("ExecutionTerminal published after orphan reap");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_execution_does_not_publish_on_error() {
+        // Cancelling an already-terminal execution bails before ever
+        // touching the DB, so this test covers only the reject-before-any-write
+        // path: a failed call must not leave a stray event on the bus. It does
+        // NOT exercise "a staged event is dropped when the enclosing
+        // transaction rolls back after staging" for a real `work/` producer —
+        // that guarantee is covered generically (against a synthetic
+        // producer) by `event_publish.rs`'s own `drops_events_when_commit_fails`
+        // / `drops_events_when_commit_never_runs` tests.
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        db.mark_execution_orphaned(&execution.id, "reap").unwrap();
+
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+        assert!(
+            db.cancel_execution(&execution.id).is_err(),
+            "cancelling a terminal execution must fail"
+        );
+
+        // Give any errant publish a chance to land before asserting absence.
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no ExecutionTerminal should be published when cancel_execution errors");
     }
 }

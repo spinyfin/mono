@@ -401,7 +401,7 @@ pub(crate) fn query_latest_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
          FROM work_executions
          WHERE work_item_id = ?1
          ORDER BY created_at DESC, id DESC
@@ -431,7 +431,7 @@ pub(crate) fn query_live_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
          FROM work_executions
          WHERE work_item_id = ?1
            AND status IN ('running', 'waiting_human')
@@ -461,7 +461,7 @@ pub(crate) fn query_last_non_abandoned_execution_for_work_item(
         "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                 cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                 created_at, started_at, finished_at,
-                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
          FROM work_executions
          WHERE work_item_id = ?1
            AND status != 'abandoned'
@@ -492,6 +492,22 @@ pub(crate) fn reconcile_work_item_execution(
     } else {
         desired_status
     };
+    // Deferred/future-scope items are auto-unblocked and left schedulable,
+    // but never auto-dispatched: skip minting or promoting any execution
+    // until a human explicitly approves the item (which clears `deferred`).
+    // The dependency auto-unblock cascade calls this function directly, so
+    // gating here — rather than in `task_accepts_execution`, which the
+    // cascade bypasses — is what suppresses execution on every automatic
+    // path (normal reconcile, cascade, project chain) without touching
+    // `dep_helpers.rs`. The unblock (row → `todo`) itself is never
+    // suppressed; only the mint is.
+    if work_item_is_deferred(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
     match query_latest_execution_for_work_item(conn, work_item_id)? {
         Some(execution) => {
             if execution.kind == kind && execution.status.can_reconcile() && execution.status != effective_status {
@@ -609,6 +625,7 @@ pub(crate) fn retired_spawning_attempt_status(conn: &Connection, task: &Task) ->
 /// snapshot the parent PR's HEAD and detect when the revision worker
 /// contributes).
 pub(crate) fn reconcile_revision_execution(
+    pending: &mut PendingEvents,
     conn: &Connection,
     result: &mut ExecutionReconcileResult,
     task: &Task,
@@ -671,7 +688,7 @@ pub(crate) fn reconcile_revision_execution(
 
         let now = now_string();
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(conn, &task.id, &now)?;
+        abandon_pending_executions(pending, conn, &task.id, &now)?;
         resolve_revision_on_parent_close(conn, task, &chain_root_task.id, &now, "reconcile_revision")?;
         return Ok(());
     }
@@ -697,7 +714,7 @@ pub(crate) fn reconcile_revision_execution(
     // alone; it self-retires on Stop.
     if let Some(attempt_status) = retired_spawning_attempt_status(conn, task)? {
         let now = now_string();
-        abandon_pending_executions(conn, &task.id, &now)?;
+        abandon_pending_executions(pending, conn, &task.id, &now)?;
         if query_live_execution_for_work_item(conn, &task.id)?.is_none() {
             let settled = conn.execute(
                 "UPDATE tasks
@@ -729,6 +746,20 @@ pub(crate) fn reconcile_revision_execution(
     } else {
         ExecutionStatus::Ready
     };
+
+    // Same future-scope suppression as `reconcile_work_item_execution`: a
+    // deferred revision is left settled/unblocked but never auto-dispatched
+    // until a human approves it (clearing `deferred`). Placed after the
+    // chain-root-done archival and spawning-attempt-retired settle logic
+    // above so those still run — only the ready/waiting_dependency mint is
+    // skipped.
+    if work_item_is_deferred(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is deferred/future-scope — suppressing execution mint until explicit approval",
+        );
+        return Ok(());
+    }
 
     match query_latest_execution_for_work_item(conn, &task.id)? {
         Some(existing)
@@ -833,6 +864,7 @@ pub(crate) fn reconcile_revision_execution(
 }
 
 pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
+    pending: &mut PendingEvents,
     conn: &Connection,
     input: RequestExecutionInput,
     is_live: F,
@@ -952,6 +984,23 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
         // there is nothing here to bypass. If the fresh attempt fails again,
         // the next sweep pass re-files the attention.
         resolve_attention_kind_in_tx(conn, &work_item_id, CHURN_GUARD_PARKED_ATTENTION_KIND)?;
+
+        // Explicit dispatch is the human-approval signal for a deferred
+        // (future-scope) item: clear the classification so the reconciler
+        // and dependency cascade will mint `ready` executions for it again.
+        // Mirrors `autostart`'s single-shot clear on start — deliberately
+        // starting an item means it is no longer future scope. Guarded on
+        // `deferred = 1` so it is a no-op for ordinary items.
+        let approved = conn.execute(
+            "UPDATE tasks SET deferred = 0 WHERE id = ?1 AND deferred = 1 AND deleted_at IS NULL",
+            params![work_item_id],
+        )?;
+        if approved > 0 {
+            tracing::info!(
+                work_item_id = %work_item_id,
+                "RequestExecution: approved deferred/future-scope item — cleared `deferred` on explicit start",
+            );
+        }
     }
 
     // Multi-repo Q5: route through the single resolver so the
@@ -1178,6 +1227,7 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                      WHERE id = ?1",
                     params![existing.id, now],
                 )?;
+                stage_execution_terminal(pending, conn, &existing.id, &work_item_id)?;
             }
         } else {
             tracing::info!(
@@ -1883,7 +1933,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -1948,7 +1999,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -2016,7 +2068,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 
@@ -2092,7 +2145,8 @@ mod tests {
         {
             let mut conn2 = db.connect().unwrap();
             let tx = conn2.transaction().unwrap();
-            reconcile_revision_execution(&tx, &mut result, &revision_task).unwrap();
+            let mut pending = PendingEvents::new();
+            reconcile_revision_execution(&mut pending, &tx, &mut result, &revision_task).unwrap();
             tx.commit().unwrap();
         }
 

@@ -337,15 +337,24 @@ impl DeviceFlow {
     ///
     /// Reads the `X-OAuth-Scopes` response header to record what scopes GitHub
     /// actually granted (may be a subset of what was requested).
+    ///
+    /// Goes through [`boss_github::send_instrumented`] because this hits
+    /// `api.github.com` and therefore spends real REST quota from the
+    /// shared token. The device-flow steps above deliberately do not:
+    /// they target `github.com/login/oauth/*`, which is not the API and
+    /// is not metered against the API budget, so counting them would
+    /// inflate the usage profile with calls that cost nothing.
     pub async fn validate_token(&self, token: &str) -> Result<TokenRecord, FlowError> {
-        let response = self
-            .client
-            .get(&self.config.user_url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "boss-engine")
-            .send()
-            .await?
-            .error_for_status()?;
+        let response = boss_github::send_instrumented(
+            self.client
+                .get(&self.config.user_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "boss-engine"),
+            "GET",
+            &self.config.user_url,
+        )
+        .await?
+        .error_for_status()?;
 
         let granted_scopes: Vec<String> = response
             .headers()
@@ -384,14 +393,16 @@ impl DeviceFlow {
         };
 
         let url = format!("{}/orgs/{org}", self.config.api_base_url);
-        let result = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {token}"))
-            .header("User-Agent", "boss-engine")
-            .header("Accept", "application/vnd.github+json")
-            .send()
-            .await;
+        let result = boss_github::send_instrumented(
+            self.client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .header("User-Agent", "boss-engine")
+                .header("Accept", "application/vnd.github+json"),
+            "GET",
+            &url,
+        )
+        .await;
 
         let response = match result {
             Err(e) => {

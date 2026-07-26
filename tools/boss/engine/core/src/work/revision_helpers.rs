@@ -19,6 +19,19 @@ impl WorkDb {
             .and_then(|t| t.pr_url)
             .filter(|u| !u.is_empty())
     }
+
+    /// For a `revision` task, walk the parent chain to the chain root and
+    /// return the chain root task's id — the row the merge poller actually
+    /// reads/writes `pr_mergeable_state` / `pr_merge_state_status` /
+    /// `pr_head_sha` / `pr_state_polled_at` for, since only the chain root
+    /// carries a bound `pr_url`. Used by `app::pr_status` so a revision
+    /// worker's `boss pr status`/`--refresh` reads and persists against the
+    /// same row the poller sweeps, instead of the revision task's own row
+    /// (which never has PR-state columns populated).
+    pub(crate) fn get_revision_chain_root_task_id(&self, task_id: &str) -> Option<String> {
+        let conn = self.connect().ok()?;
+        get_chain_root_task(&conn, task_id).ok().flatten().map(|t| t.id)
+    }
 }
 
 /// Return the id of the most-recently-created non-done revision that is a
@@ -68,15 +81,22 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
 
 /// Run the create-time gate and, on success, insert a `kind = 'revision'`
 /// task row atomically. This is the single point of truth for the invariant
-/// "kind = revision ⇒ parent_task_id IS NOT NULL AND chain root has an open PR".
+/// "kind = revision ⇒ parent_task_id IS the chain root (non-revision) AND
+/// that root has an open PR".
 ///
 /// Gate order (per revision-tasks.md §Q4):
 /// 1. Resolve `input.parent_task_id` to a real task; walk to chain root.
+///    Callers may pass a revision (manual `create-revision --parent <rev>`,
+///    PR-review / CI / conflict producers against a revision work item);
+///    the stored `parent_task_id` is always the chain root so revision
+///    chains stay flat. Sequencing of back-to-back revisions is
+///    via dependency edges on the chain tail, not nested parents.
 /// 2. If chain root has no `pr_url` → [`RevisionGateError::NoPr`].
 /// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
 /// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
 ///    `Merged` → merged error; `ClosedUnmerged` → closed error; `Open` → insert.
 pub(crate) fn assert_parent_revisable_and_insert(
+    pending: &mut PendingEvents,
     conn: &Connection,
     input: CreateRevisionInput,
     pr_checker: &dyn PrStateChecker,
@@ -116,14 +136,23 @@ pub(crate) fn assert_parent_revisable_and_insert(
     let chain_tail_id = find_latest_active_revision_in_chain(conn, &root_id)?;
 
     // ── 6. Insert revision ──────────────────────────────────────────────────
+    // Always parent to the chain root (never to another revision). Callers
+    // may have passed a revision as `--parent`; reparenting here is what
+    // keeps every automatic and manual producer flat under the original
+    // work item so the UI's direct-child rollup sees the whole chain.
     let now = now_string();
     let depends_on = input.depends_on.clone();
-    let new_revision = insert_revision_in_tx(conn, input, &parent_id, &root)?;
+    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root)?;
 
     // ── 7. Caller-supplied `--depends-on` gate ──────────────────────────────
     // Declared atomically with the row insert, same as `task create` /
     // `chore create` — this also performs the engine auto-block, so a
     // caller-supplied prerequisite gates the revision immediately.
+    // `new_revision` was just inserted in this same transaction, so it can't
+    // yet have a live execution attached — `add_dependency_edge_in_tx`'s
+    // cancelled-execution channel is guaranteed empty here (mirrors the
+    // create-time-dependency invariant documented on `insert_helpers::
+    // apply_create_time_dependencies`).
     apply_create_time_dependencies(conn, &new_revision.id, &depends_on, &now)?;
 
     // ── 8. Auto-gate: block new revision on chain tail ───────────────────────
@@ -133,7 +162,10 @@ pub(crate) fn assert_parent_revisable_and_insert(
     let has_chain_tail_gate = chain_tail_id.is_some();
     if let Some(tail_id) = chain_tail_id {
         deps::insert_edge(conn, &new_revision.id, &tail_id, RELATION_BLOCKS, &now)?;
-        maybe_engine_block_dependent(conn, &new_revision.id, &now)?;
+        // `new_revision` was just inserted in this same transaction, so it
+        // can't yet have a live execution attached — the cancelled-execution
+        // channel here is guaranteed empty (same invariant as above).
+        maybe_engine_block_dependent(pending, conn, &new_revision.id, &now)?;
     }
 
     // ── 9. Create the initial execution row now ─────────────────────────────
@@ -162,7 +194,7 @@ pub(crate) fn assert_parent_revisable_and_insert(
     // caller must explicitly start it later, exactly as today.
     if task_accepts_execution(&new_revision) {
         let mut result = ExecutionReconcileResult::default();
-        reconcile_revision_execution(conn, &mut result, &new_revision)?;
+        reconcile_revision_execution(pending, conn, &mut result, &new_revision)?;
     }
 
     if has_chain_tail_gate || !depends_on.is_empty() {
@@ -358,6 +390,40 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
     }
 }
 
+// ── Ready-for-review flag ────────────────────────────────────────────────────
+
+/// Set `ready_for_review = true` on every Review-lane task that is waiting
+/// on the operator and nothing else: an open PR (`status = "in_review"`,
+/// `pr_url` set) with no active block, no in-progress descendant revision,
+/// every required CI check green, and no merge conflict with the base
+/// branch.
+///
+/// Called by `get_work_tree` after [`attach_in_progress_revision_flag`], so
+/// `has_in_progress_revision` is already populated. Reads only fields
+/// already loaded onto `Task` by the `get_work_tree` SQL — no extra query.
+///
+/// Deliberately keyed on the *raw* polled facts (`ci_required_state`,
+/// `pr_mergeable_state`) rather than only on `blocked_reason`/`status`,
+/// which reflect the last reconciliation pass over those facts and can lag
+/// a fresher merge-poller sweep — a task can still read `status =
+/// "in_review"` with `blocked_reason = None` while `pr_mergeable_state`
+/// already reads `"conflicting"` from the most recent poll. Reading the
+/// raw fact directly means this flag doesn't have to wait for the
+/// reconciliation step to catch up before it stops calling a conflicted PR
+/// ready. A still-running (`"in_progress"`) or not-yet-polled (`None`/
+/// `"unknown"`) CI state is treated as NOT ready — there's nothing to
+/// merge yet.
+pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Task]) {
+    for task in tasks.iter_mut().chain(chores.iter_mut()) {
+        task.ready_for_review = task.status == TaskStatus::InReview
+            && task.pr_url.is_some()
+            && task.blocked_reason.is_none()
+            && !task.has_in_progress_revision
+            && task.ci_required_state.as_deref() == Some("success")
+            && task.pr_mergeable_state.as_deref() == Some("mergeable");
+    }
+}
+
 // ── AI reviewing flag ────────────────────────────────────────────────────────
 
 /// Set `ai_reviewing = true` on every task (and chore) that is currently held
@@ -487,8 +553,11 @@ pub(crate) fn revision_name_from_description(description: &str) -> String {
 
 /// Insert a `kind = 'revision'` task row. Called only after the gate passes.
 ///
-/// `parent_id` is the immediate parent (may itself be a revision).
-/// `root` is the chain root task (non-revision ancestor that owns the PR).
+/// `parent_id` is the chain root (the non-revision work item that owns the
+/// PR). Callers of [`assert_parent_revisable_and_insert`] may pass a revision
+/// as the create-time parent selector; that helper resolves to the root and
+/// passes the root id here so `parent_task_id` never points at another
+/// revision. `root` is the same row, already loaded for inherit fields.
 pub(crate) fn insert_revision_in_tx(
     conn: &Connection,
     input: CreateRevisionInput,
@@ -509,6 +578,12 @@ pub(crate) fn insert_revision_in_tx(
             .unwrap_or_else(|| default_revision_effort_level(&root.kind).to_owned()),
     );
     let model_override = normalize_model_override(input.model_override);
+    // Inherit the chain root's capability signal when the caller did not name
+    // one: a revision to an investigation is investigation-shaped, a revision
+    // to a plain chore is not. When the root itself is unclassified (a row
+    // predating the column) the revision stays unclassified too, so it keeps
+    // resolving the legacy way rather than being silently re-modelled.
+    let reasoning = input.reasoning.or(root.reasoning).map(|mode| mode.as_str().to_owned());
     let driver = normalize_model_override(input.driver);
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
     // Inherit product, project, and repo from the chain root. A revision
@@ -546,9 +621,9 @@ pub(crate) fn insert_revision_in_tx(
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, driver, short_id, parent_task_id, repo_remote_url) \
+         effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url) \
          VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15)",
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             id,
             product_id,
@@ -561,6 +636,7 @@ pub(crate) fn insert_revision_in_tx(
             created_via,
             effort_level,
             model_override,
+            reasoning,
             driver,
             short_id,
             parent_id,
@@ -869,5 +945,169 @@ mod tests {
             canonicalize_created_via(Some("  some-future-source  "), "task_x", "revision"),
             "some-future-source"
         );
+    }
+
+    // ── attach_ready_for_review_flag ─────────────────────────────────────────
+
+    fn review_task(id: &str) -> Task {
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::InReview)
+            .created_at("")
+            .updated_at("")
+            .pr_url("https://github.com/org/repo/pull/1")
+            .build()
+    }
+
+    #[test]
+    fn ready_when_open_unblocked_ci_green_and_mergeable() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_blocked() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        t.blocked_reason = Some("merge_conflict".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_in_progress_revision() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        t.has_in_progress_revision = true;
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_ci_failing_pending_unknown_or_missing() {
+        for ci_state in [Some("fail"), Some("in_progress"), Some("unknown"), None] {
+            let mut t = review_task("t1");
+            t.ci_required_state = ci_state.map(str::to_owned);
+            t.pr_mergeable_state = Some("mergeable".to_owned());
+            let mut tasks = vec![t];
+            attach_ready_for_review_flag(&mut tasks, &mut []);
+            assert!(
+                !tasks[0].ready_for_review,
+                "ci_required_state={ci_state:?} should not be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_when_pr_mergeable_state_conflicting_unknown_or_missing() {
+        // mono#2357/mono#2356 regression: a card can show a clean CI check
+        // and no badges while GitHub already reports the PR CONFLICTING
+        // because the status/blocked_reason reconciliation pass hasn't
+        // caught up with the latest merge-poller sweep yet. The flag must
+        // read pr_mergeable_state directly rather than trusting the absence
+        // of blocked_reason.
+        for mergeable_state in [Some("conflicting"), Some("unknown"), None] {
+            let mut t = review_task("t1");
+            t.ci_required_state = Some("success".to_owned());
+            t.pr_mergeable_state = mergeable_state.map(str::to_owned);
+            let mut tasks = vec![t];
+            attach_ready_for_review_flag(&mut tasks, &mut []);
+            assert!(
+                !tasks[0].ready_for_review,
+                "pr_mergeable_state={mergeable_state:?} should not be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_when_no_pr_url() {
+        let mut t = review_task("t1");
+        t.pr_url = None;
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_not_in_review() {
+        let mut t = review_task("t1");
+        t.status = TaskStatus::Active;
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    /// Regression fixture: the operator's worked example from a live Review
+    /// column (2026-07-25), with the underlying PR facts as GitHub actually
+    /// reported them once the state was checked directly (the companion
+    /// staleness chore, see `attach_ready_for_review_flag`'s doc comment).
+    /// Two of the eight cards rendered clean — green CI, no badge, no pill —
+    /// while GitHub reported `CONFLICTING`; a naive "no badge, no lock"
+    /// implementation would have called three of these ready. With correct
+    /// facts, `ready_for_review` must be `false` for every row here.
+    #[test]
+    fn worked_example_zero_of_eight_are_ready() {
+        // mono#2357 — looked clean, PR actually CONFLICTING.
+        let mut t3529 = review_task("t3529");
+        t3529.ci_required_state = Some("success".to_owned());
+        t3529.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // mono#2356 — looked clean, PR actually CONFLICTING.
+        let mut t3528 = review_task("t3528");
+        t3528.ci_required_state = Some("success".to_owned());
+        t3528.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // `in revision` badge (descendant revision still todo/active).
+        let in_revision_ids = ["t3519", "t3513", "t3540", "t3537"];
+        let mut in_revision_tasks: Vec<Task> = in_revision_ids
+            .iter()
+            .map(|id| {
+                let mut t = review_task(id);
+                t.ci_required_state = Some("success".to_owned());
+                t.pr_mergeable_state = Some("mergeable".to_owned());
+                t.has_in_progress_revision = true;
+                t
+            })
+            .collect();
+
+        // mono#2261 — `Merge Conflict` pill correctly shown.
+        let mut t3231 = review_task("t3231");
+        t3231.blocked_reason = Some("merge_conflict".to_owned());
+        t3231.status = TaskStatus::Blocked;
+        t3231.ci_required_state = Some("success".to_owned());
+        t3231.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // "Idle detection..." — no badge, no pill, but CI is broken.
+        let mut idle_detection = review_task("t_idle_detection");
+        idle_detection.ci_required_state = Some("fail".to_owned());
+        idle_detection.pr_mergeable_state = Some("mergeable".to_owned());
+
+        let mut tasks = vec![t3529, t3528, t3231, idle_detection];
+        tasks.append(&mut in_revision_tasks);
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+
+        for task in &tasks {
+            assert!(
+                !task.ready_for_review,
+                "expected {} to be NOT ready, got ready_for_review=true",
+                task.id
+            );
+        }
     }
 }

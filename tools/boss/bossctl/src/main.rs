@@ -31,7 +31,8 @@ use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
     FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry,
-    ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkspacePoolEntry,
+    ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal,
+    WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -141,7 +142,10 @@ enum Command {
     /// Equivalent to `bossctl pause state`.
     State,
     /// Inspect the dispatch-pipeline event stream (file-scan only —
-    /// works when the engine is wedged).
+    /// works when the engine is wedged), and pause/resume/inspect
+    /// dispatch specifically via its `pause`/`resume`/`state` subcommands
+    /// (see top-level `bossctl pause`/`resume`/`state` to act on every
+    /// system at once instead of dispatch alone).
     Dispatch {
         #[command(subcommand)]
         action: DispatchAction,
@@ -224,28 +228,69 @@ enum Command {
     /// Read engine diagnostic logs. Works file-scan-only — no running engine
     /// required. Resolves log paths automatically from the Boss state root.
     ///
-    /// The primary log (`engine`, default) is `engine-trace.jsonl` —
-    /// structured JSONL tracing events from the running engine. The `audit`
-    /// log is `engine-audit.log` — compact lifecycle records (start, socket
-    /// bind, shutdown) useful for timeline reconstruction after an incident.
+    /// Spans rotated and day-dated files transparently as one chronological
+    /// stream. Default behaviour is still a short tail; use `--since` /
+    /// field filters / a larger `--tail` (or `--tail 0` for unlimited) for
+    /// incident queries. When the result is capped, a truncation notice is
+    /// printed to stderr so a short answer is never mistaken for absence.
+    /// Global `--json` emits original JSONL records one per line (no wrapper)
+    /// so `jq` pipelines keep working; notices stay on stderr.
     ///
-    /// Output is plain text suitable for copy/paste into a shake report.
+    /// Sources:
+    /// - `engine` (default) — `engine-trace.jsonl` + rotated segments
+    /// - `audit` — `engine-audit.log` (+ rotated, if any)
+    /// - `dispatch` — `dispatch-events/current.jsonl`
+    /// - `spawn` — `diagnostics/spawn-YYYY-MM-DD.jsonl`
+    /// - `population-timing` — `diagnostics/population-timing-*.jsonl` (app)
+    ///   and `diagnostics/engine-population-timing-*.jsonl` (engine)
     Logs {
-        /// Which log to read.
-        /// `engine` → `engine-trace.jsonl` (structured trace, primary);
-        /// `audit`  → `engine-audit.log` (lifecycle events).
+        /// Which log / diagnostic stream to read.
         #[arg(value_enum, default_value_t = LogSource::Engine)]
         source: LogSource,
-        /// Print the last N lines (default 50).
+        /// Print the last N matching lines (default 50). `0` means unlimited.
         #[arg(short = 'n', long = "tail", default_value_t = 50)]
         tail: usize,
         /// Stream appended lines live, like `tail -f`. Polls every 250 ms;
-        /// press Ctrl-C to stop.
+        /// press Ctrl-C to stop. Initial output still honours `--tail` and
+        /// filters; the live stream keeps field/grep filters but ignores
+        /// `--since`/`--until`.
         #[arg(short = 'f', long)]
         follow: bool,
-        /// Filter to lines containing this substring (case-sensitive).
+        /// Raw case-sensitive substring match on the whole line. Prefer
+        /// `--target` / `--level` / `--field` / `--execution-id` for
+        /// structured JSONL — substring grep false-positives on message
+        /// bodies (e.g. a module name appearing in an unrelated event).
         #[arg(long)]
         grep: Option<String>,
+        /// Only records at or after this time. Accepts relative offsets
+        /// (`30m`, `6h`, `2d`, `90s`), RFC3339 (`2026-07-26T06:20:00Z`),
+        /// a date (`2026-07-26` = start of that UTC day), or an epoch integer
+        /// (seconds or ms).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only records at or before this time. Same formats as `--since`.
+        /// A bare date (`2026-07-26`) is end-of-day UTC so that whole calendar
+        /// day is included (exclusive next midnight).
+        #[arg(long)]
+        until: Option<String>,
+        /// Match the JSON `target` field (tracing module path). Exact match
+        /// or module-prefix (`boss_engine::app` matches
+        /// `boss_engine::app::server`). Does **not** search message bodies.
+        #[arg(long)]
+        target: Option<String>,
+        /// Match the JSON `level` field case-insensitively (`info`, `ERROR`).
+        #[arg(long)]
+        level: Option<String>,
+        /// Match a structured field `key=value` (repeatable). Checks the
+        /// top-level key, then a nested `fields` object. All `--field`
+        /// constraints are ANDed.
+        #[arg(long = "field", value_name = "KEY=VALUE")]
+        fields: Vec<String>,
+        /// Match `execution_id` or `run_id` (top-level or under `fields`).
+        /// Convenience for the common "what happened to this execution?"
+        /// query across trace / dispatch / spawn sources.
+        #[arg(long)]
+        execution_id: Option<String>,
         /// Override the Boss state root (defaults to
         /// `$HOME/Library/Application Support/Boss`).
         #[arg(long)]
@@ -366,6 +411,23 @@ enum DispatchAction {
         #[arg(long, default_value_t = 10)]
         top: usize,
     },
+    /// Get or set the interactive-pool ("Bridge Crew" + "Lower Decks")
+    /// concurrency cap — the ceiling `drain_ready_queue` enforces on live
+    /// main-pool workers separately from the underlying 16-slot worker
+    /// pool. Raising it lets dispatch spill into Lower Decks (slots 9-16)
+    /// instead of holding rows once 8 are live; lowering it takes effect
+    /// on the very next drain pass. Persisted to `state.db`, so a change
+    /// survives an engine restart. Does not affect the review pool, which
+    /// always dispatches from its own pool. With no `--set`, prints the
+    /// current cap.
+    Concurrency {
+        /// Set the cap to this value instead of just printing it. Must be
+        /// at least 1; values above the 16-slot worker-pool ceiling are
+        /// clamped down to it. Raising the cap immediately kicks the
+        /// scheduler so newly-available capacity is used right away.
+        #[arg(long)]
+        set: Option<usize>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -467,13 +529,21 @@ impl std::fmt::Display for TranscriptFormat {
     }
 }
 
-/// Which engine log file `bossctl logs` should read.
+/// Which engine log / diagnostic stream `bossctl logs` should read.
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
 pub(crate) enum LogSource {
     /// `engine-trace.jsonl` — structured tracing events (primary log).
     Engine,
     /// `engine-audit.log` — lifecycle events (start, socket bind, shutdown).
     Audit,
+    /// `dispatch-events/current.jsonl` — dispatch pipeline stage events.
+    Dispatch,
+    /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
+    Spawn,
+    /// App + engine population-timing day files under `diagnostics/`
+    /// (`population-timing-*.jsonl` and `engine-population-timing-*.jsonl`).
+    #[value(name = "population-timing")]
+    PopulationTiming,
 }
 
 impl std::fmt::Display for LogSource {
@@ -481,6 +551,9 @@ impl std::fmt::Display for LogSource {
         match self {
             LogSource::Engine => write!(f, "engine"),
             LogSource::Audit => write!(f, "audit"),
+            LogSource::Dispatch => write!(f, "dispatch"),
+            LogSource::Spawn => write!(f, "spawn"),
+            LogSource::PopulationTiming => write!(f, "population-timing"),
         }
     }
 }
@@ -531,6 +604,28 @@ enum AgentsAction {
     },
     /// Stop a worker session and release its lease.
     Stop {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+    },
+    /// Place an explicit hold on a live worker, exempting it from the
+    /// idle-park and auto-reap sweeps until released (`agents
+    /// release-hold`) or the run ends. Does NOT protect the run from
+    /// `agents stop`/`agents reap` — those break-glass verbs still work
+    /// on a held worker. Use this to protect a worker you know is
+    /// legitimately waiting on something the automated checks haven't
+    /// been taught to recognize (e.g. debugging it by hand).
+    Hold {
+        /// Worker reference: run id, slot id, or crew name.
+        agent: String,
+        /// Free-text note explaining why the worker is held. Surfaced on
+        /// `agents list`/`agents status`.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Release a hold placed by `agents hold`, restoring the normal
+    /// idle-park/auto-reap sweep behavior. Idempotent — releasing a
+    /// worker with no hold in place succeeds as a no-op.
+    ReleaseHold {
         /// Worker reference: run id, slot id, or crew name.
         agent: String,
     },
@@ -634,6 +729,40 @@ enum WorkAction {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Inspect the `worker_proposals` ledger.
+    Proposals {
+        #[command(subcommand)]
+        action: ProposalsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ProposalsAction {
+    /// List `worker_proposals` rows, newest first, optionally filtered.
+    /// Shows the full ledger — including `rejected`/`expired` history —
+    /// per the design's §"UI visibility and provenance": the ledger is
+    /// CLI-inspectable even though it gets no app-side UI surface. Reads
+    /// `state.db` directly (same resolution as `metrics`/`hosts`), so it
+    /// works even when the engine is wedged.
+    List {
+        /// Restrict to proposals filed against this execution.
+        #[arg(long)]
+        execution_id: Option<String>,
+        /// Restrict to proposals filed against this work item (across all
+        /// its executions).
+        #[arg(long)]
+        work_item_id: Option<String>,
+        /// Restrict to one proposal kind (e.g. `followup_task`, `blocked`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Restrict to one disposition (`proposed`, `applied`, `rejected`,
+        /// `superseded`, `expired`).
+        #[arg(long)]
+        state: Option<String>,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -672,6 +801,21 @@ enum MetricsAction {
         live: bool,
         /// Override the Boss state-root directory (ignored when
         /// `--live` is set).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// GitHub API usage attributed by subsystem: calls, quota units
+    /// spent, and the implied hourly rate against the 5000/hour budget.
+    ///
+    /// Reads the per-call `github_api_calls` rows in `state.db` directly
+    /// (same resolution as `metrics list`), which is what the `github_api.*`
+    /// counters cannot answer on their own: a counter is a monotonic
+    /// total, and the GitHub budget is a rate over a rolling hour.
+    Github {
+        /// Look back this many hours (default 24).
+        #[arg(long, default_value_t = 24)]
+        hours: u32,
+        /// Override the Boss state-root directory.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
@@ -853,6 +997,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: AgentsAction::Stop { agent },
         } => agents::agents_stop(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
+            action: AgentsAction::Hold { agent, reason },
+        } => agents::agents_hold(&cli.socket_path, cli.json, agent, reason).await,
+        Command::Agents {
+            action: AgentsAction::ReleaseHold { agent },
+        } => agents::agents_release_hold(&cli.socket_path, cli.json, agent).await,
+        Command::Agents {
             action: AgentsAction::Focus { agent },
         } => agents::agents_focus(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
@@ -912,6 +1062,19 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 state_root,
             },
         } => work_executions(cli.json, state_root, &work_item_id),
+        Command::Work {
+            action:
+                WorkAction::Proposals {
+                    action:
+                        ProposalsAction::List {
+                            execution_id,
+                            work_item_id,
+                            kind,
+                            state,
+                            state_root,
+                        },
+                },
+        } => work_proposals_list(cli.json, state_root, execution_id, work_item_id, kind, state),
         Command::Workspace {
             action: WorkspaceAction::Summary,
         } => workspace_summary(&cli.socket_path, cli.json).await,
@@ -982,6 +1145,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::Stats { state_root, since, top },
         } => dispatch_stats::dispatch_stats(cli.json, state_root, since.as_deref(), top),
+        Command::Dispatch {
+            action: DispatchAction::Concurrency { set },
+        } => dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Automation {
             action: AutomationAction::Pause,
         } => automation_set_paused(&cli.socket_path, cli.json, true).await,
@@ -1003,6 +1169,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 metrics_show(cli.json, state_root, &name)
             }
         }
+        Command::Metrics {
+            action: MetricsAction::Github { hours, state_root },
+        } => metrics_github(cli.json, state_root, hours),
         Command::Metrics {
             action: MetricsAction::Reset { name, all },
         } => {
@@ -1079,12 +1248,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
             tail,
             follow,
             grep,
+            since,
+            until,
+            target,
+            level,
+            fields,
+            execution_id,
             state_root,
         } => {
+            let query = logs::LogsQuery {
+                tail,
+                grep,
+                since,
+                until,
+                target,
+                level,
+                fields,
+                execution_id,
+            };
             if follow {
-                logs::logs_follow(source, state_root, tail, grep).await
+                logs::logs_follow(source, state_root, query).await
             } else {
-                logs::logs_tail(cli.json, source, state_root, tail, grep.as_deref())
+                logs::logs_tail(cli.json, source, state_root, query)
             }
         }
     }
@@ -1375,6 +1560,93 @@ async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> 
     } else {
         println!("state: running");
     }
+    Ok(())
+}
+
+/// Current interactive-pool concurrency cap as returned by
+/// [`FrontendRequest::SetDispatchConcurrency`] / [`FrontendRequest::GetDispatchConcurrency`].
+struct DispatchConcurrencyState {
+    limit: usize,
+    max: usize,
+    clamped_from: Option<usize>,
+}
+
+async fn get_dispatch_concurrency_raw(socket_path: &Option<String>) -> Result<DispatchConcurrencyState> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::GetDispatchConcurrency)
+        .await
+        .context("sending GetDispatchConcurrency")?;
+    match response {
+        FrontendEvent::DispatchConcurrencyResult {
+            limit,
+            max,
+            clamped_from,
+        } => Ok(DispatchConcurrencyState {
+            limit,
+            max,
+            clamped_from,
+        }),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected GetDispatchConcurrency: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+async fn set_dispatch_concurrency_raw(socket_path: &Option<String>, limit: usize) -> Result<DispatchConcurrencyState> {
+    let mut client = connect(socket_path).await?;
+    let response = client
+        .send_request(&FrontendRequest::SetDispatchConcurrency { limit })
+        .await
+        .context("sending SetDispatchConcurrency")?;
+    match response {
+        FrontendEvent::DispatchConcurrencyResult {
+            limit,
+            max,
+            clamped_from,
+        } => Ok(DispatchConcurrencyState {
+            limit,
+            max,
+            clamped_from,
+        }),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected SetDispatchConcurrency: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+fn print_dispatch_concurrency(json: bool, state: &DispatchConcurrencyState) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "limit": state.limit,
+                "max": state.max,
+                "clamped_from": state.clamped_from,
+            })
+        );
+    } else {
+        println!(
+            "interactive concurrency cap: {} (worker-pool ceiling: {})",
+            state.limit, state.max
+        );
+        if let Some(requested) = state.clamped_from {
+            println!(
+                "  requested {requested} exceeded the ceiling — clamped to {}",
+                state.limit
+            );
+        }
+    }
+}
+
+async fn dispatch_concurrency(socket_path: &Option<String>, json: bool, set: Option<usize>) -> Result<()> {
+    let state = match set {
+        Some(limit) => set_dispatch_concurrency_raw(socket_path, limit).await?,
+        None => get_dispatch_concurrency_raw(socket_path).await?,
+    };
+    print_dispatch_concurrency(json, &state);
     Ok(())
 }
 
@@ -1949,6 +2221,74 @@ fn work_executions(json: bool, state_root: Option<PathBuf>, work_item_id: &str) 
     Ok(())
 }
 
+/// `bossctl work proposals list` — the `worker_proposals` ledger,
+/// optionally filtered by execution/work-item/kind/state. Opens `state.db`
+/// directly via [`resolve_db_path`] (same resolution `metrics`/`hosts`/
+/// `work executions` use), so it works even when the engine is wedged.
+///
+/// Per the design's §"UI visibility and provenance", proposals get no
+/// app-side listing surface — this CLI verb is the full ledger, including
+/// `rejected`/`expired` history, which is why `state` is left unfiltered
+/// by default rather than defaulting to `proposed` only.
+fn work_proposals_list(
+    json: bool,
+    state_root: Option<PathBuf>,
+    execution_id: Option<String>,
+    work_item_id: Option<String>,
+    kind: Option<String>,
+    state: Option<String>,
+) -> Result<()> {
+    let kind = kind
+        .map(|k| k.parse::<ProposalKind>())
+        .transpose()
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("parsing --kind")?;
+    let state = state
+        .map(|s| s.parse::<ProposalState>())
+        .transpose()
+        .map_err(|err| anyhow::anyhow!(err))
+        .context("parsing --state")?;
+
+    let db = open_state_db(state_root)?;
+    let proposals = db
+        .list_worker_proposals(execution_id.as_deref(), work_item_id.as_deref(), kind, state)
+        .context("listing worker proposals")?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "proposals": proposals,
+            })
+        );
+    } else if proposals.is_empty() {
+        println!("no proposals match the given filters");
+    } else {
+        for proposal in &proposals {
+            print_proposal_row(proposal);
+        }
+    }
+    Ok(())
+}
+
+fn print_proposal_row(proposal: &WorkerProposal) {
+    let work_item = proposal.work_item_id.as_deref().unwrap_or("-");
+    println!(
+        "{}  [{}]  kind={}  execution={}  work_item={}  created={}",
+        proposal.id, proposal.state, proposal.kind, proposal.execution_id, work_item, proposal.created_at,
+    );
+    if let Some(applied_ref) = &proposal.applied_ref {
+        println!("  applied_ref: {applied_ref}");
+    }
+    if let Some(decision_reason) = &proposal.decision_reason {
+        let decided_by = proposal
+            .decided_by
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        println!("  decision ({decided_by}): {decision_reason}");
+    }
+}
+
 fn print_execution_history_row(exec: &WorkExecution, host: &str) {
     let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
     let started = exec.started_at.as_deref().unwrap_or("-");
@@ -2185,6 +2525,144 @@ fn print_metric_live_entry(json: bool, name: &str, entry: Option<&MetricLiveEntr
             }
         }
     }
+}
+
+/// GitHub's hourly quota for a personal token, on each of the two
+/// independently-metered buckets. Rates are printed against this so the
+/// table answers "over or under budget" without the reader doing the
+/// division.
+const GITHUB_HOURLY_BUDGET: f64 = 5000.0;
+
+/// Convert a spend and an observed span into a points-per-hour rate.
+///
+/// Divides by the span the data *actually* covers, not by the requested
+/// look-back: an engine that has been running the instrumented build for
+/// 20 minutes, queried with `--hours 24`, would otherwise report a rate
+/// ~70x under the truth. A span shorter than a minute is not a usable
+/// denominator (one burst would extrapolate to an absurd rate), so it
+/// reports `None` rather than a confident wrong number.
+fn points_per_hour(points: i64, span_ms: i64) -> Option<f64> {
+    if span_ms < 60_000 {
+        return None;
+    }
+    Some(points as f64 * 3_600_000.0 / span_ms as f64)
+}
+
+/// Per-subsystem GitHub API attribution over a time window.
+fn metrics_github(json: bool, state_root: Option<PathBuf>, hours: u32) -> Result<()> {
+    let db_path = resolve_db_path(state_root)?;
+    let db = WorkDb::open(db_path).context("opening state.db")?;
+    let since_ms = now_epoch_ms() as i64 - (hours as i64) * 3_600_000;
+
+    let buckets = db
+        .github_api_usage_by_caller(since_ms)
+        .context("reading github_api_calls from state.db")?;
+    let window = db
+        .github_api_usage_window(since_ms)
+        .context("reading github_api_calls window from state.db")?;
+    // A single sample spans zero time; treat the observed span as at
+    // least the gap between first and last row.
+    let span_ms = window.map(|(min, max)| max - min).unwrap_or(0);
+
+    if json {
+        let entries: Vec<serde_json::Value> = buckets
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "caller": b.caller,
+                    "api": b.api,
+                    "calls": b.calls,
+                    "points": b.points,
+                    "calls_without_reading": b.calls_without_reading,
+                    "errors": b.errors,
+                    "rate_limited": b.rate_limited,
+                    "points_per_hour": points_per_hour(b.points, span_ms),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "since_epoch_ms": since_ms,
+                "observed_span_ms": span_ms,
+                "hourly_budget": GITHUB_HOURLY_BUDGET,
+                "usage": entries,
+            })
+        );
+        return Ok(());
+    }
+
+    if buckets.is_empty() {
+        println!("no github_api_calls rows in the last {hours}h (engine may not have made a call yet)");
+        return Ok(());
+    }
+
+    let span_hours = span_ms as f64 / 3_600_000.0;
+    println!("GitHub API usage — {span_hours:.2}h observed (requested {hours}h look-back)");
+    println!();
+    let name_width = buckets.iter().map(|b| b.caller.len()).max().unwrap_or(10).max(10);
+    println!(
+        "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
+        "SUBSYSTEM",
+        "API",
+        "CALLS",
+        "UNITS",
+        "UNITS/HR",
+        "ERRORS",
+        "429s",
+        width = name_width,
+    );
+    for b in &buckets {
+        let rate = match points_per_hour(b.points, span_ms) {
+            Some(rate) => format!("{rate:.0}"),
+            None => "—".to_owned(),
+        };
+        println!(
+            "{:<width$}  {:>8}  {:>8}  {:>9}  {:>11}  {:>7}  {:>7}",
+            b.caller,
+            b.api,
+            b.calls,
+            b.points,
+            rate,
+            b.errors,
+            b.rate_limited,
+            width = name_width,
+        );
+    }
+
+    // Per-bucket totals: GraphQL and REST have separate 5000/hour
+    // budgets, so a combined total would compare against a limit that
+    // does not exist.
+    println!();
+    for api in ["graphql", "rest", "cli"] {
+        let points: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.points).sum();
+        let calls: i64 = buckets.iter().filter(|b| b.api == api).map(|b| b.calls).sum();
+        if calls == 0 {
+            continue;
+        }
+        match points_per_hour(points, span_ms) {
+            Some(rate) => {
+                let pct = rate / GITHUB_HOURLY_BUDGET * 100.0;
+                let verdict = if rate > GITHUB_HOURLY_BUDGET {
+                    "OVER BUDGET"
+                } else {
+                    "within budget"
+                };
+                println!("{api:>8}: {calls} calls, {points} units → {rate:.0}/hr ({pct:.0}% of 5000/hr) — {verdict}");
+            }
+            None => println!("{api:>8}: {calls} calls, {points} units (window too short for a rate)"),
+        }
+    }
+
+    let unmeasured: i64 = buckets.iter().map(|b| b.calls_without_reading).sum();
+    if unmeasured > 0 {
+        println!();
+        println!(
+            "note: {unmeasured} call(s) carried no rateLimit reading — their spend is counted \
+             as calls but contributes 0 units, so the rates above are a lower bound.",
+        );
+    }
+    Ok(())
 }
 
 async fn metrics_reset(socket_path: &Option<String>, json: bool, name: Option<String>) -> Result<()> {

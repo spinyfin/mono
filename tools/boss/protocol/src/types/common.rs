@@ -4,6 +4,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum length of a single free-form work-item tag, in Unicode scalar
+/// values (Rust `char`s). Matches the kanban chip's truncation point so a
+/// tag that survives the write path still fits the card without stretching
+/// the column. Longer values are rejected at the engine write boundary.
+pub const WORK_ITEM_TAG_MAX_LEN: usize = 24;
+
+/// Maximum number of free-form tags on a single work item. Beyond this the
+/// card would grow or overflow unboundedly; the write path rejects a final
+/// set larger than this after set/add/remove are applied.
+pub const WORK_ITEM_TAG_MAX_COUNT: usize = 5;
+
 /// Which naming strategy to use for worker branches pushed to this
 /// product's repo. The execution-id suffix is always appended for
 /// uniqueness; only the leading prefix component varies.
@@ -79,6 +90,70 @@ impl std::str::FromStr for EffortLevel {
             "max" => Ok(EffortLevel::Max),
             other => Err(format!(
                 "unknown effort level `{other}`; expected one of: trivial, small, medium, large, max"
+            )),
+        }
+    }
+}
+
+/// Allowed values for `tasks.reasoning` — the **capability** signal, which is
+/// deliberately independent of [`EffortLevel`] (the **size** signal).
+///
+/// Effort answers "how big is this job?" (how long, how many files, how many
+/// subsystems). Reasoning answers "what kind of thinking does it need?".
+/// Conflating them means the only way to get a stronger model onto a small
+/// investigate-and-fix chore is to inflate its effort level, which lies about
+/// the size and distorts scheduling, timeouts, and effort-based reporting.
+///
+/// The operator's policy, which this enum encodes: *"sonnet is best for well
+/// articulated coding tasks (these should be the bulk of what boss does, but
+/// when some investigation is required, opus is usually better)."*
+///
+/// Stored as TEXT in SQLite (no `CHECK` constraint), validated in code by
+/// [`ReasoningMode::from_str`]. A `NULL` column is **not** this enum's
+/// business: it means "never classified", and the dispatcher falls through to
+/// its pre-existing effort-table behaviour for those rows. See
+/// `boss_engine_effort::resolve_spawn_config` for the precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningMode {
+    /// Well-articulated coding work: the brief already says what to change,
+    /// and the job is to execute it correctly. Dispatches to the driver's
+    /// standard tier (Sonnet on Claude) **regardless of how big the job is**
+    /// — a genuinely mechanical `large` row belongs here.
+    Standard,
+    /// Investigation-shaped work: the worker has to diagnose, design, or root
+    /// cause something before it can decide what to change. Dispatches to the
+    /// driver's investigation tier (Opus on Claude) **regardless of how small
+    /// the job is** — a one-file `small` chore that first has to work out why
+    /// a state transition never fires belongs here.
+    Investigation,
+}
+
+impl ReasoningMode {
+    pub const ALL: &'static [ReasoningMode] = &[ReasoningMode::Standard, ReasoningMode::Investigation];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningMode::Standard => "standard",
+            ReasoningMode::Investigation => "investigation",
+        }
+    }
+}
+
+impl std::fmt::Display for ReasoningMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ReasoningMode {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "standard" => Ok(ReasoningMode::Standard),
+            "investigation" => Ok(ReasoningMode::Investigation),
+            other => Err(format!(
+                "unknown reasoning mode `{other}`; expected one of: standard, investigation"
             )),
         }
     }

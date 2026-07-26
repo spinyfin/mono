@@ -4,7 +4,36 @@
 use super::*;
 
 impl ExecutionCoordinator {
+    /// Wake the scheduler. Every call site that just enqueued a `ready`
+    /// execution — a kanban drag, a reconciler sweep, the heartbeat, an
+    /// automation dispatch, … — calls this.
+    ///
+    /// Routes through [`Self::event_bus`] as `Event::DispatchReady` when
+    /// [`Self::enable_dispatch_ready_bus`] is on; otherwise calls
+    /// [`Self::note_dispatch_ready`] directly, exactly as this function did
+    /// before the bus existed. The flag is the rollback switch: flip it off
+    /// and every call site is back on the direct path with no other change,
+    /// no redeploy of anything but config.
     pub fn kick(self: &Arc<Self>) {
+        if self.enable_dispatch_ready_bus {
+            tracing::debug!("scheduler_kick outcome=bus_publish — routing through DispatchReady");
+            self.event_bus.publish(Event::DispatchReady);
+            return;
+        }
+        self.note_dispatch_ready();
+    }
+
+    /// The double-latch wakeup itself, extracted from [`Self::kick`] so both
+    /// `kick()`'s direct (flag-off) path and
+    /// [`Self::spawn_dispatch_ready_subscriber`]'s bus-driven (flag-on) path
+    /// share one implementation. Latching `scheduling_pending` before
+    /// contending on `scheduling_active` is what closes the kick/drain TOCTOU
+    /// fixed in PR #345 — see `run_scheduler` for the full
+    /// account of the three race classes this pattern handles, and
+    /// `kick_during_active_scheduler_latches_pending_wakeup` /
+    /// `dispatch_ready_event_during_active_scheduler_latches_pending_wakeup`
+    /// for the pinning regression tests on each path.
+    pub(super) fn note_dispatch_ready(self: &Arc<Self>) {
         // Order matters: `scheduling_pending` must be written BEFORE we
         // contend on `scheduling_active`. If we lose the swap race
         // (another scheduler is already running) the alive scheduler
@@ -25,6 +54,59 @@ impl ExecutionCoordinator {
         });
     }
 
+    /// Subscribe to `Event::DispatchReady` and re-enter the double-latch
+    /// (via [`Self::note_dispatch_ready`]) on every event, so a `kick()`
+    /// that [`Self::enable_dispatch_ready_bus`] routed onto the bus still
+    /// reaches the scheduler. Returns `None` — spawning nothing — when the
+    /// flag is off, so an installation that never opts in never pays for a
+    /// subscriber loop.
+    ///
+    /// Supervised: a panic inside the subscriber loop is logged and the
+    /// loop restarted (with a fresh subscription) rather than silently
+    /// dying and leaving `kick()` publishing into a bus nobody reads. Even
+    /// so, the bus is best-effort and this is not the sole path to
+    /// dispatch — [`Self::spawn_scheduler_heartbeat`] keeps re-kicking on
+    /// its own interval regardless of this flag, so a dropped
+    /// `DispatchReady` (a full mailbox, a mid-restart gap) self-heals
+    /// within one heartbeat rather than stranding a `ready` row forever.
+    pub fn spawn_dispatch_ready_subscriber(self: &Arc<Self>) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.enable_dispatch_ready_bus {
+            return None;
+        }
+        let coordinator = Arc::clone(self);
+        Some(boss_event_bus::spawn_supervised(
+            "coordinator_dispatch_ready",
+            move || {
+                let coordinator = Arc::clone(&coordinator);
+                async move {
+                    let mut subscription = coordinator
+                        .event_bus
+                        .subscribe(TopicFilter::kind(EventKind::DispatchReady));
+                    // Reconcile pass: catch up on anything a dropped event (or a
+                    // gap while a prior attempt was restarting after a panic)
+                    // might have missed, exactly like every other bus subscriber
+                    // reconciles on start — see `spawn_supervised`'s contract.
+                    coordinator.note_dispatch_ready();
+                    while subscription.recv().await.is_some() {
+                        coordinator.note_dispatch_ready();
+                    }
+                    // `recv()` only returns `None` once the bus itself is
+                    // dropped; `spawn_supervised` treats that as a clean,
+                    // deliberate exit and does NOT restart this loop. The
+                    // coordinator owns the bus for its own lifetime, so this
+                    // is currently unreachable — but `warn!` here rather than
+                    // falling out silently, so a future change that makes it
+                    // reachable is observable instead of quietly ending
+                    // dispatch-ready subscription forever.
+                    tracing::warn!(
+                        "dispatch_ready subscriber: event bus dropped, subscription ended; \
+                         no more DispatchReady events will be delivered via the bus",
+                    );
+                }
+            },
+        ))
+    }
+
     /// Spawn a background task that periodically wakes the scheduler and
     /// surfaces a warning when a `ready` execution has been sitting in
     /// the queue for longer than one heartbeat interval.
@@ -42,11 +124,14 @@ impl ExecutionCoordinator {
     /// The heartbeat is a second line of defence, not a replacement for
     /// either mechanism:
     ///
-    /// * It calls [`kick`] regardless of the in-memory active flag, so
-    ///   any kick that was lost to a race the existing latching can't
-    ///   cover is re-issued within one interval. The scheduler still
-    ///   serializes drains through `scheduling_active`, so two
-    ///   schedulers can never run concurrently.
+    /// * It calls [`Self::note_dispatch_ready`] directly — NOT [`kick`] —
+    ///   regardless of the in-memory active flag or
+    ///   [`Self::enable_dispatch_ready_bus`], so this is the one wakeup path
+    ///   that never depends on the event bus having a live subscriber. Any
+    ///   kick that was lost to a race the existing latching can't cover, or
+    ///   a `DispatchReady` the bus dropped, is re-issued within one
+    ///   interval. The scheduler still serializes drains through
+    ///   `scheduling_active`, so two schedulers can never run concurrently.
     /// * When the heartbeat actually observes a stranded `ready` row
     ///   (anything older than the interval), it logs a `warn!` line
     ///   carrying the execution id so an operator sees the failure on
@@ -83,7 +168,13 @@ impl ExecutionCoordinator {
                          may have dropped a wakeup; re-kicking now",
                     );
                 }
-                coordinator.kick();
+                // NOT `kick()`: when `enable_dispatch_ready_bus` is on,
+                // `kick()` only publishes to the event bus and returns —
+                // routing the heartbeat through it would make the bus the
+                // sole path to `run_scheduler`, defeating the entire point
+                // of a bus-independent backstop. Call the double-latch
+                // directly so this wakeup always reaches the scheduler.
+                coordinator.note_dispatch_ready();
                 tokio::time::sleep(interval).await;
             }
         })
@@ -156,6 +247,22 @@ impl ExecutionCoordinator {
                 status = execution.status,
             ));
         }
+        // `ready` is necessary but not sufficient: the auto-dispatcher may
+        // already have handed this row (or a duplicate of it) off, and it
+        // stays `ready` until its run starts. Force-dispatching over the top
+        // would claim a second slot and spawn a second worker for one work
+        // item.
+        //
+        // Claimed BEFORE the worker, and via the atomic `try_reserve` rather
+        // than a check-then-reserve pair: a concurrent `drain_ready_queue`
+        // could otherwise slip in during the `claim_worker_force` await, and
+        // both paths would believe they own the dispatch.
+        let Some(_reservation) = self.inflight_dispatches.try_reserve(&execution) else {
+            return Err(anyhow!(
+                "execution {execution_id} (or another execution for its work item) is already \
+                 being dispatched — cannot force-dispatch"
+            ));
+        };
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
         let worker_id = self
             .worker_pool
@@ -199,7 +306,7 @@ impl ExecutionCoordinator {
         // "guard drops" — kicks landing in that window noop'd against
         // `scheduling_active=true` and the new `ready` row sat
         // forever with no scheduler running to pick it up. That is
-        // the symptom motivating this fix (see `task_18ae9d21044843b8_44`).
+        // the symptom motivating this fix (see PR #345).
         loop {
             self.scheduling_pending.store(false, Ordering::Release);
             let drain_started_at = std::time::Instant::now();
@@ -281,12 +388,45 @@ impl ExecutionCoordinator {
     /// so trusting only the first live sibling lets a root `pr_review` mask
     /// a live descendant *writer* — reintroducing the exact
     /// two-concurrent-writers-to-one-PR hazard this guard exists to prevent.
-    async fn live_chain_siblings(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
+    ///
+    /// "Live" spans two sources, and needs both. `work_executions.status`
+    /// covers siblings whose run has started; [`Self::inflight_dispatches`]
+    /// covers siblings that `drain_ready_queue` has handed off but which have
+    /// not yet reached `start_execution_run_on_host`, so the DB still shows
+    /// them `ready`. Consulting only the DB was sound while the drain loop
+    /// awaited each dispatch inline — a sibling was always either finished or
+    /// `running` by the time the next row was examined — but concurrent
+    /// hand-off means two rows on one chain can both find a DB with no live
+    /// sibling and both dispatch. See [`crate::dispatch_inflight`].
+    ///
+    /// In-flight reservations are exempt from the zombie reconciliation
+    /// below: the engine created them moments ago in this process and holds
+    /// the guard, so they are live by construction — there is no pane or
+    /// workspace to probe yet.
+    async fn live_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        let work_item_id = execution.work_item_id.as_str();
+        let inflight = self.inflight_chain_siblings(execution)?;
+        // Union DB-live siblings with in-flight ones, without double-counting
+        // a sibling that is momentarily both: a dispatch that has just
+        // committed `start_execution_run_on_host` is already `running` in the
+        // DB while its task still holds the reservation for the instant before
+        // the guard drops. `resolve_chain_hold` reports `siblings.len()` to the
+        // operator as "N revisions queued", so a duplicate would inflate the
+        // count on the kanban card.
+        let union_with_inflight = |mut db_siblings: Vec<WorkExecution>| {
+            let extra: Vec<WorkExecution> = inflight
+                .iter()
+                .filter(|i| !db_siblings.iter().any(|d| d.id == i.id))
+                .cloned()
+                .collect();
+            db_siblings.extend(extra);
+            db_siblings
+        };
         const MAX_RECONCILE_ATTEMPTS: u8 = 4;
         for _ in 0..MAX_RECONCILE_ATTEMPTS {
             let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
             if siblings.is_empty() {
-                return Ok(siblings);
+                return Ok(union_with_inflight(siblings));
             }
             let mut any_reconciled = false;
             for sibling in &siblings {
@@ -316,14 +456,38 @@ impl ExecutionCoordinator {
                 }
             }
             if !any_reconciled {
-                return Ok(siblings);
+                return Ok(union_with_inflight(siblings));
             }
         }
         // Exhausted retries without converging on a stable answer (e.g. a
         // pathological chain with many zombies reconciling one per pass).
         // Fail closed: treat whatever is there now as live rather than risk
         // co-dispatching two workers onto the same shared jj backing store.
-        self.work_db.live_executions_elsewhere_in_chain(work_item_id)
+        let siblings = self.work_db.live_executions_elsewhere_in_chain(work_item_id)?;
+        Ok(union_with_inflight(siblings))
+    }
+
+    /// Dispatches currently handed off for OTHER work items in `execution`'s
+    /// revision chain.
+    ///
+    /// Propagates a chain-walk error to [`Self::live_chain_siblings`], whose
+    /// callers all fail OPEN — they log and dispatch without the defer rather
+    /// than wedge the queue on a DB error. That is the pre-existing policy for
+    /// the DB-backed chain query and this shares it; the widened blast radius
+    /// is one extra error source, mitigated by the early return below (no
+    /// query at all unless something is actually in flight).
+    ///
+    /// Skips the chain-membership query entirely when nothing is in flight,
+    /// which is the overwhelmingly common case (a quiet queue, or a backlog
+    /// draining faster than any single dispatch takes).
+    fn inflight_chain_siblings(&self, execution: &WorkExecution) -> Result<Vec<WorkExecution>> {
+        if self.inflight_dispatches.is_empty() {
+            return Ok(Vec::new());
+        }
+        let member_ids = self.work_db.chain_member_ids(&execution.work_item_id)?;
+        Ok(self
+            .inflight_dispatches
+            .chain_siblings(&member_ids, &execution.work_item_id, &execution.id))
     }
 
     /// Resolve the per-PR single-writer chain check for `execution`,
@@ -366,7 +530,7 @@ impl ExecutionCoordinator {
     /// the pipeline could re-defer what an earlier one just bypassed,
     /// wedging the row in a defer loop instead of actually dispatching it.
     pub(super) async fn resolve_chain_hold(&self, execution: &WorkExecution) -> Result<ChainHold> {
-        let siblings = self.live_chain_siblings(&execution.work_item_id).await?;
+        let siblings = self.live_chain_siblings(execution).await?;
         let Some(first_sibling) = siblings.first().cloned() else {
             return Ok(ChainHold::Clear);
         };
@@ -603,6 +767,27 @@ impl ExecutionCoordinator {
             crate::dispatch_metrics::record_queue_snapshot(&self.metrics, snapshot);
         }
 
+        // Drop rows whose work item a previous drain already handed off. A
+        // dispatched row keeps `status = 'ready'` until its task reaches
+        // `start_execution_run_on_host`, so `list_ready_executions` still
+        // returns it — and drains overlap freely now that the loop no longer
+        // awaits each dispatch: a kick landing mid-pass re-enters the loop
+        // immediately, and the 15s heartbeat spawns a fresh scheduler as soon
+        // as the previous (now fast) one relinquishes `scheduling_active`.
+        // Without this, such a re-drain would claim a SECOND worker for a row
+        // already dispatching and spawn it twice; neither the chain guard nor
+        // the double-spawn guard would stop it, because both exclude the
+        // execution's own id and so cannot see a row racing itself.
+        //
+        // Filtering here (rather than only at the reservation below) also
+        // keeps `pool_ready_counts` honest — an in-flight row is not a
+        // candidate this pass, so it must not inflate the "beaten N
+        // candidates" the surviving rows report.
+        let executions: Vec<WorkExecution> = executions
+            .into_iter()
+            .filter(|e| !self.inflight_dispatches.is_work_item_dispatching(&e.work_item_id))
+            .collect();
+
         if executions.is_empty() {
             return DrainOutcome::QueueEmpty;
         }
@@ -722,16 +907,16 @@ impl ExecutionCoordinator {
                 continue;
             }
 
-            // TEMPORARY interactive-pool concurrency cap (operator directive,
-            // 2026-07-15): main-pool rows are held once the interactive
-            // pool's live workers reach [`MAX_CONCURRENT_INTERACTIVE_WORKERS`],
-            // even though the pool has 16 slots. Automation and review rows
-            // dispatched from their OWN home pools are never held by this
-            // gate — their pools' own sizes govern them. Spilled automation
-            // is a different story: it claims an interactive-pool slot (see
-            // `claim_worker_spill`), so it DOES count toward the live number
-            // this cap compares against — see the constant's doc for why
-            // that's intentional.
+            // Interactive-pool concurrency cap (operator-settable — see
+            // `bossctl dispatch concurrency`, default [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]):
+            // main-pool rows are held once the interactive pool's live
+            // workers reach the configured cap, even though the pool has 16
+            // slots. Automation and review rows dispatched from their OWN
+            // home pools are never held by this gate — their pools' own
+            // sizes govern them. Spilled automation is a different story: it
+            // claims an interactive-pool slot (see `claim_worker_spill`), so
+            // it DOES count toward the live number this cap compares against
+            // — see the constant's doc for why that's intentional.
             //
             // Checked BEFORE `request_recorded` (same invariant the earlier,
             // pre-preemption gate carried): a capped row must never enter
@@ -749,13 +934,14 @@ impl ExecutionCoordinator {
             // its own `WorkerClaimed` emit); a capped row that doesn't is
             // deferred here with the `interactive_concurrency_cap` reason
             // and never touches the pipeline below. See the constant's doc
-            // for rationale and removal criteria.
+            // for rationale.
             let live_workers_at_cap_check = if is_main {
                 Some(self.worker_pool.busy_count().await)
             } else {
                 None
             };
-            let capped = live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers);
+            let capped =
+                live_workers_at_cap_check.is_some_and(|live| live >= self.max_concurrent_interactive_workers());
 
             if capped {
                 let claimed = if preempted_this_pass {
@@ -773,7 +959,7 @@ impl ExecutionCoordinator {
                 };
                 let Some(worker_id) = claimed else {
                     let live_workers = live_workers_at_cap_check.unwrap_or_default();
-                    let cap = self.max_concurrent_interactive_workers;
+                    let cap = self.max_concurrent_interactive_workers();
                     tracing::info!(
                         execution_id = %execution.id,
                         work_item_id = %execution.work_item_id,
@@ -782,6 +968,18 @@ impl ExecutionCoordinator {
                         cap,
                         "spawn_attempt status=ready -> held reason=interactive_concurrency_cap"
                     );
+                    self.dispatch_events
+                        .emit(
+                            DispatchEvent::new(Stage::WorkerClaimed, DispatchOutcome::Skipped, &execution.id)
+                                .with_work_item(&execution.work_item_id)
+                                .with_details(serde_json::json!({
+                                    "reason": "interactive_concurrency_cap",
+                                    "pool": pool_label,
+                                    "live_workers": live_workers,
+                                    "cap": cap,
+                                })),
+                        )
+                        .await;
                     self.record_dispatch_wait_reason(
                         &execution.id,
                         &format!(
@@ -793,6 +991,31 @@ impl ExecutionCoordinator {
                 };
                 self.dispatch_claimed_execution(&execution, &worker_id, pool_label, false)
                     .await;
+                continue;
+            }
+
+            // A duplicate `ready` row for a work item THIS pass already handed
+            // off (the orphan-sweep race that the double-spawn guard exists
+            // for). The pre-loop filter above cannot catch it — that snapshot
+            // predates the reservation an earlier iteration just took — so it
+            // is re-checked per row.
+            //
+            // Skipped before `request_recorded` so the row emits no dispatch
+            // timeline at all: it is not a dispatch attempt, and a second
+            // `request_recorded` for a work item already dispatching would
+            // corrupt the per-execution event stream. Left `ready`; once the
+            // winner is `running`, `schedule_execution`'s DB double-spawn
+            // guard resolves this row as redundant on a later pass.
+            if self
+                .inflight_dispatches
+                .is_work_item_dispatching(&execution.work_item_id)
+            {
+                tracing::debug!(
+                    execution_id = %execution.id,
+                    work_item_id = %execution.work_item_id,
+                    pool = pool_label,
+                    "spawn_attempt status=ready -> skipped reason=work_item_dispatch_in_flight"
+                );
                 continue;
             }
 
@@ -1147,7 +1370,7 @@ impl ExecutionCoordinator {
                 .claim_worker_spill(
                     &execution.id,
                     preferred_workspace_id.as_deref(),
-                    self.max_concurrent_interactive_workers,
+                    self.max_concurrent_interactive_workers(),
                 )
                 .await
             else {
@@ -1156,7 +1379,7 @@ impl ExecutionCoordinator {
                 // row waits, exactly as it did before spillover existed.
                 let pool_capacity = self.automation_pool.capacity().await;
                 let live_workers = self.worker_pool.busy_count().await;
-                let cap = self.max_concurrent_interactive_workers;
+                let cap = self.max_concurrent_interactive_workers();
                 tracing::warn!(
                     execution_id = %execution.id,
                     work_item_id = %execution.work_item_id,
@@ -1534,8 +1757,10 @@ impl ExecutionCoordinator {
     }
 
     /// Shared tail of a successful claim: record the landing slot, clear
-    /// the wait reason, and hand off to `schedule_execution`, releasing
-    /// the slot again if the handoff fails.
+    /// the wait reason, reserve the dispatch, and hand `schedule_execution`
+    /// off to a concurrent task so a slow row cannot stall the rest of the
+    /// drain — releasing the slot again if the reservation or the handoff
+    /// fails.
     ///
     /// `spilled` marks an automation execution that claimed an
     /// interactive (Lower Decks) slot because its own pool was full. It
@@ -1592,28 +1817,99 @@ impl ExecutionCoordinator {
             tracing::warn!(execution_id = %execution.id, ?err, "failed to clear dispatch_wait_reason");
         }
 
-        match self.schedule_execution(execution, worker_id).await {
-            Ok(()) => {
-                tracing::info!(
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    worker_id = %worker_id,
-                    spilled,
-                    "spawn_attempt status=ready -> spawned"
-                );
+        // Hand the slow tail off and return to the caller's loop.
+        //
+        // Everything above this point is the serial decision section, and
+        // stays serial: the chain hold, the stagger gate and above all
+        // `claim_worker` are what keep slot accounting race-free, and one
+        // loop deciding them in priority order is what makes "this row beat
+        // those N candidates" true. What must NOT be serial is what follows
+        // — `schedule_execution` inlines `cube repo ensure` (<=60s), the
+        // workspace lease and its fallback (<=30s each) and `cube change
+        // create` before the run starts. Awaiting that here meant one row
+        // hitting a timeout budget stalled every row behind it for 30-60s,
+        // draining a resumed backlog at roughly one item per minute while
+        // slots sat free.
+        //
+        // The reservation is taken HERE, synchronously, before the caller's
+        // loop advances — the next iteration's chain guard must be able to
+        // see this dispatch, which the DB cannot show until the run
+        // actually starts. See `crate::dispatch_inflight`.
+        //
+        // It can still be refused: `force_dispatch` runs outside this loop
+        // and may have reserved this work item during one of the awaits
+        // above. `try_reserve` is atomic, so exactly one of the two wins;
+        // the loser hands its slot back rather than dispatching a second
+        // worker for the same work item.
+        let Some(reservation) = self.inflight_dispatches.try_reserve(execution) else {
+            tracing::info!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                worker_id = %worker_id,
+                "spawn_attempt status=ready -> deferred reason=dispatch_already_in_flight"
+            );
+            self.pool_for_worker_id(worker_id)
+                .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
+                .await;
+            return;
+        };
+        let coordinator = Arc::clone(self);
+        let dispatch_slots = Arc::clone(&self.dispatch_slots);
+        let execution = execution.clone();
+        let worker_id = worker_id.to_string();
+        tokio::spawn(async move {
+            // Held for the whole dispatch: the guard de-registers the
+            // reservation on drop, on every path including a panic.
+            let _reservation = reservation;
+            // Bounds concurrent cube subprocesses. Acquired inside the
+            // task, never in the caller's loop, so a saturated cap would
+            // delay only this dispatch rather than re-serializing the
+            // drain. The pools already bound in-flight dispatches below
+            // this cap, so it should never actually bind.
+            let _permit = match dispatch_slots.acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => {
+                    // Unreachable — nothing closes the semaphore. Release
+                    // the claim anyway: bailing out silently would strand
+                    // this worker slot forever, since `pool_claim_sweep`
+                    // only reclaims slots whose execution went terminal and
+                    // this row is still `ready`.
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        worker_id = %worker_id,
+                        "dispatch semaphore closed; releasing the claim instead of stranding the slot"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .await;
+                    return;
+                }
+            };
+            match coordinator.schedule_execution(&execution, &worker_id).await {
+                Ok(()) => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        spilled,
+                        "spawn_attempt status=ready -> spawned"
+                    );
+                }
+                Err(err) => {
+                    tracing::error!(
+                        ?err,
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        worker_id = %worker_id,
+                        "spawn_attempt status=ready -> failed reason=schedule_execution_error"
+                    );
+                    coordinator
+                        .pool_for_worker_id(&worker_id)
+                        .release_worker(&worker_id, execution.preferred_workspace_id.as_deref())
+                        .await;
+                }
             }
-            Err(err) => {
-                tracing::error!(
-                    ?err,
-                    execution_id = %execution.id,
-                    work_item_id = %execution.work_item_id,
-                    worker_id = %worker_id,
-                    "spawn_attempt status=ready -> failed reason=schedule_execution_error"
-                );
-                self.pool_for_worker_id(worker_id)
-                    .release_worker(worker_id, execution.preferred_workspace_id.as_deref())
-                    .await;
-            }
-        }
+        });
     }
 }

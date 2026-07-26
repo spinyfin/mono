@@ -4,6 +4,22 @@
 //! hook events live here. Pure structural move — no behavioural change.
 
 use super::*;
+use crate::driver::{AgentDriver, Capability, ClaudeDriver};
+
+impl ServerState {
+    /// First call for a given `execution_id` returns `true` (and remembers
+    /// it); every subsequent call for the same id returns `false`. Used to
+    /// downgrade the post-hoc-interception loss-of-guards warning from a
+    /// per-`PostToolUse`-event `warn!` to a per-execution one, so a
+    /// long-running hookless-driver worker logs the signal once instead of
+    /// once per tool call.
+    fn should_warn_post_hoc_interception_loss(&self, execution_id: &str) -> bool {
+        self.post_hoc_interception_warned
+            .lock()
+            .expect("post_hoc_interception_warned mutex poisoned")
+            .insert(execution_id.to_owned())
+    }
+}
 
 /// Update the per-slot LiveWorkerState for the run this hook event
 /// belongs to and push the new snapshot on the
@@ -22,6 +38,89 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
         WorkerEvent::Notification { .. } => "notification",
         WorkerEvent::SessionEnd { .. } => "session_end",
     }
+}
+
+/// The engine's [`crate::stdout_progress::WorkerEventSink`]: a
+/// `ProgressIngress::StdoutJsonl` driver's progress lands here and takes the
+/// identical fan-out the events-socket accept loop takes for a
+/// `ProgressIngress::HookCallback` driver. This impl is the whole of the
+/// stdout arm's engine-side behaviour — everything downstream of it is shared
+/// with the hook path, by construction.
+/// Implemented on `Arc<ServerState>` rather than `ServerState` because the
+/// fan-out's handlers clone the `Arc` into spawned work; `&self` is then
+/// already the `&Arc<ServerState>` they need.
+#[async_trait::async_trait]
+impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
+    async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
+        dispatch_worker_event_fanout(self, &incoming).await;
+    }
+}
+
+/// Fan one normalised worker event out to every engine subsystem that reacts
+/// to worker progress, in the order those subsystems require.
+///
+/// Transport-agnostic on purpose. Both progress ingresses converge here:
+/// [`crate::events_socket`] (a `ProgressIngress::HookCallback` driver's
+/// `boss-event` shim over the unix socket) and
+/// [`crate::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
+/// stdout stream). By the time an event reaches this function the driver has
+/// already normalised it, so which transport carried it is no longer
+/// observable — which is exactly the property that makes live-status, the
+/// staleness sweeps, and the kanban see the same shapes from either one.
+///
+/// Ordering here is load-bearing; see the per-call comments.
+pub(super) async fn dispatch_worker_event_fanout(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    // Audit *before* the live-state fan-out
+    // so an engine-side mismatch in the
+    // dispatch path can't drop the audit line
+    // — the deny is enforced harness-side by
+    // claude already, this is the independent
+    // forensic record. See
+    // [`worker_sandbox_audit`] for why.
+    crate::worker_sandbox_audit::record_if_sandbox_attempt(
+        &server_state.dispatch_event_root,
+        incoming.run_id.as_deref(),
+        &incoming.event,
+    );
+    crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
+    dispatch_live_worker_state(server_state, incoming).await;
+    // Editorial PreToolUse audit: evaluate every
+    // `gh pr|issue` Bash invocation against the
+    // product's editorial rules and record the
+    // decision in `editorial_actions`. Fire-and-
+    // forget; never blocks the event dispatch.
+    dispatch_editorial_on_pretooluse(server_state, incoming).await;
+    // Post-hoc interception fallback: for any driver
+    // that lacks real-time PreToolUse hooks (the
+    // ToolUseInterception Degrade path), this is the
+    // only place editorial/path/revision-PR/
+    // checkleft loss ever gets surfaced. No-op for
+    // Claude, which already ran those guards above.
+    dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming).await;
+    // Urgent probes fire on PostToolUse so
+    // the coordinator can redirect a worker
+    // mid-task without waiting for Stop. The
+    // tool call has already returned at this
+    // point, so no in-flight work is lost.
+    dispatch_urgent_probe_on_post_tool_use(server_state, incoming).await;
+    // ProbeReplied runs first: emit the reply for the
+    // prior probe before dispatching the next one so
+    // a single Stop never fires both reply and dispatch
+    // for the same probe (the reply text hasn't been
+    // written yet at dispatch time).
+    //
+    // Completion runs before probe dispatch: probes
+    // queued by the completion handler (e.g.
+    // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
+    // so they are delivered on the *same* Stop that
+    // triggered them rather than stalling until the
+    // next Stop (which never comes for an idle worker).
+    dispatch_probe_reply_on_stop(server_state, incoming).await;
+    dispatch_completion_on_stop(server_state, incoming).await;
+    dispatch_probe_on_stop(server_state, incoming).await;
 }
 
 pub(super) async fn dispatch_live_worker_state(
@@ -170,10 +269,10 @@ pub(super) async fn dispatch_live_worker_state(
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
-                    // the T267-class contradiction where a run we think is
-                    // dead is demonstrably alive (its worker is still
-                    // emitting hooks). If so, make it LOUD and countable
-                    // instead of swallowing it silently.
+                    // the contradiction where a run we think is dead is
+                    // demonstrably alive (its worker is still emitting
+                    // hooks). If so, make it LOUD and countable instead
+                    // of swallowing it silently.
                     if !note_hook_for_terminal_execution(server_state, run_id, event_kind) {
                         tracing::warn!(
                             run_id,
@@ -205,126 +304,166 @@ pub(super) async fn dispatch_live_worker_state(
     // hook arriving before `register_spawn` or after `release_slot`
     // is a benign no-op.
     let new_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
-    match &incoming.event {
-        crate::protocol::WorkerEvent::Stop { .. } if !is_remote_slot => {
-            server_state.live_status_manager.notify(slot_id, Trigger::Stop);
+    // The end-of-turn trigger comes from the run's driver
+    // (`Capability::TurnBoundary`), resolved once at ingress — not from this
+    // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the
+    // match because the two are disjoint: no event is both a turn boundary
+    // and a tool result.
+    if incoming.is_turn_boundary() && !is_remote_slot {
+        server_state.live_status_manager.notify(slot_id, Trigger::Stop);
+    }
+    if let crate::protocol::WorkerEvent::PostToolUse {
+        tool_name,
+        tool_input,
+        tool_response,
+        ..
+    } = &incoming.event
+    {
+        if !is_remote_slot {
+            server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
-        crate::protocol::WorkerEvent::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_response,
-            ..
-        } => {
-            if !is_remote_slot {
-                server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
-            }
-            // Primary-path PR URL capture. Every worker that opens a
-            // PR does it via a Bash `gh pr create` (and also
-            // `gh pr view` / `gh pr edit`); the PR URL is printed
-            // on stdout. Catch it here, stage against the
-            // execution_id, and the on-Stop handler picks it up
-            // without ever shelling out to `jj log` to reconstruct
-            // it.
-            //
-            // Layer-1 gate: only capture URLs from deliberate `gh pr`
-            // invocations. Arbitrary Bash output (file reads, test
-            // runs, chore descriptions printed via shell) can contain
-            // PR URLs from unrelated executions; filtering by command
-            // prevents those from staging the wrong PR.
-            if tool_name == "Bash" {
-                // Check for any PR URL first so we can log a rejection
-                // when the command isn't a gh pr invocation.
-                if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response) {
-                    if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
-                        tracing::info!(
-                            execution_id = run_id,
-                            rejected_url = %pr_url,
-                            reason = "not_a_gh_pr_command",
-                            "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
-                        );
-                    } else {
-                        // Gate the URL against the product's repo before
-                        // staging. Workers running tests can emit fixture
-                        // URLs (e.g. `https://github.com/foo/bar/pull/42`)
-                        // in tool_response.stdout; without this gate those
-                        // bind to the work_item as if they were real PRs.
-                        let execution_id = run_id;
-                        let repo_url_result = server_state
-                            .work_db
-                            .get_execution(execution_id)
-                            .map(|e| e.repo_remote_url);
-                        let valid = match repo_url_result {
-                            Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
-                                Ok(()) => true,
-                                Err(reason) => {
-                                    tracing::info!(
-                                        execution_id,
-                                        rejected_url = %pr_url,
-                                        %reason,
-                                        "pr_url_capture: dropping URL — failed product-repo gate",
-                                    );
-                                    false
-                                }
-                            },
-                            Err(err) => {
-                                tracing::warn!(
+        // Primary-path PR URL capture. Every worker that opens a
+        // PR does it via a shell `gh pr create` / `cube pr create`
+        // (and also `gh pr view` / `gh pr edit`); the PR URL is
+        // printed on the command's output. The *driver* supplies
+        // the free-text slice (and command string) via
+        // `AgentDriver::pr_url_capture_feed` — Claude from the
+        // PostToolUse `tool_response.{stdout,stderr}` object,
+        // Codex from `command_execution.aggregated_output` on the
+        // stdout-JSONL stream. The engine then runs the *shared*
+        // regex + command gates and stages against the
+        // execution_id so the on-Stop handler picks it up without
+        // shelling out to `jj log` or polling GitHub for the
+        // branch's PR.
+        //
+        // Layer-1 gate: only capture URLs from deliberate `gh pr`
+        // / `cube pr` invocations. Arbitrary shell output (file
+        // reads, test runs, chore descriptions) can contain PR
+        // URLs from unrelated executions; filtering by command
+        // prevents those from staging the wrong PR.
+        if let Some(feed) =
+            pr_url_capture_feed_for_execution(server_state, run_id, tool_name, tool_input, tool_response)
+        {
+            // Check for any PR URL first so we can log a rejection
+            // when the command isn't a gh/cube pr invocation.
+            if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_text(&feed.output_text) {
+                if !crate::pr_url_capture::is_gh_pr_command_str(&feed.command) {
+                    tracing::info!(
+                        execution_id = run_id,
+                        rejected_url = %pr_url,
+                        reason = "not_a_gh_pr_command",
+                        "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
+                    );
+                } else {
+                    // Gate the URL against the product's repo before
+                    // staging. Workers running tests can emit fixture
+                    // URLs (e.g. `https://github.com/foo/bar/pull/42`)
+                    // in tool output; without this gate those bind
+                    // to the work_item as if they were real PRs.
+                    let execution_id = run_id;
+                    let repo_url_result = server_state
+                        .work_db
+                        .get_execution(execution_id)
+                        .map(|e| e.repo_remote_url);
+                    let valid = match repo_url_result {
+                        Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                tracing::info!(
                                     execution_id,
                                     rejected_url = %pr_url,
-                                    ?err,
-                                    "pr_url_capture: could not load execution to validate URL; dropping for safety",
+                                    %reason,
+                                    "pr_url_capture: dropping URL — failed product-repo gate",
                                 );
                                 false
                             }
-                        };
-                        if valid {
-                            let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
-                            match outcome {
-                                crate::pr_url_capture::StagePrUrlOutcome::Staged => {
-                                    tracing::info!(
-                                        execution_id = run_id,
-                                        pr_url = %pr_url,
-                                        "pr_url_capture: staged PR URL from worker hook stream",
-                                    );
-                                }
-                                crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                                    // Worker emitted another PR URL after
-                                    // already staging one — typically a
-                                    // `gh pr view` follow-up referencing a
-                                    // different PR. First-writer-wins so
-                                    // the original (the worker's own
-                                    // `gh pr create`) is kept.
-                                    tracing::debug!(
-                                        execution_id = run_id,
-                                        pr_url = %pr_url,
-                                        "pr_url_capture: ignoring later URL (already staged for this execution)",
-                                    );
-                                }
-                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                rejected_url = %pr_url,
+                                ?err,
+                                "pr_url_capture: could not load execution to validate URL; dropping for safety",
+                            );
+                            false
                         }
-                    } // else (is_gh_pr_command)
-
-                    // Revision push detection: record when a revision worker
-                    // runs `cube pr update` (or, defensively, a direct
-                    // `jj git push`) so the on_stop_inner SHA-delta gate can
-                    // confirm the revision was the one that moved the PR
-                    // head (not a concurrently-active parent worker).
-                    if crate::pr_url_capture::is_revision_push_command(tool_input) {
-                        let execution_id = run_id;
-                        match server_state.work_db.get_execution(execution_id) {
-                            Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
-                                server_state.staged_revision_pushes.record(execution_id);
+                    };
+                    if valid {
+                        let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
+                        match outcome {
+                            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
                                 tracing::info!(
-                                    execution_id,
-                                    "revision_push_capture: staged push evidence for revision",
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: staged PR URL from worker progress stream",
                                 );
                             }
-                            _ => {}
+                            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                                // Worker emitted another PR URL after
+                                // already staging one — typically a
+                                // `gh pr view` follow-up referencing a
+                                // different PR. First-writer-wins so
+                                // the original (the worker's own
+                                // `gh pr create`) is kept.
+                                tracing::debug!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: ignoring later URL (already staged for this execution)",
+                                );
+                            }
                         }
+                    }
+                } // else (is_gh_pr_command)
+
+                // Revision push detection: record when a revision worker
+                // runs `cube pr update` (or, defensively, a direct
+                // `jj git push`) so the on_stop_inner SHA-delta gate can
+                // confirm the revision was the one that moved the PR
+                // head (not a concurrently-active parent worker).
+                // Nested under the URL-found branch intentionally —
+                // preserves the historical Claude control flow (a
+                // successful `cube pr update` always prints a PR URL).
+                if crate::pr_url_capture::is_revision_push_command_str(&feed.command) {
+                    let execution_id = run_id;
+                    match server_state.work_db.get_execution(execution_id) {
+                        Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
+                            server_state.staged_revision_pushes.record(execution_id);
+                            tracing::info!(execution_id, "revision_push_capture: staged push evidence for revision",);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
-        _ => {}
+
+        // proposal_channel_error detection: a `boss propose <kind>`
+        // Bash invocation that failed. Staged in-memory against the
+        // execution id; `on_stop` files an attention and increments
+        // `worker_proposals.channel_error`. See
+        // `crate::proposal_channel_error`.
+        // Still Claude-shaped (`tool_input.command` object): proposal
+        // channel capture is out of scope for this seam.
+        if tool_name == "Bash"
+            && crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
+            && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
+        {
+            let command = tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("boss propose")
+                .to_owned();
+            if server_state
+                .staged_proposal_channel_errors
+                .record_if_unset(run_id, &command, &error_text)
+            {
+                tracing::warn!(
+                    execution_id = run_id,
+                    command = %command,
+                    error_text = %error_text,
+                    "proposal_channel_error: staged a failed `boss propose` submission",
+                );
+            }
+        }
     }
     if !is_remote_slot {
         if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
@@ -393,9 +532,19 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         // local pid, so 0 (the live state stores it but the value is
         // only meaningful for the local ancestor-walk correlation that
         // remote runs bypass via the `_boss_run_id` token).
-        server_state
-            .live_worker_states
-            .register_spawn(slot_id, run_id, model, 0, binding);
+        // Remote workers are Claude-only today (the `model` fallback above
+        // is the literal label `"claude"` — see the driver-abstraction
+        // design doc's "Remote/SSH driver-awareness" future task), so this
+        // mirrors the local spawn path's derivation, passing the capability
+        // straight into registration rather than a follow-up setter call.
+        server_state.live_worker_states.register_spawn_with_capabilities(
+            slot_id,
+            run_id,
+            model,
+            0,
+            binding,
+            ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
+        );
         tracing::info!(
             run_id,
             slot_id,
@@ -410,9 +559,9 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
 /// When a hook event arrives for a run with no live slot mapping,
 /// determine whether the engine already considers that execution
 /// terminal. A terminal execution that is *still emitting worker hook
-/// events* is the T267-class contradiction: the engine believed the run
-/// dead — because an ack-timeout was once mis-handled as a spawn failure,
-/// or a sweep reaped it — yet its worker is demonstrably alive. Emit a
+/// events* is a contradiction: the engine believed the run dead — because
+/// an ack-timeout was once mis-handled as a spawn failure, or a sweep
+/// reaped it — yet its worker is demonstrably alive. Emit a
 /// loud `[engine-reconcile]` diagnostic and bump the
 /// `dispatcher.hook_events.for_terminal_execution` counter so the
 /// mismatch is observable rather than silently swallowed (the "engine has
@@ -462,11 +611,52 @@ fn remote_worker_model_override(item: &boss_protocol::WorkItem) -> Option<String
     }
 }
 
+/// DB-free gate for [`dispatch_editorial_on_pretooluse`]: decides whether a
+/// `PreToolUse` event should proceed to editorial evaluation, and if so
+/// returns the `(command, execution_id)` pair to evaluate. Split out so the
+/// `editorial_controls` flag gate can be pinned by a unit test without
+/// standing up a full `ServerState`/DB.
+fn editorial_pretooluse_candidate<'a>(
+    flag_enabled: bool,
+    event: &'a crate::protocol::WorkerEvent,
+    run_id: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    use crate::protocol::WorkerEvent;
+
+    if !flag_enabled {
+        return None;
+    }
+
+    let WorkerEvent::PreToolUse {
+        tool_name, tool_input, ..
+    } = event
+    else {
+        return None;
+    };
+    if tool_name != "Bash" {
+        return None;
+    }
+    let command = tool_input.get("command").and_then(|v| v.as_str())?;
+
+    // Fast path: only evaluate commands that match the editorial hook's scope.
+    if !boss_engine_gh_invocation::is_editorial_candidate(command) {
+        return None;
+    }
+
+    let execution_id = run_id?;
+    Some((command, execution_id))
+}
+
 /// On every `PreToolUse` event whose tool is `Bash` and whose command
 /// matches `gh pr|issue {create,edit,comment,review}` (or `cube pr ensure`),
 /// evaluate the command against the product's editorial rules and write the
 /// decision to `editorial_actions`. Emits a `work_editorial_action` topic
 /// event so subscribers (bossctl, kanban) can observe decisions live.
+///
+/// Gated on the `editorial_controls` feature flag: this is the single
+/// choke-point call site [`crate::editorial_hook::evaluate_gh_pretooluse`]'s
+/// docs describe, so when the flag is off this function returns immediately
+/// and no `editorial_actions` row is written for the event.
 ///
 /// Fails open on every error: a DB failure, a missing execution row, or an
 /// unresolvable product are all logged and dropped. The editorial controls are
@@ -475,30 +665,14 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
     use boss_editorial::CompiledRules;
     use std::path::Path;
 
-    let WorkerEvent::PreToolUse {
-        tool_name, tool_input, ..
-    } = &incoming.event
-    else {
-        return;
-    };
-    if tool_name != "Bash" {
-        return;
-    }
-    let command = match tool_input.get("command").and_then(|v| v.as_str()) {
-        Some(c) => c,
-        None => return,
-    };
-
-    // Fast path: only evaluate commands that match the editorial hook's scope.
-    if !boss_engine_gh_invocation::is_editorial_candidate(command) {
-        return;
-    }
-
-    let Some(execution_id) = incoming.run_id.as_deref() else {
+    let Some((command, execution_id)) = editorial_pretooluse_candidate(
+        server_state.feature_flags.is_enabled("editorial_controls"),
+        &incoming.event,
+        incoming.run_id.as_deref(),
+    ) else {
         return;
     };
 
@@ -630,29 +804,251 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
         .await;
 }
 
-/// On `Stop` hook events, pop a pending probe for the run (if any)
-/// and `SendToPane` the text to the worker's slot. The injection
-/// arrives at the pane just as the worker becomes idle, so claude
+/// Resolve the driver's PR-URL capture feed for a completed tool observation.
+///
+/// Looks up the execution's driver slug and asks
+/// [`crate::driver::AgentDriver::pr_url_capture_feed`]. When the slug is
+/// unknown, unregistered, or the DB lookup fails, falls back to
+/// [`crate::driver::default_pr_url_capture_feed`] so Claude's historical
+/// object shape (and the Codex bare-string shape the default also
+/// understands) still capture — never poll GitHub for the branch's PR as
+/// a substitute.
+///
+/// Non-`Bash` tools never feed PR-URL capture under any current driver
+/// (the default feed and every override map command execution onto the
+/// Bash tool name). Return `None` before the DB/registry work so ordinary
+/// Read/Edit/etc. PostToolUse events do not pay a SQLite round-trip.
+fn pr_url_capture_feed_for_execution(
+    server_state: &ServerState,
+    execution_id: &str,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> Option<crate::driver::PrUrlCaptureFeed> {
+    use crate::driver::{DriverRegistry, default_pr_url_capture_feed};
+
+    // Hot-path filter: match `default_pr_url_capture_feed`'s Bash gate
+    // before any execution-row lookup. Capture outcomes are unchanged.
+    if tool_name != "Bash" {
+        return None;
+    }
+
+    let registry = DriverRegistry::default();
+    match server_state.work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => match registry.get(&slug) {
+            Some(driver) => driver.pr_url_capture_feed(tool_name, tool_input, tool_response),
+            None => default_pr_url_capture_feed(tool_name, tool_input, tool_response),
+        },
+        Ok(None) | Err(_) => default_pr_url_capture_feed(tool_name, tool_input, tool_response),
+    }
+}
+
+/// Given a driver already resolved for an execution, decide whether the
+/// degrade path applies and, if so, what its registered
+/// [`crate::driver::PostHocInterceptionFn`] (or the implicit `Accept` when
+/// none is registered) decided. Split out so this decision logic is
+/// unit-testable against [`boss_engine_driver::test_support::StubDriver`]
+/// without a DB or a `ServerState`.
+///
+/// Returns `None` when `driver`'s declared
+/// [`crate::driver::AbsenceDisposition`] for
+/// [`crate::driver::Capability::ToolUseInterception`] is not `Degrade` —
+/// i.e. the driver either provides real-time interception itself (Claude
+/// today) or has explicitly opted into `Refuse`/`Synthesize` for this
+/// capability via [`crate::driver::CapabilitySet::with_absence_override`].
+/// Either way this is not the degrade path and the caller must not log or
+/// act.
+fn post_hoc_interception_decision(
+    driver: &dyn crate::driver::AgentDriver,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> Option<crate::driver::PostHocInterceptionAction> {
+    use crate::driver::{AbsenceDisposition, Capability, PostHocInterceptionAction};
+
+    let caps = driver.capabilities();
+    if caps.provides(Capability::ToolUseInterception) {
+        return None;
+    }
+    if caps.absence_disposition(Capability::ToolUseInterception) != AbsenceDisposition::Degrade {
+        return None;
+    }
+    Some(match driver.post_hoc_interception() {
+        Some(f) => f(tool_name, tool_input, tool_response),
+        None => PostHocInterceptionAction::Accept,
+    })
+}
+
+/// On the `PostToolUse` boundary, apply the post-hoc fallback for any driver
+/// that landed on [`crate::driver::AbsenceDisposition::Degrade`] for
+/// [`crate::driver::Capability::ToolUseInterception`] — i.e. a driver with no
+/// real-time PreToolUse hook surface, so [`dispatch_editorial_on_pretooluse`]
+/// (which only ever fires on a `PreToolUse` event) and the Claude-only path
+/// guard, revision-PR guard, and checkleft push guard never ran for this
+/// tool call.
+///
+/// **This is not equivalent to pre-hoc interception.** The tool has already
+/// executed by the time this fires — a driver-registered
+/// [`crate::driver::PostHocInterceptionFn`] can only flag the artefact for
+/// follow-up, never prevent the call. Every degrade-path call logs a visible
+/// warning naming exactly what was skipped, whether or not the driver
+/// registers a fn, so "this worker ran without editorial/path/revision-PR/
+/// checkleft guards" is never silent (design: agent-driver absence-policy
+/// model).
+///
+/// A driver that *does* declare `ToolUseInterception` (Claude today) is
+/// untouched — this returns immediately for it, before any logging, so
+/// Claude's behaviour and log volume are unchanged.
+pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::driver::{DriverRegistry, PostHocInterceptionAction};
+    use crate::protocol::WorkerEvent;
+
+    let WorkerEvent::PostToolUse {
+        tool_name,
+        tool_input,
+        tool_response,
+        ..
+    } = &incoming.event
+    else {
+        return;
+    };
+    let Some(execution_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+
+    let driver_slug = match server_state.work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => slug,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(
+                execution_id,
+                ?err,
+                "post_hoc_interception: could not resolve execution's driver; skipping",
+            );
+            return;
+        }
+    };
+
+    let registry = DriverRegistry::default();
+    let Some(driver) = registry.get(&driver_slug) else {
+        // An unregistered slug (e.g. a task/product configured with a
+        // `driver` that has no `DriverRegistry` entry yet) is exactly the
+        // hookless-driver situation this dispatch exists to make non-silent:
+        // there is no driver instance to consult a PostHocInterceptionFn on,
+        // so the outcome is the implicit Accept, but the loss of guards is
+        // real and must be logged the same as the registered-but-hookless
+        // case below.
+        let message = "post_hoc_interception: driver slug is not registered in the DriverRegistry — this tool call \
+             ran WITHOUT editorial enforcement, the path guard, the revision-PR guard, and the checkleft \
+             push guard. No driver instance is available to run a post-hoc review, so the outcome is the \
+             implicit Accept. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver \
+             crate.";
+        if server_state.should_warn_post_hoc_interception_loss(execution_id) {
+            tracing::warn!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{message}");
+        } else {
+            tracing::debug!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{message}");
+        }
+        return;
+    };
+
+    let Some(action) = post_hoc_interception_decision(driver.as_ref(), tool_name, tool_input, tool_response) else {
+        // Driver declares real-time ToolUseInterception (Claude today):
+        // the path/revision-PR/checkleft guards and the editorial audit
+        // already ran for this exact call via the PreToolUse boundary — do
+        // not double-process it here, and do not change its behaviour.
+        return;
+    };
+
+    let loss_of_guards_message = "post_hoc_interception: driver has no real-time PreToolUse hook surface — this tool call ran \
+         WITHOUT editorial enforcement, the path guard, the revision-PR guard, and the checkleft push \
+         guard. Post-hoc review can only detect problems after the tool already ran; it cannot prevent \
+         the call. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver crate.";
+    if server_state.should_warn_post_hoc_interception_loss(execution_id) {
+        tracing::warn!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{loss_of_guards_message}");
+    } else {
+        tracing::debug!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{loss_of_guards_message}");
+    }
+
+    match action {
+        PostHocInterceptionAction::Accept => {
+            tracing::debug!(
+                execution_id,
+                driver = %driver_slug,
+                tool_name = %tool_name,
+                "post_hoc_interception: driver's post-hoc adapter accepted the tool output",
+            );
+        }
+        PostHocInterceptionAction::RequestEdit { reason } => {
+            tracing::warn!(
+                execution_id,
+                driver = %driver_slug,
+                tool_name = %tool_name,
+                reason = %reason,
+                "post_hoc_interception: driver's post-hoc adapter flagged this tool output for \
+                 revision — the underlying command has already run and cannot be undone; this is a \
+                 detect-after-the-fact signal, not an enforced block",
+            );
+        }
+    }
+}
+
+/// On the driver's turn boundary, pop a pending probe for the run (if
+/// any) and `SendToPane` the text to the worker's slot. The injection
+/// arrives at the pane just as the worker becomes idle, so the agent
 /// treats it as the next user prompt. After a successful dispatch,
 /// records an in-flight entry (with the transcript path and current
 /// byte offset) so `dispatch_probe_reply_on_stop` can emit the
-/// matching `FrontendEvent::ProbeReplied` when the next Stop lands.
+/// matching `FrontendEvent::ProbeReplied` when the next boundary lands.
+///
+/// **Activity guard (fail closed):** same predicate as
+/// [`ServerState::inject_pane_text_verified`] /
+/// [`dispatch_probe_if_idle`]. After a production Stop fan-out the
+/// live activity is normally Idle / WaitingForInput, so the write
+/// proceeds. Missing live state or a non-accepting activity refuses
+/// the write and re-queues the probe — never fail-open into a
+/// non-consuming foreground process.
 pub(super) async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::{EngineToAppRequest, SendToPaneInput, WorkerEvent};
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    use crate::protocol::{EngineToAppRequest, SendToPaneInput};
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    let Some(probe) = server_state.pop_pending_probe(run_id) else {
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        // Leave queued probes alone — no slot means we cannot deliver
+        // and must not drop them by popping.
+        if server_state
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|q| !q.is_empty())
+        {
+            tracing::warn!(run_id, "probe ready but no slot mapping; leaving probe queued");
+        }
         return;
     };
-    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(run_id, "probe ready but no slot mapping; dropping probe text",);
+    // Fail closed before pop: missing live state / non-accepting
+    // activity must not write bytes to the pane.
+    if !server_state.pane_accepts_typed_input(slot_id) {
+        tracing::warn!(
+            run_id,
+            slot_id,
+            activity = server_state
+                .pane_typed_input_activity(slot_id)
+                .map(boss_protocol::WorkerActivity::as_str),
+            "probe on Stop refused: worker not accepting typed input; leaving probe queued",
+        );
+        return;
+    }
+    let Some(probe) = server_state.pop_pending_probe(run_id) else {
         return;
     };
     // Capture the transcript path + current byte length *before* the
@@ -677,7 +1073,8 @@ pub(super) async fn dispatch_probe_on_stop(
             // mechanism has always trusted (unlike the urgent
             // mid-turn path), so a successful SendToPane here is
             // treated as consumed rather than left pending
-            // confirmation.
+            // confirmation. Activity guard already confirmed the
+            // pane accepts typed input.
             server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
@@ -708,19 +1105,26 @@ pub(super) async fn dispatch_probe_on_stop(
 const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// On the `PostToolUse` boundary, check whether the front probe in the
-/// per-run queue is urgent. If so, pop it and dispatch it immediately
-/// via `SendToPane`, prefixing the text with `[coordinator-nudge]` so
-/// the worker and human readers can identify coordinator-injected
-/// urgent text. The tool call has already completed at this point, so
-/// no in-flight Bash is cancelled.
+/// per-run queue is urgent. If so, pop it and attempt an immediate
+/// verified pane write (prefixed with `[coordinator-nudge]`). The tool
+/// call has already completed at this point, so no in-flight Bash is
+/// cancelled.
 ///
-/// The write is not trusted just because `SendToPane` returned Ok: it
-/// lands while the worker is actively mid-turn, which races the CLI's
-/// TUI input handling (the probe-6 incident). This waits for
-/// confirmation — a matching `UserPromptSubmit` hook, or a transcript
-/// scan — before declaring success. On a transport/app-level failure
-/// the probe is pushed back to the front so the next `PostToolUse`
-/// retries with the same id.
+/// **Activity short-circuit (before pop):** mirrors
+/// [`dispatch_probe_if_idle`]. Production ordering is load-bearing:
+/// `dispatch_live_worker_state` applies `PostToolUse` first and forces
+/// activity to `Working`, so a mid-turn pane inject is *expected* to
+/// defer. We therefore leave the probe queued without popping when
+/// the slot is not accepting typed input, and treat that deferral as
+/// normal (no `ProbeDeliveryEscalated` per tool — multi-tool turns
+/// would otherwise spam once per `PostToolUse`). Delivery happens at
+/// the next Stop boundary via [`dispatch_probe_on_stop`].
+///
+/// When the guard passes, the write is not trusted just because
+/// `SendToPane` returned Ok: confirmation still requires a matching
+/// `UserPromptSubmit` hook or a transcript scan (probe-6). On a
+/// transport/app-level failure the probe is pushed back to the front
+/// so a later retry keeps the same id.
 ///
 /// On an *unconfirmed* write, the corrected understanding of the
 /// probe-6 incident (2026-07-13) is that the text likely still reached
@@ -747,7 +1151,46 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    // Peek at the front probe and pop it only if it's urgent.
+
+    // Fast no-op when nothing is queued for this run.
+    {
+        let guard = server_state
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned");
+        let Some(queue) = guard.get(run_id) else {
+            return;
+        };
+        if !queue.front().map(|p| p.urgent).unwrap_or(false) {
+            return;
+        }
+    }
+
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        // Leave the urgent probe queued — a later PostToolUse / Stop
+        // after slot registration can still deliver it.
+        tracing::debug!(run_id, "urgent probe ready but no slot mapping; leaving queued");
+        return;
+    };
+
+    // Short-circuit *before* pop when the pane is not accepting typed
+    // input (mirror `dispatch_probe_if_idle`). Production fan-out
+    // applies PostToolUse → Working first, so this is the common path
+    // for mid-turn urgent probes: defer silently to Stop, do not
+    // escalate once per tool call.
+    if !server_state.pane_accepts_typed_input(slot_id) {
+        tracing::debug!(
+            run_id,
+            slot_id,
+            activity = server_state
+                .pane_typed_input_activity(slot_id)
+                .map(boss_protocol::WorkerActivity::as_str),
+            "urgent probe deferred: worker not accepting typed input; remains queued for Stop",
+        );
+        return;
+    }
+
+    // Peek confirmed urgent and guard passed — now pop for inject.
     // The lock must be released before any async call.
     let probe = {
         let mut guard = server_state
@@ -766,13 +1209,12 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
         }
         probe
     };
-    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
-        tracing::warn!(run_id, "urgent probe ready but no slot mapping; dropping probe",);
-        return;
-    };
     let (transcript_path, offset_bytes) = transcript_offset_for_run(server_state, run_id).await;
     let marked_text = format!("[coordinator-nudge] {}", probe.text);
     let probe_id = probe.probe_id.clone();
+    // Lifecycle `Injected` only after the activity guard has passed
+    // (and we are about to write). A pre-pop short-circuit above
+    // leaves the probe at `Queued`.
     server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Injected);
     match server_state
         .inject_pane_text_verified(
@@ -824,6 +1266,20 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 )
                 .await;
         }
+        PaneInjectOutcome::NotAcceptingInput { activity } => {
+            // Race: activity flipped after the pre-pop check. Leave
+            // the probe queued for Stop; this is still expected
+            // mid-turn deferral, not a delivery escalation.
+            tracing::debug!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                activity = activity.map(boss_protocol::WorkerActivity::as_str),
+                "urgent probe refused after pop (activity race); re-queuing for Stop boundary",
+            );
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.requeue_probe_front(run_id.to_owned(), probe);
+        }
         PaneInjectOutcome::SendFailed(failure) => {
             tracing::warn!(
                 ?failure,
@@ -863,23 +1319,23 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
 /// emit `ProbeReplied` when the worker responds.
 pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_id: &str) {
     use crate::protocol::{EngineToAppRequest, SendToPaneInput};
-    use boss_protocol::WorkerActivity;
 
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.
         tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
         return;
     };
-    let is_parked = server_state
-        .live_worker_states
-        .get(slot_id)
-        .map(|s| matches!(s.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput))
-        .unwrap_or(false);
-    if !is_parked {
+    // Same activity predicate as `inject_pane_text_verified`: only
+    // Idle / WaitingForInput accept typed input. Working / Spawning /
+    // terminal / missing live state leave the probe queued for Stop.
+    if !server_state.pane_accepts_typed_input(slot_id) {
         tracing::debug!(
             run_id,
             slot_id,
-            "probe-if-idle: worker not parked; probe will fire at next Stop",
+            activity = server_state
+                .pane_typed_input_activity(slot_id)
+                .map(boss_protocol::WorkerActivity::as_str),
+            "probe-if-idle: worker not accepting typed input; probe will fire at next Stop",
         );
         return;
     }
@@ -963,20 +1419,19 @@ pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id
     (Some(path_str), offset)
 }
 
-/// On the `Stop` boundary that follows a probe dispatch, take the
-/// in-flight entry for `run_id`, read transcript bytes written since
+/// On the driver's turn boundary that follows a probe dispatch, take
+/// the in-flight entry for `run_id`, read transcript bytes written since
 /// dispatch, and emit `FrontendEvent::ProbeReplied` on the per-run
-/// probe topic. Idempotent: a duplicate Stop with no in-flight
+/// probe topic. Idempotent: a duplicate boundary with no in-flight
 /// probe is a no-op, so observers never see the same `probe_id`
 /// reported twice.
 pub(super) async fn dispatch_probe_reply_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
@@ -1113,27 +1568,38 @@ pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
     latest
 }
 
-/// On `Stop` hook events, ask the completion handler whether the
-/// worker has produced a PR for its workspace branch. If so, the
+/// On the driver's turn boundary, ask the completion handler whether
+/// the worker has produced a PR for its workspace branch. If so, the
 /// linked task/chore moves to `in_review`, the execution finalises,
 /// and the cube workspace is released. If not, an `awaiting_input`
 /// signal is published for the execution topic so the pane indicator
 /// can reflect that the worker is idle without losing the active
 /// kanban state.
 ///
+/// This is the gate the whole completion subsystem hangs off — PR-URL
+/// capture, the Doing→Review transition, nudge/probe routing,
+/// effort-escalation parsing. It opens on
+/// [`crate::events_socket::IncomingHookEvent::is_turn_boundary`], the
+/// signal the run's driver produced through
+/// [`crate::driver::AgentDriver::turn_boundary`], rather than on the
+/// `WorkerEvent::Stop` variant that only exists because Claude Code fires
+/// a `Stop` hook. For Claude the two coincide exactly, so behaviour is
+/// unchanged; for a driver whose turn ends some other way, completion
+/// now follows the driver instead of needing a Claude-shaped event to
+/// impersonate.
+///
 /// Runs **before** `dispatch_probe_on_stop` in the event loop so that
 /// probes the completion handler queues (e.g. `PROBE_NO_PR`) are
-/// visible when probe dispatch fires on the same Stop boundary — if
-/// completion ran after, those probes would stall until the next Stop
-/// (which never arrives for a worker that is already idle).
+/// visible when probe dispatch fires on the same boundary — if
+/// completion ran after, those probes would stall until the next
+/// boundary (which never arrives for a worker that is already idle).
 pub(super) async fn dispatch_completion_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
@@ -1144,4 +1610,170 @@ pub(super) async fn dispatch_completion_on_stop(
     // zero log evidence because this was at debug — operators saw
     // `activity=idle` workers but no record of what `on_stop` returned.
     tracing::info!(run_id, ?outcome, "completion handler stop result");
+}
+
+#[cfg(test)]
+mod editorial_gate_tests {
+    use super::editorial_pretooluse_candidate;
+    use crate::protocol::WorkerEvent;
+    use serde_json::json;
+
+    fn gh_pretooluse_event() -> WorkerEvent {
+        WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({ "command": "gh pr create --title t --body b" }),
+        }
+    }
+
+    #[test]
+    fn flag_off_skips_even_a_matching_gh_command() {
+        let event = gh_pretooluse_event();
+        assert_eq!(editorial_pretooluse_candidate(false, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_matching_bash_gh_command_is_a_candidate() {
+        let event = gh_pretooluse_event();
+        assert_eq!(
+            editorial_pretooluse_candidate(true, &event, Some("exec_1")),
+            Some(("gh pr create --title t --body b", "exec_1"))
+        );
+    }
+
+    #[test]
+    fn flag_on_non_bash_tool_is_skipped() {
+        let event = WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Read".to_string(),
+            tool_input: json!({ "command": "gh pr create --title t --body b" }),
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_non_editorial_command_is_skipped() {
+        let event = WorkerEvent::PreToolUse {
+            session_id: "sess-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: json!({ "command": "ls -la" }),
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+
+    #[test]
+    fn flag_on_missing_run_id_is_skipped() {
+        let event = gh_pretooluse_event();
+        assert_eq!(editorial_pretooluse_candidate(true, &event, None), None);
+    }
+
+    #[test]
+    fn flag_on_non_pretooluse_event_is_skipped() {
+        let event = WorkerEvent::Stop {
+            session_id: "sess-1".to_string(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        };
+        assert_eq!(editorial_pretooluse_candidate(true, &event, Some("exec_1")), None);
+    }
+}
+
+#[cfg(test)]
+mod post_hoc_interception_decision_tests {
+    use super::post_hoc_interception_decision;
+    use crate::driver::test_support::StubDriver;
+    use crate::driver::{
+        AbsenceDisposition, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PostHocInterceptionAction,
+    };
+    use serde_json::json;
+
+    fn descriptor(name: &'static str) -> DriverDescriptor {
+        DriverDescriptor {
+            name,
+            label: name,
+            binary: name,
+            config_dir: ".stub",
+            agent_rules_filename: "AGENTS.md",
+            initial_prompt_filename: "initial-prompt.txt",
+            model_menu: ModelMenu {
+                engine_default: "stub-model",
+                effort_value_for_level: |_| None,
+                default_model_for_level: |_| "stub-model",
+                model_for_reasoning: |_| "stub-model",
+                prompt_addendum_for_level: |_| None,
+                model_requires_auto_permissions: |_| false,
+            },
+        }
+    }
+
+    fn always_request_edit(
+        _tool_name: &str,
+        _tool_input: &serde_json::Value,
+        _tool_output: &serde_json::Value,
+    ) -> PostHocInterceptionAction {
+        PostHocInterceptionAction::RequestEdit {
+            reason: "flagged by fixture".to_owned(),
+        }
+    }
+
+    /// A driver that declares real-time ToolUseInterception (Claude today)
+    /// never reaches the degrade path — the caller must not log or act.
+    #[test]
+    fn driver_with_tool_use_interception_is_not_applicable() {
+        let driver = StubDriver::new(
+            descriptor("claude-like"),
+            CapabilitySet::new([Capability::ToolUseInterception]),
+        );
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, None);
+    }
+
+    /// A driver without ToolUseInterception and no registered post-hoc fn
+    /// still hits the degrade path — the implicit decision is `Accept` (the
+    /// caller logs the loss-of-guards warning regardless).
+    #[test]
+    fn degraded_driver_without_registered_fn_implicitly_accepts() {
+        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]));
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, Some(PostHocInterceptionAction::Accept));
+    }
+
+    /// A degraded driver's registered fn is actually called, and its
+    /// decision passed through verbatim.
+    #[test]
+    fn degraded_driver_with_registered_fn_returns_its_decision() {
+        let driver = StubDriver::new(descriptor("hookless"), CapabilitySet::new([]))
+            .with_post_hoc_interception(always_request_edit);
+        let outcome = post_hoc_interception_decision(
+            &driver,
+            "Bash",
+            &json!({"command": "rm -rf /"}),
+            &json!({"output": "ok"}),
+        );
+        assert_eq!(
+            outcome,
+            Some(PostHocInterceptionAction::RequestEdit {
+                reason: "flagged by fixture".to_owned(),
+            }),
+        );
+    }
+
+    /// A driver that does not provide ToolUseInterception but has
+    /// explicitly overridden its absence disposition to `Refuse` (rather
+    /// than the `Degrade` default) must not be routed through the degrade
+    /// path — dispatch is expected to have refused this driver before any
+    /// tool call could run, so treating it as "degraded" here would be
+    /// logged as if it were silently accepting reduced fidelity when its
+    /// declared policy is the opposite.
+    #[test]
+    fn driver_with_refuse_override_is_not_applicable() {
+        let caps =
+            CapabilitySet::new([]).with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
+        let driver = StubDriver::new(descriptor("refuses-without-interception"), caps);
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, None);
+    }
 }

@@ -13,10 +13,11 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::{AgentDriver, TurnEnd};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -41,19 +42,83 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// payload, which the event-shim embeds whenever `BOSS_RUN_ID` is set
 /// in its environment. The worker-spawn flow always sets this.
 ///
-/// `transcript_path` is the verbatim `transcript_path` field claude
-/// stamps on every hook payload — `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`.
-/// We surface it here so the engine can persist it on `WorkRun` the
-/// first time we see it; the live-status summarizer loop reads that
-/// row to know which file to tail. Without this, `transcript_path`
-/// stays NULL forever and the summarizer never gets past its
-/// "no transcript path yet" early-out.
+/// `transcript_path` comes from the run's driver via
+/// [`crate::driver::AgentDriver::transcript_path_for_session`] (the Claude
+/// driver reads its `transcript_path` field, stamped on every hook payload
+/// as `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`). We surface it
+/// here so the engine can persist it on `WorkRun` the first time we see it;
+/// the live-status summarizer loop reads that row to know which file to
+/// tail. Without this, `transcript_path` stays NULL forever and the
+/// summarizer never gets past its "no transcript path yet" early-out.
+///
+/// The turn boundary (`Capability::TurnBoundary`) is resolved here too, once,
+/// by asking the run's driver whether the decoded event ends a turn — see
+/// [`Self::resolve`]. Every downstream turn-boundary consumer reads
+/// [`Self::turn_boundary`] instead of matching [`WorkerEvent::Stop`], so
+/// "what counts as a turn ending" is the driver's answer rather than a
+/// Claude-shaped assumption baked into the dispatchers.
 #[derive(Debug, Clone)]
 pub struct IncomingHookEvent {
     pub peer_pid: Option<libc::pid_t>,
     pub run_id: Option<String>,
     pub transcript_path: Option<String>,
     pub event: WorkerEvent,
+    /// Deliberately private: the only way to populate it is [`Self::resolve`],
+    /// which derives it from a driver. A boundary that could be hand-set at a
+    /// construction site is a boundary the driver seam does not actually own.
+    turn_boundary: Option<TurnEnd>,
+}
+
+impl IncomingHookEvent {
+    /// Build an ingress event, resolving `event`'s turn boundary through
+    /// `driver`.
+    ///
+    /// This is the single point where a turn boundary enters the engine. The
+    /// hook-callback ingress ([`handle_connection`]) calls it with the
+    /// resolved hook-callback driver; a future stdout-JSONL reader (Codex,
+    /// whose boundary is a native `turn.completed` event) calls it with its
+    /// own driver and reaches the same consumers with no further plumbing.
+    pub fn resolve(
+        driver: &dyn AgentDriver,
+        event: WorkerEvent,
+        run_id: Option<String>,
+        transcript_path: Option<String>,
+        peer_pid: Option<libc::pid_t>,
+    ) -> Self {
+        let turn_boundary = driver.turn_boundary(&event);
+        Self {
+            peer_pid,
+            run_id,
+            transcript_path,
+            event,
+            turn_boundary,
+        }
+    }
+
+    /// The driver-supplied turn-ended signal for this event, or `None` when
+    /// the driver does not consider it a turn boundary.
+    pub fn turn_boundary(&self) -> Option<&TurnEnd> {
+        self.turn_boundary.as_ref()
+    }
+
+    /// Whether this event ends a worker turn, per its driver. The gate every
+    /// on-turn-boundary dispatcher opens with.
+    pub fn is_turn_boundary(&self) -> bool {
+        self.turn_boundary.is_some()
+    }
+
+    /// Test-only shorthand for [`Self::resolve`] against the engine's default
+    /// hook-callback driver — the same one the production accept loop
+    /// resolves via [`crate::driver::DriverRegistry`] — with no peer pid.
+    /// Tests that need a *different* driver's boundary (or its absence)
+    /// call `resolve` directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(event: WorkerEvent, run_id: Option<String>, transcript_path: Option<String>) -> Self {
+        let driver = crate::driver::DriverRegistry::default()
+            .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+            .expect("engine default driver is always registered");
+        Self::resolve(driver.as_ref(), event, run_id, transcript_path, None)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -225,7 +290,15 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// the worker's env). Every production event connection should carry
 /// this field. If missing, a warning is logged but the event is
 /// returned with `run_id: None`.
-pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, SocketError> {
+///
+/// This socket is inherently a [`crate::driver::ProgressIngress::HookCallback`]
+/// ingress — a `StdoutJsonl` driver never connects to it — but `driver` is
+/// still an injected parameter rather than a hardcoded `ClaudeDriver`
+/// reference: the caller resolves it via [`crate::driver::DriverRegistry`],
+/// so a second hook-callback driver (or per-run resolution once the dispatch
+/// gate selects a driver per run) only requires changing the caller's
+/// resolution, not this function.
+pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -238,20 +311,68 @@ pub async fn handle_connection(stream: UnixStream) -> Result<IncomingHookEvent, 
     } else {
         payload_run_id
     };
-    let transcript_path = extract_transcript_path_from_payload(&raw);
-    // Decode through the Claude driver's ProgressObservation capability: the
-    // raw hook payload becomes a typed `WorkerEvent`. The engine is
-    // Claude-default today; once the dispatch gate selects a driver per run
-    // (design Depth 3), this picks the run's driver instead of hardcoding
-    // `ClaudeDriver`. The decoded event drives the (driver-agnostic) activity
-    // machine downstream, unchanged.
-    let event = ClaudeDriver.normalize_progress_event(&raw)?;
-    Ok(IncomingHookEvent {
-        peer_pid: peer_pid_value,
+    // Decode through the driver's ProgressObservation and TranscriptAccess
+    // capabilities. The decoded event drives the (driver-agnostic) activity
+    // machine downstream, unchanged. `resolve` additionally asks the driver's
+    // TurnBoundary capability whether this event ends a turn, so the
+    // dispatchers never have to re-derive that from the event's shape.
+    let transcript_path = driver.transcript_path_for_session(&raw);
+    let event = driver.normalize_progress_event(&raw)?;
+    Ok(IncomingHookEvent::resolve(
+        driver,
+        event,
         run_id,
         transcript_path,
-        event,
-    })
+        peer_pid_value,
+    ))
+}
+
+/// Publish the two event-bus transitions this hook-ingress path can
+/// observe directly, per the event-bus design doc's taxonomy
+/// (`tools/boss/docs/designs/engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`).
+/// No subscribers are wired up yet — this only stages the publishers so a
+/// later PR can land `stranded_answering_sweep` / `transient_recovery` as
+/// thin subscribers without touching this ingress path again.
+///
+/// Events are hints, not commands: a subscriber always re-reads
+/// authoritative DB state before acting (e.g. whether this run's
+/// execution is actually a live `answer_agent` with a pending question),
+/// so publishing on a run this ingress can't fully classify is harmless
+/// — the eventual subscriber's own check no-ops on a false positive.
+///
+/// - [`Event::TransientErrorIdle`]: published on the driver's turn
+///   boundary when the transcript's last meaningful entry is a trailing
+///   API error — the same ground truth [`crate::transient_recovery`]'s
+///   sweep already trusts, just checked immediately instead of waiting
+///   for the next 60s pass.
+/// - [`Event::AnswerAgentDied`]: published on `SessionEnd`, the only
+///   hook that fires when a worker's session terminates. This does not
+///   cover a hard pane kill (no hook fires at all in that case) — that
+///   case has no in-process event and stays reliant on
+///   `stranded_answering_sweep`'s DB-driven backstop, unchanged.
+///   `SessionEnd` is a process boundary, not a turn boundary, so it stays
+///   an event-shape match.
+pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHookEvent) {
+    let Some(execution_id) = incoming.run_id.clone() else {
+        return;
+    };
+    if incoming.is_turn_boundary() {
+        let Some(transcript_path) = incoming.transcript_path.as_deref() else {
+            return;
+        };
+        let lines = crate::transient_recovery::read_transcript_tail(
+            transcript_path,
+            crate::transient_recovery::TRANSCRIPT_TAIL_MAX_BYTES,
+        )
+        .await;
+        if crate::transient_error::extract_worker_error(&lines).is_some() {
+            bus.publish(Event::TransientErrorIdle { execution_id });
+        }
+        return;
+    }
+    if let WorkerEvent::SessionEnd { .. } = &incoming.event {
+        bus.publish(Event::AnswerAgentDied { execution_id });
+    }
 }
 
 /// Pull `_boss_run_id` out of the raw hook payload if the shim
@@ -262,20 +383,10 @@ fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_owned()) }
 }
 
-/// Pull `transcript_path` out of the raw hook payload. Claude stamps
-/// the absolute path to the session's JSONL transcript on every hook
-/// payload it emits; the boss-event shim forwards the payload
-/// unchanged, so we read the field straight off the wire. Empty
-/// strings are treated as missing so we never persist a path that
-/// `tokio::fs::File::open` would reject anyway.
-fn extract_transcript_path_from_payload(raw: &serde_json::Value) -> Option<String> {
-    let s = raw.get("transcript_path")?.as_str()?;
-    if s.is_empty() { None } else { Some(s.to_owned()) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::ClaudeDriver;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -459,7 +570,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client_task.await.unwrap();
 
         match incoming.event {
@@ -492,7 +603,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(
@@ -521,7 +632,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -550,7 +661,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert!(incoming.transcript_path.is_none());
@@ -576,7 +687,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
@@ -603,7 +714,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream).await.unwrap();
+        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
         assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
 
         close_tx.send(()).ok();
@@ -625,7 +736,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream).await;
+        let result = handle_connection(stream, &ClaudeDriver).await;
         client.await.unwrap();
 
         match result {
@@ -650,7 +761,7 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream).await;
+        let result = handle_connection(stream, &ClaudeDriver).await;
         client.await.unwrap();
 
         match result {
@@ -690,5 +801,190 @@ mod tests {
         // Release the client.
         close_tx.send(()).ok();
         client.join().unwrap();
+    }
+
+    // ─── publish_hook_derived_events ───────────────────────────────────
+
+    fn incoming_stop(run_id: &str, transcript_path: Option<&str>) -> IncomingHookEvent {
+        IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
+                session_id: "s".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            },
+            Some(run_id.to_owned()),
+            transcript_path.map(str::to_owned),
+        )
+    }
+
+    fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> String {
+        use std::io::Write;
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{line}").unwrap();
+        }
+        path.to_string_lossy().into_owned()
+    }
+
+    const NORMAL_LINE: &str =
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working"}]}}"#;
+    const API_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: The socket connection was closed unexpectedly."}]}}"#;
+
+    #[tokio::test]
+    async fn stop_with_trailing_api_error_publishes_transient_error_idle() {
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, API_ERROR_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+
+        let event = sub.recv().await.expect("event published");
+        assert_eq!(
+            event,
+            Event::TransientErrorIdle {
+                execution_id: "exec-1".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_no_trailing_error_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", Some(&transcript))).await;
+
+        // Publish an unrelated event so the assertion below can distinguish
+        // "nothing published" from "recv would hang forever".
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(
+            event,
+            Event::DispatchReady,
+            "no TransientErrorIdle should have been published"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_with_no_transcript_path_publishes_nothing() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        publish_hook_derived_events(&bus, &incoming_stop("exec-1", None)).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
+    }
+
+    #[tokio::test]
+    async fn session_end_publishes_answer_agent_died() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::SessionEnd {
+                session_id: "s".to_owned(),
+                reason: "exit".to_owned(),
+            },
+            Some("exec-2".to_owned()),
+            None,
+        );
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        let event = sub.recv().await.expect("event published");
+        assert_eq!(
+            event,
+            Event::AnswerAgentDied {
+                execution_id: "exec-2".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_run_id_publishes_nothing() {
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::SessionEnd {
+                session_id: "s".to_owned(),
+                reason: "exit".to_owned(),
+            },
+            None,
+            None,
+        );
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
+    }
+
+    // ─── turn boundary (Capability::TurnBoundary) ──────────────────────
+
+    #[tokio::test]
+    async fn ingress_resolves_the_turn_boundary_through_the_driver() {
+        // The whole point of the seam: the boundary on the ingress event is
+        // whatever the driver said, carried alongside the decoded event.
+        let stop = incoming_stop("exec-1", None);
+        let end = stop.turn_boundary().expect("Claude's Stop is a turn boundary");
+        assert_eq!(end.session_id, "s");
+        assert!(!end.continuation);
+        assert!(stop.is_turn_boundary());
+    }
+
+    #[tokio::test]
+    async fn ingress_reports_no_boundary_for_a_mid_turn_event() {
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            Some("exec-1".to_owned()),
+            None,
+        );
+        assert!(!incoming.is_turn_boundary());
+        assert!(incoming.turn_boundary().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_declares_no_boundary_suppresses_the_transient_error_publish() {
+        // A `Stop`-shaped event from a driver that does not call it a turn
+        // boundary must not open the on-turn-boundary path. This is the
+        // behaviour a hardcoded `WorkerEvent::Stop` match could not express.
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, API_ERROR_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        let boundaryless = crate::driver::test_support::StubDriver::new(
+            crate::driver::test_support::stub_descriptor(),
+            crate::driver::CapabilitySet::new([]),
+        );
+        let incoming = IncomingHookEvent::resolve(
+            &boundaryless,
+            WorkerEvent::Stop {
+                session_id: "s".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            },
+            Some("exec-1".to_owned()),
+            Some(transcript),
+            None,
+        );
+        assert!(!incoming.is_turn_boundary());
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
     }
 }

@@ -1,0 +1,23 @@
+master_fd=4 slave=/dev/ttys009
+child_pid=21773
+injecting via master: b'echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt\n'
+child exited status=0
+owner done
+shell_pid: '21773\n'
+tty: '/dev/ttys009\n'
+codex_exit: '0\n'
+shell_got_line: 'echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt\n'
+injected_side_effect: 'INJECTED_VIA_MASTER\n'
+eval_exit: '0\n'
+finished: 'Sun Jul 26 03:44:27 PDT 2026\n'
+master_capture bytes: 898
+--- master capture tail ---
+{"type":"thread.started","thread_id":"019f9e06-5428-7a30-aaf1-9bc86ed996a1"}
+{"type":"turn.started"}
+echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Running the requested command."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 18'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 18'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"pty-owner-done"}}
+{"type":"turn.completed","usage":{"input_tokens":49770,"cached_input_tokens":43264,"cache_write_input_tokens":0,"output_tokens":244,"reasoning_output_tokens":124}}
+

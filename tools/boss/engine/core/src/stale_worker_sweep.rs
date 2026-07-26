@@ -54,6 +54,36 @@
 //!
 //! Runs every 60 seconds and fires once immediately on boot (same
 //! pattern as [`crate::dead_pid_sweep`] / [`crate::orphan_sweep`]).
+//!
+//! ## Non-`Rich`-tier drivers (stdout-JSONL, minimal-tier)
+//!
+//! The algorithm above judges staleness purely on hook/event cadence
+//! (`last_event_at`) plus the `current_tool.is_some()` guard. Both of
+//! those assume the driver reports a start/end boundary around every
+//! tool call — true for Claude's hooks, and true for a driver whose
+//! stdout-JSONL stream carries the same per-tool resolution (Codex's
+//! `item.started`/`item.completed`, verified live in
+//! `docs/investigations/codex-progress-channel-decision-2026-07-24.md`).
+//! Such a driver declares [`boss_engine_driver::ProgressFidelity::Rich`]
+//! and gets judged by this sweep exactly like Claude, unchanged.
+//!
+//! A driver that reports only turn boundaries
+//! ([`boss_engine_driver::ProgressFidelity::Coarse`]) or nothing at all
+//! beyond process liveness
+//! ([`boss_engine_driver::ProgressFidelity::Minimal`]) has no per-tool
+//! event to set `current_tool`, so a legitimately-busy worker deep in one
+//! long turn would look identical to a hung one under cadence alone —
+//! misfiring "too eager" in exactly the way this sweep must not (see
+//! [`crate::live_worker_state::LiveWorkerStateRegistry::progress_fidelity_for_slot`]
+//! and [`boss_engine_driver::ProgressFidelity::stale_threshold_secs`] for
+//! the full reasoning). Rather than guess a per-tier threshold, both
+//! tiers are exempted from cadence-based staleness here entirely —
+//! `fidelity_exempt_skipped` below counts them. This is not "no backstop
+//! at all": [`crate::dead_pid_sweep`] still reaps a slot whose OS process
+//! has actually exited; what a `Coarse`/`Minimal` slot loses is *this*
+//! sweep's live-but-wedged detection, a gap the design doc's risk
+//! register already named and accepted pending a future liveness-only
+//! sweep for those tiers.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +92,7 @@ use boss_protocol::WorkerActivity;
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::hold_registry::HoldRegistry;
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
 
@@ -115,6 +146,15 @@ pub struct StaleWorkerSweepOutcome {
     /// execution's own `started_at` — a mis-attributed event from a
     /// recycled slot (the false-positive cancel guard, defect 1).
     pub pre_start_event_skipped: usize,
+    /// Slots skipped because the driver's declared
+    /// [`boss_engine_driver::ProgressFidelity`] tier has no cadence-based
+    /// staleness threshold ([`Coarse`](boss_engine_driver::ProgressFidelity::Coarse)
+    /// / [`Minimal`](boss_engine_driver::ProgressFidelity::Minimal)) — see
+    /// the module doc's "Non-`Rich`-tier drivers" section.
+    pub fidelity_exempt_skipped: usize,
+    /// Slots skipped because an operator placed an explicit hold on the
+    /// execution via `bossctl agents hold` (see [`crate::hold_registry`]).
+    pub held_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
@@ -128,29 +168,51 @@ impl crate::sweep_loop::SweepOutcome for StaleWorkerSweepOutcome {
             fresh_skipped = self.fresh_skipped,
             tool_in_flight_skipped = self.tool_in_flight_skipped,
             grace_skipped = self.grace_skipped,
+            fidelity_exempt_skipped = self.fidelity_exempt_skipped,
+            held_skipped = self.held_skipped,
             "stale-worker sweep: pass complete",
         );
     }
+}
+
+/// Shared-ownership collaborators [`spawn_loop`] clones into each pass.
+/// Bundled into one struct (rather than six positional `Arc` parameters)
+/// to keep `spawn_loop` under clippy's argument-count lint once the
+/// operator-hold registry joined the sweep's dependencies.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub struct StaleWorkerSweepDeps {
+    pub work_db: Arc<WorkDb>,
+    pub live_states: Arc<LiveWorkerStateRegistry>,
+    pub coordinator: Arc<ExecutionCoordinator>,
+    pub dispatch_events: Arc<dyn DispatchEventSink>,
+    pub reaper: Arc<dyn StaleWorkerReaper>,
+    pub hold_registry: Arc<HoldRegistry>,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so a worker that wedged before the engine
 /// restarted is recovered at boot without waiting for the first interval.
 pub fn spawn_loop(
-    work_db: Arc<WorkDb>,
-    live_states: Arc<LiveWorkerStateRegistry>,
-    coordinator: Arc<ExecutionCoordinator>,
-    dispatch_events: Arc<dyn DispatchEventSink>,
-    reaper: Arc<dyn StaleWorkerReaper>,
+    deps: StaleWorkerSweepDeps,
     interval: Duration,
     stale_threshold_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
+    let StaleWorkerSweepDeps {
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        reaper,
+        hold_registry,
+    } = deps;
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
         let dispatch_events = Arc::clone(&dispatch_events);
         let reaper = Arc::clone(&reaper);
+        let hold_registry = Arc::clone(&hold_registry);
         async move {
             run_one_pass(
                 work_db.as_ref(),
@@ -158,6 +220,7 @@ pub fn spawn_loop(
                 coordinator.clone(),
                 dispatch_events.as_ref(),
                 reaper.as_ref(),
+                hold_registry.as_ref(),
                 stale_threshold_secs,
             )
             .await
@@ -177,6 +240,7 @@ pub async fn run_one_pass(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
     reaper: &dyn StaleWorkerReaper,
+    hold_registry: &HoldRegistry,
     stale_threshold_secs: i64,
 ) -> StaleWorkerSweepOutcome {
     let mut outcome = StaleWorkerSweepOutcome::default();
@@ -184,13 +248,18 @@ pub async fn run_one_pass(
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - STALE_GRACE_SECS;
-    // Build the staleness cutoff as a fixed-width ISO-8601 string so we
-    // can compare `last_event_at < stale_cutoff` lexicographically — the
-    // format is the same one the registry stamps, so byte order matches
-    // chronological order and no date parsing is needed.
-    let stale_cutoff = iso8601_utc(now_epoch_secs - stale_threshold_secs);
 
     for state in snapshot {
+        // Operator hold (`bossctl agents hold`): checked before every
+        // other guard so a held run is never reaped regardless of how
+        // stale-looking it is — see `crate::hold_registry`'s "sweeps must
+        // respect it" contract. Manual `bossctl agents stop`/`reap` still
+        // work on a held run; only this automated sweep is exempted.
+        if hold_registry.is_held(&state.run_id) {
+            outcome.held_skipped += 1;
+            continue;
+        }
+
         // Only `working` slots are candidates. `Spawning` is still
         // coming up (no event history expected); `Idle` and
         // `WaitingForInput` are handled by the completion and
@@ -209,6 +278,25 @@ pub async fn run_one_pass(
             outcome.tool_in_flight_skipped += 1;
             continue;
         }
+
+        // Derive this slot's cadence-based staleness threshold from the
+        // driver's declared fidelity tier (module doc: "Non-`Rich`-tier
+        // drivers"). `Rich` (Claude, and any driver whose stream carries
+        // the same per-tool resolution) reuses `stale_threshold_secs`
+        // unchanged; `Coarse`/`Minimal` have no per-tool boundary to guard
+        // a long turn the way `current_tool` does above, so they are
+        // exempted from cadence judgement entirely rather than judged
+        // against a guessed threshold.
+        let fidelity = live_states.progress_fidelity_for_slot(state.slot_id);
+        let Some(effective_threshold_secs) = fidelity.stale_threshold_secs(stale_threshold_secs) else {
+            outcome.fidelity_exempt_skipped += 1;
+            continue;
+        };
+        // Build the staleness cutoff as a fixed-width ISO-8601 string so we
+        // can compare `last_event_at < stale_cutoff` lexicographically —
+        // the format is the same one the registry stamps, so byte order
+        // matches chronological order and no date parsing is needed.
+        let stale_cutoff = iso8601_utc(now_epoch_secs - effective_threshold_secs);
 
         // No hook yet at all ⇒ nothing to judge staleness against; the
         // dead-PID / grace paths cover a truly stuck spawn.
@@ -310,11 +398,22 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // Reap termination path (stale-worker sweep): tear down any
+        // driver-owned state outside the workspace. `mark_execution_orphaned`
+        // preserves `workspace_path`, so the pre-call `execution` snapshot
+        // is still current.
+        crate::driver_teardown::teardown_driver_workspace(
+            work_db,
+            execution_id,
+            execution.workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
+
         // Snapshot the wedged worker's uncommitted workspace work to a
         // durable patch before the slot is released and the workspace
         // becomes eligible for re-lease/reset. Best-effort: a failed or
         // empty capture returns None and never blocks the reap.
-        let recovery_patch = crate::recovery_backup::backup_dead_execution(&execution);
+        let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(&execution);
 
         // Append [engine-reconcile] audit line to the task description so
         // a human inspecting the chore can see why it was reset (and
@@ -397,6 +496,7 @@ mod tests {
     use super::*;
     use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
+    use crate::driver::ProgressFidelity;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::test_support::*;
     use crate::work::ExecutionStatus;
@@ -533,6 +633,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -597,6 +698,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             NEVER_STALE,
         )
         .await;
@@ -632,6 +734,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -669,6 +772,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -703,6 +807,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -760,6 +865,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -816,6 +922,7 @@ mod tests {
             coordinator.clone(),
             sink.as_ref(),
             reaper.as_ref(),
+            &HoldRegistry::new(),
             ALWAYS_STALE,
         )
         .await;
@@ -833,5 +940,175 @@ mod tests {
                 .contains(&execution_id),
             "slot must be released after the reap",
         );
+    }
+
+    /// A `Coarse`-fidelity slot (turn-boundary-only progress, no per-tool
+    /// events) that looks cadence-stale must NOT be reaped: with no
+    /// per-tool event to guard a long turn the way `current_tool` does for
+    /// `Rich` drivers, cadence alone cannot distinguish "healthy, deep in
+    /// one long turn" from "hung" for this tier — the fidelity floor
+    /// exempts it entirely (module doc: "Non-`Rich`-tier drivers").
+    #[tokio::test]
+    async fn coarse_fidelity_slot_is_exempt_from_cadence_staleness() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        live_states.set_progress_fidelity(1, ProgressFidelity::Coarse);
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &HoldRegistry::new(),
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 0, "a Coarse-fidelity slot must never be cadence-reaped");
+        assert_eq!(outcome.fidelity_exempt_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
+    }
+
+    /// Same as `coarse_fidelity_slot_is_exempt_from_cadence_staleness` but
+    /// for `Minimal` (process-alive-only) — the other tier the fidelity
+    /// floor exempts.
+    #[tokio::test]
+    async fn minimal_fidelity_slot_is_exempt_from_cadence_staleness() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        live_states.set_progress_fidelity(1, ProgressFidelity::Minimal);
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &HoldRegistry::new(),
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 0,
+            "a Minimal-fidelity slot must never be cadence-reaped"
+        );
+        assert_eq!(outcome.fidelity_exempt_skipped, 1);
+        assert!(reaper.reaped().is_empty());
+    }
+
+    /// A slot with no declared fidelity (the default, and every existing
+    /// call site's behaviour) is treated as `Rich` and reaped exactly like
+    /// today — this is the "Claude's sweep behaviour must be unchanged"
+    /// requirement, pinned as a test.
+    #[tokio::test]
+    async fn unset_fidelity_defaults_to_rich_and_reaps_like_today() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        // No set_progress_fidelity call — this is the untouched default.
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &HoldRegistry::new(),
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 1,
+            "default (Rich) fidelity must reap exactly like before this change"
+        );
+        assert_eq!(outcome.fidelity_exempt_skipped, 0);
+    }
+
+    /// A stale-looking `working` slot whose execution an operator has
+    /// explicitly held (`bossctl agents hold`) is never reaped, even past
+    /// the threshold — the auto-reap sweep must respect a hold.
+    #[tokio::test]
+    async fn held_worker_is_not_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot(&live_states, 1, &execution_id, &work_item_id);
+        drive_to_working_idle(&live_states, 1);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let hold_registry = HoldRegistry::new();
+        hold_registry.hold(&execution_id, Some("debugging by hand".to_owned()), 0);
+
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &hold_registry,
+            ALWAYS_STALE,
+        )
+        .await;
+
+        assert_eq!(outcome.reaped, 0, "a held worker must never be reaped");
+        assert_eq!(outcome.held_skipped, 1);
+        assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "a held worker's slot must remain claimed",
+        );
+        assert!(reaper.reaped().is_empty(), "no process reap may fire for a held worker");
     }
 }

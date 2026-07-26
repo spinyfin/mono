@@ -49,8 +49,9 @@ impl WorkDb {
         }
         ensure_dispatch_repo_resolvable(&mut conn, &input.work_item_id)?;
         let tx = conn.transaction()?;
-        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(execution)
     }
 
@@ -179,11 +180,21 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut healed = Vec::new();
+        let mut pending = PendingEvents::new();
         let now = now_string();
         for (work_item_id, product_id) in candidates {
             // Abandon any non-terminal executions so they don't get
             // picked up by the dispatcher after the demote. Terminal
             // executions are left alone — they're already settled.
+            let abandoned_ids: Vec<String> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM work_executions
+                     WHERE work_item_id = ?1
+                       AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
+                )?;
+                stmt.query_map(params![work_item_id], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'abandoned',
@@ -192,6 +203,9 @@ impl WorkDb {
                    AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')",
                 params![work_item_id, now],
             )?;
+            for execution_id in &abandoned_ids {
+                stage_execution_terminal(&mut pending, &tx, execution_id, &work_item_id)?;
+            }
             // Demote the kanban status. Use a guarded update so we
             // don't race a concurrent move to `done`/`archived`.
             // Stamps `last_status_actor = 'engine'` so the kanban can
@@ -215,7 +229,7 @@ impl WorkDb {
                 });
             }
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(healed)
     }
 
@@ -249,6 +263,7 @@ impl WorkDb {
         };
         let now = now_string();
         let mut abandoned = Vec::new();
+        let mut pending = PendingEvents::new();
         for (execution_id, work_item_id) in candidates {
             let updated = tx.execute(
                 "UPDATE work_executions
@@ -259,13 +274,14 @@ impl WorkDb {
                 params![execution_id, now],
             )?;
             if updated > 0 {
+                stage_execution_terminal(&mut pending, &tx, &execution_id, &work_item_id)?;
                 abandoned.push(AbandonedStrandedExecution {
                     execution_id,
                     work_item_id,
                 });
             }
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(abandoned)
     }
 
@@ -460,8 +476,9 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
-        let execution = request_execution_in_tx_with_live_check(&tx, input, is_live)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let execution = request_execution_in_tx_with_live_check(&mut pending, &tx, input, is_live)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(Some(execution))
     }
 
@@ -495,6 +512,7 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut redispatched = Vec::new();
+        let mut pending = PendingEvents::new();
         for work_item_id in candidate_ids {
             // Decide whether this work item needs a fresh ready
             // execution. The candidate cases are:
@@ -534,6 +552,7 @@ impl WorkDb {
                 .filter(|_| is_orphaned_predecessor)
                 .and_then(|prev| prev.cube_workspace_id.clone());
             request_execution_in_tx_with_live_check(
+                &mut pending,
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
@@ -544,7 +563,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(redispatched)
     }
 
@@ -591,6 +610,7 @@ impl WorkDb {
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut redispatched = Vec::new();
+        let mut pending = PendingEvents::new();
         for (work_item_id, autostart) in candidates {
             if !autostart {
                 continue;
@@ -609,6 +629,7 @@ impl WorkDb {
                 continue;
             }
             request_execution_in_tx_with_live_check(
+                &mut pending,
                 &tx,
                 RequestExecutionInput::builder()
                     .work_item_id(work_item_id.clone())
@@ -621,7 +642,7 @@ impl WorkDb {
             )?;
             redispatched.push(work_item_id);
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(redispatched)
     }
 
@@ -803,17 +824,46 @@ impl WorkDb {
     }
 
     /// Count how many terminal executions (`orphaned`, `abandoned`,
-    /// `failed`) the work item has produced within the trailing
-    /// `since_epoch_secs` window. Used by the orphan-active churn
-    /// guard to stop auto-redispatching a work item that keeps dying.
-    pub fn count_recent_terminal_executions(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<i64> {
+    /// `failed`, `cancelled`) the work item has produced within the
+    /// trailing `since_epoch_secs` window, optionally restricted to a
+    /// single execution `kind`. Used by the orphan-active and
+    /// `pr_review`-recovery churn guards to stop auto-redispatching a work
+    /// item that keeps dying.
+    ///
+    /// `kind = Some(ExecutionKind::PrReview)` is what
+    /// [`crate::pr_review_recovery`]'s churn guard passes instead of
+    /// `None`: a work item routinely accumulates terminal
+    /// `chore_implementation`/`revision_implementation` retries in the same
+    /// trailing window a review is dispatched in (they happen back-to-back
+    /// as part of the same work session), and those are unrelated to
+    /// whether the *review* itself is healthy. Counting them against the
+    /// review's churn budget means a single transient review failure (a
+    /// `SlotBusy` desync, a spawn-ack timeout) can trip the guard
+    /// immediately — parking the item and leaving the PR permanently
+    /// unreviewed instead of getting the retry the guard is supposed to
+    /// allow. Every other `pr_review`-recovery query in this file (see
+    /// [`Self::list_dead_pr_review_candidates`]) is already scoped to
+    /// `kind = 'pr_review'` for the same reason.
+    ///
+    /// `cancelled` is included alongside `orphaned`/`abandoned`/`failed` so
+    /// this counts the same dead-execution statuses
+    /// [`Self::list_dead_pr_review_candidates`] treats as review-dead;
+    /// otherwise a review that repeatedly ends `cancelled` would never
+    /// accumulate toward the guard and would be refired every sweep pass.
+    pub fn count_recent_terminal_executions(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: Option<ExecutionKind>,
+    ) -> Result<i64> {
         let conn = self.connect()?;
         conn.query_row(
             "SELECT COUNT(*) FROM work_executions
               WHERE work_item_id = ?1
-                AND status IN ('orphaned', 'abandoned', 'failed')
-                AND CAST(created_at AS INTEGER) >= ?2",
-            params![work_item_id, since_epoch_secs],
+                AND (?2 IS NULL OR kind = ?2)
+                AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                AND CAST(created_at AS INTEGER) >= ?3",
+            params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
             |row| row.get(0),
         )
         .map_err(Into::into)
@@ -824,16 +874,25 @@ impl WorkDb {
     /// churn-guard trip can point the operator at the specific failing
     /// runs instead of just a count. See
     /// [`Self::file_churn_guard_parked_attention`].
-    pub fn list_recent_terminal_execution_ids(&self, work_item_id: &str, since_epoch_secs: i64) -> Result<Vec<String>> {
+    pub fn list_recent_terminal_execution_ids(
+        &self,
+        work_item_id: &str,
+        since_epoch_secs: i64,
+        kind: Option<ExecutionKind>,
+    ) -> Result<Vec<String>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
             "SELECT id FROM work_executions
               WHERE work_item_id = ?1
-                AND status IN ('orphaned', 'abandoned', 'failed')
-                AND CAST(created_at AS INTEGER) >= ?2
+                AND (?2 IS NULL OR kind = ?2)
+                AND status IN ('orphaned', 'abandoned', 'failed', 'cancelled')
+                AND CAST(created_at AS INTEGER) >= ?3
               ORDER BY created_at DESC, id DESC",
         )?;
-        let rows = stmt.query_map(params![work_item_id, since_epoch_secs], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(
+            params![work_item_id, kind.map(|k| k.as_str()), since_epoch_secs],
+            |row| row.get::<_, String>(0),
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -849,7 +908,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                  FROM work_executions
                  WHERE work_item_id = ?1
                  ORDER BY created_at ASC, id ASC",
@@ -862,7 +921,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              ORDER BY created_at ASC, id ASC",
         )?;
@@ -885,7 +944,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                  FROM work_executions
                  WHERE work_item_id = ?1",
             )?;
@@ -994,7 +1053,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND id != ?2
@@ -1023,7 +1082,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE work_item_id = ?1
                AND id != ?2
@@ -1152,6 +1211,22 @@ impl WorkDb {
         Ok(Some(not_before))
     }
 
+    /// Every work item in the same revision chain as `work_item_id`,
+    /// chain-root first, INCLUDING `work_item_id` itself and tombstoned
+    /// members (see [`chain_member_ids_on`] for the tombstone rationale).
+    ///
+    /// Exposed for the in-flight dispatch registry
+    /// ([`crate::dispatch_inflight`]), which must answer "is this chain
+    /// already being dispatched" against reservations held in memory rather
+    /// than rows in `work_executions`. Dispatch liveness is only visible in
+    /// the DB once `start_execution_run_on_host` commits, so the registry —
+    /// not this table — is the source of truth for the window between a
+    /// drain pass deciding to dispatch and the run actually starting.
+    pub fn chain_member_ids(&self, work_item_id: &str) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        chain_member_ids_on(&conn, work_item_id)
+    }
+
     /// Return EVERY live (`running` / `waiting_human`) execution belonging to
     /// ANY *other* work item in the same revision chain as `work_item_id` —
     /// not just the first one encountered. See
@@ -1169,17 +1244,7 @@ impl WorkDb {
     /// exists to prevent).
     pub fn live_executions_elsewhere_in_chain(&self, work_item_id: &str) -> Result<Vec<WorkExecution>> {
         let conn = self.connect()?;
-        let root_id = chain_root(&conn, work_item_id)?;
-        let mut member_ids = Vec::with_capacity(4);
-        member_ids.push(root_id.clone());
-        // Tombstone-inclusive: `block_pending_revisions_on_parent_close`
-        // archives *and* tombstones a WIP revision in the same transaction
-        // that the merge poller detects the merge, but its execution isn't
-        // force-released until the poller's next step. A tombstone-filtered
-        // walk could miss that still-live execution during this window and
-        // let a second worker start on the same PR branch (the T1577/T1815
-        // hazard this guard exists to prevent).
-        member_ids.extend(collect_chain_revision_ids_including_deleted(&conn, &root_id)?);
+        let member_ids = chain_member_ids_on(&conn, work_item_id)?;
         let mut live_executions = Vec::new();
         for member_id in &member_ids {
             if member_id == work_item_id {
@@ -1190,7 +1255,7 @@ impl WorkDb {
                     "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                             cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                             created_at, started_at, finished_at,
-                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                            pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                      FROM work_executions
                      WHERE work_item_id = ?1
                        AND status IN ('running', 'waiting_human')
@@ -1215,20 +1280,24 @@ impl WorkDb {
         let conn = self.connect()?;
         let existing = query_execution(&conn, execution_id)?;
         let now = now_string();
-        conn.execute(
-            "UPDATE work_executions
-             SET status = 'abandoned',
-                 finished_at = COALESCE(finished_at, ?2)
-             WHERE id = ?1",
-            rusqlite::params![execution_id, now],
-        )?;
+        let updated = match &existing {
+            Some(existing) if !existing.status.is_terminal() => conn.execute(
+                "UPDATE work_executions
+                 SET status = 'abandoned',
+                     finished_at = COALESCE(finished_at, ?2)
+                 WHERE id = ?1",
+                rusqlite::params![execution_id, now],
+            )?,
+            _ => 0,
+        };
         // Canonical terminalization trace — see
         // `WorkDb::mark_execution_orphaned` in executions_runs.rs. The
         // double-spawn guard abandoning a redundant duplicate is exactly
         // the secondary-incident shape (a cross-kind duplicate execution
         // that got abandoned and shadowed the real one), so this site must
         // be attributable from the trace alone too.
-        if let Some(existing) = existing {
+        if updated > 0 {
+            let existing = existing.expect("updated > 0 implies existing was Some and non-terminal");
             tracing::warn!(
                 execution_id = %execution_id,
                 work_item_id = %existing.work_item_id,
@@ -1237,6 +1306,10 @@ impl WorkDb {
                 reason = "redundant duplicate execution",
                 "execution terminalized: mark redundant",
             );
+            // No open `Transaction` here — `conn` auto-commits each
+            // statement, so the UPDATE above is already durable and this
+            // publish carries no rollback risk.
+            publish_execution_terminal(&self.event_bus, &conn, execution_id, &existing.work_item_id)?;
         }
         Ok(())
     }
@@ -1327,7 +1400,7 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        tx.execute(
+        let execution_rows = tx.execute(
             "UPDATE work_executions
              SET status = 'abandoned',
                  finished_at = COALESCE(finished_at, ?2)
@@ -1335,6 +1408,10 @@ impl WorkDb {
                AND status = 'ready'",
             params![execution_id, now],
         )?;
+        let mut pending = PendingEvents::new();
+        if execution_rows > 0 {
+            stage_execution_terminal(&mut pending, &tx, execution_id, task_id)?;
+        }
         let task_rows = tx.execute(
             "UPDATE tasks
                 SET status             = 'in_review',
@@ -1347,9 +1424,9 @@ impl WorkDb {
             params![task_id, now],
         )?;
         if task_rows > 0 {
-            cascade_dependents_after_prereq_status_change(&tx, task_id, "in_review", &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, task_id, "in_review", &now)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(task_rows > 0)
     }
 
@@ -1421,5 +1498,98 @@ impl WorkDb {
             )
             .optional()?;
         Ok(terminal_owner.map(|_| current_lease_id.to_owned()))
+    }
+}
+
+/// Walk `work_item_id`'s revision chain and return every member id,
+/// chain-root first, including `work_item_id` itself.
+///
+/// Tombstone-inclusive: `block_pending_revisions_on_parent_close` archives
+/// *and* tombstones a WIP revision in the same transaction that the merge
+/// poller detects the merge, but its execution isn't force-released until the
+/// poller's next step. A tombstone-filtered walk could miss that still-live
+/// execution during this window and let a second worker start on the same PR
+/// branch (the T1577/T1815 hazard the chain guard exists to prevent).
+fn chain_member_ids_on(conn: &Connection, work_item_id: &str) -> Result<Vec<String>> {
+    let root_id = chain_root(conn, work_item_id)?;
+    let mut member_ids = Vec::with_capacity(4);
+    member_ids.push(root_id.clone());
+    member_ids.extend(collect_chain_revision_ids_including_deleted(conn, &root_id)?);
+    Ok(member_ids)
+}
+
+#[cfg(test)]
+mod event_bus_tests {
+    use boss_event_bus::TopicFilter;
+
+    use super::*;
+    use crate::test_support::{create_ready_chore_execution, create_test_product, open_db};
+    use crate::work::CreateChoreInput;
+
+    #[tokio::test]
+    async fn mark_execution_redundant_publishes_execution_terminal() {
+        // `mark_execution_redundant` writes through a plain auto-committing
+        // `Connection`, not a `Transaction` — the non-tx `publish_execution_terminal`
+        // path this test exercises.
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id);
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        let event = sub
+            .recv()
+            .await
+            .expect("ExecutionTerminal published after mark_execution_redundant");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_execution_redundant_does_not_republish_on_already_terminal() {
+        // A second `mark_execution_redundant` call on an already-`abandoned`
+        // execution must be a no-op: no re-write of the row, no second
+        // `ExecutionTerminal` publish.
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = db
+            .create_chore(
+                CreateChoreInput::builder()
+                    .product_id(product.id)
+                    .name("test chore")
+                    .build(),
+            )
+            .unwrap();
+        let execution = create_ready_chore_execution(&db, chore.id);
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        db.mark_execution_redundant(&execution.id).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no second ExecutionTerminal should be published for an already-terminal execution");
     }
 }

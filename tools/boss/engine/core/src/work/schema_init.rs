@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -162,11 +162,13 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 autostart INTEGER NOT NULL DEFAULT 1,
+                deferred INTEGER NOT NULL DEFAULT 0,
                 priority TEXT NOT NULL DEFAULT 'medium',
                 repo_remote_url TEXT,
                 created_via TEXT NOT NULL DEFAULT 'unknown',
                 effort_level TEXT,
                 model_override TEXT,
+                reasoning TEXT,
                 driver TEXT,
                 ci_attempt_budget INTEGER,
                 ci_attempts_used INTEGER NOT NULL DEFAULT 0,
@@ -282,6 +284,7 @@ impl WorkDb {
         )?;
         migrate_work_executions_v3(conn)?;
         migrate_tasks_autostart(conn)?;
+        migrate_tasks_deferred(conn)?;
         migrate_last_status_actor(conn)?;
         migrate_tasks_priority(conn)?;
         migrate_project_design_doc_columns(conn)?;
@@ -623,8 +626,46 @@ impl WorkDb {
         // followup-group member from. Additive, independent of every other
         // table. Implementation task 6 of the worker-proposal-api design.
         migrate_attentions_source_proposal_id(conn)?;
+        // Comment intent taxonomy collapse: the classifier's retired
+        // `directive`/`larger_change` split re-homed onto the single
+        // `revision` intent value (nothing downstream ever branched on which
+        // of the two a comment carried). Data-only, no schema change.
+        migrate_collapse_directive_larger_change_intent(conn)?;
+        // `tasks.pr_merge_state_status` / `tasks.pr_head_sha`: two fields the
+        // merge poller's probe already fetches every sweep but previously
+        // discarded. Backs `boss pr status` — see migration doc comment.
+        migrate_tasks_pr_status_columns(conn)?;
+        // `work_executions.pr_title_before`: PR title snapshot alongside the
+        // existing `pr_body_before`. Backs `boss pr body` returning title
+        // and body together.
+        migrate_work_executions_pr_title_before(conn)?;
+        // `github_api_calls`: per-call GitHub API usage telemetry (caller
+        // subsystem, API bucket, rateLimit reading). Independent of every
+        // other table and additive-only. Rides the current schema marker.
+        migrate_github_api_calls_table(conn)?;
+        // `tasks.reasoning`: the capability signal (standard | investigation),
+        // independent of `effort_level`'s size signal. Nullable, and NULL is
+        // load-bearing — it means "never classified" and keeps the row on the
+        // dispatcher's pre-existing kind-floor/effort-table path, so landing
+        // this migration re-models nothing already in flight.
+        migrate_tasks_reasoning_column(conn)?;
+        // revision chains must be flat under the original non-revision
+        // work item. New inserts already canonicalize in
+        // `assert_parent_revisable_and_insert`; this rewrites any pre-existing
+        // nested `parent_task_id` links (revision → revision) to the chain root
+        // so the UI rollup and `list_revisions --parent <root>` surface the
+        // full chain. Idempotent; preserves status/executions/deps/history.
+        migrate_flatten_nested_revision_parents(conn)?;
+        // `tasks.tags`: free-form ordered label strings for kanban cards.
+        // JSON array text, default `[]`. Caps enforced at write.
+        migrate_tasks_tags_column(conn)?;
+        // `work_executions.driver_runtime_state`: opaque JSON from
+        // AgentDriver::provision_workspace, handed back to teardown on
+        // every termination path. Survives workspace release so future
+        // Codex retention can operate only on a recorded root.
+        migrate_work_executions_driver_runtime_state(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -715,7 +756,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "28");
+        assert_eq!(schema_version, "29");
 
         let boothby_passes_exists: bool = conn
             .query_row(

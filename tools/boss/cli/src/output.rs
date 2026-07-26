@@ -71,10 +71,12 @@ pub(crate) struct TaskListCriteria<'a> {
     #[builder(default)]
     pub(crate) ids: &'a [String],
     pub(crate) limit: Option<usize>,
-    /// When `false`, `archived` rows are hidden unless `statuses`
-    /// explicitly asks for them — mirrors the deleted/restore contract
-    /// (hidden by default, visible on request) rather than the
-    /// show-everything default other statuses get.
+    /// When `false`, `archived` and `cancelled` rows are hidden unless
+    /// `statuses` explicitly asks for them — mirrors the deleted/restore
+    /// contract (hidden by default, visible on request) rather than the
+    /// show-everything default other statuses get. Both terminal statuses
+    /// share this flag: neither should linger in default `list` output.
+    /// (The engine-side kanban board still excludes only `archived`.)
     #[builder(default)]
     pub(crate) include_archived: bool,
 }
@@ -90,10 +92,14 @@ pub(crate) fn apply_task_list_filters(
     let id_set: std::collections::HashSet<&str> = criteria.ids.iter().map(String::as_str).collect();
     let lc_term = criteria.match_term.map(str::to_lowercase);
     let show_archived = criteria.include_archived || allowed_statuses.contains(&"archived");
+    let show_cancelled = criteria.include_archived || allowed_statuses.contains(&"cancelled");
     items
         .into_iter()
         .filter(|task| {
             if !show_archived && task.status.as_str() == "archived" {
+                return false;
+            }
+            if !show_cancelled && task.status.as_str() == "cancelled" {
                 return false;
             }
             if !allowed_statuses.is_empty() && !allowed_statuses.contains(&task.status.as_str()) {
@@ -242,11 +248,25 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // anything. JSON output always carries the field; this is a
     // human-readability nicety only.
     let show_effort = tasks.iter().any(|t| t.effort_level.is_some());
+    // REASONING is rendered only when at least one row is `investigation`.
+    // A stricter predicate than `show_effort`'s `is_some()` on purpose: every
+    // newly-created row carries a reasoning mode and the overwhelming majority
+    // are `standard`, so keying off "is set" would add a column of noise to
+    // every listing. Keying off "something here is not the default" makes the
+    // column mean "these rows are the expensive ones". `boss task show` and
+    // `--json` always carry the field regardless.
+    let show_reasoning = tasks
+        .iter()
+        .any(|t| t.reasoning == Some(boss_protocol::ReasoningMode::Investigation));
     let show_short_id = tasks.iter().any(|t| t.short_id.is_some());
     // Surface the soft-delete tombstone only when a row actually carries
     // one — i.e. when the caller passed `--deleted`. Keeps the common
     // live-only listing unchanged. Mirrors the `show_effort` pattern.
     let show_deleted = tasks.iter().any(|t| t.deleted_at.is_some());
+    // Only render the READY column when at least one row carries a PR —
+    // the field is only meaningful for Review-lane tasks. Mirrors the
+    // `show_effort` pattern.
+    let show_ready = tasks.iter().any(|t| t.pr_url.is_some());
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
         header.push("#");
@@ -258,7 +278,13 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if show_effort {
         header.push("EFFORT");
     }
+    if show_reasoning {
+        header.push("REASONING");
+    }
     header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
+    if show_ready {
+        header.push("READY");
+    }
     if show_deleted {
         header.push("DELETED");
     }
@@ -267,6 +293,7 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
         let friendly = boss_protocol::short_id_label(task.short_id).unwrap_or_default();
         let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
+        let reasoning_str = task.reasoning.map(|r| r.as_str().to_owned()).unwrap_or_default();
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
             row.push(friendly);
@@ -280,9 +307,19 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         if show_effort {
             row.push(effort_str);
         }
+        if show_reasoning {
+            row.push(reasoning_str);
+        }
         row.push(task.project_id.clone().unwrap_or_default());
         row.push(ordinal);
         row.push(task.pr_url.clone().unwrap_or_default());
+        if show_ready {
+            row.push(if task.ready_for_review {
+                "yes".to_owned()
+            } else {
+                String::new()
+            });
+        }
         if show_deleted {
             row.push(task.deleted_at.clone().unwrap_or_default());
         }
@@ -891,6 +928,9 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     println!("Name: {}", task.name);
     println!("Kind: {}", task.kind);
     println!("Status: {}", task.status.display_label());
+    if task.deferred {
+        println!("Deferred: yes (future scope — awaiting approval to dispatch)");
+    }
     if let Some(reason) = task.archived_reason.as_deref() {
         println!("Archived reason: {reason}");
     }
@@ -898,8 +938,14 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
         println!("Repo: {}", format_repo_line(task.repo_remote_url.as_deref(), product),);
     }
     println!("Priority: {}", task.priority);
+    if !task.tags.is_empty() {
+        println!("Tags: {}", task.tags.join(", "));
+    }
     if let Some(level) = task.effort_level {
         println!("Effort: {level}");
+    }
+    if let Some(reasoning) = task.reasoning {
+        println!("Reasoning: {reasoning}");
     }
     if let Some(model) = task.model_override.as_deref() {
         println!("Model override: {model}");
@@ -910,6 +956,7 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     }
     if let Some(pr_url) = &task.pr_url {
         println!("PR URL: {}", pr_url);
+        println!("Ready for review: {}", if task.ready_for_review { "yes" } else { "no" });
     }
     if !task.description.is_empty() {
         println!("Description: {}", task.description);

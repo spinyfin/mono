@@ -35,8 +35,8 @@ async fn task_show_plain_integer_short_id() -> Result<()> {
         engine.socket_str(),
         &["task", "show", "--product", &product.id, &short_id.to_string()],
     )?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
-    assert_eq!(value["chore"]["short_id"].as_i64(), Some(short_id));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["short_id"].as_i64(), Some(short_id));
     Ok(())
 }
 
@@ -54,7 +54,7 @@ async fn task_show_hash_prefixed_short_id() -> Result<()> {
         engine.socket_str(),
         &["task", "show", "--product", &product.id, &selector],
     )?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
     Ok(())
 }
 
@@ -69,7 +69,7 @@ async fn task_show_cross_product_slug_slash_n() -> Result<()> {
 
     let selector = format!("{}/{short_id}", product.slug);
     let value = run_boss(engine.socket_str(), &["task", "show", &selector])?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
     Ok(())
 }
 
@@ -84,7 +84,7 @@ async fn task_show_cross_product_slug_slash_hash_n() -> Result<()> {
 
     let selector = format!("{}/#{short_id}", product.slug);
     let value = run_boss(engine.socket_str(), &["task", "show", &selector])?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
     Ok(())
 }
 
@@ -97,7 +97,7 @@ async fn task_show_primary_id_still_works() -> Result<()> {
     let chore = create_chore(&mut client, &product.id, "Do something").await?;
 
     let value = run_boss(engine.socket_str(), &["task", "show", &chore.id])?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
     Ok(())
 }
 
@@ -116,7 +116,7 @@ async fn chore_show_plain_integer_short_id() -> Result<()> {
         engine.socket_str(),
         &["chore", "show", "--product", &product.id, &short_id.to_string()],
     )?;
-    assert_eq!(value["chore"]["id"].as_str(), Some(chore.id.as_str()));
+    assert_eq!(value["id"].as_str(), Some(chore.id.as_str()));
     Ok(())
 }
 
@@ -215,7 +215,7 @@ async fn chore_show_json_includes_short_id() -> Result<()> {
 
     let value = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
     assert_eq!(
-        value["chore"]["short_id"].as_i64(),
+        value["short_id"].as_i64(),
         Some(short_id),
         "short_id missing from JSON: {value}"
     );
@@ -241,11 +241,11 @@ async fn project_show_json_includes_short_id() -> Result<()> {
 }
 
 /// `boss chore show <id> --json` always emits `current_execution_id`
-/// and `current_run_id` inside the chore object — `null` when the
+/// and `current_run_id` at the top level of the row — `null` when the
 /// chore has never been dispatched. The coordinator parses these
-/// keys directly off `.chore`, so the engine must keep them present
-/// (not skipped) even when the underlying engine state is empty.
-/// Backs the agent-visibility chore.
+/// keys directly off the row (not nested under a `chore` wrapper), so
+/// the engine must keep them present (not skipped) even when the
+/// underlying engine state is empty. Backs the agent-visibility chore.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn chore_show_json_exposes_runtime_keys_when_empty() -> Result<()> {
     let engine = TestEngine::spawn().await?;
@@ -255,28 +255,22 @@ async fn chore_show_json_exposes_runtime_keys_when_empty() -> Result<()> {
 
     let value = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
     let chore_value = value
-        .get("chore")
-        .ok_or_else(|| anyhow!("expected `chore` key in JSON: {value}"))?;
+        .as_object()
+        .ok_or_else(|| anyhow!("expected a JSON object row: {value}"))?;
     assert!(
-        chore_value
-            .as_object()
-            .map(|m| m.contains_key("current_execution_id"))
-            .unwrap_or(false),
+        chore_value.contains_key("current_execution_id"),
         "current_execution_id key must always be present: {value}",
     );
     assert!(
-        chore_value
-            .as_object()
-            .map(|m| m.contains_key("current_run_id"))
-            .unwrap_or(false),
+        chore_value.contains_key("current_run_id"),
         "current_run_id key must always be present: {value}",
     );
     assert!(
-        chore_value["current_execution_id"].is_null(),
+        value["current_execution_id"].is_null(),
         "pre-dispatch chore must have null current_execution_id: {value}",
     );
     assert!(
-        chore_value["current_run_id"].is_null(),
+        value["current_run_id"].is_null(),
         "pre-dispatch chore must have null current_run_id: {value}",
     );
     Ok(())

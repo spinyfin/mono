@@ -276,7 +276,7 @@ async fn main() -> ExitCode {
 async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.log_level, cli.log_file.clone())?;
-    let root = std::env::current_dir()?;
+    let root = resolve_invocation_root()?;
     info!(root = %root.display(), "starting checkleft");
 
     let vcs = Vcs::detect(&root)?;
@@ -451,6 +451,55 @@ fn current_checkleft_bin() -> String {
         .unwrap_or_else(|| "checkleft".to_owned())
 }
 
+/// Resolve the directory that should anchor VCS detection and CHECKS.yaml
+/// discovery for this invocation.
+///
+/// Under `bazel run`, Bazel chdirs into the target's runfiles tree before
+/// exec'ing the binary. That tree is a sparse materialization of the package
+/// (often just `tools/`), and walking up from it can land on bazel's
+/// execroot — a different git/jj workspace with a completely different file
+/// set. Diffing that workspace against `main` produces thousands of
+/// spurious paths that no check matches, so `checkleft run` reports a huge
+/// scope and then "No checks ran" (a false pass), while `cube pr create`'s
+/// push gate — which spawns checkleft with the real workspace as cwd —
+/// scopes correctly.
+///
+/// Bazel exports `BUILD_WORKING_DIRECTORY` as the absolute path of the
+/// directory from which `bazel run` was invoked. Prefer it when present and
+/// a real directory; otherwise fall back to process cwd (direct binary
+/// invocations, hooks, the push gate, CI).
+///
+/// Pure core is [`invocation_root_from`]; this wrapper only reads env + cwd.
+fn resolve_invocation_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read process current directory")?;
+    Ok(invocation_root_from(std::env::var_os("BUILD_WORKING_DIRECTORY"), cwd))
+}
+
+/// Pure selection of the invocation root given an optional
+/// `BUILD_WORKING_DIRECTORY` value and the process cwd. Extracted so unit
+/// tests can cover the bazel-run case without mutating process environment.
+fn invocation_root_from(build_working_directory: Option<std::ffi::OsString>, cwd: PathBuf) -> PathBuf {
+    if let Some(raw) = build_working_directory {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_dir() {
+            info!(
+                build_working_directory = %candidate.display(),
+                cwd = %cwd.display(),
+                "using BUILD_WORKING_DIRECTORY as invocation root (bazel run)"
+            );
+            return candidate;
+        }
+        // Present but not a directory (stale/broken env): fall through to cwd
+        // rather than fail — same fail-open posture as a missing var.
+        info!(
+            build_working_directory = %candidate.display(),
+            cwd = %cwd.display(),
+            "BUILD_WORKING_DIRECTORY is set but not a directory; falling back to cwd"
+        );
+    }
+    cwd
+}
+
 /// Run `git` in `root` and return trimmed stdout, or `None` if the command
 /// fails or produces no output.
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
@@ -519,33 +568,73 @@ async fn dispatch_run(
     .await?;
     info!("resolving changeset for run");
     let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
-    info!(
-        changed_files = changeset.changed_files.len(),
-        "resolved changeset for run"
-    );
+    let file_count = changeset.changed_files.len();
+    info!(changed_files = file_count, "resolved changeset for run");
 
     // The progress UI is purely additive on the interactive path. When it is
     // disabled the reporter is a no-op and output is byte-identical to before.
     let style = OutputStyle::detect_for_stdout();
-    let progress_enabled = matches!(format, OutputFormat::Human)
-        && should_show_progress(
-            show_progress,
-            style.level,
-            std::io::stdout().is_terminal(),
-            stderr().is_terminal(),
-            detect_ci(),
-        );
-    let mut live =
-        progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
-    let reporter: Arc<dyn ProgressReporter> = match &live {
-        Some(progress) => progress.reporter(make_render_findings(style)),
-        None => Arc::new(NoopProgressReporter),
-    };
+    if matches!(format, OutputFormat::Human) {
+        print!("{}", render_run_scope_line(&plan, file_count, style));
+    }
 
-    let run_started_at = Instant::now();
-    let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
-    let elapsed = run_started_at.elapsed();
-    sort_results_for_output(&mut results);
+    // With no modified files (and no `--all`), there is nothing for any check
+    // to run against — skip invoking the runner entirely rather than letting
+    // every check independently discover it has zero files to look at.
+    let skip_run = !matches!(plan, ChangePlan::All) && file_count == 0;
+
+    let (results, elapsed) = if skip_run {
+        if matches!(format, OutputFormat::Json) {
+            print_json_results(&[])?;
+        }
+        (Vec::new(), Duration::ZERO)
+    } else {
+        let progress_enabled = matches!(format, OutputFormat::Human)
+            && should_show_progress(
+                show_progress,
+                style.level,
+                std::io::stdout().is_terminal(),
+                stderr().is_terminal(),
+                detect_ci(),
+            );
+        let mut live = progress_enabled
+            .then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
+        let reporter: Arc<dyn ProgressReporter> = match &live {
+            Some(progress) => progress.reporter(make_render_findings(style)),
+            None => Arc::new(NoopProgressReporter),
+        };
+
+        let run_started_at = Instant::now();
+        let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
+        let elapsed = run_started_at.elapsed();
+        sort_results_for_output(&mut results);
+
+        match format {
+            OutputFormat::Human => {
+                if let Some(mut progress) = live.take() {
+                    // Stop the render loop, leaving the final per-check status block on
+                    // screen; the findings already streamed into the log area above it,
+                    // so only the summary footer remains to print.
+                    progress.finalize();
+                    // When the scope was non-empty but every path was ineligible,
+                    // emit the unambiguous warning (scope-consistency) instead of the terse
+                    // "No checks ran." that reads as a clean pass.
+                    if results.is_empty() && file_count > 0 {
+                        print!("{}", render_no_checks_ran(style, file_count));
+                    } else {
+                        print!("{}", render_human_footer(&results, style, elapsed));
+                    }
+                } else if results.is_empty() && file_count > 0 {
+                    print!("{}", render_no_checks_ran(style, file_count));
+                } else {
+                    print_human_results(&results, elapsed);
+                }
+            }
+            OutputFormat::Json => print_json_results(&results)?,
+        }
+
+        (results, elapsed)
+    };
     let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
     info!(
         elapsed_ms = elapsed.as_millis(),
@@ -553,21 +642,6 @@ async fn dispatch_run(
         total_findings,
         "run complete"
     );
-
-    match format {
-        OutputFormat::Human => {
-            if let Some(mut progress) = live.take() {
-                // Stop the render loop, leaving the final per-check status block on
-                // screen; the findings already streamed into the log area above it,
-                // so only the summary footer remains to print.
-                progress.finalize();
-                print!("{}", render_human_footer(&results, style, elapsed));
-            } else {
-                print_human_results(&results, elapsed);
-            }
-        }
-        OutputFormat::Json => print_json_results(&results)?,
-    }
 
     // Generate SARIF once if needed for file writing or upload.
     let needs_sarif = upload || annotations.contains(&AnnotationBackend::Sarif);
@@ -1597,15 +1671,21 @@ async fn attach_description_context(
     plan: &ChangePlan,
 ) -> ChangeSet {
     info!("attaching commit and PR metadata");
-    // When we know the base revision, read ALL commit descriptions in the pushed
-    // range so that a BYPASS directive placed in any content commit (including
-    // when @ is an empty working-copy commit on top of the real content) is seen.
-    let commit_description = match plan {
+    // Split commit-message surfaces:
+    // - tip (`commit_description`): leakage checks (boss-ism/pr-text-leakage via
+    //   text/forbidden-pattern surfaces: changeset). Intermediate historical
+    //   messages must not re-fail a green PR when GitHub MQ/squash re-embeds them.
+    // - full range (`bypass_commit_descriptions`): BYPASS only. A directive in
+    //   any content commit (including under an empty jj WC tip) stays visible.
+    let tip_description = normalize_optional_description(vcs.current_commit_description().ok());
+    let bypass_commit_descriptions = match plan {
         ChangePlan::Scoped { base_sha, .. } => {
             normalize_optional_description(vcs.commit_descriptions_since(base_sha).ok())
-                .or_else(|| normalize_optional_description(vcs.current_commit_description().ok()))
+                .or_else(|| tip_description.clone())
         }
-        _ => normalize_optional_description(vcs.current_commit_description().ok()),
+        // Non-scoped runs only have the tip; bypass_reason falls back to
+        // commit_description, so leave the dedicated range field unset.
+        _ => None,
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
@@ -1613,7 +1693,8 @@ async fn attach_description_context(
         resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await,
     );
     changeset
-        .with_commit_description(commit_description)
+        .with_commit_description(tip_description)
+        .with_bypass_commit_descriptions(bypass_commit_descriptions)
         .with_change_id(change_id)
         .with_repository(repository)
         .with_pr_description(pr_description)
@@ -2056,10 +2137,34 @@ fn make_render_findings(style: OutputStyle) -> RenderFindings {
     })
 }
 
+/// The leading line printed before a run starts, announcing the file scope
+/// checks are about to run against — mirrors the `checks:` prefix and colouring
+/// of the trailing summary line so the two bookend the run consistently.
+fn render_run_scope_line(plan: &ChangePlan, file_count: usize, style: OutputStyle) -> String {
+    if matches!(plan, ChangePlan::All) {
+        return format!(
+            "{}: running checks on all files in the repo\n",
+            style.paint_info("checks")
+        );
+    }
+    if file_count == 0 {
+        return format!("{}: Skipping checks - no modified files\n", style.paint_info("checks"));
+    }
+    let noun = if file_count == 1 { "file" } else { "files" };
+    format!(
+        "{}: running checks on {file_count} modified {noun}\n",
+        style.paint_info("checks")
+    )
+}
+
 /// The trailing summary the interactive path prints after finalizing the status
 /// block. The per-finding bodies already streamed into the log area, so for the
 /// has-findings case this is only the summary line; the no-findings and
 /// no-checks cases match [`render_human_results`] exactly.
+///
+/// Callers that know the change-set size and observe zero results with a
+/// non-empty scope should prefer [`render_no_checks_ran`] so the developer
+/// cannot mistake an empty schedule for a clean pass.
 fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {
     if results.is_empty() {
         return "No checks ran.\n".to_owned();
@@ -2096,6 +2201,23 @@ fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Dur
         out.push_str(&hint);
     }
     out
+}
+
+/// Message when the runner produced zero check results against a non-empty
+/// change set. This is anomalous (every changed path was ineligible, or the
+/// scope itself was wrong — historically `bazel run` using the runfiles cwd)
+/// and must not read as a clean pass.
+fn render_no_checks_ran(style: OutputStyle, file_count: usize) -> String {
+    let noun = if file_count == 1 { "file" } else { "files" };
+    format!(
+        "{summary}: no checks applied to any of the {file_count} modified {noun}.\n\
+         {warning}: this is not a clean pass — the resolved change set did not match \
+         any configured check. Inspect the scope with `checkleft show-plan`. If you \
+         invoked via `bazel run` and the file count looks far larger than your diff, \
+         the working directory was wrong (checkleft should honour BUILD_WORKING_DIRECTORY).\n",
+        summary = style.paint_bold("summary"),
+        warning = style.paint_info("warning"),
+    )
 }
 
 /// Terse, copy-pasteable line advertising `checkleft fix` when at least one
@@ -2177,11 +2299,11 @@ fn render_finding(result: &CheckResult, finding: &Finding, style: OutputStyle) -
         style.paint_message(&message)
     ));
 
-    let location = finding
-        .location
-        .as_ref()
-        .map(format_location)
-        .unwrap_or_else(|| "<unknown>".to_owned());
+    let location = match (finding.location.as_ref(), finding.surface) {
+        (Some(location), _) => format_location(location),
+        (None, Some(surface)) => surface.render_label().to_owned(),
+        (None, None) => "<unknown>".to_owned(),
+    };
     out.push_str(&format!("  --> {location}\n"));
 
     if let Some(ref path) = dump_path {

@@ -15,12 +15,12 @@ use crate::types::{
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState,
     EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState,
+    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -338,7 +338,7 @@ pub enum FrontendRequest {
     /// critical path, mirroring `CommentsCreate`'s classifier dispatch —
     /// reclassifies the follow-up with the accumulated thread as context.
     /// `question` re-enters bucket 2 (`awaiting_followup → answering`,
-    /// answer agent runs again); `directive`/`larger_change` bridges into
+    /// answer agent runs again); `revision` bridges into
     /// the bucket-1&3 path (`awaiting_followup → active`), carrying the
     /// thread's answer-agent reply into the next `[Revise]` batch's
     /// directive.
@@ -362,7 +362,7 @@ pub enum FrontendRequest {
         plain_text_projection_version: i64,
     },
 
-    /// Batch-address every unaddressed `directive`/`larger_change` comment
+    /// Batch-address every unaddressed `revision` comment
     /// on a design/investigation-owned `pr_doc` artifact: creates a
     /// revision (open PR) or chore (merged/closed/no-PR) — the
     /// `[Revise]`-banner action. App-or-Boss tier. Replies with
@@ -381,7 +381,7 @@ pub enum FrontendRequest {
     /// classification design § "Misclassification / override".
     CommentsSetIntent {
         comment_id: String,
-        /// `directive` | `question` | `larger_change`.
+        /// `revision` | `question`.
         intent: String,
     },
 
@@ -700,6 +700,10 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Query the current interactive-pool concurrency cap without changing
+    /// it. Replies with [`FrontendEvent::DispatchConcurrencyResult`].
+    GetDispatchConcurrency,
+
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
     GetDispatchState,
@@ -734,6 +738,20 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Worker → engine, read-only: the caller's own PR's body as Boss
+    /// snapshotted it at the start of this execution's run (see
+    /// `WorkDb::get_execution_pr_body_before`) — never a live GitHub read.
+    ///
+    /// Attribution matches [`Self::GetWorkerContext`] exactly (same
+    /// `run_id` cross-check, same peer-pid resolution, same
+    /// `ProposalRejected` failure shape).
+    ///
+    /// Replies with [`FrontendEvent::PrBodyResult`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    GetPrBody {
+        run_id: String,
+    },
+
     /// Read-only: fetch one markdown document's body from GitHub.
     ///
     /// Identified by the `(repo, path, ref)` triple
@@ -746,6 +764,29 @@ pub enum FrontendRequest {
         repo_remote_url: String,
         path: String,
         git_ref: String,
+    },
+
+    /// Worker → engine, read-only: the caller's own PR's mergeability as
+    /// Boss last observed it — `mergeable`, `merge_state_status`,
+    /// `head_sha`, and `observed_at`, sourced from the merge poller's
+    /// stored state, never a live GitHub call by default.
+    ///
+    /// Attribution matches [`Self::GetWorkerContext`] exactly.
+    ///
+    /// `refresh: true` requests a single, bounded, on-demand `gh pr view`
+    /// probe instead of the stored snapshot — for the case where the
+    /// caller just pushed and needs current state. The refresh is
+    /// engine-wide rate-limited: if the budget is exhausted, the stored
+    /// snapshot is returned instead with `refresh_throttled: true`, never
+    /// blocked or errored. `refresh: false` (the default) never issues a
+    /// GitHub call.
+    ///
+    /// Replies with [`FrontendEvent::PrStatusResult`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    GetPrStatus {
+        run_id: String,
+        #[serde(default)]
+        refresh: bool,
     },
 
     GetRun {
@@ -837,6 +878,24 @@ pub enum FrontendRequest {
     /// immediately with a [`FrontendEvent::GitHubAuthState`] push
     /// reflecting the latest known state.
     GitHubAuthStatus,
+
+    /// Boss-tier RPC: place an explicit operator hold on the live run
+    /// `run_id`, exempting it from the idle-park
+    /// ([`crate::LiveWorkerState`]'s owning
+    /// `WorkerCompletionHandler::nudge_or_park`) and auto-reap
+    /// (`stale_worker_sweep`) sweeps until released
+    /// ([`Self::ReleaseHoldRun`]) or the run ends. `reason` is an
+    /// optional free-text note surfaced on `agents list`/`agents status`.
+    /// Does NOT protect the run from a direct `bossctl agents stop` /
+    /// `agents reap` — those break-glass verbs still work on a held run.
+    /// Used by `bossctl agents hold`. Replies with
+    /// [`FrontendEvent::RunHeld`], or `WorkError` if `run_id` is not a
+    /// live run.
+    HoldRun {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
 
     /// Boss-tier RPC: interrupt the worker pane hosting `run_id` —
     /// equivalent to the human pressing Esc inside that pane.
@@ -1482,6 +1541,15 @@ pub enum FrontendRequest {
         capability_ids: Vec<String>,
     },
 
+    /// Boss-tier RPC: release a previously-placed [`Self::HoldRun`] hold
+    /// on `run_id`, restoring the idle-park/auto-reap sweeps' normal
+    /// behavior for it. Idempotent — releasing a run with no hold in
+    /// place still replies `RunHoldReleased`. Used by `bossctl agents
+    /// release-hold`. Replies with [`FrontendEvent::RunHoldReleased`].
+    ReleaseHoldRun {
+        run_id: String,
+    },
+
     /// Release a project's staged auto-populate batch (design
     /// §"Operator review checkpoint"): flips `autostart = true` on every
     /// non-deleted task tagged with the project's live `planner_runs`
@@ -1687,6 +1755,27 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency
+    /// cap that `drain_ready_queue` enforces separately from the underlying
+    /// 16-slot main worker pool (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`).
+    /// `limit` must be at least 1 — `0` is rejected with
+    /// [`FrontendEvent::WorkError`], since it would wedge all mainline
+    /// dispatch with no error surface; values above `MAX_WORKER_POOL_SIZE`
+    /// (there are no backing slots or panes above that) are clamped down to
+    /// it. Persisted to `state.db` so it survives an engine restart.
+    /// Raising the cap kicks the scheduler so newly-available capacity is
+    /// used immediately rather than sitting idle until the next
+    /// naturally-triggered drain pass; lowering it takes effect on the very
+    /// next drain pass, since the cap check is re-read live on every pass.
+    /// Spilled automation counts toward this cap exactly like mainline work
+    /// (see `claim_worker_spill`); the review pool is NOT gated by it and
+    /// keeps dispatching from its own pool regardless. Replies with
+    /// [`FrontendEvent::DispatchConcurrencyResult`] or
+    /// [`FrontendEvent::WorkError`] when `limit == 0`.
+    SetDispatchConcurrency {
+        limit: usize,
     },
 
     /// Pause or resume global dispatch. When `paused = true` the engine

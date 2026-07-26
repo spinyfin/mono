@@ -13,10 +13,13 @@ rust_library(
     visibility = [
         "//tools/boss/engine/core:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
+        "//tools/boss/engine/stdout-progress:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
@@ -32,7 +35,9 @@ rust_test(
     ),
     deps = [
         "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
+        "//tools/boss/engine/utils",
         "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,

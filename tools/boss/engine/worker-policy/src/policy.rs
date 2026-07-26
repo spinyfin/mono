@@ -204,6 +204,18 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // worker still cannot reach another run's work item through them.
         FrontendRequest::ListProposals { .. } | FrontendRequest::SubmitProposal { .. } => Allow,
 
+        // ── Allowed: the caller's own PR state ───────────────────────────
+        //
+        // `GetPrStatus` / `GetPrBody` are attributed identically to
+        // `GetWorkerContext` (peer pid → execution → work item, `run_id`
+        // cross-check) and read state Boss already stores about the
+        // caller's *own* PR — `boss pr status` / `boss pr body`, replacing
+        // worker `gh pr view` calls that only wanted state the engine
+        // already has. `GetPrStatus --refresh` still never leaves this
+        // process's own bounded, rate-limited probe path; the worker never
+        // gets a raw GitHub call of its own through this verb.
+        FrontendRequest::GetPrBody { .. } | FrontendRequest::GetPrStatus { .. } => Allow,
+
         // ── Allowed: sanctioned writes ───────────────────────────────────
         //
         // Each of these is a *declaration about the worker's own run* that
@@ -317,6 +329,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DebugLiveStatusPipeline
         | FrontendRequest::ExecutionTranscript { .. }
         | FrontendRequest::FocusWorkerPane { .. }
+        | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
         | FrontendRequest::GetSettings
@@ -340,6 +353,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }
         | FrontendRequest::SendInputToWorker { .. }
+        | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
         | FrontendRequest::SetFeatureFlag { .. }
         | FrontendRequest::SetLiveStatusEnabled { .. }
@@ -415,6 +429,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GitHubAuthDisconnect
         | FrontendRequest::GitHubAuthStart
         | FrontendRequest::GitHubAuthStatus
+        | FrontendRequest::HoldRun { .. }
         | FrontendRequest::KickPrReconcilers
         | FrontendRequest::ListAttentionMerges { .. }
         | FrontendRequest::ListAutomationDedupSuppressions { .. }
@@ -426,6 +441,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::ListPlannerRuns { .. }
         | FrontendRequest::MergeWhenReady { .. }
         | FrontendRequest::PlanProject { .. }
+        | FrontendRequest::ReleaseHoldRun { .. }
         | FrontendRequest::ReleaseProject { .. }
         | FrontendRequest::RetryCiRemediation { .. }
         | FrontendRequest::RetryConflictResolution { .. }

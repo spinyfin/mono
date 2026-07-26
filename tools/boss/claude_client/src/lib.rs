@@ -70,18 +70,25 @@ pub const DEFAULT_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// Resolve an Anthropic API key from the environment.
 ///
 /// `override_env` is an optional per-feature env var name (e.g.
-/// `BOSS_MAGIC_WAND_API_KEY`, `BOSS_BACKSTOP_API_KEY`) that routes billing to a
-/// separate spend bucket. If it is set (even to an empty string, matching the
-/// prior `std::env::var(..).ok()` behaviour) its value wins; otherwise we fall
-/// back to [`DEFAULT_API_KEY_ENV`]. Returns `None` when neither is set.
+/// `BOSS_BACKSTOP_API_KEY`) that routes billing to a separate spend bucket. If
+/// it is set (even to an empty string, matching the prior
+/// `std::env::var(..).ok()` behaviour) its value wins; otherwise we fall back
+/// to [`DEFAULT_API_KEY_ENV`]. Returns `None` when neither is set.
+///
+/// Engine features no longer call this directly — they resolve endpoint, model
+/// and credential together through the `boss-engine-utility-model` seam, whose
+/// Anthropic provider calls [`resolve_api_key_from`] with an injected lookup.
+/// This env-reading wrapper remains the entry point for any caller that has no
+/// provider in hand.
 pub fn resolve_api_key(override_env: Option<&str>) -> Option<String> {
     resolve_api_key_from(override_env, DEFAULT_API_KEY_ENV, |name| std::env::var(name).ok())
 }
 
-/// Testable core of [`resolve_api_key`] with the environment lookup injected.
-/// Kept private; unit tests drive it with an in-memory map so key-precedence
-/// coverage never mutates the process environment.
-fn resolve_api_key_from(
+/// Testable core of [`resolve_api_key`] with the environment lookup injected,
+/// so key-precedence coverage never mutates the process environment. Public so
+/// the `boss-engine-utility-model` Anthropic provider can apply this exact
+/// precedence against its own lookup instead of re-deriving it.
+pub fn resolve_api_key_from(
     override_env: Option<&str>,
     default_env: &str,
     lookup: impl Fn(&str) -> Option<String>,

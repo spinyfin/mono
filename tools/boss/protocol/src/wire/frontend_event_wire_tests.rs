@@ -685,6 +685,19 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "run_stopped",
         },
         TagCase {
+            label: "RunHeld",
+            event: FrontendEvent::RunHeld {
+                run_id: "run_1".into(),
+                reason: Some("investigating".into()),
+            },
+            expected_tag: "run_held",
+        },
+        TagCase {
+            label: "RunHoldReleased",
+            event: FrontendEvent::RunHoldReleased { run_id: "run_1".into() },
+            expected_tag: "run_hold_released",
+        },
+        TagCase {
             label: "WorkerPaneFocused",
             event: FrontendEvent::WorkerPaneFocused {
                 run_id: "run_1".into(),
@@ -1225,6 +1238,29 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "worker_context_result",
         },
         TagCase {
+            label: "PrStatusResult",
+            event: FrontendEvent::PrStatusResult {
+                status: PrStatusView::builder()
+                    .pr_url("https://github.com/example/repo/pull/1")
+                    .mergeable("mergeable")
+                    .merge_state_status("CLEAN")
+                    .head_sha("abc123")
+                    .observed_at("1747000000")
+                    .build(),
+            },
+            expected_tag: "pr_status_result",
+        },
+        TagCase {
+            label: "PrBodyResult",
+            event: FrontendEvent::PrBodyResult {
+                body: PrBodyView::builder()
+                    .pr_url("https://github.com/example/repo/pull/1")
+                    .body("## Summary\n...")
+                    .build(),
+            },
+            expected_tag: "pr_body_result",
+        },
+        TagCase {
             label: "WorkerTierDenied",
             event: FrontendEvent::WorkerTierDenied {
                 denial: WorkerTierDenial::redirect(
@@ -1616,6 +1652,15 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "automation_state_result",
         },
+        TagCase {
+            label: "DispatchConcurrencyResult",
+            event: FrontendEvent::DispatchConcurrencyResult {
+                limit: 8,
+                max: 16,
+                clamped_from: None,
+            },
+            expected_tag: "dispatch_concurrency_result",
+        },
     ]
 }
 
@@ -1679,6 +1724,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProbeReplied { .. }
         | FrontendEvent::ProbeDeliveryEscalated { .. }
         | FrontendEvent::RunStopped { .. }
+        | FrontendEvent::RunHeld { .. }
+        | FrontendEvent::RunHoldReleased { .. }
         | FrontendEvent::WorkerPaneFocused { .. }
         | FrontendEvent::WorkerInputSent { .. }
         | FrontendEvent::WorkerPaneInterrupted { .. }
@@ -1738,6 +1785,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }
         | FrontendEvent::WorkerContextResult { .. }
+        | FrontendEvent::PrStatusResult { .. }
+        | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }
@@ -1754,6 +1803,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsListLiveResult { .. }
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
+        | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }

@@ -73,7 +73,10 @@ pub(super) async fn handle_get_worker_context(ctx: Dispatch, req: FrontendReques
 /// `WorkItem::Chore` are plain [`Task`] rows — an execution never resolves
 /// to a bare product or project, so those variants are treated as an
 /// internal-consistency failure rather than given their own bundle shape.
-fn own_task(work_db: &WorkDb, work_item_id: &str) -> Result<Task> {
+///
+/// `pub(super)`: reused by `app::pr_status`, which is attributed and scoped
+/// identically (own task lookup off the caller's attributed work item).
+pub(super) fn own_task(work_db: &WorkDb, work_item_id: &str) -> Result<Task> {
     match work_db.get_work_item(work_item_id)? {
         WorkItem::Task(task) | WorkItem::Chore(task) => Ok(task),
         item @ (WorkItem::Product(_) | WorkItem::Project(_)) => {

@@ -126,3 +126,76 @@ fn claude_dir_for_appends_dot_claude() {
     let dir = claude_dir_for(Path::new("/some/workspace"));
     assert_eq!(dir, PathBuf::from("/some/workspace/.claude"));
 }
+
+/// Call-site cutover acceptance: `write_workspace_files` must invoke the
+/// *passed* driver's trait methods (config_dir, agent_rules_preamble,
+/// progress_observation_wiring), not hardcode Claude's. A stub registered
+/// with a non-`.claude` config dir proves the registry-resolved driver is
+/// load-bearing on this call path.
+#[test]
+fn write_workspace_files_uses_resolved_non_claude_driver() {
+    use crate::driver::test_support::{StubDriver, stub_descriptor};
+    use crate::driver::{Capability, CapabilitySet};
+
+    let _shared = lock_shared_settings_dir();
+    let _home = HomeGuard::new();
+    let dir = TempDir::new().unwrap();
+    let input = WorkerSetupInput {
+        run_id: "run-stub".into(),
+        lease_id: "lease-stub".into(),
+        workspace_path: dir.path().to_path_buf(),
+        events_socket_path: PathBuf::from("/tmp/events.sock"),
+        boss_event_path: PathBuf::from("/tmp/boss-event"),
+        draft_pr_mode: false,
+        execution_kind: "chore_implementation".into(),
+        task_kind: Some("chore".into()),
+        worker_kind: WorkerKind::Standard,
+    };
+
+    let mut descriptor = stub_descriptor();
+    descriptor.name = "stub-codex";
+    descriptor.config_dir = ".stub";
+    descriptor.agent_rules_filename = "AGENTS.md";
+    let driver = StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn]));
+
+    let written = write_workspace_files(&input, &driver).unwrap();
+
+    // Config dir and rules file come from the stub's descriptor, not Claude's.
+    assert_eq!(
+        written.claude_md_path,
+        dir.path().join(".stub").join("AGENTS.md"),
+        "agent-rules path must use the resolved driver's config_dir + filename",
+    );
+    assert!(written.claude_md_path.exists());
+    assert!(!dir.path().join(".claude").join("CLAUDE.md").exists());
+
+    let rules = std::fs::read_to_string(&written.claude_md_path).unwrap();
+    assert!(
+        rules.contains("stub-driver preamble"),
+        "agent-rules must include the stub's preamble, not Claude's; got: {rules:?}",
+    );
+
+    // StdoutJsonl ingress → no Claude boss-event lifecycle hooks. An empty
+    // PreToolUse array may still be present (interception layer inserts the
+    // key before extending); the seven Claude lifecycle events must not be.
+    let settings: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&written.settings_path).unwrap()).unwrap();
+    let hooks = settings
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .cloned()
+        .unwrap_or_default();
+    for claude_lifecycle in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+        "SessionEnd",
+    ] {
+        assert!(
+            !hooks.contains_key(claude_lifecycle),
+            "stub StdoutJsonl driver must not emit Claude lifecycle hook {claude_lifecycle}, got: {hooks:?}",
+        );
+    }
+}

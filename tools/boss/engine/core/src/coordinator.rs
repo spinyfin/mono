@@ -2,22 +2,24 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{
     EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus,
 };
 use tokio::process::Command;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use crate::config::RuntimeConfig;
 use crate::conflict_diagnosis;
 use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
+use crate::dispatch_inflight::InflightDispatches;
 use crate::host_adapter::{HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider};
 use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
@@ -204,31 +206,37 @@ pub const MAX_REVIEW_POOL_SIZE: usize = 8;
 /// contention when many PRs land simultaneously.
 pub const DEFAULT_REVIEW_POOL_SIZE: usize = 8;
 
-/// TEMPORARY hard cap on concurrently-live INTERACTIVE ("normal") pool
-/// workers — a *row dispatched from* the automation or review pool is never
-/// held by this gate; those pools' own sizes govern their own home-pool
-/// dispatch. That is NOT the same as saying automation never counts toward
-/// the number this cap compares against: `busy_count()` counts every claimed
+/// Default (and compile-time floor) for the interactive-pool concurrency
+/// cap on concurrently-live INTERACTIVE ("normal") pool workers — a *row
+/// dispatched from* the automation or review pool is never held by this
+/// gate; those pools' own sizes govern their own home-pool dispatch. That
+/// is NOT the same as saying automation never counts toward the number
+/// this cap compares against: `busy_count()` counts every claimed
 /// `worker_pool` slot, and a spilled automation run (one that overflowed its
 /// full home pool onto a Lower Decks interactive slot via `claim_worker_spill`)
 /// IS one of those slots, so it DOES count against this cap. That is a
 /// deliberate policy choice, not an oversight: counting spilled automation
-/// keeps the cap's load-bearing promise (never more than
-/// `MAX_CONCURRENT_INTERACTIVE_WORKERS` live interactive-pool workers, spilled
-/// automation included) intact, while the once-per-pass automation-preemption
-/// fallback in `drain_ready_queue` is what keeps mainline from starving behind
-/// spilled automation at the cap — a preemption is a trade (one live worker
-/// for another), so it can reclaim a slot from spilled automation without
-/// ever pushing the live count past the cap. The interactive pool has 16
-/// slots across two pages (Bridge Crew + Lower Decks), but the 2026-07-15
-/// full-fleet saturation experiment (22 live workers, load average ~152)
-/// pushed individual task times past an hour and broke pane spawn acks, so
-/// dispatch is held to one page's worth — the pre-Lower-Decks size — even
-/// though all 16 slots exist. Deliberately hardcoded per operator directive
-/// until remote workers / the dynamic pane-budget model land (see
-/// docs/designs/fleet-scaling-dynamic-panes-and-team-semantics.md); enforced
-/// in `drain_ready_queue`, deliberately NOT in `claim_worker_force` (an
-/// explicit operator `bossctl agents launch` may exceed the cap).
+/// keeps the cap's load-bearing promise (never more than the configured cap
+/// of live interactive-pool workers, spilled automation included) intact,
+/// while the once-per-pass automation-preemption fallback in
+/// `drain_ready_queue` is what keeps mainline from starving behind spilled
+/// automation at the cap — a preemption is a trade (one live worker for
+/// another), so it can reclaim a slot from spilled automation without ever
+/// pushing the live count past the cap. The interactive pool has 16 slots
+/// across two pages (Bridge Crew + Lower Decks); the 2026-07-15 full-fleet
+/// saturation experiment (22 live workers, load average ~152) pushed
+/// individual task times past an hour and broke pane spawn acks, which is
+/// why dispatch defaults to one page's worth — the pre-Lower-Decks size —
+/// even though all 16 slots exist.
+///
+/// The live cap is settable at runtime via
+/// [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+/// (`bossctl dispatch concurrency --set N`) and persisted in `state.db`, so
+/// it survives an engine restart. This constant is the value the coordinator
+/// seeds itself with at construction and the value tests get unless they
+/// override it. Any live value is clamped to `[1, MAX_WORKER_POOL_SIZE]` —
+/// enforced in `drain_ready_queue`, deliberately NOT in `claim_worker_force`,
+/// where an explicit `bossctl agents launch` may exceed the cap.
 pub const MAX_CONCURRENT_INTERACTIVE_WORKERS: usize = 8;
 
 /// Worker ID prefix for automation-pool slots. Distinct from the main-pool
@@ -256,12 +264,42 @@ pub(crate) use boss_protocol::EXECUTION_KIND_PR_REVIEW;
 /// returned and the engine was awaiting it unboundedly. With this
 /// timeout the engine surfaces a `cube_workspace_lease_failed` event
 /// and either falls back or fails cleanly within seconds.
-const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Raised 30s → 90s as an explicit stopgap, NOT as a fix. The real bound
+/// belongs to cube and now lives there: `cube workspace lease` caps its
+/// pre-claim health scan by probe count and by wall clock, so lease latency
+/// no longer grows with the size of the free pool. This engine-side number
+/// is only the outer backstop for the remaining tail — the `jj workspace
+/// add` + setup-step provisioning path, ~6s nominal but network- and
+/// host-load-dependent. A lease that takes longer than 90s is a cube bug to
+/// be fixed in cube; do not keep raising this number in its place.
+const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Same upper bound for `cube repo ensure`. `ensure_repo` is normally
 /// fast (it's an idempotent record lookup), but the same hang class
 /// applies if cube wedges, so we time-bound it too.
 const CUBE_REPO_ENSURE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Ceiling on how many handed-off dispatches may run their slow tail
+/// (`cube repo ensure` → workspace lease → `goto` → `change create`)
+/// concurrently.
+///
+/// `drain_ready_queue` hands each claimed row off to its own task so one slow
+/// item can't head-of-line block the backlog behind it (a 2026-07-15
+/// incident: a resumed 40-minute backlog drained at ~1/minute against ample
+/// free slots, because every row waited out the row before it hitting a 30-60s
+/// cube timeout).
+///
+/// The real bound on concurrent dispatches is the worker pools: a row is only
+/// handed off *after* it claims a slot, so the three pools' combined hard caps
+/// already cap in-flight dispatches. This constant is deliberately derived from
+/// those caps rather than picked independently, so it is a backstop against
+/// unbounded task spawning (a future hand-off path that forgets to claim first)
+/// and NOT a pacing mechanism. Picking a smaller round number would make the
+/// semaphore bind during exactly the workload this change exists to fix —
+/// draining a large backlog into a fully free pool — quietly reintroducing the
+/// head-of-line blocking one permit-width at a time.
+const MAX_INFLIGHT_DISPATCHES: usize = MAX_WORKER_POOL_SIZE + MAX_AUTOMATION_POOL_SIZE + MAX_REVIEW_POOL_SIZE;
 
 /// Backoff delays between successive pre-start retry attempts. Element N
 /// is the sleep before attempt N+2 (the first retry, the second retry, …).
@@ -923,6 +961,10 @@ impl CubeClient for CommandCubeClient {
 #[derive(Debug, Clone)]
 pub struct WorkerPool {
     inner: Arc<Mutex<WorkerPoolInner>>,
+    /// Slot count, fixed at construction (slots are only ever claimed or
+    /// released, never added or removed). Cached outside the mutex so
+    /// [`WorkerPool::capacity_sync`] can be read without an `await`.
+    len: usize,
 }
 
 #[derive(Debug)]
@@ -1038,8 +1080,17 @@ impl WorkerPool {
             })
             .collect();
         Self {
+            len: clamped,
             inner: Arc::new(Mutex::new(WorkerPoolInner { workers })),
         }
+    }
+
+    /// Slot count, without locking. Equivalent to `capacity().await` but
+    /// usable from sync callers (e.g. clamping a requested concurrency cap
+    /// against the live pool size without threading `async` through every
+    /// caller of [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]).
+    pub fn capacity_sync(&self) -> usize {
+        self.len
     }
 
     /// Claim an idle worker for `execution_id`. Selection is deterministic and
@@ -1551,6 +1602,17 @@ impl DispatchPauseOrigin {
     }
 }
 
+/// Result of a successful [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+/// call. `applied` is the value actually stored; `clamped_from` is `Some(requested)`
+/// when the caller's request was above [`MAX_WORKER_POOL_SIZE`] and got rounded
+/// down, so the RPC/CLI layer can surface a clear message rather than
+/// pretending the request was honored verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetConcurrencyCapOutcome {
+    pub applied: usize,
+    pub clamped_from: Option<usize>,
+}
+
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 pub struct ExecutionCoordinator {
@@ -1588,6 +1650,22 @@ pub struct ExecutionCoordinator {
     /// scheduling starts.
     #[builder(default = Arc::new(NoopDispatchEventSink))]
     dispatch_events: Arc<dyn DispatchEventSink>,
+    /// Dispatches handed off by `drain_ready_queue` that have not yet reached
+    /// `start_execution_run_on_host` (the point where the DB starts reporting
+    /// them `running`).
+    ///
+    /// The chain single-writer guard and the double-spawn guard both read
+    /// liveness from `work_executions.status`, which cannot see a dispatch
+    /// that is still resolving its lease. When the drain loop awaited each
+    /// dispatch inline, the DB was a complete picture by construction; with
+    /// concurrent hand-off it no longer is, and the guards union it with this
+    /// registry to stay correct. See [`crate::dispatch_inflight`].
+    #[builder(default)]
+    inflight_dispatches: InflightDispatches,
+    /// Permits bounding concurrent handed-off dispatch tails to
+    /// [`MAX_INFLIGHT_DISPATCHES`].
+    #[builder(default = Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)))]
+    dispatch_slots: Arc<Semaphore>,
     /// `true` while a `run_scheduler` task is alive. `kick()` returns
     /// without spawning when this is already set; the alive scheduler
     /// is responsible for noticing the wakeup via `scheduling_pending`.
@@ -1603,6 +1681,24 @@ pub struct ExecutionCoordinator {
     /// fresh `ready` executions stranded with no scheduler running.
     #[builder(default)]
     scheduling_pending: AtomicBool,
+    /// Engine event bus. `kick()` publishes `Event::DispatchReady` onto it
+    /// when [`Self::enable_dispatch_ready_bus`] is on; otherwise it goes
+    /// unused. Defaults to a fresh, subscriber-less bus so every existing
+    /// constructor and test needs no changes — publishing to a bus with no
+    /// subscribers is simply a no-op fan-out.
+    #[builder(default = Arc::new(EventBus::new()))]
+    event_bus: Arc<EventBus>,
+    /// Kill-switch for routing `kick()` through [`Self::event_bus`] instead
+    /// of latching `scheduling_pending`/`scheduling_active` directly. OFF by
+    /// default — see [`crate::config::DEFAULT_ENABLE_DISPATCH_READY_BUS`].
+    /// Seeded once at construction from `WorkConfig::enable_dispatch_ready_bus`
+    /// via [`Self::set_enable_dispatch_ready_bus`] (a boot-time setting, not a
+    /// live-toggle — unlike `dispatch_paused`, nothing flips this after
+    /// startup); `app.rs` also gates [`Self::spawn_dispatch_ready_subscriber`]
+    /// on this same flag so a bus-routed `kick()` always has a live
+    /// subscriber whenever it's on.
+    #[builder(default)]
+    enable_dispatch_ready_bus: bool,
     /// Repo origin URLs the cold-pool probe has already inspected in
     /// this engine's lifetime. The probe runs once per URL on the
     /// first successful `ensure_repo` for that URL; subsequent
@@ -1700,13 +1796,16 @@ pub struct ExecutionCoordinator {
     #[builder(default = Mutex::new(HashMap::new()))]
     refused_workspaces: Mutex<HashMap<String, Vec<String>>>,
     /// Ceiling used by the interactive-pool concurrency cap in
-    /// `drain_ready_queue`. Defaults to [`MAX_CONCURRENT_INTERACTIVE_WORKERS`];
-    /// tests that exercise automation spillover/preemption in isolation from
-    /// that unrelated, temporary cap raise it via
-    /// [`Self::with_max_concurrent_interactive_workers`] so the two features
-    /// don't collide at small pool sizes.
-    #[builder(default = MAX_CONCURRENT_INTERACTIVE_WORKERS)]
-    max_concurrent_interactive_workers: usize,
+    /// `drain_ready_queue`. Defaults to [`MAX_CONCURRENT_INTERACTIVE_WORKERS`].
+    /// Live-settable via [`Self::set_max_concurrent_interactive_workers`]
+    /// (an `AtomicUsize` so it can change on a shared `&self`, mirroring
+    /// `dispatch_paused`); `app.rs` seeds it from `state.db` at startup and
+    /// `bossctl dispatch concurrency --set N` changes it at runtime. Tests
+    /// that exercise automation spillover/preemption at small pool sizes
+    /// raise it via [`Self::with_max_concurrent_interactive_workers`] so the
+    /// cap doesn't collide with the path under test.
+    #[builder(default = AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS))]
+    max_concurrent_interactive_workers: AtomicUsize,
 }
 
 mod config;

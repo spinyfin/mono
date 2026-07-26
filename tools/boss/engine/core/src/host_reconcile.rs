@@ -180,6 +180,17 @@ async fn drain_execution(
     }
     outcome.reaped += 1;
 
+    // Host-offline reconciliation termination path: tear down any
+    // driver-owned state outside the workspace. `mark_execution_orphaned`
+    // preserves `workspace_path`, so the pre-call `execution` snapshot is
+    // still current.
+    crate::driver_teardown::teardown_driver_workspace(
+        work_db,
+        &execution.id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
+
     // Preserve the automation-triage open-task-recovery bookkeeping the
     // other reap paths do, so a triage that produced a task before its host
     // was disabled is recorded honestly rather than as a silent drop.
@@ -734,7 +745,7 @@ mod tests {
         // terminal executions to be one away from tripping the guard.
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..(crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
-            db.insert_terminal_execution_for_test(&wi, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&wi, "chore_implementation", "orphaned", now_epoch - i)
                 .unwrap();
         }
 

@@ -205,6 +205,8 @@ impl WorkerCompletionHandler {
         // count so a later unrelated nudge cycle starts clean.
         self.nudge_breaker.forget(execution_id);
         self.build_wait_tracker.forget(execution_id);
+        self.background_children_tracker.forget(execution_id);
+        self.hold_registry.release(execution_id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -372,11 +374,33 @@ impl WorkerCompletionHandler {
         }
 
         // Followups: any completing implementation worker may surface
-        // out-of-scope follow-on work. PRIMARY: the engine-owned
-        // structured-output artifact (a `FollowupEntry` JSON array). FALLBACK:
-        // a `FOLLOWUPS:` block scraped from the transcript tail. A no-op (no
-        // artifact / no transcript / no block) when absent; idempotent across
-        // re-runs via the store's content dedup.
+        // out-of-scope follow-on work. PRIMARY (design implementation task
+        // 10): a `followup_task` proposal — `boss propose followup-task`
+        // already upserted the member into the `followup` attention group
+        // synchronously at submission time
+        // (`crate::work::proposal_apply::stage_followup_task_in_transaction`),
+        // for each follow-up submitted that way. LEGACY (counted fallback for
+        // whatever a proposal did not already cover, or unconditionally when
+        // the seam is off): the engine-owned structured-output artifact (a
+        // `FollowupEntry` JSON array), falling back to a `FOLLOWUPS:` block
+        // scraped from the transcript tail, and finally the
+        // `attentions_followups_backstop` LLM pass. A no-op (no artifact / no
+        // transcript / no block) when absent; idempotent across re-runs via
+        // the store's content dedup.
+        //
+        // Follow-ups are inherently multi-item — the prompt sanctions a
+        // worker mixing channels within one run (e.g. `boss propose
+        // followup-task` for item 1, then falling back to the artifact for
+        // item 2 if the CLI call fails) — so unlike the worker-signal /
+        // deferred-scope seams, this is NOT a single execution-scoped
+        // skip-or-run gate: [`WorkDb::reconcile_attentions`]' member-level
+        // `content_key` dedup (keyed on `proposed_name` for the `followup`
+        // kind) already runs against every existing member of the group,
+        // proposal-staged members included, so the legacy chain always runs
+        // and lands only the entries a proposal did not already stage —
+        // exactly the "filter to uncovered entries" behaviour, driven off
+        // the same group the proposal path writes into rather than a
+        // separate in-memory predicate.
         //
         // Skipped for `design_postmortem`: its worker prompt never asks for
         // a `FollowupEntry`-shaped artifact (only the stronger
@@ -384,6 +408,8 @@ impl WorkerCompletionHandler {
         // find nothing (or, if reusing the same artifact path, fail to
         // parse it as `FollowupEntry` and log spurious noise).
         if !is_design_postmortem {
+            let followup_proposals_first = self.feature_flags.is_enabled("worker_proposals")
+                && self.feature_flags.is_enabled("followup_proposals_seam");
             let transcript_path = self.work_db.transcript_path_for_execution(execution_id).ok().flatten();
             let followups_result = attentions_detector::reconcile_task_followups(
                 &self.work_db,
@@ -394,6 +420,11 @@ impl WorkerCompletionHandler {
             )
             .await;
             if let Some((ref group, ref created)) = followups_result {
+                if followup_proposals_first {
+                    for _ in created {
+                        self.record_followup_fallback_hit(&completion.execution, "reconcile_task_followups");
+                    }
+                }
                 self.publish_attentions_created(group, created).await;
             } else if self.feature_flags.is_enabled("attentions_followups_backstop") {
                 // Primary found no FOLLOWUPS: block; fall back to the supervisor
@@ -406,14 +437,20 @@ impl WorkerCompletionHandler {
                 )
                 .await
                 {
+                    if followup_proposals_first {
+                        for _ in &created {
+                            self.record_followup_fallback_hit(&completion.execution, "attentions_followups_backstop");
+                        }
+                    }
                     self.publish_attentions_created(&group, &created).await;
                 }
             }
         }
-        // Reap the engine-owned followups artifact regardless of outcome (it
-        // lives in the system temp dir, but delete eagerly rather than waiting
-        // on OS reaping).
-        crate::structured_output::clear(&self.structured_output_dir, execution_id);
+        // Reap every engine-owned structured-output artifact this execution
+        // produced (followups, PR URL) regardless of outcome — they live in
+        // the system temp dir, but delete eagerly rather than waiting on OS
+        // reaping.
+        crate::structured_output::clear_all(&self.structured_output_dir, execution_id);
 
         if merged {
             tracing::info!(

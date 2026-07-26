@@ -1,0 +1,16 @@
+[package]
+name = "boss-engine-recovery"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+anyhow = { workspace = true }
+boss-log-files = { path = "../../log-files" }
+boss-protocol = { path = "../../protocol" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

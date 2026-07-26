@@ -137,6 +137,7 @@ impl CompiledDocStructureConfig {
                         line: Some((block.start_line + offset + 1) as u32),
                         column: Some(1),
                     }),
+                    surface: None,
                     remediations: vec![
                         "Markdown folds consecutive single-newline lines into one paragraph. Put metadata \
                          (Date, Task/provenance, related work items) in a bullet list or table immediately \
@@ -181,6 +182,7 @@ impl CompiledDocStructureConfig {
                 line: Some((first_paragraph.start_line + 1) as u32),
                 column: Some(1),
             }),
+            surface: None,
             remediations: vec![
                 "Keep the opening paragraph after the title to 2-3 short sentences. Move framing, method, \
                  and findings into their own sections below, separated by blank lines."

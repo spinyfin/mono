@@ -3,8 +3,8 @@
 
 use super::attention::BlockedSignal;
 use super::common::{
-    EffortLevel, default_human_actor, default_priority, default_true, default_unknown_created_via, is_false,
-    short_id_label,
+    EffortLevel, ReasoningMode, default_human_actor, default_priority, default_true, default_unknown_created_via,
+    is_false, short_id_label,
 };
 use super::execution::ExecutionStatus;
 use super::project::ProjectDesignDocState;
@@ -110,6 +110,14 @@ pub struct CreateChoreInput {
     #[builder(default = true)]
     pub autostart: bool,
 
+    /// See [`Task::deferred`]. When `true`, the chore is filed as
+    /// future/not-yet-in-scope: the engine parks it (no auto-minted
+    /// `ready` execution on any path) until a human explicitly approves
+    /// it. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
+
     /// See [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
     #[builder(default)]
@@ -141,6 +149,10 @@ pub struct CreateChoreInput {
     /// See [`CreateTaskInput::model_override`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// See [`CreateTaskInput::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// See [`CreateTaskInput::driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -190,6 +202,11 @@ pub struct CreateInvestigationInput {
     #[builder(default = true)]
     pub autostart: bool,
 
+    /// See [`Task::deferred`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
+
     #[serde(default)]
     #[builder(default)]
     pub force_duplicate: bool,
@@ -206,6 +223,12 @@ pub struct CreateInvestigationInput {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// See [`CreateTaskInput::reasoning`]. Omitted → seeded to
+    /// `investigation` by [`ReasoningMode::default_for`], since
+    /// `kind = investigation` is investigation-shaped by definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// See [`CreateTaskInput::driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,6 +280,11 @@ pub struct CreateTaskInput {
     #[builder(default = true)]
     pub autostart: bool,
 
+    /// See [`Task::deferred`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
+
     /// Bypass the recent-duplicate guard. When `true`, the engine skips
     /// the 60-second same-name/same-product duplicate check and inserts
     /// a second row unconditionally. Intended as a CLI escape hatch for
@@ -289,6 +317,16 @@ pub struct CreateTaskInput {
     /// resolves per design §Q3 precedence. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// What kind of thinking this work needs, independent of how big it is.
+    /// Set `Investigation` when the brief requires diagnosing or designing
+    /// something before any code change — that is a *capability* request, and
+    /// inflating `effort_level` to reach a stronger model instead lies about
+    /// the size. `None` → the engine seeds one from `kind` + `effort_level`
+    /// via [`ReasoningMode::default_for`] at insert time, so the stored row
+    /// always carries an explicit value. See [`Task::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// Explicit driver override. `None` → resolve via
     /// `product.default_driver` → `"claude"`. Stored verbatim.
@@ -403,6 +441,47 @@ impl std::fmt::Display for TaskKind {
     }
 }
 
+impl ReasoningMode {
+    /// The reasoning mode to stamp on a **newly created** row whose caller did
+    /// not name one explicitly. Lives here rather than in `common.rs` because
+    /// it is keyed off [`TaskKind`].
+    ///
+    /// This is a *seed*, not a dispatch rule: it runs once at insert time and
+    /// the stored value is what the dispatcher reads afterwards, so a later
+    /// `--effort` change never silently re-models the row. Rows created before
+    /// the column existed keep `NULL` and are resolved by the dispatcher's
+    /// legacy path instead (see `boss_engine_effort::resolve_spawn_config`) —
+    /// this function is deliberately never used to fill in a `NULL` at
+    /// dispatch time.
+    ///
+    /// Two rules, in order:
+    ///
+    /// 1. **Design-family kinds** (`design`, `investigation`,
+    ///    `design_postmortem`) are investigation-shaped by definition: the
+    ///    deliverable *is* the thinking. This mirrors the model floor the
+    ///    dispatcher already applied to these kinds before the column existed.
+    /// 2. **`effort = max`** seeds `Investigation` as well. `max` is
+    ///    documented as the human-only escape hatch for "Claude's maximum
+    ///    reasoning depth regardless of what the scope markers suggest" (see
+    ///    [`EffortLevel`]) — its meaning was always about capability, not
+    ///    size, so honouring it here preserves what operators who type
+    ///    `--effort max` have always got. It is only a default: an explicit
+    ///    `--reasoning standard` on a `max` row still wins.
+    ///
+    /// Everything else — the bulk of Boss's throughput — seeds `Standard`.
+    pub fn default_for(kind: &TaskKind, effort_level: Option<EffortLevel>) -> ReasoningMode {
+        let design_family = matches!(
+            kind,
+            TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem
+        );
+        if design_family || effort_level == Some(EffortLevel::Max) {
+            ReasoningMode::Investigation
+        } else {
+            ReasoningMode::Standard
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]
 #[builder(on(String, into))]
 pub struct Task {
@@ -421,6 +500,29 @@ pub struct Task {
     #[serde(default = "default_true")]
     #[builder(default = true)]
     pub autostart: bool,
+
+    /// Durable classification marking this work item as **deferred /
+    /// future scope** — filed now but explicitly not yet in scope to run.
+    ///
+    /// Distinct from [`autostart`](Self::autostart) (a one-shot
+    /// dispatch-*timing* pause) and from `status` (lifecycle position): a
+    /// deferred item is still auto-unblocked and made schedulable by the
+    /// dependency cascade — it reaches `todo` and stays visible on the
+    /// board — but the engine never *mints a `ready` execution* for it on
+    /// any automatic path (normal reconcile, dependency auto-unblock, or
+    /// automation retry). It becomes eligible only when a human explicitly
+    /// approves it: an explicit `RequestExecution` (`bossctl work start` /
+    /// a kanban drag-to-Doing) clears this flag as the approval, mirroring
+    /// `autostart`'s single-shot clear, and `boss task update --deferred
+    /// false` clears it directly. Existing rows from before this column
+    /// was introduced default to `false`.
+    ///
+    /// Not to be confused with the transient `deferred_scope` *attention*
+    /// item (the AI `[deferred-scope]` marker) — that is per-execution
+    /// telemetry; this is a durable per-row property.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
 
     /// Every active block reason currently in flight on this work
     /// item — the multi-signal companion to the scalar
@@ -628,11 +730,43 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_queue_detail: Option<String>,
 
+    /// Raw GitHub mergeability at last poll, independent of CI/review/merge-
+    /// queue state. One of `"mergeable"` (GitHub's `mergeable=MERGEABLE`),
+    /// `"conflicting"` (`mergeable=CONFLICTING` — the PR cannot be merged as
+    /// its head currently stands), or `"unknown"` (GitHub is still computing
+    /// mergeability, typically right after a base-branch move). `None` until
+    /// the merge poller has performed at least one successful probe on an
+    /// open PR.
+    ///
+    /// This is the only mergeability-derived signal on `Task` — unlike
+    /// `ci_required_state`, it says nothing about CI. A card can be
+    /// `merge_queue_state = Some("auto_merge_enabled")` (CI passing, auto-merge
+    /// armed) while this reads `"conflicting"`: that combination means "GitHub
+    /// will merge the moment the conflict clears," not "safe to merge now,"
+    /// and client badge logic must check both before claiming mergeability
+    /// (T3271 / mono#2303 — a card previously rendered a green "mergeable"
+    /// checkmark derived from CI alone while GitHub reported the PR
+    /// CONFLICTING).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_mergeable_state: Option<String>,
+
     /// Explicit model slug override. `None` → resolve via the design's
     /// Q3 precedence (effort default → product default → engine default).
     /// Stored verbatim — the engine does not validate the slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// What *kind of thinking* this work item needs, independent of how big
+    /// it is (`effort_level`). See [`ReasoningMode`].
+    ///
+    /// `None` means the row was never classified — every row created before
+    /// this column existed, plus any insert path that does not seed it. Those
+    /// rows keep their pre-existing dispatch behaviour: the dispatcher falls
+    /// through to the design-family kind floor and then the effort-level
+    /// table, exactly as it did before. New rows are seeded at insert time by
+    /// [`ReasoningMode::default_for`] or by an explicit `--reasoning` flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// Explicit agent driver override. `None` → resolve via
     /// `product.default_driver` → engine default (`"claude"`).
@@ -733,6 +867,29 @@ pub struct Task {
     #[builder(default)]
     pub ai_reviewing: bool,
 
+    /// `true` when this is a Review-lane card waiting on *the operator* and
+    /// nothing else — it could be reviewed and merged right now. All of:
+    /// `status == "in_review"` with a `pr_url` set, `blocked_reason` is
+    /// `None` (no blocked pill / merge-conflict lock), `has_in_progress_revision`
+    /// is `false` (no `in revision` badge), `ci_required_state ==
+    /// Some("success")` (a still-running or unknown CI state is NOT ready —
+    /// there is nothing to merge yet), and `pr_mergeable_state ==
+    /// Some("mergeable")` (not conflicting with the base branch).
+    ///
+    /// This is a derived projection set by the engine's `get_work_tree`
+    /// path (not a stored DB column), computed straight from the same
+    /// polled PR facts (`ci_required_state`, `pr_mergeable_state`) that
+    /// back the CI/mergeability indicators — deliberately NOT derived from
+    /// `blocked_reason`/`status` alone, which only reflect the last
+    /// reconciliation pass over those facts and can lag a fresher poll.
+    /// Because those facts are themselves refreshed by the periodic merge
+    /// poller (`merge_poller::sweep`), this field can be stale by up to one
+    /// poll interval — the same staleness window every other PR-state
+    /// affordance on the card already has.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub ready_for_review: bool,
+
     /// Resolved doc-link state for a **project-less** docs-backed work
     /// item — chiefly `kind = 'investigation'`. Parity with the design
     /// card's doc-link icon, which is resolved from the parent
@@ -787,6 +944,16 @@ pub struct Task {
     /// `dispatch_failed_reason`. `None` whenever that field is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_failed_at: Option<String>,
+
+    /// Free-form operator/agent labels on this leaf work item (task, chore,
+    /// revision, design, investigation, …). Ordered, de-duplicated at write
+    /// time. Empty when none are set. Owned by the leaf row that owns the
+    /// kanban card — revisions do **not** inherit parent tags. Caps:
+    /// [`crate::WORK_ITEM_TAG_MAX_LEN`] chars per tag,
+    /// [`crate::WORK_ITEM_TAG_MAX_COUNT`] tags per item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub tags: Vec<String>,
 }
 
 impl Task {

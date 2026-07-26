@@ -1291,7 +1291,7 @@ fn migration_from_pre_v4_adds_deps_table_and_actor_columns() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "28");
+    assert_eq!(version, "29");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1408,7 +1408,7 @@ fn migration_adds_created_via_with_unknown_default() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "28");
+    assert_eq!(version, "29");
     let _ = std::fs::remove_file(path);
 }
 
@@ -1452,7 +1452,7 @@ fn fresh_init_includes_tasks_repo_remote_url() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "28");
+    assert_eq!(version, "29");
 
     let _ = std::fs::remove_file(path);
 }
@@ -1522,7 +1522,7 @@ fn migration_from_v4_adds_tasks_repo_remote_url() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(version, "28");
+    assert_eq!(version, "29");
 
     let _ = std::fs::remove_file(path);
 }
@@ -2083,6 +2083,58 @@ fn blocking_a_running_dependent_cancels_its_execution() {
             .unwrap()
             .is_none(),
         "a blocked task must have no live execution",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Companion to [`blocking_a_running_dependent_cancels_its_execution`]:
+/// the block-cancel it exercises must also publish `ExecutionTerminal`
+/// for the reaped execution, same as every other terminal-write producer.
+#[tokio::test]
+async fn blocking_a_running_dependent_publishes_execution_terminal() {
+    let path = temp_db_path("block-running-dependent-publishes-terminal");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let prereq = create_test_chore_manual(&db, product.id.clone(), "Prereq");
+    let dependent = create_test_chore(&db, product.id.clone(), "Already running dependent");
+
+    let execution = create_ready_chore_execution(&db, dependent.id.clone());
+    db.start_execution_run(
+        &execution.id,
+        "la-forge",
+        "mono",
+        "lease-1",
+        "mono-agent-006",
+        "/tmp/mono-agent-006",
+    )
+    .unwrap();
+
+    let mut sub = db.event_bus().subscribe(boss_event_bus::TopicFilter::kind(
+        boss_event_bus::EventKind::ExecutionTerminal,
+    ));
+
+    let (_edge, reaped) = db
+        .add_dependency_with_worker_reconcile(AddDependencyInput {
+            dependent: dependent.id.clone(),
+            prerequisite: prereq.id.clone(),
+            relation: None,
+        })
+        .unwrap();
+    let reaped = reaped.expect("blocking a running dependent must report the cancelled execution");
+
+    let event = sub
+        .recv()
+        .await
+        .expect("ExecutionTerminal published after the block-cancel");
+    assert_eq!(
+        event,
+        Event::ExecutionTerminal {
+            execution_id: reaped.id.clone(),
+            task_id: dependent.id.clone(),
+            host_id: "local".to_owned(),
+            pool_claim: None,
+        }
     );
 
     let _ = std::fs::remove_file(path);

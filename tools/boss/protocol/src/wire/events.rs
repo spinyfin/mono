@@ -299,6 +299,20 @@ pub enum FrontendEvent {
     RunStopped {
         run_id: String,
     },
+    /// Engine acknowledges a [`FrontendRequest::HoldRun`] — the run is
+    /// now exempt from the idle-park and auto-reap sweeps. `reason`
+    /// echoes back whatever the caller supplied, if any.
+    RunHeld {
+        run_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// Engine acknowledges a [`FrontendRequest::ReleaseHoldRun`] — the
+    /// idle-park/auto-reap sweeps' normal behavior is restored for the
+    /// run.
+    RunHoldReleased {
+        run_id: String,
+    },
     /// Engine acknowledges a focus request — the worker pane has
     /// been raised in the macOS app. Carries the resolved `slot_id`
     /// so the caller (e.g. `bossctl agents focus`) can confirm which
@@ -871,6 +885,17 @@ pub enum FrontendEvent {
     WorkerContextResult {
         bundle: Box<WorkerContextBundle>,
     },
+    /// Reply for [`FrontendRequest::GetPrStatus`]: the caller's own PR's
+    /// mergeability as Boss last observed it (or, with `refresh: true` and
+    /// budget available, a fresh on-demand probe).
+    PrStatusResult {
+        status: PrStatusView,
+    },
+    /// Reply for [`FrontendRequest::GetPrBody`]: the caller's own PR's body
+    /// as Boss snapshotted it at the start of this execution's run.
+    PrBodyResult {
+        body: PrBodyView,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)
@@ -984,6 +1009,19 @@ pub enum FrontendEvent {
     /// no-op).
     PrReconcilersKicked {
         kicked: bool,
+    },
+    /// Response to [`FrontendRequest::SetDispatchConcurrency`] and
+    /// [`FrontendRequest::GetDispatchConcurrency`]. `limit` is the current
+    /// effective interactive-pool concurrency cap; `max` is the hard
+    /// ceiling (`MAX_WORKER_POOL_SIZE`) any requested value clamps to.
+    /// `clamped_from` is `Some(requested)` when the most recent `Set` call
+    /// asked for more than `max` and got rounded down; always `None` on a
+    /// `Get` or an unclamped `Set`.
+    DispatchConcurrencyResult {
+        limit: usize,
+        max: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clamped_from: Option<usize>,
     },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state

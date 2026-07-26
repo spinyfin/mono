@@ -151,7 +151,7 @@ pub async fn run_one_pass(
 
     for work_item_id in candidates {
         // Churn guard: count terminal executions in the trailing window.
-        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff) {
+        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff, None) {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -171,9 +171,15 @@ pub async fn run_one_pass(
                 "orphan sweep: churn guard tripped; skipping redispatch — human attention required",
             );
             let failing_ids = work_db
-                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff)
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, None)
                 .unwrap_or_default();
-            work_db.file_churn_guard_parked_attention(&work_item_id, "orphan_sweep", recent_terminal, &failing_ids);
+            work_db.file_churn_guard_parked_attention(
+                &work_item_id,
+                "orphan_sweep",
+                recent_terminal,
+                &failing_ids,
+                "terminal executions",
+            );
             outcome.churn_skipped += 1;
             continue;
         }
@@ -437,7 +443,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
@@ -465,7 +471,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "orphaned", now_epoch - i)
                 .unwrap();
         }
 

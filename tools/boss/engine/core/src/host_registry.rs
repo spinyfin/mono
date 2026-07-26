@@ -7,8 +7,10 @@
 /// on every engine startup via `uname` + `gh auth status`.
 use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
+use boss_event_bus::Event;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 
 use crate::work::WorkDb;
@@ -200,7 +202,20 @@ pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<
 /// Probe the local host and return `(capability, source)` pairs. Every
 /// returned row has `source = "auto"`. Failures for individual probes
 /// are logged and skipped; the remainder still land.
+///
+/// Cached process-wide: `uname` + `gh auth status` are stable for the
+/// life of an engine process (design: probe once at startup). Without
+/// the cache, every fresh `WorkDb::open` / schema-template init re-ran
+/// the full probe — and `gh auth status` alone was ~0.7s against a real
+/// `gh` (network + keychain). That cost was paid once per unit test that
+/// opened a WorkDb, dominating suites that open many databases.
 fn discover_local_capabilities() -> Vec<(String, String)> {
+    static CACHED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CACHED.get_or_init(discover_local_capabilities_uncached).clone()
+}
+
+/// Uncached probe body. See [`discover_local_capabilities`].
+fn discover_local_capabilities_uncached() -> Vec<(String, String)> {
     let mut caps: Vec<(String, String)> = Vec::new();
 
     // OS family
@@ -229,13 +244,14 @@ fn discover_local_capabilities() -> Vec<(String, String)> {
 
     // gh auth state (per design open-question: catches credential drift
     // hours earlier than waiting for a `gh pr create` failure in a worker)
-    let gh_authed = std::process::Command::new("gh")
-        .args(["auth", "status"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    // `gh auth status` validates the token against the API, so it spends
+    // from the same shared budget as everything else and goes through the
+    // instrumented spawn rather than a bare `Command`.
+    let gh_authed = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::HOST_REGISTRY, || {
+        boss_github::gh_runner::gh_output_blocking(&["auth", "status"])
+    })
+    .map(|out| out.status.success())
+    .unwrap_or(false);
     caps.push((format!("gh-authed={gh_authed}"), "auto".to_owned()));
 
     caps
@@ -332,12 +348,23 @@ impl WorkDb {
 
     pub fn set_host_enabled(&self, id: &str, enabled: bool) -> Result<()> {
         let conn = self.connect()?;
+        let was_enabled: Option<bool> = conn
+            .query_row("SELECT enabled FROM hosts WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?;
         let n = conn.execute(
             "UPDATE hosts SET enabled = ?1 WHERE id = ?2",
             params![enabled as i64, id],
         )?;
         if n == 0 {
             bail!("host '{}' not found", id);
+        }
+        // Publish only on a genuine true → false transition — an explicit
+        // re-disable of an already-disabled host (or an enable call) is not
+        // a new "host disabled" fact and must not re-fire the event, so
+        // future idempotent subscribers (e.g. `host_reconcile`) don't
+        // re-terminalize executions that were already handled.
+        if !enabled && was_enabled == Some(true) {
+            self.event_bus().publish(Event::HostDisabled { host_id: id.to_owned() });
         }
         Ok(())
     }
@@ -384,10 +411,20 @@ impl WorkDb {
         if failures >= HOST_HEALTH_FAILURE_THRESHOLD {
             let reason =
                 format!("auto-disabled after {failures} consecutive dispatch failures; last error: {error_text}");
+            let was_enabled: Option<bool> = conn
+                .query_row("SELECT enabled FROM hosts WHERE id = ?1", params![id], |row| row.get(0))
+                .optional()?;
             conn.execute(
                 "UPDATE hosts SET enabled = 0, last_error_text = ?1 WHERE id = ?2",
                 params![reason, id],
             )?;
+            // Same true → false transition guard as `set_host_enabled`: a
+            // host already sitting disabled that keeps failing (or that a
+            // human explicitly disabled) must not re-publish on every
+            // subsequent failed dispatch attempt.
+            if was_enabled == Some(true) {
+                self.event_bus().publish(Event::HostDisabled { host_id: id.to_owned() });
+            }
             return Ok(HostHealthOutcome::AutoDisabled {
                 consecutive_failures: failures,
             });
@@ -627,10 +664,13 @@ fn pragma_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
 // ordering test.
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::test_support::insert_host_capability;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
+
+    use boss_event_bus::{EventKind, TopicFilter};
+
+    use super::*;
+    use crate::test_support::insert_host_capability;
 
     fn open_db() -> WorkDb {
         WorkDb::open(PathBuf::from(":memory:")).expect("open in-memory work db")
@@ -774,6 +814,51 @@ mod tests {
         assert!(db.get_host("zakalwe").unwrap().unwrap().enabled);
     }
 
+    #[tokio::test]
+    async fn set_host_enabled_publishes_host_disabled_on_true_to_false() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let event = sub.recv().await.expect("HostDisabled published on disable");
+        assert_eq!(
+            event,
+            Event::HostDisabled {
+                host_id: "zakalwe".to_owned()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn set_host_enabled_does_not_republish_when_already_disabled() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("re-disabling an already-disabled host must not republish");
+    }
+
+    #[tokio::test]
+    async fn set_host_enabled_does_not_publish_on_enable() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.set_host_enabled("zakalwe", false).unwrap();
+
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+        db.set_host_enabled("zakalwe", true).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("re-enabling a host must not publish HostDisabled");
+    }
+
     // ── record_host_dispatch_failure / _success ─────────────────────────────
 
     #[test]
@@ -861,6 +946,36 @@ mod tests {
                 .unwrap()
                 .contains("command not found: cube")
         );
+    }
+
+    #[tokio::test]
+    async fn record_host_dispatch_failure_publishes_host_disabled_once_at_threshold() {
+        let db = open_db();
+        db.add_host("anaplian", "user@a", 3, &[]).unwrap();
+        let mut sub = db.event_bus().subscribe(TopicFilter::kind(EventKind::HostDisabled));
+
+        for _ in 1..HOST_HEALTH_FAILURE_THRESHOLD {
+            db.record_host_dispatch_failure("anaplian", "boom").unwrap();
+        }
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no HostDisabled before the threshold trips");
+
+        db.record_host_dispatch_failure("anaplian", "boom").unwrap();
+        let event = sub.recv().await.expect("HostDisabled published once the breaker trips");
+        assert_eq!(
+            event,
+            Event::HostDisabled {
+                host_id: "anaplian".to_owned()
+            }
+        );
+
+        // A further failure against an already-disabled host must not
+        // republish.
+        db.record_host_dispatch_failure("anaplian", "boom again").unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
+            .await
+            .expect_err("no repeat HostDisabled while already disabled");
     }
 
     #[test]

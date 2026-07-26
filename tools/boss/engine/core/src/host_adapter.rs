@@ -34,8 +34,8 @@ use crate::cube_commands::CubeJsonTransport;
 use crate::host_registry::Host;
 use crate::remote_wrapper::remote_wrapper_path;
 use crate::runner::{
-    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, bazel_prepush_gate_text, compose_worker_spawn,
-    work_item_name, work_item_task_kind,
+    ComposedWorkerSpawn, ExecutionRunner, RunOutcome, RunWaitState, WorkerSpawnOpts, bazel_prepush_gate_text,
+    compose_worker_spawn, work_item_name, work_item_task_kind,
 };
 use crate::ssh_spawn::{
     REASON_WORKER_LAUNCH_FAILED, RemoteSpawnPlan, perform_remote_launch, remote_events_socket_path,
@@ -681,19 +681,26 @@ impl HostAdapter for SshHostAdapter {
             work_item,
             workspace_path,
             cube_change_id,
-            // Editorial controls and the worker-proposal-seam prompt gate both
+            // Editorial controls and every worker-proposal-seam prompt gate
             // default OFF on the remote path: SshHostAdapter does not hold a
             // FeatureFlagsStore (its `cfg` is "not yet read"; see struct
-            // docs), so this hardcodes `false` regardless of the engine's own
-            // (local) read of `worker_signal_proposals_seam` — the remote
-            // worker always gets the legacy `[blocked]` / `[effort-escalation]`
-            // marker text, even when the engine's read path is
-            // proposals-first. That marker then always counts as a fallback
-            // hit in `worker_proposals.fallback_hit.*` — see the caveat on
-            // those counters' declaration in `completion.rs` before using them
-            // as an exit criterion. Wire feature flags into the remote path
+            // docs), so these all hardcode `false` regardless of the
+            // engine's own (local) read of `worker_signal_proposals_seam` /
+            // `deferred_scope_proposals_seam` / `followup_proposals_seam` —
+            // the remote worker always gets the legacy marker/artifact text,
+            // even when the engine's read path is proposals-first. That
+            // marker/artifact then always counts as a fallback hit in
+            // `worker_proposals.fallback_hit.*` — see the caveat on those
+            // counters' declaration in `completion.rs` before using them as
+            // an exit criterion. Wire feature flags into the remote path
             // alongside the cross-host config work (PR3/PR4).
-            (false, self.cfg.work.max_review_embed_diff_lines, false),
+            WorkerSpawnOpts {
+                editorial_enabled: false,
+                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
+                worker_signal_proposals_seam_enabled: false,
+                deferred_scope_proposals_seam_enabled: false,
+                followup_proposals_seam_enabled: false,
+            },
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
@@ -722,7 +729,14 @@ impl HostAdapter for SshHostAdapter {
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
         };
-        let settings_json = render_remote_settings_json(&settings_input);
+        // Resolve the same driver `compose_worker_spawn` already validated
+        // against the registry — settings wiring (ProgressObservation +
+        // ToolUseInterception) must come from that driver, not a hardcoded
+        // Claude reference.
+        let driver = crate::driver::DriverRegistry::default()
+            .require(&spawn_config.driver)
+            .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
+        let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
         // 5. Ship the prompt + settings to the remote. The prompt lives
         //    under `<workspace>/.boss/` (read by the wrapper via
@@ -791,6 +805,7 @@ impl HostAdapter for SshHostAdapter {
             run_id = %run_id,
             remote_pid = ?outcome.remote_pid,
             model = %spawn_config.model,
+            reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
         );
 

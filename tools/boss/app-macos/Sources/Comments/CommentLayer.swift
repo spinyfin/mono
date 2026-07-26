@@ -564,11 +564,11 @@ final class CommentLayer: NSObject, ObservableObject {
         comments[index].intentOverriddenByUser = true
 
         // Mirrors the engine posting an `entry_kind='nudge'` thread entry
-        // immediately on directive/larger_change classification (design §
+        // immediately on `revision` classification (design §
         // "Buckets 1 & 3 — unified"), before `[Revise]` is ever clicked.
         // One-shot: a comment already carrying a nudge entry doesn't get a
         // second one on reclassification.
-        if intent == .directive || intent == .largerChange {
+        if intent == .revision {
             // Mirrors the engine's re-home (`override_comment_intent`): the
             // bucket-2 statuses only make sense for a question, so a comment
             // reclassified onto the revise track returns to `.active`
@@ -681,18 +681,18 @@ final class CommentLayer: NSObject, ObservableObject {
     /// `CommentsBannerState` fetched alongside `reload()`. Artifact-less
     /// fallback (no engine to fetch from): derived locally from `comments`,
     /// mirroring the RPC's own `revisable` rule (at least one active
-    /// directive/larger_change comment to batch).
+    /// `revision` comment to batch).
     var bannerState: CommentsBannerState {
         if let fetchedBannerState { return fetchedBannerState }
         let unresolvedCount = comments.filter {
-            $0.status == .active && ($0.intent == .directive || $0.intent == .largerChange)
+            $0.status == .active && $0.intent == .revision
         }.count
         let inRevisionCount = comments.filter { $0.status == .inRevision }.count
         return CommentsBannerState(revisable: unresolvedCount > 0, unresolvedCount: unresolvedCount, inRevisionCount: inRevisionCount)
     }
 
     /// The `[Revise]`-banner action: batch-address every unaddressed
-    /// directive/larger_change comment. Engine-backed: calls the real
+    /// `revision` comment. Engine-backed: calls the real
     /// `CommentsReviseDoc` RPC. On success the engine flips the addressed
     /// comments to `in_revision` and publishes a `comment_topic`
     /// invalidation, which reloads this layer with the real task id — no
@@ -707,7 +707,7 @@ final class CommentLayer: NSObject, ObservableObject {
             return
         }
         let indices = comments.indices.filter {
-            comments[$0].status == .active && (comments[$0].intent == .directive || comments[$0].intent == .largerChange)
+            comments[$0].status == .active && comments[$0].intent == .revision
         }
         guard !indices.isEmpty else { return }
         revisionCounter += 1

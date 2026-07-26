@@ -1,0 +1,28 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Under the operator decision recorded in this doc, Codex carries Boss's command guardrails on its own PreToolUse hook -- the same mechanism the Claude path uses today -- and the PATH-shim relocation becomes a follow-on project rather than a prerequisite. That decision leaves exactly one consequence needing a call: Codex's inline `gh --body \"...\"` editorial rewrite is unreachable (updatedInput requires permissionDecision:allow, which Codex rejects), so the design handles it by DENYING with a reason telling the worker to re-issue with --body-file. The safety property holds -- unreviewed prose still never reaches GitHub -- at the cost of one agent round-trip, and worker rules already forbid inline --body. Approve deny-instead-of-rewrite for the Codex editorial path?",
+    "anchor": "the-editorial-case-precisely"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Codex's --json event stream carries no schema version, and re-running this analysis across 0.137.0 -> 0.145.0 found the drift is real rather than hypothetical: a removed flag that would have made the design's prescribed launch command fail outright, an added `usage` field, a changed item-ID base, a second meaning for `error` items, four new TurnItem variants, and a new hook event -- none of them announced on the wire, across eight minor versions. How should agent-CLI versions be managed?",
+    "choices": [
+      "Pin the tested Codex version, add --strict-config for the config half, and gate upgrades on the conformance harness",
+      "Track latest; rely on the conformance harness to catch breakage after the fact",
+      "Pin both Codex and Claude Code versions under one policy",
+      "Defer the decision until after Phase 1 acceptance (T-23)"
+    ],
+    "anchor": "oq-2"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Confirm that the Codex hook trust-provisioning spike (T-01) gates the FIRST Codex worker, not just Phase 2? The operator decision makes hooks Codex's guardrail carrier, which is what promoted this from informational to load-bearing: hooks demonstrably fire on 0.145.0 and a PreToolUse deny genuinely blocks pre-execution, but an untrusted hook (and a hook whose command is missing) is skipped in complete silence, so the guarantee rests entirely on Boss provisioning `trusted_hash` deterministically AND being able to observe a hook that did not run. T-01 is `small` and replaces the withdrawn 'PATH shims must land first' constraint. If T-01 finds trust cannot be provisioned deterministically, the fallback is promoting the PATH-shim project back ahead of Codex -- a scope call that would come back to you.",
+    "anchor": "oq-1-hook-trust-provisioning"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Confirm that triage and answer-agent kinds stay refused for Codex indefinitely via KindRequirements? They are blocked on transcript-scraping contracts (parse_triage_decision, and UserPromptSubmit-based delivery confirmation), not on guardrails. Rewriting those contracts to be file-based would unblock them and would arguably make triage MORE reliable than it is on Claude today, but that is a separate project.",
+    "anchor": "which-work-item-kinds-are-codex-eligible"
+  }
+]

@@ -18,6 +18,7 @@ mod leaked_hooks;
 mod path_guard;
 mod pr_redirect_guard;
 mod pre_tool_use_composition;
+mod progress_ingress;
 mod remote;
 mod revision_guard;
 mod settings_hooks;

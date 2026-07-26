@@ -1,0 +1,7 @@
+.local-GhosttyKit.xcframework/
+.build/
+*.o
+ghosttykit_spike
+run_out/
+run_console.log
+build.log

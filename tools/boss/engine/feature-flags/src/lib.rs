@@ -95,10 +95,14 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
     FeatureFlagSpec {
         name: "editorial_controls",
         description: "Enable editorial controls for agent-authored PRs and GitHub comments: injects the \
-             [editorial-rules] block into worker prompts (T945), activates the PreToolUse hook \
-             on gh pr|issue calls (T946), and enables editorial_actions audit writes (T947). \
-             DEFAULT OFF — set to true to opt in. Kill switch: set to false to make every \
-             editorial surface a no-op without a rebuild.",
+             [editorial-rules] block into worker prompts, and gates the PreToolUse \
+             editorial evaluation path so `editorial_actions` audit rows are only written when \
+             this flag is on. Does NOT block or enforce anything — no PreToolUse \
+             hook currently blocks a gh pr|issue call, so a deny verdict is advisory only; \
+             building that enforcement is separate, deferred work. With the flag off there is \
+             no editorial telemetry at all. DEFAULT OFF — set to true to opt in. Kill switch: \
+             set to false to make every editorial surface (prompt injection and audit writes) \
+             a no-op without a rebuild.",
         category: "editorial",
         default_enabled: false,
         capability_id: None,
@@ -265,6 +269,47 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
              DEFAULT OFF: enable per operator once the proposal path is validated in staging. Kill switch: \
              set false to restore the pre-migration marker-only detection exactly.",
         category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "deferred_scope_proposals_seam",
+        description: "Read worker_proposals rows before falling back to the legacy [deferred-scope] \
+             marker parser in detect_and_record_deferred_scope (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, implementation task 9 — the \
+             deferred-scope seam migration, following the recipe `worker_signal_proposals_seam` \
+             established). When on, an execution that already carries a worker_proposals row of kind \
+             deferred_scope whose summary/reason match a detected marker skips that marker — \
+             SubmitProposal's synchronous apply pipeline already wrote the audit line and attention item \
+             at submission time, so re-parsing would just re-file the same event. When no such proposal \
+             exists, the legacy marker parser still runs exactly as before, and every time it does the \
+             worker_proposals.fallback_hit.deferred_scope counter increments and a WARN logs — the \
+             counter is this seam's explicit exit criterion for eventually deleting the marker parser. \
+             DEFAULT OFF: enable per operator once the proposal path is validated in staging. Kill \
+             switch: set false to restore the pre-migration marker-only detection exactly.",
+        category: "completion",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
+        name: "followup_proposals_seam",
+        description: "Read worker_proposals rows before falling back to the legacy structured-output-artifact / \
+             FOLLOWUPS: sentinel scrape and LLM extraction backstop in reconcile_task_followups (design: \
+             worker-proposal-api-replace-fragile-worker-to-engine-seams.md, implementation task 10 — the \
+             follow-ups seam migration, following the recipe `worker_signal_proposals_seam`/ \
+             `deferred_scope_proposals_seam` established). When on, an execution that already carries at \
+             least one worker_proposals row of kind followup_task skips the legacy artifact/sentinel scrape \
+             and the attentions_followups_backstop LLM pass entirely for that execution — \
+             stage_followup_task_in_transaction already upserted each proposed follow-up into the \
+             originating task's `followup` attention group synchronously at submission time (task 6), so \
+             re-scraping legacy sources would only produce redundant or conflicting members. When no \
+             followup_task proposal exists, the legacy chain still runs exactly as before, and every time it \
+             records a genuinely new follow-up the worker_proposals.fallback_hit.followup_task counter \
+             increments and a WARN logs — the counter is this seam's explicit exit criterion for eventually \
+             deleting the sentinel scrape and LLM backstop. DEFAULT OFF: enable per operator once the \
+             proposal path is validated in staging. Kill switch: set false to restore the pre-migration \
+             artifact/sentinel-only detection exactly.",
+        category: "attentions",
         default_enabled: false,
         capability_id: None,
     },
@@ -695,6 +740,54 @@ mod tests {
         let store2 = make_store(&tmp);
         store2.load().unwrap();
         assert!(store2.is_enabled("worker_signal_proposals_seam"));
+    }
+
+    #[test]
+    fn deferred_scope_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("deferred_scope_proposals_seam"),
+            "deferred_scope_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "deferred_scope_proposals_seam")
+            .expect("deferred_scope_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "completion");
+
+        store.set("deferred_scope_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("deferred_scope_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("deferred_scope_proposals_seam"));
+    }
+
+    #[test]
+    fn followup_proposals_seam_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("followup_proposals_seam"),
+            "followup_proposals_seam must default disabled"
+        );
+        let snap = store.snapshot_all(None);
+        let seam = snap
+            .iter()
+            .find(|s| s.name == "followup_proposals_seam")
+            .expect("followup_proposals_seam must be in registry");
+        assert!(!seam.default_enabled);
+        assert_eq!(seam.category, "attentions");
+
+        store.set("followup_proposals_seam", true).unwrap();
+        assert!(store.is_enabled("followup_proposals_seam"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("followup_proposals_seam"));
     }
 
     #[test]

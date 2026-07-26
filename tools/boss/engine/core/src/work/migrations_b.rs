@@ -12,6 +12,20 @@ pub(crate) fn migrate_tasks_autostart(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the `deferred` column to `tasks` for older databases. A deferred
+/// (future-scope) work item is auto-unblocked and made schedulable like
+/// any other, but the engine never mints a `ready` execution for it on an
+/// automatic path — it runs only after explicit human approval (see
+/// [`crate::work::exec_status_helpers::work_item_is_deferred`] and
+/// `reconcile_work_item_execution`). Older rows default to 0 so the
+/// historical "not future scope" behaviour is preserved across the upgrade.
+pub(crate) fn migrate_tasks_deferred(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "deferred")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN deferred INTEGER NOT NULL DEFAULT 0", [])?;
+    }
+    Ok(())
+}
+
 /// Add `last_status_actor` to `tasks` and `projects` so the engine
 /// can distinguish a status it set itself (`'engine'`) from one a
 /// human typed at the CLI / kanban (`'human'`). The dependencies
@@ -335,6 +349,28 @@ pub(crate) fn migrate_tasks_effort_and_model_columns(conn: &Connection) -> Resul
     }
     if !table_has_column(conn, "tasks", "model_override")? {
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `tasks.reasoning` — the capability signal (`standard` |
+/// `investigation`) that decides which model a row dispatches to, kept
+/// deliberately independent of `tasks.effort_level`'s size signal.
+///
+/// Nullable TEXT, and the NULL is load-bearing rather than incidental: it
+/// means "this row was never classified", and the dispatcher resolves those
+/// rows through exactly the path they used before this column existed (the
+/// design-family kind floor, then the effort-level table). So every row
+/// already in flight when this migration runs keeps its current model; only
+/// an explicit write changes one. There is no backfill for the same reason.
+///
+/// Constrained in code (see [`boss_protocol::ReasoningMode`]), not by a SQL
+/// `CHECK` — same rationale as [`migrate_tasks_effort_and_model_columns`]:
+/// the vocabulary lives in the engine, and extending it should never require
+/// a schema rebuild.
+pub(crate) fn migrate_tasks_reasoning_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "reasoning")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN reasoning TEXT", [])?;
     }
     Ok(())
 }
@@ -877,11 +913,11 @@ pub(crate) fn migrate_backfill_autostart_consumed(conn: &Connection) -> Result<(
 }
 
 /// Add `ci_required_state`, `review_required_state`, `ci_required_detail`,
-/// `review_required_detail`, `pr_state_polled_at`, and `merge_queue_state`
-/// columns to the `tasks` table. These are populated by the merge poller on
-/// every Review-lane sweep and surfaced to the macOS kanban as CI, review,
-/// and merging indicators with tooltips. Idempotent — guarded by
-/// `tasks_has_column`.
+/// `review_required_detail`, `pr_state_polled_at`, `merge_queue_state`, and
+/// `pr_mergeable_state` columns to the `tasks` table. These are populated by
+/// the merge poller on every Review-lane sweep and surfaced to the macOS
+/// kanban as CI, review, merging, and mergeability indicators with tooltips.
+/// Idempotent — guarded by `tasks_has_column`.
 pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
     for (column, ddl) in [
         (
@@ -908,6 +944,10 @@ pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
             "merge_queue_state",
             "ALTER TABLE tasks ADD COLUMN merge_queue_state TEXT",
         ),
+        (
+            "pr_mergeable_state",
+            "ALTER TABLE tasks ADD COLUMN pr_mergeable_state TEXT",
+        ),
     ] {
         if !table_has_column(conn, "tasks", column)? {
             conn.execute(ddl, [])?;
@@ -928,6 +968,64 @@ pub(crate) fn migrate_pr_poll_state_columns(conn: &Connection) -> Result<()> {
 pub(crate) fn migrate_tasks_merge_queue_detail_column(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "tasks", "merge_queue_detail")? {
         conn.execute("ALTER TABLE tasks ADD COLUMN merge_queue_detail TEXT", [])?;
+    }
+    Ok(())
+}
+
+/// Add `tasks.pr_merge_state_status` and `tasks.pr_head_sha` — two fields
+/// the merge poller's `gh pr view` probe already fetches every sweep
+/// (`PrLifecycleProbe::raw_merge_state_status` / `head_ref_oid`) but
+/// previously discarded after routing the CI/conflict/merge-queue
+/// dispatch decision. Persisting them costs no additional GitHub call —
+/// see `sweep::update_pr_poll_state`, which now writes both alongside the
+/// existing `pr_mergeable_state` write.
+///
+/// `pr_merge_state_status` is GitHub's raw `mergeStateStatus` enum
+/// (`"CLEAN"`, `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`,
+/// `"UNKNOWN"`) — distinct from `pr_mergeable_state`, which is Boss's own
+/// normalized `mergeable`/`conflicting`/`unknown` derived from GitHub's
+/// separate `mergeable` field. `pr_head_sha` is the PR's `headRefOid` at
+/// last poll. Both back `boss pr status` (`app::pr_status`), which reads
+/// them as the "Boss already observed this" snapshot instead of every
+/// worker re-fetching the same state via `gh pr view`.
+/// Idempotent — guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_pr_status_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "pr_merge_state_status",
+            "ALTER TABLE tasks ADD COLUMN pr_merge_state_status TEXT",
+        ),
+        ("pr_head_sha", "ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT"),
+        // `pr_status_observed_at`: the "last observed by anyone" timestamp
+        // `boss pr status` reports as `observed_at`, stamped by BOTH the
+        // merge poller sweep and a worker's `--refresh` call. Deliberately
+        // separate from `pr_state_polled_at`, which stays the poller's own
+        // liveness diagnostic (see `update_task_pr_poll_state`'s doc
+        // comment) — if a worker refresh could also advance
+        // `pr_state_polled_at`, a wedged poller with active worker refreshes
+        // would look alive when it isn't.
+        (
+            "pr_status_observed_at",
+            "ALTER TABLE tasks ADD COLUMN pr_status_observed_at TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+            if column == "pr_status_observed_at" {
+                // One-time backfill for engines upgrading from before this
+                // column existed: without it, every already-polled task
+                // would report `observed_at: null` from `boss pr status`
+                // until the merge poller's next sweep happens to touch that
+                // row — and rows the poller has stopped sweeping (merged,
+                // closed) would stay null indefinitely. `pr_state_polled_at`
+                // is the closest prior observation timestamp available.
+                conn.execute(
+                    "UPDATE tasks SET pr_status_observed_at = pr_state_polled_at \
+                     WHERE pr_status_observed_at IS NULL AND pr_state_polled_at IS NOT NULL",
+                    [],
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -1823,6 +1921,34 @@ pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> 
     Ok(())
 }
 
+/// Add `tasks.tags` — a JSON-encoded ordered list of free-form label
+/// strings rendered on kanban cards. Empty set is stored as `'[]'`.
+/// Caps enforced at the write path (`WORK_ITEM_TAG_MAX_LEN` /
+/// `WORK_ITEM_TAG_MAX_COUNT` in `boss_protocol`), not by SQL. Owned by
+/// the leaf row (revisions do not inherit parent tags). Idempotent —
+/// guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_tags_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "tags")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
+    }
+    Ok(())
+}
+
+/// One-time data migration: re-homes rows still carrying the retired
+/// `directive` / `larger_change` intent values onto the single
+/// `INTENT_REVISION` ("revision") value, so they keep matching
+/// `revisable_comment_predicate` (`intent = 'revision'`) rather than
+/// silently falling out of the `[Revise]` candidate pool. Data-only, no
+/// schema change. Idempotent: only rows still carrying one of the two
+/// retired values are touched, so a second run affects zero rows.
+pub(crate) fn migrate_collapse_directive_larger_change_intent(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "UPDATE work_comments SET intent = 'revision' WHERE intent IN ('directive', 'larger_change')",
+        [],
+    )?;
+    Ok(())
+}
+
 /// One-time data migration (Phase 2 task 2e, magic-wand removal, of
 /// `comment-triggered-document-revisions.md`): retires every `work_comments`
 /// row left in `status = 'dispatched'` by the now-deleted magic-wand
@@ -2218,5 +2344,68 @@ pub(crate) fn migrate_automation_runs_first_attempted_at_column(conn: &Connectio
     if !table_has_column(conn, "automation_runs", "first_attempted_at")? {
         conn.execute("ALTER TABLE automation_runs ADD COLUMN first_attempted_at TEXT", [])?;
     }
+    Ok(())
+}
+
+/// Create `github_api_calls`: one append-only row per GitHub API call the
+/// engine makes, with the caller subsystem, the API bucket, and the
+/// `rateLimit` reading the response carried.
+///
+/// This is the persistence half of the `gh` / GitHub API instrumentation.
+/// The in-memory counters (`github_api.*`, via the metrics framework)
+/// answer "how much, cumulatively"; these rows answer "how much, by whom,
+/// in which hour" — the question that could previously only be inferred
+/// from the handful of threshold-crossing log lines that fire when the
+/// remaining budget crosses the low-water mark.
+///
+/// ## Timestamps are INTEGER epoch milliseconds
+///
+/// Deliberately NOT the `TEXT` convention most tables here use, and
+/// deliberately not epoch seconds stored as a string — which is what
+/// `editorial_actions.created_at` does, where a natural-looking
+/// `created_at >= '2026-07-24'` filter silently returns zero rows instead
+/// of erroring. `started_at_ms` and `reset_at_ms` are INTEGER epoch
+/// milliseconds, so range filters and `strftime('%s', …)` conversions are
+/// unambiguous and a wrong-typed comparison fails loudly rather than
+/// quietly.
+///
+/// `points_cost` / `points_remaining` / `points_limit` are `NULL` when the
+/// response carried no reading (a REST call to an endpoint that omits the
+/// headers, a failed call, or a GraphQL query that didn't request the
+/// block) — distinguishable from a genuine zero, which matters when the
+/// zero means "budget exhausted".
+///
+/// Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`.
+pub(crate) fn migrate_github_api_calls_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS github_api_calls (
+             id               INTEGER PRIMARY KEY,
+             -- Epoch MILLISECONDS (integer), not a string. See the doc
+             -- comment on migrate_github_api_calls_table.
+             started_at_ms    INTEGER NOT NULL,
+             -- Subsystem that made the call ('merge_poller.sweep',
+             -- 'ci_watch', …), or 'unattributed' when no scope was active.
+             caller           TEXT NOT NULL,
+             -- 'graphql' | 'rest' | 'cli'. GraphQL and REST are metered
+             -- against separate hourly buckets and must not be summed.
+             api              TEXT NOT NULL,
+             verb             TEXT NOT NULL,
+             endpoint         TEXT NOT NULL,
+             -- 'ok' | 'error' | 'rate_limited'.
+             outcome          TEXT NOT NULL,
+             duration_ms      INTEGER NOT NULL,
+             -- GraphQL points this call cost (REST: 1 request). NULL when
+             -- the response carried no reading.
+             points_cost      INTEGER,
+             points_remaining INTEGER,
+             points_limit     INTEGER,
+             -- Epoch MILLISECONDS (integer) of the quota-window reset.
+             reset_at_ms      INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS github_api_calls_started_idx
+             ON github_api_calls(started_at_ms);
+         CREATE INDEX IF NOT EXISTS github_api_calls_caller_idx
+             ON github_api_calls(caller, started_at_ms);",
+    )?;
     Ok(())
 }

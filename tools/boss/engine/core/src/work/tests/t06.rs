@@ -1092,11 +1092,21 @@ fn create_revision_of_revision_gates_against_chain_root() {
     let checker_open = FakePrStateChecker::always(PrOpenState::Open);
     let r1 = db.create_revision(revision_input(&root_id), &checker_open).unwrap();
     assert_eq!(r1.kind, TaskKind::Revision);
+    assert_eq!(
+        r1.parent_task_id.as_deref(),
+        Some(root_id.as_str()),
+        "direct revision must parent to the chain root"
+    );
 
-    // R2: revision of R1 — gate should resolve to root's PR.
+    // R2: filed against R1 — gate still checks the root's PR, and the stored
+    // parent is the root (flat chain), not R1.
     let r2 = db.create_revision(revision_input(&r1.id), &checker_open).unwrap();
     assert_eq!(r2.kind, TaskKind::Revision);
-    assert_eq!(r2.parent_task_id.as_deref(), Some(r1.id.as_str()));
+    assert_eq!(
+        r2.parent_task_id.as_deref(),
+        Some(root_id.as_str()),
+        "revision filed against a revision must reparent to the chain root"
+    );
 
     // Now simulate the root's PR being closed; revising R1 should fail.
     let checker_closed = FakePrStateChecker::always(PrOpenState::ClosedUnmerged);
@@ -1730,4 +1740,154 @@ fn create_revision_skips_done_revision_as_tail() {
     let conn = db.connect().unwrap();
     let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
     assert!(prereqs.is_empty(), "no prerequisite edge when prior revision is done");
+}
+
+// ── flat revision chains under the original work item ────────────
+
+/// Manual create-revision against a prior revision must store
+/// `parent_task_id` as the chain root and surface under the root listing.
+#[test]
+fn create_revision_from_revision_parents_to_chain_root() {
+    let db = WorkDb::open(temp_db_path("rev-flat-manual")).unwrap();
+    let product_id = make_revision_product(&db, "flat-manual");
+    let pr_url = "https://github.com/spinyfin/mono/pull/4703";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let r1 = db.create_revision(revision_input(&root_id), &checker).unwrap();
+    let r2 = db.create_revision(revision_input(&r1.id), &checker).unwrap();
+
+    assert_eq!(r1.parent_task_id.as_deref(), Some(root_id.as_str()));
+    assert_eq!(
+        r2.parent_task_id.as_deref(),
+        Some(root_id.as_str()),
+        "manual create-revision --parent <revision> must reparent to chain root"
+    );
+
+    // Both appear in the root's revision listing (UI rollup model).
+    let listed = db.list_revisions(&product_id, None, false, Some(&root_id)).unwrap();
+    let listed_ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+    assert!(listed_ids.contains(&r1.id.as_str()), "r1 must appear under root");
+    assert!(listed_ids.contains(&r2.id.as_str()), "r2 must appear under root");
+
+    // Listing via the intermediate revision also resolves to the root chain.
+    let via_r1 = db.list_revisions(&product_id, None, false, Some(&r1.id)).unwrap();
+    assert_eq!(
+        via_r1.len(),
+        listed.len(),
+        "list_revisions --parent <revision> must return the full root chain"
+    );
+
+    // Sequencing still works: r2 is gated on r1.
+    {
+        let conn = db.connect().unwrap();
+        let prereqs = crate::work_dependencies::prerequisites_of(&conn, &r2.id, Some("blocks")).unwrap();
+        assert_eq!(prereqs.len(), 1);
+        assert_eq!(prereqs[0].prerequisite_id, r1.id);
+    }
+
+    // Work-tree projection assigns flat R1/R2 under the root.
+    let tree = db.get_work_tree(&product_id).unwrap();
+    let seq = |id: &str| tree.tasks.iter().find(|t| t.id == id).and_then(|t| t.revision_seq);
+    assert_eq!(seq(&r1.id), Some(1));
+    assert_eq!(seq(&r2.id), Some(2));
+}
+
+/// Automatic producers (PR-review path shape: parent = a revision,
+/// `created_via = pr_review:…`) share `create_revision` and must also
+/// land flat under the chain root.
+#[test]
+fn create_revision_pr_review_against_revision_parents_to_chain_root() {
+    let db = WorkDb::open(temp_db_path("rev-flat-pr-review")).unwrap();
+    let product_id = make_revision_product(&db, "flat-pr-review");
+    let pr_url = "https://github.com/spinyfin/mono/pull/3704";
+    let root_id = make_in_review_chore(&db, &product_id, pr_url);
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let r1 = db.create_revision(revision_input(&root_id), &checker).unwrap();
+
+    // Mirror finalize_passes: produce a revision with parent = the
+    // producing revision task and created_via = pr_review:<exec>.
+    let r2 = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(r1.id.clone())
+                .description("Address review findings")
+                .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_auto_3703"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+
+    assert_eq!(
+        r2.parent_task_id.as_deref(),
+        Some(root_id.as_str()),
+        "PR-review automatic revision against a revision must parent to the chain root"
+    );
+    assert!(
+        r2.created_via.starts_with(CREATED_VIA_PR_REVIEW_PREFIX),
+        "created_via provenance preserved"
+    );
+
+    let listed = db.list_revisions(&product_id, None, false, Some(&root_id)).unwrap();
+    let listed_ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+    assert!(listed_ids.contains(&r1.id.as_str()));
+    assert!(listed_ids.contains(&r2.id.as_str()));
+}
+
+/// Startup migration rewrites pre-existing nested revision parents to the
+/// chain root without touching status / identity.
+#[test]
+fn migrate_flatten_nested_revision_parents_repairs_chain() {
+    // disk path: re-open triggers migrations.
+    let (_dir, path) = disk_db_path("flatten-nested-revs");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product_id = make_revision_product(&db, "flatten-mig");
+    let root_id = make_chore_root(&db, &product_id, "root");
+
+    // Insert a nested chain directly (bypass create_revision) to simulate
+    // pre-flatten rows: root ← r1 ← r2 ← r3.
+    let r1_id = insert_revision_row(&db, &product_id, &root_id);
+    let r2_id = insert_revision_row(&db, &product_id, &r1_id);
+    let r3_id = insert_revision_row(&db, &product_id, &r2_id);
+
+    // Sanity: nested before migration re-run.
+    {
+        let conn = db.connect().unwrap();
+        let parent_of = |id: &str| -> String {
+            conn.query_row("SELECT parent_task_id FROM tasks WHERE id = ?1", [id], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(parent_of(&r1_id), root_id);
+        assert_eq!(parent_of(&r2_id), r1_id);
+        assert_eq!(parent_of(&r3_id), r2_id);
+    }
+    drop(db);
+
+    // Re-open re-runs migrations, including flatten.
+    let db = WorkDb::open(path).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        let parent_of = |id: &str| -> String {
+            conn.query_row("SELECT parent_task_id FROM tasks WHERE id = ?1", [id], |row| row.get(0))
+                .unwrap()
+        };
+        assert_eq!(parent_of(&r1_id), root_id, "r1 already under root");
+        assert_eq!(parent_of(&r2_id), root_id, "r2 reparented to root");
+        assert_eq!(parent_of(&r3_id), root_id, "r3 reparented to root");
+
+        // Status preserved (still todo from insert_revision_row).
+        let status: String = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [&r3_id], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "todo");
+    }
+
+    // Root listing now surfaces the whole chain.
+    let listed = db.list_revisions(&product_id, None, false, Some(&root_id)).unwrap();
+    let listed_ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(listed.len(), 3, "all three revisions under root after flatten");
+    assert!(listed_ids.contains(&r1_id.as_str()));
+    assert!(listed_ids.contains(&r2_id.as_str()));
+    assert!(listed_ids.contains(&r3_id.as_str()));
 }

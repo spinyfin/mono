@@ -5,7 +5,7 @@ use super::helpers::*;
 fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
     let mut input = sample_input();
     input.execution_kind = "revision_implementation".into();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
@@ -62,7 +62,7 @@ fn revision_implementation_adds_gh_pr_create_guard_to_pre_tool_use() {
 #[test]
 fn chore_implementation_has_pr_redirect_guard_but_no_revision_guard() {
     let input = sample_input(); // execution_kind: "chore_implementation"
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");
@@ -109,7 +109,7 @@ fn design_and_investigation_workers_carry_pr_redirect_guard() {
     for execution_kind in ["project_design", "investigation_implementation"] {
         let mut input = sample_input();
         input.execution_kind = execution_kind.into();
-        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .unwrap_or_else(|| panic!("{execution_kind}: PreToolUse must be an array"));
@@ -145,7 +145,7 @@ fn every_worker_blocks_launching_boss_in_pre_tool_use() {
     for kind in ["chore_implementation", "revision_implementation"] {
         let mut input = sample_input();
         input.execution_kind = kind.into();
-        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
         let pre = parsed["hooks"]["PreToolUse"]
             .as_array()
             .expect("PreToolUse must be an array");
@@ -195,7 +195,7 @@ fn revision_task_kind_adds_gh_pr_create_guard_even_with_wrong_execution_kind() {
     input.execution_kind = "task_implementation".into();
     input.task_kind = Some("revision".into());
 
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let pre = parsed["hooks"]["PreToolUse"]
         .as_array()
         .expect("PreToolUse must be an array");

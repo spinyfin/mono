@@ -24,7 +24,9 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::driver::ClaudeDriver;
+use std::sync::Arc;
+
+use crate::driver::{AgentDriver, Capability};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -52,8 +54,10 @@ const WORKER_SANITIZED_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/
 /// because we never set it explicitly here.
 const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     "BOSS_TASK_ID",
-    // Absolute path of the engine-owned structured-output artifact the worker
-    // writes (review findings / task followups). See `crate::structured_output`.
+    // Absolute paths of the engine-owned structured-output artifacts the
+    // worker writes: its designated payload (review findings / triage decision
+    // / followups) and the PR URL. See `crate::structured_output`.
+    "BOSS_PR_URL_OUTPUT",
     "BOSS_STRUCTURED_OUTPUT",
     "CUBE_LEASE_ID",
     "CUBE_REPO",
@@ -67,7 +71,9 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
-#[derive(Debug, Clone, bon::Builder)]
+// No `Debug` derive: `Arc<dyn AgentDriver>` is not `Debug`, and nothing
+// logs or asserts on a full `StartWorkerInput` dump.
+#[derive(Clone, bon::Builder)]
 #[builder(on(String, into))]
 pub struct StartWorkerInput {
     pub run_id: String,
@@ -119,8 +125,14 @@ pub struct StartWorkerInput {
     /// Worker kind — forwarded to `WorkerSetupInput` to select the per-kind
     /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
     /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
-    /// reviewer worker (task 3 of P992).
+    /// reviewer worker.
     pub worker_kind: WorkerKind,
+    /// Resolved agent driver for this worker. Production callers look the
+    /// slug up once via [`crate::driver::DriverRegistry::require`] and pass
+    /// the same `Arc` into provision, spawn, and this struct so every trait
+    /// method on the run goes through one object. Tests may pass any
+    /// registered (or stub) driver.
+    pub driver: Arc<dyn AgentDriver>,
 }
 
 #[derive(Debug)]
@@ -235,7 +247,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         task_kind: input.task_kind.clone(),
         worker_kind: input.worker_kind.clone(),
     };
-    let written = write_workspace_files(&setup, &ClaudeDriver).map_err(StartWorkerError::WriteFiles)?;
+    let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
 
     // 2. Build the SpawnWorkerPane request. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
@@ -342,7 +354,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // The subtle case is an **ack timeout** (`SendToAppError::Timeout`):
     // the request WAS delivered to the app, but no reply arrived within
     // the window. This is *ambiguous* — the app may already have hosted
-    // the pane (the T267 incident: post-sleep the app's RPC queue drained
+    // the pane (seen previously: post-sleep the app's RPC queue drained
     // slowly, the ack timed out, yet the `claude` process had started and
     // kept working). Treating that as a spawn failure releases the cube
     // lease out from under a live pane and re-dispatches a duplicate
@@ -421,13 +433,24 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    see "Spawning" with the launch-default model — no more
     //    "Claude Unknown" while we wait for SessionStart to fire.
     if let Some(live_states) = spawner.live_worker_state_registry() {
-        live_states.register_spawn(
+        // Ask the resolved driver, rather than assume: this derives the
+        // capability from the actual driver's declared capabilities and
+        // passes it straight into registration, so there is no window
+        // between spawn and a follow-up setter call where a concurrently
+        // delivered hook event would be evaluated against a stale default.
+        live_states.register_spawn_with_capabilities(
             slot_id,
             input.run_id.clone(),
             input.model,
             shell_pid,
             input.work_item_binding,
+            input.driver.capabilities().provides(Capability::AwaitingInputSignal),
         );
+        // Declare this slot's driver-reported progress fidelity so
+        // `stale_worker_sweep` judges cadence-based staleness against the
+        // driver that is actually running, not an assumed Claude rhythm
+        // (see `ProgressFidelity::stale_threshold_secs`).
+        live_states.set_progress_fidelity(slot_id, input.driver.progress_fidelity());
         spawner.publish_live_worker_states().await;
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down
@@ -512,6 +535,9 @@ mod tests {
             execution_kind: "chore_implementation".into(),
             task_kind: Some("chore".into()),
             worker_kind: WorkerKind::Standard,
+            driver: crate::driver::DriverRegistry::default()
+                .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+                .expect("engine default driver is always registered"),
         }
     }
 
@@ -541,6 +567,48 @@ mod tests {
         assert!(started.written_files.settings_path.exists());
         assert!(started.written_files.gitignore_path.exists());
         assert_eq!(registry.lookup(42_111).as_deref(), Some("run-test"));
+    }
+
+    /// Call-site cutover acceptance: `start_worker` must use the driver Arc
+    /// on `StartWorkerInput` for workspace-file wiring — a non-Claude stub
+    /// yields its own config_dir / preamble, not Claude's.
+    #[tokio::test]
+    async fn start_worker_uses_resolved_non_claude_driver_for_workspace_files() {
+        use crate::driver::test_support::{StubDriver, stub_descriptor};
+        use crate::driver::{Capability, CapabilitySet};
+
+        let workspace = TempDir::new().unwrap();
+        let spawner = StubSpawner {
+            registry: WorkerRegistry::new(),
+            spawn_calls: Arc::new(AtomicUsize::new(0)),
+            last_request: std::sync::Mutex::new(None),
+            canned_response: Ok(EngineToAppResponse::SpawnWorkerPane {
+                result: Ok(SpawnWorkerPaneResult {
+                    slot_id: 3,
+                    shell_pid: 99,
+                }),
+            }),
+        };
+
+        let mut descriptor = stub_descriptor();
+        descriptor.name = "stub-codex";
+        descriptor.config_dir = ".stub";
+        descriptor.agent_rules_filename = "AGENTS.md";
+        let mut input = sample_input(&workspace);
+        input.driver = Arc::new(StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn])));
+
+        let started = start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        assert_eq!(
+            started.written_files.claude_md_path,
+            workspace.path().join(".stub").join("AGENTS.md"),
+        );
+        let rules = std::fs::read_to_string(&started.written_files.claude_md_path).unwrap();
+        assert!(
+            rules.contains("stub-driver preamble"),
+            "start_worker must render the resolved driver's preamble, got: {rules:?}",
+        );
+        assert!(!workspace.path().join(".claude").join("CLAUDE.md").exists());
     }
 
     #[tokio::test]
@@ -858,9 +926,9 @@ mod tests {
         assert!(keys.contains(&"BOSS_TASK_ID"));
     }
 
-    /// T267 regression: a `SpawnWorkerPane` ack timeout must NOT surface
-    /// as a spawn failure. The app may have hosted the pane anyway (the
-    /// incident: a slow post-sleep RPC drain made the ack time out while
+    /// Regression test: a `SpawnWorkerPane` ack timeout must NOT surface
+    /// as a spawn failure. The app may have hosted the pane anyway (seen
+    /// previously: a slow post-sleep RPC drain made the ack time out while
     /// the `claude` process had already started). `start_worker` returns
     /// `Ok` with `ack_timed_out` set, `shell_pid = 0`, and the
     /// engine-claimed slot — and it registers the run→slot mapping so the

@@ -15,12 +15,24 @@ pub(crate) fn content_checksum(title: &str, body: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// What [`WorkDb::clear_execution_workspace`] cleared, returned so the
+/// caller can both release the cube lease and (separately) tear down any
+/// driver-owned state that lived outside the workspace.
+pub struct ClearedExecutionWorkspace {
+    /// The lease id the caller must release via the cube CLI.
+    pub lease_id: String,
+    /// `workspace_path` as it stood immediately before being nulled, for
+    /// driver-workspace teardown. `None` if the row never recorded one.
+    pub workspace_path: Option<String>,
+}
+
 impl WorkDb {
     /// Atomically null out `cube_lease_id`, `cube_workspace_id`, and
     /// `workspace_path` on `execution_id`. Returns the prior lease id
-    /// — `Some` means the caller is responsible for issuing the cube
-    /// `workspace release`, `None` means there was nothing to release
-    /// (already cleared by an earlier path or never leased).
+    /// (and the workspace path as it stood before clearing) — `Some`
+    /// means the caller is responsible for issuing the cube `workspace
+    /// release`, `None` means there was nothing to release (already
+    /// cleared by an earlier path or never leased).
     ///
     /// Used by the engine-side release path (manual chore-done update,
     /// `bossctl agents stop`) to claim ownership of the cube release
@@ -71,7 +83,11 @@ impl WorkDb {
         } else {
             false
         };
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        if cancelled {
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(cancelled)
     }
 
@@ -129,16 +145,20 @@ impl WorkDb {
             )?;
             affected > 0
         };
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        if exec_cancelled {
+            stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
+        }
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok((exec_cancelled, task_demoted))
     }
 
-    pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<String>> {
+    pub fn clear_execution_workspace(&self, execution_id: &str) -> Result<Option<ClearedExecutionWorkspace>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
         let prior = execution.cube_lease_id.clone();
-        if prior.is_some() {
+        if let Some(lease_id) = prior {
             tx.execute(
                 "UPDATE work_executions
                  SET cube_lease_id = NULL,
@@ -147,9 +167,15 @@ impl WorkDb {
                  WHERE id = ?1",
                 params![execution_id],
             )?;
+            tx.commit()?;
+            Ok(Some(ClearedExecutionWorkspace {
+                lease_id,
+                workspace_path: execution.workspace_path,
+            }))
+        } else {
+            tx.commit()?;
+            Ok(None)
         }
-        tx.commit()?;
-        Ok(prior)
     }
 
     /// Append an `effort_escalations` row recording a worker's
@@ -272,7 +298,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE work_item_id = ?1
              ORDER BY created_at DESC, id DESC
@@ -360,7 +386,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at
              FROM tasks
@@ -391,7 +417,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     external_ref_kind, external_ref_canonical_id, external_ref_raw,
                     external_ref_synced_at, external_ref_unbound_at
              FROM tasks
@@ -497,10 +523,11 @@ impl WorkDb {
                AND deleted_at IS NULL",
             params![work_item_id, now],
         )?;
+        let mut pending = PendingEvents::new();
         if n > 0 {
-            cascade_dependents_after_prereq_status_change(&tx, work_item_id, "done", &now)?;
+            cascade_dependents_after_prereq_status_change(&mut pending, &tx, work_item_id, "done", &now)?;
         }
-        tx.commit()?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
         Ok(n > 0)
     }
 

@@ -71,9 +71,20 @@ pub struct GhPrStateChecker;
 
 impl PrStateChecker for GhPrStateChecker {
     fn check(&self, pr_url: &str) -> Result<PrOpenState> {
-        let output = std::process::Command::new("gh")
-            .args(["pr", "view", pr_url, "--json", "state,mergedAt"])
-            .output()
+        // Via `gh_output_blocking` rather than a bare
+        // `Command::new("gh")`: this spends real quota from the shared
+        // token, and a raw spawn here would be invisible to the usage
+        // counter — precisely the kind of blind spot that made the
+        // GraphQL exhaustion unattributable.
+        //
+        // `_if_unattributed`, not a plain `scope_blocking`: this checker is
+        // also called from inside the merge poller's own sweep scope
+        // (`merge_poller.sweep`), whose label is the more specific one and
+        // must win rather than being overridden to `pr_state_check`.
+        let output =
+            boss_gh_telemetry::scope_blocking_if_unattributed(boss_gh_telemetry::callers::PR_STATE_CHECK, || {
+                boss_github::gh_runner::gh_output_blocking(&["pr", "view", pr_url, "--json", "state,mergedAt"])
+            })
             .with_context(|| format!("failed to run `gh pr view` for {pr_url}"))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -273,6 +284,29 @@ mod tests {
         assert_eq!(classify_pr_merge_state("OPEN", ""), PrMergeClass::Open);
         assert_eq!(classify_pr_merge_state("", ""), PrMergeClass::Open);
         assert_eq!(classify_pr_merge_state("SOMETHING_ELSE", ""), PrMergeClass::Open);
+    }
+
+    #[test]
+    fn checker_attribution_yields_to_an_active_merge_poller_sweep_scope() {
+        // GhPrStateChecker::check attributes its `gh` call via
+        // `scope_blocking_if_unattributed(PR_STATE_CHECK, ...)` rather than
+        // an unconditional `scope_blocking`, so a call issued from inside
+        // the sweep's own `merge_poller.sweep` scope stays billed to the
+        // sweep instead of being overridden to `pr_state_check`.
+        let observed = boss_gh_telemetry::scope_blocking(boss_gh_telemetry::callers::MERGE_POLLER_SWEEP, || {
+            boss_gh_telemetry::scope_blocking_if_unattributed(
+                boss_gh_telemetry::callers::PR_STATE_CHECK,
+                boss_gh_telemetry::current_caller,
+            )
+        });
+        assert_eq!(observed, boss_gh_telemetry::callers::MERGE_POLLER_SWEEP);
+
+        // Called with no ambient scope, it still self-attributes.
+        let observed = boss_gh_telemetry::scope_blocking_if_unattributed(
+            boss_gh_telemetry::callers::PR_STATE_CHECK,
+            boss_gh_telemetry::current_caller,
+        );
+        assert_eq!(observed, boss_gh_telemetry::callers::PR_STATE_CHECK);
     }
 
     #[test]

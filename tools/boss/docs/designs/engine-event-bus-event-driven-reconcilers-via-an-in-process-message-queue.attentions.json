@@ -1,0 +1,22 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Adopt \"publish-after-commit\" as the default producer convention (events fire only after the state-write transaction commits, and are dropped on rollback), with the existing dep-unblock in-transaction cascade as the one documented exception?",
+    "anchor": "chosen-approach"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Does the `PrReconcileRequested` topic + merge-poller targeted single-PR reconcile belong to THIS event-bus project, rather than to P856 (PR/CI/conflict state reconciliation)? A 'no' means we drop tasks touching that seam and defer them to P856.",
+    "anchor": "risks--open-questions"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the bus rollout be gated so a regression can be reverted instantly?",
+    "choices": [
+      "Per-loop feature flags (each converted loop independently toggleable) — most granular, recommended",
+      "One global event-bus feature flag (all-or-nothing)",
+      "No flag; rely on the retained sweep backstop alone"
+    ],
+    "anchor": "phased-low-risk-migration"
+  }
+]

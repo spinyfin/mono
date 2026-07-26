@@ -27,6 +27,32 @@ pub enum TrunkError {
     /// so callers must not retry this the way they would [`Self::Transport`].
     #[error("failed to decode trunk response: {0}")]
     Decode(String),
+    /// A 2xx response whose body isn't JSON at all — as opposed to
+    /// [`Self::Decode`], where the body parses as JSON but doesn't match
+    /// the expected shape. This is the case that used to surface as an
+    /// opaque `Decode("expected value at line 1 column 1")` with no way to
+    /// tell an HTML/plaintext page apart from a genuine schema drift.
+    /// Carries the status, content type, and a truncated body snippet so
+    /// the operator has something to compare against Trunk's actual
+    /// response instead of a bare serde parse error. Never retried, for
+    /// the same reason as `Decode`.
+    #[error(
+        "trunk returned a non-JSON response where JSON was expected ({0}); this is a real 2xx response, not an \
+         auth/token problem — run `boss engine trunk status` and compare against what Trunk actually sent"
+    )]
+    NonJsonResponse(String),
+    /// Trunk answered with a redirect (3xx) instead of a direct response.
+    /// The HTTP client no longer follows redirects (see
+    /// `boss_http_retry::http_client`), so a redirect now surfaces here
+    /// explicitly instead of being silently followed to whatever page it
+    /// points at and having that page's response mistaken for Trunk's.
+    /// Never retried: a redirect on what should be a direct API POST is a
+    /// transport-level anomaly worth surfacing loudly, not a transient blip.
+    #[error(
+        "trunk redirected the request instead of answering directly ({0}); run `boss engine trunk status` to \
+         confirm the queue integration is otherwise healthy"
+    )]
+    Redirected(String),
 }
 
 #[cfg(test)]
@@ -55,5 +81,18 @@ mod tests {
             TrunkError::Decode("unexpected eof".to_owned()).to_string(),
             "failed to decode trunk response: unexpected eof"
         );
+        let non_json = TrunkError::NonJsonResponse("status 200, content-type \"text/html\": <html>...".to_owned());
+        assert!(non_json.to_string().starts_with(
+            "trunk returned a non-JSON response where JSON was expected (status 200, content-type \"text/html\""
+        ));
+        assert!(non_json.to_string().contains("boss engine trunk status"));
+
+        let redirected = TrunkError::Redirected("status 302: <html>...".to_owned());
+        assert!(
+            redirected
+                .to_string()
+                .starts_with("trunk redirected the request instead of answering directly (status 302")
+        );
+        assert!(redirected.to_string().contains("boss engine trunk status"));
     }
 }

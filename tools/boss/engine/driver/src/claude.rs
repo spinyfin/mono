@@ -8,14 +8,20 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use async_trait::async_trait;
+use boss_engine_structured_output::StructuredOutputKind;
+use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
-use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_event};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, normalize_hook_event};
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, ProgressFidelity, ProgressObservationConfig,
-    ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
+    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
+    SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
 };
+
+pub mod structured_output;
 
 // ---------------------------------------------------------------------------
 // Claude model / effort menu (design §1.4 / §Mix-and-match)
@@ -36,7 +42,36 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
+/// Model slug for a given [`ReasoningMode`] — the capability lever.
+///
+/// This is the table the operator's policy actually lives in: *"sonnet is best
+/// for well articulated coding tasks (these should be the bulk of what boss
+/// does, but when some investigation is required, opus is usually better)."*
+/// Neither arm consults [`EffortLevel`], which is the entire point — a small
+/// investigate-and-fix chore gets Opus without its effort level being inflated
+/// to `large`, and a big-but-mechanical `large` row gets Sonnet.
+///
+/// Family aliases, not pinned snapshots, for the same reason as
+/// [`claude_default_model_for_level`]. Fable is deliberately absent: it is the
+/// most expensive model in the menu and is only ever reachable through an
+/// explicit per-row `--model fable`, never as a table default.
+fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
+    match reasoning {
+        ReasoningMode::Standard => "sonnet",
+        ReasoningMode::Investigation => "opus",
+    }
+}
+
 /// Default model slug for a given effort level.
+///
+/// **Legacy fall-through only.** Since the `reasoning` column landed, this
+/// table is consulted exclusively for rows that carry no [`ReasoningMode`] —
+/// rows created before the column existed, and insert paths that do not seed
+/// it. Classified rows resolve through [`claude_model_for_reasoning`] instead.
+/// Do not extend this table to express capability: effort is a size signal,
+/// and deriving the model from it is precisely the conflation the reasoning
+/// column exists to undo. It stays because clearing a row's reasoning must
+/// restore exactly the dispatch behaviour that row had before.
 ///
 /// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the engine
 /// auto-tracks the latest snapshot per family without requiring a code
@@ -102,6 +137,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         engine_default: "opus",
         effort_value_for_level: claude_effort_value_for_level,
         default_model_for_level: claude_default_model_for_level,
+        model_for_reasoning: claude_model_for_reasoning,
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
     },
@@ -368,7 +404,10 @@ pub const REVISION_PR_GUARD_COMMAND: &str = concat!(
 /// `boss_engine::worker_setup::render_claude_md`.
 const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
-     via claude hooks.";
+     via claude hooks.\n\
+     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     strong stated justification.";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -401,17 +440,18 @@ impl AgentDriver for ClaudeDriver {
             Capability::ControlVerbs,
             Capability::ToolProvisioning,
             Capability::PromptComposition,
+            Capability::AwaitingInputSignal,
         ])
     }
 
-    fn spawn_invocation(
-        &self,
-        model: &str,
-        effort: Option<&str>,
-        settings_path: Option<&Path>,
-        non_opus_auto_mode: bool,
-        permission_mode_override: Option<&str>,
-    ) -> String {
+    fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
+        let SpawnRequest {
+            model,
+            effort,
+            settings_path,
+            non_opus_auto_mode,
+            permission_mode_override,
+        } = request;
         let mut cmd = format!("claude --model {model}");
         if let Some(e) = effort {
             cmd.push_str(" --effort ");
@@ -442,7 +482,17 @@ impl AgentDriver for ClaudeDriver {
             " \"$(cat {}/{})\"\n",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         ));
-        cmd
+        SpawnPlan {
+            // Claude must authenticate via OAuth credentials
+            // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
+            // inherited from the user's shell profile (or `launchctl
+            // setenv`) — that produces "Auth conflict: Using
+            // ANTHROPIC_API_KEY instead of Anthropic Console key." The
+            // engine needs the var in its own process for pane-summary LLM
+            // calls, so this unset is scoped to the worker pane shell only.
+            env: vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
+            command: cmd,
+        }
     }
 
     /// Write per-session workspace files and suppress the first-run trust
@@ -454,7 +504,12 @@ impl AgentDriver for ClaudeDriver {
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
     ///   the headless worker session
-    async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, _run_id: &str) -> anyhow::Result<()> {
+    async fn provision_workspace(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        _run_id: &str,
+    ) -> anyhow::Result<Option<super::DriverRuntimeState>> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
         std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
@@ -471,12 +526,45 @@ impl AgentDriver for ClaudeDriver {
         // swallowed by pre_trust_workspace.
         pre_trust_workspace(workspace);
 
+        // Claude creates no per-run state outside the cube workspace, so
+        // there is nothing for teardown (or a future retention sweep) to
+        // clean up. A Codex driver would return its Boss-owned CODEX_HOME
+        // (or archive root) here instead.
+        Ok(None)
+    }
+
+    /// No-op: Claude needs no teardown. It creates no per-run state outside
+    /// the cube workspace — the `.claude/` config dir `provision_workspace`
+    /// writes lives inside the workspace, which cube owns and tears down
+    /// itself. `runtime_state` is expected to be `None` for Claude and is
+    /// ignored; we deliberately do not invent a cleanup target from the
+    /// engine environment or by scanning a shared provider home.
+    async fn teardown_workspace(
+        &self,
+        _workspace: Option<&Path>,
+        _run_id: &str,
+        _runtime_state: Option<&super::DriverRuntimeState>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    async fn write_permission_config(&self, _dest_dir: &Path) -> anyhow::Result<PathBuf> {
-        // TODO(@brianduff,2026-12-31): extract from worker_setup::render_settings_json
-        unimplemented!("extracted in the PermissionPolicy task")
+    async fn write_permission_config(
+        &self,
+        _input: &PermissionInput,
+        _dest_dir: &Path,
+    ) -> anyhow::Result<PermissionArtifacts> {
+        // TODO(@brianduff,2026-12-31): the settings/deny-rule rendering this
+        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`,
+        // the reviewer/triage/answer-agent rule builders, and the path-guard
+        // constants) lives in `boss_engine::worker_setup`. The dependency edge
+        // is one-way `core -> driver`, so this crate cannot reach it;
+        // implementing this method requires porting that rendering into this
+        // crate first (mirroring the `WorkspaceProvisioning` helpers already
+        // moved into this file). Once implemented, this returns a single
+        // settings file in `config_files` with `extra_args`/`env` empty —
+        // behaviourally identical to the pre-`PermissionArtifacts`
+        // single-`PathBuf` return.
+        unimplemented!("blocked on migrating worker_setup's settings/deny-rule rendering into the driver crate")
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
@@ -485,7 +573,7 @@ impl AgentDriver for ClaudeDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring {
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
         // Inline-prefix every env var the `boss-event` shim needs. `BOSS_RUN_ID`
         // is load-bearing: without it the shim can't splice `_boss_run_id` and
         // the engine drops the event, pinning the worker at `Spawning`.
@@ -521,11 +609,31 @@ impl AgentDriver for ClaudeDriver {
         for event in CLAUDE_HOOK_EVENTS {
             hooks.insert((*event).to_owned(), serde_json::json!([forward_hook.clone()]));
         }
-        ProgressObservationWiring { hooks }
+        ProgressIngress::HookCallback(ProgressObservationWiring { hooks })
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
         normalize_hook_event(raw)
+    }
+
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        // Claude's turn boundary is its `Stop` hook, and only that: every
+        // other hook fires mid-turn. `stop_hook_active` is Claude's name for
+        // "a stop hook pulled the agent back into another turn", which is
+        // exactly `TurnEnd::continuation`; `stop_reason` is already the
+        // sequencer-refined value.
+        match event {
+            WorkerEvent::Stop {
+                session_id,
+                stop_hook_active,
+                stop_reason,
+            } => Some(TurnEnd {
+                session_id: session_id.clone(),
+                reason: *stop_reason,
+                continuation: *stop_hook_active,
+            }),
+            _ => None,
+        }
     }
 
     fn tool_use_interception_wiring(&self, config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
@@ -603,12 +711,24 @@ impl AgentDriver for ClaudeDriver {
         CLAUDE_AGENT_RULES_PREAMBLE
     }
 
-    fn normalize_transcript_entry(&self, raw: &serde_json::Value) -> serde_json::Value {
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
+        // Claude stamps the absolute path to the session's JSONL transcript
+        // on every hook payload it emits —
+        // `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Empty
+        // strings are treated as missing so callers never end up trying to
+        // open a path `tokio::fs::File::open` would reject anyway.
+        let s = raw.get("transcript_path")?.as_str()?;
+        if s.is_empty() { None } else { Some(s.to_owned()) }
+    }
+
+    fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
         // Claude's transcript JSONL is already in the canonical redactable
         // field shape (tool_name / tool_input / tool_response at the top level,
         // content[].type == "tool_use" blocks with name + input sub-fields).
-        // No remapping is needed; return the entry as-is.
-        raw.clone()
+        // No remapping is needed; return the entry as-is (moved, not cloned —
+        // this runs on every polled transcript line on the hot live-status
+        // path).
+        raw
     }
 
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String> {
@@ -621,6 +741,23 @@ impl AgentDriver for ClaudeDriver {
             ErrorClass::Permanent => WorkerErrorClass::Permanent,
             ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
+    }
+
+    fn structured_output_wiring(
+        &self,
+        request: &StructuredOutputRequest<'_>,
+    ) -> anyhow::Result<StructuredOutputArtifacts> {
+        // Env-file contract: export the designated path via the BOSS_* env
+        // vars, point the engine's reader at the same path. Claude has no
+        // native schema-enforcement flag (`--output-schema` is a Codex
+        // mechanism), so `request.schema` is ignored — the prompt carries
+        // the shape and the worker Write-tools to `result_path`. Behaviour
+        // is identical to the pre-trait env-var export in the spawn flow.
+        Ok(default_structured_output_wiring(request))
+    }
+
+    fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate> {
+        structured_output::fallback_candidates(kind, text)
     }
 }
 
@@ -790,6 +927,7 @@ mod tests {
             Capability::ControlVerbs,
             Capability::ToolProvisioning,
             Capability::PromptComposition,
+            Capability::AwaitingInputSignal,
         ] {
             assert!(caps.provides(cap), "ClaudeDriver must provide {cap:?}",);
         }
@@ -819,9 +957,19 @@ mod tests {
         assert_eq!(ClaudeDriver.progress_fidelity(), ProgressFidelity::Rich);
     }
 
+    /// Unwrap a [`ProgressIngress`] as the [`ProgressIngress::HookCallback`]
+    /// wiring it must be for `ClaudeDriver`, panicking with a clear message
+    /// if the driver ever regresses to `StdoutJsonl`.
+    fn expect_hook_callback(ingress: ProgressIngress) -> ProgressObservationWiring {
+        match ingress {
+            ProgressIngress::HookCallback(wiring) => wiring,
+            ProgressIngress::StdoutJsonl => panic!("ClaudeDriver must produce HookCallback wiring"),
+        }
+    }
+
     #[test]
     fn observation_wiring_covers_all_seven_lifecycle_events() {
-        let wiring = ClaudeDriver.progress_observation_wiring(&sample_config());
+        let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
         for name in [
             "SessionStart",
             "UserPromptSubmit",
@@ -841,7 +989,7 @@ mod tests {
 
     #[test]
     fn observation_wiring_threads_socket_lease_run_and_workspace_into_command() {
-        let wiring = ClaudeDriver.progress_observation_wiring(&sample_config());
+        let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
         let command = wiring.hooks["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         // Single-quote escaping must survive the space in "Application Support".
         assert!(command.contains("BOSS_EVENTS_SOCKET='/Users/x/Library/Application Support/Boss/events.sock'"));
@@ -861,6 +1009,80 @@ mod tests {
         });
         let event = ClaudeDriver.normalize_progress_event(&raw).unwrap();
         assert!(matches!(event, WorkerEvent::Stop { .. }));
+    }
+
+    // ── TurnBoundary ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn turn_boundary_reports_a_stop_event() {
+        let end = ClaudeDriver
+            .turn_boundary(&WorkerEvent::Stop {
+                session_id: "sess-1".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            })
+            .expect("Stop is Claude's turn boundary");
+        assert_eq!(end.session_id, "sess-1");
+        assert_eq!(end.reason, boss_protocol::StopReason::Completed);
+        assert!(!end.continuation);
+    }
+
+    #[test]
+    fn turn_boundary_carries_stop_hook_active_as_continuation() {
+        // `stop_hook_active` is the only Claude-specific field in the boundary;
+        // it must survive the mapping or a re-entrant stop reads as a fresh one.
+        let end = ClaudeDriver
+            .turn_boundary(&WorkerEvent::Stop {
+                session_id: "sess-1".to_owned(),
+                stop_hook_active: true,
+                stop_reason: boss_protocol::StopReason::AwaitingInput,
+            })
+            .expect("Stop is Claude's turn boundary");
+        assert!(end.continuation);
+        assert_eq!(end.reason, boss_protocol::StopReason::AwaitingInput);
+    }
+
+    #[test]
+    fn turn_boundary_rejects_every_non_stop_event() {
+        // Mid-turn hooks must not be mistaken for a boundary — completion
+        // detection and probe injection both fire off this predicate.
+        let mid_turn = [
+            WorkerEvent::SessionStart {
+                session_id: "sess-1".to_owned(),
+                source: boss_protocol::SessionStartSource::Startup,
+            },
+            WorkerEvent::UserPromptSubmit {
+                session_id: "sess-1".to_owned(),
+                prompt: "go".to_owned(),
+            },
+            WorkerEvent::PreToolUse {
+                session_id: "sess-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+            WorkerEvent::PostToolUse {
+                session_id: "sess-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            WorkerEvent::Notification {
+                session_id: "sess-1".to_owned(),
+                message: "permission?".to_owned(),
+            },
+            // SessionEnd is a *process* boundary, not a turn boundary: the
+            // worker is gone, so there is no turn to complete or probe into.
+            WorkerEvent::SessionEnd {
+                session_id: "sess-1".to_owned(),
+                reason: "exit".to_owned(),
+            },
+        ];
+        for event in mid_turn {
+            assert!(
+                ClaudeDriver.turn_boundary(&event).is_none(),
+                "{event:?} must not report a turn boundary",
+            );
+        }
     }
 
     #[test]
@@ -1020,6 +1242,28 @@ mod tests {
     // ── TranscriptAccess ─────────────────────────────────────────────────────
 
     #[test]
+    fn transcript_path_for_session_reads_field_from_payload() {
+        let raw = serde_json::json!({
+            "session_id": "sess-1",
+            "hook_event_name": "Stop",
+            "transcript_path": "/home/u/.claude/projects/foo/sess-1.jsonl",
+        });
+        assert_eq!(
+            ClaudeDriver.transcript_path_for_session(&raw).as_deref(),
+            Some("/home/u/.claude/projects/foo/sess-1.jsonl"),
+        );
+    }
+
+    #[test]
+    fn transcript_path_for_session_is_none_when_missing_or_empty() {
+        let missing = serde_json::json!({"session_id": "sess-1"});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&missing), None);
+
+        let empty = serde_json::json!({"transcript_path": ""});
+        assert_eq!(ClaudeDriver.transcript_path_for_session(&empty), None);
+    }
+
+    #[test]
     fn normalize_transcript_entry_is_identity_for_claude_format() {
         // Claude's transcript is already in the canonical shape; the
         // normaliser must return the value unchanged.
@@ -1029,7 +1273,7 @@ mod tests {
             "tool_input": {"command": "ls"},
             "tool_response": "file.txt\n",
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]
@@ -1041,7 +1285,7 @@ mod tests {
                 "content": [{"type": "text", "text": "working on it"}],
             }
         });
-        assert_eq!(ClaudeDriver.normalize_transcript_entry(&raw), raw);
+        assert_eq!(ClaudeDriver.normalize_transcript_entry(raw.clone()), raw);
     }
 
     #[test]
@@ -1158,6 +1402,10 @@ mod tests {
             preamble.contains("Boss-managed"),
             "preamble must describe Boss session: {preamble}"
         );
+        assert!(
+            preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
+            "preamble must direct ordinary validation to scoped checkleft: {preamble}"
+        );
     }
 
     #[tokio::test]
@@ -1179,10 +1427,14 @@ mod tests {
         }
 
         let driver = ClaudeDriver;
-        driver
+        let runtime_state = driver
             .provision_workspace(workspace.path(), "hello prompt", "run-1")
             .await
             .unwrap();
+        assert!(
+            runtime_state.is_none(),
+            "Claude creates no out-of-workspace runtime state"
+        );
 
         // Prompt file at the descriptor-derived path.
         let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
@@ -1212,16 +1464,70 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn teardown_workspace_is_a_no_op() {
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("marker.txt"), "untouched").unwrap();
+
+        ClaudeDriver
+            .teardown_workspace(Some(workspace.path()), "run-1", None)
+            .await
+            .unwrap();
+
+        // Bit-identical to before: nothing in the workspace changed.
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("marker.txt")).unwrap(),
+            "untouched",
+        );
+        assert_eq!(
+            std::fs::read_dir(workspace.path()).unwrap().count(),
+            1,
+            "teardown must not create or remove any files in the workspace",
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_workspace_succeeds_with_no_workspace_path() {
+        // Callers pass `None` when the workspace path was never recorded or
+        // was already cleared by a racing teardown; the no-op impl must not
+        // require a path to succeed.
+        ClaudeDriver.teardown_workspace(None, "run-1", None).await.unwrap();
+    }
+
+    fn spawn_request(model: &str) -> SpawnRequest<'_> {
+        SpawnRequest {
+            model,
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+        }
+    }
+
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
-        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
+        let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
         let expected_cat = format!(
             "\"$(cat {}/{})\"\n",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         );
         assert!(
-            cmd.contains(&expected_cat),
-            "spawn invocation must read from descriptor paths; got: {cmd}",
+            plan.command.contains(&expected_cat),
+            "spawn invocation must read from descriptor paths; got: {}",
+            plan.command,
+        );
+    }
+
+    #[test]
+    fn spawn_invocation_unsets_anthropic_api_key() {
+        // Claude must authenticate via OAuth credentials, not a stray
+        // ANTHROPIC_API_KEY inherited from the worker pane's shell profile.
+        let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
+        assert_eq!(
+            plan.env,
+            vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
+            "spawn plan must unset ANTHROPIC_API_KEY; got: {:?}",
+            plan.env,
         );
     }
 
@@ -1231,7 +1537,11 @@ mod tests {
         // `--dangerously-skip-permissions` (which bypasses the settings
         // allow/deny rules). The override must win and suppress that entirely,
         // so the capability-restricted answer agent always runs deny-by-default.
-        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, Some("dontAsk"));
+        let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
+            permission_mode_override: Some("dontAsk"),
+            ..spawn_request("sonnet")
+        });
+        let cmd = plan.command;
         assert!(
             cmd.contains("--permission-mode dontAsk"),
             "expected forced dontAsk; got: {cmd}"
@@ -1246,7 +1556,7 @@ mod tests {
         );
 
         // Without an override, the default per-model behaviour is unchanged.
-        let default_cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
+        let default_cmd = ClaudeDriver.spawn_invocation(spawn_request("sonnet")).command;
         assert!(
             default_cmd.contains("--dangerously-skip-permissions"),
             "got: {default_cmd}"

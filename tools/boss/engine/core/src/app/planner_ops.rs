@@ -49,7 +49,7 @@ pub(super) async fn handle_plan_project(ctx: Dispatch, req: FrontendRequest) {
     };
 
     let steps = LivePopulatorSteps {
-        api_key: server_state.anthropic_api_key.clone(),
+        utility: server_state.utility_model.clone(),
     };
 
     if dry_run {

@@ -7,10 +7,20 @@ import Foundation
 /// connection lifecycle to `ChatViewModel+Connection.swift`, attention groups
 /// to `ChatViewModel+Attentions.swift`, and so on. Keep this file about
 /// routing; put the work in the extension that owns the state.
+///
+/// `EngineClient` batches the hop onto the main actor (accumulate-and-drain
+/// on the next run-loop turn; see `EngineClient.emit`). A burst of N socket
+/// events may therefore invoke `handle` N times back-to-back inside one
+/// main-actor turn. Per-event routing stays correct; SwiftUI coalesces
+/// `@Published` writes until the end of that turn. Invalidation-driven
+/// *fetches* still go through [[scheduleWorkTreeRefetch]]'s 150 ms debounce
+/// — that is a different boundary (request coalescing), not delivery batching.
 extension ChatViewModel {
     /// Point the engine's event stream at `handle(_:)`. Called from
     /// `commonInit`; kept here so the dispatch itself stays private to this
-    /// file and every event path is visible in one place.
+    /// file and every event path is visible in one place. The callback may
+    /// fire multiple times in a single main-actor drain (see file-level
+    /// note); each call is one `EngineEvent` in arrival order.
     func bindEngineEventStream() {
         engine.onEvent = { [weak self] event in
             self?.handle(event)
@@ -42,8 +52,8 @@ extension ChatViewModel {
             if let productID = currentSelectedProductID {
                 // Cold-start population of the restored product. NOTE: the
                 // `.productsList` handler below fetches this same product a
-                // SECOND time (the confirmed cold-start double-fetch, T2101
-                // R2) — the per-product fetch counter makes both visible.
+                // SECOND time (a confirmed cold-start double-fetch) — the
+                // per-product fetch counter makes both visible.
                 engine.sendGetWorkTree(productId: productID, flow: .coldStart)
                 engine.sendListAttentionGroups(productId: productID)
             }
@@ -66,6 +76,10 @@ extension ChatViewModel {
                     automationsFetchStateByProductID[productID] = .failed("Connection lost")
                 }
             }
+            // A request in flight when the link drops can never complete;
+            // without this, a disconnect mid-request leaves the row
+            // permanently disabled since no work_error will ever arrive.
+            deferredScopeActionInFlightIDs.removeAll()
             scheduleConnectionLostBannerCheck()
         case .workInvalidated(let topic, let productId, _):
             if CommentEngineBridge.isCommentTopic(topic) {
@@ -151,6 +165,7 @@ extension ChatViewModel {
             openingLiveWorkspaceTerminalIDs.removeAll()
             mergingWhenReadyIDs.removeAll()
             plannerActionInFlightProjectIDs.removeAll()
+            deferredScopeActionInFlightIDs.removeAll()
             if case .loading = reviewTerminalVM.state {
                 reviewTerminalVM.state = .idle
             }
@@ -281,18 +296,25 @@ extension ChatViewModel {
             //    "ci auto-fixed" chip — a fresh attempt means the prior
             //    auto-fix claim no longer holds even if the
             //    `ciRemediationStarted` push that would normally clear it
-            //    was missed (T2764: the push is the only other writer of
+            //    was missed (the push is the only other writer of
             //    `recentlyClearedCIPRs`, so a dropped push stranded the
             //    badge for up to the full freshness window).
-            //  - latest succeeded and still fresh: (re)stamp the
-            //    "ci auto-fixed" chip using the engine's own timestamp
-            //    rather than local observation time, so a missed
-            //    `ciRemediationSucceeded` push self-heals on the next
-            //    list refresh instead of never showing the chip at all.
+            //  - latest succeeded: the attempt that was fixing this PR is
+            //    done, so an `in_flight` failure chip is now stale even if
+            //    the `ciRemediationSucceeded` push that would normally
+            //    clear it was missed — drop it here so the chip can't
+            //    outlive the condition it represents. If still fresh,
+            //    (re)stamp the "ci auto-fixed" chip using the engine's own
+            //    timestamp rather than local observation time, so this same
+            //    missed push self-heals the auto-fixed badge too.
             // Exhausted chips are sticky until the user clears them via
             // retry — they are not derivable from the row list alone (the
             // engine tracks them via `task_blocked_signals`), so we leave
-            // pre-existing exhausted chips alone.
+            // pre-existing exhausted chips alone. Terminal failed/abandoned
+            // attempts also leave the `in_flight` chip alone: the parent PR
+            // is still `blocked: ci_failure` until the engine retries or
+            // exhausts (see the `.ciRemediationFailed`/`.ciRemediationAbandoned`
+            // handling below), so the chip is still accurate.
             var seenPRs = Set<String>()
             for row in attempts {
                 guard seenPRs.insert(row.prURL).inserted else { continue }
@@ -307,6 +329,12 @@ extension ChatViewModel {
                     }
                     recentlyClearedCIPRs.removeValue(forKey: row.prURL)
                 case "succeeded":
+                    // Skip only the sticky `.exhausted` state so any future
+                    // non-sticky `CiFailureBadge.State` case defaults to
+                    // clearable here, rather than silently stranding it.
+                    if ciFailureBadges[row.prURL]?.state != .exhausted {
+                        ciFailureBadges.removeValue(forKey: row.prURL)
+                    }
                     if let observedAt = AutomationTime.parse(row.finishedAt ?? row.createdAt),
                        Date().timeIntervalSince(observedAt) < badgeFreshnessWindow {
                         recentlyClearedCIPRs[row.prURL] = observedAt

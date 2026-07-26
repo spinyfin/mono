@@ -1,0 +1,1 @@
+echo GKIT_INJECT_VIA_SURFACE_TEXT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/injected_side_effect.txt

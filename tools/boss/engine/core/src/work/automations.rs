@@ -266,15 +266,32 @@ impl WorkDb {
     /// is returned when multiple open tasks exist (possible when
     /// `open_task_limit > 1`).
     ///
-    /// Used by the triage finalizer's marker-recovery path: when a triage run
-    /// ends without a decision marker but DID create a task (the worker ran
-    /// `boss task create --automation` then stopped before emitting the marker),
-    /// the finalizer calls this to record `produced_task` instead of
-    /// `failed_will_retry`, preventing the retry loop from over-producing
-    /// duplicate tasks until the open-task cap is full.
+    /// `not_before_epoch`, when `Some`, additionally requires `created_at >=`
+    /// that epoch — pass the triage execution's own creation time so a task
+    /// left open by an *earlier* automation run (stuck in review, or one the
+    /// open-task cap is otherwise holding open) is never misattributed to
+    /// *this* run. Without the bound, "most recent" is a guess across the
+    /// automation's entire history; with it, the row must have been created
+    /// no earlier than the run being finalized. `None` disables the bound
+    /// entirely — no production caller does this today; both call sites
+    /// (`completion.rs`'s Stop-driven finalizer and `execution_liveness.rs`'s
+    /// dead-pane reconciler) pass their execution's creation time. It exists
+    /// for callers with no execution context, and for tests asserting the
+    /// unbounded ordering behaviour.
+    ///
+    /// This is the primary decision-derivation path for a triage run's
+    /// finalization (see [`crate::completion::WorkerCompletionHandler::finalize_automation_triage`]):
+    /// the decision marker the triage agent is asked to emit is, in practice,
+    /// almost never present in the transcript (a measurement of 67 recent
+    /// `produced_task` finalizations found none with a valid marker), so
+    /// this DB-state-derived recovery — not the marker — is what actually
+    /// determines the outcome for the overwhelming majority of runs. The
+    /// marker remains a fast-path override: when it *is* present and
+    /// verifies, it is trusted directly without this lookup.
     pub fn find_most_recent_open_task_for_automation(
         &self,
         automation_id: &str,
+        not_before_epoch: Option<i64>,
     ) -> Result<Option<boss_protocol::Task>> {
         let conn = self.connect()?;
         let sql = format!(
@@ -283,18 +300,23 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1
                 AND status IN ({OPEN_SIBLING_STATUSES})
                 AND deleted_at IS NULL
+                AND (?2 IS NULL OR CAST(created_at AS INTEGER) >= ?2)
               ORDER BY created_at DESC, id DESC
               LIMIT 1"
         );
-        conn.query_row(&sql, [automation_id], map_task_with_source_automation_id)
-            .optional()
-            .map_err(Into::into)
+        conn.query_row(
+            &sql,
+            params![automation_id, not_before_epoch],
+            map_task_with_source_automation_id,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Everything this automation is already tracking: open tasks, plus
@@ -428,7 +450,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     source_automation_id
                FROM tasks
               WHERE source_automation_id = ?1
@@ -457,7 +479,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     source_automation_id
                FROM tasks
               WHERE product_id = ?1
@@ -494,7 +516,7 @@ impl WorkDb {
                     priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url,
                     effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id,
                     ci_required_state, review_required_state, ci_required_detail,
-                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver,
+                    review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning,
                     source_automation_id
                FROM tasks
               WHERE product_id = ?1

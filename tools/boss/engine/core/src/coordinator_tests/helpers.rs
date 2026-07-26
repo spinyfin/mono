@@ -59,6 +59,13 @@ pub(super) struct FakeCubeClient {
     /// written.
     pub(super) repos: Mutex<Vec<CubeRepoSummary>>,
     pub(super) fail_ensure: bool,
+    /// When set, `ensure_repo` for this origin blocks for
+    /// [`Self::slow_ensure_delay`] before returning. Models one item
+    /// burning a chunk of the `cube repo ensure` timeout budget
+    /// ([`CUBE_REPO_ENSURE_TIMEOUT`], 60s in production) while the rest of
+    /// the ready queue waits behind it.
+    pub(super) slow_ensure_origin: Option<String>,
+    pub(super) slow_ensure_delay: Duration,
     pub(super) fail_lease: bool,
     /// Model the anaplian failure-mode A: cube exits non-zero on a
     /// post-lease setup step, surfaced as a typed [`CubeCliError`]
@@ -117,6 +124,9 @@ impl FakeCubeClient {
 crate::stub_cube_client! { FakeCubeClient {
     async fn ensure_repo(&self, origin: &str) -> Result<CubeRepoHandle> {
         self.ensure_calls.lock().await.push(origin.to_owned());
+        if self.slow_ensure_origin.as_deref() == Some(origin) {
+            tokio::time::sleep(self.slow_ensure_delay).await;
+        }
         if self.fail_ensure {
             return Err(anyhow!("cube repo ensure failed"));
         }
@@ -301,6 +311,11 @@ pub(super) struct FakeExecutionRunner {
     /// Handle used by the `cancelled_during_spawn` path to cancel the
     /// row before returning. `None` for the default fake.
     pub(super) work_db: Option<Arc<WorkDb>>,
+    /// Overrides the default outcome's `wait_state` (`WaitingHuman`).
+    /// Used by teardown-wiring tests that need a `Terminal` /
+    /// `WaitingDependency` outcome to drive the coordinator down the
+    /// workspace-release path.
+    pub(super) wait_state: Option<RunWaitState>,
 }
 
 impl Default for FakeExecutionRunner {
@@ -315,6 +330,7 @@ impl Default for FakeExecutionRunner {
             cancelled_during_spawn: false,
             ack_timed_out: false,
             work_db: None,
+            wait_state: None,
         }
     }
 }
@@ -384,7 +400,7 @@ impl ExecutionRunner for FakeExecutionRunner {
         }
 
         Ok(RunOutcome {
-            wait_state: RunWaitState::WaitingHuman,
+            wait_state: self.wait_state.unwrap_or(RunWaitState::WaitingHuman),
             result_summary: Some(format!("finished {}", execution.kind)),
             attention: Some(RunAttention {
                 kind: "review_required".to_owned(),

@@ -189,6 +189,7 @@ impl CompiledRequiredFlagRule {
                 line: None,
                 column: None,
             }),
+            surface: None,
             remediations: vec![self.remediation.clone().unwrap_or_else(|| match &self.value {
                 Some(value) => format!(
                     "Update the Bazel rc configuration so `{}` declares `--{}={value}`.",
@@ -247,6 +248,7 @@ impl CompiledForbiddenFlagRule {
                     line: Some(entry.line),
                     column: Some(entry.column),
                 }),
+                surface: None,
                 remediations: vec![self.remediation.clone().unwrap_or_else(|| {
                     format!(
                         "Remove the `--{}` flag or switch to the approved alternative.",

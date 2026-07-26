@@ -8,11 +8,21 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ```
 .buildkite/
-  pipeline.yml          # Buildkite reads this; declares steps, queue tags, depends_on only
+  pipeline.yml                        # Main CI pipeline: bazel-build-test, mac-app-build, checks, boss-release
+  pipeline-integrity.yml              # mono-integrity: periodic full-repo build/test health check
+  pipeline-checkleft-release.yml      # checkleft prebuilt-binary release: prepare step, fans out to builds
+  pipeline-checkleft-release-builds.yml # checkleft-release build fragment, uploaded dynamically by prepare
+  REQUIRED_CHECKS.md                  # branch-protection contract for buildkite/mono/<step-key> checks
   steps/
-    bootstrap.sh        # Prime the agent: rust toolchain, bazelisk, pnpm, cache restore
-    bazel-build-test.sh # bazel build //... then bazel test //... (one agent, reuses build outputs)
-    checks.sh           # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
+    bazel-build-test.sh    # bazel build //... then bazel test //... (one agent, reuses build outputs)
+    mac-app-build.sh       # macOS app build
+    checks.sh              # CHECKS.yaml runner (checkleft, no-generated-artifacts, etc.)
+    boss-release.sh        # boss release (main only, macos-arm64)
+    checkleft-release.sh   # checkleft prebuilt-binary release (prepare/linux/musl/darwin phases)
+    ci-env.sh              # shared env/toolchain setup sourced by other steps
+    integrity-commit-delta.sh # mono-integrity: commit-delta check
+    integrity-bazel.sh        # mono-integrity: full bazel build + test
+    integrity-checkleft.sh    # mono-integrity: checkleft check
   README.md             # this file
 ```
 
@@ -30,14 +40,9 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
 
 ## Step details
 
-### `bootstrap.sh`
+### `ci-env.sh`
 
-Ensures the agent has the required toolchain:
-
-- Rust: installs / pins via `rust-toolchain.toml` using `rustup`.
-- Bazel: `bazelisk` should be on `$PATH`; version is read from `.bazelversion`.
-- pnpm: installs if not present, pins to the version in `package.json#packageManager`.
-- Restores the agent-local bazel disk cache (uses `~/.cache/bazelcache` from `.bazelrc`).
+Sourced by other steps to set up the shared bazel wrapper and CI config rather than run standalone. Sets `CI_BAZEL_STARTUP_FLAGS` (the single source of truth for bazel startup options in CI — every code path that shells out to bazel must read from here or the workspace ends up running two daemons at once), detects and recovers from stale-Xcode-cache failures on macOS, and installs `repobin` tools into `bin/`.
 
 ### `bazel-build-test.sh`
 
@@ -49,7 +54,22 @@ Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped
 
 ## Agents and queue
 
-All steps run on `queue=linux-amd64`. The `bootstrap.sh` step handles toolchain setup (rust, bazel, pnpm, cache restoration).
+Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles toolchain provisioning (rust, bazel, pnpm) on whatever agent it lands on.
+
+## Pushing from CI (queue heterogeneity)
+
+The `bazel-any` queue is a **heterogeneous fleet**, and that determines whether a `git push` to `spinyfin/mono` from a step running on it succeeds:
+
+- **Personal Macs** run the agent under a real developer's user account using their `~/.ssh/` keys. A repo admin's Mac pushes **with write access** and succeeds — but the push lands attributed to that person's personal identity.
+- **Linux cloud agents** are bootstrapped with a **read-only** deploy key. Their pushes are **denied** ("Permission to spinyfin/mono.git denied to deploy key").
+
+`spinyfin/mono` itself has **zero deploy keys** registered (`gh api repos/spinyfin/mono/keys` returns none) — read works via the agent's ambient credentials, but there is no write-capable deploy key on the repo.
+
+Consequence: any CI step on `bazel-any` that pushes flaps — green when the step lands on a Mac, "denied to deploy key" when it lands on a Linux cloud agent. A passing run does NOT prove a push-auth fix; it may just have landed on a Mac. `.buildkite/steps/checkleft-release.sh` has this exposure today: `pipeline-checkleft-release.yml` runs every phase on `queue: bazel-any` (pinned to an OS by agent tag), and the `prepare` phase pushes the release tag with plain `git push origin` on the ambient agent credential — see the comment and `die` message around the `git push origin "refs/tags/${NEW_TAG}"` call in `checkleft-release.sh`. By contrast `boss-release` runs on `macos-arm64`, so it always lands on a Mac and never flaps.
+
+The deterministic fix is to push over HTTPS with a scoped `GITHUB_TOKEN` (Contents: write) injected as a Buildkite secret, so the push works on every agent and stops borrowing a personal identity. That fix has not landed for `checkleft-release.sh`.
+
+Diagnose push/auth flakiness by reading the per-job agent (`bk api "pipelines/<p>/builds/<n>"` → `.jobs[].agent.name`) and the job log's `known_hosts` path (a path under a personal `/Users/<name>/.ssh` indicates a Mac/personal key).
 
 ## Debugging a red build locally
 

@@ -1,4 +1,5 @@
 use super::super::*;
+use super::helpers::*;
 
 #[test]
 fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
@@ -15,7 +16,7 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
         task_kind: Some("task".into()),
         worker_kind: WorkerKind::Standard,
     };
-    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
 
     // All seven boss-event hook events are still wired.
     let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
@@ -64,5 +65,5 @@ fn remote_settings_drop_data_dir_sandbox_but_keep_hooks_and_static_denies() {
 
     // Sanity: the LOCAL renderer DOES install the path guard, proving
     // the remote variant is the one dropping it.
-    assert!(render_settings_json(&input).contains("boss-path-guard.py"));
+    assert!(render_settings_json(&input, &ClaudeDriver).contains("boss-path-guard.py"));
 }

@@ -5,6 +5,36 @@ use super::attention::CreateAttentionItemInput;
 use super::common::BranchNaming;
 use serde::{Deserialize, Serialize};
 
+/// Opaque per-execution runtime state owned by an agent driver.
+///
+/// Returned from workspace provisioning and later handed back to the same
+/// driver on every teardown path. Boss persists the payload without
+/// interpreting it — a future Codex driver may record its Boss-owned
+/// per-run `CODEX_HOME` (or archive root) here so teardown and retention
+/// never scan a shared provider home or infer one from the engine
+/// environment. Claude returns no state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DriverRuntimeState(pub serde_json::Value);
+
+impl DriverRuntimeState {
+    /// Wrap an arbitrary JSON value as driver-owned runtime state.
+    pub fn new(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the underlying JSON value.
+    pub fn as_value(&self) -> &serde_json::Value {
+        &self.0
+    }
+}
+
+impl From<serde_json::Value> for DriverRuntimeState {
+    fn from(value: serde_json::Value) -> Self {
+        Self(value)
+    }
+}
+
 /// Discriminator for the `work_executions.kind` column.  Exhaustive
 /// match enforces that every callsite handles new variants explicitly —
 /// adding a new kind here produces a compile error at every kind-keyed
@@ -450,6 +480,17 @@ pub struct WorkExecution {
     /// `dispatch_wait_reason` is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_wait_since: Option<String>,
+
+    /// Opaque driver-owned per-execution runtime state returned by
+    /// workspace provisioning and later handed to teardown. Boss
+    /// persists this without interpreting it: Claude returns none; a
+    /// future Codex driver records its Boss-owned per-run `CODEX_HOME`
+    /// (or archive root) so teardown and retention never scan a shared
+    /// provider home or infer one from the engine environment. Survives
+    /// engine restart, orphan recovery, and workspace release (the
+    /// column is *not* cleared when `workspace_path` is nulled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_runtime_state: Option<DriverRuntimeState>,
 
     pub finished_at: Option<String>,
     /// SHA of the bound chore PR's head ref at the moment this

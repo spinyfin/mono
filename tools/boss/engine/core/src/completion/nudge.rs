@@ -35,6 +35,27 @@ impl WorkerCompletionHandler {
         bound_pr_url: Option<&str>,
         proceed_outcome: StopOutcome,
     ) -> StopOutcome {
+        // Operator hold (`bossctl agents hold`): the most explicit
+        // suppression signal there is — a human deliberately exempted this
+        // run from the idle-park sweep. Checked before every other signal
+        // so a held run never even reaches the breaker, matching
+        // `crate::hold_registry`'s "sweeps must respect it" contract.
+        if let Some(record) = self.hold_registry.get(&execution.id) {
+            tracing::info!(
+                execution_id = %execution.id,
+                reason = record.reason.as_deref().unwrap_or("(none given)"),
+                "auto-nudge: suppressed — execution is held by an operator",
+            );
+            self.publisher
+                .publish(
+                    &execution.id,
+                    &execution.work_item_id,
+                    execution.status.as_str(),
+                    "worker_held",
+                )
+                .await;
+            return StopOutcome::Held { reason: record.reason };
+        }
         if let Some(reason) = self.unresolved_worker_signal_reason(execution) {
             tracing::info!(
                 execution_id = %execution.id,
@@ -101,6 +122,61 @@ impl WorkerCompletionHandler {
                         horizon_secs = self.build_wait_horizon_secs,
                         "auto-nudge: build-wait horizon elapsed — no longer suppressing, falling \
                          back to the normal nudge/park flow"
+                    );
+                    // Fall through to the normal nudge/park flow below.
+                }
+            }
+        }
+        // Background-children suppression (observed live 2026-07-17): the
+        // worker's own turn genuinely ended (Stop fired, hooks go quiet), but its
+        // process tree still has live descendant processes — a
+        // backgrounded subagent spawned via the harness Agent tool that
+        // has not yet reported back with a task-notification. That is
+        // WAITING, not stalled: nudging it just manufactures the next
+        // Stop and burns the breaker cap below, exactly like the
+        // build-wait case above. Checked before `nudge_breaker` for the
+        // same reason — a suppressed Stop must never burn the cap.
+        // Bounded by `background_children_tracker`'s horizon so a
+        // genuinely wedged subagent (one that never exits) still
+        // eventually reaches the normal nudge/park path.
+        let descendant_count = self.background_activity_probe.live_descendant_count(&execution.id);
+        if descendant_count > 0 {
+            let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+            match self.background_children_tracker.record(
+                &execution.id,
+                now_epoch_secs,
+                self.background_children_horizon_secs,
+            ) {
+                BuildWaitDecision::Suppress { waited_secs } => {
+                    tracing::info!(
+                        execution_id = %execution.id,
+                        descendant_count,
+                        waited_secs,
+                        horizon_secs = self.background_children_horizon_secs,
+                        "auto-nudge: suppressed — worker has live background children; holding \
+                         (breaker not consulted, no probe queued)"
+                    );
+                    self.publisher
+                        .publish(
+                            &execution.id,
+                            &execution.work_item_id,
+                            execution.status.as_str(),
+                            "worker_background_children_pending",
+                        )
+                        .await;
+                    return StopOutcome::BackgroundChildrenPending {
+                        descendant_count,
+                        waited_secs,
+                    };
+                }
+                BuildWaitDecision::Expired { waited_secs } => {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        descendant_count,
+                        waited_secs,
+                        horizon_secs = self.background_children_horizon_secs,
+                        "auto-nudge: background-children horizon elapsed — no longer suppressing, \
+                         falling back to the normal nudge/park flow"
                     );
                     // Fall through to the normal nudge/park flow below.
                 }
@@ -207,35 +283,21 @@ status is otherwise left unchanged for re-dispatch or manual review."
                     .any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved")
             })
             .unwrap_or(false);
-        if !already_filed {
-            match self.work_db.create_attention_item(CreateAttentionItemInput {
-                execution_id: Some(execution.id.clone()),
-                work_item_id: None,
-                kind: NUDGE_BREAKER_ATTENTION_KIND.to_owned(),
-                status: None,
-                title: "Worker parked: auto-nudge loop bounded".to_owned(),
-                body_markdown: reason.clone(),
-                resolved_at: None,
-            }) {
-                Ok(item) => {
-                    if let Ok(work_item) = self.work_db.get_work_item(&execution.work_item_id) {
-                        let product_id = work_item.product_id().to_string();
-                        self.publisher
-                            .publish_frontend_event_on_product(
-                                &product_id,
-                                FrontendEvent::AttentionItemCreated { item },
-                            )
-                            .await;
-                    }
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        execution_id = %execution.id,
-                        ?err,
-                        "nudge breaker: failed to file attention item; parking without UI surface"
-                    );
-                }
-            }
+        if !already_filed
+            && let Err(err) = self
+                .file_execution_attention(
+                    execution,
+                    NUDGE_BREAKER_ATTENTION_KIND,
+                    "Worker parked: auto-nudge loop bounded",
+                    reason.clone(),
+                )
+                .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "nudge breaker: failed to file attention item; parking without UI surface"
+            );
         }
 
         self.publisher
@@ -301,6 +363,8 @@ status is otherwise left unchanged for re-dispatch or manual review."
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
+        self.background_children_tracker.forget(&execution.id);
+        self.hold_registry.release(&execution.id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

@@ -173,6 +173,8 @@ The CLI surface autocompletes against the short aliases; the column stores whate
 
 ### Precedence
 
+> **Amended.** Step 2 below was the model lever for the life of this design, and it was the wrong one — see "Amendment: `reasoning`, the capability axis" at the end of this document. It survives only as the fall-through for rows created before `tasks.reasoning` existed. The list here is preserved as written; the amendment states the current precedence in full.
+
 When the dispatcher picks the model for a worker, it resolves in this order, taking the first non-empty value:
 
 1. **`tasks.model_override`** — explicit per-row override.
@@ -346,3 +348,55 @@ The level examples in Q1 and the marker list in Q4 were derived from a scan of a
 - 6 rows (15%) classify as `large`.
 
 The split is the rough validation that the four-level enum tracks real work distribution: `trivial` and `small` together are the majority, `large` is rare-but-real, and `medium` is the bin where a default-Sonnet decision is most load-bearing. If the distribution had been "85% small / 15% medium," we would have collapsed to a two-level enum and not bothered.
+
+---
+
+## Amendment: `reasoning`, the capability axis
+
+This design gave `effort_level` two jobs, and the second one was never really its to do. Effort is a **size** estimate — how long, how many files, how many subsystems — and this document correctly derives the `--effort` value and the prompt addendum from it. It also derived the **model** from it, and that is a different question: not how big the work is, but what kind of thinking it needs.
+
+The operator's position, which is the policy this amendment encodes:
+
+> "I think sonnet is best for well articulated coding tasks (these should be the bulk of what boss does, but when some investigation is required, opus is usually better)."
+
+Those two properties are independent. A small, well-specified change should run on Sonnet even if it touches several files. A _small_ investigate-and-fix chore should still run on Opus. Under the original design the only way to get the second one was to inflate its effort level, which lies about the size and distorts scheduling, timeouts, and every effort-based report — and the effort heuristic's own investigate-family marker rule (Q4 rule 2) exists precisely because investigation-ness had nowhere else to go. The rule is documented as affecting size only and explicitly "must not bias the kind decision"; the fact that it was nonetheless the only lever reaching model selection is the smell this amendment removes.
+
+### The signal
+
+`tasks.reasoning`, a nullable TEXT column holding `standard | investigation`.
+
+- **`standard`** — well-articulated coding work: the brief already says what to change. Dispatches to the driver's standard tier (Sonnet on Claude) **regardless of size**.
+- **`investigation`** — the worker has to diagnose, design, or root cause something before it can decide what to change. Dispatches to the driver's investigation tier (Opus on Claude) **regardless of size**.
+- **`NULL`** — never classified. Load-bearing, not incidental: these rows resolve through the pre-amendment path below, unchanged.
+
+Like the effort table, the tiers are per-driver data (`ModelMenu::model_for_reasoning`), so a non-Claude driver resolves against its own menu rather than being handed Claude slugs its CLI would reject.
+
+### Amended precedence
+
+1. **`tasks.model_override`** — explicit per-row override. Unchanged.
+2. **Pool override** — the review and automation pools pin their agents to Opus. Unchanged.
+3. **`tasks.reasoning`** — the capability lever, via the driver's `model_for_reasoning`. **This decides the model for every classified row**, and consults `effort_level` in neither direction.
+4. **Design-family kind floor** → `opus`. _Unclassified rows only._
+5. **Effort-level default** — the table above. _Unclassified rows only._
+6. **Product default** — `products.default_model`. _Unclassified rows only._
+7. **Engine default.**
+
+Steps 4-6 are the original design, preserved verbatim so that landing the column re-models nothing already in flight. The separation now cuts both ways: `reasoning` moves the model without touching the worker's runway, and `effort_level` moves the runway without touching the model.
+
+### Defaults
+
+Every create path seeds a concrete value, so the signal is visible on the row (`boss task show`) rather than being an invisible fall-through. The seed runs once at insert time from `kind` + `effort_level`:
+
+- `kind` in `design` / `investigation` / `design_postmortem` → `investigation`. The deliverable is the thinking; this reaches the same model the kind floor used to, through the capability lever instead of a kind special-case.
+- `effort_level = max` → `investigation`. `max` is documented above as the human-only escape hatch for "Claude's maximum reasoning depth regardless of what the scope markers suggest" — its meaning was always about capability rather than size, so honouring it here preserves what `--effort max` has always bought.
+- Everything else → `standard`. This is deliberately the common case.
+
+Revisions inherit the chain root's value. Only an explicit write changes an existing row; there is no backfill, and re-dispatch reads the current value exactly as it already does for `effort_level`.
+
+### Surfaces
+
+`--reasoning <mode>` on `boss task create` / `boss chore create` / `create-investigation` / `create-revision`; `--reasoning` / `--unset-reasoning` on `boss task update`. `boss task show` prints it; `boss task list` renders a `REASONING` column only when some row in the view is `investigation` (a column reading `standard` on nearly every row is noise). The kanban card carries an `INV` chip on the same condition. The `pane_spawned` dispatch event carries it alongside the resolved model, so `bossctl dispatch diagnose` can answer _why_ a given model was chosen — without it, an Opus spawn on a `small` row looks like a bug.
+
+### What this deliberately does not do
+
+There is no per-row `--model` for the coordinator. The operator's guidance is a _policy_ about kinds of work, so it lives in the model tables as policy rather than as per-row micromanagement; the coordinator classifies the work and the driver's menu decides the slug. `model_override` remains the human escape hatch it always was.

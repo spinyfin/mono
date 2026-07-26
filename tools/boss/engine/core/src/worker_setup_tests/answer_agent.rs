@@ -58,7 +58,8 @@ fn answer_agent_settings_use_dontask_allowlist_mode() {
     // The whole point of P3a: an allowlist, not a blocklist. `dontAsk`
     // auto-denies every tool call except `permissions.allow` matches and
     // built-in read-only Bash — a true deny-by-default sandbox.
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&answer_agent_input())).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_settings_json(&answer_agent_input(), &ClaudeDriver)).unwrap();
     assert_eq!(
         parsed["permissions"]["defaultMode"],
         serde_json::Value::String("dontAsk".into()),
@@ -68,7 +69,8 @@ fn answer_agent_settings_use_dontask_allowlist_mode() {
 
 #[test]
 fn answer_agent_allow_list_is_exactly_the_reduced_table() {
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&answer_agent_input())).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_settings_json(&answer_agent_input(), &ClaudeDriver)).unwrap();
     let allow: Vec<&str> = parsed["permissions"]["allow"]
         .as_array()
         .expect("answer agent settings carry an allow list")
@@ -93,7 +95,8 @@ fn answer_agent_allow_list_is_exactly_the_reduced_table() {
 
 #[test]
 fn answer_agent_deny_belt_blocks_every_mutating_surface() {
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&answer_agent_input())).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_settings_json(&answer_agent_input(), &ClaudeDriver)).unwrap();
     let deny: Vec<&str> = parsed["permissions"]["deny"]
         .as_array()
         .expect("deny array present")
@@ -144,7 +147,8 @@ fn answer_agent_gets_read_only_claude_md_not_the_pr_deliverable_one() {
 #[test]
 fn standard_worker_keeps_auto_mode_and_no_allow_list() {
     // Regression guard: the allowlist posture is scoped to the answer agent.
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&sample_input())).unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(&render_settings_json(&sample_input(), &ClaudeDriver)).unwrap();
     assert_eq!(
         parsed["permissions"]["defaultMode"],
         serde_json::Value::String("auto".into())

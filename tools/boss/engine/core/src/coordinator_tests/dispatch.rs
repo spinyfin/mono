@@ -77,6 +77,49 @@ async fn schedules_ready_execution_into_running_run() {
     assert_eq!(runner.calls.lock().await[0].3.as_deref(), Some("chg-1"));
 }
 
+/// Asserts that the normal-completion termination path invokes driver
+/// teardown exactly once — not zero times, not once per retry — driven
+/// through the real `coordinator.kick()` pipeline (dispatch →
+/// `run_execution` → `record_run_completion`) rather than by calling
+/// the private method directly, so this also exercises the real call
+/// site.
+#[tokio::test]
+async fn record_run_completion_tears_down_driver_workspace_on_terminal_outcome() {
+    crate::driver_teardown::test_hooks::reset();
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        wait_state: Some(RunWaitState::Terminal),
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        runner.clone(),
+    ));
+    coordinator.kick();
+    wait_for_execution_status(
+        db.as_ref(),
+        &db.list_executions(Some(&chore.id)).unwrap()[0].id,
+        ExecutionStatus::Completed,
+    )
+    .await;
+
+    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
+    assert_eq!(
+        crate::driver_teardown::test_hooks::count(),
+        1,
+        "driver teardown must fire exactly once on the normal-completion termination path",
+    );
+}
+
 /// Host-adapter provider that records every host the dispatch loop
 /// asks it to build an adapter for, then returns a single fixed inner
 /// adapter. Lets a routing test assert *which* host was selected
@@ -153,7 +196,7 @@ async fn pinned_execution_routes_to_remote_host_and_persists_host_id() {
     );
 }
 
-/// The temporary interactive-pool concurrency cap
+/// The interactive-pool concurrency cap
 /// ([`MAX_CONCURRENT_INTERACTIVE_WORKERS`]): when the interactive pool
 /// already carries the capped number of live workers, a drain pass holds
 /// every main-pool `ready` row — no run starts, no cube work happens, the
@@ -171,9 +214,17 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
     assert_eq!(execution.status, ExecutionStatus::Ready);
 
     let cube = Arc::new(FakeCubeClient::default());
-    let runner = Arc::new(FakeExecutionRunner::default());
+    // `pending: true` keeps the run parked in `Running` so the
+    // post-cap-release assertion below has a stable status to wait
+    // for — the default fake runner completes instantly to
+    // `WaitingHuman`, which would race straight past `Running`.
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
     // Pool has idle slots beyond the cap — the cap, not slot
     // availability, must be what holds the row.
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
     let coordinator = Arc::new(
         ExecutionCoordinator::new(
             db.clone(),
@@ -181,7 +232,8 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
             cube.clone(),
             runner.clone(),
         )
-        .with_pre_start_retry_delays(Vec::new()),
+        .with_pre_start_retry_delays(Vec::new())
+        .with_dispatch_events(recording.clone()),
     );
     for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
         coordinator
@@ -204,12 +256,174 @@ async fn interactive_concurrency_cap_holds_ready_rows() {
         "wait reason should name the cap, got: {reason}",
     );
 
+    // `bossctl dispatch stats` derives the held-row view entirely from
+    // this event — assert it, not just the DB-level wait reason above,
+    // so a future refactor that drops the emit fails a test instead of
+    // silently going unobserved.
+    let events = recording.events_for(&execution.id).await;
+    let cap_event = events
+        .iter()
+        .find(|e| {
+            e.stage == crate::dispatch_events::Stage::WorkerClaimed.as_str()
+                && e.outcome == crate::dispatch_events::Outcome::Skipped.as_str()
+        })
+        .expect("a WorkerClaimed/Skipped event must be emitted for the cap-held execution");
+    assert_eq!(
+        cap_event.details.get("reason").and_then(|v| v.as_str()),
+        Some("interactive_concurrency_cap"),
+        "details.reason must name the cap as the hold reason, got: {:?}",
+        cap_event.details,
+    );
+    assert_eq!(
+        cap_event.details.get("live_workers").and_then(|v| v.as_u64()),
+        Some(MAX_CONCURRENT_INTERACTIVE_WORKERS as u64),
+        "details.live_workers must record the live count at the cap check, got: {:?}",
+        cap_event.details,
+    );
+    assert_eq!(
+        cap_event.details.get("cap").and_then(|v| v.as_u64()),
+        Some(MAX_CONCURRENT_INTERACTIVE_WORKERS as u64),
+        "details.cap must record the active cap, got: {:?}",
+        cap_event.details,
+    );
+
     // One worker frees → the next drain dispatches the held row.
     coordinator.worker_pool().release_worker("worker-1", None).await;
     coordinator.drain_ready_queue().await;
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
     assert!(
         !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
         "row must dispatch once the pool drops below the cap",
+    );
+}
+
+/// [`ExecutionCoordinator::set_max_concurrent_interactive_workers`]
+/// rejects `0` outright and clamps anything above
+/// [`MAX_WORKER_POOL_SIZE`] down to it, reporting which happened via
+/// [`SetConcurrencyCapOutcome`] rather than silently doing something
+/// other than what was asked. Uses a full-size pool so the ceiling
+/// under test is the compile-time [`MAX_WORKER_POOL_SIZE`], not the
+/// live pool capacity (see
+/// `set_max_concurrent_interactive_workers_clamps_to_live_pool_capacity`
+/// for the shrunk-pool case).
+#[tokio::test]
+async fn set_max_concurrent_interactive_workers_rejects_zero_and_clamps_overflow() {
+    use crate::coordinator::{MAX_CONCURRENT_INTERACTIVE_WORKERS, MAX_WORKER_POOL_SIZE};
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let coordinator = ExecutionCoordinator::new(db, WorkerPool::new(MAX_WORKER_POOL_SIZE), cube, runner);
+
+    let err = coordinator
+        .set_max_concurrent_interactive_workers(0)
+        .expect_err("0 must be rejected, not silently clamped to 1");
+    assert!(err.contains("at least 1"), "error should explain the floor, got: {err}");
+    assert_eq!(
+        coordinator.max_concurrent_interactive_workers(),
+        MAX_CONCURRENT_INTERACTIVE_WORKERS,
+        "a rejected set must not change the live value",
+    );
+
+    let outcome = coordinator
+        .set_max_concurrent_interactive_workers(MAX_WORKER_POOL_SIZE + 5)
+        .expect("above-ceiling values clamp rather than error");
+    assert_eq!(outcome.applied, MAX_WORKER_POOL_SIZE);
+    assert_eq!(outcome.clamped_from, Some(MAX_WORKER_POOL_SIZE + 5));
+    assert_eq!(coordinator.max_concurrent_interactive_workers(), MAX_WORKER_POOL_SIZE);
+
+    let outcome = coordinator
+        .set_max_concurrent_interactive_workers(12)
+        .expect("an in-range value applies verbatim");
+    assert_eq!(outcome.applied, 12);
+    assert_eq!(outcome.clamped_from, None);
+    assert_eq!(coordinator.max_concurrent_interactive_workers(), 12);
+}
+
+/// On a `BOSS_WORKER_POOL_SIZE`-shrunk instance (a test instance, e.g.
+/// pool size 2), the clamp ceiling must be the live pool capacity, not
+/// the compile-time [`MAX_WORKER_POOL_SIZE`] — otherwise `--set 16` is
+/// accepted unclamped and `bossctl agents pools` prints a cap the pool
+/// can never fill, reproducing the exact capacity-vs-cap contradiction
+/// this clamp exists to prevent.
+#[tokio::test]
+async fn set_max_concurrent_interactive_workers_clamps_to_live_pool_capacity() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner::default());
+    let coordinator = ExecutionCoordinator::new(db, WorkerPool::new(2), cube, runner);
+
+    let outcome = coordinator
+        .set_max_concurrent_interactive_workers(16)
+        .expect("above-capacity values clamp rather than error");
+    assert_eq!(
+        outcome.applied, 2,
+        "clamp must use the live 2-slot pool capacity, not MAX_WORKER_POOL_SIZE"
+    );
+    assert_eq!(outcome.clamped_from, Some(16));
+    assert_eq!(coordinator.max_concurrent_interactive_workers(), 2);
+}
+
+/// Raising the interactive-pool concurrency cap live — without
+/// recreating the coordinator, mirroring what `bossctl dispatch
+/// concurrency --set N` does against a running engine — lets a row
+/// already held at the old cap dispatch on the very next drain pass.
+/// This is the behavior the `SetDispatchConcurrency` RPC handler's
+/// `kick()` call exists for: a bare atomic store is not itself
+/// observed until something re-runs `drain_ready_queue`.
+#[tokio::test]
+async fn raising_interactive_concurrency_cap_live_unblocks_held_rows() {
+    use crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS;
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Held then unblocked");
+    db.reconcile_product_executions(&product.id).unwrap();
+    let execution = db.list_executions(Some(&chore.id)).unwrap().pop().unwrap();
+    assert_eq!(execution.status, ExecutionStatus::Ready);
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let runner = Arc::new(FakeExecutionRunner {
+        pending: true,
+        ..FakeExecutionRunner::default()
+    });
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(
+            db.clone(),
+            WorkerPool::new(MAX_CONCURRENT_INTERACTIVE_WORKERS + 4),
+            cube,
+            runner,
+        )
+        .with_pre_start_retry_delays(Vec::new()),
+    );
+    for i in 0..MAX_CONCURRENT_INTERACTIVE_WORKERS {
+        coordinator
+            .worker_pool()
+            .claim_worker(&format!("exec-busy-{i}"), None)
+            .await
+            .expect("idle slot below the cap");
+    }
+
+    coordinator.drain_ready_queue().await;
+    assert!(
+        db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+        "row must be held at the cap before it is raised",
+    );
+
+    // Raise the cap live (no new coordinator, no released worker) —
+    // exactly what the RPC handler does — then re-drain without
+    // freeing any of the already-claimed slots.
+    let outcome = coordinator
+        .set_max_concurrent_interactive_workers(MAX_CONCURRENT_INTERACTIVE_WORKERS + 1)
+        .expect("in-range raise applies verbatim");
+    assert_eq!(outcome.applied, MAX_CONCURRENT_INTERACTIVE_WORKERS + 1);
+    coordinator.drain_ready_queue().await;
+
+    wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
+    assert!(
+        !db.active_run_ids_for_execution(&execution.id).unwrap().is_empty(),
+        "row must dispatch once the live cap is raised, with no slot ever released",
     );
 }
 

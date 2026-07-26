@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use boss_event_bus::{Event, EventBus};
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
+
+use crate::event_publish::{PendingEvents, commit_and_publish};
 
 /// How long sqlite will internally retry on `SQLITE_BUSY` before
 /// surfacing the error to the caller. We funnel concurrent CLI writes
@@ -172,9 +175,9 @@ pub use boss_protocol::{
     CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyDirection, DependencyEdge,
     DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
     EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput,
-    FollowupMemberOverride, INTENT_DIRECTIVE, INTENT_LARGER_CHANGE, INTENT_QUESTION, LAST_STATUS_ACTOR_BOOTHBY,
-    LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState,
-    ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, RemoveDependencyInput,
+    FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN,
+    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus,
+    RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput,
     RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind,
     ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
     THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
@@ -391,6 +394,14 @@ pub struct WorkDb {
     /// cloned freely across the engine, and an arm on one handle must be
     /// visible to the mutation that runs through another.
     boothby_action: Arc<Mutex<Option<boothby::BoothbyActionContext>>>,
+    /// The engine event bus this `WorkDb` (and every clone of it) publishes
+    /// state-transition events onto — see `crate::event_publish`. Defaults
+    /// to a private bus with no subscribers when `WorkDb` is opened
+    /// directly; callers that want other subsystems to observe published
+    /// events (e.g. `ServerState`) construct the bus themselves and inject
+    /// it via [`Self::with_event_bus`] so every clone shares the one
+    /// instance subscribers attach to.
+    event_bus: Arc<EventBus>,
 }
 
 impl Clone for WorkDb {
@@ -400,6 +411,7 @@ impl Clone for WorkDb {
             memory: self.memory.clone(),
             conn: Arc::clone(&self.conn),
             boothby_action: Arc::clone(&self.boothby_action),
+            event_bus: Arc::clone(&self.event_bus),
         }
     }
 }
@@ -421,11 +433,13 @@ mod design_postmortem;
 mod dispatch;
 mod dispatch_class;
 mod dispatch_helpers;
+mod driver_lookup;
 mod editorial;
 mod exec_status_helpers;
 mod exec_tail;
 mod execution_retention;
 mod executions_runs;
+mod github_api_usage_db;
 mod host_reconcile_queries;
 mod insert_helpers;
 mod list_filter;
@@ -487,10 +501,12 @@ pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
+pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;
@@ -516,6 +532,7 @@ pub use output_types::WorkerPrCompletionTarget;
 pub use planner_runs::ClaimPlannerRunInput;
 pub use planner_runs::PlannerRunPatch;
 pub use pr_flow::PrPollStateInput;
+pub use pr_flow::PrStatusSnapshot;
 pub use pr_flow::QueuedMergeQueueMember;
 #[cfg(test)]
 pub use pr_state::FakePrStateChecker;

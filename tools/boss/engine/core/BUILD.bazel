@@ -19,6 +19,13 @@ rust_library(
         # Stamped build-info constants (BOSS_VERSION, BOSS_GIT_SHA, BOSS_BUILD_TIME).
         # Referenced via include!(env!("BOSS_BUILD_INFO_RS")) in build_info_stamp module.
         "//tools/boss/installer:build_info_rs",
+        # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
+        # boss-ism pattern stays byte-identical to BOSS_ID_RE.
+        "//:CHECKS.yaml",
+        # Reference-driver conformance goldens — include_str!'d from
+        # src/conformance/claude_goldens.rs.
+        "src/conformance/goldens/settings_standard.json.golden",
+        "src/conformance/goldens/claude_md_standard.md.golden",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
@@ -29,6 +36,12 @@ rust_library(
         # rules_rust prefixes $(execpath) values with ${pwd} and resolves
         # them to absolute filesystem paths before invoking rustc.
         "BOSS_BUILD_INFO_RS": "$(execpath //tools/boss/installer:build_info_rs)",
+        # Absolute path to the root CHECKS.yaml, read by
+        # boss_construct_scan.rs's self-test via include_str!(env!(...)). A
+        # plain relative include_str! can't cross this package boundary: the
+        # source file's compile-time path is rooted under bazel-out, not the
+        # real source tree, so `../../../CHECKS.yaml` doesn't resolve there.
+        "BOSS_CHECKS_YAML": "$(execpath //:CHECKS.yaml)",
     },
     visibility = [
         "//tools/boss/bossctl:__pkg__",
@@ -43,15 +56,18 @@ rust_library(
         "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",
         "//tools/boss/engine/ci-log-reader",
+        "//tools/boss/engine/comment-classifier",
         "//tools/boss/engine/conflict-diagnosis",
         "//tools/boss/engine/day-rotated-log",
         "//tools/boss/engine/design-doc-fetcher",
         "//tools/boss/engine/design-docs",
         "//tools/boss/engine/deterministic-resolvers",
         "//tools/boss/engine/dispatch-events",
+        "//tools/boss/engine/dispatch-reader",
         "//tools/boss/engine/driver",
         "//tools/boss/engine/editorial",
         "//tools/boss/engine/effort",
+        "//tools/boss/engine/event-bus",
         "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/gh-invocation",
         "//tools/boss/engine/live-status-redact",
@@ -60,12 +76,17 @@ rust_library(
         "//tools/boss/engine/pr-review",
         "//tools/boss/engine/pr-template",
         "//tools/boss/engine/proposal-validation",
+        "//tools/boss/engine/recovery",
         "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/stdout-progress",
+        "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",
         "//tools/boss/engine/transient-error",
+        "//tools/boss/engine/utility-model",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/worker-policy",
+        "//tools/boss/gh_telemetry",
         "//tools/boss/github",
         "//tools/boss/github_tracker",
         "//tools/boss/log-files",
@@ -103,7 +124,7 @@ rust_binary(
 # //third_party/patches (see MODULE.bazel single_version_override). One
 # cfg(test) compile of the crate + 11 parallel shard executions, vs the
 # previous layout's 4 filter-partitioned rust_test targets = 4 full compiles.
-# See docs/investigations/rust-test-sharding-engine-lib-test.md (T2856) for
+# See docs/investigations/rust-test-sharding-engine-lib-test.md for
 # the correctness gate and before/after measurements this adoption is based on.
 #
 # size = "small" / timeout = "moderate" (300 s):

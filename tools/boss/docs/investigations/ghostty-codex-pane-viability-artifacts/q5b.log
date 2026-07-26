@@ -1,0 +1,17 @@
+pid=74245
+t=7.0 ESC
+t=12.1 alive=True
+t=12.1 submitted follow-up with CR
+t=35.2 try submit with newline too
+final alive=True bytes=42014
+rollout /Users/brianduff/.codex/sessions/2026/07/26/rollout-2026-07-26T03-52-12-019f9e0d-cc26-7ef0-a121-bc6eeff24bad.jsonl
+  EVENT task_started: {"type": "task_started", "turn_id": "019f9e0d-cdad-7753-8fa6-4029b64492cf", "started_at": 1785063132, "model_context_window": 258400, "collaboration_mode_kind": "default"}
+  EVENT user_message: {"type": "user_message", "message": "run: sleep 90; reply with exactly: should-not-finish", "images": [], "local_images": [], "audio": [], "local_audio": [], "text_elements": []}
+  EVENT agent_message: {"type": "agent_message", "message": "Running the requested delay.", "phase": "commentary", "memory_citation": null}
+  EVENT turn_aborted: {"type": "turn_aborted", "turn_id": "019f9e0d-cdad-7753-8fa6-4029b64492cf", "reason": "interrupted", "started_at": 1785063132, "completed_at": 1785063139, "duration_ms": 6344}
+  EVENT task_started: {"type": "task_started", "turn_id": "019f9e0d-fc91-73a3-b535-c17cd0290c36", "started_at": 1785063144, "model_context_window": 258400, "collaboration_mode_kind": "default"}
+  EVENT user_message: {"type": "user_message", "message": "reply with exactly: second-turn-ok", "images": [], "local_images": [], "audio": [], "local_audio": [], "text_elements": []}
+  EVENT agent_message: {"type": "agent_message", "message": "second-turn-ok", "phase": "final_answer", "memory_citation": null}
+  EVENT task_complete: {"type": "task_complete", "turn_id": "019f9e0d-fc91-73a3-b535-c17cd0290c36", "last_agent_message": "second-turn-ok", "started_at": 1785063144, "completed_at": 1785063146, "duration_ms": 1613, "time_to_first_token_ms": 14
+  total lines 25
+DONE

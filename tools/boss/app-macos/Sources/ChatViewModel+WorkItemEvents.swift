@@ -19,6 +19,8 @@ extension ChatViewModel {
         taskRuntimes: [WorkTaskRuntime],
         dependencies: [WorkItemDependency]
     ) {
+        // Fan-out regression counter (design entry 2): full work-tree applies.
+        UIUpdateCounters.shared.recordApplyWorkTree()
         // Population-timing (T2101 R1): time this @MainActor apply burst
         // and its two hot sub-steps. `popCtx` carries the flow/seq tag
         // decoded off-main so every segment of one fetch reads together.
@@ -232,25 +234,75 @@ extension ChatViewModel {
     /// fetching the full work tree. Routes the task into the correct bucket
     /// based on its current `projectID` and `kind`, removing any stale entry
     /// from other buckets first (handles the rare case where these change).
+    ///
+    /// Cache invalidation is keyed (design entry 8): when bucket membership
+    /// and kind are unchanged, `taskIndexByID` is patched in place and the
+    /// dependency / revision caches are only dropped when their baked-in
+    /// snapshots would go stale (status / name for prereq rows; any field
+    /// on a revision row). Project-membership, kind, or unknown-previous
+    /// updates still full-invalidate.
     private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
-        let productID = updatedTask.productID
-        if isChore {
-            var chores = choresByProductID[productID] ?? []
-            chores.removeAll { $0.id == updatedTask.id }
-            chores.append(updatedTask)
-            choresByProductID[productID] = chores.sorted(by: taskSort)
-        } else {
-            // Remove from all task buckets so a rare projectID/kind change
-            // doesn't leave a stale entry behind.
-            for key in Array(tasksByProjectID.keys) {
-                tasksByProjectID[key]?.removeAll { $0.id == updatedTask.id }
-            }
-            var revisions = productLevelRevisionsByProductID[productID] ?? []
-            revisions.removeAll { $0.id == updatedTask.id }
-            var productLevelItems = productLevelTasksByProductID[productID] ?? []
-            productLevelItems.removeAll { $0.id == updatedTask.id }
+        // Fan-out regression counter (design entry 2): single-task board update.
+        UIUpdateCounters.shared.recordIncrementalTaskUpdate()
+        let previous = task(withID: updatedTask.id)
+        let requiresFullInvalidation = Self.incrementalUpdateRequiresFullInvalidation(
+            previous: previous,
+            updated: updatedTask,
+            isChore: isChore
+        )
 
-            if let projectID = updatedTask.projectID {
+        // Suppress the bucket didSet → full invalidate so we can apply a
+        // keyed drop after the mutation instead of discarding all ten caches
+        // once per assignment.
+        withSuppressedWorkCacheInvalidation {
+            let productID = updatedTask.productID
+            let taskID = updatedTask.id
+
+            // Evict the id from every bucket it might previously have lived
+            // in (chore arm included) so a kind/project/product flip cannot
+            // leave a stale twin behind. Dictionary values are Arrays —
+            // copy out, mutate, write back; `dict[key]?.removeAll` discards
+            // the copy. Product-scoped maps are scanned across all keys so a
+            // productID change does not leave the row under the old product.
+            for key in Array(tasksByProjectID.keys) {
+                guard var bucket = tasksByProjectID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    tasksByProjectID[key] = bucket
+                }
+            }
+            for key in Array(choresByProductID.keys) {
+                guard var bucket = choresByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    choresByProductID[key] = bucket
+                }
+            }
+            for key in Array(productLevelRevisionsByProductID.keys) {
+                guard var bucket = productLevelRevisionsByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    productLevelRevisionsByProductID[key] = bucket
+                }
+            }
+            for key in Array(productLevelTasksByProductID.keys) {
+                guard var bucket = productLevelTasksByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    productLevelTasksByProductID[key] = bucket
+                }
+            }
+
+            // Insert into the destination bucket for the updated shape.
+            if isChore {
+                var chores = choresByProductID[productID] ?? []
+                chores.append(updatedTask)
+                choresByProductID[productID] = chores.sorted(by: taskSort)
+            } else if let projectID = updatedTask.projectID {
                 var tasks = tasksByProjectID[projectID] ?? []
                 tasks.append(updatedTask)
                 tasksByProjectID[projectID] = tasks.sorted(by: taskSort)
@@ -261,13 +313,55 @@ extension ChatViewModel {
                 // un-evicted and duplicate the task onto itself.
                 trackedProjectIDsByProductID[productID, default: []].insert(projectID)
             } else if updatedTask.kind == "revision" {
+                var revisions = productLevelRevisionsByProductID[productID] ?? []
                 revisions.append(updatedTask)
                 productLevelRevisionsByProductID[productID] = revisions.sorted(by: taskSort)
             } else {
+                var productLevelItems = productLevelTasksByProductID[productID] ?? []
                 productLevelItems.append(updatedTask)
                 productLevelTasksByProductID[productID] = productLevelItems.sorted(by: taskSort)
             }
         }
+
+        if requiresFullInvalidation {
+            invalidateWorkCache()
+            return
+        }
+
+        // Same bucket + same kind: patch the id index and drop only the
+        // caches this row can affect.
+        patchTaskIndex(with: updatedTask)
+        var keys: WorkCacheInvalidation = [.boardLayout]
+        // Status feeds edge satisfaction (`isWorkItemRowSatisfied`); name is
+        // baked into `WorkDependencyRow.title` at rebuild time. Either change
+        // must drop the prereq graphs so the next read rebuilds with current
+        // titles / satisfaction.
+        if previous?.status != updatedTask.status
+            || previous?.name != updatedTask.name
+        {
+            keys.insert(.dependencies)
+        }
+        if taskUpdateAffectsRevisionCache(previous: previous, updated: updatedTask) {
+            keys.insert(.revisions)
+        }
+        invalidateWorkCache(keys)
+    }
+
+    /// True when an incremental update must discard every derived cache
+    /// (id index, dep graphs, revision rollups, board layout). Covers the
+    /// correctness cases: unknown previous row, project-membership change,
+    /// kind change, and chore/task arm flip.
+    static func incrementalUpdateRequiresFullInvalidation(
+        previous: WorkTask?,
+        updated: WorkTask,
+        isChore: Bool
+    ) -> Bool {
+        guard let previous else { return true }
+        if previous.kind != updated.kind { return true }
+        if previous.projectID != updated.projectID { return true }
+        if previous.productID != updated.productID { return true }
+        if previous.isChore != isChore { return true }
+        return false
     }
 
     /// Fire a review notification when `updatedTask` enters `in_review`

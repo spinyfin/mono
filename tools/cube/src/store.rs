@@ -233,7 +233,9 @@ impl Store {
                 head_commit,
                 last_release_reason,
                 health_status,
-                unhealthy_since_epoch_s
+                unhealthy_since_epoch_s,
+                last_holder,
+                last_task
             FROM workspaces
             WHERE 1=1
             "#,
@@ -302,7 +304,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -495,7 +499,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -669,7 +675,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -698,7 +706,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -726,7 +736,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -782,6 +794,8 @@ impl Store {
                 SET
                     state = ?2,
                     lease_id = NULL,
+                    last_holder = COALESCE(holder, last_holder),
+                    last_task = COALESCE(task, last_task),
                     holder = NULL,
                     task = NULL,
                     leased_at_epoch_s = NULL,
@@ -799,6 +813,8 @@ impl Store {
         Ok(Some(WorkspaceRecord {
             state: WorkspaceState::Free,
             lease_id: None,
+            last_holder: record.holder.clone().or_else(|| record.last_holder.clone()),
+            last_task: record.task.clone().or_else(|| record.last_task.clone()),
             holder: None,
             task: None,
             leased_at_epoch_s: None,
@@ -847,6 +863,8 @@ impl Store {
                 SET
                     state = ?2,
                     lease_id = NULL,
+                    last_holder = COALESCE(holder, last_holder),
+                    last_task = COALESCE(task, last_task),
                     holder = NULL,
                     task = NULL,
                     leased_at_epoch_s = NULL,
@@ -882,7 +900,9 @@ impl Store {
                     head_commit,
                     last_release_reason,
                     health_status,
-                    unhealthy_since_epoch_s
+                    unhealthy_since_epoch_s,
+                    last_holder,
+                    last_task
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -1104,6 +1124,8 @@ impl Store {
                 SET
                     state = ?2,
                     lease_id = NULL,
+                    last_holder = COALESCE(holder, last_holder),
+                    last_task = COALESCE(task, last_task),
                     holder = NULL,
                     task = NULL,
                     leased_at_epoch_s = NULL,
@@ -1215,6 +1237,8 @@ impl Store {
                     last_release_reason TEXT,
                     health_status TEXT,
                     unhealthy_since_epoch_s INTEGER,
+                    last_holder TEXT,
+                    last_task TEXT,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -1275,6 +1299,28 @@ impl Store {
             "ALTER TABLE workspaces ADD COLUMN unhealthy_since_epoch_s INTEGER",
         )?;
         try_add_column(&self.connection, "ALTER TABLE repos ADD COLUMN clone_command TEXT")?;
+        // Snapshots of `holder` / `task` taken as the lease ends, so retention
+        // salvage (which runs days later, when the live columns are long since
+        // NULL) can still attribute the work it captures.
+        try_add_column(&self.connection, "ALTER TABLE workspaces ADD COLUMN last_holder TEXT")?;
+        try_add_column(&self.connection, "ALTER TABLE workspaces ADD COLUMN last_task TEXT")?;
+
+        // Created after the ALTERs above so it also lands on a database whose
+        // `workspaces` table pre-dates the `health_status` column.
+        //
+        // The lease hot path selects candidates by (repo, state,
+        // health_status). Once the cached health verdict became authoritative
+        // — rather than something re-derived from the filesystem on every
+        // lease — this composite is what keeps candidate selection an indexed
+        // lookup instead of a scan of every workspace row for the repo.
+        self.connection
+            .execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS workspaces_repo_state_health_idx
+                    ON workspaces(repo, state, health_status);
+                "#,
+            )
+            .map_err(CubeError::Storage)?;
 
         Ok(())
     }
@@ -1346,6 +1392,8 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         last_release_reason: row.get(10)?,
         health_status: health_raw.as_deref().and_then(|h| h.parse().ok()),
         unhealthy_since_epoch_s: row.get(12)?,
+        last_holder: row.get(13)?,
+        last_task: row.get(14)?,
     })
 }
 

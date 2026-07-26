@@ -43,9 +43,91 @@
 use super::*;
 
 use boss_engine_proposal_validation::{derive_idempotency_key, validate_caller_idempotency_key, validate_payload};
-use boss_protocol::{ProposalErrorCode, ProposalSubmissionError};
+use boss_protocol::{ProposalErrorCode, ProposalKind, ProposalSubmissionError};
 
+use crate::metrics::Registry;
 use crate::work::{SubmitWorkerProposalInput, SubmitWorkerProposalOutcome};
+
+// `SubmitProposal` counter families (design §"Seam migration map" /
+// implementation task 13: "proposal counters registered in the metrics
+// framework: submissions by kind, validation failures, rate-limit hits,
+// fallback hits per seam"). The fourth family (fallback hits per seam)
+// is declared per-seam as each seam migration lands (see
+// `completion.rs`'s `worker_proposals.fallback_hit.*` counters); these
+// three cover every `SubmitProposal` call regardless of which seam it
+// belongs to.
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_ATTENTION,
+    "worker_proposals.submitted.attention",
+    "SubmitProposal accepted a proposal of kind `attention`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_EFFORT_ESCALATION,
+    "worker_proposals.submitted.effort_escalation",
+    "SubmitProposal accepted a proposal of kind `effort_escalation`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_BLOCKED,
+    "worker_proposals.submitted.blocked",
+    "SubmitProposal accepted a proposal of kind `blocked`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_DEFERRED_SCOPE,
+    "worker_proposals.submitted.deferred_scope",
+    "SubmitProposal accepted a proposal of kind `deferred_scope`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_FOLLOWUP_TASK,
+    "worker_proposals.submitted.followup_task",
+    "SubmitProposal accepted a proposal of kind `followup_task`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME,
+    "worker_proposals.submitted.automation_outcome",
+    "SubmitProposal accepted a proposal of kind `automation_outcome`.",
+);
+crate::register_counter!(
+    PROPOSAL_SUBMITTED_PR_CREATED,
+    "worker_proposals.submitted.pr_created",
+    "SubmitProposal accepted a proposal of kind `pr_created`.",
+);
+crate::register_counter!(
+    PROPOSAL_VALIDATION_FAILED,
+    "worker_proposals.validation_failed",
+    "SubmitProposal rejected a submission for ProposalErrorCode::ValidationFailed (payload schema).",
+);
+crate::register_counter!(
+    PROPOSAL_RATE_LIMITED,
+    "worker_proposals.rate_limited",
+    "SubmitProposal rejected a submission for ProposalErrorCode::RateLimited (per-execution cap exhausted).",
+);
+
+/// Register every `SubmitProposal` counter handle with `registry`. Called
+/// from [`crate::metrics_init::init_all`] at engine startup.
+pub fn register_metrics(registry: &Registry) {
+    registry.register_counter(&PROPOSAL_SUBMITTED_ATTENTION);
+    registry.register_counter(&PROPOSAL_SUBMITTED_EFFORT_ESCALATION);
+    registry.register_counter(&PROPOSAL_SUBMITTED_BLOCKED);
+    registry.register_counter(&PROPOSAL_SUBMITTED_DEFERRED_SCOPE);
+    registry.register_counter(&PROPOSAL_SUBMITTED_FOLLOWUP_TASK);
+    registry.register_counter(&PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME);
+    registry.register_counter(&PROPOSAL_SUBMITTED_PR_CREATED);
+    registry.register_counter(&PROPOSAL_VALIDATION_FAILED);
+    registry.register_counter(&PROPOSAL_RATE_LIMITED);
+}
+
+/// Increment the `worker_proposals.submitted.<kind>` counter for `kind`.
+fn record_proposal_submitted(metrics: &Registry, kind: ProposalKind) {
+    match kind {
+        ProposalKind::Attention => PROPOSAL_SUBMITTED_ATTENTION.inc(metrics),
+        ProposalKind::EffortEscalation => PROPOSAL_SUBMITTED_EFFORT_ESCALATION.inc(metrics),
+        ProposalKind::Blocked => PROPOSAL_SUBMITTED_BLOCKED.inc(metrics),
+        ProposalKind::DeferredScope => PROPOSAL_SUBMITTED_DEFERRED_SCOPE.inc(metrics),
+        ProposalKind::FollowupTask => PROPOSAL_SUBMITTED_FOLLOWUP_TASK.inc(metrics),
+        ProposalKind::AutomationOutcome => PROPOSAL_SUBMITTED_AUTOMATION_OUTCOME.inc(metrics),
+        ProposalKind::PrCreated => PROPOSAL_SUBMITTED_PR_CREATED.inc(metrics),
+    }
+}
 
 /// The execution a proposal call was attributed to, plus the work item it
 /// is thereby scoped to.
@@ -185,6 +267,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
         Ok(validated) => validated,
         Err(field_errors) => {
             let error = ProposalSubmissionError::validation(field_errors);
+            PROPOSAL_VALIDATION_FAILED.inc(&server_state.metrics);
             tracing::debug!(
                 execution_id = %caller.execution_id,
                 kind = %kind,
@@ -233,6 +316,7 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             already_submitted,
             staged_followup,
         })) => {
+            record_proposal_submitted(&server_state.metrics, kind);
             tracing::info!(
                 proposal_id = %proposal.id,
                 execution_id = %caller.execution_id,
@@ -312,6 +396,9 @@ pub(super) async fn handle_submit_proposal(ctx: Dispatch, req: FrontendRequest) 
             );
         }
         Ok(Err(refusal)) => {
+            if refusal.code == ProposalErrorCode::RateLimited {
+                PROPOSAL_RATE_LIMITED.inc(&server_state.metrics);
+            }
             tracing::warn!(
                 execution_id = %caller.execution_id,
                 kind = %kind,

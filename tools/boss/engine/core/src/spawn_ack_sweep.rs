@@ -347,10 +347,23 @@ pub(crate) async fn reap_never_started_spawn(
         return false;
     }
 
+    // Never-started-spawn termination path: tear down any driver-owned
+    // state outside the workspace. `mark_execution_orphaned` preserves
+    // `workspace_path`, so the pre-call `execution` snapshot is still
+    // current. Best-effort: a never-started spawn typically means
+    // `provision_workspace` ran but `teardown_workspace` still gets its
+    // chance regardless.
+    crate::driver_teardown::teardown_driver_workspace(
+        ctx.work_db,
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
+
     // Snapshot any uncommitted workspace work to a durable patch before the
     // slot is released and the workspace becomes eligible for re-lease/reset.
     // Best-effort: a false-live spawn typically has nothing to back up.
-    let recovery_patch = crate::recovery_backup::backup_dead_execution(execution);
+    let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
 
     // Append an [engine-reconcile] audit line to the work item's description
     // so a human inspecting the chore can see why it was reset.

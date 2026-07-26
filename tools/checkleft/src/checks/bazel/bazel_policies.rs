@@ -262,6 +262,7 @@ fn collect_findings_forbidden_rule_calls(
                 line: Some(location.line),
                 column: Some(location.column),
             }),
+            surface: None,
             remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
                 "Replace the forbidden Bazel rule or macro call with an approved alternative.".to_owned()
             })],
@@ -310,6 +311,7 @@ fn collect_findings_forbidden_default_visibility(
                 line: Some(location.line),
                 column: Some(location.column),
             }),
+            surface: None,
             remediations: vec![rule.remediation.clone().unwrap_or_else(|| {
                 "Remove the package default visibility or narrow visibility on individual targets.".to_owned()
             })],

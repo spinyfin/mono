@@ -94,6 +94,7 @@ mod tests {
                 line: Some(42),
                 column: None,
             }),
+            surface: None,
             remediations: vec!["fix it".to_owned()],
             suggested_fix: None,
         };

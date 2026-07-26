@@ -686,7 +686,7 @@ fn find_most_recent_open_task_returns_none_when_no_tasks() {
     let product = create_test_product_named(&db, "Automation Test Co");
     let automation = make_automation(&db, &product.id, 3);
     assert!(
-        db.find_most_recent_open_task_for_automation(&automation.id)
+        db.find_most_recent_open_task_for_automation(&automation.id, None)
             .unwrap()
             .is_none()
     );
@@ -704,7 +704,7 @@ fn find_most_recent_open_task_returns_open_task() {
         .unwrap();
 
     let found = db
-        .find_most_recent_open_task_for_automation(&automation.id)
+        .find_most_recent_open_task_for_automation(&automation.id, None)
         .unwrap()
         .expect("must return the one open task");
     assert_eq!(found.id, task.id);
@@ -731,7 +731,7 @@ fn find_most_recent_open_task_ignores_done_tasks() {
     .unwrap();
 
     assert!(
-        db.find_most_recent_open_task_for_automation(&automation.id)
+        db.find_most_recent_open_task_for_automation(&automation.id, None)
             .unwrap()
             .is_none(),
         "a completed task must not be returned"
@@ -756,7 +756,7 @@ fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open()
 
     // t2 was created after t1 — must be returned.
     let found = db
-        .find_most_recent_open_task_for_automation(&automation.id)
+        .find_most_recent_open_task_for_automation(&automation.id, None)
         .unwrap()
         .expect("must return the newest open task");
     assert_eq!(
@@ -775,7 +775,7 @@ fn find_most_recent_open_task_returns_most_recently_created_when_multiple_open()
     )
     .unwrap();
     let found2 = db
-        .find_most_recent_open_task_for_automation(&automation.id)
+        .find_most_recent_open_task_for_automation(&automation.id, None)
         .unwrap()
         .expect("t1 still open");
     assert_eq!(found2.id, t1.id);
@@ -794,10 +794,49 @@ fn find_most_recent_open_task_ignores_deleted_tasks() {
     db.delete_work_item(&task.id).unwrap();
 
     assert!(
-        db.find_most_recent_open_task_for_automation(&automation.id)
+        db.find_most_recent_open_task_for_automation(&automation.id, None)
             .unwrap()
             .is_none(),
         "soft-deleted task must not be returned"
+    );
+}
+
+/// `not_before_epoch` excludes a task created strictly before it — the bound
+/// that keeps a task left open by an *earlier* triage run from being
+/// misattributed to the run being finalized now.
+#[test]
+fn find_most_recent_open_task_respects_not_before_epoch_bound() {
+    let db = WorkDb::open(temp_db_path("auto-find-not-before")).unwrap();
+    let product = create_test_product_named(&db, "Automation Test Co");
+    let automation = make_automation(&db, &product.id, 2);
+
+    let task = db
+        .create_automation_task(&automation.id, "from an earlier run", None, &[], &[])
+        .unwrap();
+    let created_epoch: i64 = task.created_at.parse().unwrap();
+
+    // A later run's start time (after the task was created) must not see it.
+    assert!(
+        db.find_most_recent_open_task_for_automation(&automation.id, Some(created_epoch + 100))
+            .unwrap()
+            .is_none(),
+        "a task created before the bound must be excluded"
+    );
+
+    // A bound at-or-before the task's creation time must still find it.
+    assert_eq!(
+        db.find_most_recent_open_task_for_automation(&automation.id, Some(created_epoch))
+            .unwrap()
+            .expect("task created exactly at the bound must be included")
+            .id,
+        task.id
+    );
+    assert_eq!(
+        db.find_most_recent_open_task_for_automation(&automation.id, Some(created_epoch - 100))
+            .unwrap()
+            .expect("task created after the bound must be included")
+            .id,
+        task.id
     );
 }
 

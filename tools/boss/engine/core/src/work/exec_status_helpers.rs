@@ -32,6 +32,64 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
     })
 }
 
+/// Stage an [`Event::ExecutionTerminal`] for publish once the caller's
+/// transaction commits. Call immediately after writing `work_executions`'s
+/// `status` column to a terminal value, passing the row's own id and its
+/// `work_item_id` (task id). Resolves `host_id` with its own read so
+/// callers don't have to thread it through — `work_executions.host_id` is
+/// nullable until a run first picks a host, so this falls back to
+/// `"local"` (the engine's historical default host) rather than publish an
+/// event with an empty id.
+///
+/// `pool_claim` is always published as `None`: whether an execution still
+/// holds a worker-pool slot is runtime state owned by the
+/// `ExecutionCoordinator`'s `WorkerPool`, not a DB column this DB-layer
+/// helper can see. Per the event-bus design's "events are hints, not
+/// commands" contract, a future `pool_claim_sweep` subscriber re-reads the
+/// live pool state itself rather than trusting this field for correctness.
+pub(crate) fn stage_execution_terminal(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    execution_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let host_id: Option<String> = conn
+        .query_row(
+            "SELECT host_id FROM work_executions WHERE id = ?1",
+            params![execution_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    pending.push(Event::ExecutionTerminal {
+        execution_id: execution_id.to_owned(),
+        task_id: task_id.to_owned(),
+        host_id: host_id.unwrap_or_else(|| "local".to_owned()),
+        pool_claim: None,
+    });
+    Ok(())
+}
+
+/// Publish an [`Event::ExecutionTerminal`] immediately — for the rarer
+/// terminal-write call sites that mutate `work_executions` through a plain
+/// (auto-committing) [`Connection`] rather than an explicit `Transaction`,
+/// so there is no commit to gate the publish on. Same field resolution as
+/// [`stage_execution_terminal`]; callers must invoke this only *after* the
+/// write that made the transition already succeeded.
+pub(crate) fn publish_execution_terminal(
+    bus: &EventBus,
+    conn: &Connection,
+    execution_id: &str,
+    task_id: &str,
+) -> Result<()> {
+    let mut pending = PendingEvents::new();
+    stage_execution_terminal(&mut pending, conn, execution_id, task_id)?;
+    for event in pending.into_events() {
+        bus.publish(event);
+    }
+    Ok(())
+}
+
 pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,
@@ -85,6 +143,34 @@ pub(crate) fn task_accepts_execution(task: &Task) -> bool {
         return false;
     }
     true
+}
+
+/// True when `work_item_id` is a task flagged `deferred = 1` (future /
+/// not-yet-in-scope). Deferred items are still auto-unblocked and remain
+/// schedulable, but the engine must never mint a `ready` execution for
+/// them on any automatic path — `reconcile_work_item_execution` and
+/// `reconcile_revision_execution` consult this and skip the mint until a
+/// human explicitly approves the item (which clears the flag). Projects
+/// (`proj_…`) never carry the column, so this is always `false` for them.
+///
+/// Reads the column directly rather than mapping a full `Task`: gating
+/// must stay correct on every code path regardless of which mapper (and
+/// therefore which SELECT column set) produced a caller's in-memory Task.
+/// It is deliberately NOT wired into [`task_accepts_execution`] — the
+/// dependency auto-unblock cascade bypasses that gate and calls the
+/// reconcile helpers directly, so the check belongs at the mint point.
+pub(crate) fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    if !work_item_id.starts_with("task_") {
+        return Ok(false);
+    }
+    let deferred: Option<i64> = conn
+        .query_row(
+            "SELECT deferred FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(deferred.unwrap_or(0) != 0)
 }
 
 pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {

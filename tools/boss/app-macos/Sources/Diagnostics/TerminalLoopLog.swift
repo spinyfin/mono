@@ -182,7 +182,7 @@ struct TabSwitchSample: Codable, Identifiable, Sendable, Equatable {
 ///
 /// Added after the 2026-07-15 App Nap incident: with the display asleep,
 /// macOS throttled the main run loop and delayed engine→app RPC acks
-/// (`EngineClient.emit`'s `Task { @MainActor }` hop) by 24-87s, well past
+/// (`EngineClient.emit`'s main-actor drain hop) by 24-87s, well past
 /// the engine's spawn-ack deadline, and diagnosing the window required
 /// external forensics (`pmset` logs, coordinator-side reconstruction)
 /// because the app kept no record of display power state. This record

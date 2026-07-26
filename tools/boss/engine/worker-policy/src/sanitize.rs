@@ -221,6 +221,8 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::ProposalsList { .. }
         | FrontendEvent::WorkerContextResult { .. }
+        | FrontendEvent::PrStatusResult { .. }
+        | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }
         | FrontendEvent::FeatureFlagSet { .. }
@@ -236,6 +238,7 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::MetricsListLiveResult { .. }
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
+        | FrontendEvent::DispatchConcurrencyResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::AutomationStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
@@ -272,6 +275,8 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::AutomationRunsList { .. }
         | FrontendEvent::AutomationDedupSuppressionsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
-        | FrontendEvent::AutomationRunEnqueued { .. }) => passthrough,
+        | FrontendEvent::AutomationRunEnqueued { .. }
+        | FrontendEvent::RunHeld { .. }
+        | FrontendEvent::RunHoldReleased { .. }) => passthrough,
     }
 }

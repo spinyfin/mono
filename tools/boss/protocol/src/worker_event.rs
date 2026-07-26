@@ -1,10 +1,16 @@
-//! Typed events emitted by a claude worker via its hook payloads.
+//! Typed events emitted by a coding-agent worker via its hook payloads.
 //!
 //! Claude's hooks (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
 //! Stop, Notification, SessionEnd) deliver JSON payloads to the
 //! `boss-event` shim, which forwards them over the engine events socket.
 //! [`normalize_hook_event`] converts a raw payload into a typed
 //! [`WorkerEvent`] that downstream engine code can match on.
+//!
+//! The shape here is shared, not Claude-exclusive: a driver whose hook
+//! payloads look enough like Claude's (same event names, same-ish fields)
+//! can reuse [`normalize_hook_event`] rather than writing its own. The one
+//! place that genuinely varies per driver is the session-identity key —
+//! see [`extract_session_identity`].
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -46,11 +52,21 @@ pub enum WorkerEvent {
     },
 }
 
+/// Why a session started or resumed.
+///
+/// `Startup` / `Resume` / `Compact` are Claude's trigger set. `Clear` is
+/// Codex's addition (its `/clear`-equivalent) — a strict superset of
+/// Claude's, so widening this enum costs Claude nothing. `Other` is the
+/// catch-all for any trigger neither driver has named yet: unrecognized
+/// values are tolerated, never a hard parse failure, so a future driver
+/// with its own trigger vocabulary doesn't need this enum to change again
+/// just to stay unblocked.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionStartSource {
     Startup,
     Resume,
+    Clear,
     Compact,
     Other,
 }
@@ -86,11 +102,7 @@ pub fn normalize_hook_event(raw: &serde_json::Value) -> Result<WorkerEvent, Norm
         .as_object()
         .ok_or_else(|| NormalizeError::Malformed("expected JSON object".into()))?;
 
-    let session_id = obj
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned)
-        .ok_or(NormalizeError::MissingField("session_id"))?;
+    let session_id = extract_session_identity(obj).ok_or(NormalizeError::MissingField("session_id"))?;
 
     let event_name = obj
         .get("hook_event_name")
@@ -134,10 +146,27 @@ pub fn normalize_hook_event(raw: &serde_json::Value) -> Result<WorkerEvent, Norm
     })
 }
 
+/// Pulls the session-identity string out of a raw hook payload.
+///
+/// Claude's hooks report it under `session_id`. A driver is not required to
+/// use that name — it must not pretend to be a Claude session just to fit
+/// this field, so `thread_id` is accepted as an equivalent alias. (Codex in
+/// particular reports the *same* identity as `session_id` on its hook
+/// channel but `thread_id` on its streaming channel — both name the one
+/// underlying identity, not two different things.) `session_id` is checked
+/// first so a payload carrying both keys is unambiguous.
+fn extract_session_identity(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    obj.get("session_id")
+        .or_else(|| obj.get("thread_id"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
 fn parse_session_start_source(source: Option<&str>) -> SessionStartSource {
     match source {
         Some("startup") => SessionStartSource::Startup,
         Some("resume") => SessionStartSource::Resume,
+        Some("clear") => SessionStartSource::Clear,
         Some("compact") => SessionStartSource::Compact,
         _ => SessionStartSource::Other,
     }
@@ -179,6 +208,19 @@ mod tests {
             panic!("expected SessionStart");
         };
         assert_eq!(source, SessionStartSource::Resume);
+    }
+
+    #[test]
+    fn session_start_clear() {
+        let raw = json!({
+            "session_id": "sess-1",
+            "hook_event_name": "SessionStart",
+            "source": "clear",
+        });
+        let WorkerEvent::SessionStart { source, .. } = normalize_hook_event(&raw).unwrap() else {
+            panic!("expected SessionStart");
+        };
+        assert_eq!(source, SessionStartSource::Clear);
     }
 
     #[test]
@@ -312,6 +354,55 @@ mod tests {
                 reason: "exit".into(),
             }
         );
+    }
+
+    #[test]
+    fn thread_id_is_accepted_as_session_identity() {
+        let raw = json!({
+            "thread_id": "thread-1",
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        });
+        let WorkerEvent::Stop { session_id, .. } = normalize_hook_event(&raw).unwrap() else {
+            panic!("expected Stop");
+        };
+        assert_eq!(session_id, "thread-1");
+    }
+
+    /// Pins the equivalence the trap in this task calls out explicitly: a
+    /// driver reporting the same identity as `session_id` on one channel
+    /// and `thread_id` on another must normalize to the same value, not two
+    /// different sessions.
+    #[test]
+    fn session_id_and_thread_id_normalize_to_the_same_identity() {
+        let via_session_id = json!({
+            "session_id": "shared-identity",
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        });
+        let via_thread_id = json!({
+            "thread_id": "shared-identity",
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        });
+        assert_eq!(
+            normalize_hook_event(&via_session_id).unwrap(),
+            normalize_hook_event(&via_thread_id).unwrap()
+        );
+    }
+
+    #[test]
+    fn session_id_wins_when_both_keys_are_present() {
+        let raw = json!({
+            "session_id": "sess-1",
+            "thread_id": "thread-1",
+            "hook_event_name": "Stop",
+            "stop_hook_active": false,
+        });
+        let WorkerEvent::Stop { session_id, .. } = normalize_hook_event(&raw).unwrap() else {
+            panic!("expected Stop");
+        };
+        assert_eq!(session_id, "sess-1");
     }
 
     #[test]

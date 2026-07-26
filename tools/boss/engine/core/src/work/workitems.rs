@@ -226,12 +226,19 @@ impl WorkDb {
     /// Best-effort: the caller has already logged the trip via
     /// `tracing::warn!`; a failure here is logged and swallowed rather than
     /// aborting the sweep pass.
+    ///
+    /// `counted_scope` describes what `recent_terminal` actually counted
+    /// (e.g. `"terminal executions"` for an unscoped sweep,
+    /// `"terminal pr_review executions"` for a kind-scoped one) so the
+    /// attention body doesn't overstate the count to an operator comparing
+    /// it against the item's full execution list.
     pub fn file_churn_guard_parked_attention(
         &self,
         work_item_id: &str,
         source: &str,
         recent_terminal: i64,
         failing_execution_ids: &[String],
+        counted_scope: &str,
     ) {
         let title = format!("Parked by churn guard — {recent_terminal} recent failures");
         let ids = if failing_execution_ids.is_empty() {
@@ -242,7 +249,7 @@ impl WorkDb {
         let window_hours = ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS / 3600;
         let body = format!(
             "The `{source}` sweep stopped auto-redispatching this work item: it produced \
-             {recent_terminal} terminal executions within the trailing {window_hours}h window \
+             {recent_terminal} {counted_scope} within the trailing {window_hours}h window \
              (threshold {ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD}), which usually means something \
              structural is broken (a bad host, a repo/config issue) rather than a one-off blip.\n\n\
              Failing executions: {ids}\n\n\
@@ -784,7 +791,7 @@ impl WorkDb {
             // project's task chain, which matches the kanban
             // expectation that design lands first.
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('project_task', 'design', 'investigation', 'revision', 'design_postmortem') AND deleted_at IS NULL AND status != 'archived'
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -801,7 +808,7 @@ impl WorkDb {
             // leaving them queryable/listable via `boss task|chore list
             // --include-archived` (they are NOT tombstoned, unlike delete).
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, external_ref_kind, external_ref_canonical_id, external_ref_raw, external_ref_synced_at, external_ref_unbound_at, parent_task_id, source_automation_id, origin_task_short_id, origin_pr_number, completed_at, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ('chore', 'followup') AND deleted_at IS NULL AND status != 'archived'
                  ORDER BY created_at ASC",
@@ -839,6 +846,11 @@ impl WorkDb {
         // Compute has_in_progress_revision for every chain-root task that
         // has at least one todo/active descendant revision.
         attach_in_progress_revision_flag(&mut tasks, &mut chores);
+        // Compute ready_for_review for every Review-lane task that is
+        // waiting on the operator and nothing else (no block, no
+        // in-progress revision, CI green, no merge conflict). Must run
+        // after attach_in_progress_revision_flag, which it reads.
+        attach_ready_for_review_flag(&mut tasks, &mut chores);
         trace.record_plain(segment::ASSEMBLE, elapsed_ms(t));
 
         // Compute ai_reviewing for tasks held in Doing while a pr_review
@@ -1020,7 +1032,7 @@ impl WorkDb {
         let conn = self.connect()?;
         if let Some(task) = conn
             .query_row(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, archived_reason, dispatch_failed_reason, dispatch_failed_error, dispatch_failed_at, blocked_detail, deferred, tags
                  FROM tasks
                  WHERE product_id = ?1 AND short_id = ?2 AND deleted_at IS NULL",
                 params![product_id, short_id],
@@ -1075,7 +1087,7 @@ impl WorkDb {
         // merge poller's and robust to `?`/`#` suffixes.
         let owners: Vec<Task> = {
             let mut stmt = conn.prepare(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, parent_task_id
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id
                  FROM tasks
                  WHERE pr_url IS NOT NULL AND pr_url != '' AND deleted_at IS NULL
                  ORDER BY created_at ASC",
@@ -1128,7 +1140,7 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1137,7 +1149,7 @@ impl WorkDb {
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
@@ -1224,6 +1236,11 @@ impl WorkDb {
     /// from `list_tasks` and `list_chores` by design; this is the only bulk
     /// enumeration path. Optionally restrict to a single parent via
     /// `parent_id`.
+    ///
+    /// When `parent_id` is supplied, it is resolved to the chain root first:
+    /// revisions always store `parent_task_id` as the original non-revision
+    /// work item, so filtering by a revision id still returns the full flat
+    /// chain under that root.
     pub fn list_revisions(
         &self,
         product_id: &str,
@@ -1234,6 +1251,13 @@ impl WorkDb {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
 
+        // Canonicalize to chain root so `--parent <revision>` and
+        // `--parent <root>` list the same flat chain.
+        let parent_id = match parent_id {
+            Some(id) => Some(chain_root(&conn, id)?),
+            None => None,
+        };
+
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let parent_clause = if parent_id.is_some() {
             " AND parent_task_id = ?2"
@@ -1241,12 +1265,12 @@ impl WorkDb {
             ""
         };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
              FROM tasks
              WHERE product_id = ?1 AND kind = 'revision'{deleted_clause}{parent_clause}
              ORDER BY created_at ASC",
         ))?;
-        let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id {
+        let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id.as_deref() {
             let rows = stmt.query_map(params![product_id, parent_id], map_task_with_parent_and_provenance)?;
             collect_rows(rows)?
         } else {
@@ -1277,7 +1301,7 @@ impl WorkDb {
         // See `list_tasks` for the include-deleted contract.
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
              FROM tasks
              WHERE product_id = ?1 AND kind IN ('chore', 'followup'){deleted_clause}
              ORDER BY created_at ASC",
@@ -1381,8 +1405,10 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        let (edge, reaped) = add_dependency_edge_in_tx(&tx, dependent_id, prerequisite_id, relation, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let (edge, reaped) =
+            add_dependency_edge_in_tx(&mut pending, &tx, dependent_id, prerequisite_id, relation, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok((edge, reaped))
     }
 
@@ -1410,8 +1436,9 @@ impl WorkDb {
         // Human-placed blocks (other blocked_reason / NULL + human actor)
         // stick — the user must clear them.
         let now = now_string();
-        maybe_engine_unblock_dependent(&tx, dependent_id, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        maybe_engine_unblock_dependent(&mut pending, &tx, dependent_id, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(removed)
     }
 
@@ -1460,8 +1487,9 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let now = now_string();
-        let unblocked = maybe_engine_unblock_dependent(&tx, work_item_id, &now)?;
-        tx.commit()?;
+        let mut pending = PendingEvents::new();
+        let unblocked = maybe_engine_unblock_dependent(&mut pending, &tx, work_item_id, &now)?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(unblocked)
     }
 

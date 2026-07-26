@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
+use checkleft::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix, Surface};
 
 use checkleft::change_detection::environment::CiEnvironment;
 
@@ -11,9 +11,10 @@ use checkleft::external::FixInvocationOutcome;
 use super::{
     ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
     TRUNCATE_TAIL_LINES, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
-    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_fix_results,
-    render_human_footer, render_human_results, resolve_github_token_from_sources, should_show_progress,
-    sort_results_for_output, still_failing_from_verify, truncate_tool_output,
+    invocation_root_from, normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number,
+    render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
+    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, still_failing_from_verify,
+    truncate_tool_output,
 };
 
 #[test]
@@ -30,6 +31,7 @@ fn human_output_includes_line_and_column() {
                     line: Some(12),
                     column: Some(5),
                 }),
+                surface: None,
                 remediations: vec!["Replace typo.".to_owned()],
                 suggested_fix: None,
             }],
@@ -59,6 +61,7 @@ fn human_output_omits_ansi_when_color_is_disabled() {
                     line: Some(200),
                     column: None,
                 }),
+                surface: None,
                 remediations: vec![],
                 suggested_fix: Some(SuggestedFix {
                     description: "Split file by module.".to_owned(),
@@ -82,6 +85,58 @@ fn human_output_omits_ansi_when_color_is_disabled() {
 }
 
 #[test]
+fn human_output_renders_surface_for_changeset_scoped_finding() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "text/forbidden-pattern".to_owned(),
+            findings: vec![
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "Do not reference the brief in the PR description.".to_owned(),
+                    location: None,
+                    surface: Some(Surface::PrDescription),
+                    remediations: vec!["matched forbidden pattern `boss-brief-reference`".to_owned()],
+                    suggested_fix: None,
+                },
+                Finding {
+                    fixable: false,
+                    severity: Severity::Error,
+                    message: "Do not reference the brief in the commit message.".to_owned(),
+                    location: None,
+                    surface: Some(Surface::CommitMessage),
+                    remediations: vec![],
+                    suggested_fix: None,
+                },
+            ],
+        }],
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("  --> <pr description>\n"));
+    assert!(output.contains("  --> <commit message>\n"));
+}
+
+#[test]
+fn human_output_renders_unknown_for_locationless_finding_without_surface() {
+    let output = render_human_results(
+        &[CheckResult {
+            check_id: "some-check".to_owned(),
+            findings: vec![make_finding_no_location(Severity::Error)],
+        }],
+        OutputStyle {
+            level: ColorLevel::None,
+        },
+        Duration::from_secs(1),
+    );
+
+    assert!(output.contains("  --> <unknown>\n"));
+}
+
+#[test]
 fn human_output_message_is_bold_when_color_enabled() {
     let output = render_human_results(
         &[CheckResult {
@@ -91,6 +146,7 @@ fn human_output_message_is_bold_when_color_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -117,6 +173,7 @@ fn human_output_help_body_uses_256_gray_when_color256_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -140,6 +197,7 @@ fn human_output_help_body_uses_truecolor_gray_when_truecolor_enabled() {
                 severity: Severity::Error,
                 message: "Found typo.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix it.".to_owned()],
                 suggested_fix: None,
             }],
@@ -163,6 +221,7 @@ fn human_output_multi_line_remediation_renders_as_bullets() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![
                     "Do option A.".to_owned(),
                     "Do option B.".to_owned(),
@@ -194,6 +253,7 @@ fn human_output_multi_line_remediation_uses_circle_bullet_when_color_enabled() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -218,6 +278,7 @@ fn finding_with_multiple_remediations_renders_as_bullet_list() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -243,6 +304,7 @@ fn finding_with_multiple_remediations_uses_circle_bullet_when_color_enabled() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Do option A.".to_owned(), "Do option B.".to_owned()],
                 suggested_fix: None,
             }],
@@ -267,6 +329,7 @@ fn finding_with_single_remediation_renders_inline() {
                 severity: Severity::Error,
                 message: "something is wrong".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec!["Fix the issue.".to_owned()],
                 suggested_fix: None,
             }],
@@ -292,6 +355,7 @@ fn human_output_check_id_is_gray_when_color_enabled() {
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -316,6 +380,7 @@ fn human_output_check_id_is_plain_when_color_disabled() {
                 severity: Severity::Error,
                 message: "Found debug log.".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -356,6 +421,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -367,6 +433,7 @@ fn output_sorting_prioritizes_error_checks_before_warning_checks() {
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             }],
@@ -389,6 +456,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Warning,
                 message: "warning finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -397,6 +465,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Info,
                 message: "info finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -405,6 +474,7 @@ fn output_sorting_orders_findings_within_each_check_by_severity() {
                 severity: Severity::Error,
                 message: "error finding".to_owned(),
                 location: None,
+                surface: None,
                 remediations: vec![],
                 suggested_fix: None,
             },
@@ -683,6 +753,7 @@ fn snapshot_results() -> Vec<CheckResult> {
                 line: Some(3),
                 column: Some(5),
             }),
+            surface: None,
             remediations: vec!["Fix it.".to_owned()],
             suggested_fix: None,
         }],
@@ -740,6 +811,53 @@ fn footer_matches_disabled_output_for_no_findings_and_no_checks() {
         render_human_footer(&[], style, Duration::from_secs(0)),
         render_human_results(&[], style, Duration::from_secs(0)),
     );
+}
+
+// --- invocation_root_from (bazel run cwd / scope consistency) ---
+
+#[test]
+fn invocation_root_prefers_build_working_directory_when_it_is_a_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bwd = tmp.path().to_path_buf();
+    let cwd = PathBuf::from("/some/bazel/runfiles/_main");
+    let root = invocation_root_from(Some(bwd.as_os_str().to_owned()), cwd);
+    assert_eq!(root, bwd, "BUILD_WORKING_DIRECTORY must win over process cwd");
+}
+
+#[test]
+fn invocation_root_falls_back_to_cwd_when_build_working_directory_absent() {
+    let cwd = PathBuf::from("/real/workspace");
+    let root = invocation_root_from(None, cwd.clone());
+    assert_eq!(root, cwd);
+}
+
+#[test]
+fn invocation_root_falls_back_to_cwd_when_build_working_directory_is_not_a_dir() {
+    let cwd = PathBuf::from("/real/workspace");
+    let root = invocation_root_from(Some(std::ffi::OsString::from("/no/such/path/at/all")), cwd.clone());
+    assert_eq!(root, cwd, "stale BUILD_WORKING_DIRECTORY must not hard-fail the run");
+}
+
+// --- render_no_checks_ran (non-empty scope, zero checks) ---
+
+#[test]
+fn no_checks_ran_with_nonempty_scope_is_not_a_silent_pass() {
+    let style = OutputStyle {
+        level: ColorLevel::None,
+    };
+    let msg = render_no_checks_ran(style, 1872);
+    assert!(msg.contains("1872"), "must report the resolved file count: {msg}");
+    assert!(msg.contains("not a clean pass"), "must not read as a clean pass: {msg}");
+    assert!(
+        msg.contains("show-plan"),
+        "must point the developer at show-plan: {msg}"
+    );
+    assert!(
+        msg.contains("BUILD_WORKING_DIRECTORY"),
+        "must name the bazel-run cwd fix: {msg}"
+    );
+    // Must not be the terse silent-pass line alone.
+    assert_ne!(msg, "No checks ran.\n");
 }
 
 // --- github_auth_unavailable_warning ---
@@ -890,6 +1008,7 @@ fn truncate_tool_output_does_not_affect_json_serialization() {
             severity: Severity::Error,
             message: huge_message.clone(),
             location: None,
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }],
@@ -928,6 +1047,7 @@ fn make_finding(severity: Severity, path: &str) -> Finding {
             line: None,
             column: None,
         }),
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }
@@ -939,6 +1059,7 @@ fn make_finding_no_location(severity: Severity) -> Finding {
         severity,
         message: "no location".to_owned(),
         location: None,
+        surface: None,
         remediations: vec![],
         suggested_fix: None,
     }
@@ -1480,6 +1601,7 @@ fn make_fixable_finding(severity: Severity, path: &str) -> Finding {
             line: None,
             column: None,
         }),
+        surface: None,
         remediations: vec!["Run `checkleft fix` to apply this automatically.".to_owned()],
         suggested_fix: None,
     }
@@ -1570,4 +1692,127 @@ fn json_output_serializes_fixable_field_per_finding() {
     let findings = parsed[0]["findings"].as_array().expect("findings array");
     assert_eq!(findings[0]["fixable"], serde_json::Value::Bool(true));
     assert_eq!(findings[1]["fixable"], serde_json::Value::Bool(false));
+}
+
+/// Scoped attach must put only the tip message on the leakage surface
+/// (`commit_description`) while keeping the full `base..HEAD` range on the
+/// BYPASS surface (`bypass_commit_descriptions`). Intermediate historical
+/// messages that mention boss-isms or carry BYPASS must not pollute the tip.
+#[tokio::test]
+async fn attach_description_context_splits_tip_leakage_from_range_bypass() {
+    use std::fs;
+    use std::process::Command;
+
+    use checkleft::change_detection::ChangePlan;
+    use checkleft::change_detection::scenario::Scenario;
+    use checkleft::input::ChangeSet;
+    use checkleft::vcs::Vcs;
+    use tempfile::tempdir;
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("utf-8").trim().to_owned()
+    }
+
+    let temp = tempdir().expect("temp dir");
+    run_git(temp.path(), &["init", "-b", "main"]);
+    run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
+    run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+    fs::write(temp.path().join("base.txt"), "base\n").expect("write base");
+    run_git(temp.path(), &["add", "base.txt"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    let base_sha = git_output(temp.path(), &["rev-parse", "HEAD"]);
+
+    run_git(temp.path(), &["checkout", "-b", "pr-branch"]);
+
+    // Intermediate content commit: boss-ism leakage + a BYPASS directive.
+    fs::write(temp.path().join("design.md"), "design\n").expect("write design");
+    run_git(temp.path(), &["add", "design.md"]);
+    run_git(
+        temp.path(),
+        &[
+            "commit",
+            "-m",
+            "docs: record the operator refutation of PATH shims\n\nFold ZZ3718 into the design.\n\nBYPASS_FILE_SIZE=Intentionally large fixture for the spike.",
+        ],
+    );
+
+    // Clean tip (simulates a later amend / empty jj WC commit with a clean message).
+    run_git(
+        temp.path(),
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "docs: design Codex as a first-class agent driver",
+        ],
+    );
+
+    let vcs = Vcs::detect(temp.path()).expect("detect vcs");
+    let plan = ChangePlan::Scoped {
+        base_sha,
+        scenario: Scenario::PullRequest {
+            base_branch: "main".to_owned(),
+        },
+    };
+    let env = CiEnvironment::default();
+
+    let attached = super::attach_description_context(ChangeSet::default(), &vcs, &env, &plan).await;
+
+    assert_eq!(
+        attached.commit_description.as_deref(),
+        Some("docs: design Codex as a first-class agent driver"),
+        "leakage surface must be tip-only; got {:?}",
+        attached.commit_description
+    );
+    assert!(
+        !attached
+            .commit_description
+            .as_deref()
+            .unwrap_or("")
+            .contains("the operator"),
+        "tip leakage surface must not include historical 'the operator'"
+    );
+    assert!(
+        !attached.commit_description.as_deref().unwrap_or("").contains("ZZ3718"),
+        "tip leakage surface must not include historical work-item id"
+    );
+
+    let range = attached
+        .bypass_commit_descriptions
+        .as_deref()
+        .expect("scoped plan must populate bypass range");
+    assert!(
+        range.contains("BYPASS_FILE_SIZE="),
+        "BYPASS in a non-tip content commit must remain visible on the bypass surface; got: {range:?}"
+    );
+    assert!(
+        range.contains("the operator") && range.contains("ZZ3718"),
+        "full range should still include historical messages for BYPASS context; got: {range:?}"
+    );
+    assert_eq!(
+        attached.bypass_reason("BYPASS_FILE_SIZE").as_deref(),
+        Some("Intentionally large fixture for the spike."),
+        "bypass_reason must resolve directives from the full-range surface"
+    );
 }

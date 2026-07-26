@@ -560,6 +560,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         created_at: ts.to_owned(),
         updated_at: ts.to_owned(),
         autostart: true,
+        deferred: false,
         last_status_actor: "human".to_owned(),
         priority: "medium".to_owned(),
         created_via: "cli".to_owned(),
@@ -581,6 +582,8 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         pr_state_polled_at: None,
         merge_queue_state: None,
         merge_queue_detail: None,
+        pr_mergeable_state: None,
+        reasoning: None,
         external_ref: None,
         parent_task_id: parent.map(str::to_owned),
         revision_seq: None,
@@ -590,6 +593,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         review_cycle: 0,
         last_reviewed_sha: None,
         ai_reviewing: false,
+        ready_for_review: false,
         doc_link_state: None,
         origin_task_short_id: None,
         origin_pr_number: None,
@@ -597,6 +601,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         dispatch_failed_reason: None,
         dispatch_failed_error: None,
         dispatch_failed_at: None,
+        tags: vec![],
     }
 }
 
@@ -639,4 +644,7 @@ mod t28;
 mod t29;
 mod t30;
 mod t31;
+mod t32;
+mod t33;
+mod work_item_tags_tests;
 mod work_item_write_tests;

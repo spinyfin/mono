@@ -39,10 +39,6 @@ checks:
         - pnpm-lock.yaml
         - "**/*.pb.rs"
         # Files currently over the 3000-line limit — TODO: split each below 3000
-        - tools/boss/engine/core/src/merge_poller.rs
-        - tools/boss/engine/core/src/runner.rs
-        - tools/cube/src/app.rs
-        - tools/boss/app-macos/Sources/ContentView.swift
     policy:
       severity: error
       allow_bypass: true
@@ -91,3 +87,121 @@ checks:
   - id: lint/oxc
     policy:
       severity: error
+
+  # Deterministic catch for Boss-internal review vocabulary leaking into
+  # PR-visible text (title/description) or commit messages — the automated
+  # PR reviewer was flagging these downstream on every occurrence, which is
+  # exactly the kind of thing a worker can catch itself before ever pushing.
+  # See the rubric this mirrors: the `agent_isms` dimension, sub-rules
+  # (2)/(3), in `engine/pr-review/src/render.rs`.
+  #
+  # Scoped to `surfaces: [changeset]` only (PR description + tip commit
+  # message), deliberately NOT `files`. Every one of these phrases —
+  # `T<n>`/`P<n>` ids, "the operator", "chore", "revision" — is also this
+  # codebase's own correct, long-standing internal vocabulary for describing
+  # Boss itself (e.g. `boss_construct_scan.rs`'s own doc comments, or the
+  # hundreds of pre-existing `// T<n>: ...` provenance comments across
+  # engine/core). Scanning file content would flag that legitimate usage
+  # everywhere it already exists rather than newly-introduced leaks, and the
+  # check has no per-line grandfather mechanism — only a file-level
+  # `exclude`, which would have to list most of `engine/core` to stay quiet,
+  # defeating the point of a narrow exclusion list. The PR description and
+  # tip commit message of a real changeset carry none of that legacy noise,
+  # and are exactly the surface the motivating incident was about, so that is
+  # where this starts. Intermediate historical commit messages on the branch
+  # are intentionally not scanned (checkleft keeps the full range only for
+  # BYPASS parsing) so MQ/squash re-embedding of old messages cannot
+  # false-fail a PR whose tip + PR body are clean.
+  #
+  # Declared at the repo root (not under tools/boss/) and with an explicit
+  # `scope: changeset` because `scope = changeset` is only honoured in the
+  # repo-root CHECKS file — a subdirectory CHECKS.yaml is scheduled per
+  # changed file, so a check living under tools/boss/ would only ever run
+  # on PRs that touch tools/boss/, leaving every other PR in the repo
+  # (including the Boss-worker PRs this check exists to catch) unscanned.
+  - id: boss-ism/pr-text-leakage
+    check: text/forbidden-pattern
+    scope: changeset
+    policy:
+      severity: error
+    config:
+      surfaces:
+        - changeset
+      patterns:
+        - name: boss-work-item-id
+          # Byte-identical to `BOSS_ID_RE` in
+          # `tools/boss/engine/core/src/boss_construct_scan.rs` — enforced by
+          # the `boss_ism_checks_yaml_id_pattern_matches_boss_id_re_source`
+          # test next to that constant, which fails loudly if the two drift
+          # apart.
+          pattern: '\b[TP]\d+\b'
+          message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in the PR description or commit message."
+          severity: error
+        - name: boss-operator-reference
+          pattern: "(?i)\\bthe operator\\b"
+          message: "Do not refer to \"the operator\" in the PR description or commit message; state the reason directly instead of naming who asked for it."
+          severity: error
+        - name: boss-brief-reference
+          pattern: "(?i)\\bper the brief\\b"
+          message: "Do not reference \"the brief\" in the PR description or commit message; describe what the change does instead of where the instruction came from."
+          severity: warning
+        - name: boss-chore-reference
+          pattern: "(?i)\\bthis chore\\b"
+          message: "Do not reference Boss work-kind vocabulary (\"this chore\") in the PR description or commit message."
+          severity: warning
+        - name: boss-revision-cycle-reference
+          pattern: "(?i)\\brevision cycle\\b"
+          message: "Do not reference Boss's internal revision-cycle vocabulary (\"revision cycle\") in the PR description or commit message; describe the change itself."
+          severity: warning
+
+  # File-content sibling of boss-ism/pr-text-leakage: catches a leaked Boss
+  # work-item id (e.g. a stray provenance comment) landing directly in source,
+  # not just PR-visible text. Left at the framework's default `scope: files`
+  # (NOT `scope: changeset`) — a changeset-scope run carries no file diffs, so
+  # `config.surfaces: [files]` would scan nothing and `changed_lines_only`
+  # would silently no-op.
+  #
+  # Carries only the work-item-id pattern, not the "the operator" / "per the
+  # brief" / "this chore" / "revision cycle" patterns from the changeset
+  # instance above — those are ordinary English with real hits in file
+  # content (source comments, docs) that a file scan can't disambiguate from
+  # a leak the way a changeset-text scan can.
+  #
+  # `policy.changed_lines_only: true` scopes findings to lines the PR itself
+  # adds or modifies, so this repo's own hundreds of pre-existing, legitimate
+  # `T<n>`/`P<n>` provenance comments (this is Boss's own tracker vocabulary,
+  # used correctly throughout engine/core and tools/checkleft) do not need a
+  # blanket exclusion — they simply never come up as changed lines. This is a
+  # documented no-op under `checkleft run --all` (no hunk data to scope
+  # against, so an `--all` run reports every existing occurrence, expected
+  # behaviour for a manual full-repo sweep, not a regression).
+  #
+  # `\d{3,}` floors the id at 3 digits (vs. the changeset instance's
+  # unfloored `\d+`) to avoid false positives on new lines this pattern would
+  # otherwise catch: ISO-8601 "T" time separators (`2024-01-01T00:00:00`),
+  # percentile labels (`P25`/`P75`), and short tie-placement notation. Chosen
+  # to match flunge's `boss-ism/file-text-leakage` instance (see
+  # brianduff/flunge#1133) for consistency across the two repos.
+  #
+  # Severity is `warning`, not `error`: unlike a PR description (which is
+  # trivial to edit before merge), a false-positive-shaped id landing in a
+  # source comment is not worth hard-blocking the push gate over — a human
+  # reviewer can weigh in without this becoming red CI.
+  - id: boss-ism/file-text-leakage
+    check: text/forbidden-pattern
+    policy:
+      severity: warning
+      changed_lines_only: true
+    exclude:
+      # This file's own tests exercise `BOSS_ID_RE` against literal
+      # id-shaped and near-miss fixture strings as their entire purpose —
+      # new test cases necessarily add more of them.
+      - "tools/boss/engine/core/src/boss_construct_scan.rs"
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: boss-work-item-id-floored
+          pattern: '\b[TP]\d{3,}\b'
+          message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in source. Remove the reference; if provenance is genuinely needed, put it in the PR description instead."
+          severity: warning

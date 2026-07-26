@@ -119,16 +119,57 @@ impl CommandRunner for RealCommandRunner {
 }
 
 impl RealCommandRunner {
-    /// Core of [`CommandRunner::run_with_timeout`], with the heartbeat
-    /// cadence and callback injectable so tests can verify heartbeats fire
-    /// without waiting out a real 15s interval or scraping process stderr.
-    fn run_with_timeout_and_heartbeat(
+    /// Run a command with a wall-clock timeout, returning the raw
+    /// [`std::process::Output`] regardless of exit status (`Ok(Some(_))`),
+    /// or `Ok(None)` if the timeout elapsed (the child is killed and reaped
+    /// first). `Err` is reserved for a spawn/exec failure -- the command
+    /// never actually ran.
+    ///
+    /// Unlike [`CommandRunner::run_with_timeout`], failure is not inferred
+    /// from a non-zero exit code and stdout is never discarded, so callers
+    /// that need the raw output on a failing exit (e.g. the checkleft push
+    /// gate, which echoes checkleft's own findings) use this instead of the
+    /// `Result<String, CubeError>`-returning trait method.
+    ///
+    /// `env_remove` lists variable names to explicitly clear from the
+    /// child's environment -- e.g. to override an ambient value with an
+    /// *absence* rather than a fresh value, which [`CommandInvocation::env`]
+    /// cannot express since it can only add.
+    pub fn run_with_timeout_capturing_output(
         &self,
         invocation: &CommandInvocation,
+        env_remove: &[&str],
+        timeout: Duration,
+    ) -> Result<Option<std::process::Output>, CubeError> {
+        let program = invocation.program.clone();
+        let args = invocation.args.join(" ");
+        self.run_with_timeout_capturing_output_and_heartbeat(
+            invocation,
+            env_remove,
+            timeout,
+            HEARTBEAT_INTERVAL,
+            move |elapsed, timeout| {
+                eprintln!(
+                    "cube: still waiting on `{program} {args}` ({}s elapsed, {}s deadline)...",
+                    elapsed.as_secs(),
+                    timeout.as_secs(),
+                );
+            },
+        )
+    }
+
+    /// Core of [`RealCommandRunner::run_with_timeout_capturing_output`],
+    /// with the heartbeat cadence and callback injectable so tests can
+    /// verify heartbeats fire without waiting out a real 15s interval or
+    /// scraping process stderr.
+    fn run_with_timeout_capturing_output_and_heartbeat(
+        &self,
+        invocation: &CommandInvocation,
+        env_remove: &[&str],
         timeout: Duration,
         heartbeat_interval: Duration,
         mut on_heartbeat: impl FnMut(Duration, Duration),
-    ) -> Result<String, CubeError> {
+    ) -> Result<Option<std::process::Output>, CubeError> {
         let mut cmd = Command::new(&invocation.program);
         cmd.args(&invocation.args)
             .current_dir(&invocation.cwd)
@@ -138,6 +179,9 @@ impl RealCommandRunner {
         Self::configure_env(&mut cmd);
         for (k, v) in &invocation.env {
             cmd.env(k, v);
+        }
+        for k in env_remove {
+            cmd.env_remove(k);
         }
 
         let mut child = cmd.spawn().map_err(CubeError::Io)?;
@@ -183,11 +227,7 @@ impl RealCommandRunner {
                         let _ = child.wait();
                         let _ = out_handle.join();
                         let _ = err_handle.join();
-                        return Err(CubeError::CommandTimedOut {
-                            program: invocation.program.clone(),
-                            args: invocation.args.clone(),
-                            timeout_secs: timeout.as_secs(),
-                        });
+                        return Ok(None);
                     }
                     // Long-running commands (most importantly `jj git push`
                     // queued behind a contended shared-store lock) must never
@@ -209,15 +249,43 @@ impl RealCommandRunner {
         let stdout = out_handle.join().unwrap_or_default();
         let stderr = err_handle.join().unwrap_or_default();
 
-        if status.success() {
-            Ok(String::from_utf8_lossy(&stdout).trim().to_string())
-        } else {
-            Err(CubeError::CommandFailed {
+        Ok(Some(std::process::Output { status, stdout, stderr }))
+    }
+
+    /// Core of [`CommandRunner::run_with_timeout`], with the heartbeat
+    /// cadence and callback injectable so tests can verify heartbeats fire
+    /// without waiting out a real 15s interval or scraping process stderr.
+    fn run_with_timeout_and_heartbeat(
+        &self,
+        invocation: &CommandInvocation,
+        timeout: Duration,
+        heartbeat_interval: Duration,
+        on_heartbeat: impl FnMut(Duration, Duration),
+    ) -> Result<String, CubeError> {
+        match self.run_with_timeout_capturing_output_and_heartbeat(
+            invocation,
+            &[],
+            timeout,
+            heartbeat_interval,
+            on_heartbeat,
+        )? {
+            None => Err(CubeError::CommandTimedOut {
                 program: invocation.program.clone(),
                 args: invocation.args.clone(),
-                status: status.code(),
-                stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
-            })
+                timeout_secs: timeout.as_secs(),
+            }),
+            Some(output) => {
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    Err(CubeError::CommandFailed {
+                        program: invocation.program.clone(),
+                        args: invocation.args.clone(),
+                        status: output.status.code(),
+                        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                    })
+                }
+            }
         }
     }
 }

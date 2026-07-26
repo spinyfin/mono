@@ -862,6 +862,7 @@ fn insert_seeded_design_task_in_tx(
 /// *precisely* when the gate refuses (no PR / merged / closed). Any other
 /// failure (e.g. a `gh` probe error) is a real error and propagates.
 fn action_question_group(
+    pending: &mut PendingEvents,
     conn: &Connection,
     group: &AttentionGroup,
     members: &[Attention],
@@ -885,7 +886,7 @@ fn action_question_group(
             .name(name.clone())
             .created_via(CREATED_VIA_ATTENTION)
             .build();
-        match assert_parent_revisable_and_insert(conn, input, pr_checker) {
+        match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
             Ok(revision) => {
                 let reference = serde_json::json!({
                     "task_id": revision.id,
@@ -1230,8 +1231,9 @@ impl WorkDb {
             });
         }
 
+        let mut pending = PendingEvents::new();
         let (produced_kind, produced_ref, produced_work_item_ids) = match group.kind.as_str() {
-            "question" => action_question_group(&tx, &group, &members, pr_checker)?,
+            "question" => action_question_group(&mut pending, &tx, &group, &members, pr_checker)?,
             "followup" => action_followup_group(&tx, &group, &members, member_overrides)?,
             other => bail!("cannot action attention group {} of kind {other:?}", group.id),
         };
@@ -1246,7 +1248,7 @@ impl WorkDb {
         )?;
         let group = query_attention_group(&tx, &group.id)?
             .with_context(|| format!("missing attention group after action: {}", group.id))?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(ActionedAttentionGroup {
             group,
             produced_work_item_ids,

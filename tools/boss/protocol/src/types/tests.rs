@@ -1805,3 +1805,75 @@ fn work_execution_epoch_accessors_none_when_unset_or_unparseable() {
     assert_eq!(exec.finished_epoch(), None);
     assert_eq!(exec.created_epoch(), None);
 }
+
+#[test]
+fn reasoning_mode_parses_serializes_and_rejects_unknown_values() {
+    use std::str::FromStr;
+    assert_eq!(ReasoningMode::from_str("standard").unwrap(), ReasoningMode::Standard);
+    assert_eq!(
+        ReasoningMode::from_str("investigation").unwrap(),
+        ReasoningMode::Investigation
+    );
+
+    let err = ReasoningMode::from_str("galaxybrain").unwrap_err();
+    assert!(err.contains("galaxybrain"));
+    assert!(err.contains("standard"));
+    assert!(err.contains("investigation"));
+
+    // The wire form must match the stored column form so the DB round-trip and
+    // the JSON round-trip cannot drift apart.
+    for mode in ReasoningMode::ALL {
+        assert_eq!(
+            serde_json::to_value(mode).unwrap(),
+            Value::String(mode.as_str().to_owned()),
+        );
+        assert_eq!(ReasoningMode::from_str(mode.as_str()).unwrap(), *mode);
+    }
+}
+
+#[test]
+fn reasoning_default_is_derived_from_kind_then_effort_and_is_standard_otherwise() {
+    // Rule 1: the design family is investigation-shaped by definition — the
+    // deliverable is the thinking. Holds at every effort level, including the
+    // small ones the legacy effort table would have sent to Sonnet.
+    for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+        for effort in [None, Some(EffortLevel::Trivial), Some(EffortLevel::Large)] {
+            assert_eq!(
+                ReasoningMode::default_for(&kind, effort),
+                ReasoningMode::Investigation,
+                "{kind:?} at {effort:?} must default to investigation",
+            );
+        }
+    }
+
+    // Rule 2: `max` is documented as the human-only "maximum reasoning depth"
+    // escape hatch, so its meaning was always about capability, not size.
+    assert_eq!(
+        ReasoningMode::default_for(&TaskKind::Chore, Some(EffortLevel::Max)),
+        ReasoningMode::Investigation,
+    );
+
+    // Everything else — including `large`, which the legacy effort table sent
+    // to Opus. Big is a size claim, not a capability one.
+    for kind in [
+        TaskKind::Chore,
+        TaskKind::Task,
+        TaskKind::ProjectTask,
+        TaskKind::Followup,
+        TaskKind::Revision,
+    ] {
+        for effort in [
+            None,
+            Some(EffortLevel::Trivial),
+            Some(EffortLevel::Small),
+            Some(EffortLevel::Medium),
+            Some(EffortLevel::Large),
+        ] {
+            assert_eq!(
+                ReasoningMode::default_for(&kind, effort),
+                ReasoningMode::Standard,
+                "{kind:?} at {effort:?} must default to standard",
+            );
+        }
+    }
+}

@@ -7,7 +7,7 @@ use tempfile::tempdir;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::Severity;
 
-use super::{ConfigResolver, StaleExclusionMode};
+use super::{CheckScope, ConfigResolver, StaleExclusionMode};
 
 mod yaml;
 
@@ -95,6 +95,125 @@ id = "rust/giant-structs"
             .any(|diagnostic| diagnostic.message.contains("stale_exclusion_severity")),
         "expected a diagnostic about the invalid severity, got {diagnostics:?}"
     );
+}
+
+#[test]
+fn scope_defaults_to_files() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let check = checks.get("rust/giant-structs").expect("check present");
+    assert_eq!(check.scope, CheckScope::Files);
+}
+
+#[test]
+fn scope_changeset_is_parsed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let check = checks.get("boss/no-boss-isms").expect("check present");
+    assert_eq!(check.scope, CheckScope::Changeset);
+}
+
+#[test]
+fn scope_changeset_in_subdirectory_config_produces_diagnostic_and_is_not_scheduled() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("subdir")).expect("create dir");
+    fs::write(
+        temp.path().join("subdir/CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("subdir/a.rs"))
+        .expect("resolve checks");
+
+    // The check must not be silently scheduled: it's absent from the
+    // resolved set, and a diagnostic explains why.
+    assert!(
+        checks.get("boss/no-boss-isms").is_none(),
+        "a subdirectory-declared changeset-scope check must never be scheduled"
+    );
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("scope = changeset") && diagnostic.message.contains("boss/no-boss-isms")
+        }),
+        "expected a diagnostic naming the misplaced changeset-scope check, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn subdirectory_override_without_scope_inherits_root_changeset_scope() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\nscope = \"changeset\"\n",
+    )
+    .expect("write root config");
+    fs::create_dir_all(temp.path().join("subdir")).expect("create dir");
+    fs::write(
+        temp.path().join("subdir/CHECKS.toml"),
+        "[[checks]]\nid = \"boss/no-boss-isms\"\n\n[checks.policy]\nseverity = \"warning\"\n",
+    )
+    .expect("write subdirectory config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("subdir/a.rs"))
+        .expect("resolve checks");
+
+    // The override (no `scope` key) must inherit the root's `Changeset` scope,
+    // not silently reset to `Files` — otherwise the check gets scheduled twice
+    // (once as changeset at the root, once as files here).
+    let check = checks.get("boss/no-boss-isms").expect("check present");
+    assert_eq!(check.scope, CheckScope::Changeset);
+
+    // No misplacement diagnostic: this is an inherited scope, not an explicit
+    // (and invalid) `scope = changeset` declared in a subdirectory.
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("scope = changeset")),
+        "inheriting scope from the root should not produce a misplacement diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn invalid_scope_produces_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nscope = \"directory\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("scope")),
+        "expected a diagnostic about the invalid scope, got {diagnostics:?}"
+    );
+    // The malformed check is skipped, not upserted with a bogus scope.
+    assert!(checks.get("rust/giant-structs").is_none());
 }
 
 #[test]

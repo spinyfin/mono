@@ -12,21 +12,25 @@
 //! operator should see on the kanban/attention surface without knowing
 //! to run that verb.
 //!
-//! This sweep re-scans the same per-execution `dispatch.jsonl` mirrors
-//! [`crate::dispatch_reader::persistently_stalled`] reads, on a slower
-//! cadence and a much larger flat threshold, and files a
-//! `dispatch_stage_stalled` attention item
-//! (`crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND`) for each one —
+//! This sweep asks the same question [`crate::dispatch_reader::TimelineIndex`]
+//! answers for the 15s `stage_stalled` detector, on a slower cadence and a
+//! much larger flat threshold, and files a `dispatch_stage_stalled` attention
+//! item (`crate::work::DISPATCH_STAGE_STALLED_ATTENTION_KIND`) for each one —
 //! idempotently, via `WorkDb::file_dispatch_stage_stalled_attention`, so
 //! repeated ticks refresh the same row instead of piling up duplicates.
 //! The item resolves when the execution finally claims a worker slot
 //! (`Coordinator::dispatch_claimed_execution`).
+//!
+//! It shares one [`crate::dispatch_reader::SharedTimelineIndex`] with that
+//! detector. Both used to re-read every per-execution `dispatch.jsonl` mirror
+//! on every tick — ~103 MB across 16k files, twice a minute between them;
+//! sharing the index means the dispatch stream is tailed once per pass
+//! instead of twice and the derived state is held once instead of twice.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::dispatch_reader;
+use crate::dispatch_reader::SharedTimelineIndex;
 use crate::work::{StallEscalation, WorkDb};
 
 /// How long a dispatch stage must be stuck before it graduates from
@@ -36,6 +40,17 @@ use crate::work::{StallEscalation, WorkDb};
 /// regression quickly in logs/JSONL; this exists so a human doesn't have
 /// to notice a multi-minute stall on their own.
 pub const PERSISTENT_STALL_THRESHOLD: Duration = Duration::from_secs(5 * 60);
+
+/// How long [`crate::dispatch_reader::SharedTimelineIndex`] keeps a
+/// never-terminating timeline resident before evicting it — see
+/// `TimelineIndex::with_eviction_horizon_ms`. Deliberately far above
+/// [`PERSISTENT_STALL_THRESHOLD`]: this sweep re-reports the same stuck
+/// timeline every tick on purpose (no dedupe against a prior attention
+/// item), so the horizon has to stay well past that threshold or eviction
+/// would cut off re-reporting almost immediately after it starts. 24h still
+/// bounds resident memory to a day's worth of accumulated stalls instead of
+/// all of history.
+pub const STATE_EVICTION_HORIZON: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Default cadence for [`spawn_loop`]. Slower than the 15s
 /// `stage_stalled` detector — this sweep only matters once a stall has
@@ -47,7 +62,7 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
 /// a `dispatch_stage_stalled` attention item for any execution whose
 /// dispatch timeline has been stuck past `threshold`.
 pub fn spawn_loop(
-    root: PathBuf,
+    index: SharedTimelineIndex,
     work_db: Arc<WorkDb>,
     threshold: Duration,
     interval: Duration,
@@ -55,9 +70,15 @@ pub fn spawn_loop(
     tokio::spawn(async move {
         tokio::time::sleep(interval).await;
         loop {
-            match run_one_pass(&root, work_db.as_ref(), threshold) {
-                Ok(outcome) => log_pass(&outcome),
-                Err(err) => tracing::warn!(?err, "dispatch stall attention sweep: pass failed"),
+            // The pass reads the dispatch stream and then hits SQLite once
+            // per stall — both blocking, neither belongs on a tokio worker.
+            let index = index.clone();
+            let work_db = work_db.clone();
+            let pass = tokio::task::spawn_blocking(move || run_one_pass(&index, work_db.as_ref(), threshold)).await;
+            match pass {
+                Ok(Ok(outcome)) => log_pass(&outcome),
+                Ok(Err(err)) => tracing::warn!(?err, "dispatch stall attention sweep: pass failed"),
+                Err(err) => tracing::warn!(?err, "dispatch stall attention sweep: pass task panicked"),
             }
             tokio::time::sleep(interval).await;
         }
@@ -149,9 +170,20 @@ impl SweepOutcome {
 /// scan detector can't tell those apart, so the authoritative call is made
 /// here against the DB (see [`WorkDb::classify_dispatch_stall`]). Returns a
 /// [`SweepOutcome`] tallying what was filed and what was skipped, by reason.
-pub fn run_one_pass(root: &Path, work_db: &WorkDb, threshold: Duration) -> anyhow::Result<SweepOutcome> {
+pub fn run_one_pass(
+    index: &SharedTimelineIndex,
+    work_db: &WorkDb,
+    threshold: Duration,
+) -> anyhow::Result<SweepOutcome> {
     let now_ms = boss_engine_utils::epoch_time::now_epoch_ms();
-    let stalls = dispatch_reader::persistently_stalled(root, now_ms, threshold.as_millis())?;
+    let (stats, stalls) = index.refresh_and_persistently_stalled(now_ms, threshold.as_millis())?;
+    tracing::debug!(
+        bytes_scanned = stats.bytes_scanned,
+        records_applied = stats.records_applied,
+        rebuilt = stats.rebuilt,
+        tracked_timelines = stats.tracked_timelines,
+        "dispatch stall attention sweep: incremental scan",
+    );
     let mut outcome = SweepOutcome::default();
     for stall in stalls {
         // Classify by execution id against the DB — its `work_item_id` and
@@ -226,7 +258,12 @@ mod tests {
         let root = emit_stalled_event(&execution.id).await;
 
         // now_ms far past the threshold.
-        let outcome = run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
+        let outcome = run_one_pass(
+            &SharedTimelineIndex::new(root.path()),
+            &db,
+            Duration::from_millis(300_000),
+        )
+        .unwrap();
         assert_eq!(outcome.filed, 1);
         assert_eq!(outcome.skipped_total(), 0);
 
@@ -245,8 +282,13 @@ mod tests {
         let execution = create_ready_chore_execution(&db, work_item_id.clone());
         let root = emit_stalled_event(&execution.id).await;
 
-        run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
-        run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
+        // One index across both ticks, as the real loop does: the second pass
+        // reads nothing new off disk and must still re-report the stall so
+        // the attention item's elapsed-time text stays current.
+        let index = SharedTimelineIndex::new(root.path());
+        run_one_pass(&index, &db, Duration::from_millis(300_000)).unwrap();
+        run_one_pass(&index, &db, Duration::from_millis(300_000)).unwrap();
+        assert_eq!(index.rebuilds(), 1, "the second tick must resume incrementally");
 
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
         assert_eq!(items.len(), 1, "repeat ticks must refresh, not duplicate");
@@ -267,7 +309,7 @@ mod tests {
         let event = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, &execution.id);
         sink.emit(event).await;
 
-        let outcome = run_one_pass(root.path(), &db, Duration::from_secs(300)).unwrap();
+        let outcome = run_one_pass(&SharedTimelineIndex::new(root.path()), &db, Duration::from_secs(300)).unwrap();
         assert_eq!(outcome.filed, 0);
         assert_eq!(outcome.skipped_total(), 0);
         assert!(db.list_attention_items_for_work_item(&work_item_id).unwrap().is_empty());
@@ -291,7 +333,12 @@ mod tests {
             .unwrap();
         let root = emit_stalled_event(&execution.id).await;
 
-        let outcome = run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
+        let outcome = run_one_pass(
+            &SharedTimelineIndex::new(root.path()),
+            &db,
+            Duration::from_millis(300_000),
+        )
+        .unwrap();
         assert_eq!(outcome.filed, 0);
         assert_eq!(outcome.skipped_terminal, 1);
         assert!(outcome.errors.is_empty());
@@ -311,7 +358,12 @@ mod tests {
         assert_eq!(execution.work_item_id, "auto_test");
         let root = emit_stalled_event(&execution.id).await;
 
-        let outcome = run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
+        let outcome = run_one_pass(
+            &SharedTimelineIndex::new(root.path()),
+            &db,
+            Duration::from_millis(300_000),
+        )
+        .unwrap();
         assert_eq!(outcome.filed, 0);
         assert_eq!(outcome.skipped_not_work_item, 1);
         assert!(outcome.errors.is_empty(), "automation stalls must not error the sweep");
@@ -324,7 +376,12 @@ mod tests {
         let (_dir, db) = open_db();
         let root = emit_stalled_event("exec_gone_000").await;
 
-        let outcome = run_one_pass(root.path(), &db, Duration::from_millis(300_000)).unwrap();
+        let outcome = run_one_pass(
+            &SharedTimelineIndex::new(root.path()),
+            &db,
+            Duration::from_millis(300_000),
+        )
+        .unwrap();
         assert_eq!(outcome.filed, 0);
         assert_eq!(outcome.skipped_missing, 1);
         assert!(outcome.errors.is_empty());

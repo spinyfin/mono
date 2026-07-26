@@ -4,6 +4,42 @@
 
 use super::*;
 
+/// Drop the `deferred` column (simulating a pre-classification DB) and
+/// re-open: `migrate_tasks_deferred`'s ALTER TABLE path must re-add it and
+/// leave existing rows at the `0` (not-future-scope) default, so an upgrade
+/// never spuriously parks live work.
+#[test]
+fn migration_re_adds_deferred_column_defaulting_to_zero() {
+    // disk_db_path required: drops a column and re-opens the DB to trigger migration.
+    let (_dir, path) = disk_db_path("deferred-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let chore = create_test_chore(&db, product.id.clone(), "Legacy chore");
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE tasks DROP COLUMN deferred", []).unwrap();
+        assert!(!table_has_column(&conn, "tasks", "deferred").unwrap());
+    }
+    drop(db);
+
+    // Re-open re-runs the migrations.
+    let db = WorkDb::open(path.clone()).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "deferred").unwrap());
+        let deferred: i64 = conn
+            .query_row("SELECT deferred FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            deferred, 0,
+            "an existing row must default to not-deferred after the migration"
+        );
+    }
+}
+
 /// Drop the effort/model columns (simulating a pre-PR-370 DB)
 /// and re-open: the migration's ALTER TABLE path must re-add
 /// them and leave existing rows with NULL on each new column.
@@ -339,4 +375,163 @@ fn migration_normalises_empty_effort_level_to_null() {
     assert!(after.is_none(), "empty effort_level should be NULL after migration");
 
     let _ = std::fs::remove_file(path);
+}
+
+/// Comment intent taxonomy collapse: existing rows carrying the classifier's
+/// retired `directive`/`larger_change` values must be re-homed onto the
+/// single `revision` value on the next DB open, so they keep matching
+/// `revisable_comment_predicate` (`intent = 'revision'`) instead of silently
+/// falling out of the `[Revise]` candidate pool. A `question` row is an
+/// untouched control.
+#[test]
+fn migration_collapses_directive_and_larger_change_intent_to_revision() {
+    let (_dir, path) = disk_db_path("collapse-directive-larger-change-intent");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let directive_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "alpha".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a comment".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    let larger_change_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "beta".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "another comment".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    let question_comment = db
+        .create_comment(CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "t1".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: CommentAnchor {
+                exact: "gamma".to_owned(),
+                prefix: String::new(),
+                suffix: String::new(),
+            },
+            body: "a question".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 0,
+        })
+        .unwrap();
+    db.set_comment_intent(&question_comment.id, "question", 0.9).unwrap();
+
+    // Bypass `set_comment_intent`'s validation (which now rejects these
+    // retired values) to simulate legacy rows written before the collapse.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_comments SET intent = 'directive', intent_classified_at = '1' WHERE id = ?1",
+            [&directive_comment.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_comments SET intent = 'larger_change', intent_classified_at = '1' WHERE id = ?1",
+            [&larger_change_comment.id],
+        )
+        .unwrap();
+    }
+    drop(db);
+
+    // Re-opening runs the migration which collapses both retired values.
+    let db = WorkDb::open(path.clone()).unwrap();
+    assert_eq!(
+        db.get_comment(&directive_comment.id)
+            .unwrap()
+            .unwrap()
+            .intent
+            .as_deref(),
+        Some("revision"),
+        "a legacy 'directive' row must be re-homed onto 'revision'",
+    );
+    assert_eq!(
+        db.get_comment(&larger_change_comment.id)
+            .unwrap()
+            .unwrap()
+            .intent
+            .as_deref(),
+        Some("revision"),
+        "a legacy 'larger_change' row must be re-homed onto 'revision'",
+    );
+    assert_eq!(
+        db.get_comment(&question_comment.id).unwrap().unwrap().intent.as_deref(),
+        Some("question"),
+        "a 'question' row must be left untouched by the collapse migration",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Upgrading a database that predates the `reasoning` column re-adds it and
+/// leaves every existing row NULL. No backfill is correct, not an omission:
+/// NULL is the "never classified" state the dispatcher resolves through its
+/// legacy kind-floor / effort-table path, so an in-flight row keeps the exact
+/// model it had before the upgrade. Backfilling `standard` here would silently
+/// re-model every `large` row on the board from Opus to Sonnet.
+#[test]
+fn migration_re_adds_reasoning_column_and_leaves_existing_rows_null() {
+    // disk_db_path required: drops a column and re-opens the DB to migrate.
+    let (_dir, path) = disk_db_path("reasoning-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Legacy large chore")
+                .effort_level(EffortLevel::Large)
+                .build(),
+        )
+        .unwrap();
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE tasks DROP COLUMN reasoning", []).unwrap();
+        assert!(!table_has_column(&conn, "tasks", "reasoning").unwrap());
+    }
+    drop(db);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "reasoning").unwrap());
+        let stored: Option<String> = conn
+            .query_row("SELECT reasoning FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored.is_none(), "the migration must not backfill a value");
+    }
+
+    // And the row reads back as unclassified through the mapper, so the
+    // dispatcher takes the legacy path for it.
+    let reread = db.get_work_item(&chore.id).unwrap();
+    let task = match reread {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore/task item, got {other:?}"),
+    };
+    assert!(task.reasoning.is_none());
+    assert_eq!(
+        task.effort_level,
+        Some(EffortLevel::Large),
+        "size signal survives intact"
+    );
 }

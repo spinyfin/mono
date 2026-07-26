@@ -6,6 +6,7 @@ use std::sync::{Arc, Weak};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use boss_event_bus::{EventBus, EventKind, TopicFilter};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
@@ -26,7 +27,7 @@ use crate::external_tracker::github_oauth::{
 use crate::ipc_log::IpcLogger;
 use crate::live_status_loop::{LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger};
 use crate::live_worker_state::LiveWorkerStateRegistry;
-use crate::merge_poller::{CommandMergeProbe, MergeProbe, PrReconcilerTargetedKick, spawn_loop as spawn_merge_poller};
+use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
@@ -77,10 +78,11 @@ mod pane_delivery;
 mod pane_ops;
 mod panes;
 mod planner_ops;
+mod pr_status;
 mod probes;
 mod products;
 mod projects;
-mod proposals;
+pub(crate) mod proposals;
 mod review;
 mod server;
 mod sessions;
@@ -103,17 +105,24 @@ use server::{
     resolve_status_actor, signal_shell_pids,
 };
 
-// Re-import pane-op error types so the `tests` child module can access them via `use super::*`.
-// Only the test module references these by name; production code calls the
-// `ServerState` methods and matches on the returned error with `{err}`/`{err:?}`,
-// never the concrete type — so this import is dead outside `#[cfg(test)]`.
+// Re-import pane-op error types so child modules can match on them via
+// `use super::*`. Production code (chore-update notify) matches
+// `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
+use pane_ops::SendInputError;
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
+use worker_events::{dispatch_probe_if_idle, dispatch_worker_event_fanout};
+
+// Production ingress paths go through `dispatch_worker_event_fanout`, which
+// calls these in order. Only the test modules name them individually, to drive
+// one handler at a time — so outside `#[cfg(test)]` this import is dead, the
+// same situation as the `pane_ops` import above.
+#[cfg(test)]
 use worker_events::{
-    dispatch_completion_on_stop, dispatch_editorial_on_pretooluse, dispatch_live_worker_state, dispatch_probe_if_idle,
-    dispatch_probe_on_stop, dispatch_probe_reply_on_stop, dispatch_urgent_probe_on_post_tool_use,
+    dispatch_live_worker_state, dispatch_probe_on_stop, dispatch_probe_reply_on_stop,
+    dispatch_urgent_probe_on_post_tool_use,
 };
 
 // Re-import verified pane-injection types so child modules can access them via `use super::*`.
@@ -137,17 +146,17 @@ use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
-    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
-    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
-    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
-    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
-    handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
-    load_dispatch_paused_state, load_live_status_disabled_slots, open_review_terminal_async,
-    persist_live_status_disabled_slots, publish_comment_invalidation, publish_work_invalidation, read_transcript_tail,
-    resolve_transcript_for_tail, segment_to_wire, send_push, send_response, send_response_with_revision,
-    send_work_error, tail_lines_from_content, task_name_description_for_id, task_status_for_id,
-    task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
-    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT,
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+    TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
+    build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
+    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
+    load_automation_paused_state, load_dispatch_concurrency_limit, load_dispatch_paused_state,
+    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
+    publish_comment_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
+    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
+    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
+    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -278,17 +287,17 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
             tracing::debug!(slot_id, "start_live_status_slot: ServerState already dropped",);
             return;
         };
-        // Snapshot the API key once at slot start — picking it up
-        // lazily inside the task would require sharing the config or
-        // a closure, and the key doesn't change for the worker's
-        // lifetime anyway.
-        let api_key = arc_self.anthropic_api_key.clone();
+        // Hand the slot the engine's utility-model provider rather than a
+        // bare key: the provider owns endpoint, model and credential together,
+        // and is resolved once at startup for the same reason the key used to
+        // be snapshotted here — none of it changes for the worker's lifetime.
+        let utility = arc_self.utility_model.clone();
         let broadcaster: Arc<dyn LiveStatusBroadcaster> = arc_self.clone();
         let resolver: Arc<dyn TranscriptPathResolver> = arc_self.clone();
         self.live_status_manager.start_slot(
             slot_id,
             run_id.to_owned(),
-            api_key,
+            utility,
             self.live_worker_states.clone(),
             broadcaster,
             resolver,
@@ -402,6 +411,12 @@ struct ServerState {
     /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
     /// in production (see [`Self::new_arc_with_app_pid_and_merge_probe`]).
     merge_probe: Arc<dyn MergeProbe>,
+    /// Engine-wide bound on `boss pr status --refresh` live probes — see
+    /// [`pr_status::PrStatusRefreshBudget`]. Defaults to an empty (fresh)
+    /// window via `#[builder(default)]`; not threaded through the
+    /// `ServerState::builder()` call site.
+    #[builder(default)]
+    pr_status_refresh_budget: pr_status::PrStatusRefreshBudget,
     /// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
     /// --squash`) for `handle_merge_when_ready`'s `MergeMechanism::Direct`
     /// branch. Defaults to `CommandDirectMergeExecutor` in production (see
@@ -422,12 +437,27 @@ struct ServerState {
     /// against the same files the sink populates.
     dispatch_event_root: PathBuf,
     topic_broker: Arc<TopicBroker>,
+    /// In-process typed event bus (design:
+    /// `tools/boss/docs/designs/engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`).
+    /// The events-socket accept loop publishes the hook-observable
+    /// transitions onto it. The merge poller subscribes to the
+    /// `PrReconcileRequested{pr_url}` topic here as the keyed companion to
+    /// the broad `pr_reconciler_kick` sweep.
+    #[builder(default = Arc::new(EventBus::new()))]
+    event_bus: Arc<EventBus>,
     worker_registry: WorkerRegistry,
     /// Live runtime state per allocated worker slot. Updated as hook
     /// events arrive on the events socket; surfaced to bossctl/UI via
     /// `ListWorkerLiveStates` and pushed on the
     /// `worker.live_states` topic whenever any slot changes.
     live_worker_states: Arc<LiveWorkerStateRegistry>,
+    /// Operator-placed holds (`bossctl agents hold`/`release-hold`) that
+    /// exempt a live run from the idle-park and auto-reap sweeps. Shared
+    /// with the completion handler (idle-park) and the stale-worker sweep
+    /// (auto-reap) so both consult the same holds. See
+    /// [`crate::hold_registry`].
+    #[builder(default)]
+    hold_registry: Arc<crate::hold_registry::HoldRegistry>,
     /// Cross-work-item spawn-capability circuit breaker. Fed by both the
     /// `ReportWorkerSpawnFailed` NACK handler and the periodic
     /// [`crate::spawn_ack_sweep`]; when too many DISTINCT work items fail to
@@ -478,16 +508,43 @@ struct ServerState {
     /// completion handler so `on_stop_inner`'s SHA-delta gate can confirm
     /// the revision was the one that moved the PR head.
     staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    /// In-memory `execution_id → error` staging map for `boss propose`
+    /// submissions that failed. Populated by the `PostToolUse` hook
+    /// dispatcher; consumed by the completion handler's
+    /// `proposal_channel_error` pass, which files an attention and
+    /// increments `worker_proposals.channel_error`. See
+    /// [`crate::proposal_channel_error`].
+    staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
     /// Per-execution deny counter for the editorial PreToolUse loop guard
     /// (design R3). State is in-memory only; a restart resets it to zero,
     /// which is the safe direction (worst case a worker gets three fresh
     /// denies rather than an indefinite block).
     editorial_deny_tracker: Arc<crate::editorial_hook::DenyTracker>,
+    /// Execution ids that have already logged the post-hoc-interception
+    /// loss-of-guards `warn!` (unregistered driver slug, or a registered
+    /// driver on the `AbsenceDisposition::Degrade` path). A long-running
+    /// worker on a hookless driver fires `PostToolUse` once per tool call —
+    /// without this, every one of those calls would repeat the identical
+    /// warning. First occurrence per execution stays a `warn!`; the rest
+    /// downgrade to `debug!`. In-memory only; a restart re-warns once, which
+    /// is the safe direction.
+    #[builder(default)]
+    post_hoc_interception_warned: StdMutex<std::collections::HashSet<String>>,
     /// Snapshot of the Anthropic API key captured at engine startup.
-    /// Used by the live-status summarizer for the per-slot task; the
-    /// pane-titlebar summarizer continues to resolve the key
-    /// per-spawn via `cfg.agent()`.
+    /// Reported (as a presence bit only) by the health verb and the
+    /// live-status debug verb. The engine's own inference calls no longer
+    /// read it directly — they go through [`Self::utility_model`], which is
+    /// seeded from this same snapshot.
     anthropic_api_key: Option<String>,
+    /// Where the engine's *own* short inference calls — live status, pane
+    /// title, attentions backstop, comment intent, Planner — get their
+    /// endpoint, model and credential.
+    ///
+    /// An orthogonal axis to any work item's driver, configured independently
+    /// (`BOSS_UTILITY_MODEL_PROVIDER`): a work item dispatched on a non-Claude
+    /// driver still gets its live status summarised by whatever this points
+    /// at. See `boss_engine_utility_model`'s crate docs.
+    utility_model: Arc<dyn crate::utility_model::UtilityModel>,
     /// Live pool sizes clamped at engine startup. Pushed to the macOS
     /// app as `EnginePoolConfig` on every `RegisterAppSession` so the
     /// app's `WorkersWorkspaceModel` slot ranges always mirror the
@@ -659,21 +716,6 @@ struct ServerState {
     /// `new_arc` return and the first `spawn_merge_poller` call in
     /// `serve` — that window is < 1 ms in production.
     pr_reconciler_kick: Arc<Notify>,
-    /// Targeted companion to `pr_reconciler_kick`: lets a future caller
-    /// (push-event relay, adaptive per-PR timer — see
-    /// `tools/boss/docs/investigations/
-    /// github-event-detection-webhooks-vs-polling-2026-07-08.md` §9)
-    /// request an immediate pass for one specific PR instead of the broad
-    /// "sweep everything" kick. No caller fires this yet; it's plumbed
-    /// through to the poller so that follow-up work has an entry point.
-    #[builder(default)]
-    pr_reconciler_targeted_kick: PrReconcilerTargetedKick,
-    /// Kick signal for the automation scheduler loop. Notified by any
-    /// automation mutation handler (create, update, enable, disable,
-    /// delete) so the scheduler recomputes its min-next-fire sleep
-    /// immediately on state change rather than waiting out its current
-    /// interval. See [`crate::automation_scheduler::spawn_loop`].
-    automation_scheduler_kick: Arc<Notify>,
     /// Secret token written to the control-token file at startup. A
     /// frontend `Shutdown { token }` RPC must match this value to
     /// trigger graceful exit. `None` only in tests / in-process
@@ -713,21 +755,33 @@ impl ServerState {
     ) -> Result<Arc<Self>> {
         let work_db = Arc::new(WorkDb::open(cfg.work.db_path.clone())?);
         let anthropic_api_key = cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
-        // One-time startup signal so the missing-API-key case is
+        // Resolve the engine's own inference provider once, here, and install
+        // it process-wide so paths too deep to thread a handle through (the
+        // attentions backstop, reached from the completion handler with only a
+        // `&WorkDb`) reach the same one. `utility_model()` logs which provider
+        // it picked and why, including the fall-back-to-default case.
+        let utility_model = cfg.utility_model();
+        crate::utility_model::install(utility_model.clone());
+        // One-time startup signal so the missing-credential case is
         // immediately visible in engine stderr — the chore calls out
         // that the summarizer used to drop this silently and the user
         // wants to confirm it's not the failure mode they're hitting.
         // Logged at `info` for the happy path so a `grep "live_status:"`
-        // sweep still shows the engine made a decision.
-        if anthropic_api_key.is_some() {
-            tracing::info!("live_status: ANTHROPIC_API_KEY is configured; summarizer enabled",);
-        } else {
-            tracing::error!(
-                "live_status: ANTHROPIC_API_KEY is NOT configured — \
+        // sweep still shows the engine made a decision. Asked of the
+        // provider rather than of the raw env var, so an operator who has
+        // pointed the summarizer somewhere else gets a truthful answer.
+        match utility_model.resolve(crate::utility_model::UtilityTask::LiveStatus) {
+            Ok(call) => tracing::info!(
+                provider = call.provider.as_str(),
+                model = call.model.as_str(),
+                "live_status: utility model resolved; summarizer enabled",
+            ),
+            Err(err) => tracing::error!(
+                %err,
+                "live_status: no utility-model credential — \
                  every summarizer call will return no_api_key and no \
-                 worker will get a live_status sentence. Set it in the \
-                 engine's agent config or via env to enable.",
-            );
+                 worker will get a live_status sentence.",
+            ),
         }
         // Engine build identity, logged once at startup so the user
         // can grep `live_status:` and confirm which binary is live.
@@ -804,6 +858,8 @@ impl ServerState {
         let probe_queuer = Arc::new(ServerStateProbeQueuer::default());
         let staged_pr_urls = Arc::new(crate::pr_url_capture::StagedPrUrlCache::new());
         let staged_revision_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
+        let staged_proposal_channel_errors =
+            Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new());
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is
@@ -886,8 +942,6 @@ impl ServerState {
         let metrics_for_coordinator = metrics_registry.clone();
         let pr_reconciler_kick = Arc::new(Notify::new());
         let pr_reconciler_kick_for_state = pr_reconciler_kick.clone();
-        let automation_scheduler_kick = Arc::new(Notify::new());
-        let automation_scheduler_kick_for_state = automation_scheduler_kick.clone();
         let shutdown_trigger = Arc::new(Notify::new());
         let shutdown_trigger_for_state = shutdown_trigger.clone();
         let control_token_for_state = control_token.clone();
@@ -944,6 +998,17 @@ impl ServerState {
         let merge_probe_for_state = ci_probe.clone();
         let direct_merge_executor_for_state: Arc<dyn merge_when_ready::DirectMergeExecutor> =
             direct_merge_executor_override.unwrap_or_else(|| Arc::new(merge_when_ready::CommandDirectMergeExecutor));
+
+        // Create the live per-slot worker registry and the operator-hold
+        // registry before the completion handler is built, so the
+        // completion handler (background-children probe, idle-park hold
+        // check), the coordinator's occupancy guard, and `ServerState` all
+        // share the SAME instances.
+        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
+        let live_worker_states_for_coordinator = live_worker_states.clone();
+        let live_worker_states_for_completion = live_worker_states.clone();
+        let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
+        let hold_registry_for_state = hold_registry.clone();
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -955,12 +1020,17 @@ impl ServerState {
             )
             .with_staged_pr_urls(staged_pr_urls.clone())
             .with_staged_revision_pushes(staged_revision_pushes.clone())
+            .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion)
             .with_max_review_cycles(cfg.work.max_review_cycles)
             .with_min_review_changed_lines(cfg.work.min_review_changed_lines)
-            .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews),
+            .with_enable_revision_triggered_reviews(cfg.work.enable_revision_triggered_reviews)
+            .with_background_activity_probe(Arc::new(
+                crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion),
+            ))
+            .with_hold_registry(hold_registry),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -999,11 +1069,6 @@ impl ServerState {
         // reverse forward at the production engine.
         let provider_events_socket = crate::runner::bound_events_socket_path(&cfg);
         let provider_control_dir = crate::ssh_transport::default_control_socket_dir();
-        // Create the live per-slot worker registry up front so the
-        // coordinator's lease-time occupancy guard (defect 3) and
-        // ServerState share the SAME registry instance.
-        let live_worker_states = Arc::new(LiveWorkerStateRegistry::new());
-        let live_worker_states_for_coordinator = live_worker_states.clone();
         let server_state = Arc::new_cyclic(move |weak_self: &Weak<ServerState>| {
             let mut execution_coordinator_inner = ExecutionCoordinator::with_publisher(
                 work_db.clone(),
@@ -1015,9 +1080,22 @@ impl ServerState {
             execution_coordinator_inner.set_dispatch_events(dispatch_events);
             execution_coordinator_inner.set_metrics(metrics_for_coordinator);
             execution_coordinator_inner.set_live_worker_states(live_worker_states_for_coordinator);
+            // Explicitly seed the coordinator's single `EventBus` (design
+            // doc: "One engine process, one bus") rather than letting it
+            // fall through to its private `EventBus::new()` default. A
+            // future producer living outside the coordinator reaches this
+            // same bus via `ExecutionCoordinator::event_bus()` (through
+            // `server_state.execution_coordinator`) instead of standing up
+            // a second, unreachable one — see the boot-time wiring check in
+            // `serve_with_merge_probe`.
+            execution_coordinator_inner.set_event_bus(Arc::new(boss_event_bus::EventBus::new()));
             // Bounded merge_order dispatch stagger (direction 2, default off).
             // Already clamped to MAX_MERGE_ORDER_STAGGER_SECS at config load.
             execution_coordinator_inner.set_merge_order_stagger_secs(cfg.work.merge_order_stagger_secs);
+            // DispatchReady bus routing (default off) — see
+            // `config::DEFAULT_ENABLE_DISPATCH_READY_BUS`. `server.rs` spawns
+            // the matching subscriber once the coordinator is behind its `Arc`.
+            execution_coordinator_inner.set_enable_dispatch_ready_bus(cfg.work.enable_dispatch_ready_bus);
             execution_coordinator_inner.set_automation_pool(automation_pool);
             execution_coordinator_inner.set_review_pool(review_pool);
             // Wire the SHA-delta gate's run-start snapshot: when an
@@ -1067,6 +1145,7 @@ impl ServerState {
                 .topic_broker(topic_broker)
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
+                .hold_registry(hold_registry_for_state)
                 .spawn_health(Arc::new(
                     crate::spawn_health::SpawnHealthTracker::new()
                         .with_breaker_enabled(cfg.work.enable_spawn_capability_breaker),
@@ -1079,8 +1158,10 @@ impl ServerState {
                 .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new()))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
+                .staged_proposal_channel_errors(staged_proposal_channel_errors)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
+                .utility_model(utility_model)
                 .worker_pool_size(worker_pool_size)
                 .automation_pool_size(automation_pool_size)
                 .review_pool_size(review_pool_size)
@@ -1102,7 +1183,6 @@ impl ServerState {
                 .settings(settings_for_state)
                 .metrics(metrics_for_state)
                 .pr_reconciler_kick(pr_reconciler_kick_for_state)
-                .automation_scheduler_kick(automation_scheduler_kick_for_state)
                 .tracker_registry(tracker_registry_for_state)
                 .github_auth(github_auth_for_state)
                 .trunk_token_store(trunk_token_store_for_state)
@@ -1128,6 +1208,10 @@ impl ServerState {
         if let Err(err) = crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db) {
             tracing::warn!(?err, "metrics: seed_from_db failed; starting from zeroed counters",);
         }
+        // The GitHub API usage sink is installed later, on the async
+        // server-startup path (see `crate::app::server`), not here: it
+        // spawns a writer task, and this constructor also runs from
+        // synchronous unit tests with no Tokio reactor.
 
         // Late-bind the runner to the Arc<ServerState>. Going through
         // the WorkerSpawner trait keeps the runner unaware of
@@ -1184,6 +1268,30 @@ impl ServerState {
                 "automation: restoring persisted pause state — automation remains \
                  globally paused until `bossctl automation resume` is called",
             );
+        }
+
+        // Seed the interactive-pool concurrency cap from the engine metadata
+        // KV — independent of the pause flags above. Set before any
+        // scheduler kick so the cap is in place before the first drain pass.
+        let dispatch_concurrency_limit = load_dispatch_concurrency_limit(&server_state.work_db);
+        if dispatch_concurrency_limit != crate::coordinator::MAX_CONCURRENT_INTERACTIVE_WORKERS {
+            // `load_dispatch_concurrency_limit` already filters out 0, so
+            // this can only fail to apply verbatim by clamping — never by
+            // rejecting outright.
+            match server_state
+                .execution_coordinator
+                .set_max_concurrent_interactive_workers(dispatch_concurrency_limit)
+            {
+                Ok(outcome) => tracing::info!(
+                    ?outcome,
+                    "dispatch: restoring persisted interactive concurrency cap from state.db",
+                ),
+                Err(err) => tracing::warn!(
+                    dispatch_concurrency_limit,
+                    %err,
+                    "dispatch: persisted interactive concurrency cap rejected — keeping compile-time default",
+                ),
+            }
         }
 
         Ok(server_state)
@@ -1729,12 +1837,15 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetDispatchConcurrency => engine_meta::handle_get_dispatch_concurrency(ctx, r).await,
             r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
             r @ FrontendRequest::GetEngineHealth => engine_meta::handle_get_engine_health(ctx, r).await,
             r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
             r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
             r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
+            r @ FrontendRequest::GetPrBody { .. } => pr_status::handle_get_pr_body(ctx, r).await,
             r @ FrontendRequest::GetProductDesignDoc { .. } => design_docs::handle_get_product_design_doc(ctx, r).await,
+            r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
@@ -1748,6 +1859,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStart => github_auth::handle_git_hub_auth_start(ctx, r).await,
             r @ FrontendRequest::GitHubAuthStatus => github_auth::handle_git_hub_auth_status(ctx, r).await,
+            r @ FrontendRequest::HoldRun { .. } => executions::handle_hold_run(ctx, r).await,
             r @ FrontendRequest::InterruptWorkerPane { .. } => panes::handle_interrupt_worker_pane(ctx, r).await,
             r @ FrontendRequest::KickPrReconcilers => engine_meta::handle_kick_pr_reconcilers(ctx, r).await,
             r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
@@ -1833,6 +1945,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::RegisterAppSession => sessions::handle_register_app_session(ctx, r).await,
             r @ FrontendRequest::RegisterBossSession { .. } => sessions::handle_register_boss_session(ctx, r).await,
             r @ FrontendRequest::RegisterCapabilities { .. } => engine_meta::handle_register_capabilities(ctx, r).await,
+            r @ FrontendRequest::ReleaseHoldRun { .. } => executions::handle_release_hold_run(ctx, r).await,
             r @ FrontendRequest::ReleaseProject { .. } => planner_ops::handle_release_project(ctx, r).await,
             r @ FrontendRequest::ReleaseReviewTerminal { .. } => review::handle_release_review_terminal(ctx, r).await,
             r @ FrontendRequest::RemoveDependency { .. } => dependencies::handle_remove_dependency(ctx, r).await,
@@ -1854,6 +1967,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
             r @ FrontendRequest::SetAutomationPaused { .. } => engine_meta::handle_set_automation_paused(ctx, r).await,
             r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
+            r @ FrontendRequest::SetDispatchConcurrency { .. } => {
+                engine_meta::handle_set_dispatch_concurrency(ctx, r).await
+            }
             r @ FrontendRequest::SetDispatchPaused { .. } => engine_meta::handle_set_dispatch_paused(ctx, r).await,
             r @ FrontendRequest::SetFeatureFlag { .. } => engine_meta::handle_set_feature_flag(ctx, r).await,
             r @ FrontendRequest::SetHostEnabled { .. } => hosts::handle_set_host_enabled(ctx, r).await,

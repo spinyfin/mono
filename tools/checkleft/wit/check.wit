@@ -147,6 +147,14 @@ interface types {
         column: option<u32>,
     }
 
+    /// Non-file surface a changeset-scoped finding refers to, when the finding
+    /// has no `location` (e.g. a match in the PR description rather than in a
+    /// changed file). Mirrors `output::Surface`.
+    enum surface {
+        pr-description,
+        commit-message,
+    }
+
     /// A single text substitution within a file.
     /// Mirrors `output::FileEdit`.
     record file-edit {
@@ -168,6 +176,9 @@ interface types {
         severity: severity,
         message: string,
         location: option<location>,
+        /// Set only when `location` is absent, to name the non-file surface
+        /// (PR description or commit message) the finding refers to.
+        surface: option<surface>,
         remediations: list<string>,
         suggested-fix: option<suggested-fix>,
     }

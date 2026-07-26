@@ -6,6 +6,6 @@ workspace = "../../../.."
 
 [dependencies]
 bon = { workspace = true }
-boss-engine-utils = { path = "../utils" }
+boss-engine-structured-output = { path = "../structured-output" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

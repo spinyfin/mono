@@ -4,6 +4,8 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, bail};
 
+use boss_engine_utility_model::{self as utility_model, UtilityModel};
+
 use crate::coordinator::{DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE, MAX_WORKER_POOL_SIZE};
 
 /// Environment override for the SQLite state database path.
@@ -78,6 +80,23 @@ pub const MAX_MERGE_ORDER_STAGGER_SECS: u64 = 600;
 /// either way — only the actual dispatch pause (and its automatic recovery
 /// machinery) are gated by this flag.
 pub const DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER: bool = true;
+
+/// Default value for [`WorkConfig::enable_dispatch_ready_bus`]. **OFF** by
+/// default. When on, [`crate::coordinator::ExecutionCoordinator::kick`]
+/// routes through the engine event bus (`Event::DispatchReady`) instead of
+/// latching `scheduling_pending`/`scheduling_active` directly, and a
+/// subscriber task re-enters that same double-latch on receipt. This is the
+/// first real producer/consumer wiring of the event bus (see
+/// `engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`)
+/// and is the highest-risk step in that migration — the flag exists so a
+/// bad interaction can be rolled back instantly via
+/// `BOSS_ENABLE_DISPATCH_READY_BUS=false` without a revert; `kick()`'s
+/// legacy direct-latch path stays in the binary unconditionally for exactly
+/// that purpose. The scheduler heartbeat (`spawn_scheduler_heartbeat`)
+/// keeps re-kicking every interval regardless of this flag, so even a
+/// dropped bus event (the bus is best-effort) self-heals within one
+/// heartbeat.
+pub const DEFAULT_ENABLE_DISPATCH_READY_BUS: bool = false;
 
 /// Default value for [`WorkConfig::coordinator_model`]. The Boss coordinator
 /// session (the macOS app's single always-on Claude Code pane) launches on
@@ -188,6 +207,13 @@ pub struct WorkConfig {
     /// dispatch event on trip — it just never calls `set_dispatch_paused`.
     #[builder(default = DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)]
     pub enable_spawn_capability_breaker: bool,
+    /// Whether the coordinator's `kick()` routes through the event bus
+    /// (`Event::DispatchReady`) instead of latching scheduling state
+    /// directly. OFF by default — see
+    /// [`DEFAULT_ENABLE_DISPATCH_READY_BUS`]. Configured via
+    /// `BOSS_ENABLE_DISPATCH_READY_BUS`.
+    #[builder(default = DEFAULT_ENABLE_DISPATCH_READY_BUS)]
+    pub enable_dispatch_ready_bus: bool,
     /// Model slug the Boss coordinator session launches with, pushed to the
     /// macOS app as `EnginePoolConfig.coordinator_model` on every
     /// `RegisterAppSession`. Configured via `BOSS_COORDINATOR_MODEL`;
@@ -239,6 +265,8 @@ impl WorkConfig {
             .min(MAX_MERGE_ORDER_STAGGER_SECS);
         let enable_spawn_capability_breaker = lookup_bool(&lookup, "BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER")?
             .unwrap_or(DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER);
+        let enable_dispatch_ready_bus =
+            lookup_bool(&lookup, "BOSS_ENABLE_DISPATCH_READY_BUS")?.unwrap_or(DEFAULT_ENABLE_DISPATCH_READY_BUS);
         let coordinator_model = lookup_string(&lookup, "BOSS_COORDINATOR_MODEL")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
@@ -256,6 +284,7 @@ impl WorkConfig {
             .enable_revision_triggered_reviews(enable_revision_triggered_reviews)
             .merge_order_stagger_secs(merge_order_stagger_secs)
             .enable_spawn_capability_breaker(enable_spawn_capability_breaker)
+            .enable_dispatch_ready_bus(enable_dispatch_ready_bus)
             .coordinator_model(coordinator_model)
             .build())
     }
@@ -336,6 +365,16 @@ impl AgentConfig {
 pub struct RuntimeConfig {
     pub work: WorkConfig,
     agent_cell: OnceLock<Arc<AgentConfig>>,
+    /// Lazily-resolved [`UtilityModel`] provider — where the engine's *own*
+    /// short inference calls (live status, pane title, attentions backstop,
+    /// comment intent, Planner) get their endpoint, model and credential.
+    ///
+    /// Deliberately a separate cell from `agent_cell`: the utility provider is
+    /// an orthogonal axis to any work item's driver, configured independently
+    /// (`BOSS_UTILITY_MODEL_PROVIDER`), so a work item on a non-Claude driver
+    /// still gets its live status summarised by whatever the engine is
+    /// pointed at. See `boss_engine_utility_model`'s crate docs.
+    utility_cell: OnceLock<Arc<dyn UtilityModel>>,
 }
 
 impl RuntimeConfig {
@@ -343,6 +382,7 @@ impl RuntimeConfig {
         Ok(Self {
             work: WorkConfig::load_from_env()?,
             agent_cell: OnceLock::new(),
+            utility_cell: OnceLock::new(),
         })
     }
 
@@ -351,7 +391,11 @@ impl RuntimeConfig {
         if let Some(agent) = agent {
             let _ = cell.set(Arc::new(agent));
         }
-        Self { work, agent_cell: cell }
+        Self {
+            work,
+            agent_cell: cell,
+            utility_cell: OnceLock::new(),
+        }
     }
 
     /// Return a copy of this config with `work` replaced, carrying over any
@@ -365,7 +409,15 @@ impl RuntimeConfig {
         if let Some(agent) = self.agent_cell.get() {
             let _ = cell.set(agent.clone());
         }
-        Self { work, agent_cell: cell }
+        let utility = OnceLock::new();
+        if let Some(provider) = self.utility_cell.get() {
+            let _ = utility.set(provider.clone());
+        }
+        Self {
+            work,
+            agent_cell: cell,
+            utility_cell: utility,
+        }
     }
 
     pub fn agent(&self) -> Result<Arc<AgentConfig>> {
@@ -378,6 +430,50 @@ impl RuntimeConfig {
             Ok(()) => Ok(arc),
             Err(_) => Ok(self.agent_cell.get().expect("OnceLock set after failed insert").clone()),
         }
+    }
+
+    /// The [`UtilityModel`] provider for the engine's own inference calls.
+    ///
+    /// Infallible on purpose — provider selection never fails, it falls back
+    /// visibly (see [`utility_model::select`]). A *missing credential* is
+    /// reported later, per task, by [`UtilityModel::resolve`], which is what
+    /// lets one feature work while another is unconfigured.
+    ///
+    /// The Anthropic provider is seeded with the already-loaded
+    /// `ANTHROPIC_API_KEY` snapshot so an in-process engine built via
+    /// [`Self::from_parts`] with an injected key resolves the same way a
+    /// production one does. A failure to load `AgentConfig` is not fatal here:
+    /// the provider falls back to reading the env var itself.
+    ///
+    /// Callers that must not hit the network (unit tests) should install a
+    /// keyless provider via [`Self::set_utility_model`] before the first
+    /// `utility_model()` call — `from_parts(work, None)` alone still lazy-
+    /// loads credentials from the process environment on first use.
+    pub fn utility_model(&self) -> Arc<dyn UtilityModel> {
+        if let Some(provider) = self.utility_cell.get() {
+            return provider.clone();
+        }
+        let base_api_key = self.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        let selection = utility_model::select(base_api_key);
+        selection.log();
+        let provider = selection.provider;
+        match self.utility_cell.set(provider.clone()) {
+            Ok(()) => provider,
+            Err(_) => self
+                .utility_cell
+                .get()
+                .expect("OnceLock set after failed insert")
+                .clone(),
+        }
+    }
+
+    /// Install a [`UtilityModel`] provider before the first
+    /// [`Self::utility_model`] call. Used by tests to inject a keyless
+    /// (or mock) provider so spawn / live-status / pane-summary paths never
+    /// issue real network requests when `ANTHROPIC_API_KEY` is set in the
+    /// process environment. No-op if a provider is already installed.
+    pub fn set_utility_model(&self, provider: Arc<dyn UtilityModel>) {
+        let _ = self.utility_cell.set(provider);
     }
 }
 
@@ -456,10 +552,10 @@ fn default_db_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_COORDINATOR_MODEL, DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS, DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER,
-        DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES, DEFAULT_MERGE_ORDER_STAGGER_SECS,
-        DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE, MAX_AUTOMATION_POOL_SIZE,
-        MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
+        DEFAULT_COORDINATOR_MODEL, DEFAULT_ENABLE_DISPATCH_READY_BUS, DEFAULT_ENABLE_REVISION_TRIGGERED_REVIEWS,
+        DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER, DEFAULT_MAX_EMBED_DIFF_LINES, DEFAULT_MAX_REVIEW_CYCLES,
+        DEFAULT_MERGE_ORDER_STAGGER_SECS, DEFAULT_MIN_REVIEW_CHANGED_LINES, DEFAULT_REVIEW_POOL_SIZE,
+        MAX_AUTOMATION_POOL_SIZE, MAX_MERGE_ORDER_STAGGER_SECS, MAX_WORKER_POOL_SIZE, WorkConfig,
     };
     use std::ffi::OsString;
 
@@ -716,6 +812,40 @@ mod tests {
         })
         .expect("config loads");
         assert!(config.enable_spawn_capability_breaker);
+    }
+
+    #[test]
+    fn enable_dispatch_ready_bus_defaults_off_and_reads_env() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let db_path_str = tempdir.path().join("state.db");
+
+        // Absent → defaults OFF: `kick()` keeps its legacy direct-latch
+        // path unconditionally, so the bus wiring is opt-in only.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert_eq!(config.enable_dispatch_ready_bus, DEFAULT_ENABLE_DISPATCH_READY_BUS);
+        assert!(!config.enable_dispatch_ready_bus, "dispatch-ready bus defaults off");
+
+        // Explicit "true" opts in.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_DISPATCH_READY_BUS" => Some(OsString::from("true")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(config.enable_dispatch_ready_bus);
+
+        // Explicit "0" is also accepted as false.
+        let config = WorkConfig::load_from(|k| match k {
+            "BOSS_ENABLE_DISPATCH_READY_BUS" => Some(OsString::from("0")),
+            "BOSS_DB_PATH" => Some(OsString::from(&db_path_str)),
+            _ => None,
+        })
+        .expect("config loads");
+        assert!(!config.enable_dispatch_ready_bus);
     }
 
     #[test]

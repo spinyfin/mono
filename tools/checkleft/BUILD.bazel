@@ -307,3 +307,25 @@ rust_test(
         normal_dev = True,
     ),
 )
+
+# Functional / end-to-end test for `policy.changed_lines_only` (Phase 1 of
+# docs/investigations/checkleft-line-scoped-detection-and-fixes.md): drives a
+# real git repo through `Vcs::changeset_since` and the full `Runner` to
+# confirm a finding on a PR-changed line survives while one on an untouched
+# line of the same file is dropped, in both directions from one real changeset.
+rust_test(
+    name = "changed_lines_only_e2e_test",
+    size = "small",
+    srcs = ["tests/changed_lines_only_e2e.rs"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":checkleft_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

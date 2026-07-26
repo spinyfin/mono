@@ -53,8 +53,12 @@ impl WorkerCompletionHandler {
         };
         let repo_slug = parse_repo_slug(&execution.repo_remote_url).ok()?;
         let pr_number = pr_number_from_url(bound_pr_url)?;
-        let current = match self.branch_verifier.fetch_pr_body(&repo_slug, pr_number).await {
-            Ok(body) => body,
+        let current = match self
+            .branch_verifier
+            .fetch_pr_title_and_body(&repo_slug, pr_number)
+            .await
+        {
+            Ok((_title, body)) => body,
             Err(err) => {
                 tracing::debug!(
                     execution_id,

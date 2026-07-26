@@ -1,6 +1,6 @@
 //! Worker Stop-boundary deferred-scope marker detection.
 //!
-//! Root cause (T222/PR #765, recovered weeks later as Flunge T254): a worker
+//! Root cause (PR #765, recovered weeks later): a worker
 //! legitimately narrowed its task's scope mid-execution — it wired part of
 //! the brief and deferred the rest because it needed new data plumbing, not
 //! just wiring. The only record of the deferred remainder was a prose
@@ -15,7 +15,7 @@
 //! marker protocol: a worker that deliberately delivers less than the brief
 //! asks emits one `[deferred-scope]` line per deferred item on its Stop
 //! boundary (see
-//! [`crate::runner::deferred_scope_directive`] for the prompt text taught to
+//! [`crate::runner::prompt::deferred_scope_directive`] for the prompt text taught to
 //! workers). [`crate::completion::WorkerCompletionHandler::detect_and_record_deferred_scope`]
 //! detects it at the same Stop-boundary surface `[effort-escalation]`/
 //! `[blocked]` travel on, appends a durable audit line to the work item's
@@ -132,13 +132,13 @@ mod tests {
     #[test]
     fn detects_well_formed_deferred_scope() {
         let text = "Some prose.\n\n\
-                    [deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new ingestion pipeline\"\n";
+                    [deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline\"\n";
         let items = detect_deferred_scope_items(text);
         assert_eq!(items.len(), 1);
         assert!(items[0].is_well_formed(), "warning: {:?}", items[0].parse_warning);
         assert_eq!(
             items[0].marker_line,
-            "[deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new ingestion pipeline\""
+            "[deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new ingestion pipeline\""
         );
     }
 
@@ -203,9 +203,10 @@ mod tests {
 
     #[test]
     fn summary_and_reason_extracts_both_fields() {
-        let (summary, reason) =
-            summary_and_reason("[deferred-scope] summary=\"T11 data plumbing\" reason=\"needs a new pipeline\"");
-        assert_eq!(summary.as_deref(), Some("T11 data plumbing"));
+        let (summary, reason) = summary_and_reason(
+            "[deferred-scope] summary=\"wiring for the third data source\" reason=\"needs a new pipeline\"",
+        );
+        assert_eq!(summary.as_deref(), Some("wiring for the third data source"));
         assert_eq!(reason.as_deref(), Some("needs a new pipeline"));
     }
 

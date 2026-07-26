@@ -340,7 +340,9 @@ async fn rung1_residual_conflicts_falls_through_and_releases() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: Some(1)
+            residual_conflict_files: Some(1),
+            reason: "rung 0 declined: one or more residual files have no applicable deterministic \
+                     resolver, or a matched resolver declined",
         }
     );
     assert!(
@@ -374,7 +376,9 @@ async fn rung1_residual_conflicts_beyond_rung2_bound_declines_rung2() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: Some(2)
+            residual_conflict_files: Some(2),
+            reason: "rung 0 declined: one or more residual files have no applicable deterministic \
+                     resolver, or a matched resolver declined",
         }
     );
     assert!(
@@ -396,7 +400,8 @@ async fn rung1_rebase_error_falls_through_and_releases() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "engine-direct rebase (rung 1) failed; mechanical rungs unavailable",
         }
     );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
@@ -419,7 +424,8 @@ async fn rung1_clean_but_unpushed_falls_through() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "rung 1 rebased clean but the push was skipped upstream; mechanical resolution not landed",
         }
     );
     let row = db.get_conflict_resolution(&attempt.id).unwrap().unwrap();
@@ -442,7 +448,8 @@ async fn rung1_ensure_repo_error_falls_through_without_lease() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "ensure_repo failed; mechanical rungs skipped",
         }
     );
     // Never leased (ensure_repo failed first), so nothing to release, no goto.
@@ -840,7 +847,9 @@ async fn rung0_declined_file_falls_through_without_pushing() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "rung 0 declined: one or more residual files have no applicable deterministic \
+                     resolver, or a matched resolver declined",
         }
     );
     assert!(
@@ -888,7 +897,9 @@ async fn rung0_declines_both_no_resolver_and_resolver_ran_files_together() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "rung 0 declined: one or more residual files have no applicable deterministic \
+                     resolver, or a matched resolver declined",
         }
     );
     assert!(
@@ -935,7 +946,8 @@ async fn rung0_push_failure_falls_through_without_marking_succeeded() {
     assert_eq!(
         outcome,
         LadderOutcome::FellThrough {
-            residual_conflict_files: None
+            residual_conflict_files: None,
+            reason: "rung 0 resolved every residual file but pushing the resolution failed",
         }
     );
     // Every file resolved, but the push failed — must not mark succeeded.

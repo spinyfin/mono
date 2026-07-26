@@ -242,3 +242,91 @@ fn clear_external_ref_missing_row_errors() {
         "clearing a non-existent work item should error"
     );
 }
+
+#[cfg(test)]
+mod event_bus_tests {
+    use boss_event_bus::TopicFilter;
+
+    use super::*;
+    use crate::test_support::create_ready_chore_execution;
+
+    /// `cancel_running_execution` publishes `ExecutionTerminal` when it
+    /// actually cancels a non-terminal execution — mirrors
+    /// `cancel_execution_publishes_execution_terminal` in
+    /// `executions_runs.rs`'s `event_bus_tests`.
+    #[tokio::test]
+    async fn cancel_running_execution_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Backlog-drag chore");
+        let execution = create_ready_chore_execution(&db, chore.id.clone());
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        let cancelled = db.cancel_running_execution(&execution.id).unwrap();
+        assert!(cancelled, "a non-terminal execution must be cancelled");
+
+        let event = sub
+            .recv()
+            .await
+            .expect("ExecutionTerminal published after cancel_running_execution");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+
+    /// `cancel_running_execution_and_demote_task` publishes
+    /// `ExecutionTerminal` when it actually cancels a non-terminal
+    /// execution (the `bossctl agents stop` / force-stop path).
+    #[tokio::test]
+    async fn cancel_running_execution_and_demote_task_publishes_execution_terminal() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, product.id.clone(), "Force-stopped chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                status: Some("active".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(ExecutionKind::ChoreImplementation)
+                    .status(ExecutionStatus::Running)
+                    .build(),
+            )
+            .unwrap();
+        let mut sub = db
+            .event_bus()
+            .subscribe(TopicFilter::kind(boss_event_bus::EventKind::ExecutionTerminal));
+
+        let (cancelled, demoted) = db.cancel_running_execution_and_demote_task(&execution.id).unwrap();
+        assert!(cancelled, "a non-terminal execution must be cancelled");
+        assert!(demoted, "the active task must be demoted to todo");
+
+        let event = sub
+            .recv()
+            .await
+            .expect("ExecutionTerminal published after cancel_running_execution_and_demote_task");
+        assert_eq!(
+            event,
+            Event::ExecutionTerminal {
+                execution_id: execution.id.clone(),
+                task_id: execution.work_item_id.clone(),
+                host_id: "local".to_owned(),
+                pool_claim: None,
+            }
+        );
+    }
+}

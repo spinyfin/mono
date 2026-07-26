@@ -91,19 +91,34 @@ impl ExecutionCoordinator {
                 // concurrent `force_release` and this branch can't issue
                 // a duplicate cube release against the same lease.
                 let released = match self.work_db.clear_execution_workspace(&execution.id) {
-                    Ok(Some(lease_id)) => match adapter.release_workspace(&lease_id).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            tracing::error!(
-                                ?err,
-                                execution_id = %execution.id,
-                                run_id = %run.id,
-                                lease_id = %lease_id,
-                                "failed to release deferred lease after mid-spawn cancel",
-                            );
-                            false
+                    Ok(Some(cleared)) => {
+                        // Stop termination path (mid-spawn cancel): tear
+                        // down any driver-owned state outside the
+                        // workspace, using the path captured before
+                        // `clear_execution_workspace` nulled it. Called
+                        // unconditionally (not gated on a workspace path)
+                        // since a driver may key its out-of-workspace state
+                        // by run id alone.
+                        crate::driver_teardown::teardown_driver_workspace(
+                            &self.work_db,
+                            &execution.id,
+                            cleared.workspace_path.as_deref().map(std::path::Path::new),
+                        )
+                        .await;
+                        match adapter.release_workspace(&cleared.lease_id).await {
+                            Ok(()) => true,
+                            Err(err) => {
+                                tracing::error!(
+                                    ?err,
+                                    execution_id = %execution.id,
+                                    run_id = %run.id,
+                                    lease_id = %cleared.lease_id,
+                                    "failed to release deferred lease after mid-spawn cancel",
+                                );
+                                false
+                            }
                         }
-                    },
+                    }
                     // Already cleared by a racing force_release that saw
                     // the slot mapped and reaped + released itself.
                     Ok(None) => false,
@@ -206,7 +221,14 @@ impl ExecutionCoordinator {
                 if let Some(spawn) = spawn_config_for_event {
                     details["spawn_config"] = serde_json::json!({
                         "effort_level": spawn.effort_level.map(|level| level.as_str()),
-                        "claude_effort": spawn.claude_effort,
+                        "effort_value": spawn.effort_value,
+                        // The capability signal is what actually picked the
+                        // model for any classified row, so the dispatch stream
+                        // has to carry it to answer *why* this model — without
+                        // it, an Opus spawn on a `small` row looks like a bug.
+                        // `null` here means the row was unclassified and the
+                        // legacy kind-floor / effort-table path chose instead.
+                        "reasoning": spawn.reasoning.map(|mode| mode.as_str()),
                         "model": spawn.model,
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
                     });
@@ -223,6 +245,21 @@ impl ExecutionCoordinator {
                     .await;
             }
             Err(err) => {
+                // Pane-spawn-failure termination path: the run is
+                // unconditionally terminal from here (marked `failed`
+                // below regardless of whether the cube release below
+                // succeeds), so tear down any driver-owned state outside
+                // the workspace now — before the cube release, matching
+                // `force_release`'s ordering, so a driver that derives
+                // out-of-workspace state from the workspace path never
+                // races a concurrent re-lease of the same workspace once
+                // cube has it back.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    Some(&lease.workspace_path),
+                )
+                .await;
                 let released = match adapter.release_workspace(&lease.lease_id).await {
                     Ok(()) => true,
                     Err(release_err) => {
@@ -296,6 +333,8 @@ impl ExecutionCoordinator {
                         .build(),
                 ) {
                     Ok((execution, _run, _)) => {
+                        // Driver teardown for this termination path already
+                        // ran unconditionally above, before the cube release.
                         // The execution is now durably `failed` in the DB —
                         // safe to have `pool_claim_sweep` own reclaiming this
                         // slot instead of releasing it immediately (see the
@@ -754,6 +793,25 @@ impl ExecutionCoordinator {
         adapter: &Arc<dyn HostAdapter>,
     ) -> Result<()> {
         let release_workspace = outcome.wait_state.release_workspace();
+
+        // Normal-completion termination path: `release_workspace` (not
+        // `released` below) is the actual terminality signal — a park
+        // (`release_workspace == false`) correctly skips teardown, but a
+        // release that is *attempted* and merely fails to reach cube is
+        // still a terminated run, so teardown must not be gated on the cube
+        // call's own success. Runs before the cube release (matching
+        // `force_release`'s ordering) so a driver that derives
+        // out-of-workspace state from the workspace path never races a
+        // concurrent re-lease of the same workspace once cube has it back.
+        if release_workspace {
+            crate::driver_teardown::teardown_driver_workspace(
+                &self.work_db,
+                &execution.id,
+                Some(&lease.workspace_path),
+            )
+            .await;
+        }
+
         let released = if release_workspace {
             match adapter.release_workspace(&lease.lease_id).await {
                 Ok(()) => true,

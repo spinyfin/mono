@@ -73,8 +73,12 @@ impl ExecutionCoordinator {
             host_adapter_provider,
             publisher,
             dispatch_events: Arc::new(NoopDispatchEventSink),
+            inflight_dispatches: InflightDispatches::new(),
+            dispatch_slots: Arc::new(Semaphore::new(MAX_INFLIGHT_DISPATCHES)),
             scheduling_active: AtomicBool::new(false),
             scheduling_pending: AtomicBool::new(false),
+            event_bus: Arc::new(EventBus::new()),
+            enable_dispatch_ready_bus: false,
             repo_cold_probe_seen: Mutex::new(HashSet::new()),
             pre_start_retry_delays: PRE_START_RETRY_DELAYS.to_vec(),
             merge_order_stagger_secs: 0,
@@ -88,7 +92,7 @@ impl ExecutionCoordinator {
             automation_paused_since_epoch_s: AtomicU64::new(0),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
-            max_concurrent_interactive_workers: MAX_CONCURRENT_INTERACTIVE_WORKERS,
+            max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
         }
     }
 
@@ -246,6 +250,46 @@ impl ExecutionCoordinator {
         self.metrics = metrics;
     }
 
+    /// Seed the `kick()`-routes-through-the-bus kill-switch. `app.rs` calls
+    /// this once at construction with `cfg.work.enable_dispatch_ready_bus`
+    /// (default off). A boot-time setting, not a live toggle: nothing flips
+    /// this after the coordinator is wrapped in its `Arc`. See
+    /// [`Self::enable_dispatch_ready_bus`] and
+    /// [`Self::spawn_dispatch_ready_subscriber`].
+    pub fn set_enable_dispatch_ready_bus(&mut self, enabled: bool) {
+        self.enable_dispatch_ready_bus = enabled;
+    }
+
+    /// Wire the engine-wide event bus into this coordinator. Per the design
+    /// doc ("One engine process, one bus" —
+    /// `engine-event-bus-event-driven-reconcilers-via-an-in-process-message-queue.md`),
+    /// there must be exactly one `EventBus` per engine process so every
+    /// producer and subscriber — this coordinator's `kick()`/
+    /// `spawn_dispatch_ready_subscriber`, and any future producer wired
+    /// through `crate::event_publish::commit_and_publish` — reaches the same
+    /// fan-out. `app.rs` calls this once at construction with the single
+    /// `Arc<EventBus>` it also hands to `ServerState`. Left unset, the
+    /// coordinator keeps its private `EventBus::new()` default, which is
+    /// correct for tests and any caller that never wires a shared bus but
+    /// would silently strand events from a second producer in production.
+    pub fn set_event_bus(&mut self, bus: Arc<EventBus>) {
+        self.event_bus = bus;
+    }
+
+    /// The coordinator's `EventBus`, per the design doc's "one engine
+    /// process, one bus" invariant. A future producer living outside the
+    /// coordinator (e.g. a `crate::event_publish::commit_and_publish` call
+    /// site in another module) reaches the same bus `kick()` and
+    /// `spawn_dispatch_ready_subscriber` use through
+    /// `server_state.execution_coordinator.event_bus()`, rather than
+    /// constructing an unreachable bus of its own. `serve_with_merge_probe`
+    /// also uses this to log the subscriber count once the dispatch-ready
+    /// subscriber has attached, as a boot-time sanity check that the
+    /// injected bus in [`Self::set_event_bus`] is actually the one wired up.
+    pub(crate) fn event_bus(&self) -> &Arc<EventBus> {
+        &self.event_bus
+    }
+
     /// Wire the engine's live per-slot worker registry so the dispatch
     /// loop can run the lease-time occupancy guard (defect 3). `app.rs`
     /// calls this once with the shared registry; tests that want to
@@ -266,12 +310,54 @@ impl ExecutionCoordinator {
     /// Override the interactive-pool concurrency cap ceiling (default
     /// [`MAX_CONCURRENT_INTERACTIVE_WORKERS`]). Tests that exercise
     /// automation spillover/preemption at pool sizes at or near
-    /// [`WORKER_PAGE_SIZE`] raise this so the unrelated, temporary cap
-    /// doesn't hold mainline rows before they ever reach the spillover/
-    /// preemption path under test.
-    pub fn with_max_concurrent_interactive_workers(mut self, max: usize) -> Self {
-        self.max_concurrent_interactive_workers = max;
+    /// [`WORKER_PAGE_SIZE`] raise this so the cap doesn't hold mainline rows
+    /// before they reach the spillover/preemption path under test.
+    pub fn with_max_concurrent_interactive_workers(self, max: usize) -> Self {
+        self.max_concurrent_interactive_workers.store(max, Ordering::Release);
         self
+    }
+
+    /// Current interactive-pool concurrency cap.
+    pub fn max_concurrent_interactive_workers(&self) -> usize {
+        self.max_concurrent_interactive_workers.load(Ordering::Acquire)
+    }
+
+    /// Live-set the interactive-pool concurrency cap. `0` is rejected
+    /// outright with `Err` — it would wedge all mainline dispatch with no
+    /// error surface — and anything above the live main-pool capacity
+    /// (`self.worker_pool.capacity_sync()`, the same number
+    /// `handle_worker_pool_summary` reports and the value
+    /// `config.worker_pool_size`/`BOSS_WORKER_POOL_SIZE` produces at
+    /// construction) is clamped down to it, since there are no backing slots
+    /// or panes above that on this instance. Clamping against the live pool
+    /// rather than the compile-time [`MAX_WORKER_POOL_SIZE`] ceiling avoids
+    /// accepting a cap the configured pool can never fill, which would
+    /// otherwise reproduce the same capacity-vs-cap contradiction a
+    /// shrunk-and-capped pool is meant to avoid. Reported via
+    /// `Ok(SetConcurrencyCapOutcome::clamped_from)` so the caller can still
+    /// surface a clear message instead of pretending the request was
+    /// honored verbatim.
+    ///
+    /// The caller is responsible for persisting the new value to `state.db`
+    /// (see `handle_set_dispatch_concurrency` in `app/engine_meta.rs`) so it
+    /// survives an engine restart, and for calling [`Self::kick`] afterward
+    /// when raising the cap — a bare store here does not itself wake
+    /// `drain_ready_queue`, so a raised cap would otherwise sit unused until
+    /// the next naturally-triggered drain pass.
+    pub fn set_max_concurrent_interactive_workers(&self, requested: usize) -> Result<SetConcurrencyCapOutcome, String> {
+        if requested == 0 {
+            return Err(
+                "interactive concurrency cap must be at least 1 (0 would wedge all mainline dispatch)".to_string(),
+            );
+        }
+        let ceiling = self.worker_pool.capacity_sync().min(MAX_WORKER_POOL_SIZE);
+        let applied = requested.min(ceiling);
+        self.max_concurrent_interactive_workers
+            .store(applied, Ordering::Release);
+        Ok(SetConcurrencyCapOutcome {
+            applied,
+            clamped_from: (applied != requested).then_some(requested),
+        })
     }
 
     /// Install a dispatch-event sink. The production engine threads

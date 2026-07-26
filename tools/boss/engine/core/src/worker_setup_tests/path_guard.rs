@@ -19,7 +19,7 @@ fn settings_json_adds_deterministic_path_guard_hook() {
     // Boss data dir passed via BOSS_DATA_DIR so the script resolves
     // candidate paths against the right boundary.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let cmd = path_guard_command(&parsed).expect("PreToolUse must include the deterministic path-guard hook");
     assert!(cmd.contains("python3"), "guard must run via python3: {cmd}");
     // The data dir is the Boss state dir (events socket parent),
@@ -44,7 +44,7 @@ fn path_guard_present_for_revision_sessions_too() {
     let mut input = sample_input();
     input.execution_kind = "revision_implementation".into();
     input.task_kind = Some("revision".into());
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     assert!(
         path_guard_command(&parsed).is_some(),
         "revision sessions must also carry the deterministic path guard",

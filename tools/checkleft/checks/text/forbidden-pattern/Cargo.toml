@@ -1,0 +1,17 @@
+[package]
+name = "checkleft-text-forbidden-pattern"
+version = "0.1.0"
+edition.workspace = true
+description = "checkleft check (text/forbidden-pattern): flag lines in changed files that match configured forbidden regular-expression patterns"
+
+# An ordinary rlib. The component ABI is wired once in the aggregating
+# `checkleft-preinstalled-bundle` crate (a cdylib), which links this check into
+# the single multiplexed preinstalled component. No `wit-bindgen` dependency is
+# needed here: `export_checks!` is called by the aggregating bundle, not here.
+[dependencies]
+checkleft-check-sdk = { path = "../../../sdk" }
+serde = { workspace = true, features = ["derive"] }
+regex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

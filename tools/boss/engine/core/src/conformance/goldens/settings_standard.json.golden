@@ -1,0 +1,132 @@
+{
+  "permissions": {
+    "defaultMode": "auto",
+    "deny": [
+      "Read(/Users/brianduff/Library/Application Support/Boss)",
+      "Read(/Users/brianduff/Library/Application Support/Boss/**)",
+      "Edit(/Users/brianduff/Library/Application Support/Boss)",
+      "Edit(/Users/brianduff/Library/Application Support/Boss/**)",
+      "Bash(bossctl)",
+      "Bash(bossctl:*)",
+      "Bash(boss engine start)",
+      "Bash(boss engine start:*)",
+      "Bash(boss engine stop)",
+      "Bash(boss engine stop:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_DATA_DIR='/Users/brianduff/Library/Application Support/Boss' python3 '$TMPDIR/boss-worker-settings/boss-path-guard.py'"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport json,os,sys,re,shlex\ninp=json.load(sys.stdin)\ncmd=inp.get('tool_input',{}).get('command','')\nDELIMS={'&&','||',';','|','&'}\nWRAP={'nohup','env','sudo','exec','command','stdbuf','setsid','caffeinate','xargs'}\nASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\nPROD='/tmp/boss-engine.sock'\nvars={}\ndef expand(t):\n    for k,v in vars.items():\n        t=t.replace('$'+'{'+k+'}',v).replace('$'+k,v)\n    return t\ngroups=[]\nfor line in cmd.split(chr(10)):\n    try:\n        toks=shlex.split(line,posix=True)\n    except Exception:\n        toks=line.split()\n    resolved=[]\n    for t in toks:\n        m=ASSIGN.match(t)\n        if m:\n            vars[m.group(1)]=expand(m.group(2))\n        resolved.append(expand(t))\n    cur=[]\n    for t in resolved:\n        if t in DELIMS:\n            if cur:\n                groups.append(cur[:])\n            cur=[]\n        else:\n            cur.append(t)\n    if cur:\n        groups.append(cur)\ndef socket_arg(g):\n    for j,t in enumerate(g):\n        if t=='--socket-path' and j+1<len(g):\n            return g[j+1]\n        if t.startswith('--socket-path='):\n            return t.split('=',1)[1]\n    return None\nmatched=None\nfor g in groups:\n    i=0\n    while i<len(g):\n        b=os.path.basename(g[i])\n        if ASSIGN.match(g[i]) or b in WRAP:\n            i+=1\n            continue\n        if b=='timeout' and i+1<len(g):\n            i+=2\n            continue\n        break\n    rest=g[i:]\n    if not rest:\n        continue\n    prog=rest[0]\n    base=os.path.basename(prog)\n    if base in ('Boss','engine','boss-engine') or 'Boss.app' in prog:\n        matched=prog\n        break\n    if base=='open':\n        joined=' '.join(rest)\n        if 'Boss.app' in joined or 'dev.spinyfin.bossmacapp' in joined or re.search(r'(^| )-a +Boss( |$)',joined):\n            matched=joined[:120]\n            break\n    if base in ('bazel','bazelisk') and len(rest)>1 and rest[1]=='run':\n        joined=' '.join(rest)\n        if 'tools/boss/app-macos' in joined:\n            matched='bazel run of an app-macos target'\n            break\n        if 'tools/boss/engine' in joined:\n            sp=socket_arg(rest)\n            if sp is None or os.path.normpath(sp)==PROD or 'Library/Application Support/Boss' in sp:\n                matched='bazel run of an engine target without an isolating --socket-path'\n                break\n    if base=='swift' and len(rest)>1 and rest[1]=='run':\n        matched='swift run'\n        break\nif matched:\n    msg=('Blocked: this would start Boss itself (matched: '+matched+'). Workers must not launch the Boss macOS app or an engine that can reach production state on this machine -- the app puts a window on the user screen while they are working, and it terminates the running engine and starts its own in its place. To exercise a real engine, start an isolated one: env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-<id>.sock. Any --socket-path other than /tmp/boss-engine.sock derives its own db, events socket, pid file and control token; unsetting BOSS_EVENTS_SOCKET matters because every worker pane inherits one pointing at production. Building and testing are unaffected (bazel build, bazel test). GUI verification is not something a worker can do -- say so in the PR and leave it to a human.')\n    print(json.dumps({'decision':'block','reason':msg}))\nelse:\n    print(json.dumps({'decision':'approve'}))\n\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"\nimport json,os,sys,re,shlex\ninp=json.load(sys.stdin)\ncmd=inp.get('tool_input',{}).get('command','')\nDELIMS={'&&','||',';','|','&'}\ntry:\n    toks=shlex.split(cmd,posix=True)\nexcept Exception:\n    toks=cmd.split()\ngroups=[]\ncur=[]\nfor t in toks:\n    if t in DELIMS:\n        if cur:\n            groups.append(cur[:])\n        cur=[]\n    else:\n        cur.append(t)\nif cur:\n    groups.append(cur)\nmatched=None\nfor g in groups:\n    i=0\n    while i<len(g) and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=',g[i]):\n        i+=1\n    rest=g[i:]\n    prog=os.path.basename(rest[0]) if rest else ''\n    if len(rest)>=3 and prog=='gh' and rest[1]=='pr' and rest[2]=='create':\n        matched='gh pr create'\n        break\n    if len(rest)>=3 and prog=='jj' and rest[1]=='git' and rest[2]=='push':\n        matched='jj git push'\n        break\n    if len(rest)>=2 and prog=='git' and rest[1]=='push':\n        matched='git push'\n        break\nif matched:\n    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: cube pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or cube pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n    print(json.dumps({'decision':'block','reason':msg}))\nelse:\n    print(json.dumps({'decision':'approve'}))\n\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 '$TMPDIR/boss-worker-settings/boss-checkleft-push-guard.py'"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "BOSS_EVENTS_SOCKET='/Users/brianduff/Library/Application Support/Boss/events.sock' BOSS_LEASE_ID='lease-conformance-golden' BOSS_RUN_ID='run-conformance-golden' BOSS_WORKSPACE='/Users/brianduff/Documents/dev/workspaces/mono-agent-007' '/Users/brianduff/Library/Application Support/Boss/bin/boss-event'"
+          }
+        ]
+      }
+    ]
+  }
+}

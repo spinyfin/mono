@@ -13,6 +13,12 @@ pub struct Finding {
     pub severity: Severity,
     pub message: String,
     pub location: Option<Location>,
+    /// Set only when `location` is absent, naming the non-file surface (PR
+    /// description or commit message) the finding refers to. `#[serde(default)]`
+    /// keeps JSON output backward-compatible with consumers built before this
+    /// field existed.
+    #[serde(default)]
+    pub surface: Option<Surface>,
     #[serde(default)]
     pub remediations: Vec<String>,
     pub suggested_fix: Option<SuggestedFix>,
@@ -48,6 +54,33 @@ pub struct Location {
     pub path: PathBuf,
     pub line: Option<u32>,
     pub column: Option<u32>,
+}
+
+/// Non-file surface a finding refers to when it has no [`Location`] — the PR
+/// description or the commit message. The only two changeset-level text
+/// sources a check can scan (see `ChangeSet::pr_description` /
+/// `commit_description`); do not confuse with the framework's `CheckScope`
+/// (`files` | `changeset`, which surface *is scheduled*) or a check's own
+/// `surfaces` config key (which text *is scanned*) — both are unrelated
+/// scheduling/config concepts, not this rendering identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Surface {
+    PrDescription,
+    CommitMessage,
+}
+
+impl Surface {
+    /// Pseudo-location rendering used wherever a locationless finding's
+    /// surface needs to be shown in place of a file path (the terminal `-->`
+    /// line, the check-run summary). Matches the angle-bracket pseudo-syntax
+    /// convention already established by the `<unknown>` fallback.
+    pub fn render_label(self) -> &'static str {
+        match self {
+            Surface::PrDescription => "<pr description>",
+            Surface::CommitMessage => "<commit message>",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

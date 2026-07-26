@@ -73,9 +73,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Notify;
-
 use async_trait::async_trait;
+use boss_event_bus::Subscription;
 use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_GAVE_UP, AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_SKIPPED,
     AUTOMATION_OUTCOME_SUPPRESSED_AT_LIMIT, Automation, AutomationRun, AutomationTrigger,
@@ -302,8 +301,9 @@ fn is_retryable_hold(run: &AutomationRun) -> bool {
 /// - [`AUTOMATION_SCHEDULER_UNINITIALIZED_POLL_SECS`] when any enabled
 ///   automation still has `next_due_at IS NULL` (bootstrap case: initialise
 ///   the first occurrence promptly).
-/// - Immediate wake via `kick.notify_one()`, called by automation mutation
-///   handlers (create, update, enable, disable, delete) and by the
+/// - Immediate wake via `kick`, a [`boss_event_bus::Subscription`] to
+///   [`boss_event_bus::Event::AutomationMutation`], published by automation
+///   mutation handlers (create, update, enable, disable, delete) and by the
 ///   pause/resume handler so the scheduler recomputes its sleep on every
 ///   state change without waiting out the current interval.
 ///
@@ -324,12 +324,12 @@ fn is_retryable_hold(run: &AutomationRun) -> bool {
 ///
 /// **Resume latency depends on the kick.** Because a paused loop sleeps up to
 /// [`AUTOMATION_SCHEDULER_MAX_SLEEP_SECS`], `handle_set_automation_paused`
-/// must notify `kick` when it clears the flag; without it, resuming would take
-/// up to an hour to take effect.
+/// must publish `AutomationMutation` when it clears the flag; without it,
+/// resuming would take up to an hour to take effect.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     dispatcher: Arc<dyn TriageDispatcher>,
-    kick: Arc<Notify>,
+    mut kick: Subscription,
     is_paused: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -378,7 +378,7 @@ pub fn spawn_loop(
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {}
-                _ = kick.notified() => {}
+                _ = kick.recv() => {}
             }
         }
     })
@@ -1548,11 +1548,13 @@ mod tests {
     /// A paused scheduler now sleeps up to `AUTOMATION_SCHEDULER_MAX_SLEEP_SECS`
     /// (one hour) instead of spinning, which means resume is only prompt if the
     /// pause handler kicks it. `handle_set_automation_paused` does — and if that
-    /// notify is ever dropped, this test hangs on the hour-long sleep until the
+    /// publish is ever dropped, this test hangs on the hour-long sleep until the
     /// timeout fires rather than passing quietly.
     #[tokio::test]
     async fn resume_kick_wakes_a_paused_scheduler_promptly() {
         use std::sync::atomic::{AtomicBool, Ordering};
+
+        use boss_event_bus::{Event, EventBus, TopicFilter};
 
         let (_d, db) = open_db_arc();
         let product = create_product(&db);
@@ -1563,13 +1565,14 @@ mod tests {
         db.initialize_automation_next_due_at(&automation.id, now - 5).unwrap();
 
         let paused = Arc::new(AtomicBool::new(true));
-        let kick = Arc::new(Notify::new());
+        let bus = EventBus::new();
+        let kick = bus.subscribe(TopicFilter::kind(boss_event_bus::EventKind::AutomationMutation));
         let dispatcher = Arc::new(FakeDispatcher::dispatched());
         let paused_for_loop = paused.clone();
         let _handle = spawn_loop(
             db.clone(),
             dispatcher.clone(),
-            kick.clone(),
+            kick,
             Arc::new(move || paused_for_loop.load(Ordering::Acquire)),
         );
 
@@ -1582,9 +1585,9 @@ mod tests {
         );
 
         // Resume, exactly as `handle_set_automation_paused` does: clear the
-        // flag, then kick.
+        // flag, then publish.
         paused.store(false, Ordering::Release);
-        kick.notify_one();
+        bus.publish(Event::AutomationMutation);
 
         // Without the kick this would wait out the full max sleep.
         let fired = tokio::time::timeout(Duration::from_secs(10), async {

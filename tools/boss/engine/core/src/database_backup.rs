@@ -20,7 +20,7 @@
 //!
 //! ## Non-fatal by construction
 //!
-//! Like [`crate::recovery_backup`], every failure mode is logged and
+//! Like [`boss_engine_recovery::recovery_backup`], every failure mode is logged and
 //! swallowed. A backup failure never propagates to the engine's request
 //! path. In-memory databases (used by the test suite) are silently skipped.
 

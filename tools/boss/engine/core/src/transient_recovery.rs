@@ -134,8 +134,10 @@ pub const RECOVERY_GRACE_SECS: i64 = 60;
 
 /// Only the tail of the transcript matters (we want the last entry).
 /// Reading a bounded suffix keeps the sweep cheap even for multi-MB
-/// transcripts.
-const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 256 * 1024;
+/// transcripts. `pub(crate)` so `events_socket`'s hook-ingress publisher
+/// can apply the same bound when checking for a trailing API error at
+/// `Stop`-hook time (see [`crate::events_socket::publish_hook_derived_events`]).
+pub(crate) const TRANSCRIPT_TAIL_MAX_BYTES: u64 = 256 * 1024;
 
 /// Clip error strings to this many bytes before putting them on a
 /// dispatch event or attention item.
@@ -506,15 +508,27 @@ pub async fn run_one_pass(
                 let class_label = class.as_str();
                 // Settle the execution so it isn't re-inspected; ignore a
                 // race where another reconciler already marked it terminal.
-                if let Err(err) = work_db.mark_execution_orphaned(
+                match work_db.mark_execution_orphaned(
                     &execution_id,
                     &format!("transient-recovery escalation ({}): {clipped}", reason.as_str()),
                 ) {
-                    tracing::debug!(
-                        execution_id,
-                        ?err,
-                        "transient-recovery: execution already terminal at escalation (benign)",
-                    );
+                    Ok(orphaned) => {
+                        // Reap termination path: tear down any driver-owned
+                        // state outside the workspace.
+                        crate::driver_teardown::teardown_driver_workspace(
+                            work_db,
+                            &execution_id,
+                            orphaned.workspace_path.as_deref().map(std::path::Path::new),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            execution_id,
+                            ?err,
+                            "transient-recovery: execution already terminal at escalation (benign)",
+                        );
+                    }
                 }
                 let title = match reason {
                     EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
@@ -599,8 +613,11 @@ async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, live_states: &Liv
 /// Read the last `max_bytes` of a transcript file and parse the
 /// complete JSONL lines within. Tolerant: a missing file, an unreadable
 /// file, or malformed lines yield an empty/partial vec rather than an
-/// error — recovery should never crash on a bad transcript.
-async fn read_transcript_tail(path: &str, max_bytes: u64) -> Vec<Value> {
+/// error — recovery should never crash on a bad transcript. `pub(crate)`
+/// so `events_socket`'s hook-ingress publisher can reuse the same
+/// ground-truth read instead of duplicating it (see
+/// [`crate::events_socket::publish_hook_derived_events`]).
+pub(crate) async fn read_transcript_tail(path: &str, max_bytes: u64) -> Vec<Value> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,

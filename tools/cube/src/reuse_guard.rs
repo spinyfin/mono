@@ -90,7 +90,7 @@ pub(crate) fn unpushed_work_revset(main_branch: &str) -> String {
 }
 
 /// Escape a bookmark name for embedding in a jj revset string literal.
-fn escape_revset_string(raw: &str) -> String {
+pub(crate) fn escape_revset_string(raw: &str) -> String {
     raw.replace('\\', "\\\\").replace('"', "\\\"")
 }
 

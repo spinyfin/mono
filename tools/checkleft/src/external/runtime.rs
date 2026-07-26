@@ -15,7 +15,7 @@ use crate::exclusion::{DeclaredExclusion, ExclusionStatus};
 use crate::exclusion_matcher::ExclusionMatcher;
 use crate::fix::{ComponentFixOutcome, CopyBackReport, WritableSandbox};
 use crate::input::{ChangeKind, ChangeSet, ChangedFile, DiffHunk, FileDiff, SourceTree};
-use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix};
+use crate::output::{CheckResult, FileEdit, Finding, Location, Severity, SuggestedFix, Surface};
 use crate::path::validate_relative_path;
 
 use super::component_bindings::Check as WitCheck;
@@ -1489,12 +1489,20 @@ fn lift_suggested_fix(fix: wit_types::SuggestedFix) -> SuggestedFix {
     }
 }
 
+fn lift_surface(s: wit_types::Surface) -> Surface {
+    match s {
+        wit_types::Surface::PrDescription => Surface::PrDescription,
+        wit_types::Surface::CommitMessage => Surface::CommitMessage,
+    }
+}
+
 fn lift_finding(f: wit_types::Finding) -> Finding {
     Finding {
         fixable: false,
         severity: lift_severity(f.severity),
         message: f.message,
         location: f.location.map(lift_location),
+        surface: f.surface.map(lift_surface),
         remediations: f.remediations,
         suggested_fix: f.suggested_fix.map(lift_suggested_fix),
     }

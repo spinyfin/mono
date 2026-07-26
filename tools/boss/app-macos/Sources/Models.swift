@@ -10,7 +10,8 @@ import Foundation
 // repo's file-size check: Models+Automations.swift, Models+Editorial.swift,
 // Models+Products.swift, Models+WorkBoard.swift, Models+Transcript.swift,
 // Models+WorkerActivity.swift, Models+CI.swift, Models+Engine.swift,
-// Models+AttentionItems.swift, Models+GitHubAuth.swift.
+// Models+AttentionItems.swift, Models+GitHubAuth.swift,
+// Models+WorkCardSnapshot.swift.
 // ===========================================================================
 
 struct WorkTask: Identifiable, Hashable {
@@ -74,6 +75,14 @@ struct WorkTask: Identifiable, Hashable {
     /// leaving them in Backlog. Defaults to `false` when absent from the
     /// wire so legacy rows without the field stay in Backlog (unchanged).
     var autostart: Bool = false
+    /// Durable "future scope" classification. When `true`, this item was
+    /// filed as deferred / not-yet-in-scope: the engine still auto-unblocks
+    /// it and keeps it visible/schedulable, but never auto-dispatches it
+    /// until a human explicitly approves it. Distinct from `autostart` (a
+    /// one-shot dispatch-timing pause) and from the transient
+    /// `deferred_scope` attention marker. Rendered as a muted "Future"
+    /// badge on the card. Defaults to `false` when absent from the wire.
+    var deferred: Bool = false
     /// Aggregate required-CI state at last merge-poller probe. One of:
     /// `"in_progress"`, `"success"`, `"fail"`, `"unknown"`. `nil` until the
     /// first probe completes. Only rendered when `status == "in_review"` and
@@ -108,6 +117,16 @@ struct WorkTask: Identifiable, Hashable {
     /// `mergeQueueState` is non-nil. Parsed by `MergeQueueDetail.parse(json:)`
     /// for the Merging section's compact badge and sort order.
     var mergeQueueDetail: String? = nil
+    /// Raw GitHub mergeability at last poll, independent of CI, review, and
+    /// merge-queue state. One of `"mergeable"`, `"conflicting"`, or
+    /// `"unknown"`; `nil` until the first probe completes. This is the only
+    /// field that reflects whether the PR's head actually merges cleanly —
+    /// `mergeQueueState == "auto_merge_enabled"` means GitHub will merge the
+    /// PR *once it becomes mergeable*, not that it is mergeable now, so a
+    /// card can legitimately show both "auto-merge armed" and
+    /// `prMergeableState == "conflicting"` simultaneously (T3271 / mono#2303).
+    /// Mirrors `Task.pr_mergeable_state` on the wire.
+    var prMergeableState: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this
     /// work item. `nil` when no binding exists. Mirrors `Task.external_ref`.
     var externalRef: WorkItemExternalRef? = nil
@@ -130,6 +149,11 @@ struct WorkTask: Identifiable, Hashable {
     /// rows or items where the engine emitted `null`). Mirrors
     /// `Task.effort_level` on the wire; absent means unset, NOT medium.
     var effortLevel: String? = nil
+    /// What kind of thinking this work item needs — `standard` or
+    /// `investigation` — independent of `effortLevel`'s size. Mirrors
+    /// `Task.reasoning` on the wire. `nil` means the row was never classified
+    /// (pre-column rows); it does NOT mean `standard`.
+    var reasoning: String? = nil
     /// Non-null when this task was produced by an automation triage run.
     /// Mirrors `Task.source_automation_id` on the wire. Used to display
     /// the automation-provenance badge on the card and to route execution
@@ -144,6 +168,13 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
+    /// `true` when this is a Review-lane card waiting on the operator and
+    /// nothing else: an open PR with no blocked pill, no `in revision`
+    /// badge, all required CI checks green, and no merge conflict with the
+    /// base branch. Engine-computed (not derived in the view layer) so the
+    /// CLI and any future surface agree with the board. Mirrors
+    /// `Task.ready_for_review` on the wire; `false` when absent.
+    var readyForReview: Bool = false
     /// Resolved doc-link state for a **project-less** docs-backed item —
     /// chiefly `kind == "investigation"`. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns
@@ -193,6 +224,13 @@ struct WorkTask: Identifiable, Hashable {
     /// `dispatchFailedReason`. `nil` whenever that field is `nil`.
     /// Mirrors `Task.dispatch_failed_at` on the wire.
     var dispatchFailedAt: String? = nil
+
+    /// Free-form operator/agent labels on this leaf work item. Empty when
+    /// none are set. Mirrors `Task.tags` on the wire. Owned by the leaf
+    /// card row — revisions do not inherit parent tags. Caps enforced by
+    /// the engine (24 chars / 5 tags); the card truncates display further
+    /// if needed and collapses entirely when empty.
+    var tags: [String] = []
 
     var isChore: Bool {
         kind == "chore" || kind == "followup"
@@ -377,7 +415,7 @@ extension WorkTask {
     /// scheduling reaches them — so they belong visually with active work,
     /// not with unscheduled backlog items. The card renders a distinct
     /// hourglass indicator to distinguish "queued" from "working"; see
-    /// `WorkBoardCardItem.liveStatusForCard` for how the subtitle picks
+    /// `WorkCardLiveStatus.resolve` for how the subtitle picks
     /// apart "not yet scheduled" from "genuinely waiting on pool capacity".
     ///
     /// A row the engine gave up starting (`dispatchFailedReason` set) is

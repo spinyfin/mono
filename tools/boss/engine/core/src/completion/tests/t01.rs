@@ -232,6 +232,137 @@ async fn on_stop_finalizes_triage_skip_when_final_message_lands_after_a_flush_ra
     );
 }
 
+/// Writes a no-marker final message to `execution_id`'s transcript: no
+/// `automation: task`/`automation: skip` marker, and no "nothing to do"
+/// language, so `finalize_automation_triage` lands on
+/// `TriageDecision::NoDecision` with `recover_skip_reason` unable to fire.
+fn write_no_marker_transcript(workspace: &Path, execution_id: &str) -> std::path::PathBuf {
+    let transcript_path = workspace.join(format!("transcript-{execution_id}.jsonl"));
+    let mut content = String::new();
+    content.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": "triage this repo for dead code"}]}
+        })
+    ));
+    content.push_str(&format!(
+        "{}\n",
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Investigated the repo for dead code \
+                candidates and made partial progress; ran out of context before finishing."}]}
+        })
+    ));
+    std::fs::write(&transcript_path, content.as_bytes()).unwrap();
+    transcript_path
+}
+
+#[tokio::test]
+async fn on_stop_excludes_earlier_run_task_and_records_failed_will_retry() {
+    // Pins the behaviour change the `not_before_epoch` bound exists for:
+    // a triage run that emits no marker and creates no task of its own,
+    // for an automation that already has an open task left by an
+    // *earlier* run, must NOT adopt that older task as its own — it must
+    // record `failed_will_retry`, not `produced_task`.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+    let earlier_task = db
+        .create_automation_task(&automation_id, "from an earlier triage run", None, &[], &[])
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET created_at = '100' WHERE id = ?1",
+            rusqlite::params![earlier_task.id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '200' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+    }
+
+    let transcript_path = write_no_marker_transcript(workspace.path(), &execution_id);
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(outcome, AUTOMATION_OUTCOME_FAILED_WILL_RETRY)
+        }
+        other => panic!("expected failed_will_retry, got {other:?}"),
+    }
+
+    let run = db
+        .automation_run_for_triage_execution(&execution_id)
+        .unwrap()
+        .expect("automation run row should exist");
+    assert_eq!(run.outcome, AUTOMATION_OUTCOME_FAILED_WILL_RETRY);
+    assert!(
+        run.produced_task_id.is_none(),
+        "must not adopt the earlier run's task: {:?}",
+        run.produced_task_id
+    );
+}
+
+#[tokio::test]
+async fn on_stop_recovers_task_created_by_this_run_as_produced_task() {
+    // Companion case pinning the other side of the `not_before_epoch`
+    // boundary: a task created no earlier than the execution being
+    // finalized is still recovered as `produced_task` via marker-recovery.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) = automation_triage_fixture(workspace.path());
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET created_at = '100' WHERE id = ?1",
+            rusqlite::params![execution_id],
+        )
+        .unwrap();
+    }
+    let this_run_task = db
+        .create_automation_task(&automation_id, "created by this run", None, &[], &[])
+        .unwrap();
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET created_at = '200' WHERE id = ?1",
+            rusqlite::params![this_run_task.id],
+        )
+        .unwrap();
+    }
+
+    let transcript_path = write_no_marker_transcript(workspace.path(), &execution_id);
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(outcome, AUTOMATION_OUTCOME_PRODUCED_TASK)
+        }
+        other => panic!("expected produced_task, got {other:?}"),
+    }
+
+    let run = db
+        .automation_run_for_triage_execution(&execution_id)
+        .unwrap()
+        .expect("automation run row should exist");
+    assert_eq!(run.outcome, AUTOMATION_OUTCOME_PRODUCED_TASK);
+    assert_eq!(run.produced_task_id.as_deref(), Some(this_run_task.id.as_str()));
+}
+
 #[tokio::test]
 async fn on_stop_finalizes_answer_agent_with_no_reply_as_failed_and_answered() {
     // Regression test for the "stranded running run" edge case: the
@@ -394,6 +525,135 @@ async fn pr_detected_moves_work_item_to_in_review_and_releases_lease() {
         probes.snapshot().is_empty(),
         "fresh-PR completion must NOT queue a probe — the worker is done",
     );
+}
+
+/// File-based StructuredOutput contract: a worker that wrote its PR URL to the
+/// engine-owned artifact is finalised from that file alone — no hook-stream
+/// capture, no cold-path detector. This is the driver-agnostic primary
+/// channel; a backend with no `PostToolUse` hooks reaches `in_review` on it.
+#[tokio::test]
+async fn on_stop_uses_pr_url_artifact_when_the_hook_stream_captured_nothing() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    // A wrong detector URL makes any fall-through to the cold path visible.
+    let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+
+    let out_dir = tempdir().unwrap();
+    std::fs::write(
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &execution_id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ),
+        r#"{"pr_url": "https://github.com/spinyfin/mono/pull/458"}"#,
+    )
+    .unwrap();
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler
+        .with_structured_output_dir(out_dir.path().to_path_buf())
+        .with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+            &execution_id,
+            &BranchNaming::BossExecPrefix,
+            None,
+        )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+        "expected ReviewerEnqueued with the artifact's URL, got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "the artifact must short-circuit the cold-path detector, exactly as a staged hook URL does",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(
+            t.pr_url.as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+            "the chore must bind to the artifact's URL, not the detector's",
+        ),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// A PR URL in the artifact that belongs to a different repository is dropped
+/// by the same product-repo gate the hook-capture path applies — the file
+/// channel is primary, not privileged.
+#[tokio::test]
+async fn pr_url_artifact_for_a_foreign_repo_is_rejected() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(None);
+
+    let out_dir = tempdir().unwrap();
+    std::fs::write(
+        crate::structured_output::path_for(
+            out_dir.path(),
+            &execution_id,
+            crate::structured_output::StructuredOutputKind::PrUrl,
+        ),
+        r#"{"pr_url": "https://github.com/someone/else/pull/1"}"#,
+    )
+    .unwrap();
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_structured_output_dir(out_dir.path().to_path_buf());
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a foreign-repo URL must never bind the work item; got {outcome:?}",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), None, "no PR URL may be stamped"),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}
+
+/// Fallback tier: no artifact and no hook capture, but the worker followed the
+/// Claude driver's "print the PR URL on its own line" convention. The driver's
+/// producer recovers it, and the engine finalises without the cold-path
+/// reconstruction.
+#[tokio::test]
+async fn on_stop_recovers_pr_url_from_the_driver_final_message_producer() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    let detector = StubPrDetector::ok(Some("https://github.com/should/not/pull/999"));
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done. Tests pass.\n\nhttps://github.com/spinyfin/mono/pull/458",
+    );
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let handler = handler.with_branch_verifier(StubBranchVerifier::ok(&expected_branch_name(
+        &execution_id,
+        &BranchNaming::BossExecPrefix,
+        None,
+    )));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/458"),
+        "expected ReviewerEnqueued with the URL from the final message, got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        0,
+        "the driver's producer must be consulted before the cold-path detector",
+    );
+    let item = db.get_work_item(&chore_id).unwrap();
+    match item {
+        WorkItem::Chore(t) => assert_eq!(t.pr_url.as_deref(), Some("https://github.com/spinyfin/mono/pull/458"),),
+        other => panic!("expected chore, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1124,6 +1384,24 @@ async fn force_release_releases_pane_and_cube_lease_then_idempotent() {
         cube.release_calls.lock().await.len(),
         1,
         "cube release must fire only once across duplicate force_release calls",
+    );
+}
+
+/// Asserts that `force_release` invokes driver teardown exactly once.
+#[tokio::test]
+async fn force_release_tears_down_driver_workspace() {
+    crate::driver_teardown::test_hooks::reset();
+
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _, _, execution_id) = fixture(workspace.path());
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), StubPrDetector::ok(None));
+
+    handler.force_release(&execution_id).await;
+
+    assert_eq!(
+        crate::driver_teardown::test_hooks::count(),
+        1,
+        "force_release must invoke driver teardown exactly once",
     );
 }
 
@@ -2001,8 +2279,15 @@ async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
     }
     let probe = NoOpProbe;
 
-    let outcome =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(handler.as_ref())).await;
+    let outcome = crate::merge_poller::run_one_pass(
+        db.as_ref(),
+        &probe,
+        publisher.as_ref(),
+        None,
+        Some(handler.as_ref()),
+        None,
+    )
+    .await;
 
     assert_eq!(
         outcome.pr_recheck_recovered, 1,

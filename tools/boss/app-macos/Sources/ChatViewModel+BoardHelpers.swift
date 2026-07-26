@@ -120,6 +120,20 @@ extension ChatViewModel {
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }
 
+    /// True when an incremental task update must drop the revision rollup
+    /// caches (`cachedInReviewRevisionsByParentID` /
+    /// `cachedDoneRevisionsByParentID`). Rollups store full `WorkTask`
+    /// snapshots, so any field change on a revision row (name, PR URL,
+    /// status, parent, seq, …) — or a kind flip into/out of revision —
+    /// must invalidate them. Non-revision same-bucket edits leave the
+    /// caches intact. Used by keyed invalidation in
+    /// `applyIncrementalTaskUpdate` (design entry 8).
+    func taskUpdateAffectsRevisionCache(previous: WorkTask?, updated: WorkTask) -> Bool {
+        let wasRevision = previous?.kind == "revision"
+        let isRevision = updated.kind == "revision"
+        return wasRevision || isRevision
+    }
+
     /// Groups every project- and product-level revision task by parent id
     /// for the two statuses the kanban card footer actually renders
     /// (`in_review`, `done`), in one O(total revisions) pass. Populates
@@ -365,5 +379,132 @@ extension ChatViewModel {
         ciRemediations.first {
             $0.workItemID == taskID && ($0.status == "pending" || $0.status == "running")
         }
+    }
+
+    // MARK: - Work card snapshot (observation-detach / design entry 6)
+
+    /// Build the equatable [[WorkCardSnapshot]] for a board card.
+    ///
+    /// Called by the column container so per-card views no longer observe
+    /// `ChatViewModel` / `LiveWorkerStateStore` — they receive this value
+    /// and re-render only when their own inputs change (via
+    /// `WorkBoardCardView.equatable()`).
+    ///
+    /// `liveState` is resolved by the container from `LiveWorkerStateStore`
+    /// (Doing column only). `now` is injectable for tests of time-relative
+    /// live-status phrasing.
+    func workCardSnapshot(
+        for task: WorkTask,
+        column: WorkBoardColumnKey,
+        isSelected: Bool,
+        isFrontierHighlighted: Bool,
+        boardStyle: KanbanBoardStyle,
+        liveState: WorkerLiveState?,
+        now: Date = Date()
+    ) -> WorkCardSnapshot {
+        let runtime = column == .doing ? taskRuntime(for: task.id) : nil
+        let liveStatus = WorkCardLiveStatus.resolve(
+            task: task,
+            column: column,
+            runtime: runtime,
+            liveState: liveState,
+            now: now
+        )
+
+        let cachedGating = gatingPrereqsByTaskID[task.id] ?? []
+        let blockedBy: String? = {
+            if task.status == "blocked" {
+                let names = cachedGating.filter { $0.kind != .unknown }.map(\.title)
+                return names.isEmpty ? nil : names.joined(separator: ", ")
+            }
+            if task.blockedReason == "dependency" {
+                let rows = dependencyPrereqsByTaskID[task.id] ?? []
+                guard !rows.isEmpty else { return nil }
+                return rows.map(\.title).joined(separator: ", ")
+            }
+            return nil
+        }()
+        let isAutoBlocked = task.status == "blocked"
+            && task.lastStatusActor == "engine"
+            && !cachedGating.isEmpty
+
+        let designDocProject: WorkProject? = (task.kind == "design" || task.kind == "design_postmortem")
+            ? task.projectID.flatMap { project(withID: $0) }
+            : nil
+        // Design and design-postmortem cards resolve their doc-link state
+        // from the parent PROJECT; project-less docs-backed items
+        // (investigations) carry an engine-resolved state on the task itself
+        // (`docLinkState`). Prefer the project state when present, else fall
+        // back to the per-task state so investigation cards render the same
+        // Review-lane doc-link icon.
+        let designDocState: ProjectDesignDocState? = designDocProject
+            .map { designDocStateByProjectID[$0.id] ?? .notSet }
+            ?? task.docLinkState
+
+        // Roll-up rows must render wherever the parent's OWN card lands, not
+        // just in Review/Done. A revision that reaches in_review/done never
+        // gets a standalone card (see `workItems(in:)`'s rollup filter), so
+        // gating this on `column` left revisions with no visual
+        // representation at all whenever the parent's card landed somewhere
+        // else — e.g. a parent blocked for a non-review reason renders in
+        // Backlog (`reveal_work_item` had nothing to point at).
+        let inReviewRevisions: [WorkCardRevisionRollup] = (
+            inReviewRevisions(forParentTaskID: task.id) + doneRevisions(forParentTaskID: task.id)
+        )
+        .sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+        .map(WorkCardRevisionRollup.init(revision:))
+
+        let parentShortID: Int? = task.kind == "revision"
+            ? task.parentTaskId.flatMap { workTask(withID: $0)?.shortID }
+            : nil
+
+        let showsTerminalButton: Bool = {
+            if (column == .review || column == .done),
+               let prURL = task.prURL, !prURL.isEmpty {
+                return true
+            }
+            return liveState != nil
+        }()
+        let showsMergeWhenReady = column == .review
+            && task.status == "in_review"
+            && task.prURL.map { !$0.isEmpty } == true
+            && task.mergeQueueState == nil
+        let terminalTooltip = (column == .review || column == .done)
+            ? "Open terminal on PR branch"
+            : "Open terminal in workspace"
+        let deferredScopeItems = column == .review
+            ? deferredScopeAttentions(forWorkItemID: task.id)
+            : []
+
+        return WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: column,
+                projectName: cardProjectBadge(for: task),
+                isSelected: isSelected,
+                runtime: runtime,
+                liveState: liveState,
+                liveStatus: liveStatus,
+                blockedBy: blockedBy,
+                isAutoBlocked: isAutoBlocked,
+                gatingPrereqs: cachedGating,
+                repoChip: repoChip(for: task),
+                showsConflictClearedBadge: showsConflictClearedBadge(forPR: task.prURL),
+                showsCIAutoFixedBadge: showsCIAutoFixedBadge(forPR: task.prURL),
+                ciFailureBadge: ciFailureBadge(forPR: task.prURL),
+                isFrontierHighlighted: isFrontierHighlighted,
+                designDocState: designDocState,
+                externalRefLink: ExternalRefLinkPresentation.forTask(task),
+                ambiguousRepoNames: ambiguousVisibleRepoNames,
+                inReviewRevisions: inReviewRevisions,
+                parentShortID: parentShortID,
+                deferredScopeItems: deferredScopeItems,
+                deferredScopeActionInFlightIDs: deferredScopeActionInFlightIDs,
+                showsTerminalButton: showsTerminalButton,
+                terminalTooltip: terminalTooltip,
+                showsMergeWhenReady: showsMergeWhenReady,
+                boardStyle: boardStyle
+            )
+        )
     }
 }

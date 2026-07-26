@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::automation_triage::{TriageContext, parse_triage_decision, render_triage_preamble};
+use crate::automation_triage::{TriageContext, render_triage_preamble, resolve_triage_decision};
+
+/// Stand-in for the engine-owned decision artifact path in preamble tests.
+const ARTIFACT_PATH: &str = "/tmp/boss-worker-output/exec_1.triage.json";
 
 // ── layer-0 context injection: cross-automation open/merged task queries ──
 
@@ -136,7 +139,7 @@ fn preamble_surfaces_seeded_open_task_and_skip_marker_round_trips() {
     let merged_tasks = Vec::new();
     let context = TriageContext::from_rows(open_tasks, merged_tasks);
 
-    let preamble = render_triage_preamble(&auto_b, "Layer0 Preamble Co", &[], &context);
+    let preamble = render_triage_preamble(&auto_b, "Layer0 Preamble Co", &[], &context, ARTIFACT_PATH);
 
     let expected_ref = format!("T{}", open_task.short_id.expect("task should carry a short_id"));
     assert!(
@@ -159,7 +162,13 @@ fn preamble_surfaces_seeded_open_task_and_skip_marker_round_trips() {
     // The agent following that instruction emits this marker; it must parse
     // back as a Skip decision whose reason cites the duplicate ref.
     let agent_message = format!("Nothing new here.\n\nautomation: skip — duplicate of {expected_ref}");
-    let decision = parse_triage_decision(&agent_message);
+    let decision = resolve_triage_decision(
+        &crate::driver::ClaudeDriver,
+        // No artifact on disk: this exercises the driver's marker fallback.
+        std::path::Path::new("/nonexistent-boss-structured-output"),
+        "exec_absent",
+        Some(&agent_message),
+    );
     assert_eq!(
         decision,
         crate::automation_triage::TriageDecision::Skip(format!("duplicate of {expected_ref}"))
@@ -181,7 +190,7 @@ fn preamble_omits_context_block_when_nothing_in_flight() {
         .created_at("2026-01-01")
         .updated_at("2026-01-01")
         .build();
-    let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default());
+    let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
     assert!(
         !preamble.contains("Recently filed / in-flight automation work"),
         "empty context must not render the block"

@@ -74,6 +74,7 @@ impl ConfiguredCheck for WorkflowShellStrictCheck {
                             line: None,
                             column: None,
                         }),
+                        surface: None,
                         remediations: vec![
                             "Add `set -euo pipefail` as the first non-comment line in each `run:` script block."
                                 .to_owned(),

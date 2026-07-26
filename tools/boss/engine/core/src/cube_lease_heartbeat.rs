@@ -228,9 +228,13 @@ pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 pub const LEASE_TTL_SECS: u64 = 1800;
 
 /// Per-call timeout for a single `cube workspace heartbeat` subprocess
-/// invocation. Mirrors [`crate::coordinator::CUBE_LEASE_TIMEOUT`]: the
-/// same cube-hang failure mode that prompted timeouts on lease/repo-ensure
-/// calls applies here. Without a bound, one hung heartbeat call would
+/// invocation. Addresses the same cube-hang failure mode that prompted
+/// timeouts on lease/repo-ensure calls, but deliberately no longer tracks
+/// [`crate::coordinator::CUBE_LEASE_TIMEOUT`]: `cube workspace heartbeat`
+/// is a single indexed UPDATE against the local SQLite registry, with no
+/// filesystem probing, `jj` subprocess, or network in its path, so it has
+/// none of the tail that made the lease bound worth relaxing.
+/// Without a bound, one hung heartbeat call would
 /// stall the entire pass and leave every other live worker un-heartbeated
 /// until the subprocess eventually returned (or never did).
 pub const HEARTBEAT_CUBE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -768,6 +772,17 @@ async fn auto_reap_dead_lease(
         return false;
     }
     ctx.breaker.forget(&execution.id);
+
+    // Reap termination path (cube-lease heartbeat auto-reap): tear down
+    // any driver-owned state outside the workspace.
+    // `mark_execution_orphaned` preserves `workspace_path`, so the
+    // pre-call `execution` snapshot is still current.
+    crate::driver_teardown::teardown_driver_workspace(
+        ctx.work_db,
+        &execution.id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
 
     if execution.kind == ExecutionKind::AutomationTriage {
         crate::execution_liveness::finalize_dead_automation_triage_run(

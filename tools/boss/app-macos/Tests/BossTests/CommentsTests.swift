@@ -248,8 +248,8 @@ final class CommentLayerTests: XCTestCase {
     func testSetIntentUpdatesCommentAndMarksOverridden() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.directive, for: layer.comments[0])
-        XCTAssertEqual(layer.comments[0].intent, .directive)
+        layer.setIntent(.revision, for: layer.comments[0])
+        XCTAssertEqual(layer.comments[0].intent, .revision)
         XCTAssertTrue(layer.comments[0].intentOverriddenByUser)
     }
 
@@ -257,7 +257,7 @@ final class CommentLayerTests: XCTestCase {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
         let stray = Comment(id: "stray", anchor: CommentAnchor(exact: "x"), body: "y", author: "user:me", createdAt: Date())
-        layer.setIntent(.directive, for: stray)
+        layer.setIntent(.revision, for: stray)
         XCTAssertNil(layer.comments[0].intent)
     }
 
@@ -268,11 +268,11 @@ final class CommentLayerTests: XCTestCase {
         let backend = FakeCommentBackend()
         layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
         layer.applyList([Self.wireComment(id: "cmt_1", exact: "alpha", body: "one")])
-        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.revision, for: layer.comments[0])
 
         XCTAssertEqual(backend.setIntentCalls.count, 1)
         XCTAssertEqual(backend.setIntentCalls[0].commentId, "cmt_1")
-        XCTAssertEqual(backend.setIntentCalls[0].intent, "directive")
+        XCTAssertEqual(backend.setIntentCalls[0].intent, "revision")
         // No local mutation — the layer waits for the `comment_result` echo's reload.
         XCTAssertNil(layer.comments[0].intent)
         XCTAssertFalse(layer.comments[0].intentOverriddenByUser)
@@ -280,10 +280,10 @@ final class CommentLayerTests: XCTestCase {
 
     // MARK: - `[Revise]` banner + chips (artifact-less fallback, unchanged behaviour)
 
-    func testDirectiveClassificationPostsNudgeAndMakesBannerRevisable() {
+    func testRevisionClassificationPostsNudgeAndMakesBannerRevisable() {
         let layer = CommentLayer()
         layer.addComment(quoted: "some text", body: "a note")
-        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.revision, for: layer.comments[0])
         XCTAssertTrue(layer.bannerState.revisable)
         XCTAssertEqual(layer.comments[0].threadEntries.count, 1)
         XCTAssertEqual(layer.comments[0].threadEntries[0].entryKind, .nudge)
@@ -293,7 +293,7 @@ final class CommentLayerTests: XCTestCase {
     func testReviseDocTransitionsMatchingCommentsToInRevision() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
-        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.revision, for: layer.comments[0])
         layer.reviseDoc()
         XCTAssertEqual(layer.comments[0].status, .inRevision)
         XCTAssertNotNil(layer.comments[0].reviseTaskId)
@@ -302,7 +302,7 @@ final class CommentLayerTests: XCTestCase {
     func testReviseDocWithNoUnresolvedCommentsIsNoOp() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
-        // No comment has been classified directive/larger_change, so there is
+        // No comment has been classified `revision`, so there is
         // nothing to batch.
         layer.reviseDoc()
         XCTAssertEqual(layer.comments[0].status, .active)
@@ -351,7 +351,7 @@ final class CommentLayerTests: XCTestCase {
         XCTAssertNil(layer.reviseDocMessage)
     }
 
-    /// A batch that drops comments the sidebar still badges `Larger Change`
+    /// A batch that drops comments the sidebar still badges `Revision`
     /// must say so — the badge renders `intent` alone, so a silent success
     /// toast is indistinguishable from "everything was addressed".
     func testApplyReviseDocOutcomeCreatedReportsExcludedComments() {
@@ -422,7 +422,7 @@ final class CommentLayerTests: XCTestCase {
     func testSetIntentToQuestionLeavesAClaimedCommentInRevision() {
         let layer = CommentLayer()
         layer.addComment(quoted: "a", body: "first")
-        layer.setIntent(.directive, for: layer.comments[0])
+        layer.setIntent(.revision, for: layer.comments[0])
         layer.reviseDoc()
         XCTAssertEqual(layer.comments[0].status, .inRevision)
 
@@ -530,12 +530,12 @@ final class CommentLayerTests: XCTestCase {
         let backend = FakeCommentBackend()
         layer.configure(source: "x", baseURL: nil, artifact: .workItem(id: "t"), backend: backend)
         layer.applyList([
-            Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "active", intent: "directive"),
+            Self.wireComment(id: "cmt_1", exact: "alpha", body: "one", status: "active", intent: "revision"),
             Self.wireComment(id: "cmt_2", exact: "beta", body: "two", status: "answering"),
         ])
         XCTAssertEqual(layer.comments.count, 2)
         XCTAssertEqual(layer.comments[0].id, "cmt_1")
-        XCTAssertEqual(layer.comments[0].intent, .directive)
+        XCTAssertEqual(layer.comments[0].intent, .revision)
         XCTAssertEqual(layer.comments[1].status, .answering)
     }
 

@@ -176,6 +176,17 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // rather than silently dropping the level.
         Some(s) => Some(parse_text_column::<EffortLevel>(19, s)?),
     };
+    let reasoning_raw: Option<String> = row.get(33)?;
+    let reasoning = match reasoning_raw.as_deref() {
+        // NULL / '' is the "never classified" state, not corruption: the
+        // dispatcher resolves those rows through its legacy kind-floor /
+        // effort-table path. See `boss_engine_effort::resolve_spawn_config`.
+        None | Some("") => None,
+        // Constrained in code, not by SQL — an out-of-set value is engine-side
+        // corruption, so surface it rather than silently downgrading the row
+        // to the legacy path (which would quietly change its model).
+        Some(s) => Some(parse_text_column::<ReasoningMode>(33, s)?),
+    };
     let kind_raw: String = row.get(3)?;
     let kind = parse_text_column::<TaskKind>(3, &kind_raw)?;
     let status_raw: String = row.get(6)?;
@@ -199,16 +210,17 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         created_via: row.get(15)?,
         blocked_reason: row.get(16)?,
         blocked_attempt_id: row.get(17)?,
-        // Not part of the base 32-column SELECT; populated only by the
+        // Not part of the base 33-column SELECT; populated only by the
         // extended mappers below (mirrors archived_reason/dispatch_failed_*).
         blocked_detail: None,
-        // Not part of the base 32-column SELECT; populated only by
+        // Not part of the base 33-column SELECT; populated only by
         // map_task_with_parent_provenance_and_archived_reason when the
         // caller's query appends the trailing `archived_reason` column.
         archived_reason: None,
         repo_remote_url: row.get(18)?,
         effort_level,
         model_override: row.get::<_, Option<String>>(20)?.filter(|s| !s.is_empty()),
+        reasoning,
         ci_attempt_budget: row.get(21)?,
         ci_attempts_used: row.get(22)?,
         short_id: row.get(23)?,
@@ -227,13 +239,14 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         merge_queue_state: row.get::<_, Option<String>>(29)?.filter(|s| !s.is_empty()),
         merge_queue_detail: row.get::<_, Option<String>>(30)?.filter(|s| !s.is_empty()),
         driver: row.get::<_, Option<String>>(31)?.filter(|s| !s.is_empty()),
+        pr_mergeable_state: row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty()),
         // Standard queries omit the external_ref columns; the T8 methods
-        // use map_task_with_external_ref which adds columns 32-36.
+        // use map_task_with_external_ref which adds columns 33-37.
         // T1 schema columns; populated by T8 WorkDb methods when the migration
         // has run. Until then the protocol field carries None.
         external_ref: None,
         parent_task_id: None,
-        // completed_at is not in the base 32-column SELECT; extended
+        // completed_at is not in the base 33-column SELECT; extended
         // mappers (map_task_with_parent_and_provenance and
         // map_task_with_external_ref_parent_source_and_provenance) read it
         // from the appended column in their respective SELECTs.
@@ -256,6 +269,10 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // in single-item query paths (get_work_item etc.) where the derived
         // projection is not computed.
         ai_reviewing: false,
+        // Computed by attach_ready_for_review_flag in get_work_tree; always
+        // false in single-item query paths where the derived projection is
+        // not computed.
+        ready_for_review: false,
         // Resolved per-task doc-link state for project-less docs-backed
         // items (investigations). Computed by attach_task_doc_links in
         // get_work_tree from the task's `doc_*` columns; None everywhere
@@ -274,55 +291,90 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         dispatch_failed_reason: None,
         dispatch_failed_error: None,
         dispatch_failed_at: None,
+        // Deferred (future-scope) classification. Like blocked_detail, this
+        // is a trailing column absent from the base SELECT: `false` here,
+        // populated only by the wide mappers whose SELECT appends the
+        // `deferred` column (single-item show + get_work_tree). Gating never
+        // reads it off the mapped struct — `work_item_is_deferred` does a
+        // targeted read — so a `false` here is display-only, never a
+        // dispatch decision.
+        deferred: false,
+        // Free-form kanban tags. Trailing column on the wide SELECTs only
+        // (`query_task`, `get_work_tree`, short-id lookup); empty here for
+        // base-SELECT paths that do not need tags.
+        tags: Vec::new(),
     })
 }
 
+/// Decode the JSON array stored in `tasks.tags`. Empty/NULL/`[]` → empty
+/// vec. Corrupt JSON is treated as a row-level conversion error rather
+/// than silently dropped, matching other JSON text columns.
+pub(crate) fn decode_task_tags(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if raw == "[]" {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into()))
+}
+
+/// Encode tags for storage in `tasks.tags`. Always a JSON array (never
+/// NULL) so the column's NOT NULL DEFAULT stays honest.
+pub(crate) fn encode_task_tags(tags: &[String]) -> String {
+    serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_owned())
+}
+
 /// Like [`map_task`] but reads a trailing `source_automation_id` column
-/// at index 32 (after the `driver` column at 31). Used by
+/// at index 34 (after the `reasoning` column at 33). Used by
 /// `list_tasks_for_automation` so produced tasks carry their provenance
 /// on the wire.
 pub(crate) fn map_task_with_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    task.source_automation_id = row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty());
+    task.source_automation_id = row.get::<_, Option<String>>(34)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task`] but also reads a trailing `parent_task_id` column
-/// (index 32, i.e. appended right after `driver` at 31). Used by
+/// (index 34, i.e. appended right after `reasoning` at 33). Used by
 /// `query_task` / `get_work_item_by_short_id`; the wider
 /// [`map_task_with_external_ref_and_parent`] reads `parent_task_id` from
-/// index 37 instead (after the external-ref columns at 32-36).
+/// index 39 instead (after the external-ref columns at 34-38).
 pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    task.parent_task_id = row.get::<_, Option<String>>(32)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(34)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_parent`] but also reads `origin_task_short_id`
-/// (index 33), `origin_pr_number` (index 34), and `completed_at`
-/// (index 35). Used by `query_task`, `get_work_item_by_short_id`, and
+/// (index 35), `origin_pr_number` (index 36), and `completed_at`
+/// (index 37). Used by `query_task`, `get_work_item_by_short_id`, and
 /// `list_chores` when those columns are appended to the standard SELECT.
 pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent(row)?;
-    task.origin_task_short_id = row.get(33)?;
-    task.origin_pr_number = row.get(34)?;
-    task.completed_at = row.get::<_, Option<String>>(35)?.filter(|s| !s.is_empty());
+    task.origin_task_short_id = row.get(35)?;
+    task.origin_pr_number = row.get(36)?;
+    task.completed_at = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
-/// `archived_reason` column (index 36), `dispatch_failed_*` (37-39), and
-/// `blocked_detail` (40). Used by `query_task` and
-/// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
-/// `get_work_item`) surface why the engine auto-archived a row and the
-/// verbatim blocked-status detail.
+/// `archived_reason` column (index 38), `dispatch_failed_*` (39-41),
+/// `blocked_detail` (42), `deferred` (43), and `tags` (44). Used by
+/// `query_task` and `get_work_item_by_short_id` so single-item lookups
+/// (`boss task show`, `get_work_item`) surface why the engine auto-archived
+/// a row, the verbatim blocked-status detail, the future-scope
+/// classification, and free-form kanban tags.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
-    task.archived_reason = row.get::<_, Option<String>>(36)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_reason = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_error = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_at = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
-    task.blocked_detail = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
+    task.archived_reason = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
+    task.blocked_detail = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
+    task.deferred = row.get::<_, i64>(43)? != 0;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(44)?)?;
     Ok(task)
 }
 
@@ -340,16 +392,17 @@ pub(crate) fn derive_external_ref_web_url(kind: &str, canonical_id: &str) -> Str
     String::new()
 }
 
-/// Like [`map_task`] but reads columns 32–36 carrying the external-ref
+/// Like [`map_task`] but reads columns 34-38 carrying the external-ref
 /// data and populates `Task.external_ref`. Used whenever the SELECT
 /// explicitly includes those columns (e.g. `get_work_tree`, `find_by_external_ref`).
-/// (Column 31 is `driver`, part of the base SELECT.)
+/// (Columns 32 and 33 are `pr_mergeable_state` and `reasoning`, both part of
+/// the base SELECT.)
 pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task(row)?;
-    let kind: Option<String> = row.get(32)?;
-    let canonical_id: Option<String> = row.get(33)?;
+    let kind: Option<String> = row.get(34)?;
+    let canonical_id: Option<String> = row.get(35)?;
     if let (Some(kind), Some(canonical_id)) = (kind, canonical_id) {
-        let raw_json: Option<String> = row.get(34)?;
+        let raw_json: Option<String> = row.get(36)?;
         let raw: serde_json::Value = deserialize_json_or_default(raw_json.as_deref());
         let web_url = derive_external_ref_web_url(&kind, &canonical_id);
         task.external_ref = Some(WorkItemExternalRef {
@@ -357,48 +410,50 @@ pub(crate) fn map_task_with_external_ref(row: &Row<'_>) -> rusqlite::Result<Task
             canonical_id,
             raw,
             web_url,
-            synced_at: row.get(35)?,
-            unbound_at: row.get(36)?,
+            synced_at: row.get(37)?,
+            unbound_at: row.get(38)?,
         });
     }
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref`] but also reads column 37 carrying
+/// Like [`map_task_with_external_ref`] but also reads column 39 carrying
 /// `parent_task_id`. Used in `get_work_tree` where the SELECT explicitly
-/// includes the external-ref columns (32–36) followed by `parent_task_id`.
+/// includes the external-ref columns (34-38) followed by `parent_task_id`.
 pub(crate) fn map_task_with_external_ref_and_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref(row)?;
-    task.parent_task_id = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    task.parent_task_id = row.get::<_, Option<String>>(39)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
-/// Like [`map_task_with_external_ref_and_parent`] but also reads column 38
+/// Like [`map_task_with_external_ref_and_parent`] but also reads column 40
 /// carrying `source_automation_id`. Used in `get_work_tree` so automation-
 /// produced tasks carry their provenance to the client (icon display + kanban
 /// filtering both key off this field).
 pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_and_parent(row)?;
-    task.source_automation_id = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
+    task.source_automation_id = row.get::<_, Option<String>>(40)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
 /// Like [`map_task_with_external_ref_parent_and_source_automation_id`] but
-/// also reads `origin_task_short_id` (index 39), `origin_pr_number`
-/// (index 40), `completed_at` (index 41), the trailing
+/// also reads `origin_task_short_id` (index 41), `origin_pr_number`
+/// (index 42), `completed_at` (index 43), the trailing
 /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
-/// columns (indices 42-44), and `blocked_detail` (index 45). Used by
-/// `get_work_tree` for both task and chore queries, which append these
-/// columns at the end.
+/// columns (indices 44-46), `blocked_detail` (index 47), `deferred`
+/// (index 48), and `tags` (index 49). Used by `get_work_tree` for both
+/// task and chore queries, which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
-    task.origin_task_short_id = row.get(39)?;
-    task.origin_pr_number = row.get(40)?;
-    task.completed_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_reason = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_error = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
-    task.dispatch_failed_at = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
-    task.blocked_detail = row.get::<_, Option<String>>(45)?.filter(|s| !s.is_empty());
+    task.origin_task_short_id = row.get(41)?;
+    task.origin_pr_number = row.get(42)?;
+    task.completed_at = row.get::<_, Option<String>>(43)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_reason = row.get::<_, Option<String>>(44)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_error = row.get::<_, Option<String>>(45)?.filter(|s| !s.is_empty());
+    task.dispatch_failed_at = row.get::<_, Option<String>>(46)?.filter(|s| !s.is_empty());
+    task.blocked_detail = row.get::<_, Option<String>>(47)?.filter(|s| !s.is_empty());
+    task.deferred = row.get::<_, i64>(48)? != 0;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(49)?)?;
     Ok(task)
 }
 
@@ -434,6 +489,9 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         branch_naming,
         dispatch_wait_reason: row.get(23)?,
         dispatch_wait_since: row.get(24)?,
+        driver_runtime_state: row
+            .get::<_, Option<String>>(25)?
+            .and_then(|raw| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&raw).ok()),
     })
 }
 
@@ -887,4 +945,103 @@ pub(crate) fn map_automation_run(row: &Row<'_>) -> rusqlite::Result<boss_protoco
         first_attempted_at: row.get::<_, Option<String>>(9)?.filter(|s| !s.is_empty()),
         repeat_count: 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A minimal local `FromStr` type used to drive both the Ok and Err
+    // paths of `parse_text_column` without depending on any production
+    // enum's parse rules. It accepts `"tag:<x>"` and rejects everything
+    // else, so a single helper exercises both branches deterministically.
+    #[derive(Debug, PartialEq)]
+    struct Tag(String);
+
+    #[derive(Debug)]
+    struct TagParseError(String);
+
+    impl std::fmt::Display for TagParseError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "not a tag: {}", self.0)
+        }
+    }
+
+    impl std::error::Error for TagParseError {}
+
+    impl std::str::FromStr for Tag {
+        type Err = TagParseError;
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s.strip_prefix("tag:") {
+                Some(rest) if !rest.is_empty() => Ok(Tag(rest.to_owned())),
+                _ => Err(TagParseError(s.to_owned())),
+            }
+        }
+    }
+
+    #[test]
+    fn deserialize_json_or_default_returns_default_on_null() {
+        // NULL column (None) yields T::default().
+        let v: Vec<String> = deserialize_json_or_default(None);
+        assert_eq!(v, Vec::<String>::new());
+    }
+
+    #[test]
+    fn deserialize_json_or_default_returns_default_on_malformed_json() {
+        // Undeserializable text falls back to T::default() rather than
+        // surfacing a parse error.
+        let v: Vec<String> = deserialize_json_or_default(Some("{ not valid json"));
+        assert_eq!(v, Vec::<String>::new());
+
+        // Well-formed JSON of the wrong shape (an object where a list is
+        // expected) also falls through to the default.
+        let v: Vec<String> = deserialize_json_or_default(Some(r#"{"a":1}"#));
+        assert_eq!(v, Vec::<String>::new());
+    }
+
+    #[test]
+    fn deserialize_json_or_default_parses_valid_json() {
+        let v: Vec<String> = deserialize_json_or_default(Some(r#"["a","b"]"#));
+        assert_eq!(v, vec!["a".to_owned(), "b".to_owned()]);
+    }
+
+    #[test]
+    fn deserialize_json_or_default_value_null_on_missing_or_invalid() {
+        // The doc comment pins that `serde_json::Value::default()` is
+        // `Value::Null`, so a `Value` call site degrades NULL / invalid
+        // input to `Value::Null` (the behavior the old
+        // `unwrap_or(Value::Null)` sites relied on).
+        let null_from_none: serde_json::Value = deserialize_json_or_default(None);
+        assert_eq!(null_from_none, serde_json::Value::Null);
+
+        let null_from_invalid: serde_json::Value = deserialize_json_or_default(Some("{ not json"));
+        assert_eq!(null_from_invalid, serde_json::Value::Null);
+
+        // Valid JSON still parses through to the real value.
+        let parsed: serde_json::Value = deserialize_json_or_default(Some(r#"{"k":42}"#));
+        assert_eq!(parsed, serde_json::json!({"k": 42}));
+    }
+
+    #[test]
+    fn parse_text_column_parses_valid_input() {
+        let parsed: Tag = parse_text_column(3, "tag:alpha").unwrap();
+        assert_eq!(parsed, Tag("alpha".to_owned()));
+    }
+
+    #[test]
+    fn parse_text_column_surfaces_from_sql_conversion_failure() {
+        let err = parse_text_column::<Tag>(7, "not-a-tag").unwrap_err();
+        // The contract is that a parse failure becomes a
+        // `FromSqlConversionFailure` keyed to the caller-supplied column
+        // index and `Type::Text`. Assert those survive; the boxed source
+        // error is an internal detail we don't pin.
+        match err {
+            rusqlite::Error::FromSqlConversionFailure(col, ty, _) => {
+                assert_eq!(col, 7);
+                assert_eq!(ty, rusqlite::types::Type::Text);
+            }
+            other => panic!("expected FromSqlConversionFailure, got {other:?}"),
+        }
+    }
 }

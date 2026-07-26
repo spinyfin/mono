@@ -81,32 +81,32 @@ const COMMENT_COLUMNS: &str = "id, artifact_kind, artifact_id, doc_version, anch
      intent_classification_error";
 
 /// The one definition of "this comment is a `[Revise]` candidate": `active`
-/// status **and** a `directive`/`larger_change` intent. A SQL fragment rather
-/// than a Rust predicate because all three consumers are queries:
+/// status **and** a `revision` intent. A SQL fragment rather than a Rust
+/// predicate because all three consumers are queries:
 /// [`WorkDb::comments_banner_state`]'s `unresolved_count`,
 /// [`query_revisable_comments`] (the batch's candidate read), and the guarded
 /// claim UPDATE in [`super::revise_doc`]. All three consumers must use this
 /// one definition; a divergence shows up as the banner counting a comment
 /// `[Revise]` then silently drops.
 ///
-/// `intent` is deliberately not the only term. A comment badged
-/// `larger_change` whose `status` is `answering`/`in_revision`/`orphaned`
-/// genuinely is not ready for a batch; the fix for the reclassification bug is
-/// to re-home `status` on override (see [`WorkDb::override_comment_intent`]),
-/// never to loosen this predicate.
+/// `intent` is deliberately not the only term. A comment badged `revision`
+/// whose `status` is `answering`/`in_revision`/`orphaned` genuinely is not
+/// ready for a batch; the fix for the reclassification bug is to re-home
+/// `status` on override (see [`WorkDb::override_comment_intent`]), never to
+/// loosen this predicate.
 pub(crate) fn revisable_comment_predicate() -> String {
-    format!("status = '{COMMENT_STATUS_ACTIVE}' AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')")
+    format!("status = '{COMMENT_STATUS_ACTIVE}' AND intent = '{INTENT_REVISION}'")
 }
 
-/// The complement of [`revisable_comment_predicate`] over the same intent set:
-/// comments the sidebar badges `directive`/`larger_change` whose `status`
-/// disqualifies them from a batch. Drives `ReviseDocOutcome::Created`'s
-/// `excluded_comment_ids` so the operator is told what the batch left behind
-/// instead of seeing an unqualified success.
+/// The complement of [`revisable_comment_predicate`] over the same intent:
+/// comments the sidebar badges `revision` whose `status` disqualifies them
+/// from a batch. Drives `ReviseDocOutcome::Created`'s `excluded_comment_ids`
+/// so the operator is told what the batch left behind instead of seeing an
+/// unqualified success.
 pub(crate) fn excluded_revisable_comment_predicate() -> String {
     format!(
         "status NOT IN ('{COMMENT_STATUS_ACTIVE}', '{COMMENT_STATUS_RESOLVED}', '{COMMENT_STATUS_DISMISSED}') \
-         AND intent IN ('{INTENT_DIRECTIVE}', '{INTENT_LARGER_CHANGE}')"
+         AND intent = '{INTENT_REVISION}'"
     )
 }
 
@@ -204,7 +204,7 @@ impl WorkDb {
     }
 
     /// Read-only `[Revise]`-banner summary for an artifact: `revisable`,
-    /// `unresolved_count` (active `directive`/`larger_change` comments —
+    /// `unresolved_count` (active `revision` comments —
     /// same candidate set as `query_revisable_comments`), `in_revision_count`,
     /// and the doc owner's `TaskKind` (`None` when `resolve_doc_owner` finds
     /// no design/investigation owner). Design:
@@ -334,17 +334,17 @@ impl WorkDb {
     /// on `answered` would strand the comment
     /// off the `[Revise]` candidate pool exactly like the forward-direction
     /// bug this module fixes — there's no question left to await a
-    /// follow-up on. So if `intent` is already `directive`/`larger_change`
-    /// by the time this fires, skip `answered` entirely and land on
-    /// `active`, folding the comment straight into the revise pool (the
-    /// answer-agent's reply is still available as thread context via
+    /// follow-up on. So if `intent` is already `revision` by the time this
+    /// fires, skip `answered` entirely and land on `active`, folding the
+    /// comment straight into the revise pool (the answer-agent's reply is
+    /// still available as thread context via
     /// [`Self::latest_answer_agent_run_for_comment`]).
     pub fn transition_comment_to_answered(&self, comment_id: &str) -> Result<WorkComment> {
         let conn = self.connect()?;
         let now = now_string();
         let n = conn.execute(
             "UPDATE work_comments
-             SET status = CASE WHEN intent IN (?5, ?6) THEN ?7 ELSE ?2 END,
+             SET status = CASE WHEN intent = ?5 THEN ?6 ELSE ?2 END,
                  status_actor = 'engine', updated_at = ?3
              WHERE id = ?1 AND status = ?4",
             params![
@@ -352,8 +352,7 @@ impl WorkDb {
                 COMMENT_STATUS_ANSWERED,
                 now,
                 COMMENT_STATUS_ANSWERING,
-                INTENT_DIRECTIVE,
-                INTENT_LARGER_CHANGE,
+                INTENT_REVISION,
                 COMMENT_STATUS_ACTIVE,
             ],
         )?;
@@ -447,9 +446,9 @@ impl WorkDb {
     }
 
     /// The bucket-1&3 bridge (P3c): `awaiting_followup → active`, fired when
-    /// a follow-up reply reclassifies as `directive`/`larger_change`. The
+    /// a follow-up reply reclassifies as `revision`. The
     /// comment re-enters the `[Revise]` candidate pool exactly like any
-    /// other `active` `directive`/`larger_change` comment (design
+    /// other `active` `revision` comment (design
     /// §"Bridging a bucket-2 answer into a revision") — `revise_task_id`
     /// stays `NULL` since no batch has claimed it yet.
     pub fn transition_comment_awaiting_followup_to_active(&self, comment_id: &str) -> Result<WorkComment> {
@@ -484,7 +483,7 @@ impl WorkDb {
     /// must not leave a stale failure record from an earlier attempt.
     pub fn reclassify_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
         match intent {
-            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            INTENT_REVISION | INTENT_QUESTION => {}
             other => bail!("invalid comment intent: {other}"),
         }
         let conn = self.connect()?;
@@ -513,7 +512,7 @@ impl WorkDb {
     /// [`Self::override_comment_intent`], which that RPC uses instead.
     pub fn set_comment_intent(&self, comment_id: &str, intent: &str, confidence: f64) -> Result<WorkComment> {
         match intent {
-            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            INTENT_REVISION | INTENT_QUESTION => {}
             other => bail!("invalid comment intent: {other}"),
         }
         let conn = self.connect()?;
@@ -569,7 +568,7 @@ impl WorkDb {
     ///
     /// Also has no status guard — it can fire from any comment status,
     /// including mid-bucket-2 (`answering`/`answered`/`awaiting_followup`).
-    /// If the new intent is revisable (`directive`/`larger_change`) and the
+    /// If the new intent is revisable (`revision`) and the
     /// comment is sitting in any of those three statuses, this also resets
     /// `status` back to `active` in the same write: all three only make
     /// sense for a `question` awaiting (or receiving) an answer, and leaving
@@ -603,7 +602,7 @@ impl WorkDb {
     /// `ReviseDocOutcome::Created`'s `excluded_comment_ids`.
     pub fn override_comment_intent(&self, comment_id: &str, intent: &str) -> Result<WorkComment> {
         match intent {
-            INTENT_DIRECTIVE | INTENT_QUESTION | INTENT_LARGER_CHANGE => {}
+            INTENT_REVISION | INTENT_QUESTION => {}
             other => bail!("invalid comment intent: {other}"),
         }
         let conn = self.connect()?;
@@ -612,9 +611,9 @@ impl WorkDb {
             "UPDATE work_comments
              SET intent = ?2, intent_confidence = NULL, intent_classified_at = ?3, intent_overridden_by = 'user',
                  intent_classification_failed_at = NULL, intent_classification_error = NULL,
-                 status = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN ?8 ELSE status END,
-                 status_actor = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN 'user' ELSE status_actor END,
-                 updated_at = CASE WHEN status IN (?4, ?5, ?9) AND ?2 IN (?6, ?7) THEN ?3 ELSE updated_at END
+                 status = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN ?7 ELSE status END,
+                 status_actor = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN 'user' ELSE status_actor END,
+                 updated_at = CASE WHEN status IN (?4, ?5, ?8) AND ?2 = ?6 THEN ?3 ELSE updated_at END
              WHERE id = ?1",
             params![
                 comment_id,
@@ -622,8 +621,7 @@ impl WorkDb {
                 now,
                 COMMENT_STATUS_ANSWERED,
                 COMMENT_STATUS_AWAITING_FOLLOWUP,
-                INTENT_DIRECTIVE,
-                INTENT_LARGER_CHANGE,
+                INTENT_REVISION,
                 COMMENT_STATUS_ACTIVE,
                 COMMENT_STATUS_ANSWERING,
             ],
@@ -930,7 +928,7 @@ pub(crate) fn query_comments(
 }
 
 /// Comments eligible for a `[Revise]` batch (`CommentsReviseDoc`): `active`
-/// status, classified `directive`/`larger_change`. `comment_ids` narrows to
+/// status, classified `revision`. `comment_ids` narrows to
 /// that id set when supplied — v1 always passes `None` (reserved for a
 /// future subset-selection UI, design §"Batch scope").
 pub(crate) fn query_revisable_comments(
@@ -963,7 +961,7 @@ pub(crate) fn query_revisable_comments(
 }
 
 /// The comments a `[Revise]` batch on this artifact leaves behind: badged
-/// `directive`/`larger_change` (so the operator reads them as revisable) but
+/// `revision` (so the operator reads them as revisable) but
 /// disqualified by `status` — `in_revision` (claimed by an earlier batch),
 /// `orphaned` (the anchor no longer resolves), or `answering` (a live
 /// answer-agent run). Exactly the complement of [`query_revisable_comments`]
@@ -1138,13 +1136,13 @@ mod tests {
         let db = mem_db();
         // No project/design task points at this artifact, so
         // `resolve_doc_owner` returns `None`. `revisable` must be false even
-        // though there is an unresolved directive comment sitting on it —
+        // though there is an unresolved revision comment sitting on it —
         // `doc_kind` being absent is the gate, not the comment count.
         let artifact_id = "pr_doc:git@github.com:o/r.git:main:x.md";
         let mut create_input = input(artifact_id, "alpha", "", "");
         create_input.artifact_kind = "pr_doc".to_owned();
         let c = db.create_comment(create_input).unwrap();
-        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
         let state = db.comments_banner_state("pr_doc", artifact_id).unwrap();
         assert!(!state.revisable);
         assert_eq!(state.unresolved_count, 1);
@@ -1378,12 +1376,12 @@ mod tests {
     fn set_comment_intent_is_guarded_against_double_classification() {
         let db = mem_db();
         let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
-        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
         // A second call finds intent_classified_at already set, so it's a
         // no-op error rather than silently overwriting the classification.
         assert!(db.set_comment_intent(&c.id, "question", 0.5).is_err());
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert_eq!(reloaded.intent.as_deref(), Some("revision"));
     }
 
     #[test]
@@ -1413,7 +1411,7 @@ mod tests {
     fn record_comment_classification_failed_does_not_clobber_a_classified_comment() {
         let db = mem_db();
         let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
-        db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
 
         // A late-arriving failure (e.g. a raced/duplicate classifier attempt)
         // must not knock an already-classified comment back into a failed
@@ -1421,7 +1419,7 @@ mod tests {
         assert!(db.record_comment_classification_failed(&c.id, "too late").is_err());
 
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert_eq!(reloaded.intent.as_deref(), Some("revision"));
         assert!(reloaded.intent_classification_error.is_none());
         assert!(reloaded.intent_classification_failed_at.is_none());
     }
@@ -1454,7 +1452,7 @@ mod tests {
         db.record_comment_classification_failed(&c.id, "transient error")
             .unwrap();
 
-        let classified = db.set_comment_intent(&c.id, "directive", 0.8).unwrap();
+        let classified = db.set_comment_intent(&c.id, "revision", 0.8).unwrap();
         assert!(classified.intent_classification_failed_at.is_none());
         assert!(classified.intent_classification_error.is_none());
     }
@@ -1470,13 +1468,13 @@ mod tests {
         // guard, so it succeeds even after a recorded failure — and it must
         // clear the failure columns rather than leaving stale error state
         // alongside a successful classification.
-        let reclassified = db.reclassify_comment_intent(&c.id, "larger_change", 0.7).unwrap();
-        assert_eq!(reclassified.intent.as_deref(), Some("larger_change"));
+        let reclassified = db.reclassify_comment_intent(&c.id, "revision", 0.7).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("revision"));
         assert!(reclassified.intent_classification_failed_at.is_none());
         assert!(reclassified.intent_classification_error.is_none());
 
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some("larger_change"));
+        assert_eq!(reloaded.intent.as_deref(), Some("revision"));
         assert!(reloaded.intent_classification_failed_at.is_none());
         assert!(reloaded.intent_classification_error.is_none());
     }
@@ -1487,14 +1485,14 @@ mod tests {
         let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         db.set_comment_intent(&c.id, "question", 0.6).unwrap();
 
-        let overridden = db.override_comment_intent(&c.id, "directive").unwrap();
-        assert_eq!(overridden.intent.as_deref(), Some("directive"));
+        let overridden = db.override_comment_intent(&c.id, "revision").unwrap();
+        assert_eq!(overridden.intent.as_deref(), Some("revision"));
         assert!(overridden.intent_confidence.is_none());
         assert!(overridden.intent_classified_at.is_some());
         assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
 
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert_eq!(reloaded.intent.as_deref(), Some("revision"));
         assert_eq!(reloaded.intent_overridden_by.as_deref(), Some("user"));
     }
 
@@ -1504,8 +1502,8 @@ mod tests {
         let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         assert!(c.intent.is_none());
 
-        let overridden = db.override_comment_intent(&c.id, "larger_change").unwrap();
-        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+        let overridden = db.override_comment_intent(&c.id, "revision").unwrap();
+        assert_eq!(overridden.intent.as_deref(), Some("revision"));
         assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
     }
 
@@ -1519,7 +1517,7 @@ mod tests {
     #[test]
     fn override_comment_intent_rejects_unknown_comment() {
         let db = mem_db();
-        assert!(db.override_comment_intent("cmt_missing", "directive").is_err());
+        assert!(db.override_comment_intent("cmt_missing", "revision").is_err());
     }
 
     // --- Reclassified answered/awaiting_followup comments re-enter the
@@ -1531,10 +1529,10 @@ mod tests {
         let comment = seed_answered_comment(&db);
         assert_eq!(comment.status, "answered");
 
-        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
         assert_eq!(overridden.status_actor.as_deref(), Some("user"));
-        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+        assert_eq!(overridden.intent.as_deref(), Some("revision"));
         assert_eq!(overridden.intent_overridden_by.as_deref(), Some("user"));
 
         let reloaded = db.get_comment(&comment.id).unwrap().unwrap();
@@ -1547,7 +1545,7 @@ mod tests {
         let comment = seed_answered_comment(&db);
         db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
 
-        let overridden = db.override_comment_intent(&comment.id, "directive").unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
         assert_eq!(overridden.status_actor.as_deref(), Some("user"));
     }
@@ -1570,7 +1568,7 @@ mod tests {
         assert_eq!(comment.status, "active");
 
         // Already active — the CASE guard must be a no-op, not an error.
-        let overridden = db.override_comment_intent(&comment.id, "directive").unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
     }
 
@@ -1584,17 +1582,17 @@ mod tests {
         // the status must move here, immediately, or the comment keeps
         // showing "Thinking…", stays off the unresolved count, and `[Revise]`
         // drops it for as long as the run lasts.
-        let overridden = db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        let overridden = db.override_comment_intent(&comment.id, "revision").unwrap();
         assert_eq!(overridden.status, "active");
         assert_eq!(overridden.status_actor.as_deref(), Some("user"));
-        assert_eq!(overridden.intent.as_deref(), Some("larger_change"));
+        assert_eq!(overridden.intent.as_deref(), Some("revision"));
     }
 
     #[test]
     fn override_comment_intent_leaves_a_claimed_comment_in_revision() {
         let db = mem_db();
         let comment = db.create_comment(input("t1", "alpha", "", "")).unwrap();
-        db.set_comment_intent(&comment.id, "directive", 0.9).unwrap();
+        db.set_comment_intent(&comment.id, "revision", 0.9).unwrap();
         // `set_comment_status` rejects `in_revision` (it's an engine-internal
         // transition), so claim the comment the way a real batch does.
         {
@@ -1644,7 +1642,7 @@ mod tests {
             );
         }
 
-        db.override_comment_intent(&comment.id, "larger_change").unwrap();
+        db.override_comment_intent(&comment.id, "revision").unwrap();
 
         assert_eq!(
             db.comments_banner_state("pr_doc", artifact_id)
@@ -1675,7 +1673,7 @@ mod tests {
         let resolved = make("resolved-one");
         let question = make("question-one");
         for c in [&active, &claimed, &orphaned, &answering, &resolved] {
-            db.set_comment_intent(&c.id, "directive", 0.9).unwrap();
+            db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
         }
         db.set_comment_intent(&question.id, "question", 0.9).unwrap();
         {
@@ -1716,7 +1714,7 @@ mod tests {
         // can't set this state up. `reclassify_comment_intent` (the engine's
         // follow-up reclassifier) writes `intent` without touching `status`,
         // which is exactly the residual path this reverse edge backstops.
-        db.reclassify_comment_intent(&comment.id, "larger_change", 0.8).unwrap();
+        db.reclassify_comment_intent(&comment.id, "revision", 0.8).unwrap();
         assert_eq!(db.get_comment(&comment.id).unwrap().unwrap().status, "answering");
 
         // The run finishes: rather than landing on 'answered' (stranding
@@ -1725,7 +1723,7 @@ mod tests {
         let answered = db.transition_comment_to_answered(&comment.id).unwrap();
         assert_eq!(answered.status, "active");
         assert_eq!(answered.status_actor.as_deref(), Some("engine"));
-        assert_eq!(answered.intent.as_deref(), Some("larger_change"));
+        assert_eq!(answered.intent.as_deref(), Some("revision"));
     }
 
     #[test]
@@ -1856,13 +1854,16 @@ mod tests {
     }
 
     #[test]
-    fn awaiting_followup_bridges_to_active_for_a_directive() {
+    fn awaiting_followup_bridges_to_active_for_a_revision() {
         let db = mem_db();
         let comment = seed_answered_comment(&db);
         db.transition_comment_to_awaiting_followup(&comment.id).unwrap();
+        // The follow-up reply reclassifies as wanting a doc change.
+        db.reclassify_comment_intent(&comment.id, "revision", 0.9).unwrap();
 
         let bridged = db.transition_comment_awaiting_followup_to_active(&comment.id).unwrap();
         assert_eq!(bridged.status, "active");
+        assert_eq!(bridged.intent.as_deref(), Some("revision"));
         assert!(bridged.revise_task_id.is_none());
     }
 
@@ -1880,13 +1881,27 @@ mod tests {
         let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
         db.set_comment_intent(&c.id, "question", 0.9).unwrap();
 
-        let reclassified = db.reclassify_comment_intent(&c.id, "directive", 0.8).unwrap();
-        assert_eq!(reclassified.intent.as_deref(), Some("directive"));
+        let reclassified = db.reclassify_comment_intent(&c.id, "revision", 0.8).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("revision"));
         assert_eq!(reclassified.intent_confidence, Some(0.8));
         assert!(reclassified.intent_overridden_by.is_none());
 
         let reloaded = db.get_comment(&c.id).unwrap().unwrap();
-        assert_eq!(reloaded.intent.as_deref(), Some("directive"));
+        assert_eq!(reloaded.intent.as_deref(), Some("revision"));
+    }
+
+    #[test]
+    fn reclassify_comment_intent_overwrites_a_prior_classification_the_other_way() {
+        let db = mem_db();
+        let c = db.create_comment(input("t1", "alpha", "", "")).unwrap();
+        db.set_comment_intent(&c.id, "revision", 0.9).unwrap();
+
+        let reclassified = db.reclassify_comment_intent(&c.id, "question", 0.8).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("question"));
+        assert_eq!(reclassified.intent_confidence, Some(0.8));
+
+        let reloaded = db.get_comment(&c.id).unwrap().unwrap();
+        assert_eq!(reloaded.intent.as_deref(), Some("question"));
     }
 
     #[test]
@@ -1902,8 +1917,8 @@ mod tests {
         // A fresh engine reclassification (a new follow-up reply) supersedes
         // the earlier manual override rather than preserving its audit trail
         // forever — the operator's new reply is the thing being classified.
-        let reclassified = db.reclassify_comment_intent(&c.id, "larger_change", 0.7).unwrap();
-        assert_eq!(reclassified.intent.as_deref(), Some("larger_change"));
+        let reclassified = db.reclassify_comment_intent(&c.id, "revision", 0.7).unwrap();
+        assert_eq!(reclassified.intent.as_deref(), Some("revision"));
         assert!(reclassified.intent_overridden_by.is_none());
     }
 
@@ -1917,7 +1932,7 @@ mod tests {
     #[test]
     fn reclassify_comment_intent_rejects_unknown_comment() {
         let db = mem_db();
-        assert!(db.reclassify_comment_intent("cmt_missing", "directive", 0.5).is_err());
+        assert!(db.reclassify_comment_intent("cmt_missing", "revision", 0.5).is_err());
     }
 
     // --- CommentsList read path: thread entries + answer_agent_running ---

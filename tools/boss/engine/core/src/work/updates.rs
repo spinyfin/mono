@@ -36,6 +36,72 @@ fn validate_blocked_reason_length(reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalize and validate a free-form tag list for a leaf work item.
+/// Trims whitespace, drops empty strings, de-duplicates (first wins),
+/// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
+/// [`boss_protocol::WORK_ITEM_TAG_MAX_COUNT`]. Length is measured in
+/// Unicode scalar values (Rust `char`s), matching the Swift UI chip
+/// truncation so a tag that survives the write path still fits the card.
+pub(crate) fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
+    use boss_protocol::{WORK_ITEM_TAG_MAX_COUNT, WORK_ITEM_TAG_MAX_LEN};
+    let mut out: Vec<String> = Vec::new();
+    for raw in input {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let len = trimmed.chars().count();
+        if len > WORK_ITEM_TAG_MAX_LEN {
+            bail!(
+                "tag is too long ({len} chars, max {WORK_ITEM_TAG_MAX_LEN}): `{trimmed}`. \
+                 Keep tags short so kanban chips stay readable."
+            );
+        }
+        if out.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_owned());
+    }
+    if out.len() > WORK_ITEM_TAG_MAX_COUNT {
+        bail!(
+            "too many tags ({}, max {WORK_ITEM_TAG_MAX_COUNT}). \
+             Remove some tags before adding more.",
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+/// Apply set / add / remove tag patch fields onto the current list.
+/// Order: replace (if `set` is `Some`) → append adds → drop removes.
+/// Final list is re-validated for length/count caps.
+pub(crate) fn apply_tag_patch(
+    current: &[String],
+    set: Option<Vec<String>>,
+    add: Option<Vec<String>>,
+    remove: Option<Vec<String>>,
+) -> Result<Vec<String>> {
+    let mut tags = if let Some(set) = set {
+        normalize_and_validate_tags(&set)?
+    } else {
+        current.to_vec()
+    };
+    if let Some(add) = add {
+        let mut combined = tags;
+        combined.extend(add);
+        tags = normalize_and_validate_tags(&combined)?;
+    }
+    if let Some(remove) = remove {
+        let remove_set: Vec<String> = remove
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        tags.retain(|t| !remove_set.iter().any(|r| r == t));
+    }
+    Ok(tags)
+}
+
 impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
         let mut conn = self.connect()?;
@@ -135,15 +201,22 @@ impl WorkDb {
             ],
         )?;
 
+        let mut pending = PendingEvents::new();
         if status_changed && previous_status != project.status {
-            cascade_dependents_after_prereq_status_change(&tx, id, project.status.as_str(), &project.updated_at)?;
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                project.status.as_str(),
+                &project.updated_at,
+            )?;
         }
 
         let updated = query_project(&tx, id).require("project", id)?;
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_project_update(&tx, self, actor, &before, &updated, &project.updated_at)?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(WorkItem::Project(updated))
     }
 
@@ -157,6 +230,7 @@ impl WorkDb {
         let blocked_detail_patch_requests_set = patch.blocked_detail.as_deref().is_some_and(|s| !s.is_empty());
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
+        let mut pending = PendingEvents::new();
         let mut task = query_task(&tx, id).require("task", id)?;
         let previous_status = task.status.clone();
         // Check this before the generic tombstone bail below: an
@@ -216,12 +290,40 @@ impl WorkDb {
                 Some(trimmed.parse::<EffortLevel>().map_err(|e| anyhow::anyhow!(e))?)
             };
         }
+        if let Some(reasoning_patch) = patch.reasoning {
+            // Same contract as `effort_level` above: empty string clears the
+            // column (back to the dispatcher's legacy path), anything else
+            // must parse, and an invalid value rejects the whole patch rather
+            // than half-applying it.
+            let trimmed = reasoning_patch.trim();
+            task.reasoning = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.parse::<ReasoningMode>().map_err(|e| anyhow::anyhow!(e))?)
+            };
+        }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
         apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
         apply_optional_string_patch(&mut task.blocked_detail, patch.blocked_detail);
         if let Some(autostart) = patch.autostart {
             task.autostart = autostart;
+        }
+        // Approving (`--deferred false`) pulls a future-scope item into
+        // scope so the reconciler/cascade can mint a `ready` execution for
+        // it again; `--deferred true` re-parks it. `task.deferred` was
+        // loaded from the row by `query_task`, so writing it back below
+        // never clobbers an unrelated update.
+        if let Some(deferred) = patch.deferred {
+            task.deferred = deferred;
+        }
+        if patch.tags.is_some() || patch.add_tags.is_some() || patch.remove_tags.is_some() {
+            task.tags = apply_tag_patch(
+                &task.tags,
+                patch.tags.clone(),
+                patch.add_tags.clone(),
+                patch.remove_tags.clone(),
+            )?;
         }
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
@@ -273,6 +375,8 @@ impl WorkDb {
         };
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
+        let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
+        let tags_value = encode_task_tags(&task.tags);
 
         tx.execute(
             "UPDATE tasks
@@ -280,7 +384,8 @@ impl WorkDb {
                  priority = ?9, repo_remote_url = ?10,
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
-                 archived_reason = ?17, blocked_detail = ?18,
+                 archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
+                 reasoning = ?20, tags = ?21,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -306,11 +411,30 @@ impl WorkDb {
                 task.driver,
                 task.archived_reason,
                 task.blocked_detail,
+                task.deferred as i64,
+                reasoning_value,
+                tags_value,
             ],
         )?;
 
+        // Re-classifying an item as deferred pulls it out of the dispatch
+        // pool immediately: abandon any not-yet-live execution so a row that
+        // was already queued (`ready` / `waiting_dependency`) can't dispatch
+        // before the reconcile gate next runs. A live worker
+        // (`running` / `waiting_human`) is left alone — it self-retires. The
+        // reconcile guard (`work_item_is_deferred`) then keeps it parked.
+        if patch.deferred == Some(true) {
+            abandon_pending_executions(&mut pending, &tx, id, &task.updated_at)?;
+        }
+
         if status_changed && previous_status != task.status {
-            cascade_dependents_after_prereq_status_change(&tx, id, task.status.as_str(), &task.updated_at)?;
+            cascade_dependents_after_prereq_status_change(
+                &mut pending,
+                &tx,
+                id,
+                task.status.as_str(),
+                &task.updated_at,
+            )?;
         }
 
         // Manual-override suppression for `blocked: ci_failure` /
@@ -340,7 +464,7 @@ impl WorkDb {
         // Audit inside `tx`: the action row and the write it describes
         // commit together or not at all. Inert unless `actor` is Boothby.
         boothby::capture_task_update(&tx, self, actor, &before, &updated, &task.updated_at)?;
-        tx.commit()?;
+        commit_and_publish(tx, pending, self.event_bus())?;
         Ok(task_to_item(updated))
     }
 }

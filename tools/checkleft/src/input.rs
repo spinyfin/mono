@@ -13,8 +13,23 @@ pub struct ChangeSet {
     pub file_line_deltas: HashMap<PathBuf, FileLineDelta>,
     #[serde(default)]
     pub file_diffs: HashMap<PathBuf, FileDiff>,
+    /// Tip commit message only (`HEAD` / `jj @`).
+    ///
+    /// This is the surface scanned by leakage checks such as
+    /// `text/forbidden-pattern` with `surfaces: [changeset]`. It deliberately
+    /// does **not** include intermediate historical commit messages from the
+    /// pushed range — those are re-emitted by GitHub squash/MQ templates and
+    /// would otherwise false-fail green PR branches when they re-enter MQ.
     #[serde(default)]
     pub commit_description: Option<String>,
+    /// Concatenated commit messages for the full `base..HEAD` range.
+    ///
+    /// Host-only: used by BYPASS directive parsing so a directive placed in any
+    /// content commit remains visible (including under an empty jj working-copy
+    /// tip). Not lowered to external/wasm checks and not scanned by text
+    /// leakage checks — see [`Self::commit_description`] for that surface.
+    #[serde(default)]
+    pub bypass_commit_descriptions: Option<String>,
     #[serde(default)]
     pub pr_description: Option<String>,
     #[serde(default)]
@@ -30,6 +45,7 @@ impl ChangeSet {
             file_line_deltas: HashMap::new(),
             file_diffs: HashMap::new(),
             commit_description: None,
+            bypass_commit_descriptions: None,
             pr_description: None,
             change_id: None,
             repository: None,
@@ -42,6 +58,11 @@ impl ChangeSet {
 
     pub fn with_commit_description(mut self, commit_description: Option<String>) -> Self {
         self.commit_description = commit_description;
+        self
+    }
+
+    pub fn with_bypass_commit_descriptions(mut self, bypass_commit_descriptions: Option<String>) -> Self {
+        self.bypass_commit_descriptions = bypass_commit_descriptions;
         self
     }
 
@@ -71,8 +92,25 @@ impl ChangeSet {
         self
     }
 
+    /// The precise added-line ranges for `path`, or `None` when no diff data
+    /// exists for it in this changeset (e.g. `--all` mode, which carries no
+    /// hunk data at all). Callers should treat `None` as "no line restriction
+    /// available" rather than "no lines changed" — an empty-but-present range
+    /// list (e.g. a rename with no content change) legitimately means zero
+    /// changed lines.
+    pub fn changed_lines(&self, path: &Path) -> Option<&[(u32, u32)]> {
+        self.file_diffs.get(path).map(|diff| diff.added_line_ranges.as_slice())
+    }
+
     pub fn bypass_reason(&self, bypass_name: &str) -> Option<String> {
-        parse_bypass_directives_from_descriptions(self.commit_description.as_deref(), self.pr_description.as_deref())
+        // Prefer the full-range bypass surface so a BYPASS in any content commit
+        // is visible; fall back to the tip commit message for tests and local
+        // runs that only populate `commit_description`.
+        let commit_for_bypass = self
+            .bypass_commit_descriptions
+            .as_deref()
+            .or(self.commit_description.as_deref());
+        parse_bypass_directives_from_descriptions(commit_for_bypass, self.pr_description.as_deref())
             .get(bypass_name)
             .cloned()
     }
@@ -88,6 +126,14 @@ pub struct FileLineDelta {
 pub struct FileDiff {
     #[serde(default)]
     pub hunks: Vec<DiffHunk>,
+    /// Precise post-image (new-file) line ranges, inclusive on both ends, that
+    /// this diff *added*. Unlike a `DiffHunk`'s `new_start..new_start+new_lines`
+    /// span (which includes unified-diff context lines), these ranges cover
+    /// exactly the `+` lines — built by tracking the post-image line counter
+    /// while walking the patch. Used by `ChangeSet::changed_lines` to filter
+    /// findings down to PR-changed lines.
+    #[serde(default)]
+    pub added_line_ranges: Vec<(u32, u32)>,
 }
 
 impl FileDiff {
@@ -98,6 +144,14 @@ impl FileDiff {
             delta.removed_lines = delta.removed_lines.saturating_add(hunk.removed_lines);
         }
         delta
+    }
+
+    /// Whether post-image line `line` (1-based) falls inside one of this diff's
+    /// added-line ranges.
+    pub fn contains_added_line(&self, line: u32) -> bool {
+        self.added_line_ranges
+            .iter()
+            .any(|&(start, end)| line >= start && line <= end)
     }
 }
 
@@ -185,6 +239,58 @@ mod tests {
             changeset.bypass_reason("BYPASS_API_BREAKING_SURFACE"),
             Some("From PR.".to_owned())
         );
+    }
+
+    /// Regression: BYPASS lives on a non-tip historical commit while the tip
+    /// description (the leakage surface) is clean / empty.
+    #[test]
+    fn bypass_reason_reads_full_range_when_tip_commit_description_lacks_directive() {
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: "backend/blob/src/v3/auth.rs".into(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }])
+        .with_commit_description(Some("wip: empty working-copy tip".to_owned()))
+        .with_bypass_commit_descriptions(Some(
+            "feat: add large file\n\nBYPASS_FILE_SIZE=Intentionally large; one-off exception.\n\nwip: empty working-copy tip"
+                .to_owned(),
+        ));
+
+        assert_eq!(
+            changeset.bypass_reason("BYPASS_FILE_SIZE"),
+            Some("Intentionally large; one-off exception.".to_owned())
+        );
+        // Tip surface stays free of the bypass text's sibling noise for leakage
+        // scanners that only read `commit_description`.
+        assert_eq!(
+            changeset.commit_description.as_deref(),
+            Some("wip: empty working-copy tip")
+        );
+    }
+
+    /// Leakage surface must not inherit historical commit messages that only
+    /// appear on the bypass/full-range field.
+    #[test]
+    fn tip_commit_description_is_independent_of_bypass_range() {
+        let changeset = ChangeSet::new(vec![ChangedFile {
+            path: "docs/design.md".into(),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        }])
+        .with_commit_description(Some("docs: clean tip message".to_owned()))
+        .with_bypass_commit_descriptions(Some(
+            "docs: clean tip message\n\nRecord operator refutation\n\nFold ZZ3718 into design".to_owned(),
+        ));
+
+        assert_eq!(changeset.commit_description.as_deref(), Some("docs: clean tip message"));
+        assert!(
+            changeset
+                .bypass_commit_descriptions
+                .as_deref()
+                .is_some_and(|s| s.contains("ZZ3718") && s.contains("operator"))
+        );
+        // No BYPASS directive in either surface → None.
+        assert_eq!(changeset.bypass_reason("BYPASS_ANYTHING"), None);
     }
 
     #[test]

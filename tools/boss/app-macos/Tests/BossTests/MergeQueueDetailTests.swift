@@ -67,11 +67,11 @@ final class MergeQueueDetailTests: XCTestCase {
 
     func testParsesTrunkSourceAndQueueStateFields() {
         let json = #"""
-        {"source":"trunk","state":"testing","position":3,"enqueued_at":"2026-07-20T09:00:00Z","queue_state":"RUNNING","section_order":3}
+        {"source":"trunk","state":"testing","position":3,"enqueued_at":"2026-07-20T09:00:00Z","queue_state":"running","section_order":3}
         """#
         let detail = MergeQueueDetail.parse(json)
         XCTAssertEqual(detail?.source, "trunk")
-        XCTAssertEqual(detail?.queueState, "RUNNING")
+        XCTAssertEqual(detail?.queueState, "running")
         XCTAssertTrue(detail?.isTrunk ?? false)
     }
 
@@ -143,7 +143,7 @@ final class MergeQueueDetailTests: XCTestCase {
     // MARK: - queueStateBanner
 
     func testQueueStateBannerNilWhenRunning() {
-        XCTAssertNil(MergeQueueDetail(source: "trunk", queueState: "RUNNING").queueStateBanner)
+        XCTAssertNil(MergeQueueDetail(source: "trunk", queueState: "running").queueStateBanner)
     }
 
     func testQueueStateBannerNilWhenAbsent() {
@@ -151,17 +151,17 @@ final class MergeQueueDetailTests: XCTestCase {
     }
 
     func testQueueStateBannerNilForNonTrunkEntry() {
-        XCTAssertNil(MergeQueueDetail(queueState: "PAUSED").queueStateBanner)
+        XCTAssertNil(MergeQueueDetail(queueState: "paused").queueStateBanner)
     }
 
     func testQueueStateBannerForPausedAndDraining() {
-        XCTAssertEqual(MergeQueueDetail(source: "trunk", queueState: "PAUSED").queueStateBanner, "Trunk queue paused")
-        XCTAssertEqual(MergeQueueDetail(source: "trunk", queueState: "DRAINING").queueStateBanner, "Trunk queue draining")
+        XCTAssertEqual(MergeQueueDetail(source: "trunk", queueState: "paused").queueStateBanner, "Trunk queue paused")
+        XCTAssertEqual(MergeQueueDetail(source: "trunk", queueState: "draining").queueStateBanner, "Trunk queue draining")
     }
 
     func testQueueStateBannerFallsBackForUnrecognisedValue() {
         XCTAssertEqual(
-            MergeQueueDetail(source: "trunk", queueState: "SOME_NEW_STATE").queueStateBanner,
+            MergeQueueDetail(source: "trunk", queueState: "some_new_state").queueStateBanner,
             "Trunk queue some_new_state"
         )
     }

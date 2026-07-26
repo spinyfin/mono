@@ -85,11 +85,11 @@ bin/checkleft run
 
 The flags below exist as **escape hatches** for unusual situations:
 
-| Flag                      | When to use                                                                                                                                                                                |
-| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `--base-ref=<sha>`        | Override the auto-detected base (e.g. a custom merge strategy that produces a non-standard HEAD layout).                                                                                   |
-| `--all`                   | Scan the entire repository regardless of what changed. Manual use only — catching and fixing pre-existing violations that per-diff runs would miss. Never run `--all` automatically in CI. |
-| `--default-branch=<name>` | Tell checkleft the default branch name when it differs from `main` (e.g. `master`, `trunk`).                                                                                               |
+| Flag                      | When to use                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--base-ref=<sha>`        | Override the auto-detected base (e.g. a custom merge strategy that produces a non-standard HEAD layout).                                                                                                                                                                                                                                                            |
+| `--all`                   | Scan the entire repository regardless of what changed — catching and fixing pre-existing violations that per-diff runs would miss. Never use `--all` in a per-PR CI pipeline or to validate your own diff; the only sanctioned automatic use is a dedicated repo-integrity pipeline. Otherwise it is for deliberate manual sweeps and for work on checkleft itself. |
+| `--default-branch=<name>` | Tell checkleft the default branch name when it differs from `main` (e.g. `master`, `trunk`).                                                                                                                                                                                                                                                                        |
 
 `checkleft` looks for `CHECKS.yaml` or `CHECKS.toml` files from the repository
 root down to the file being evaluated.
@@ -114,6 +114,14 @@ to the commit message or PR description (see the bypass docs).
 > run git hooks, so this hook does not fire for jj-driven pushes. In a
 > jj-based workflow, run `checkleft run` before pushing (or wire it into your
 > push tooling) rather than relying on the git hook.
+
+> **`bazel run` note.** Under `bazel run`, Bazel chdirs into the target's
+> runfiles tree. checkleft therefore honours `BUILD_WORKING_DIRECTORY` (the
+> directory from which `bazel run` was invoked) so change detection still
+> scopes against your real working copy — the same scope `cube pr create`'s
+> push gate sees when it spawns checkleft with the workspace as cwd. Without
+> that, a monorepo `bazel run //tools/checkleft -- run` can resolve thousands
+> of spurious paths against bazel's execroot and report a false pass.
 
 The root config can also set `settings.external_checks_url` to merge an
 externally hosted root config before applying local root and child overrides.

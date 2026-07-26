@@ -456,11 +456,13 @@ pub(crate) async fn run_create_investigation(
             .name(name.clone())
             .maybe_description(description)
             .autostart(!ctx.no_autostart)
+            .deferred(args.deferred)
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
             .created_via("cli")
             .maybe_repo_remote_url(args.repo_remote_url)
             .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
             .maybe_model_override(model_override)
+            .maybe_reasoning(args.reasoning.map(boss_protocol::ReasoningMode::from))
             .maybe_driver(driver)
             .force_duplicate(args.force_duplicate)
             .build(),
@@ -578,12 +580,13 @@ pub(crate) async fn run_create_revision(
     let task = create_revision_rpc(
         client,
         CreateRevisionInput::builder()
-            .parent_task_id(parent_id)
+            .parent_task_id(parent_id.clone())
             .description(description.clone())
             .maybe_name(name)
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
             .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
             .maybe_model_override(model_override)
+            .maybe_reasoning(args.reasoning.map(boss_protocol::ReasoningMode::from))
             .maybe_driver(driver)
             .force_duplicate(args.force_duplicate)
             .depends_on(depends_on)
@@ -592,12 +595,81 @@ pub(crate) async fn run_create_revision(
             .build(),
     )
     .await?;
+    warn_if_chain_has_live_worker(client, &parent_id, &task.id).await;
     print_entity(ctx, &serde_json::json!({ "task": task }), || {
         if !ctx.quiet {
             println!("created revision T{}: {}", task.short_id.unwrap_or(0), description);
         }
     })?;
     Ok(())
+}
+
+/// Best-effort advisory printed after `create-revision` succeeds: if any
+/// execution *elsewhere* in the parent's revision chain (the chain root
+/// itself or a sibling revision) is still `running`/`waiting_human`, a
+/// worker may still be actively landing commits on the shared PR branch.
+/// The engine already serializes dispatch for back-to-back revisions on the
+/// same PR (see coordinator dispatch gating), so this is visibility only —
+/// it does not block or delay the new revision.
+///
+/// `new_revision_id` is excluded from the liveness scan: `create_revision`
+/// reconciles the new revision's own execution inside the same transaction
+/// that inserts it, so when there is no chain tail to gate on, that
+/// execution is born `ready` and can already be `running` by the time this
+/// advisory's RPCs land — without the exclusion the advisory would tell the
+/// caller to watch out for the very revision they just created.
+///
+/// Failures here (chain-root resolution or the executions lookup) are
+/// swallowed: this is a courtesy notice, not part of the create-revision
+/// contract, so a transient RPC hiccup must not fail an otherwise-successful
+/// creation.
+async fn warn_if_chain_has_live_worker(client: &mut BossClient, parent_id: &str, new_revision_id: &str) {
+    let chain_root_id = resolve_chain_root_id(client, parent_id).await;
+    let Ok(executions) = list_executions_for_chain(client, &chain_root_id).await else {
+        return;
+    };
+    let live: Vec<String> = executions
+        .iter()
+        .filter(|e| e.work_item_id != new_revision_id && e.status.is_live())
+        .map(|e| format!("{} ({})", e.work_item_id, e.status.as_str()))
+        .collect();
+    if !live.is_empty() {
+        eprintln!(
+            "warning: a worker still appears to be active on this PR's revision chain: {}. It may \
+             still be landing commits — the new revision is queued to run after it, but check for \
+             conflicts once both have landed.",
+            live.join(", "),
+        );
+    }
+}
+
+/// Walk `parent_task_id` links up from `task_id` to the chain root — the
+/// first ancestor whose `kind` is not `revision`, or one with no
+/// `parent_task_id` — capped at 64 hops to mirror the engine's own
+/// chain-walk cap (`work/chain_helpers.rs::chain_root`). A lookup failure
+/// for the starting id or any hop mid-walk returns the last
+/// successfully-resolved id, matching the engine's broken-parent handling —
+/// this never fails, so `warn_if_chain_has_live_worker`'s downstream RPC
+/// failure is the only thing that can skip the advisory.
+async fn resolve_chain_root_id(client: &mut BossClient, task_id: &str) -> String {
+    let mut current = task_id.to_owned();
+    for _ in 0..64 {
+        let Ok(item) = get_work_item(client, &current).await else {
+            return current;
+        };
+        let (kind, parent_task_id) = match &item {
+            WorkItem::Task(t) | WorkItem::Chore(t) => (t.kind.clone(), t.parent_task_id.clone()),
+            _ => return current,
+        };
+        if kind != boss_protocol::TaskKind::Revision {
+            return current;
+        }
+        match parent_task_id {
+            Some(parent) => current = parent,
+            None => return current,
+        }
+    }
+    current
 }
 
 pub(crate) async fn get_work_item(client: &mut BossClient, id: &str) -> Result<WorkItem, CliError> {
@@ -966,6 +1038,12 @@ pub(crate) struct BulkCreateItem {
     pub(crate) description: String,
     #[serde(default)]
     pub(crate) autostart: Option<bool>,
+    /// Per-item deferred / future-scope override. Omitted → `false` (not
+    /// future scope). When `true`, the created item is parked as future
+    /// scope: visible and auto-unblocked, but never auto-dispatched until
+    /// explicitly approved. See [`boss_protocol::Task::deferred`].
+    #[serde(default)]
+    pub(crate) deferred: Option<bool>,
     #[serde(default)]
     pub(crate) project_id: Option<String>,
     /// Per-item priority override. Omitted → engine default
@@ -1067,6 +1145,7 @@ pub(crate) async fn run_task_create_many(
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .deferred(item.deferred.unwrap_or(false))
                 .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
@@ -1116,6 +1195,7 @@ pub(crate) async fn run_chore_create_many(
                 .name(item.name)
                 .maybe_description(normalize_non_empty(Some(item.description)))
                 .autostart(item.autostart.unwrap_or(default_autostart))
+                .deferred(item.deferred.unwrap_or(false))
                 .depends_on(depends_on)
                 .maybe_priority(item.priority)
                 .created_via(CREATED_VIA_CLI)
@@ -1380,10 +1460,28 @@ pub(crate) async fn list_executions_for_item(
     client: &mut BossClient,
     work_item_id: &str,
 ) -> Result<Vec<WorkExecution>, CliError> {
+    list_executions_for_item_impl(client, work_item_id, false).await
+}
+
+/// Like [`list_executions_for_item`] but also pulls in every revision task's
+/// executions for `work_item_id`'s revision chain (`work_item_id` must be
+/// the chain root — see `ListExecutions.include_revision_chain`).
+pub(crate) async fn list_executions_for_chain(
+    client: &mut BossClient,
+    chain_root_id: &str,
+) -> Result<Vec<WorkExecution>, CliError> {
+    list_executions_for_item_impl(client, chain_root_id, true).await
+}
+
+async fn list_executions_for_item_impl(
+    client: &mut BossClient,
+    work_item_id: &str,
+    include_revision_chain: bool,
+) -> Result<Vec<WorkExecution>, CliError> {
     match client
         .send_request(&FrontendRequest::ListExecutions {
             work_item_id: Some(work_item_id.to_owned()),
-            include_revision_chain: false,
+            include_revision_chain,
         })
         .await
         .map_err(CliError::internal)?
@@ -2139,14 +2237,19 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.pr_url.is_some()
         || patch.ordinal.is_some()
         || patch.effort_level.is_some()
+        || patch.reasoning.is_some()
         || patch.model_override.is_some()
         || patch.driver.is_some()
         || patch.default_model.is_some()
         || patch.dispatch_preamble.is_some()
         || patch.worker_branch_prefix.is_some()
         || patch.autostart.is_some()
+        || patch.deferred.is_some()
         || patch.blocked_reason.is_some()
-        || patch.blocked_detail.is_some();
+        || patch.blocked_detail.is_some()
+        || patch.tags.is_some()
+        || patch.add_tags.is_some()
+        || patch.remove_tags.is_some();
 
     if has_fields {
         Ok(())

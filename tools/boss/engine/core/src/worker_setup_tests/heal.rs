@@ -87,7 +87,7 @@ fn heal_worker_settings_json_updates_all_hook_events() {
         worker_kind: WorkerKind::Standard,
     };
     let settings_file = settings_dir.path().join("mono-agent-heal.json");
-    std::fs::write(&settings_file, render_settings_json(&input)).unwrap();
+    std::fs::write(&settings_file, render_settings_json(&input, &ClaudeDriver)).unwrap();
 
     let new_path = PathBuf::from("/stable/bin/boss-event");
     heal_worker_settings_json(settings_dir.path(), &new_path);

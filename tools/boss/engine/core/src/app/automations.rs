@@ -21,7 +21,9 @@ pub(super) async fn handle_create_automation(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.create_automation(input) {
             Ok(automation) => {
-                server_state.automation_scheduler_kick.notify_one();
+                server_state
+                    .event_bus
+                    .publish(boss_event_bus::Event::AutomationMutation);
                 send_response(&sink, &request_id, FrontendEvent::AutomationCreated { automation });
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
@@ -98,7 +100,9 @@ pub(super) async fn handle_update_automation(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.update_automation(&id, patch) {
             Ok(automation) => {
-                server_state.automation_scheduler_kick.notify_one();
+                server_state
+                    .event_bus
+                    .publish(boss_event_bus::Event::AutomationMutation);
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
@@ -120,7 +124,9 @@ pub(super) async fn handle_enable_automation(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.enable_automation(&id) {
             Ok(automation) => {
-                server_state.automation_scheduler_kick.notify_one();
+                server_state
+                    .event_bus
+                    .publish(boss_event_bus::Event::AutomationMutation);
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
@@ -142,7 +148,9 @@ pub(super) async fn handle_disable_automation(ctx: Dispatch, req: FrontendReques
     {
         match work_db.disable_automation(&id) {
             Ok(automation) => {
-                server_state.automation_scheduler_kick.notify_one();
+                server_state
+                    .event_bus
+                    .publish(boss_event_bus::Event::AutomationMutation);
                 send_response(&sink, &request_id, FrontendEvent::AutomationUpdated { automation })
             }
             Err(err) => send_work_error(&sink, &request_id, &err),
@@ -164,7 +172,9 @@ pub(super) async fn handle_delete_automation(ctx: Dispatch, req: FrontendRequest
     {
         match work_db.delete_automation(&id) {
             Ok(()) => {
-                server_state.automation_scheduler_kick.notify_one();
+                server_state
+                    .event_bus
+                    .publish(boss_event_bus::Event::AutomationMutation);
                 send_response(
                     &sink,
                     &request_id,

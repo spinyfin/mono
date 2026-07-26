@@ -40,7 +40,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::CreateAttentionItemInput;
+use boss_protocol::{CreateAttentionItemInput, ExecutionKind};
 
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
@@ -131,8 +131,7 @@ pub async fn run_one_pass(
             execution_status: dead_status,
         } = candidate;
 
-        // Churn guard: a work item that keeps producing terminal
-        // executions (of any kind, in the trailing window) is almost
+        // Churn guard: a work item whose *reviews* keep dying is almost
         // certainly hitting something structural (a persistently broken
         // host, like the incident's `anaplian`) rather than a one-off
         // blip. Re-firing forever would just burn another doomed review
@@ -140,7 +139,22 @@ pub async fn run_one_pass(
         // threshold/window `orphan_sweep` uses — both guards exist to stop
         // an unproductive redispatch loop, so one operator-tunable
         // constant covers both.
-        let recent_terminal = match work_db.count_recent_terminal_executions(&work_item_id, churn_cutoff) {
+        //
+        // Scoped to `kind = pr_review` (unlike `orphan_sweep`'s unscoped
+        // count): a work item routinely accumulates terminal
+        // `chore_implementation`/`revision_implementation` retries in the
+        // same trailing hour a review is first dispatched in — they happen
+        // back-to-back as part of the same work session and say nothing
+        // about whether the review itself is healthy. Counting them against
+        // the review's churn budget let a single transient review failure
+        // trip the guard immediately, parking the item and leaving the PR
+        // permanently unreviewed instead of getting the retry this guard is
+        // supposed to allow.
+        let recent_terminal = match work_db.count_recent_terminal_executions(
+            &work_item_id,
+            churn_cutoff,
+            Some(ExecutionKind::PrReview),
+        ) {
             Ok(n) => n,
             Err(err) => {
                 tracing::warn!(
@@ -162,13 +176,14 @@ pub async fn run_one_pass(
                 "pr_review recovery: churn guard tripped; not auto-refiring — human attention required",
             );
             let failing_ids = work_db
-                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff)
+                .list_recent_terminal_execution_ids(&work_item_id, churn_cutoff, Some(ExecutionKind::PrReview))
                 .unwrap_or_default();
             work_db.file_churn_guard_parked_attention(
                 &work_item_id,
                 "pr_review_recovery",
                 recent_terminal,
                 &failing_ids,
+                "terminal pr_review executions",
             );
             outcome.churn_skipped += 1;
             continue;
@@ -377,7 +392,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
@@ -420,6 +435,37 @@ mod tests {
         );
     }
 
+    /// Regression: `list_dead_pr_review_candidates` treats `cancelled`
+    /// pr_review executions as dead-review candidates, so the churn guard
+    /// must count them too — otherwise a review that repeatedly ends
+    /// `cancelled` never accumulates toward the threshold and gets
+    /// refired by every sweep pass with the guard never tripping.
+    #[tokio::test]
+    async fn churn_guard_counts_cancelled_reviews() {
+        let (_dir, db) = open_db();
+        let (work_item_id, _dead_execution_id) =
+            create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/9");
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "cancelled", now_epoch - i)
+                .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(
+            outcome.churn_skipped, 1,
+            "cancelled pr_review executions must count toward the churn guard"
+        );
+        assert_eq!(outcome.refired, 0);
+    }
+
     #[tokio::test]
     async fn churn_guard_park_auto_clears_via_recovery_sweep_once_window_drains() {
         // Regression test for the real auto-recovery path: the sweep must
@@ -435,7 +481,7 @@ mod tests {
 
         let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
         for i in 0..ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD {
-            db.insert_terminal_execution_for_test(&work_item_id, "orphaned", now_epoch - i)
+            db.insert_terminal_execution_for_test(&work_item_id, "pr_review", "orphaned", now_epoch - i)
                 .unwrap();
         }
 
@@ -479,6 +525,56 @@ mod tests {
                 .all(|a| a.status == "resolved"),
             "churn_guard_parked attention should auto-resolve once the recovery sweep re-fires the review; \
              got: {attentions_after:?}"
+        );
+    }
+
+    /// Regression: unrelated `chore_implementation` churn (the normal
+    /// back-and-forth of a work item reaching a PR at all) must NOT count
+    /// against the `pr_review` churn guard. Before the kind-scoped fix,
+    /// `count_recent_terminal_executions` counted terminal executions of
+    /// ANY kind, so a work item that had already burned through
+    /// `ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1` failed implementation
+    /// attempts in the trailing window would trip the guard on the review's
+    /// very FIRST dead attempt — parking the item and leaving the PR
+    /// permanently unreviewed instead of getting the retry the guard is
+    /// supposed to allow.
+    #[tokio::test]
+    async fn unrelated_implementation_churn_does_not_trip_review_churn_guard() {
+        let (_dir, db) = open_db();
+        let (work_item_id, _dead_execution_id) =
+            create_chore_with_dead_review(&db, "https://github.com/test/repo/pull/6");
+
+        let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
+        // Enough unrelated chore_implementation churn, on its own, to have
+        // tripped the old unscoped guard (threshold - 1 plus the one dead
+        // pr_review from create_chore_with_dead_review == threshold).
+        for i in 0..(ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD - 1) {
+            db.insert_terminal_execution_for_test(&work_item_id, "chore_implementation", "failed", now_epoch - i)
+                .unwrap();
+        }
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let checker = FakePrStateChecker::always(PrOpenState::Open);
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &checker).await;
+
+        assert_eq!(
+            outcome.churn_skipped, 0,
+            "unrelated chore_implementation churn must not count toward the pr_review churn guard"
+        );
+        assert_eq!(
+            outcome.refired, 1,
+            "the review's first dead attempt must still be auto-refired"
+        );
+
+        let attentions = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            attentions
+                .iter()
+                .all(|a| a.kind != crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND),
+            "no churn_guard_parked attention should be filed; got: {attentions:?}"
         );
     }
 

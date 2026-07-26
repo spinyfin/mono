@@ -223,6 +223,7 @@ mod tests {
             severity: Severity::Error,
             message: message.to_owned(),
             location: None,
+            surface: None,
             remediations: Vec::new(),
             suggested_fix: None,
         }

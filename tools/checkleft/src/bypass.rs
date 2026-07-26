@@ -90,6 +90,7 @@ pub fn bypass_applied_finding(bypass_name: &str, reason: &str, location: Option<
         severity: Severity::Warning,
         message: format!("check was bypassed via `{bypass_name}`"),
         location,
+        surface: None,
         remediations: vec![format!(
             "Bypass reason: {reason}. Keep bypasses rare and only for legitimate exceptions."
         )],

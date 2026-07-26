@@ -20,4 +20,5 @@ checkleft-file-size = { path = "../checks/file/size" }
 checkleft-md-link-integrity = { path = "../checks/md/link-integrity" }
 checkleft-rust-giant-structs = { path = "../checks/rust/giant-structs" }
 checkleft-rust-giant-structs-create = { path = "../checks/rust/giant-structs-create" }
+checkleft-text-forbidden-pattern = { path = "../checks/text/forbidden-pattern" }
 wit-bindgen = "0.51"

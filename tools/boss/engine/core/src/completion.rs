@@ -53,12 +53,13 @@ use boss_protocol::{
 };
 
 use crate::attentions_detector;
-use crate::automation_triage::{TriageDecision, parse_triage_decision};
+use crate::automation_triage::TriageDecision;
 use crate::build_wait::detect_build_wait_signal;
 use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUILD_WAIT_HORIZON_SECS};
 use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
+use crate::driver::AgentDriver;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };
@@ -69,12 +70,14 @@ use crate::work::{CreateAttentionItemInput, PendingMergeCheck, WorkDb, WorkItem,
 use crate::work::{FinishExecutionRunInput, TaskStatus};
 use crate::worker_escalation::{self, WorkerSignal, WorkerSignalKind};
 use boss_engine_gh_invocation::{gh_compare_jq, run_gh};
+use boss_gh_telemetry::{callers, scope as gh_scope};
 use boss_github::pr_url::pr_number_from_url;
 
 // The inherent `impl WorkerCompletionHandler` is split across the submodules
 // below to keep each file under the 3000-line size limit. Each contributes
 // methods to the same type; the handler struct, shared types, traits, and free
 // helpers stay in this parent module and reach the submodules via `use super`.
+mod attention;
 mod execution_started;
 mod finalize_passes;
 mod handler_build;
@@ -88,14 +91,28 @@ mod remediation;
 mod stop;
 mod worker_signals;
 
-// Phase-3 counter handles for the PR URL capture paths. The primary path
-// fires when the PostToolUse staging cache already holds the URL; the
-// reconstruction path fires when the cold-path `detect_pr` fallback is
-// invoked instead.
+// Counter handles for the PR URL capture channels, in the order they are
+// consulted: the worker's structured-output artifact (the driver-agnostic file
+// contract), the PostToolUse staging cache, the driver's final-message
+// producer, and finally the cold-path `detect_pr` reconstruction. The
+// `primary_path` counter covers every URL that arrived via the staging cache,
+// whichever channel filled it.
 crate::register_counter!(
     PR_URL_CAPTURE_PRIMARY_HIT,
     "pr_url_capture.primary_path.hit",
     "on_stop / recheck_for_pr found a staged PR URL and skipped the detector.",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_ARTIFACT_HIT,
+    "pr_url_capture.artifact.hit",
+    "the worker's structured-output PR-URL artifact supplied the URL (file contract, \
+     driver-agnostic).",
+);
+crate::register_counter!(
+    PR_URL_CAPTURE_DRIVER_FALLBACK_HIT,
+    "pr_url_capture.driver_fallback.hit",
+    "the driver's final-message producer supplied the PR URL (artifact and hook stream \
+     both empty).",
 );
 crate::register_counter!(
     PR_URL_CAPTURE_RECONSTRUCTION_HIT,
@@ -141,17 +158,48 @@ crate::register_counter!(
     "detect_and_file_worker_signals fell back to the legacy [blocked] marker parser because no \
      worker_proposals row existed for the execution (worker_signal_proposals_seam on).",
 );
+// Worker-proposal seam: fallback-hit counter for
+// `detect_and_record_deferred_scope`'s legacy [deferred-scope] marker parser
+// (design implementation task 9), incremented only when
+// `deferred_scope_proposals_seam` is on and no `worker_proposals` row
+// covered the marker — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*` above. Same
+// remote-worker caveat applies (see the comment on those counters).
+crate::register_counter!(
+    DEFERRED_SCOPE_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.deferred_scope",
+    "detect_and_record_deferred_scope fell back to the legacy [deferred-scope] marker parser \
+     because no worker_proposals row existed for the execution (deferred_scope_proposals_seam on).",
+);
+// Worker-proposal seam: fallback-hit counter for `reconcile_task_followups`'s
+// legacy structured-output-artifact / `FOLLOWUPS:` sentinel scrape and the
+// `attentions_followups_backstop` LLM pass (design implementation task 10),
+// incremented only when `followup_proposals_seam` is on and no
+// `worker_proposals` row of kind `followup_task` existed for the execution
+// — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`
+// above. Same remote-worker caveat applies (see the comment on those
+// counters).
+crate::register_counter!(
+    FOLLOWUP_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.followup_task",
+    "reconcile_task_followups fell back to the legacy structured-output-artifact / FOLLOWUPS: \
+     sentinel scrape (or the attentions_followups_backstop LLM pass) because no worker_proposals \
+     row of kind followup_task existed for the execution (followup_proposals_seam on).",
+);
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
 /// surface at boot rather than at the first counter increment.
 pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&PR_URL_CAPTURE_PRIMARY_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_ARTIFACT_HIT);
+    registry.register_counter(&PR_URL_CAPTURE_DRIVER_FALLBACK_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_HIT);
     registry.register_counter(&PR_URL_CAPTURE_RECONSTRUCTION_FAILED);
     registry.register_counter(&PR_RECHECK_STAGED_BRANCH_MISMATCH);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_EFFORT_ESCALATION);
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
+    registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
+    registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row
@@ -498,14 +546,17 @@ pub trait BranchVerifier: Send + Sync {
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
-    /// Returns the description/body of PR `pr_number` in `repo_slug`.
-    /// Used by the metadata-only CI-fix finalize gate (issue #1252) to
-    /// detect an operator-visible PR-metadata delta: a CI-fix revision
-    /// that repairs a PR-description validator via `gh pr edit --body`
-    /// makes no commit, so the head SHA never moves — the body diff is
-    /// the only evidence the worker contributed. An empty body is a
-    /// valid value (not an error), unlike the head-ref fetches.
-    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+    /// Returns `(title, body)` of PR `pr_number` in `repo_slug` in a single
+    /// `gh pr view` call. The body is used by the metadata-only CI-fix
+    /// finalize gate (issue #1252) to detect an operator-visible
+    /// PR-metadata delta: a CI-fix revision that repairs a PR-description
+    /// validator via `gh pr edit --body` makes no commit, so the head SHA
+    /// never moves — the body diff is the only evidence the worker
+    /// contributed. The title is snapshotted alongside it at execution
+    /// start so `boss pr body` can return both without a worker needing a
+    /// second `gh pr view` call. An empty body is a valid value (not an
+    /// error), unlike the head-ref fetches.
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -532,8 +583,8 @@ impl BranchVerifier for CommandBranchVerifier {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 
-    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
-        fetch_pr_body_cmd(repo_slug, pr_number).await
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
+        fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
     }
 }
 
@@ -542,11 +593,14 @@ impl BranchVerifier for CommandBranchVerifier {
 /// in the comparison. Returns `0` when the diff is empty (pure rebase with no
 /// file-content changes). Used by the no-op skip gate.
 async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> Result<u64> {
-    let trimmed = gh_compare_jq(
-        repo_slug,
-        base,
-        head,
-        "(.files // []) | map(.additions + .deletions) | add // 0",
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(
+            repo_slug,
+            base,
+            head,
+            "(.files // []) | map(.additions + .deletions) | add // 0",
+        ),
     )
     .await?;
     let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
@@ -556,20 +610,40 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
     Ok(total)
 }
 
-/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json body` and
-/// return the PR description. An empty body is a valid result (returned
-/// as the empty string) — a PR can legitimately have no description, and
-/// the metadata-fix gate needs to distinguish "" (snapshotted empty)
-/// from a failed fetch.
-async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title,body`
+/// and return `(title, body)` from a single API round trip. An empty body
+/// is a valid result (returned as the empty string) — a PR can
+/// legitimately have no description, and the metadata-fix gate needs to
+/// distinguish "" (snapshotted empty) from a failed fetch.
+async fn fetch_pr_title_and_body_cmd(repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
     let pr_str = pr_number.to_string();
-    run_gh(
-        &[
-            "pr", "view", &pr_str, "-R", repo_slug, "--json", "body", "--jq", ".body",
-        ],
-        &format!("gh pr view {pr_number} -R {repo_slug} --json body"),
+    let display = format!("gh pr view {pr_number} -R {repo_slug} --json title,body");
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "view",
+                &pr_str,
+                "-R",
+                repo_slug,
+                "--json",
+                "title,body",
+                "--jq",
+                "[.title, .body]",
+            ],
+            &display,
+        ),
     )
-    .await
+    .await?;
+    let mut fields: Vec<String> =
+        serde_json::from_str(&stdout).with_context(|| format!("unexpected output from `{display}`: {stdout:?}"))?;
+    if fields.len() != 2 {
+        return Err(anyhow!("unexpected output from `{display}`: {stdout:?}"));
+    }
+    let body = fields.pop().expect("checked len == 2");
+    let title = fields.pop().expect("checked len == 2");
+    Ok((title, body))
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.
@@ -670,24 +744,27 @@ fn classify_pr(pr: ApiPr) -> PrStatus {
 /// — if multiple historical rows happen to exist, we want the most
 /// recent (which `gh pr list` returns first).
 async fn query_pr_for_branch(repo_slug: &str, branch: &str) -> Result<Option<ApiPr>> {
-    let stdout = run_gh(
-        &[
-            "pr",
-            "list",
-            "-R",
-            repo_slug,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "url,state,mergedAt,changedFiles,additions,deletions",
-            "--jq",
-            r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
-        ],
-        &format!("gh pr list -R {repo_slug} --head {branch}"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--head",
+                branch,
+                "--state",
+                "all",
+                "--limit",
+                "1",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions",
+                "--jq",
+                r#".[0] | select(.) | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring)] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --head {branch}"),
+        ),
     )
     .await?;
     let trimmed = stdout.trim();
@@ -721,22 +798,25 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
         return Ok(None);
     }
     const SCAN_LIMIT: usize = 100;
-    let stdout = run_gh(
-        &[
-            "pr",
-            "list",
-            "-R",
-            repo_slug,
-            "--state",
-            "all",
-            "--limit",
-            "100",
-            "--json",
-            "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
-            "--jq",
-            r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
-        ],
-        &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "pr",
+                "list",
+                "-R",
+                repo_slug,
+                "--state",
+                "all",
+                "--limit",
+                "100",
+                "--json",
+                "url,state,mergedAt,changedFiles,additions,deletions,headRefName",
+                "--jq",
+                r#".[] | [(.url // ""), (.state // ""), (.mergedAt // ""), ((.changedFiles // 0) | tostring), ((.additions // 0) | tostring), ((.deletions // 0) | tostring), (.headRefName // "")] | @tsv"#,
+            ],
+            &format!("gh pr list -R {repo_slug} --state all (suffix scan)"),
+        ),
     )
     .await?;
     let mut rows = 0usize;
@@ -794,16 +874,19 @@ async fn query_pr_by_branch_suffix(repo_slug: &str, suffix: &str) -> Result<Opti
 async fn verify_pr_diff_nonempty(repo_slug: &str, pr_url: &str) -> Result<bool> {
     let pr_number = pr_number_from_url(pr_url).ok_or_else(|| anyhow!("cannot parse PR number from URL: {pr_url}"))?;
     let endpoint = format!("repos/{repo_slug}/pulls/{pr_number}");
-    let stdout = run_gh(
-        &[
-            "api",
-            &endpoint,
-            "-H",
-            "Accept: application/vnd.github+json",
-            "--jq",
-            "((.additions // 0) + (.deletions // 0))",
-        ],
-        &format!("gh api {endpoint}"),
+    let stdout = gh_scope(
+        callers::COMPLETION,
+        run_gh(
+            &[
+                "api",
+                &endpoint,
+                "-H",
+                "Accept: application/vnd.github+json",
+                "--jq",
+                "((.additions // 0) + (.deletions // 0))",
+            ],
+            &format!("gh api {endpoint}"),
+        ),
     )
     .await?;
     let total: i64 = stdout
@@ -894,6 +977,12 @@ pub struct WorkerCompletionHandler {
     /// `on_stop_inner`'s SHA-delta `Contributed` gate to distinguish the
     /// revision's own push from a concurrent parent-worker push.
     staged_revision_pushes: Arc<crate::pr_url_capture::StagedRevisionPushCache>,
+    /// In-memory staging map for failed `boss propose` submissions.
+    /// Populated by the `PostToolUse` hook dispatcher in `app.rs`; consumed
+    /// by [`Self::detect_and_file_proposal_channel_error`] on `on_stop`,
+    /// which files an attention and increments
+    /// `worker_proposals.channel_error`. See [`crate::proposal_channel_error`].
+    staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
     /// Toggleable feature flags (incident 001 AI #5). Consulted by
     /// `on_stop_inner` and `recheck_for_pr` to decide whether the
     /// cold-path PR fallback is permitted to run. Defaults to a
@@ -956,6 +1045,40 @@ pub struct WorkerCompletionHandler {
     /// [`DEFAULT_BUILD_WAIT_HORIZON_SECS`]; tests override it via
     /// [`Self::with_build_wait_horizon_secs`].
     build_wait_horizon_secs: i64,
+    /// Reports whether an execution's worker process tree still has live
+    /// descendant processes at Stop boundary — e.g. a backgrounded
+    /// subagent spawned via the harness Agent tool that has not yet
+    /// reported back (observed live 2026-07-17). See
+    /// [`crate::background_children`] for the process-tree scan this
+    /// wraps in production. Defaults to
+    /// [`crate::background_children::NoopBackgroundActivityProbe`]; `app.rs`
+    /// wires in the real [`crate::background_children::RegistryBackgroundActivityProbe`]
+    /// via [`Self::with_background_activity_probe`].
+    background_activity_probe: Arc<dyn crate::background_children::BackgroundActivityProbe>,
+    /// Time-bounded suppression tracker for the background-children
+    /// signal, mirroring [`Self::build_wait_tracker`]'s role for the
+    /// build-wait signal — same generic bounded-suppression primitive,
+    /// a separate instance because the two are independent signals (one
+    /// text-narration-based, one process-tree-based) that can each start
+    /// and expire on their own schedule. Trust is not indefinite: a
+    /// descendant that never exits (a genuinely wedged subagent) still
+    /// eventually falls back to the normal nudge/park flow once
+    /// [`Self::background_children_horizon_secs`] elapses.
+    background_children_tracker: Arc<BuildWaitTracker>,
+    /// How long a continuously-reported live-descendant sighting is
+    /// trusted before [`Self::nudge_or_park`] stops suppressing and falls
+    /// back to the normal nudge/park flow. Defaults to
+    /// [`crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS`];
+    /// tests override it via [`Self::with_background_children_horizon_secs`].
+    background_children_horizon_secs: i64,
+    /// Operator-placed holds that exempt a live run from the idle-park
+    /// (this handler's nudge/park flow) and auto-reap
+    /// ([`crate::stale_worker_sweep`]) sweeps until released or the run
+    /// ends. See [`crate::hold_registry`] for the full rationale —
+    /// `bossctl agents hold`/`release-hold` is the operator-facing verb
+    /// pair. Shared via `Arc` so `app.rs`'s RPC handlers and both sweeps
+    /// see the same holds.
+    hold_registry: Arc<crate::hold_registry::HoldRegistry>,
     /// Maximum number of automated reviewer passes per PR.
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances to human Review directly.
@@ -1373,6 +1496,27 @@ pub enum StopOutcome {
     /// horizon elapses, the normal nudge/park flow resumes automatically
     /// (no coordinator action required — unlike [`StopOutcome::EscalationPending`]).
     BuildWaitPending { waited_secs: i64 },
+    /// The worker's Stop-boundary process tree still has live descendant
+    /// processes — e.g. a backgrounded subagent spawned via the harness
+    /// Agent tool that has not yet reported back (observed live
+    /// 2026-07-17). Same suppression shape as [`Self::BuildWaitPending`] (checked before
+    /// [`crate::nudge_breaker`] is even consulted, so this Stop does not
+    /// burn any of its cap) but a distinct signal: process-tree-based
+    /// rather than text-narration-based. `descendant_count` is how many
+    /// live descendants [`crate::background_children`] found;
+    /// `waited_secs` is how long this execution has been continuously
+    /// reporting live descendants. The execution stays `waiting_human`;
+    /// no probe is sent, nothing is parked. Once
+    /// [`Self::background_children_horizon_secs`] elapses, the normal
+    /// nudge/park flow resumes automatically.
+    BackgroundChildrenPending { descendant_count: usize, waited_secs: i64 },
+    /// An operator placed an explicit hold on this execution via
+    /// `bossctl agents hold` (see [`crate::hold_registry`]). The
+    /// idle-park flow is skipped entirely — no nudge, no breaker
+    /// consultation, no park — until the operator releases the hold or
+    /// the run ends. `reason` is the operator-supplied explanation, if
+    /// any.
+    Held { reason: Option<String> },
     /// The worker is a conflict-resolution or CI-failure revision that
     /// stopped without pushing, but the blocking signal was already
     /// cleared (conflict: PR `mergeable`; CI: required checks green)

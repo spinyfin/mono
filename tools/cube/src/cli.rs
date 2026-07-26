@@ -247,6 +247,22 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         holder: Option<String>,
     },
+    /// List salvaged work from workspaces reclaimed after their retention
+    /// window expired.
+    ///
+    /// A workspace withheld from the pool because it held unpushed work is
+    /// retained for a bounded time (`[unhealthy-gc] max-age-hours`, 24h by
+    /// default). When that window expires cube captures the work as a durable
+    /// salvage record — a manifest plus one git-format patch per commit —
+    /// before resetting the workspace. This lists those records, newest first.
+    Salvage {
+        /// Filter by repo id.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Filter by the workspace the work was salvaged from.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
     /// Forget consumed boss/exec_* bookmarks from workspace pools.
     ///
     /// A bookmark is "consumed" when its tip is reachable from `main`

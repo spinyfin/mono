@@ -87,6 +87,18 @@ pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) ->
     Ok(())
 }
 
+/// `pr_title_before`: the bound PR's title captured at the same moment as
+/// `pr_body_before` (execution start). Backs `boss pr body`, which returns
+/// both title and body so a worker doing read-modify-write on the
+/// description doesn't need a separate `gh pr view` for the title.
+/// Idempotent.
+pub(crate) fn migrate_work_executions_pr_title_before(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_title_before")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN pr_title_before TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// `dispatch_wait_reason` + `dispatch_wait_since`: the dispatcher's
 /// current defer reason (`chain_serialized`, `pool_exhausted`, ...) for a
 /// `ready` execution that hasn't claimed a worker slot yet, and when that
@@ -136,6 +148,65 @@ pub(crate) fn migrate_tasks_parent_task_id_column(conn: &Connection) -> Result<(
         "CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id
              ON tasks(parent_task_id);",
     )?;
+    Ok(())
+}
+
+/// Flatten nested revision parentage so every revision's `parent_task_id`
+/// points at the chain root (the original non-revision work item).
+///
+/// Historically, `create_revision` stored the caller's parent selector
+/// verbatim — so a revision filed against another revision (manual
+/// `create-revision --parent <rev>`, PR-review / CI / conflict producers
+/// against a revision work item) nested under that revision. The UI and
+/// `list_revisions --parent <root>` only surface direct children of the
+/// root, which hid nested revisions from the chain.
+///
+/// New inserts already canonicalize via [`assert_parent_revisable_and_insert`].
+/// This migration repairs existing nested rows in place: walks each
+/// revision whose parent is itself a revision up to the non-revision
+/// chain root and rewrites `parent_task_id`. Soft-deleted rows are
+/// included so a later restore cannot reintroduce nesting. Status,
+/// executions, PR association, dependency edges, and sequence order
+/// (creation-order R<n>) are untouched. Idempotent: a second pass finds
+/// no nested parents and is a no-op.
+pub(crate) fn migrate_flatten_nested_revision_parents(conn: &Connection) -> Result<()> {
+    // Collect candidates first so we don't hold a query open while
+    // rewriting (and so a long chain of nested rows is repaired in one
+    // pass even when an intermediate rewrite changes the join set).
+    let mut stmt = conn.prepare(
+        "SELECT child.id
+         FROM tasks child
+         JOIN tasks parent ON parent.id = child.parent_task_id
+         WHERE child.kind = 'revision'
+           AND parent.kind = 'revision'
+           AND child.parent_task_id IS NOT NULL",
+    )?;
+    let nested_ids: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+    drop(stmt);
+
+    for rev_id in nested_ids {
+        let root_id = chain_root(conn, &rev_id)?;
+        if root_id == rev_id {
+            // Corrupt cycle / broken parent: leave the row alone rather
+            // than inventing a parent. chain_root's cycle guard already
+            // returned a reachable id; if that id is the revision itself
+            // we have nowhere safe to reparent.
+            continue;
+        }
+        // Skip if the resolved root is still a revision (orphaned nested
+        // chain with no non-revision ancestor) — same leave-alone policy.
+        let root_kind: Option<String> = conn
+            .query_row("SELECT kind FROM tasks WHERE id = ?1", params![root_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if root_kind.as_deref() != Some("revision") {
+            conn.execute(
+                "UPDATE tasks SET parent_task_id = ?2 WHERE id = ?1 AND parent_task_id != ?2",
+                params![rev_id, root_id],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -317,6 +388,21 @@ pub(crate) fn migrate_work_executions_revision_stop_contributed_head(conn: &Conn
              ADD COLUMN revision_stop_contributed_head TEXT",
             [],
         )?;
+    }
+    Ok(())
+}
+
+/// `driver_runtime_state`: opaque JSON blob returned by
+/// [`boss_engine_driver::AgentDriver::provision_workspace`] and later
+/// handed to [`boss_engine_driver::AgentDriver::teardown_workspace`].
+/// Survives engine restart, orphan recovery, and workspace release —
+/// deliberately *not* cleared when `workspace_path` is nulled, so a
+/// future Codex retention sweep can still find the recorded
+/// Boss-owned root without scanning a shared provider home. Claude
+/// returns no state, so most rows stay NULL. Idempotent.
+pub(crate) fn migrate_work_executions_driver_runtime_state(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "driver_runtime_state")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN driver_runtime_state TEXT", [])?;
     }
     Ok(())
 }

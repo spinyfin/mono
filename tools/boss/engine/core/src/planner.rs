@@ -60,7 +60,7 @@
 //! [`coerce_stringified_array_fields`] rewrites a remaining known-array field
 //! (`tasks`, `edges`) back into an array, when the string itself parses as
 //! one, before schema validation runs; (3) if validation still fails,
-//! [`plan_with_url`] retries (bounded by [`PLANNER_VALIDATION_ATTEMPTS`])
+//! [`plan_with_call`] retries (bounded by [`PLANNER_VALIDATION_ATTEMPTS`])
 //! with the validation error fed back into the prompt; (4) if the *final*
 //! attempt is still schema-invalid, it falls back to the last schema-valid
 //! proposal an earlier attempt produced (if any) rather than discarding a
@@ -82,6 +82,7 @@ use serde_json::{Value, json};
 use boss_protocol::{PlannerInput, PlannerOutput, planner_output_schema};
 
 use crate::claude_client::{self, CallConfig, ClaudeError, MessagesResponse, RetryPolicy};
+use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 use boss_engine_planner_validation::{OversizeFinding, detect_oversize_tasks};
 
 /// The model the Planner runs on. A direct API call needs a concrete model
@@ -90,7 +91,11 @@ use boss_engine_planner_validation::{OversizeFinding, detect_oversize_tasks};
 /// alias. Opus is deliberate: planning quality matters and the call is
 /// infrequent (once per project), unlike the Haiku one-liner in
 /// [`crate::live_status`]. Tunable here without a schema change (design R5).
-pub const PLANNER_MODEL: &str = "claude-opus-4-8";
+///
+/// This is the *default*; the model actually used comes from the
+/// [`UtilityModel`] provider, whose per-task selection is exactly what keeps
+/// the Planner on Opus while the cheap one-liner sits on Haiku.
+pub const PLANNER_MODEL: &str = UtilityTask::Planner.default_model();
 
 /// `output_config.effort` for the planning call (design "bound … effort").
 /// `high` is the recommended minimum for intelligence-sensitive work;
@@ -213,7 +218,7 @@ impl PlannerOutcome {
                     out.breakdown_found,
                 )
             }
-            PlannerOutcome::NoApiKey => "ANTHROPIC_API_KEY not configured on the engine".to_owned(),
+            PlannerOutcome::NoApiKey => "no utility-model credential configured on the engine".to_owned(),
             PlannerOutcome::ApiError { status, snippet } => {
                 format!("anthropic returned {status}: {snippet}")
             }
@@ -227,7 +232,7 @@ impl PlannerOutcome {
 /// call, carried alongside [`PlannerOutcome`] so the caller (the Populator)
 /// can surface it to the operator without re-deriving it from logs. Purely
 /// observational — it does not change the gate's behaviour (design/T298
-/// lineage), only exposes what [`plan_with_url`] already computes.
+/// lineage), only exposes what [`plan_with_call`] already computes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DecompositionAudit {
     /// Number of attempts on which [`detect_oversize_tasks`] found an
@@ -248,11 +253,12 @@ impl Planner {
     /// Plan the implementation task graph for one project from its merged
     /// design doc.
     ///
-    /// `api_key` is passed in (not read from config here) so the Planner
+    /// `utility` is passed in (not read from config here) so the Planner
     /// stays a pure transform with no config/DB dependency — the caller
-    /// sources it from `Config::anthropic_api_key`, mirroring
-    /// [`crate::live_status::summarize_transcript`]. A `None` key short-
-    /// circuits to [`PlannerOutcome::NoApiKey`] without a network call.
+    /// sources it from `RuntimeConfig::utility_model`, mirroring
+    /// [`crate::live_status::summarize_transcript`]. A provider that cannot
+    /// resolve a credential for [`UtilityTask::Planner`] short-circuits to
+    /// [`PlannerOutcome::NoApiKey`] without a network call.
     ///
     /// The shared [`crate::claude_client`] pipeline retries transient failures
     /// (transport errors and HTTP 429/5xx/overloaded) once before failing safe;
@@ -260,13 +266,13 @@ impl Planner {
     /// validation is surfaced immediately, mapped into a [`PlannerOutcome`].
     /// The second element of the return tuple is the decomposition-gate audit
     /// ([`DecompositionAudit`]) for this call.
-    pub async fn plan(api_key: Option<&str>, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
-        match api_key {
-            None => {
-                tracing::error!("planner: skipped — ANTHROPIC_API_KEY not configured",);
+    pub async fn plan(utility: &dyn UtilityModel, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
+        match utility.resolve(UtilityTask::Planner) {
+            Err(err) => {
+                tracing::error!(%err, "planner: skipped — no utility-model credential");
                 (PlannerOutcome::NoApiKey, DecompositionAudit::default())
             }
-            Some(key) => plan_with_url(claude_client::ANTHROPIC_MESSAGES_URL, key, input).await,
+            Ok(call) => plan_with_call(&call, input).await,
         }
     }
 }
@@ -283,18 +289,18 @@ enum RetryFeedback {
     Oversize(Vec<OversizeFinding>),
 }
 
-/// Core of [`Planner::plan`] with the endpoint URL injected so tests can
-/// drive it against a mock server. Hands each attempt's request to the shared
+/// Core of [`Planner::plan`] with the resolved [`UtilityCall`] injected so
+/// tests can drive it against a mock server. Hands each attempt's request to the shared
 /// [`crate::claude_client`] pipeline (which owns 429/5xx/transport
 /// retry/backoff) and, on a rejection — a schema-validation failure OR an
 /// oversize proposal the decomposition gate catches — rebuilds the request
 /// with the reason fed back into the prompt and tries again, bounded by
 /// [`PLANNER_VALIDATION_ATTEMPTS`], before failing safe / accepting
 /// best-effort.
-async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
+async fn plan_with_call(call: &UtilityCall, input: &PlannerInput) -> (PlannerOutcome, DecompositionAudit) {
     let config = CallConfig::new(PLANNER_TIMEOUT)
         .with_retry(RetryPolicy::new(PLANNER_ATTEMPTS, PLANNER_BACKOFF, PLANNER_BACKOFF))
-        .with_endpoint(url);
+        .with_endpoint(call.endpoint.clone());
 
     let mut feedback: Option<RetryFeedback> = None;
     let mut audit = DecompositionAudit::default();
@@ -305,10 +311,10 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (Plann
     let mut last_valid: Option<(PlannerOutput, usize)> = None;
     for attempt in 1..=PLANNER_VALIDATION_ATTEMPTS {
         let body = match &feedback {
-            None => build_request_body(input),
-            Some(fb) => build_retry_request_body(input, fb),
+            None => build_request_body(input, &call.model),
+            Some(fb) => build_retry_request_body(input, fb, &call.model),
         };
-        match claude_client::send_messages_raw(api_key, &body, &config).await {
+        match claude_client::send_messages_raw(&call.api_key, &body, &config).await {
             Ok(response) => match planner_output_from_response(&response) {
                 Ok(output) => {
                     // Decomposition gate (design brief deliverable 1): reject a
@@ -389,9 +395,9 @@ async fn plan_with_url(url: &str, api_key: &str, input: &PlannerInput) -> (Plann
 
 /// Assemble the Anthropic Messages request body. Public so tests and future
 /// callers can inspect the exact request shape.
-pub fn build_request_body(input: &PlannerInput) -> Value {
+pub fn build_request_body(input: &PlannerInput, model: &str) -> Value {
     json!({
-        "model": PLANNER_MODEL,
+        "model": model,
         "max_tokens": PLANNER_MAX_TOKENS,
         // Bound the reasoning/token spend (design "bound … effort"). Effort
         // lives inside `output_config`, not at the top level.
@@ -467,8 +473,8 @@ pub fn build_user_prompt(input: &PlannerInput) -> String {
 /// the single user turn also carries the previous attempt's rejection reason,
 /// so the model can see and correct exactly what it got wrong instead of
 /// repeating the same mistake blind.
-fn build_retry_request_body(input: &PlannerInput, feedback: &RetryFeedback) -> Value {
-    let mut body = build_request_body(input);
+fn build_retry_request_body(input: &PlannerInput, feedback: &RetryFeedback, model: &str) -> Value {
+    let mut body = build_request_body(input, model);
     if let Some(content) = body
         .get_mut("messages")
         .and_then(|messages| messages.get_mut(0))
@@ -617,7 +623,7 @@ fn derive_effort_audit(output: &mut PlannerOutput) {
 /// swaps it in place before schema validation, logging a warning so the slip
 /// stays visible rather than being silently masked. A string that fails to
 /// parse (or parses to something other than an array) is left untouched —
-/// serde still rejects it, and the retry loop in [`plan_with_url`] then feeds
+/// serde still rejects it, and the retry loop in [`plan_with_call`] then feeds
 /// the resulting schema error back to the model.
 fn coerce_stringified_array_fields(input: &mut Value) {
     let Some(obj) = input.as_object_mut() else {
@@ -734,6 +740,36 @@ shared root), which is a normal `dependent` edge.\n\
 other task — the deferral is a scheduling signal, not a different shape of \
 work.\n\
 \n\
+## coordinator-only landing site gate\n\
+\n\
+Every task you propose is dispatched to a cube worker, which leases a repo \
+workspace. A cube worker cannot read or write coordinator-private state: the \
+Boss coordinator's private memory store, the engine's runtime database, or \
+any artifact under the coordinator's local Application Support directory. A \
+task whose entire deliverable is an action on that state is unexecutable by \
+any worker, no matter how clearly it is briefed.\n\
+\n\
+- **Never emit a `project_task` (or `investigation` task) whose landing \
+site is coordinator-only state.** Recognize this shape: \"update the \
+coordinator's memory/runbook store\", \"prune/mark memory notes for \
+deletion\", \"write to the runtime database\", \"update engine taxonomy \
+state directly\" — none of these land in a repo, so none are worker-filable, \
+even when the surrounding design doc's rationale is entirely legitimate.\n\
+- **Account for it visibly — never just leave it out.** Unlike a deferred \
+item (which still becomes a `[deferred] `-prefixed task), a coordinator-only \
+item must NOT be emitted as a task at all: omit it from `tasks` and add one \
+line per omitted item to `notes` describing the item and stating that it is \
+coordinator-only work the coordinator must perform directly in-session.\n\
+- A design doc can correctly *describe* a coordinator-only constraint (e.g. \
+\"the memory store must stop being a runbook\") without every task derived \
+from it being coordinator-only — judge each breakdown item on where ITS OWN \
+deliverable lands, not on whether the doc's subject matter mentions \
+coordinator state.\n\
+- When only PART of a breakdown item is coordinator-only (e.g. it also \
+touches a repo file), still emit the task but scope its `description` to \
+the repo-side portion only, and note in `notes` that the coordinator-only \
+portion was excluded and why.\n
+
 ## task sizing contract — one reviewable PR per task\n\
 \n\
 Every task you propose must be single-subsystem, single-PR, and completable \
@@ -897,6 +933,17 @@ mod tests {
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// A [`UtilityCall`] pointing at a `wiremock` server, standing in for what
+    /// the engine's provider would resolve for [`UtilityTask::Planner`].
+    fn mock_call(server_uri: &str) -> UtilityCall {
+        UtilityCall {
+            provider: "anthropic".to_owned(),
+            endpoint: format!("{server_uri}/v1/messages"),
+            model: PLANNER_MODEL.to_owned(),
+            api_key: "test-key".to_owned(),
+        }
+    }
+
     fn sample_input() -> PlannerInput {
         PlannerInput::builder()
             .design_doc("# Design\n\n## Proposed implementation task breakdown\n1. Protocol types.\n2. Engine handler. Depends on 1.\n")
@@ -970,7 +1017,7 @@ mod tests {
 
     #[test]
     fn build_request_body_forces_the_planner_tool() {
-        let body = build_request_body(&sample_input());
+        let body = build_request_body(&sample_input(), PLANNER_MODEL);
         assert_eq!(body["model"], PLANNER_MODEL);
         assert_eq!(body["max_tokens"], PLANNER_MAX_TOKENS);
         assert_eq!(body["output_config"]["effort"], PLANNER_EFFORT);
@@ -1060,6 +1107,16 @@ mod tests {
         assert!(SYSTEM_PROMPT.contains("[deferred] "));
         assert!(SYSTEM_PROMPT.contains("Do not gate in-scope work on a deferred task"));
         assert!(SYSTEM_PROMPT.contains("stretch goal"));
+    }
+
+    /// The coordinator-only landing site gate must survive edits to this
+    /// 200+ line literal: a cube worker cannot land work in coordinator-only
+    /// state, so such an item must never be emitted as a dispatchable task.
+    #[test]
+    fn system_prompt_encodes_coordinator_only_gate() {
+        assert!(SYSTEM_PROMPT.contains("coordinator-only landing site gate"));
+        assert!(SYSTEM_PROMPT.contains("whose landing site is coordinator-only state"));
+        assert!(SYSTEM_PROMPT.contains("coordinator must perform directly in-session"));
     }
 
     fn response_from(value: Value) -> MessagesResponse {
@@ -1309,7 +1366,8 @@ mod tests {
 
     #[tokio::test]
     async fn plan_returns_no_api_key_when_key_missing() {
-        let (outcome, audit) = Planner::plan(None, &sample_input()).await;
+        let keyless = crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None);
+        let (outcome, audit) = Planner::plan(&keyless, &sample_input()).await;
         assert!(matches!(outcome, PlannerOutcome::NoApiKey));
         assert_eq!(outcome.tag(), "no_api_key");
         assert_eq!(audit, DecompositionAudit::default());
@@ -1326,8 +1384,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
 
         match outcome {
             PlannerOutcome::Success(out) => {
@@ -1356,8 +1413,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after one retry, got {outcome:?}",
@@ -1429,8 +1485,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => assert_eq!(out.effort_audit.len(), 1),
             other => panic!("expected Success via derivation, got {other:?}"),
@@ -1462,8 +1517,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "expected success after the validation retry, got {outcome:?}",
@@ -1499,8 +1553,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::InvalidOutput(_)),
             "expected InvalidOutput after exhausting retries, got {outcome:?}",
@@ -1524,8 +1577,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, _audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, _audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::ApiError { status, .. } => assert_eq!(status, 401),
             other => panic!("expected ApiError, got {other:?}"),
@@ -1634,8 +1686,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
                 assert_eq!(out.tasks.len(), 3, "the decomposed plan must replace the monolith");
@@ -1688,8 +1739,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         assert!(
             matches!(outcome, PlannerOutcome::Success(_)),
             "an unsplittable oversize proposal is accepted best-effort, not failed: {outcome:?}",
@@ -1734,8 +1784,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (outcome, audit) =
-            plan_with_url(&format!("{}/v1/messages", server.uri()), "test-key", &sample_input()).await;
+        let (outcome, audit) = plan_with_call(&mock_call(&server.uri()), &sample_input()).await;
         match outcome {
             PlannerOutcome::Success(out) => {
                 assert_eq!(

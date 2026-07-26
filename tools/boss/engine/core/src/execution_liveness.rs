@@ -176,33 +176,34 @@ pub fn execution_workspace_dir_missing(execution: &WorkExecution) -> bool {
 /// this is called.
 pub fn finalize_dead_automation_triage_run(work_db: &WorkDb, execution: &WorkExecution, death_reason: &str) {
     let automation_id = &execution.work_item_id;
-    let (outcome, produced_task_id, detail) = match work_db.find_most_recent_open_task_for_automation(automation_id) {
-        Ok(Some(task)) => {
-            let detail = format!(
-                "produced task {} (recovered after pane death before Stop: {death_reason})",
-                task.short_label()
-            );
-            (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
-        }
-        Ok(None) => (
-            AUTOMATION_OUTCOME_FAILED_GAVE_UP,
-            None,
-            format!("no task was produced (pane died before Stop: {death_reason})"),
-        ),
-        Err(err) => {
-            tracing::warn!(
-                execution_id = %execution.id,
-                automation_id = %automation_id,
-                error = %format!("{err:#}"),
-                "dead-triage reconcile: open-task lookup failed; recording failed_gave_up",
-            );
-            (
+    let (outcome, produced_task_id, detail) =
+        match work_db.find_most_recent_open_task_for_automation(automation_id, execution.created_epoch()) {
+            Ok(Some(task)) => {
+                let detail = format!(
+                    "produced task {} (recovered after pane death before Stop: {death_reason})",
+                    task.short_label()
+                );
+                (AUTOMATION_OUTCOME_PRODUCED_TASK, Some(task.id), detail)
+            }
+            Ok(None) => (
                 AUTOMATION_OUTCOME_FAILED_GAVE_UP,
                 None,
                 format!("no task was produced (pane died before Stop: {death_reason})"),
-            )
-        }
-    };
+            ),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    automation_id = %automation_id,
+                    error = %format!("{err:#}"),
+                    "dead-triage reconcile: open-task lookup failed; recording failed_gave_up",
+                );
+                (
+                    AUTOMATION_OUTCOME_FAILED_GAVE_UP,
+                    None,
+                    format!("no task was produced (pane died before Stop: {death_reason})"),
+                )
+            }
+        };
 
     match work_db.finalize_automation_triage_run(&execution.id, outcome, produced_task_id.as_deref(), Some(&detail)) {
         Ok(true) => {}
@@ -248,7 +249,18 @@ pub async fn finalize_gone_execution(
     details: serde_json::Value,
 ) -> bool {
     match work_db.mark_execution_orphaned(&execution.id, reason) {
-        Ok(_) => {}
+        Ok(_) => {
+            // Reap termination path (dead-pane / lost-workspace reconcile):
+            // tear down any driver-owned state outside the workspace.
+            // `mark_execution_orphaned` preserves `workspace_path` on the
+            // row, so the pre-call value on `execution` is still current.
+            crate::driver_teardown::teardown_driver_workspace(
+                work_db,
+                &execution.id,
+                execution.workspace_path.as_deref().map(Path::new),
+            )
+            .await;
+        }
         Err(err) => {
             let already_terminal = work_db
                 .get_execution(&execution.id)
@@ -525,6 +537,38 @@ mod tests {
         let runs = db.list_automation_runs(&automation).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].outcome, AUTOMATION_OUTCOME_FAILED_GAVE_UP);
+    }
+
+    /// Asserts that `finalize_gone_execution` invokes driver teardown
+    /// exactly once.
+    #[tokio::test]
+    async fn finalize_gone_execution_tears_down_driver_workspace() {
+        crate::driver_teardown::test_hooks::reset();
+
+        let (_dir, db) = open_db();
+        let product = create_product(&db);
+        let automation = create_automation(&db, &product);
+        let exec = db.create_automation_triage_execution(&automation, TEST_REPO).unwrap();
+        seed_dispatch_run(&db, &automation, &exec.id);
+
+        let sink = RecordingDispatchEventSink::new();
+        let reconciled = finalize_gone_execution(
+            &db,
+            &sink,
+            &exec,
+            "reconcile for teardown wiring coverage",
+            "its cube workspace is gone",
+            Stage::LostWorkspaceReconcile,
+            reap_details(),
+        )
+        .await;
+
+        assert!(reconciled);
+        assert_eq!(
+            crate::driver_teardown::test_hooks::count(),
+            1,
+            "finalize_gone_execution must invoke driver teardown exactly once",
+        );
     }
 
     /// Still-live retry path (the `Err`-arm `!already_terminal` branch). When

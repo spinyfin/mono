@@ -167,6 +167,14 @@ pub struct Location {
     pub column: Option<u32>,
 }
 
+/// Non-file surface a finding refers to when it has no [`Location`] — the PR
+/// description or the commit message. Set via [`Finding::on_surface`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Surface {
+    PrDescription,
+    CommitMessage,
+}
+
 /// A single text substitution within a file.
 #[derive(Debug, Clone)]
 pub struct FileEdit {
@@ -236,6 +244,7 @@ pub struct Finding {
     pub severity: Severity,
     pub message: String,
     pub location: Option<Location>,
+    pub surface: Option<Surface>,
     pub remediations: Vec<String>,
     pub suggested_fix: Option<SuggestedFix>,
 }
@@ -261,6 +270,7 @@ impl Finding {
             severity,
             message: message.into(),
             location: None,
+            surface: None,
             remediations: vec![],
             suggested_fix: None,
         }
@@ -283,6 +293,13 @@ impl Finding {
             line: Some(line),
             column: Some(column),
         });
+        self
+    }
+
+    /// Attach a non-file surface (PR description or commit message) to this
+    /// finding, for a changeset-scoped check with no file location to point at.
+    pub fn on_surface(mut self, surface: Surface) -> Self {
+        self.surface = Some(surface);
         self
     }
 

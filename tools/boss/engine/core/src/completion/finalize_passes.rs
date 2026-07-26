@@ -15,29 +15,37 @@ impl WorkerCompletionHandler {
     /// marker protocol and finalise both its `automation_runs` row and the
     /// execution itself.
     ///
-    /// The worker was told to end its final message with exactly one of
-    /// `automation: task <id>` or `automation: skip — <reason>`. Steps:
-    /// 1. read the final assistant message and parse the decision;
-    /// 2. for a `task` marker, verify the id resolves to a task carrying this
-    ///    automation's provenance — so a misbehaving agent can't pass off an
-    ///    unrelated task as its own output;
+    /// The worker was told to write its decision to the engine-owned
+    /// structured-output artifact and to end its final message with the
+    /// matching `automation: task <id>` / `automation: skip — <reason>`
+    /// marker. Steps:
+    /// 1. resolve the decision — artifact first, the driver's marker-line
+    ///    producer as fallback (see
+    ///    [`crate::automation_triage::resolve_triage_decision`]);
+    /// 2. for a `task` decision, verify the id resolves to a task carrying
+    ///    this automation's provenance — so a misbehaving agent can't pass off
+    ///    an unrelated task as its own output;
     /// 3. record the terminal outcome (`produced_task` / `skipped`, or keep
-    ///    `failed_will_retry` for a missing / ambiguous / unverifiable marker);
+    ///    `failed_will_retry` for a missing / ambiguous / unverifiable
+    ///    decision);
     /// 4. finalise the execution (`completed`) and release pane + workspace.
     pub(super) async fn finalize_automation_triage(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
         let automation_id = execution.work_item_id.clone();
+        // The transcript state is still read (and kept) because the
+        // no-decision detail below distinguishes "ran but reported nothing"
+        // from "produced no transcript at all" — but it is only the *fallback*
+        // channel for the decision itself.
         let transcript = self.read_final_triage_message(&execution.id).await;
-        let decision = match &transcript {
-            TriageTranscript::FinalMessage(text) => parse_triage_decision(text),
-            // No path / unreadable / no assistant prose all mean we have no
-            // message to scan for a marker — treat as NoDecision, but the
-            // specific transcript state is folded into the detail below so the
-            // run history distinguishes "ran but emitted no marker" from
-            // "produced no transcript at all".
-            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => {
-                TriageDecision::NoDecision
-            }
+        let final_message = match &transcript {
+            TriageTranscript::FinalMessage(text) => Some(text.as_str()),
+            TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         };
+        let decision = crate::automation_triage::resolve_triage_decision(
+            &crate::driver::ClaudeDriver,
+            &self.structured_output_dir,
+            &execution.id,
+            final_message,
+        );
 
         let (outcome, produced_task_id, detail): (&str, Option<String>, Option<String>) = match &decision {
             TriageDecision::ProducedTask(marker_id) => {
@@ -87,27 +95,41 @@ impl WorkerCompletionHandler {
                 // Build the base detail for the no-marker case (used when
                 // recovery fails or is inapplicable).
                 let base_detail = triage_no_decision_detail(&transcript);
-                // Recovery path: if the worker ran `boss task create --automation`
-                // but forgot to emit the decision marker (or emitted it in a turn
-                // the Stop hook raced past), the open-task record is the ground
-                // truth. Treat the most recently created open task as the
-                // produced outcome rather than recording `failed_will_retry`.
+                // Primary decision-derivation path: a valid marker is the
+                // exception, not the rule (a measurement of 67 recent
+                // `produced_task` finalizations found none with one), so this
+                // is not a rare "recovery" — it is how almost every triage run
+                // is actually decided. Derive the outcome from what the run
+                // provably did: if it called `boss task create --automation`,
+                // the open-task record is ground truth for that; if it didn't,
+                // but its own final words plainly concluded there is nothing
+                // to do, that conclusion stands in for the missing marker.
+                // Bounding the task lookup to tasks created no earlier than
+                // this execution started (`not_before_epoch`) keeps a task
+                // left open by an *earlier* run (e.g. stuck in review) from
+                // being misattributed to this one.
                 //
-                // Without this, every retry creates another task until the
-                // open-task cap fills, then loops as `failed_will_retry` forever
-                // — the exact "Fix compilation warnings: at limit 3/3" wedge in
-                // the field evidence.
-                match self.work_db.find_most_recent_open_task_for_automation(&automation_id) {
+                // This matters most on retry: without it, a run that created a
+                // task but lost its marker records `failed_will_retry`, and the
+                // next fire creates a second task for the same work. (Reaching
+                // the open-task cap itself is prevented upstream by the
+                // scheduler's `suppressed_at_limit` gate, not here — the
+                // `not_before_epoch` bound means rows from earlier runs are
+                // deliberately invisible to this lookup.)
+                match self
+                    .work_db
+                    .find_most_recent_open_task_for_automation(&automation_id, execution.created_epoch())
+                {
                     Ok(Some(task)) => {
-                        tracing::warn!(
+                        tracing::info!(
                             execution_id = %execution.id,
                             automation_id = %automation_id,
                             recovered_task_id = %task.id,
                             base_detail,
                             "triage run ended without a valid decision marker but \
-                             found an open task produced by this automation; \
-                             recording as produced_task (marker-recovery path \
-                             prevents duplicate tasks on retry)",
+                             found an open task produced by this run; recording as \
+                             produced_task (marker-recovery is the primary decision \
+                             path — see find_most_recent_open_task_for_automation)",
                         );
                         (
                             AUTOMATION_OUTCOME_PRODUCED_TASK,
@@ -128,13 +150,13 @@ impl WorkerCompletionHandler {
                         // `failed_will_retry` forever, re-running a full session
                         // to re-prove an already-clean repo.
                         Some(reason) => {
-                            tracing::warn!(
+                            tracing::info!(
                                 execution_id = %execution.id,
                                 automation_id = %automation_id,
                                 base_detail,
                                 "triage run created no task and emitted no skip marker, but its \
                                  final message plainly concluded there is nothing to do; recording \
-                                 as skipped (skip marker-recovery) instead of failed_will_retry",
+                                 as skipped (skip marker-recovery is the primary decision path)",
                             );
                             (
                                 AUTOMATION_OUTCOME_SKIPPED,
@@ -145,7 +167,29 @@ impl WorkerCompletionHandler {
                                 )),
                             )
                         }
-                        None => (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail)),
+                        // Neither a task nor a recoverable skip conclusion: a
+                        // genuine failure, distinct from the two paths above —
+                        // this is the only case that should still read as
+                        // `failed_will_retry` / "Failed (retrying)" to an
+                        // operator.
+                        None => {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                automation_id = %automation_id,
+                                base_detail,
+                                "triage run ended with no valid decision marker, no task \
+                                 created, and no recoverable skip conclusion; recording as \
+                                 failed_will_retry (genuine failure, not marker-recovery)",
+                            );
+                            (
+                                AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                                None,
+                                Some(format!(
+                                    "no decision: no task created and no no-work \
+                                     conclusion — {base_detail}"
+                                )),
+                            )
+                        }
                     },
                     Err(err) => {
                         tracing::warn!(
@@ -155,7 +199,11 @@ impl WorkerCompletionHandler {
                             "triage recovery: DB query for open tasks failed; \
                              recording as failed_will_retry",
                         );
-                        (AUTOMATION_OUTCOME_FAILED_WILL_RETRY, None, Some(base_detail))
+                        (
+                            AUTOMATION_OUTCOME_FAILED_WILL_RETRY,
+                            None,
+                            Some(format!("db error during recovery lookup — {base_detail}")),
+                        )
                     }
                 }
             }
@@ -180,6 +228,11 @@ impl WorkerCompletionHandler {
             ),
         }
 
+        // The decision has been consumed and recorded; reap the artifact so a
+        // re-fired automation reusing this execution id can never read a stale
+        // one.
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
+
         // Finalise the execution + release pane and cube workspace, mirroring
         // the PR-completion finalizer's release order. Capture the lease id
         // before `complete_pane_parked_execution` nulls the lease columns.
@@ -194,12 +247,23 @@ impl WorkerCompletionHandler {
         // sweep re-finalize an already-finalized triage run later with a
         // misleading pane-died detail.
         let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
             Some(&format!("automation triage: {outcome}")),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Stop-driven completion termination path: tear down any
+                // driver-owned state outside the workspace, captured before
+                // `complete_pane_parked_execution` nulls `workspace_path`.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
+            }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "automation triage finalise: execution already terminal; nothing to do",
@@ -294,6 +358,7 @@ impl WorkerCompletionHandler {
         // `complete_pane_parked_execution` (see that finalizer's comment for
         // why this does not depend on there being a still-`active` run).
         let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
@@ -303,7 +368,17 @@ impl WorkerCompletionHandler {
                 "answer agent: no reply posted"
             }),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Stop-driven completion termination path: tear down any
+                // driver-owned state outside the workspace, captured before
+                // `complete_pane_parked_execution` nulls `workspace_path`.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
+            }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "answer-agent finalise: execution already terminal; nothing to do",
@@ -412,21 +487,24 @@ impl WorkerCompletionHandler {
 
         // Read the reviewer's ReviewResult. PRIMARY channel: the engine-owned
         // structured-output artifact the reviewer wrote, schema-validated here
-        // via `ReviewResult::from_json`. TRANSITIONAL FALLBACK: scrape the
-        // transcript's final message (fenced / bare JSON) — this covers remote
-        // workers, whose artifact is written on the remote host and not
-        // readable here, and any local artifact-write failure. The legacy
-        // scraper (`extract_review_result` + the balanced-brace hack) is kept
-        // only as this fallback and can be deleted once the artifact path is
-        // proven in production.
+        // via `ReviewResult::from_json`. TRANSITIONAL FALLBACK: ask the Claude
+        // driver's fallback producer to recover the JSON from the transcript's
+        // final message (fenced / bare) — this covers remote workers, whose
+        // artifact is written on the remote host and not readable here, and
+        // any local artifact-write failure.
         //
-        // `last_parse_error` captures the serde error from the last failed
-        // parse attempt across both channels so it can be included verbatim
-        // in the reviewer re-prompt, giving the reviewer the specific field +
-        // type message rather than a generic "write valid JSON" instruction.
-        let mut last_parse_error: Option<String> = None;
+        // `parse_error` captures the serde error from the artifact if it was
+        // present-but-invalid, else from the driver fallback's most-preferred
+        // failing candidate, so the reviewer re-prompt names the specific
+        // field + type mismatch rather than a generic "write valid JSON"
+        // instruction.
+        let mut parse_error: Option<String> = None;
 
-        let from_artifact = match crate::structured_output::read(&self.structured_output_dir, &execution.id) {
+        let from_artifact = match crate::structured_output::read(
+            &self.structured_output_dir,
+            &execution.id,
+            crate::structured_output::StructuredOutputKind::ReviewResult,
+        ) {
             None => None,
             Some(raw) => match crate::pr_review::ReviewResult::from_json(&raw) {
                 Ok(result) => Some(result),
@@ -437,9 +515,9 @@ impl WorkerCompletionHandler {
                         producing_task_id,
                         error = %err_str,
                         "pr_review finalize: structured-output artifact present but did not \
-                         validate as ReviewResult; trying the transcript fallback",
+                         validate as ReviewResult; trying the driver's transcript fallback",
                     );
-                    last_parse_error = Some(err_str);
+                    parse_error = Some(err_str);
                     None
                 }
             },
@@ -449,7 +527,11 @@ impl WorkerCompletionHandler {
             None => match self.read_final_triage_message(&execution.id).await.into_message() {
                 None => None,
                 Some(text) => {
-                    let (result, err) = crate::pr_review::extract_review_result_verbose(&text);
+                    let candidates = crate::driver::ClaudeDriver.structured_output_fallback(
+                        crate::structured_output::StructuredOutputKind::ReviewResult,
+                        &text,
+                    );
+                    let (result, err) = crate::pr_review::review_result_from_candidates(&candidates);
                     if let Some(ref e) = err {
                         tracing::warn!(
                             execution_id = %execution.id,
@@ -458,8 +540,8 @@ impl WorkerCompletionHandler {
                             "pr_review finalize: transcript JSON block present but did not \
                              validate as ReviewResult",
                         );
-                        if last_parse_error.is_none() {
-                            last_parse_error = err;
+                        if parse_error.is_none() {
+                            parse_error = err;
                         }
                     }
                     result
@@ -491,11 +573,15 @@ impl WorkerCompletionHandler {
                     return StopOutcome::ReviewPassAwaitingResult;
                 }
                 NudgeDecision::Proceed { count } => {
-                    let output_path = crate::structured_output::path_in(&self.structured_output_dir, &execution.id);
+                    let output_path = crate::structured_output::path_for(
+                        &self.structured_output_dir,
+                        &execution.id,
+                        crate::structured_output::StructuredOutputKind::ReviewResult,
+                    );
                     // Include the specific serde error in the probe when we have one so
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
-                    let probe = if let Some(ref parse_err) = last_parse_error {
+                    let probe = if let Some(ref parse_err) = parse_error {
                         format!(
                             "Your review did not produce a valid ReviewResult. The JSON was \
                              present but failed to parse:\n\n  {parse_err}\n\n\
@@ -541,7 +627,7 @@ impl WorkerCompletionHandler {
 
         // We are going to finalise now (we have a result, or we gave up after
         // re-prompting). Reap the engine-owned artifact either way.
-        crate::structured_output::clear(&self.structured_output_dir, &execution.id);
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
 
         // Extract head_sha before review_result is (potentially)
         // consumed by the revision path below. Used to update last_reviewed_sha.

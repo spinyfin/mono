@@ -1506,13 +1506,13 @@ impl ExecutionCoordinator {
     /// disk, a DB error) yields `None`: recovery is a precaution layered on
     /// top of dispatch and must never be able to break it.
     fn recovery_patch_for_resume(&self, execution: &WorkExecution) -> Option<(String, PathBuf)> {
-        let recovery_dir = crate::recovery_backup::default_recovery_dir()?;
+        let recovery_dir = boss_engine_recovery::recovery_backup::default_recovery_dir()?;
         let prior = self
             .work_db
             .get_prior_orphaned_execution(&execution.work_item_id, &execution.id)
             .ok()
             .flatten()?;
-        let patch = crate::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
+        let patch = boss_engine_recovery::recovery_apply::find_patch(&recovery_dir, &prior.id)?;
         Some((prior.id, patch))
     }
 
@@ -1556,10 +1556,10 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     lease,
-                    crate::recovery_apply::RecoveryReport {
+                    boss_engine_recovery::recovery_apply::RecoveryReport {
                         for_execution_id: execution.id.clone(),
                         from_execution_id: String::new(),
-                        source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
                         applied: None,
                         patch_error: None,
                     },
@@ -1576,10 +1576,10 @@ impl ExecutionCoordinator {
                 execution,
                 worker_id,
                 lease,
-                crate::recovery_apply::RecoveryReport {
+                boss_engine_recovery::recovery_apply::RecoveryReport {
                     for_execution_id: execution.id.clone(),
                     from_execution_id: dead_execution_id,
-                    source: crate::recovery_apply::RecoverySource::CubeInPlace,
+                    source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
                     applied: None,
                     patch_error: None,
                 },
@@ -1590,7 +1590,7 @@ impl ExecutionCoordinator {
         }
 
         // ── 2. patch fallback ────────────────────────────────────────────
-        match crate::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
+        match boss_engine_recovery::recovery_apply::apply_recovery_patch(&lease.workspace_path, &patch_path) {
             Ok(Some(applied)) => {
                 tracing::info!(
                     execution_id = %execution.id,
@@ -1603,10 +1603,10 @@ impl ExecutionCoordinator {
                     execution,
                     worker_id,
                     lease,
-                    crate::recovery_apply::RecoveryReport {
+                    boss_engine_recovery::recovery_apply::RecoveryReport {
                         for_execution_id: execution.id.clone(),
                         from_execution_id: dead_execution_id,
-                        source: crate::recovery_apply::RecoverySource::Patch,
+                        source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
                         applied: Some(applied),
                         patch_error: None,
                     },
@@ -1637,7 +1637,7 @@ impl ExecutionCoordinator {
                             })),
                     )
                     .await;
-                crate::recovery_apply::mark_patch_consumed(&patch_path);
+                boss_engine_recovery::recovery_apply::mark_patch_consumed(&patch_path);
             }
             Err(err) => {
                 let message = format!("{err:#}");
@@ -1667,10 +1667,10 @@ impl ExecutionCoordinator {
                     .await;
                 // Deliberately NOT marked consumed: the patch is the only
                 // copy of the work and a human may still salvage it by hand.
-                let report = crate::recovery_apply::RecoveryReport {
+                let report = boss_engine_recovery::recovery_apply::RecoveryReport {
                     for_execution_id: execution.id.clone(),
                     from_execution_id: dead_execution_id,
-                    source: crate::recovery_apply::RecoverySource::Patch,
+                    source: boss_engine_recovery::recovery_apply::RecoverySource::Patch,
                     applied: None,
                     patch_error: Some(message),
                 };
@@ -1695,12 +1695,12 @@ impl ExecutionCoordinator {
         execution: &WorkExecution,
         worker_id: &str,
         lease: &CubeWorkspaceLease,
-        report: crate::recovery_apply::RecoveryReport,
+        report: boss_engine_recovery::recovery_apply::RecoveryReport,
         consume_patch: Option<&Path>,
     ) {
         let source = match report.source {
-            crate::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
-            crate::recovery_apply::RecoverySource::Patch => "patch",
+            boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace => "cube_in_place",
+            boss_engine_recovery::recovery_apply::RecoverySource::Patch => "patch",
         };
         let restored = report.applied.as_ref().map(|a| a.summary());
         if let Err(err) = report.write(&lease.workspace_path) {
@@ -1726,7 +1726,7 @@ impl ExecutionCoordinator {
             )
             .await;
         if let Some(patch) = consume_patch {
-            crate::recovery_apply::mark_patch_consumed(patch);
+            boss_engine_recovery::recovery_apply::mark_patch_consumed(patch);
         }
     }
 

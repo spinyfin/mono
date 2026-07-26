@@ -618,7 +618,11 @@ async fn do_scan_pr(pr_url: &str) -> Result<PrScanResult> {
 /// [`boss_github::pr_files::fetch_pr_view_json`], shared with `runner.rs`
 /// and `stacked_pr_structuring.rs`.
 async fn fetch_pr_view_json(pr_url: &str) -> Result<serde_json::Value> {
-    boss_github::pr_files::fetch_pr_view_json(pr_url, "files,headRefName,baseRefName").await
+    boss_gh_telemetry::scope(
+        boss_gh_telemetry::callers::DESIGN_DETECTOR,
+        boss_github::pr_files::fetch_pr_view_json(pr_url, "files,headRefName,baseRefName"),
+    )
+    .await
 }
 
 /// Pure parse of the `gh pr view --json files,headRefName,baseRefName`

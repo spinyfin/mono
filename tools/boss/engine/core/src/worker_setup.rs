@@ -63,7 +63,7 @@ use serde_json;
 use boss_protocol::ExecutionKind;
 
 use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
-use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
+use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig};
 use crate::ssh_transport::shell_quote;
 
 // Re-export guard command constants so the test module (which uses `use
@@ -73,6 +73,10 @@ use crate::ssh_transport::shell_quote;
 pub(crate) use crate::driver::claude::{
     BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
 };
+// Only constructed directly by tests (`ProgressIngress::HookCallback(..)`
+// fixtures) — production code only destructures it via `hooks_map_for_ingress`.
+#[cfg(test)]
+pub(crate) use crate::driver::ProgressObservationWiring;
 
 /// The kind of worker being spawned, used to select the per-kind tool
 /// denylist. Kept in this module so the denylist rules and the kind
@@ -277,9 +281,13 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            invocation on a timeout but the push had actually landed), it\n\
            returns that PR's URL instead of erroring. Use `cube pr update`\n\
            only when you have new commits to push onto an already-open PR;\n\
-           it errors if none does. Check first with:\n\
-           `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
-           or `gh pr view`.\n\
+           it errors if none does. Check first with `boss pr status` — one\n\
+           local round trip against the engine, not GitHub. Do NOT rely on\n\
+           `boss context`'s `task.pr_url` field for this: it is NULL for a\n\
+           revision task by design (a revision never owns its own PR — the\n\
+           chain root does), so an empty `task.pr_url` does NOT mean \"no\n\
+           PR exists\" when you're a revision worker. `boss pr status`\n\
+           resolves your actually-bound PR correctly either way.\n\
          - Do not hard-wrap PR bodies.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
@@ -288,6 +296,53 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          - Print the PR URL on its own line as the last thing in your final response.\n\
          - Before pushing, run `jj diff -r @`. If the diff is empty,\n\
            do NOT commit, push, or open a PR — stop and explain.\n\
+         \n\
+         ## Checking your own PR's state\n\
+         \n\
+         Boss already stores most of what you'd otherwise ask GitHub for.\n\
+         These read your own PR only — never another run's — and cost one\n\
+         local round trip against the engine, not a GitHub API call:\n\
+         \n\
+         - `boss pr status` — includes your resolved `pr_url`, the\n\
+           cheapest way to answer \"do I already have a PR?\" before\n\
+           deciding between `cube pr create` and `cube pr update`. Prefer\n\
+           this over `boss context`'s `task.pr_url` field: that field is\n\
+           NULL for a revision task by design (the chain root owns the PR,\n\
+           not the revision), so it reads as \"no PR\" even when one exists.\n\
+           `boss pr status` also returns `mergeable`, `merge_state_status`,\n\
+           `head_sha`, and `observed_at` for your own PR, e.g.:\n\
+           ```sh\n\
+           boss pr status --json\n\
+           ```\n\
+           This is Boss's **last stored observation from the merge poller,\n\
+           not live GitHub truth** — `observed_at` (Unix epoch seconds) is\n\
+           the timestamp of that observation, not of your call. Right after\n\
+           a push, the stored snapshot usually still reflects the *pre-push*\n\
+           state. If you need current state (e.g. right after `cube pr\n\
+           update` to see whether the push cleared a conflict), pass\n\
+           `--refresh` for one bounded, rate-limited live check:\n\
+           ```sh\n\
+           boss pr status --refresh --json\n\
+           ```\n\
+           A refresh can be silently throttled (`refresh_throttled: true`\n\
+           in the response) if the engine-wide budget is exhausted — in\n\
+           that case you still get the last stored snapshot, never an error\n\
+           or a hang. Never loop calling `--refresh` waiting for a state\n\
+           change: the engine's own merge poller is what watches your PR to\n\
+           green after you push, not you — the same \"do not babysit CI\"\n\
+           principle your task prompt states applies here too.\n\
+         - `boss pr body` — the PR title and body/description Boss\n\
+           snapshotted when this run started, for a read-modify-write of\n\
+           the description without a `gh pr view` round trip. If the\n\
+           response's `body` is null (`--json`) or says \"(none stored)\"\n\
+           (text), it means this run began a brand-new PR flow — there is\n\
+           nothing to diff against yet, you are about to write the first\n\
+           description via `cube pr\n\
+           create --body-file`. It does NOT mean the PR has an empty\n\
+           description; an intentionally empty one is stored as `\"\"`, not\n\
+           null. Only fall back to `gh pr view --json body` if you must\n\
+           confirm the null case is not a fetch failure rather than a\n\
+           new-PR flow.\n\
          \n\
          ## Your workspace\n\
          \n\
@@ -483,8 +538,12 @@ enum EngineDataDirSandbox {
 /// the `boss-event` shim with absolute paths so the hook fires
 /// regardless of `PATH`. The engine points the session at this via
 /// `claude --settings`; it is written outside the workspace tree.
-pub fn render_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Enabled);
+///
+/// `driver` supplies ProgressObservation + ToolUseInterception wiring —
+/// resolved by the caller via [`crate::driver::DriverRegistry::require`],
+/// never constructed as a concrete type here.
+pub fn render_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Enabled, driver);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
@@ -497,43 +556,49 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 /// the worker-visible *forwarded* socket path on the remote (e.g.
 /// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
 /// shim (typically the bare `boss-event` resolved on the remote PATH).
-pub fn render_remote_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Disabled);
+pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Disabled, driver);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
-fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
-    // Rich-tier ProgressObservation (design §1.5): the Claude driver wires
-    // every hook event to the `boss-event` forwarder, producing the
-    // `WorkerEvent` stream that drives the activity machine. The env-prefix
-    // rationale (`BOSS_RUN_ID` correlation, `BOSS_WORKSPACE` buffering) and
-    // the shim command live in `ClaudeDriver::progress_observation_wiring`.
+fn settings_value(
+    input: &WorkerSetupInput,
+    sandbox: EngineDataDirSandbox,
+    driver: &dyn AgentDriver,
+) -> serde_json::Value {
+    // Rich-tier ProgressObservation (design §1.5): the resolved driver wires
+    // every hook event to the `boss-event` forwarder (or declares a
+    // StdoutJsonl ingress with no hooks), producing the `WorkerEvent` stream
+    // that drives the activity machine. The env-prefix rationale
+    // (`BOSS_RUN_ID` correlation, `BOSS_WORKSPACE` buffering) and the shim
+    // command live in the driver's `progress_observation_wiring`.
     //
     // The settings file is still assembled here because the permission rules
     // (PermissionPolicy) and the PreToolUse interception guards
-    // (ToolUseInterception) share this JSON and are extracted in later tasks;
-    // for now they layer on top of the driver-produced hooks.
-    let wiring = ClaudeDriver.progress_observation_wiring(&ProgressObservationConfig {
+    // (ToolUseInterception) share this JSON; they layer on top of the
+    // driver-produced hooks.
+    let ingress = driver.progress_observation_wiring(&ProgressObservationConfig {
         events_socket_path: input.events_socket_path.clone(),
         lease_id: input.lease_id.clone(),
         run_id: input.run_id.clone(),
         workspace_path: input.workspace_path.clone(),
         forwarder_binary: input.boss_event_path.clone(),
     });
-    let mut hooks = wiring.hooks;
+    let mut hooks = hooks_map_for_ingress(ingress);
 
     // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
     // All interception guards are appended to the forwarder hook the driver
     // wired, which stays the first `PreToolUse` entry so the live-status
-    // machine sees every tool call before any guard can block it.
-    let pre_tool_use_hooks = hooks
-        .get_mut("PreToolUse")
-        .and_then(serde_json::Value::as_array_mut)
-        .expect("Claude ProgressObservation wiring always includes PreToolUse");
+    // machine sees every tool call before any guard can block it. A
+    // `StdoutJsonl` driver's ingress carries no hooks at all (`hooks` is
+    // empty — the documented, supported no-hooks case), so `PreToolUse` may
+    // not exist yet; `pre_tool_use_array` inserts it fresh rather than
+    // assuming a `HookCallback` driver already populated it.
+    let pre_tool_use_hooks = pre_tool_use_array(&mut hooks);
 
     let is_revision =
         input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
-    let interception_wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+    let interception_wiring = driver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
         data_dir: if sandbox == EngineDataDirSandbox::Enabled {
             input.events_socket_path.parent().map(|p| p.to_path_buf())
         } else {
@@ -571,6 +636,34 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     }
 
     value
+}
+
+/// Resolve a driver's [`ProgressIngress`] into the settings-file `hooks`
+/// map. [`ProgressIngress::StdoutJsonl`] drivers (Codex) have no
+/// hook-callback wiring at all — their progress is read from the worker's
+/// stdout by [`crate::stdout_progress`], not this Claude-style hooks map
+/// — so this returns an empty map for that arm instead of assuming a
+/// `HookCallback` that was never produced.
+fn hooks_map_for_ingress(ingress: ProgressIngress) -> serde_json::Map<String, serde_json::Value> {
+    match ingress {
+        ProgressIngress::HookCallback(wiring) => wiring.hooks,
+        ProgressIngress::StdoutJsonl => serde_json::Map::new(),
+    }
+}
+
+/// Get (or insert) the `PreToolUse` array in `hooks`, ready for
+/// [`AgentDriver::tool_use_interception_wiring`] entries to be appended.
+///
+/// `hooks` may be empty (a `StdoutJsonl` driver's ingress) or may already
+/// carry a `PreToolUse` entry (a `HookCallback` driver's forwarder hook) —
+/// either way this returns a mutable array to extend, inserting an empty one
+/// first when absent instead of panicking on the documented no-hooks case.
+fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) -> &mut Vec<serde_json::Value> {
+    hooks
+        .entry("PreToolUse".to_owned())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("PreToolUse hook entry is always inserted as a JSON array")
 }
 
 /// Build the `permissions` object for the worker settings file.
@@ -1066,9 +1159,35 @@ if __name__ == "__main__":
 /// behaviour means repos without convention checks are transparently
 /// allowed.
 ///
-/// The checkleft binary is resolved from (in order) `BOSS_CHECKLEFT_BIN`
-/// (an override used by tests), `<repo-root>/bin/checkleft` (the
-/// repobin-installed path), then a `checkleft` on `PATH`.
+/// The checkleft invocation is resolved from (in order): `BOSS_CHECKLEFT_BIN`
+/// (an override used by tests, used as-is); `repobin exec checkleft` via a
+/// `repobin` binary found at `<repo-root>/bin/repobin` or on `PATH`, but
+/// only once a cheap `repobin exec checkleft --version` probe confirms the
+/// dispatch actually works (see `probe_repobin_checkleft` below);
+/// `<repo-root>/bin/checkleft` (a repobin-installed tool symlink); then a
+/// bare `checkleft` on `PATH`.
+///
+/// repobin is preferred over a direct `checkleft` lookup because a bare
+/// `checkleft` on `PATH` can silently resolve to an unrelated, stale build —
+/// e.g. an old `cargo install checkleft` from crates.io — that predates
+/// checks the repo's current `CHECKS.yaml` configures. That binary still
+/// runs and still exits non-zero, so the gate does not fail open; it fails
+/// *closed* with `error[...]: configured check references unknown
+/// implementation`, blocking every push. `repobin exec` sidesteps this by
+/// dispatching a binary that `bazel build` produces from the current source
+/// tree (repobin's dispatch cache is keyed by a content hash of that
+/// target's build witnesses, so a stale build is never served).
+///
+/// The probe step matters because that same `bazel build` can itself fail —
+/// a broken crate elsewhere in the tree, a toolchain problem — and a failed
+/// `repobin exec checkleft run` looks identical, from the gate's point of
+/// view, to a policy failure with no findings on stdout: both exit non-zero
+/// with nothing checkleft-shaped on stdout. Without the probe that reads as
+/// a checkleft internal error and hard-blocks every push with no `BYPASS_`
+/// escape, even though the failure has nothing to do with the change being
+/// pushed. Probing with `--version` first, and falling back to the legacy
+/// `<repo-root>/bin/checkleft` / PATH resolution when it fails, keeps a
+/// broken repobin dispatch from taking down the push gate.
 const CHECKLEFT_PUSH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Deterministic pre-push checkleft gate (Claude Code PreToolUse hook).
 
@@ -1087,9 +1206,13 @@ checkleft all approve -- so the gate can never wedge a session; its only
 deterministic action is to block a push that checkleft itself rejected.
 
 The PreToolUse payload arrives as JSON on stdin; a decision JSON is written to
-stdout. The checkleft binary is resolved from (in order) the BOSS_CHECKLEFT_BIN
-env var, `<repo-root>/bin/checkleft` (the repobin-installed path), and a
-`checkleft` on PATH.
+stdout. The checkleft invocation is resolved from (in order) the
+BOSS_CHECKLEFT_BIN env var (used as-is), `repobin exec checkleft` via a
+`repobin` found at `<repo-root>/bin/repobin` or on PATH -- gated on a
+`repobin exec checkleft --version` probe succeeding first -- then
+`<repo-root>/bin/checkleft` (a repobin-installed tool symlink), and finally a
+bare `checkleft` on PATH. See resolve_checkleft_command()'s docstring for why
+repobin is preferred and why it is probed rather than trusted outright.
 """
 import json
 import os
@@ -1099,10 +1222,26 @@ import shutil
 import subprocess
 import sys
 
-# Warm-cache checkleft runs are seconds; cap the wait so a wedged checkleft can
-# never hang a push attempt. On timeout we fail open (approve) rather than
-# strand the session -- the cube verb gates are the belt for that rare case.
-CHECKLEFT_TIMEOUT_SECONDS = 240
+# The probe (`repobin exec checkleft --version`) is what pays a cold
+# dispatch-cache miss: a full `bazel build //tools/checkleft:checkleft`, which
+# can run into the tens of seconds to a few minutes depending on host
+# contention. Budget generously for it since it runs at most once per push
+# (repobin's dispatch cache is content-hash keyed, so a warm cache after the
+# probe means the subsequent `run` invocation below hits it too). On timeout
+# the probe is treated as failed and resolution falls through to the legacy
+# bin/checkleft / PATH lookup -- it does NOT fail open, since a fallback
+# checkleft may still exist and would otherwise be skipped for no reason.
+CHECKLEFT_PROBE_TIMEOUT_SECONDS = 240
+
+# Once the probe above has (if needed) warmed the dispatch cache, the actual
+# `checkleft run` is a fast, already-built invocation -- measured at 85-95s on
+# this repo -- but this budget is kept well above that measurement (roughly
+# 3x headroom) rather than trimmed close to it, because a run timeout takes
+# the fail-open path below and silently approves an unchecked push, which is
+# exactly the outcome this gate exists to prevent. On timeout we fail open
+# (approve) rather than strand the session -- the cube verb gates are the
+# belt for that rare case.
+CHECKLEFT_TIMEOUT_SECONDS = 300
 
 ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 DELIMS = {"&&", "||", ";", "|", "&"}
@@ -1168,14 +1307,71 @@ def find_repo_root(start):
         cur = parent
 
 
-def resolve_checkleft(root):
-    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
-    if override:
-        return override if os.path.exists(override) else None
-    candidate = os.path.join(root, "bin", "checkleft")
+def resolve_repobin(root):
+    candidate = os.path.join(root, "bin", "repobin")
     if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
         return candidate
-    return shutil.which("checkleft")
+    return shutil.which("repobin")
+
+
+def probe_repobin_checkleft(repobin):
+    """Confirm `repobin exec checkleft` can actually dispatch before the
+    gate trusts it for the real `run` invocation.
+
+    `repobin exec checkleft` builds checkleft with `bazel build` on a
+    dispatch-cache miss. If that build fails (a broken crate elsewhere in
+    the tree, a bazel toolchain problem, a missing REPOBIN.toml entry),
+    `repobin exec checkleft run` itself exits non-zero with nothing on
+    stdout -- indistinguishable, from the gate's point of view, from a
+    checkleft "internal error" -- so it would hard-block every push with no
+    BYPASS_ escape, for a failure that has nothing to do with the change
+    being pushed. `--version` is cheap (no CHECKS.yaml / VCS context
+    needed) and shares the same on-disk dispatch cache as `run`, so probing
+    with it first pays the build cost at most once and never twice.
+    """
+    try:
+        proc = subprocess.run(
+            [repobin, "exec", "checkleft", "--version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=CHECKLEFT_PROBE_TIMEOUT_SECONDS,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def resolve_checkleft_command(root):
+    """Return the argv prefix that runs checkleft's `run` subcommand.
+
+    Preferred over a bare `checkleft` lookup: `repobin exec checkleft`
+    dispatches through repobin's normal build-from-source path (per
+    REPOBIN.toml), so it can never run a binary older than the current
+    source tree. A plain PATH search for `checkleft` has no such
+    guarantee -- it can resolve an unrelated, stale build (e.g. an old
+    `cargo install checkleft`) that still runs and still exits non-zero,
+    which fails the gate *closed* with "unknown implementation" errors
+    for every check added since that build, rather than failing open.
+
+    The repobin path is only used once `probe_repobin_checkleft` confirms
+    it actually works -- a repobin whose underlying bazel dispatch is
+    broken falls through to the legacy resolution below instead of taking
+    the whole push gate down with it.
+    """
+    override = os.environ.get("BOSS_CHECKLEFT_BIN", "").strip()
+    if override:
+        return [override] if os.path.exists(override) else None
+
+    repobin = resolve_repobin(root)
+    if repobin and probe_repobin_checkleft(repobin):
+        return [repobin, "exec", "checkleft"]
+
+    candidate = os.path.join(root, "bin", "checkleft")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return [candidate]
+    which = shutil.which("checkleft")
+    return [which] if which else None
 
 
 def main():
@@ -1198,14 +1394,14 @@ def main():
 
     cwd = payload.get("cwd") or os.getcwd()
     root = find_repo_root(cwd)
-    checkleft = resolve_checkleft(root)
-    if not checkleft:
+    checkleft_cmd = resolve_checkleft_command(root)
+    if not checkleft_cmd:
         # No checkleft available -> nothing to enforce (repo may not use it).
         emit("approve")
 
     try:
         proc = subprocess.run(
-            [checkleft, "run"],
+            checkleft_cmd + ["run"],
             cwd=root,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -1256,8 +1452,24 @@ if __name__ == "__main__":
 /// Rooted at the per-user system temp dir (`$TMPDIR` on macOS, a
 /// private per-user location), so the files are user-private and never
 /// inside a workspace tree.
+///
+/// Under Bazel tests, prefers `$TEST_TMPDIR` when set. That directory is
+/// unique per test action (including each shard of a `shard_count > 1`
+/// `rust_test` and each `runs_per_test` copy), so concurrent processes
+/// do not race on the shared gate-script paths
+/// (`boss-path-guard.py`, `boss-checkleft-push-guard.py`) that live
+/// here. Production never sets `TEST_TMPDIR`, so the stable per-user
+/// location that heal relies on is unchanged.
 pub fn worker_settings_dir() -> PathBuf {
-    std::env::temp_dir().join(WORKER_SETTINGS_SUBDIR)
+    worker_settings_root().join(WORKER_SETTINGS_SUBDIR)
+}
+
+/// Root directory under which [`worker_settings_dir`] places its subdir.
+fn worker_settings_root() -> PathBuf {
+    match std::env::var_os("TEST_TMPDIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
 }
 
 /// Absolute path to the worker settings file for `workspace_path`. The
@@ -1461,9 +1673,11 @@ fn hook_group_is_leaked(group: &serde_json::Value) -> bool {
 /// module docs for why dropping session config into a VCS-visible path
 /// (`settings.json` or `settings.local.json`) is the bug this avoids.
 ///
-/// `driver` supplies the config-dir name, the agent-rules filename, and
-/// the hook-enforcement preamble (WorkspaceProvisioning + PromptComposition
-/// capabilities). Pass [`crate::driver::ClaudeDriver`] for the standard case.
+/// `driver` supplies the config-dir name, the agent-rules filename, the
+/// hook-enforcement preamble, and ProgressObservation / ToolUseInterception
+/// wiring (WorkspaceProvisioning + PromptComposition + those capabilities).
+/// Callers resolve it via [`crate::driver::DriverRegistry::require`] rather
+/// than constructing a concrete driver type.
 pub fn write_workspace_files(
     input: &WorkerSetupInput,
     driver: &dyn crate::driver::AgentDriver,
@@ -1506,7 +1720,7 @@ pub fn write_workspace_files(
         ensure_path_guard_script_in(parent)?;
         ensure_checkleft_push_guard_script_in(parent)?;
     }
-    std::fs::write(&settings_path, render_settings_json(input))?;
+    std::fs::write(&settings_path, render_settings_json(input, driver))?;
 
     Ok(WrittenFiles {
         claude_md_path: agent_rules_path,

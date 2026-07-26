@@ -413,6 +413,24 @@ pub async fn serve_with_merge_probe(
         None,
     )?;
 
+    // GitHub API usage telemetry: install the process-wide sink and start
+    // its batching writer.
+    //
+    // Placed here, immediately after `ServerState` exists and before any
+    // subsystem loop is spawned, for two reasons. It must come *after*
+    // `ServerState::new` (which runs `metrics_init::init_all`), because
+    // the sink increments static handles and the registry panics on an
+    // unregistered increment. And it must come *before* the sweep loops
+    // below, several of which fire a pass the instant they are spawned —
+    // installing later would silently drop each of those first passes
+    // from the usage profile.
+    //
+    // Not in `ServerState`'s constructor itself: this spawns a task, and
+    // that constructor also runs from synchronous unit tests with no
+    // Tokio reactor.
+    let _github_api_usage_handle =
+        crate::github_api_usage::install(server_state.metrics.clone(), server_state.work_db.clone());
+
     // A socket file with a live process behind it must never be unlinked;
     // only a crashed engine's leftover is safe to rebind. Same probe as the
     // events socket below — the frontend socket is what the macOS app and
@@ -799,10 +817,19 @@ pub async fn serve_with_merge_probe(
                     cube_workspace_id = ?execution.cube_workspace_id,
                     "startup reaper: marked execution orphaned (workspace preserved for re-lease)",
                 );
+                // App-crash-reconciliation termination path (engine
+                // startup reaper): tear down any driver-owned state
+                // outside the workspace.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &server_state.work_db,
+                    &execution.id,
+                    execution.workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
                 // Snapshot any uncommitted in-flight work to a durable
                 // patch before the workspace can be re-leased/reset.
                 // Best-effort and self-logging; never blocks the reaper.
-                crate::recovery_backup::backup_dead_execution(&execution);
+                boss_engine_recovery::recovery_backup::backup_dead_execution(&execution);
             }
             Err(err) => {
                 // Already-terminal rows are benign here — a parallel
@@ -910,12 +937,12 @@ pub async fn serve_with_merge_probe(
     // poller starts, so the first design-PR merge it detects can enqueue a
     // populate. Held in a process-wide OnceLock so the merge-trigger hook —
     // deep in the poller's call chain with only a `&WorkDb` — can spawn the
-    // background pass without threading the api key through every signature.
-    // The api key is the same `ANTHROPIC_API_KEY`-sourced value the
-    // live-status summarizer uses; a `None` key degrades auto-populate to
+    // background pass without threading the provider through every signature.
+    // It is the same utility-model provider the live-status summarizer uses;
+    // a provider that resolves no credential degrades auto-populate to
     // "pointer set, tasks not auto-created" with an attention item.
     crate::populator::install(crate::populator::PopulatorConfig {
-        api_key: server_state.anthropic_api_key.clone(),
+        utility: server_state.utility_model.clone(),
         max_tasks: crate::populator::DEFAULT_MAX_TASKS,
         publisher: server_state.publisher.clone(),
     });
@@ -935,6 +962,9 @@ pub async fn serve_with_merge_probe(
     let merge_probe: Arc<dyn MergeProbe> = Arc::new(CommandMergeProbe::new());
     let trunk_queue_api: Arc<dyn crate::trunk_queue_poller::TrunkQueueApi> =
         Arc::new(server_state.trunk_client.clone());
+    let pr_reconcile_requests = server_state
+        .event_bus
+        .subscribe(TopicFilter::kind(EventKind::PrReconcileRequested));
     let _merge_handle = spawn_merge_poller(
         server_state.work_db.clone(),
         merge_probe,
@@ -946,10 +976,7 @@ pub async fn serve_with_merge_probe(
         ),
         Duration::from_secs(60),
         server_state.metrics.clone(),
-        (
-            server_state.pr_reconciler_kick.clone(),
-            server_state.pr_reconciler_targeted_kick.clone(),
-        ),
+        (server_state.pr_reconciler_kick.clone(), pr_reconcile_requests),
     );
 
     // Periodic dead-PID reconciler: detects worker slots whose backing
@@ -1155,14 +1182,17 @@ pub async fn serve_with_merge_probe(
     // (the process is alive), so this reaps the execution and releases
     // the slot for redispatch. Runs every 60s and fires on boot.
     let _stale_worker_sweep_handle = crate::stale_worker_sweep::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.live_worker_states.clone(),
-        server_state.execution_coordinator.clone(),
-        server_state.dispatch_events.clone(),
-        // Reap via the same `release_worker_pane` teardown as `bossctl
-        // agents stop` so a reconcile-cancel kills the worker's process
-        // tree before its slot/lease is freed.
-        server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+        crate::stale_worker_sweep::StaleWorkerSweepDeps {
+            work_db: server_state.work_db.clone(),
+            live_states: server_state.live_worker_states.clone(),
+            coordinator: server_state.execution_coordinator.clone(),
+            dispatch_events: server_state.dispatch_events.clone(),
+            // Reap via the same `release_worker_pane` teardown as `bossctl
+            // agents stop` so a reconcile-cancel kills the worker's
+            // process tree before its slot/lease is freed.
+            reaper: server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+            hold_registry: server_state.hold_registry.clone(),
+        },
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );
@@ -1258,6 +1288,21 @@ pub async fn serve_with_merge_probe(
         server_state.dispatch_events.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::WorkerNudger>,
         crate::transient_recovery::DEFAULT_INTERVAL,
+    );
+
+    // Periodic abandoned-branch-PR reconciler: catches a terminated worker
+    // that pushed its engine-supplied branch but never got a PR opened for
+    // it (e.g. a GitHub outage on the PR-create path, or a worker that died
+    // before reaching that step). Detects the state directly off the
+    // execution row — terminal, workspace-backed, no `pr_url` anywhere —
+    // independent of whatever kanban status the task fell back to, then
+    // binds an already-existing PR or auto-creates one. Runs on a slow
+    // fixed interval and fires on boot; see that module for the full
+    // incident writeup and retry/backoff rationale.
+    let _abandoned_branch_pr_sweep_handle = crate::abandoned_branch_pr_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.dispatch_events.clone(),
+        crate::abandoned_branch_pr_sweep::DEFAULT_INTERVAL,
     );
 
     // Engine-restart reattach (distributed-execution PR4): a remote
@@ -1431,7 +1476,9 @@ pub async fn serve_with_merge_probe(
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
-        server_state.automation_scheduler_kick.clone(),
+        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+            boss_event_bus::EventKind::AutomationMutation,
+        )),
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
     );
 
@@ -1449,10 +1496,27 @@ pub async fn serve_with_merge_probe(
         .execution_coordinator
         .spawn_scheduler_heartbeat(Duration::from_secs(15));
 
+    // DispatchReady bus subscriber — no-op (returns `None`, spawns nothing)
+    // unless `BOSS_ENABLE_DISPATCH_READY_BUS` is on. When it is, this is
+    // what re-enters the kick/drain double-latch for a `kick()` that routed
+    // through the bus instead of latching directly; the heartbeat above
+    // stays the backstop either way. See
+    // `ExecutionCoordinator::spawn_dispatch_ready_subscriber`.
+    let _dispatch_ready_subscriber_handle = server_state.execution_coordinator.spawn_dispatch_ready_subscriber();
+    if _dispatch_ready_subscriber_handle.is_some() {
+        // Boot-time sanity check that the bus injected via `set_event_bus`
+        // in `app.rs` is the same one the subscriber just attached to —
+        // `server_state.execution_coordinator.event_bus()` is the seam a
+        // future producer outside the coordinator reaches this bus through.
+        tracing::debug!(
+            subscriber_count = server_state.execution_coordinator.event_bus().subscriber_count(),
+            "dispatch_ready bus subscriber attached",
+        );
+    }
+
     // Watch in-flight dispatch timelines for stalled stages and emit
     // a `stage_stalled` event when one sits past the threshold
-    // without progressing. Read-only against the per-execution
-    // dispatch.jsonl mirrors; never modifies dispatcher behavior.
+    // without progressing.
     //
     // Per-stage overrides: the early dispatch handoffs (worker
     // claim → cube repo ensure → cube workspace lease) should
@@ -1472,21 +1536,38 @@ pub async fn serve_with_merge_probe(
         .with_override("cube_repo_ensure_attempted", Duration::from_secs(60))
         .with_override("cube_repo_ensured", Duration::from_secs(60))
         .with_override("cube_workspace_lease_attempted", Duration::from_secs(30));
-    let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
+
+    // Shared, incrementally-maintained view of every live dispatch timeline,
+    // used by both stall sweeps below. It reads `dispatch-events/current.jsonl`
+    // once and then tails only what is appended, which is what keeps their
+    // per-pass cost flat as dispatch history grows — see `dispatch_reader`'s
+    // `index` module for the profile that motivated it. Read-only; never
+    // modifies dispatcher behavior. Eviction horizon is the larger of the
+    // widest per-stage threshold above and `STATE_EVICTION_HORIZON`, so
+    // memory is bounded by accumulated stalls within that window rather than
+    // by all never-terminated history — see `TimelineIndex::with_eviction_horizon_ms`.
+    let dispatch_timeline_index = crate::dispatch_reader::SharedTimelineIndex::with_eviction_horizon_ms(
         server_state.dispatch_event_root.clone(),
+        stage_thresholds
+            .max_ms()
+            .max(crate::dispatch_stall_escalation::STATE_EVICTION_HORIZON.as_millis()),
+    );
+    let _stage_stalled_handle = crate::dispatch_reader::spawn_stage_stalled_detector(
+        dispatch_timeline_index.clone(),
         server_state.dispatch_events.clone(),
         stage_thresholds,
         Duration::from_secs(15),
     );
 
     // Persistent-stall escalation: on a slower cadence than the detector
-    // above, re-scan the same per-execution dispatch.jsonl mirrors for
-    // stages stuck past a much larger threshold and file a durable
-    // `dispatch_stage_stalled` attention item — the `stage_stalled` event
-    // above is write-only telemetry with nothing surfacing it to an
-    // operator. See `dispatch_stall_escalation.rs`.
+    // above, re-check the same timelines for stages stuck past a much larger
+    // threshold and file a durable `dispatch_stage_stalled` attention item —
+    // the `stage_stalled` event above is write-only telemetry with nothing
+    // surfacing it to an operator. Shares the index with the detector, so the
+    // dispatch stream is tailed once per pass rather than once per sweep.
+    // See `dispatch_stall_escalation.rs`.
     let _dispatch_stall_escalation_handle = crate::dispatch_stall_escalation::spawn_loop(
-        server_state.dispatch_event_root.clone(),
+        dispatch_timeline_index,
         server_state.work_db.clone(),
         crate::dispatch_stall_escalation::PERSISTENT_STALL_THRESHOLD,
         crate::dispatch_stall_escalation::DEFAULT_INTERVAL,
@@ -1963,12 +2044,22 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
     if let Some(p) = local_addr.as_ref().and_then(|a| a.as_pathname()) {
         crate::audit::record_accept_loop_started("events", p);
     }
+    // This socket only ever hears from a `ProgressIngress::HookCallback`
+    // driver's `boss-event` shim (a `StdoutJsonl` driver never connects to
+    // it), so the engine default is the correct resolution today. Resolved
+    // through the registry — not a hardcoded `ClaudeDriver` reference — so
+    // per-run resolution (once the dispatch gate selects a driver per run)
+    // only requires changing this lookup.
+    let hook_callback_driver: std::sync::Arc<dyn crate::driver::AgentDriver> = crate::driver::DriverRegistry::default()
+        .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+        .expect("engine default driver is always registered");
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
+                let driver = hook_callback_driver.clone();
                 tokio::spawn(async move {
-                    match handle_connection(stream).await {
+                    match handle_connection(stream, driver.as_ref()).await {
                         Ok(incoming) => {
                             tracing::info!(
                                 peer_pid = ?incoming.peer_pid,
@@ -1976,46 +2067,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
-                            // Audit *before* the live-state fan-out
-                            // so an engine-side mismatch in the
-                            // dispatch path can't drop the audit line
-                            // — the deny is enforced harness-side by
-                            // claude already, this is the independent
-                            // forensic record. See
-                            // [`worker_sandbox_audit`] for why.
-                            crate::worker_sandbox_audit::record_if_sandbox_attempt(
-                                &server_state.dispatch_event_root,
-                                incoming.run_id.as_deref(),
-                                &incoming.event,
-                            );
-                            dispatch_live_worker_state(&server_state, &incoming).await;
-                            // Editorial PreToolUse audit: evaluate every
-                            // `gh pr|issue` Bash invocation against the
-                            // product's editorial rules and record the
-                            // decision in `editorial_actions`. Fire-and-
-                            // forget; never blocks the event dispatch.
-                            dispatch_editorial_on_pretooluse(&server_state, &incoming).await;
-                            // Urgent probes fire on PostToolUse so
-                            // the coordinator can redirect a worker
-                            // mid-task without waiting for Stop. The
-                            // tool call has already returned at this
-                            // point, so no in-flight work is lost.
-                            dispatch_urgent_probe_on_post_tool_use(&server_state, &incoming).await;
-                            // ProbeReplied runs first: emit the reply for the
-                            // prior probe before dispatching the next one so
-                            // a single Stop never fires both reply and dispatch
-                            // for the same probe (the reply text hasn't been
-                            // written yet at dispatch time).
-                            //
-                            // Completion runs before probe dispatch: probes
-                            // queued by the completion handler (e.g.
-                            // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
-                            // so they are delivered on the *same* Stop that
-                            // triggered them rather than stalling until the
-                            // next Stop (which never comes for an idle worker).
-                            dispatch_probe_reply_on_stop(&server_state, &incoming).await;
-                            dispatch_completion_on_stop(&server_state, &incoming).await;
-                            dispatch_probe_on_stop(&server_state, &incoming).await;
+                            dispatch_worker_event_fanout(&server_state, &incoming).await;
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");

@@ -109,6 +109,76 @@ fn archived_tasks_hidden_from_list_by_default_but_shown_on_request() {
     );
 }
 
+#[test]
+fn cancelled_tasks_hidden_from_list_by_default_but_shown_on_request() {
+    let cancelled = Task::builder()
+        .id("task_cancelled")
+        .product_id("prod_1")
+        .kind(TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(TaskStatus::Cancelled)
+        .created_at("")
+        .updated_at("")
+        .build();
+    let live = Task::builder()
+        .id("task_live")
+        .product_id("prod_1")
+        .kind(TaskKind::Chore)
+        .name("n")
+        .description("")
+        .status(TaskStatus::Todo)
+        .created_at("")
+        .updated_at("")
+        .build();
+
+    // Default view: cancelled is hidden, live rows still show.
+    let visible = apply_task_list_filters(
+        vec![cancelled.clone(), live.clone()],
+        TaskListCriteria::builder()
+            .statuses(&[])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(false)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(), ["task_live"]);
+
+    // `--include-archived` surfaces it alongside everything else.
+    let visible = apply_task_list_filters(
+        vec![cancelled.clone(), live.clone()],
+        TaskListCriteria::builder()
+            .statuses(&[])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(true)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(visible.len(), 2);
+
+    // An explicit `--status cancelled` filter also surfaces it, without
+    // needing `--include-archived` too.
+    let visible = apply_task_list_filters(
+        vec![cancelled, live],
+        TaskListCriteria::builder()
+            .statuses(&[TaskStatusArg::Cancelled])
+            .priorities(&[])
+            .ids(&[])
+            .include_archived(false)
+            .build(),
+        None,
+        None,
+    );
+    assert_eq!(
+        visible.iter().map(|t| t.id.as_str()).collect::<Vec<_>>(),
+        ["task_cancelled"]
+    );
+}
+
 /// Filter-test row: `dummy_task` with the fields the list filters
 /// actually read dialled in. Everything else keeps the
 /// `dummy_task` defaults.
@@ -664,6 +734,25 @@ fn task_status_accepts_legacy_aliases_on_input() {
 }
 
 #[test]
+fn task_status_arg_accepts_cancelled() {
+    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--status", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Update(args),
+        } => assert!(matches!(args.status, Some(TaskStatusArg::Cancelled))),
+        _ => panic!("expected task update command"),
+    }
+    let cli = Cli::parse_from(["boss", "task", "list", "--status", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::List(args),
+        } => assert!(matches!(args.status.as_slice(), [TaskStatusArg::Cancelled])),
+        _ => panic!("expected task list command"),
+    }
+    assert_eq!(TaskStatusArg::Cancelled.as_str(), "cancelled");
+}
+
+#[test]
 fn move_target_accepts_board_name_primary() {
     let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "backlog"]);
     match cli.command {
@@ -671,6 +760,39 @@ fn move_target_accepts_board_name_primary() {
             command: TaskCommand::Move(args),
         } => assert!(matches!(args.target, MoveTarget::Backlog)),
         _ => panic!("expected task move command"),
+    }
+}
+
+#[test]
+fn move_target_accepts_cancelled() {
+    let cli = Cli::parse_from(["boss", "task", "move", "task_1", "--to", "cancelled"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Move(args),
+        } => assert!(matches!(args.target, MoveTarget::Cancelled)),
+        _ => panic!("expected task move command"),
+    }
+}
+
+#[test]
+fn parses_task_cancel_command() {
+    let cli = Cli::parse_from(["boss", "task", "cancel", "T441"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Cancel(args),
+        } => assert_eq!(args.id, "T441"),
+        _ => panic!("expected task cancel command"),
+    }
+}
+
+#[test]
+fn parses_chore_cancel_command() {
+    let cli = Cli::parse_from(["boss", "chore", "cancel", "task_1"]);
+    match cli.command {
+        Commands::Chore {
+            command: ChoreCommand::Cancel(args),
+        } => assert_eq!(args.id, "task_1"),
+        _ => panic!("expected chore cancel command"),
     }
 }
 
@@ -1380,6 +1502,30 @@ fn bulk_create_item_rejects_unknown_fields() {
     let raw = r#"{ "name": "x", "description": "y", "autosatrt": true }"#;
     let err = serde_json::from_str::<BulkCreateItem>(raw).expect_err("typo must fail");
     assert!(err.to_string().contains("autosatrt"), "{err}");
+}
+
+#[test]
+fn bulk_create_item_deserializes_deferred_and_defaults_absent_to_none() {
+    let with_deferred: BulkCreateItem =
+        serde_json::from_str(r#"{ "name": "future work", "description": "d", "deferred": true }"#).unwrap();
+    assert_eq!(with_deferred.deferred, Some(true));
+
+    // Absent → None (the create path treats None as `false`).
+    let without: BulkCreateItem = serde_json::from_str(r#"{ "name": "n", "description": "d" }"#).unwrap();
+    assert_eq!(without.deferred, None);
+}
+
+#[test]
+fn task_update_parses_deferred_flag() {
+    // `--deferred false` is the operator-approval form; it must parse into
+    // the shared TaskUpdateArgs.
+    let cli = Cli::parse_from(["boss", "task", "update", "task_1", "--deferred", "false"]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Update(args),
+        } => assert_eq!(args.deferred, Some(false)),
+        _ => panic!("expected task update command"),
+    }
 }
 
 #[test]

@@ -17,7 +17,7 @@ fn settings_json_denies_boss_state_dir_reads_writes_and_edits() {
     // "Write(...) is not matched by file permission checks — only Edit(path)
     // rules are").
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let deny = parsed["permissions"]["deny"].as_array().expect("deny array present");
     let deny_set: Vec<&str> = deny.iter().filter_map(|v| v.as_str()).collect();
     let boss_dir = "/Users/brianduff/Library/Application Support/Boss";
@@ -45,7 +45,7 @@ fn settings_json_denies_bossctl_and_engine_lifecycle_verbs() {
     // into engine process state. The rest of the `boss` surface
     // talks to the engine over its IPC socket and is fine.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let deny: Vec<&str> = parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -69,7 +69,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
     // Standard workers must not carry the reviewer deny rules — that
     // would break every implementation worker.
     let std_input = sample_input(); // worker_kind: Standard
-    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input, &ClaudeDriver)).unwrap();
     let std_deny: Vec<&str> = std_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -86,7 +86,7 @@ fn reviewer_kind_adds_write_and_push_deny_rules_standard_does_not() {
     // Reviewer workers must carry every rule from reviewer_deny_rules().
     let mut rev_input = sample_input();
     rev_input.worker_kind = WorkerKind::Reviewer;
-    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input, &ClaudeDriver)).unwrap();
     let rev_deny: Vec<&str> = rev_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -144,7 +144,7 @@ fn reviewer_settings_json_has_fast_mode_standard_does_not() {
     // Reviewer workers are latency-sensitive: fastMode must be true.
     let mut rev_input = sample_input();
     rev_input.worker_kind = WorkerKind::Reviewer;
-    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input)).unwrap();
+    let rev_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&rev_input, &ClaudeDriver)).unwrap();
     assert_eq!(
         rev_parsed["fastMode"],
         serde_json::json!(true),
@@ -153,7 +153,7 @@ fn reviewer_settings_json_has_fast_mode_standard_does_not() {
 
     // Standard workers must NOT have fastMode set at all.
     let std_input = sample_input();
-    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input, &ClaudeDriver)).unwrap();
     assert!(
         std_parsed.get("fastMode").is_none() || std_parsed["fastMode"] == serde_json::json!(null),
         "standard worker settings.json must not carry fastMode (got {:?})",
@@ -167,7 +167,7 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
     // investigate and emit a marker; they must not edit, push, or open a
     // PR). Standard implementation workers must NOT carry it.
     let std_input = sample_input(); // worker_kind: Standard
-    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input)).unwrap();
+    let std_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&std_input, &ClaudeDriver)).unwrap();
     let std_deny: Vec<&str> = std_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -183,7 +183,8 @@ fn triage_kind_adds_no_publish_deny_rules_standard_does_not() {
 
     let mut triage_input = sample_input();
     triage_input.worker_kind = WorkerKind::Triage;
-    let triage_parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&triage_input)).unwrap();
+    let triage_parsed: serde_json::Value =
+        serde_json::from_str(&render_settings_json(&triage_input, &ClaudeDriver)).unwrap();
     let triage_deny: Vec<&str> = triage_parsed["permissions"]["deny"]
         .as_array()
         .unwrap()
@@ -223,7 +224,7 @@ fn settings_json_does_not_deny_workspace_paths() {
     // (their lease lives there). Verify no deny rule names the
     // workspace root.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let deny: Vec<&str> = parsed["permissions"]["deny"]
         .as_array()
         .unwrap()

@@ -55,6 +55,7 @@ impl ConfiguredCheck for RepoVisibilityCheck {
                             line: Some(location.line),
                             column: Some(location.column),
                         }),
+                        surface: None,
                         remediations: vec![
                             "Remove the package default_visibility or narrow visibility on individual targets."
                                 .to_owned(),

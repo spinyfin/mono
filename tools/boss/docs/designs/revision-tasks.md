@@ -376,7 +376,9 @@ The seven questions this design originally raised have been resolved by the oper
 
 ### OQ2 — Revision chains and sequence numbering
 
-**Decision: flat continuation, no nested numbering.** A revision can itself have a revision (second-pass feedback on R1 — yes, this is allowed). The sequence is **chain-root-scoped and creation-ordered**: if a parent already has R1 and R2 and a revision is spawned on R1, the new one is **R3**, counted from the chain root — never `R1.1` or any `R<n>.<m>` sub-sequence. The parent linkage still records the _immediate_ parent (`parent_task_id` points at R1, not the root), so provenance is preserved; only the _display number_ is chain-root-scoped. _Why it matters: a human reading the parent card wants "this PR has had 3 rounds", and all revisions in a chain target the same PR; nested numbering would leak the chain's tree shape into the UI for no benefit and complicate the Review-lane rollup._
+**Decision: flat continuation, no nested numbering.** A revision can itself have a revision (second-pass feedback on R1 — yes, this is allowed). The sequence is **chain-root-scoped and creation-ordered**: if a parent already has R1 and R2 and a revision is spawned on R1, the new one is **R3**, counted from the chain root — never `R1.1` or any `R<n>.<m>` sub-sequence.
+
+**As built:** `parent_task_id` is **always the chain root**, not the immediate revision the caller named. Filing `create-revision --parent <R2>` (or an automatic PR-review / CI / conflict producer against a revision work item) still resolves the gate against the root's PR, but the new row stores `parent_task_id = root`. Sequencing of back-to-back revisions is via dependency edges on the chain tail, not nested parents. Nested parentage hid later revisions from the UI rollup (which only surfaces direct children of the root). A startup migration flattens any pre-existing nested rows.
 
 ### OQ3 — Permission scope / `gh pr create` guard
 

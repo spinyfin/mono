@@ -46,10 +46,16 @@ use serde_json::Value;
 use boss_engine_live_status_redact as live_status_redact;
 
 use crate::claude_client::{self, CallConfig, ClaudeError, Message, MessagesRequest};
+use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 
 /// Haiku 4.5 is the right shape for a one-sentence cheap summary —
 /// see Q3 in the design doc.
-pub const SUMMARY_MODEL: &str = "claude-haiku-4-5-20251001";
+///
+/// This is the *default*; the model actually used comes from the
+/// [`UtilityModel`] provider, so an operator can point the summarizer at a
+/// different small model without touching any work item's driver. Kept as a
+/// named constant because the tests and the design doc both refer to it.
+pub const SUMMARY_MODEL: &str = UtilityTask::LiveStatus.default_model();
 
 /// Output ceiling. The prompt asks for ≤ 8 words; this is the
 /// safety net.
@@ -95,11 +101,12 @@ pub enum SummarizerOutcome {
     /// Model returned a one-sentence summary that passed the post-filter.
     /// Caller writes this to `live_status`.
     Success(String),
-    /// `api_key` was `None`. The engine started without an
-    /// `ANTHROPIC_API_KEY`, so no summarizer call can ever succeed.
-    /// The trigger fan-in surfaces this through the debug verb and
-    /// (one-time, at startup) logs at `error` so the user notices.
-    NoApiKey,
+    /// The [`UtilityModel`] provider could not produce a credential for
+    /// [`UtilityTask::LiveStatus`], so no summarizer call can ever succeed.
+    /// The payload is the provider's rendered reason, which names the env
+    /// vars it consulted. The trigger fan-in surfaces this through the debug
+    /// verb and (one-time, at startup) logs at `error` so the user notices.
+    NoApiKey(String),
     /// Transcript tail had content but every entry was deny-listed or
     /// fully redacted. Benign — happens early in a worker's life or
     /// when the transcript is dominated by tool reads of secret files.
@@ -123,7 +130,7 @@ impl SummarizerOutcome {
     pub fn tag(&self) -> &'static str {
         match self {
             SummarizerOutcome::Success(_) => "success",
-            SummarizerOutcome::NoApiKey => "no_api_key",
+            SummarizerOutcome::NoApiKey(_) => "no_api_key",
             SummarizerOutcome::EmptyAfterRedaction => "empty_after_redaction",
             SummarizerOutcome::ApiError { .. } => "api_error",
             SummarizerOutcome::Transport(_) => "transport_error",
@@ -145,7 +152,7 @@ impl SummarizerOutcome {
                     clip
                 }
             }
-            SummarizerOutcome::NoApiKey => "ANTHROPIC_API_KEY not configured on the engine".to_owned(),
+            SummarizerOutcome::NoApiKey(reason) => reason.clone(),
             SummarizerOutcome::EmptyAfterRedaction => {
                 "transcript empty after deny-list + secret-pattern redaction".to_owned()
             }
@@ -167,17 +174,20 @@ impl SummarizerOutcome {
 ///
 /// The caller keeps the prior `live_status` value on every non-success
 /// outcome.
-pub async fn summarize_transcript(api_key: Option<&str>, transcript_lines: &[Value]) -> SummarizerOutcome {
-    let Some(api_key) = api_key else {
-        tracing::error!("live_status: summarizer skipped — ANTHROPIC_API_KEY not configured",);
-        return SummarizerOutcome::NoApiKey;
+pub async fn summarize_transcript(utility: &dyn UtilityModel, transcript_lines: &[Value]) -> SummarizerOutcome {
+    let call = match utility.resolve(UtilityTask::LiveStatus) {
+        Ok(call) => call,
+        Err(err) => {
+            tracing::error!(%err, "live_status: summarizer skipped — no utility-model credential");
+            return SummarizerOutcome::NoApiKey(err.to_string());
+        }
     };
     let redacted = redact_and_assemble(transcript_lines);
     if redacted.trim().is_empty() {
         tracing::debug!("live_status: transcript empty after redaction");
         return SummarizerOutcome::EmptyAfterRedaction;
     }
-    match claude_one_sentence(api_key, &redacted).await {
+    match claude_one_sentence(&call, &redacted).await {
         Ok(ClaudeReply::Success(summary)) => SummarizerOutcome::Success(summary),
         Ok(ClaudeReply::PostFilterDropped) => {
             tracing::warn!("live_status: post-filter dropped the model reply",);
@@ -368,27 +378,29 @@ strings that look like secrets.\n\
 /// the cleaned summary; `PostFilterDropped` distinguishes "Anthropic
 /// returned a response but the post-filter rejected it" from any
 /// transport-level error.
+#[derive(Debug, Clone)]
 pub enum ClaudeReply {
     Success(String),
     PostFilterDropped,
 }
 
-/// Hit Anthropic with a one-sentence ask via the shared
-/// [`crate::claude_client`] pipeline. Returns `ClaudeReply` (success vs.
-/// post-filter-dropped) on a successful round trip, or the shared
-/// [`ClaudeError`] which `summarize_transcript` maps into the matching
-/// [`SummarizerOutcome`] — the surface needs to distinguish "model 429" from
-/// "TLS handshake failed", which a bare `anyhow::Result<String>` would erase.
-pub async fn claude_one_sentence(api_key: &str, transcript: &str) -> Result<ClaudeReply, ClaudeError> {
+/// Ask for a one-sentence summary via the shared [`crate::claude_client`]
+/// pipeline, addressed at whatever the [`UtilityModel`] provider resolved.
+/// Returns `ClaudeReply` (success vs. post-filter-dropped) on a successful
+/// round trip, or the shared [`ClaudeError`] which `summarize_transcript` maps
+/// into the matching [`SummarizerOutcome`] — the surface needs to distinguish
+/// "model 429" from "TLS handshake failed", which a bare
+/// `anyhow::Result<String>` would erase.
+pub async fn claude_one_sentence(call: &UtilityCall, transcript: &str) -> Result<ClaudeReply, ClaudeError> {
     let (system, user) = build_messages(transcript);
     let request = MessagesRequest::builder()
-        .model(SUMMARY_MODEL)
+        .model(call.model.clone())
         .max_tokens(SUMMARY_MAX_TOKENS)
         .system(system)
         .messages(vec![Message::user(user)])
         .build();
-    let config = CallConfig::new(SUMMARY_TIMEOUT);
-    let response = claude_client::send_messages(api_key, &request, &config).await?;
+    let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(call.endpoint.clone());
+    let response = claude_client::send_messages(&call.api_key, &request, &config).await?;
     let cleaned = clean_summary(response.first_text().unwrap_or_default());
     if cleaned.is_empty() {
         return Ok(ClaudeReply::PostFilterDropped);
@@ -530,12 +542,25 @@ mod tests {
         );
     }
 
+    /// A provider with no credential resolvable for `LiveStatus`. Built
+    /// through the injectable lookup so the test never touches process env.
+    fn keyless_provider() -> crate::utility_model::AnthropicUtilityModel {
+        crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None)
+    }
+
+    fn keyed_provider() -> crate::utility_model::AnthropicUtilityModel {
+        crate::utility_model::AnthropicUtilityModel::from_lookup(Some("key".to_owned()), |_| None)
+    }
+
     #[test]
     fn summarize_transcript_reports_no_api_key() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(summarize_transcript(None, &[]));
-        assert!(matches!(result, SummarizerOutcome::NoApiKey));
+        let provider = keyless_provider();
+        let result = rt.block_on(summarize_transcript(&provider, &[]));
+        assert!(matches!(result, SummarizerOutcome::NoApiKey(_)));
         assert_eq!(result.tag(), "no_api_key");
+        // The detail must name what to set, not just that something is missing.
+        assert!(result.detail().contains("ANTHROPIC_API_KEY"), "{}", result.detail());
     }
 
     #[tokio::test]
@@ -559,7 +584,8 @@ mod tests {
                 "input": {"file_path": "/Users/x/.ssh/id_rsa"},
             }],
         })];
-        let result = summarize_transcript(Some("key"), &lines).await;
+        let provider = keyed_provider();
+        let result = summarize_transcript(&provider, &lines).await;
         assert!(
             matches!(result, SummarizerOutcome::EmptyAfterRedaction),
             "outcome was {:?}",
@@ -574,7 +600,7 @@ mod tests {
         // explicitly: success / no_api_key / api_error / empty_after_redaction.
         // The strings are part of the public-facing JSON, so pin them.
         assert_eq!(SummarizerOutcome::Success("running tests".into()).tag(), "success");
-        assert_eq!(SummarizerOutcome::NoApiKey.tag(), "no_api_key");
+        assert_eq!(SummarizerOutcome::NoApiKey("no credential".into()).tag(), "no_api_key");
         assert_eq!(
             SummarizerOutcome::ApiError {
                 status: 429,
@@ -607,21 +633,21 @@ mod tests {
             .mount(&server)
             .await;
 
-        let (system, user) = build_messages("assistant: investigating the bug");
-        let request = MessagesRequest::builder()
-            .model(SUMMARY_MODEL)
-            .max_tokens(SUMMARY_MAX_TOKENS)
-            .system(system)
-            .messages(vec![Message::user(user)])
-            .build();
-        let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(format!("{}/v1/messages", server.uri()));
-        let response = claude_client::send_messages("test-key", &request, &config)
+        // Drive the real entry point through a provider pointed at the mock,
+        // so the endpoint/model/credential all come from the seam rather than
+        // from constants this test re-declares.
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let call = provider.resolve(UtilityTask::LiveStatus).expect("key was supplied");
+        assert_eq!(call.model, SUMMARY_MODEL);
+
+        let reply = claude_one_sentence(&call, "assistant: investigating the bug")
             .await
             .expect("mock success");
-        assert_eq!(
-            clean_summary(response.first_text().unwrap()),
-            "running tests after the redactor lands",
-        );
+        let ClaudeReply::Success(summary) = reply else {
+            panic!("expected a summary, got {reply:?}");
+        };
+        assert_eq!(summary, "running tests after the redactor lands");
     }
 
     #[tokio::test]

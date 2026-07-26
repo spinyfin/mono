@@ -1,0 +1,23 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "D5 — cube lease TTL / release policy. Dirty state now survives expiry (guard + quarantine + preserve on release already landed), so a longer TTL only slows reclaim of cheap clean idle workspaces. What should the default be, replacing DEFAULT_LEASE_TTL_SECS = 1800 (30m)?",
+    "choices": [
+      "Hold the lease until the execution reaches a terminal state, with a 4h wall-clock backstop",
+      "Hold until terminal, with an 8h backstop",
+      "Hold until terminal, no wall-clock backstop (rely on terminal-state release only)",
+      "Keep a fixed TTL but raise it to 2h"
+    ],
+    "anchor": "the-six-decisions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "D6 — take-the-conn persistence. The prompt says take-the-conn mode persists until explicitly revoked; a later memory quotes you saying the opposite ('you're taking the conn a bit too easily'). Should take-the-conn PERSIST until explicitly revoked? (No = it should be single-use / decay, and the prompt-surgery item will invert the rule.)",
+    "anchor": "the-six-decisions"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "D2 — prompt-amendment mechanism. Should coordinator-prompt amendments ride on the worker proposal API (i.e. add 'coordinator prompt' as a proposable target), rather than keeping today's file-a-chore-that-edits-a-Swift-string loop?",
+    "anchor": "the-six-decisions"
+  }
+]

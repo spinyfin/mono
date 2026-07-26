@@ -63,7 +63,7 @@ enum WorkerActivity: String, Hashable {
     }
 }
 
-enum AgentActivityState {
+enum AgentActivityState: Equatable {
     case active
     case waiting(reason: String)
     case errored(reason: String)

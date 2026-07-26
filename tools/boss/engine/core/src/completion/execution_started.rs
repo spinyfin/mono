@@ -137,16 +137,23 @@ impl WorkerCompletionHandler {
             "execution_started hook: snapshotted pr_head_before for SHA-delta gate"
         );
 
-        // Also snapshot the PR body as the baseline for the metadata-only
-        // CI-fix finalize gate (issue #1252). A CI-fix revision that
-        // repairs a PR-description validator edits the body with no commit,
-        // so the head SHA never moves; the body diff against this snapshot
-        // is the only operator-visible evidence the worker contributed.
-        // Best-effort and independent of downstream finalisation — an empty
-        // body is a valid snapshot, but a fetch failure leaves it unset and
-        // the gate treats that as inapplicable.
-        match self.branch_verifier.fetch_pr_body(&repo_slug, pr_number).await {
-            Ok(body) => {
+        // Also snapshot the PR title and body as the baseline for the
+        // metadata-only CI-fix finalize gate (issue #1252) and for `boss pr
+        // body`'s read-modify-write. A CI-fix revision that repairs a
+        // PR-description validator edits the body with no commit, so the
+        // head SHA never moves; the body diff against this snapshot is the
+        // only operator-visible evidence the worker contributed. Fetched
+        // together in one `gh pr view` call since both come from the same
+        // API response. Best-effort and independent of downstream
+        // finalisation — an empty body is a valid snapshot, but a fetch
+        // failure leaves both unset and the gate treats that as
+        // inapplicable.
+        match self
+            .branch_verifier
+            .fetch_pr_title_and_body(&repo_slug, pr_number)
+            .await
+        {
+            Ok((title, body)) => {
                 if let Err(err) = self.work_db.set_execution_pr_body_before(execution_id, &body) {
                     tracing::warn!(
                         execution_id,
@@ -161,13 +168,26 @@ impl WorkerCompletionHandler {
                         "execution_started hook: snapshotted pr_body_before for metadata-fix gate"
                     );
                 }
+                if let Err(err) = self.work_db.set_execution_pr_title_before(execution_id, &title) {
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        "execution_started hook: failed to persist pr_title_before"
+                    );
+                } else {
+                    tracing::debug!(
+                        execution_id,
+                        bound_pr_url = %bound_pr_url,
+                        "execution_started hook: snapshotted pr_title_before"
+                    );
+                }
             }
             Err(err) => {
                 tracing::warn!(
                     execution_id,
                     bound_pr_url = %bound_pr_url,
                     ?err,
-                    "execution_started hook: fetch PR body failed; skipping pr_body_before snapshot"
+                    "execution_started hook: fetch PR title/body failed; skipping snapshots"
                 );
             }
         }

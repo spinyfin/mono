@@ -1,0 +1,37 @@
+load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "utility-model",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "boss_engine_utility_model",
+    crate_root = "src/lib.rs",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(proc_macro = True),
+    visibility = [
+        "//tools/boss/engine/comment-classifier:__pkg__",
+        "//tools/boss/engine/core:__pkg__",
+    ],
+    deps = [
+        "//tools/boss/claude_client",
+    ] + all_crate_deps(normal = True),
+)
+
+rust_test(
+    name = "utility-model_test",
+    size = "small",
+    crate = ":utility-model",
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        "//tools/boss/claude_client",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)

@@ -226,6 +226,7 @@ extension EngineClient {
             blockedAttemptID: payload["blocked_attempt_id"] as? String,
             shortID: (payload["short_id"] as? NSNumber)?.intValue,
             autostart: (payload["autostart"] as? Bool) ?? false,
+            deferred: (payload["deferred"] as? Bool) ?? false,
             ciRequiredState: payload["ci_required_state"] as? String,
             ciRequiredDetail: payload["ci_required_detail"] as? String,
             reviewRequiredState: payload["review_required_state"] as? String,
@@ -233,6 +234,7 @@ extension EngineClient {
             prStatePolledAt: payload["pr_state_polled_at"] as? String,
             mergeQueueState: payload["merge_queue_state"] as? String,
             mergeQueueDetail: payload["merge_queue_detail"] as? String,
+            prMergeableState: payload["pr_mergeable_state"] as? String,
             externalRef: parseExternalRef(payload["external_ref"]),
             parentTaskId: payload["parent_task_id"] as? String,
             revisionSeq: (payload["revision_seq"] as? NSNumber)?.intValue,
@@ -240,16 +242,32 @@ extension EngineClient {
             hasInProgressRevision: (payload["has_in_progress_revision"] as? Bool) ?? false,
             effortLevel: (payload["effort_level"] as? String)
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
+            reasoning: (payload["reasoning"] as? String)
+                .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             sourceAutomationId: payload["source_automation_id"] as? String,
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
+            readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,
             completedAt: payload["completed_at"] as? String,
             dispatchFailedReason: payload["dispatch_failed_reason"] as? String,
             dispatchFailedError: payload["dispatch_failed_error"] as? String,
-            dispatchFailedAt: payload["dispatch_failed_at"] as? String
+            dispatchFailedAt: payload["dispatch_failed_at"] as? String,
+            tags: parseWorkItemTags(payload["tags"])
         )
+    }
+
+    /// Decode free-form work-item tags from the wire. Absent / null / empty
+    /// → `[]` so pre-feature engines and zero-tag rows collapse the UI row.
+    /// Non-string entries are dropped rather than failing the whole task.
+    func parseWorkItemTags(_ value: Any?) -> [String] {
+        guard let raw = value as? [Any] else { return [] }
+        return raw.compactMap { entry in
+            guard let s = entry as? String else { return nil }
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
     }
 
     /// Decode the per-task `doc_link_state` wire object (engine-resolved

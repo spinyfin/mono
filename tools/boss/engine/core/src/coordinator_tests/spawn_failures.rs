@@ -931,7 +931,8 @@ async fn pane_spawned_event_carries_spawn_config_details() {
         slot_id: Some(1),
         spawn_config: Some(crate::effort::SpawnConfig {
             effort_level: Some(crate::work::EffortLevel::Trivial),
-            claude_effort: Some("low"),
+            reasoning: Some(crate::work::ReasoningMode::Standard),
+            effort_value: Some("low"),
             model: "sonnet".to_owned(),
             driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),
             prompt_addendum: None,
@@ -958,7 +959,7 @@ async fn pane_spawned_event_carries_spawn_config_details() {
         )
     });
     assert_eq!(spawn["effort_level"], "trivial");
-    assert_eq!(spawn["claude_effort"], "low");
+    assert_eq!(spawn["effort_value"], "low");
     assert_eq!(spawn["model"], "sonnet");
     assert_eq!(spawn["prompt_addendum_applied"], false);
 }

@@ -209,6 +209,13 @@ extension ChatViewModel {
         // just `done` ones.
         if column == .review {
             items = items.filter { !($0.kind == "revision" && $0.status == "in_review") }
+            // View-only "ready to merge" narrowing — never mutates the
+            // underlying task. `readyForReview` is engine-computed
+            // (`Task.ready_for_review`), so this reads a fact, it doesn't
+            // re-derive one.
+            if reviewReadyOnly {
+                items = items.filter(\.readyForReview)
+            }
         }
         if column == .done {
             items = items.filter { !($0.kind == "revision" && ($0.status == "done" || $0.status == "in_review")) }

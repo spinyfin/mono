@@ -69,6 +69,25 @@ impl WorkerActivity {
         matches!(self, WorkerActivity::Terminated | WorkerActivity::Errored)
     }
 
+    /// True iff the pane's foreground worker is in a posture where
+    /// typed / `SendToPane` input is expected to be consumed as agent
+    /// (or interactive-shell) input rather than buffered against a
+    /// non-consuming process.
+    ///
+    /// Only [`Self::Idle`] (between turns at the prompt) and
+    /// [`Self::WaitingForInput`] (parked on a permission / human
+    /// redirect) qualify. Mid-turn [`Self::Working`], pre-session
+    /// [`Self::Spawning`], and terminal states do **not**: injecting
+    /// there races the foreground process and — when that process
+    /// does not consume stdin (e.g. `codex exec`) — leaves bytes in
+    /// the tty input buffer that the interactive shell later
+    /// executes (see the ghostty-codex-pane-viability investigation,
+    /// Q2 Layer D). This is a property of live pane activity, not of
+    /// which agent driver owns the run.
+    pub fn accepts_typed_input(self) -> bool {
+        matches!(self, WorkerActivity::Idle | WorkerActivity::WaitingForInput)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WorkerActivity::Spawning => "spawning",
@@ -181,6 +200,14 @@ pub struct LiveWorkerState {
     pub work_item_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    /// True while an operator has placed an explicit hold on this run via
+    /// `bossctl agents hold` — exempting it from the idle-park and
+    /// auto-reap sweeps until released or the run ends. Surfaced so
+    /// `bossctl agents list`/`status` can show held workers distinctly
+    /// from a normal `idle` row. `#[serde(default)]` keeps decode
+    /// tolerant of payloads from older engines that omit the key.
+    #[serde(default)]
+    pub held: bool,
 }
 
 impl LiveWorkerState {
@@ -217,6 +244,7 @@ impl LiveWorkerState {
             work_item_id,
             work_item_name,
             execution_id,
+            held: false,
         }
     }
 }
@@ -253,6 +281,16 @@ mod tests {
     }
 
     #[test]
+    fn accepts_typed_input_only_when_parked_at_prompt() {
+        assert!(WorkerActivity::Idle.accepts_typed_input());
+        assert!(WorkerActivity::WaitingForInput.accepts_typed_input());
+        assert!(!WorkerActivity::Spawning.accepts_typed_input());
+        assert!(!WorkerActivity::Working.accepts_typed_input());
+        assert!(!WorkerActivity::Errored.accepts_typed_input());
+        assert!(!WorkerActivity::Terminated.accepts_typed_input());
+    }
+
+    #[test]
     fn new_spawning_sets_defaults() {
         let state = LiveWorkerState::new_spawning(3, "run-1", "claude-opus-4-7", 42, None);
         assert_eq!(state.slot_id, 3);
@@ -270,6 +308,21 @@ mod tests {
         assert!(state.live_status.is_none());
         assert!(state.live_status_at.is_none());
         assert!(state.recovery_status.is_none());
+        assert!(!state.held);
+    }
+
+    #[test]
+    fn held_defaults_false_when_key_is_absent_from_json() {
+        // Decode tolerance for payloads from older engines that predate
+        // the `held` field.
+        let json = r#"{
+            "slot_id": 1, "name": "Riker", "run_id": "run-1", "model": "opus",
+            "shell_pid": 0, "last_event_at": null, "current_tool": null,
+            "last_tool_ended_at": null, "activity": "idle",
+            "live_status": null, "live_status_at": null
+        }"#;
+        let parsed: LiveWorkerState = serde_json::from_str(json).unwrap();
+        assert!(!parsed.held);
     }
 
     #[test]
@@ -318,6 +371,7 @@ mod tests {
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
+            held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();
@@ -366,6 +420,7 @@ mod tests {
             work_item_id: None,
             work_item_name: None,
             execution_id: None,
+            held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
         let parsed: LiveWorkerState = serde_json::from_str(&json).unwrap();

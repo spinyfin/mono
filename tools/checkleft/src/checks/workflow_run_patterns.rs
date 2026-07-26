@@ -77,6 +77,7 @@ impl ConfiguredCheck for CompiledWorkflowRunPatternsConfig {
                                 line: None,
                                 column: None,
                             }),
+                            surface: None,
                             remediations: vec![rule.remediation.clone()],
                             suggested_fix: None,
                         });

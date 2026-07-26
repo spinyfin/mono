@@ -401,6 +401,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// `.idleDisplaySleepDisabled` or similar, which would do the latter.
     private var appNapOptOutToken: NSObjectProtocol?
 
+    /// Observes `UserDefaults.didChangeNotification` so flipping
+    /// [[MainThreadStallMonitor.enabledKey]] in Settings starts/stops the
+    /// stall watchdog live (no relaunch).
+    private var stallMonitorDefaultsObserver: NSObjectProtocol?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         appNapOptOutToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
@@ -425,12 +430,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // [[UpdateLifecycle]] and design doc §4.
         UpdateLifecycle.reconcileAtLaunch()
 
-        // Start the main-thread hang watchdog. Captures the main thread's
-        // Mach port here (we are on the main thread), then runs a
-        // background watchdog that records a stall + backtrace whenever
-        // the main queue goes unresponsive. Surfaced via the "UI Stalls"
-        // window (Cmd-Shift-U). See [[MainThreadStallMonitor]].
-        MainThreadStallMonitor.shared.start()
+        // Main-thread hang watchdog — gated on Settings (default off).
+        // When off: no timers, no watchdog queue (zero cost). Apply once
+        // at launch, then re-apply on any UserDefaults change so the
+        // Feature Flags toggle takes effect without a relaunch. Surfaced
+        // via the "UI Stalls" window (Cmd-Shift-U). See
+        // [[MainThreadStallMonitor]].
+        MainThreadStallMonitor.shared.applyEnabledFromDefaults()
+        stallMonitorDefaultsObserver = NotificationCenter.default.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: UserDefaults.standard,
+            queue: .main
+        ) { _ in
+            MainThreadStallMonitor.shared.applyEnabledFromDefaults()
+        }
 
         // Start the terminal event-loop diagnostics sampler (1 Hz). Counts
         // libghostty app-loop activity and probes each pane's pty/EOF/pid
@@ -443,6 +456,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // JSONL mirror (App Nap incident, 2026-07-15) — see
         // [[DisplayPowerMonitor]].
         DisplayPowerMonitor.shared.start()
+
+        // 1 Hz flush of board fan-out counters (applyWorkTree, incremental
+        // task updates, main-actor engine deliveries, card body evals).
+        // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
+        // the population signposter. See [[UIUpdateCounters]].
+        UIUpdateCounters.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

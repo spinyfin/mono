@@ -85,18 +85,36 @@ impl TrackerCredentialResolver for GhAuthStatusResolver {
         match kind {
             "github" => {
                 let host = "github.com";
-                let output = Command::new(self.gh())
-                    .args(["auth", "status", "--hostname", host])
-                    .stdin(Stdio::null())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .kill_on_drop(true)
-                    .output()
-                    .await
-                    .map_err(|e| TrackerCredentialError::AuthFailed {
-                        host: host.to_owned(),
-                        detail: e.to_string(),
-                    })?;
+                // Retry a few times on ETXTBSY (errno 26): a just-written + chmod'd
+                // binary (tests' fake `gh`, or a freshly deployed CLI) can briefly
+                // still be held open for writing by the kernel after close(), making
+                // it unspawnable for a few ms. Mirrors ci_log_reader::run_capture.
+                const MAX_SPAWN_ATTEMPTS: u32 = 5;
+                let mut attempt = 0;
+                let output = loop {
+                    attempt += 1;
+                    let spawn_result = Command::new(self.gh())
+                        .args(["auth", "status", "--hostname", host])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .kill_on_drop(true)
+                        .output()
+                        .await;
+                    match spawn_result {
+                        Ok(output) => break output,
+                        Err(e) if e.raw_os_error() == Some(26) && attempt < MAX_SPAWN_ATTEMPTS => {
+                            tokio::time::sleep(std::time::Duration::from_millis(20 * u64::from(attempt))).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(TrackerCredentialError::AuthFailed {
+                                host: host.to_owned(),
+                                detail: e.to_string(),
+                            });
+                        }
+                    }
+                };
 
                 if output.status.success() {
                     return Ok(TrackerCredential::ambient());
@@ -192,45 +210,29 @@ mod tests {
     ///
     /// Returning `TempPath` (not `NamedTempFile`) is intentional: `NamedTempFile` holds
     /// the file open for writing, and on Linux exec fails with ETXTBSY if any fd with
-    /// O_WRONLY is open against the target. `into_temp_path()` closes the write fd while
-    /// keeping the file on disk until the returned value is dropped.
+    /// O_WRONLY is open against the target. We flush + `sync_all` before releasing the
+    /// write fd, then `into_temp_path()` closes it while keeping the file on disk until
+    /// the returned value is dropped. The resolver also retries spawn on ETXTBSY.
     fn make_fake_gh(script: &str) -> tempfile::TempPath {
         let mut f = tempfile::NamedTempFile::new().expect("temp file");
         write!(f, "#!/bin/sh\n{script}").expect("write script");
+        f.flush().expect("flush script");
+        f.as_file().sync_all().expect("sync script to disk");
         let mut perms = f.as_file().metadata().expect("metadata").permissions();
         perms.set_mode(0o755);
         f.as_file().set_permissions(perms).expect("set permissions");
+        // Close the write fd before any exec can race with O_WRONLY (Linux ETXTBSY).
         f.into_temp_path()
-    }
-
-    /// Resolve, retrying if the kernel transiently reports ETXTBSY.
-    ///
-    /// Even after the write fd is closed (see `make_fake_gh`), Linux can briefly
-    /// refuse to exec a just-written file with "Text file busy" under heavy parallel
-    /// test load (e.g. sandboxed CI runners) before the kernel fully releases it.
-    /// Retrying a few times rides out that window without weakening the assertion:
-    /// the resolve is still required to succeed, just not necessarily on the first try.
-    async fn resolve_retrying_etxtbsy(
-        resolver: &(impl TrackerCredentialResolver + ?Sized),
-    ) -> Result<TrackerCredential, TrackerCredentialError> {
-        for attempt in 0..5 {
-            match resolver.resolve("github", &serde_json::Value::Null).await {
-                Err(TrackerCredentialError::AuthFailed { detail, .. })
-                    if attempt < 4 && detail.contains("Text file busy") =>
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                result => return result,
-            }
-        }
-        unreachable!("loop always returns by the last attempt")
     }
 
     #[tokio::test]
     async fn resolves_ambient_credential_when_gh_auth_succeeds() {
         let fake = make_fake_gh("exit 0");
         let resolver = GhAuthStatusResolver::with_gh_binary(&*fake);
-        let cred = resolve_retrying_etxtbsy(&resolver).await.expect("should succeed");
+        let cred = resolver
+            .resolve("github", &serde_json::Value::Null)
+            .await
+            .expect("should succeed");
         assert_eq!(cred.token, "");
     }
 
@@ -300,7 +302,10 @@ mod tests {
         let store = KeychainTokenStore::with_backend(FakeStore::empty());
         let fallback = GhAuthStatusResolver::with_gh_binary(&*fake_gh);
         let resolver = KeychainOAuthResolver::with_fallback(store, fallback);
-        let cred = resolve_retrying_etxtbsy(&resolver).await.expect("should succeed");
+        let cred = resolver
+            .resolve("github", &serde_json::Value::Null)
+            .await
+            .expect("should succeed");
         assert_eq!(cred.token, ""); // ambient credential
     }
 

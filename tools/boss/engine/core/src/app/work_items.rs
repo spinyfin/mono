@@ -634,6 +634,13 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 // DB update. Two rapid edits may produce two notices
                 // in sequence — that's acceptable per the acceptance
                 // criteria.
+                //
+                // Mid-turn (`Working`) is special: `send_input_to_worker`
+                // refuses typed input for safety, but the notice must
+                // not be dropped. Re-queue as a non-urgent probe so
+                // `dispatch_probe_on_stop` delivers it at the next
+                // Idle/Stop boundary (same durability as deferred
+                // urgent probes).
                 if let Some((old_name, old_description)) = previous_spec
                     && let Some(run_id) = active_chore_run_id(&server_state, &item)
                 {
@@ -646,12 +653,28 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                     {
                         let server_for_notify = server_state.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = server_for_notify.send_input_to_worker(&run_id, msg).await {
-                                tracing::warn!(
-                                    ?err,
-                                    %run_id,
-                                    "chore-update: failed to notify live worker",
-                                );
+                            match server_for_notify.send_input_to_worker(&run_id, msg.clone()).await {
+                                Ok(_) => {}
+                                Err(SendInputError::NotAcceptingInput { activity }) => {
+                                    // Durable deferral: same probe queue
+                                    // Stop/idle paths already drain.
+                                    let probe_id =
+                                        server_for_notify.queue_probe(run_id.clone(), msg, /*urgent=*/ false);
+                                    tracing::info!(
+                                        %run_id,
+                                        %probe_id,
+                                        activity = activity.map(boss_protocol::WorkerActivity::as_str),
+                                        "chore-update: worker not accepting typed input; \
+                                         re-queued notice for Stop/idle delivery",
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        %run_id,
+                                        "chore-update: failed to notify live worker",
+                                    );
+                                }
                             }
                         });
                     }

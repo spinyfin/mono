@@ -1,6 +1,6 @@
 //! Worker Stop-boundary escalation/blocker signal detection.
 //!
-//! Background: incident 2026-07-02 (`exec_18b5243e65ff188_2d`, T2085) — a
+//! Background: incident 2026-07-02 (`exec_18b5243e65ff188_2d`) — a
 //! worker hit a bazel blocker, did exactly the right thing (stopped,
 //! emitted an `[effort-escalation]` marker, refused to push unvalidated
 //! code, asked for guidance), and the system did nothing with it. Nothing
@@ -37,7 +37,7 @@ pub const EFFORT_ESCALATION_MARKER: &str = "[effort-escalation]";
 
 /// `[blocked]` marker prefix — the new blocker convention this module
 /// introduces. Documented for workers in
-/// [`crate::runner::worker_escalation_protocol_directive`].
+/// [`crate::runner::prompt::worker_escalation_protocol_directive`].
 pub const BLOCKED_MARKER: &str = "[blocked]";
 
 /// Engine-owned `work_attention_items.kind` for a filed `[effort-escalation]` signal.

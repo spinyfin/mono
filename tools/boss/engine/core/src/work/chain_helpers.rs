@@ -23,9 +23,10 @@ pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
 /// Walk `tasks.parent_task_id` from `task_id` to find the originating
 /// non-revision task (the "chain root") — the task that owns the PR.
 ///
-/// Revision tasks form chains: a revision of a revision is allowed (OQ2),
-/// and all revisions in a chain share the chain root's PR. This helper
-/// returns the ID of the first ancestor whose `kind` is not `'revision'`.
+/// All revisions in a chain share the chain root's PR. New revisions always
+/// store `parent_task_id = chain root`; this walk still handles legacy
+/// nested rows (revision parented to a revision) so pre-migration data and
+/// mid-upgrade open DBs keep resolving correctly.
 ///
 /// **Broken-parent handling**: if a row's `parent_task_id` points to a
 /// task that no longer exists (soft-deleted or missing), walking stops at
@@ -191,7 +192,12 @@ pub(crate) fn collect_chain_revision_ids_including_deleted(
 /// alone; it self-retires when its worker stops.
 ///
 /// Returns the number of execution rows abandoned.
-pub(crate) fn abandon_pending_executions(conn: &Connection, work_item_id: &str, now: &str) -> Result<usize> {
+pub(crate) fn abandon_pending_executions(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    work_item_id: &str,
+    now: &str,
+) -> Result<usize> {
     // Capture the ids/statuses of the rows about to be abandoned so the
     // canonical terminalization trace (see `WorkDb::mark_execution_orphaned`
     // in executions_runs.rs) can name each one individually, rather than
@@ -215,6 +221,7 @@ pub(crate) fn abandon_pending_executions(conn: &Connection, work_item_id: &str, 
         params![work_item_id, now],
     )?;
     for (execution_id, from_status) in &doomed {
+        stage_execution_terminal(pending, conn, execution_id, work_item_id)?;
         tracing::warn!(
             execution_id = %execution_id,
             work_item_id = %work_item_id,
@@ -418,7 +425,12 @@ pub(crate) fn resolve_revision_on_parent_close(
 /// function returns — callers that must still locate a just-archived
 /// revision (e.g. the merge poller stopping its in-flight execution) use
 /// [`collect_chain_revision_ids_including_deleted`] instead.
-pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_root_id: &str, now: &str) -> Result<()> {
+pub(crate) fn block_pending_revisions_on_parent_close(
+    pending: &mut PendingEvents,
+    conn: &Connection,
+    chain_root_id: &str,
+    now: &str,
+) -> Result<()> {
     let revision_ids = collect_chain_revision_ids(conn, chain_root_id)?;
     if revision_ids.is_empty() {
         return Ok(());
@@ -438,7 +450,7 @@ pub(crate) fn block_pending_revisions_on_parent_close(conn: &Connection, chain_r
         }
 
         // Drop any not-yet-live execution row before archiving the task.
-        abandon_pending_executions(conn, rev_id, now)?;
+        abandon_pending_executions(pending, conn, rev_id, now)?;
 
         resolve_revision_on_parent_close(conn, &rev, chain_root_id, now, "block_pending_revisions")?;
     }

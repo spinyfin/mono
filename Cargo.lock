@@ -310,6 +310,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-codex-auth"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "fs4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "boss-comment-anchor"
 version = "0.1.0"
 dependencies = [
@@ -366,6 +380,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-dispatch-reader"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "boss-dispatch-events",
+ "boss-engine-utils",
+ "boss-log-files",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-editorial"
 version = "0.1.0"
 dependencies = [
@@ -389,9 +419,11 @@ dependencies = [
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
  "boss-dispatch-events",
+ "boss-dispatch-reader",
  "boss-editorial",
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
+ "boss-engine-comment-classifier",
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
  "boss-engine-driver",
@@ -400,10 +432,16 @@ dependencies = [
  "boss-engine-live-status-redact",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
+ "boss-engine-recovery",
+ "boss-engine-stdout-progress",
+ "boss-engine-structured-output",
  "boss-engine-transient-error",
+ "boss-engine-utility-model",
  "boss-engine-utils",
  "boss-engine-worker-policy",
+ "boss-event-bus",
  "boss-feature-flags",
+ "boss-gh-telemetry",
  "boss-github",
  "boss-github-tracker",
  "boss-log-files",
@@ -452,6 +490,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-codex-hook-trust"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
+name = "boss-engine-comment-classifier"
+version = "0.1.0"
+dependencies = [
+ "boss-claude-client",
+ "boss-engine-utility-model",
+ "boss-engine-utils",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "boss-engine-day-rotated-log"
 version = "0.1.0"
 dependencies = [
@@ -483,9 +545,12 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-engine-structured-output",
  "boss-engine-transient-error",
+ "boss-engine-utils",
  "boss-protocol",
  "boss-ssh-transport",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -544,10 +609,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-recovery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "boss-log-files",
+ "boss-protocol",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-stdout-progress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-engine-driver",
+ "boss-engine-structured-output",
+ "boss-protocol",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-structured-output"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-utils",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "boss-engine-transient-error"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "boss-engine-utility-model"
+version = "0.1.0"
+dependencies = [
+ "boss-claude-client",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]
@@ -576,6 +689,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-event-bus"
+version = "0.1.0"
+dependencies = [
+ "boss-engine-metrics-registry",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-feature-flags"
 version = "0.1.0"
 dependencies = [
@@ -587,11 +709,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-gh-telemetry"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-github"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "boss-gh-telemetry",
  "jsonwebtoken",
  "reqwest",
  "rustls",
@@ -652,6 +786,9 @@ name = "boss-log-files"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
+ "chrono",
+ "serde_json",
  "tempfile",
 ]
 
@@ -670,7 +807,7 @@ name = "boss-pr-review"
 version = "0.1.0"
 dependencies = [
  "bon",
- "boss-engine-utils",
+ "boss-engine-structured-output",
  "serde",
  "serde_json",
 ]
@@ -700,6 +837,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "boss-timer-wheel"
+version = "0.1.0"
+dependencies = [
+ "boss-event-bus",
+ "tokio",
 ]
 
 [[package]]
@@ -751,6 +896,7 @@ name = "bossctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "boss-build-info",
  "boss-client",
  "boss-engine",
@@ -1021,6 +1167,7 @@ dependencies = [
  "checkleft-md-link-integrity",
  "checkleft-rust-giant-structs",
  "checkleft-rust-giant-structs-create",
+ "checkleft-text-forbidden-pattern",
  "wit-bindgen 0.51.0",
 ]
 
@@ -1052,6 +1199,16 @@ dependencies = [
  "serde",
  "serde_json",
  "syn",
+ "tempfile",
+]
+
+[[package]]
+name = "checkleft-text-forbidden-pattern"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "regex",
+ "serde",
  "tempfile",
 ]
 
