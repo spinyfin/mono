@@ -2216,10 +2216,13 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
     // A Trunk eviction with nothing captured is the shape that destroyed
     // flunge#1137: the engine could not name a failing build, the prompt
     // asserted one existed anyway, and the bail-out below was gated off.
-    // `ci_watch::on_queue_side_failure_detected` now refuses to create such
-    // an attempt at all, so this should be unreachable — but a row created
-    // before that guard shipped can still be re-dispatched by the
+    // `ci_watch::on_queue_side_failure_detected` refuses to create such an
+    // attempt for the Trunk arm, so this should be unreachable for new
+    // Trunk rows — but a pre-guard row can still be re-dispatched by the
     // stranded-rescue path, so the prompt has to stay honest about it.
+    // Merge-queue rebounce *may* land with empty checks when evidence
+    // enrichment misses; that path uses the generic directive below
+    // rather than the Trunk bail-out.
     let trunk_eviction_without_evidence = is_trunk_eviction && captured_checks.is_none();
     match captured_checks {
         Some(md) => out.push_str(&md),
@@ -2229,7 +2232,11 @@ fn compose_ci_remediation_fragment(attempt: &CiRemediation) -> String {
                 out.push_str(&format!(
                     "_The engine did not capture the failing checks for this merge-queue rebounce. \
                      Do NOT use `gh pr checks` — it shows the PR-head checks, which are green. \
-                     Instead, fetch the check runs for the synthetic merge SHA directly: \
+                     Instead, fetch CI for the synthetic merge SHA directly. Prefer legacy commit \
+                     statuses when check-runs are empty (Buildkite on mono posts only those): \
+                     `gh api repos/<owner>/<repo>/commits/{sha_hint}/status \
+                     | jq '.statuses[] | select(.state == \"failure\" or .state == \"error\") | {{context, target_url}}'`; \
+                     also try check-runs: \
                      `gh api repos/<owner>/<repo>/commits/{sha_hint}/check-runs \
                      | jq '.check_runs[] | select(.conclusion == \"failure\") | {{name, details_url}}'`._\n",
                 ));

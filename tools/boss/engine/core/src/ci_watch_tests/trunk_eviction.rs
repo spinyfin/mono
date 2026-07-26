@@ -464,17 +464,19 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
     assert!(state.is_none(), "the card must leave the Merging lane");
 }
 
-/// Defence in depth for the T792/T793 shape: a queue-side episode carrying
-/// no failing check must not flip the row.
+/// Defence in depth: a **Trunk** queue-side episode carrying no failing
+/// check must not flip the row.
 ///
-/// `trunk_queue_poller` now classifies the eviction before routing, so this
+/// `trunk_queue_poller` classifies the eviction before routing, so this
 /// should be unreachable in production — but the combination it guards
 /// against (a CI-fix attempt with nothing to fix) is what dispatched a worker
-/// that force-pushed an empty commit over flunge#1137's contents, so the
-/// shared queue-side helper refuses it regardless of caller. Applies to both
-/// arms: `merge_queue_rebounce` gets the same treatment.
+/// that force-pushed an empty commit over flunge#1137's contents. The shared
+/// helper refuses empty-`failures` **only for the Trunk arm** (the
+/// pre-#2354 blanket refusal was scoped away from GitHub-native
+/// merge-queue rebounce: a confirmed `failed_checks` ejection is
+/// authoritative even when the evidence-enrichment lookup comes back empty).
 #[tokio::test]
-async fn a_queue_side_episode_with_no_failing_checks_does_not_flip_the_row() {
+async fn a_trunk_episode_with_no_failing_checks_does_not_flip_the_row() {
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("boss.db");
     let db = WorkDb::open(db_path.clone()).unwrap();
@@ -494,10 +496,6 @@ async fn a_queue_side_episode_with_no_failing_checks_does_not_flip_the_row() {
     )
     .await;
     assert!(!evicted, "a Trunk eviction with no failing build must not flip");
-
-    let rebounced =
-        on_merge_queue_rebounce_detected(&db, pub_.as_ref(), &cand, Some("feature"), "synthetic-sha", &[], &[]).await;
-    assert!(!rebounced, "a rebounce with no failing checks must not flip either");
 
     let (status, reason) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::InReview, "the row stays where it was");
