@@ -532,12 +532,7 @@ mod tests {
         // out from under the assertions below.
         let started_at_ms = boss_gh_telemetry::now_ms();
         for _ in 0..WRITE_BATCH_MAX {
-            let mut s = sample(
-                "merge_poller.adaptive",
-                GhApi::Graphql,
-                GhOutcome::Ok,
-                rl(2, 4972),
-            );
+            let mut s = sample("merge_poller.adaptive", GhApi::Graphql, GhOutcome::Ok, rl(2, 4972));
             s.started_at_ms = started_at_ms;
             tx.send(s).expect("writer task is alive");
         }
@@ -551,9 +546,7 @@ mod tests {
         // sits in `pending` until the next tick, and a reader that stops at
         // the first non-empty result sees a short count.
         drop(tx);
-        handle
-            .await
-            .expect("writer task exits cleanly once its senders drop");
+        handle.await.expect("writer task exits cleanly once its senders drop");
 
         let buckets = db.github_api_usage_by_caller(0).expect("query");
         assert_eq!(buckets.len(), 1, "the recorded calls must reach state.db");
