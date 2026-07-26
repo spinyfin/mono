@@ -23,8 +23,10 @@
 //!    own hash does not cover file bytes — only the command string).
 //! 3. Stamp `[hooks.state]` into the worker's `config.toml`.
 //! 4. **Observe** arming via `codex app-server` `hooks/list` — every required
-//!    hook must report `trustStatus = trusted`. Silence, missing hooks, or
-//!    `untrusted`/`modified` refuse the worker.
+//!    hook must report `trustStatus = trusted`, `enabled = true`, and a
+//!    matching `currentHash`. Silence, missing hooks, disabled hooks, or
+//!    `untrusted`/`modified` refuse the worker. Observation is wall-clock
+//!    bounded; a hung app-server is treated as refuse, not a hang.
 //!
 //! Missing, stale, or unobservable attestation → refuse. Silence is not
 //! success.
@@ -69,8 +71,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Wall-clock budget for a live `codex app-server` `hooks/list` observation.
+///
+/// A hung or stalled app-server must not block worker dispatch forever.
+/// Exceeding this budget is [`TrustGateError::ObservationFailed`] (refuse).
+pub const OBSERVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
@@ -208,7 +218,8 @@ pub struct HookAttestationEntry {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ObservationProof {
     /// `hooks/list` returned an entry for every required hook with
-    /// `trustStatus = "trusted"` and `currentHash` equal to the stamped hash.
+    /// `trustStatus = "trusted"`, `enabled = true`, and `currentHash` equal
+    /// to the stamped hash.
     HooksList {
         /// codex-cli version string when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -251,6 +262,8 @@ pub enum TrustGateError {
     ObservationFailed { detail: String },
     /// A required hook was absent from `hooks/list` after stamping.
     HookNotListed { key: String },
+    /// `hooks/list` reported `enabled = false` for a required hook.
+    HookNotEnabled { key: String },
     /// `hooks/list` reported a trust status other than `trusted`.
     HookNotTrusted {
         key: String,
@@ -327,6 +340,13 @@ impl std::fmt::Display for TrustGateError {
                     f,
                     "Codex hook-trust gate: required hook key `{key}` not listed by hooks/list \
                      after stamping — refusing worker"
+                )
+            }
+            Self::HookNotEnabled { key } => {
+                write!(
+                    f,
+                    "Codex hook-trust gate: required hook key `{key}` is listed but enabled=false \
+                     — refusing worker"
                 )
             }
             Self::HookNotTrusted {
@@ -499,12 +519,11 @@ fn ensure_guard_executable(path: &Path) -> Result<String, TrustGateError> {
 /// command strings already written; a round-trip through `toml::Value` is
 /// unnecessary and fragile for that shape.
 ///
-/// Does not observe arming and does not validate guard executables — use
-/// [`arm_and_attest`] for the full gate. Returns the hashes that were written.
-pub fn stamp_hook_trust(
-    config_path: &Path,
-    hooks: &[CommandHookSpec],
-) -> Result<Vec<(String, String)>, TrustGateError> {
+/// **Internal write step only.** This does not observe arming and is not an
+/// attestation — callers must go through [`arm_and_attest`] /
+/// [`arm_and_attest_with_observer`], which stamp then verify via `hooks/list`.
+/// Kept private so it cannot be mistaken for a public proof API.
+fn stamp_hook_trust(config_path: &Path, hooks: &[CommandHookSpec]) -> Result<Vec<(String, String)>, TrustGateError> {
     if hooks.is_empty() {
         return Err(TrustGateError::NoHooksConfigured);
     }
@@ -604,6 +623,11 @@ pub trait TrustObserver {
 /// Live observer: `codex app-server` over stdio, `hooks/list` RPC.
 ///
 /// Never passes `--dangerously-bypass-hook-trust`.
+///
+/// Observation is hard-capped by [`OBSERVE_TIMEOUT`]. A hung `read_line` is
+/// not a silent success — the child is killed and the gate refuses.
+/// `stderr` is discarded (`Stdio::null`) so a chatty app-server cannot
+/// deadlock the pipe buffer.
 #[derive(Debug, Clone)]
 pub struct CodexAppServerObserver {
     pub codex_bin: PathBuf,
@@ -620,101 +644,144 @@ impl TrustObserver for CodexAppServerObserver {
             // Explicitly do NOT set any bypass-hook-trust flag/env.
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            // Never pipe stderr without a drain — a full pipe deadlocks the child.
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|err| TrustGateError::ObservationFailed {
                 detail: format!("failed to spawn `{} app-server`: {err}", self.codex_bin.display()),
             })?;
 
-        let mut stdin = child.stdin.take().ok_or_else(|| TrustGateError::ObservationFailed {
+        let stdin = child.stdin.take().ok_or_else(|| TrustGateError::ObservationFailed {
             detail: "app-server stdin not piped".into(),
         })?;
         let stdout = child.stdout.take().ok_or_else(|| TrustGateError::ObservationFailed {
             detail: "app-server stdout not piped".into(),
         })?;
-        let mut reader = BufReader::new(stdout);
 
-        let write_msg = |stdin: &mut std::process::ChildStdin, msg: &JsonValue| {
-            let line = serde_json::to_string(msg).map_err(|err| TrustGateError::ObservationFailed {
-                detail: format!("serialize RPC: {err}"),
-            })?;
-            writeln!(stdin, "{line}").map_err(|err| TrustGateError::ObservationFailed {
-                detail: format!("write RPC: {err}"),
-            })?;
-            stdin.flush().map_err(|err| TrustGateError::ObservationFailed {
-                detail: format!("flush RPC: {err}"),
-            })?;
-            Ok::<(), TrustGateError>(())
+        // Run the RPC on a side thread so a blocked read cannot hang dispatch
+        // past OBSERVE_TIMEOUT. The parent owns the Child and kills it on
+        // timeout (which unblocks the reader when stdout closes).
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let result = observe_hooks_rpc(stdin, stdout);
+            let _ = tx.send(result);
+        });
+
+        let result = match rx.recv_timeout(OBSERVE_TIMEOUT) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(TrustGateError::ObservationFailed {
+                detail: format!(
+                    "hooks/list observation timed out after {}s — silence is not success",
+                    OBSERVE_TIMEOUT.as_secs()
+                ),
+            }),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(TrustGateError::ObservationFailed {
+                detail: "hooks/list observer thread disconnected before responding".into(),
+            }),
         };
 
-        let read_until_id =
-            |reader: &mut BufReader<std::process::ChildStdout>, want_id: u64| -> Result<JsonValue, TrustGateError> {
-                // Bound the read so a hung app-server cannot wedge dispatch forever.
-                // app-server is local and typically answers in milliseconds.
-                let mut line = String::new();
-                for _ in 0..200 {
-                    line.clear();
-                    let n = reader
-                        .read_line(&mut line)
-                        .map_err(|err| TrustGateError::ObservationFailed {
-                            detail: format!("read RPC: {err}"),
-                        })?;
-                    if n == 0 {
-                        return Err(TrustGateError::ObservationFailed {
-                            detail: "app-server closed stdout before responding".into(),
-                        });
-                    }
-                    let Ok(val) = serde_json::from_str::<JsonValue>(line.trim()) else {
-                        continue;
-                    };
-                    if val.get("id").and_then(|v| v.as_u64()) == Some(want_id) {
-                        return Ok(val);
-                    }
-                }
-                Err(TrustGateError::ObservationFailed {
-                    detail: format!("no response for RPC id={want_id} within read bound"),
-                })
-            };
-
-        write_msg(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "clientInfo": { "name": "boss-codex-hook-trust", "version": "0" },
-                    "capabilities": {}
-                }
-            }),
-        )?;
-        let _init = read_until_id(&mut reader, 1)?;
-
-        write_msg(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized"
-            }),
-        )?;
-
-        write_msg(
-            &mut stdin,
-            &serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "hooks/list",
-                "params": {}
-            }),
-        )?;
-        let list_resp = read_until_id(&mut reader, 2)?;
-
-        // Best-effort shutdown; ignore failures.
+        // Always reap the child so we do not leave orphans after success,
+        // failure, or timeout.
         let _ = child.kill();
         let _ = child.wait();
 
-        parse_hooks_list_response(&list_resp)
+        result
     }
+}
+
+fn write_rpc_line(stdin: &mut ChildStdin, msg: &JsonValue) -> Result<(), TrustGateError> {
+    let line = serde_json::to_string(msg).map_err(|err| TrustGateError::ObservationFailed {
+        detail: format!("serialize RPC: {err}"),
+    })?;
+    writeln!(stdin, "{line}").map_err(|err| TrustGateError::ObservationFailed {
+        detail: format!("write RPC: {err}"),
+    })?;
+    stdin.flush().map_err(|err| TrustGateError::ObservationFailed {
+        detail: format!("flush RPC: {err}"),
+    })?;
+    Ok(())
+}
+
+fn read_until_id(reader: &mut BufReader<ChildStdout>, want_id: u64) -> Result<JsonValue, TrustGateError> {
+    // Secondary line-count bound (wall-clock is the real cap via OBSERVE_TIMEOUT).
+    let mut line = String::new();
+    for _ in 0..200 {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .map_err(|err| TrustGateError::ObservationFailed {
+                detail: format!("read RPC: {err}"),
+            })?;
+        if n == 0 {
+            return Err(TrustGateError::ObservationFailed {
+                detail: "app-server closed stdout before responding".into(),
+            });
+        }
+        let Ok(val) = serde_json::from_str::<JsonValue>(line.trim()) else {
+            continue;
+        };
+        if val.get("id").and_then(|v| v.as_u64()) == Some(want_id) {
+            return Ok(val);
+        }
+    }
+    Err(TrustGateError::ObservationFailed {
+        detail: format!("no response for RPC id={want_id} within read bound"),
+    })
+}
+
+/// JSON-RPC `initialize` + `hooks/list` over an already-spawned app-server.
+fn observe_hooks_rpc(mut stdin: ChildStdin, stdout: ChildStdout) -> Result<Vec<ObservedHook>, TrustGateError> {
+    let mut reader = BufReader::new(stdout);
+
+    write_rpc_line(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": { "name": "boss-codex-hook-trust", "version": "0" },
+                "capabilities": {}
+            }
+        }),
+    )?;
+    let init = read_until_id(&mut reader, 1)?;
+    if let Some(err) = init.get("error") {
+        return Err(TrustGateError::ObservationFailed {
+            detail: format!("initialize RPC error: {err}"),
+        });
+    }
+    if init.get("result").is_none() {
+        return Err(TrustGateError::ObservationFailed {
+            detail: format!("initialize response missing result: {init}"),
+        });
+    }
+
+    write_rpc_line(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }),
+    )?;
+
+    write_rpc_line(
+        &mut stdin,
+        &serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "hooks/list",
+            "params": {}
+        }),
+    )?;
+    let list_resp = read_until_id(&mut reader, 2)?;
+    if let Some(err) = list_resp.get("error") {
+        return Err(TrustGateError::ObservationFailed {
+            detail: format!("hooks/list RPC error: {err}"),
+        });
+    }
+
+    parse_hooks_list_response(&list_resp)
 }
 
 fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, TrustGateError> {
@@ -793,7 +860,8 @@ fn parse_hooks_list_response(resp: &JsonValue) -> Result<Vec<ObservedHook>, Trus
 ///    file; bind its content SHA-256 into the attestation.
 /// 3. Stamp `[hooks.state.<key>].trusted_hash` for every hook.
 /// 4. Observe via `observer` (`hooks/list`); every required key must report
-///    `trustStatus = "trusted"` with `currentHash` equal to the stamped hash.
+///    `enabled = true`, `trustStatus = "trusted"`, and `currentHash` equal to
+///    the stamped hash.
 /// 5. Return a serializable [`HookTrustAttestation`].
 ///
 /// Does **not** pass `--dangerously-bypass-hook-trust`.
@@ -848,6 +916,9 @@ pub fn arm_and_attest_with_observer<O: TrustObserver>(
             .get(&key)
             .ok_or_else(|| TrustGateError::HookNotListed { key: key.clone() })?;
 
+        if !obs.enabled {
+            return Err(TrustGateError::HookNotEnabled { key: key.clone() });
+        }
         if !obs.trust_status.eq_ignore_ascii_case("trusted") {
             return Err(TrustGateError::HookNotTrusted {
                 key: key.clone(),
@@ -969,7 +1040,9 @@ pub fn verify_attestation(attestation: &HookTrustAttestation, hooks: &[CommandHo
         }
 
         if hook.require_guard_executable {
-            let live = content_sha256_of_file(&command)?;
+            // Re-check existence + executable bit (not just content hash) so a
+            // chmod that drops +x after arming still fails re-verify.
+            let live = ensure_guard_executable(&command)?;
             match &entry.guard_content_sha256 {
                 Some(bound) if bound == &live => {}
                 Some(bound) => {

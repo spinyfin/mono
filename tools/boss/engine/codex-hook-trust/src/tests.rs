@@ -37,14 +37,19 @@ fn command_hook_hash_is_stable_and_path_sensitive() {
 #[test]
 fn command_hook_hash_matches_known_live_capture() {
     // Captured live with codex app-server hooks/list on 2026-07-26 against
-    // codex-cli 0.145.0. Command path and hash are from that run's resolved
-    // realpath — re-check algorithm fidelity without re-running Codex.
+    // codex-cli 0.145.0. Command path is the resolved realpath from that run;
+    // the golden below is the live-reported currentHash / independent
+    // recomputation of the same identity — pin it so algorithm drift fails
+    // the suite without re-running Codex.
     //
     // Identity JSON (canonical):
     // {"event_name":"session_start","hooks":[{"async":false,"command":"/private/tmp/boss-hook-trust-golden/h.sh","timeout":600,"type":"command"}]}
+    const GOLDEN_SESSION_START: &str = "sha256:f6412f932140037c9b09b4fd9a240fb62e7aa9e563e1d0a5af4019254acb0941";
     let dir = PathBuf::from("/private/tmp/boss-hook-trust-golden");
     let cmd = dir.join("h.sh");
     let hash = command_hook_trusted_hash(HookEvent::SessionStart, cmd.to_str().unwrap(), None, 600, false);
+    assert_eq!(hash, GOLDEN_SESSION_START, "pinned live-capture golden must hold");
+
     // Independent recomputation of the same identity.
     let mut handler = serde_json::Map::new();
     handler.insert("async".into(), serde_json::json!(false));
@@ -75,8 +80,8 @@ fn hook_state_key_format() {
 // ── Fake observer ───────────────────────────────────────────────────────────
 
 struct FakeObserver {
-    /// key → (trust_status, current_hash)
-    responses: Mutex<BTreeMap<String, (String, String)>>,
+    /// key → (trust_status, current_hash, enabled)
+    responses: Mutex<BTreeMap<String, (String, String, bool)>>,
     fail: Mutex<Option<String>>,
 }
 
@@ -89,10 +94,14 @@ impl FakeObserver {
     }
 
     fn set(&self, key: &str, status: &str, hash: &str) {
+        self.set_with_enabled(key, status, hash, true);
+    }
+
+    fn set_with_enabled(&self, key: &str, status: &str, hash: &str, enabled: bool) {
         self.responses
             .lock()
             .unwrap()
-            .insert(key.to_string(), (status.to_string(), hash.to_string()));
+            .insert(key.to_string(), (status.to_string(), hash.to_string(), enabled));
     }
 
     fn fail_with(&self, msg: &str) {
@@ -113,11 +122,11 @@ impl TrustObserver for FakeObserver {
         }
         Ok(map
             .iter()
-            .map(|(key, (status, hash))| ObservedHook {
+            .map(|(key, (status, hash, enabled))| ObservedHook {
                 key: key.clone(),
                 trust_status: status.clone(),
                 current_hash: hash.clone(),
-                enabled: true,
+                enabled: *enabled,
             })
             .collect())
     }
@@ -324,6 +333,56 @@ fn arm_refuses_when_hook_listed_but_untrusted() {
 }
 
 #[test]
+fn arm_refuses_when_hook_listed_but_disabled() {
+    let fx = setup_fixture("#!/bin/sh\necho guard\n");
+    let hooks = standard_hooks(&fx);
+    let observer = FakeObserver::new();
+    for hook in &hooks {
+        let key = hook_state_key(&fx.config_path, hook.event, hook.group_index, hook.handler_index);
+        let hash = expected_hash(&fx, hook.event, hook.matcher.as_deref());
+        // Trusted hash but disabled — must still refuse.
+        observer.set_with_enabled(&key, "trusted", &hash, false);
+    }
+
+    let req = ArmRequest {
+        codex_home: fx.codex_home.clone(),
+        config_path: fx.config_path.clone(),
+        cwd: fx.cwd.clone(),
+        hooks,
+        codex_bin: PathBuf::from("codex"),
+    };
+    let err = arm_and_attest_with_observer(&req, &observer).unwrap_err();
+    assert!(matches!(err, TrustGateError::HookNotEnabled { .. }));
+}
+
+#[test]
+fn verify_attestation_refuses_when_guard_loses_executable_bit() {
+    let fx = setup_fixture("#!/bin/sh\necho guard\n");
+    let hooks = standard_hooks(&fx);
+    let observer = FakeObserver::new();
+    for hook in &hooks {
+        let key = hook_state_key(&fx.config_path, hook.event, hook.group_index, hook.handler_index);
+        let hash = expected_hash(&fx, hook.event, hook.matcher.as_deref());
+        observer.set(&key, "trusted", &hash);
+    }
+    let req = ArmRequest {
+        codex_home: fx.codex_home.clone(),
+        config_path: fx.config_path.clone(),
+        cwd: fx.cwd.clone(),
+        hooks: hooks.clone(),
+        codex_bin: PathBuf::from("codex"),
+    };
+    let att = arm_and_attest_with_observer(&req, &observer).unwrap();
+    verify_attestation(&att, &hooks).expect("fresh attestation must verify");
+
+    let mut perms = fs::metadata(&fx.guard).unwrap().permissions();
+    perms.set_mode(0o644);
+    fs::set_permissions(&fx.guard, perms).unwrap();
+    let err = verify_attestation(&att, &hooks).unwrap_err();
+    assert!(matches!(err, TrustGateError::GuardExecutableNotExecutable { .. }));
+}
+
+#[test]
 fn arm_refuses_when_observed_hash_mismatches_stamp() {
     let fx = setup_fixture("#!/bin/sh\necho guard\n");
     let hooks = standard_hooks(&fx);
@@ -431,6 +490,24 @@ fn parse_hooks_list_response_extracts_entries() {
     assert_eq!(hooks.len(), 1);
     assert_eq!(hooks[0].trust_status, "trusted");
     assert_eq!(hooks[0].current_hash, "sha256:abc");
+    assert!(hooks[0].enabled);
+
+    // Missing `enabled` defaults to false (fail closed at the gate).
+    let resp_no_enabled = serde_json::json!({
+        "id": 2,
+        "result": {
+            "data": [{
+                "cwd": "/tmp/repo",
+                "hooks": [{
+                    "key": "/tmp/config.toml:pre_tool_use:0:0",
+                    "trustStatus": "trusted",
+                    "currentHash": "sha256:abc"
+                }]
+            }]
+        }
+    });
+    let hooks = parse_hooks_list_response(&resp_no_enabled).unwrap();
+    assert!(!hooks[0].enabled);
 }
 
 #[test]

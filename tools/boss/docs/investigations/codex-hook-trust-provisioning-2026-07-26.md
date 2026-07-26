@@ -71,14 +71,16 @@ Verified live 2026-07-26: after stamping matching hashes, `trustStatus` becomes 
 
 Failure modes that **must refuse** dispatch:
 
-| Symptom                                        | Gate outcome        |
-| ---------------------------------------------- | ------------------- |
-| `hooks/list` fails / empty `data` / no entries | `ObservationFailed` |
-| Required key absent from list                  | `HookNotListed`     |
-| `trustStatus != trusted`                       | `HookNotTrusted`    |
-| `currentHash != stamped hash`                  | `HashMismatch`      |
-| Guard path missing / not executable            | `GuardExecutable*`  |
-| Prior attestation but guard bytes changed      | `AttestationStale`  |
+| Symptom                                        | Gate outcome                                     |
+| ---------------------------------------------- | ------------------------------------------------ |
+| `hooks/list` fails / empty `data` / no entries | `ObservationFailed`                              |
+| `hooks/list` / initialize RPC error or hang    | `ObservationFailed` (wall-clock timeout; refuse) |
+| Required key absent from list                  | `HookNotListed`                                  |
+| Required key listed with `enabled = false`     | `HookNotEnabled`                                 |
+| `trustStatus != trusted`                       | `HookNotTrusted`                                 |
+| `currentHash != stamped hash`                  | `HashMismatch`                                   |
+| Guard path missing / not executable            | `GuardExecutable*`                               |
+| Prior attestation but guard bytes changed      | `AttestationStale`                               |
 
 ## Bypass flag blast radius
 
@@ -91,7 +93,7 @@ arm_and_attest(ArmRequest) -> Result<HookTrustAttestation, TrustGateError>
 verify_attestation(&attestation, &hooks) -> Result<(), TrustGateError>
 write_attestation_file(path, &attestation)
 command_hook_trusted_hash(...)   // pure
-stamp_hook_trust(config_path, hooks)  // write-only; prefer arm_and_attest
+// stamp_hook_trust is crate-private — write-only, not an attestation
 ```
 
 Call sequence at spawn:
