@@ -989,6 +989,20 @@ pub(crate) fn migrate_tasks_pr_status_columns(conn: &Connection) -> Result<()> {
     ] {
         if !table_has_column(conn, "tasks", column)? {
             conn.execute(ddl, [])?;
+            if column == "pr_status_observed_at" {
+                // One-time backfill for engines upgrading from before this
+                // column existed: without it, every already-polled task
+                // would report `observed_at: null` from `boss pr status`
+                // until the merge poller's next sweep happens to touch that
+                // row — and rows the poller has stopped sweeping (merged,
+                // closed) would stay null indefinitely. `pr_state_polled_at`
+                // is the closest prior observation timestamp available.
+                conn.execute(
+                    "UPDATE tasks SET pr_status_observed_at = pr_state_polled_at \
+                     WHERE pr_status_observed_at IS NULL AND pr_state_polled_at IS NOT NULL",
+                    [],
+                )?;
+            }
         }
     }
     Ok(())

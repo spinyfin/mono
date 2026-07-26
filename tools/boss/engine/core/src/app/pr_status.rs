@@ -321,16 +321,16 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
     };
 
     let mergeable = crate::merge_poller::mergeable_state_str(open.mergeability);
-    let merge_state_status =
+    let probe_merge_state_status =
         (!probe.raw_merge_state_status.is_empty()).then_some(probe.raw_merge_state_status.as_str());
-    let head_sha = probe.head_ref_oid.as_deref();
+    let probe_head_sha = probe.head_ref_oid.as_deref();
     use crate::work::now_string;
     let observed_at = now_string();
     if let Err(err) = work_db.set_pr_status_observation(
         &effective.status_task_id,
         mergeable,
-        merge_state_status,
-        head_sha,
+        probe_merge_state_status,
+        probe_head_sha,
         &observed_at,
     ) {
         tracing::warn!(
@@ -340,6 +340,14 @@ pub(super) async fn handle_get_pr_status(ctx: Dispatch, req: FrontendRequest) {
             "get_pr_status: failed to persist refresh observation (response still reflects the live probe)",
         );
     }
+
+    // Mirror the write path's COALESCE: a probe response missing a field
+    // must not report it as null to the caller when a known-good stored
+    // value exists — otherwise a `--refresh` caller sees a blanked field
+    // that a later plain `boss pr status` (reading the coalesced row back)
+    // would not.
+    let merge_state_status = probe_merge_state_status.or(snapshot.merge_state_status.as_deref());
+    let head_sha = probe_head_sha.or(snapshot.head_sha.as_deref());
 
     send_response(
         &sink,

@@ -191,20 +191,18 @@ impl BranchVerifier for StubBranchVerifier {
         }
     }
 
-    async fn fetch_pr_body(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
-        let guard = self.body_result.lock().await;
-        match &*guard {
-            Ok(body) => Ok(body.clone()),
-            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
-        }
-    }
-
-    async fn fetch_pr_title(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
-        let guard = self.title_result.lock().await;
-        match &*guard {
-            Ok(title) => Ok(title.clone()),
-            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
-        }
+    async fn fetch_pr_title_and_body(&self, _repo_slug: &str, _pr_number: u64) -> Result<(String, String)> {
+        let title_guard = self.title_result.lock().await;
+        let title = match &*title_guard {
+            Ok(title) => title.clone(),
+            Err(msg) => return Err(anyhow::anyhow!(msg.clone())),
+        };
+        let body_guard = self.body_result.lock().await;
+        let body = match &*body_guard {
+            Ok(body) => body.clone(),
+            Err(msg) => return Err(anyhow::anyhow!(msg.clone())),
+        };
+        Ok((title, body))
     }
 }
 

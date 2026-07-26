@@ -460,10 +460,15 @@ async fn status_refresh_with_missing_head_ref_oid_does_not_null_out_the_stored_s
 
     assert!(status.refreshed);
     assert_eq!(status.mergeable.as_deref(), Some("mergeable"));
-    // The DB write must COALESCE a missing probe field against the stored
-    // value, not blank it — re-read the row to confirm the persisted state,
-    // since the in-response value reflects the raw probe (None) rather than
-    // what was actually written.
+    // The response itself must COALESCE a missing probe field against the
+    // stored value, not just the DB write — a `--refresh` caller must see
+    // the same known-good SHA a later plain `boss pr status` would.
+    assert_eq!(
+        status.head_sha.as_deref(),
+        Some("known-good-sha"),
+        "a probe with no headRefOid must not null out a previously known SHA in the response"
+    );
+    // The DB write must COALESCE the same way, not just the response.
     let reread = fx
         .server_state
         .work_db

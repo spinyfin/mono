@@ -283,9 +283,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
            revision task by design (a revision never owns its own PR — the\n\
            chain root does), so an empty `task.pr_url` does NOT mean \"no\n\
            PR exists\" when you're a revision worker. `boss pr status`\n\
-           resolves your actually-bound PR correctly either way. Fall back\n\
-           to `gh pr list --head $(jj log -r @ --no-graph -T 'bookmarks' | head -1)`\n\
-           or `gh pr view` only if the engine is unreachable.\n\
+           resolves your actually-bound PR correctly either way.\n\
          - Do not hard-wrap PR bodies.\n\
          - **NEVER pass the PR body as `--body \"<inline text>\"`** — the shell\n\
            evaluates backticks and `$(...)` inside double-quoted strings, which\n\
