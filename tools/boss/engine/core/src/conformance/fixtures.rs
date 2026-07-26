@@ -16,9 +16,9 @@ use async_trait::async_trait;
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 
 use crate::driver::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
-    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest,
-    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
+    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan,
+    SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -321,11 +321,17 @@ impl AgentDriver for CodexShapedDriver {
         }
     }
 
-    async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
-        unimplemented!("conformance fixture — not exercised")
+    async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<Option<DriverRuntimeState>> {
+        // Conformance fixture creates no out-of-workspace state.
+        Ok(None)
     }
 
-    async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
+    async fn teardown_workspace(
+        &self,
+        _: Option<&Path>,
+        _: &str,
+        _: Option<&DriverRuntimeState>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

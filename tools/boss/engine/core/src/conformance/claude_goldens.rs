@@ -35,10 +35,20 @@ fn golden_input() -> WorkerSetupInput {
 
 /// Host-temp paths land in the path-guard / checkleft hook commands. Rewrite
 /// them to a stable placeholder so the settings.json golden is portable.
+///
+/// Must mirror [`crate::worker_setup`]'s `worker_settings_root`: under Bazel
+/// tests `render_settings_json` roots gate scripts at `$TEST_TMPDIR` (unique
+/// per test action / shard), not `std::env::temp_dir()`. Normalising only the
+/// latter leaves the sandbox path in the rendered golden and fails CI.
 fn normalize_host_paths(rendered: &str) -> String {
-    // temp_dir() may or may not carry a trailing slash (macOS often does).
-    // Strip it so the replacement always leaves a single `/` after `$TMPDIR`.
-    let tmp = std::env::temp_dir().display().to_string();
+    // Prefer TEST_TMPDIR when set (Bazel), else the process temp dir. Either
+    // may or may not carry a trailing slash — strip so the replacement always
+    // leaves a single `/` after `$TMPDIR`.
+    let tmp = match std::env::var_os("TEST_TMPDIR") {
+        Some(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    };
+    let tmp = tmp.display().to_string();
     let tmp = tmp.trim_end_matches('/').to_owned();
     rendered
         .replace(&tmp, "$TMPDIR")
