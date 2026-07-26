@@ -3,7 +3,14 @@
 - **Date:** 2026-07-25
 - **Status:** Design — awaiting review
 - **Project:** `proj_18c5b7e300fb2d30_43` (Boss UI Performance improvements)
-- **Baseline artifact:** 60 s `sample` of Boss 1.0.369, pid 59513, ARM64 / macOS 26.5.2, captured 2026-07-25 19:58 PDT (coordinator-private; the distilled counts below are the shared baseline)
+- **Baseline artifact:** 60 s `sample` of Boss 1.0.369, pid 59513, ARM64 / macOS 26.5.2, captured 2026-07-25 19:58 PDT. Coordinator-private: the sample file itself is not in the repo, so the counts and symbol attributions distilled below — including the ones this doc goes on to correct — are the shared baseline.
+- **Remit:** the brief this project was opened from. It lives in Boss rather than in the repo, so its recommendations are reproduced here once, in its own priority order, and referred to by these labels throughout:
+  - **P0 #1 — coalesce / debounce work-tree applies.** "Coalesce engine work-tree / work-item events on the main actor (e.g. 16–50 ms debounce, or 'apply latest only' on next run-loop turn)"; prefer diffed updates over "rebuilding the entire published tree every event".
+  - **P0 #2 — make `WorkTask` (and board row models) cheaper to diff.** "If `WorkTask` is large, stop using full-struct equality as the invalidation signal" — "prefer equating on a small snapshot (id + status + display fields used by the card)", or a reference type / revision token.
+  - **P0 #3 — slim `WorkBoardCardView` layout.** "Split the card into subviews with stable identity", gate expensive badges behind "cheap booleans computed once in the model", lazy-load hover-only chips and dialogs, and reach for `drawingGroup()` "only if profiling shows draw cost".
+  - **P1 #1 — invalidate only affected cards.** Map engine events to specific work-item ids; for live status text, update "a narrow observed object per card/slot, not the global work tree".
+  - **P1 #2 — terminal pane cost (secondary).** Cap live terminal surfaces, "detach off-screen panes from display link if architecture allows", keep hidden worker panes off full refresh rate.
+  - **P2 — keep stall monitoring, use it as a regression signal.** Log stalls during board updates, add dev-only counters, and "treat 'stall spikes when engine floods events' as a CI or manual perf checklist item".
 - **Prior art:** [`../investigations/ui-performance-audit-2026-05-07.md`](../investigations/ui-performance-audit-2026-05-07.md) — static audit that predicted this mechanism 11 weeks before the sample confirmed it
 - **Related:** [`engine-dispatch-instrumentation.md`](engine-dispatch-instrumentation.md), [`engine-counter-metrics-framework.md`](engine-counter-metrics-framework.md)
 
@@ -58,7 +65,7 @@ The layout families overlap by nesting and must not be summed.
 
 ### The mechanism, read off the source
 
-The profile says _what_ is hot. The source says _why_, and the answer is more specific than the remit assumed.
+The profile says _what_ is hot. The source says _why_, and the answer is more specific than the remit's problem statement assumed.
 
 **`WorkBoardCardItem` observes the whole view model.** `Sources/WorkBoardCard.swift:45-46` declares `@ObservedObject var model: ChatViewModel` and `@ObservedObject var liveStates: LiveWorkerStateStore` on the per-card view. `ChatViewModel` has **77 `@Published` properties** (`Sources/ChatViewModel.swift`), including `transcriptsByExecutionID`, `automationRunsByID`, `engineMetrics`, `trunkTokenNote`, `bossPanelWidth`, and `editorialActionsByProductID` — none of which any card renders. Every one of them fires `objectWillChange` on every visible card.
 
@@ -76,7 +83,7 @@ The team has already met this. `Sources/ContentView.swift:1030-1038` documents i
 532     specialized static WorkTask.__derived_struct_equals(_:_:)
 ```
 
-That is the largest of ~15 such sites; the next five are 261, 151, 130, 104, 98. Those six alone total ~1323 of the 1991 `WorkTask.==` samples. AttributeGraph is comparing a 45-field value type field-by-field, per card, per graph update — because the 45-field value type _is_ the view input. Coalescing the engine-apply path does not touch this number. The two P0 items are independent and both are needed.
+That is the largest of ~15 such sites; the next five are 261, 151, 130, 104, 98. Those six alone total ~1323 of the 1991 `WorkTask.==` samples. AttributeGraph is comparing a 45-field value type field-by-field, per card, per graph update — because the 45-field value type _is_ the view input. Coalescing the engine-apply path does not touch this number. The remit's first two P0 items are independent of each other, and both are needed.
 
 **`FlowLayout` recomputes everything twice, with no cache.** `Sources/WorkBoardCard.swift:401-463` implements the badge-strip layout with `cache: inout Void`. Both `sizeThatFits` and `placeSubviews` call `computeRows`, and `computeRows` calls `subviews[index].sizeThatFits(.unspecified)` for every chip. SwiftUI may invoke `sizeThatFits` several times per layout pass while resolving a proposal. The `Layout` protocol has `makeCache`/`updateCache` for exactly this; using `Void` opts out. This is a direct, isolated contributor to the 5108-sample `sizeThatFits` family.
 
@@ -129,7 +136,7 @@ Sizing it honestly: 3164 samples against a 45284-sample window is **~7% of one c
 
 The cause is visible in `MainThreadStallMonitor.tick()` (`Sources/Diagnostics/MainThreadStallMonitor.swift:169-182`): it symbolicates **all 64 frames** via `dladdr`, and only _then_ asks `isIdleEventLoopStack` whether the capture was a false positive worth discarding. Under a main thread that is ~55% busy, heartbeats routinely land >250 ms late, so this fires constantly — and a large share of those captures are discarded immediately after paying for full symbolication. It is started unconditionally in release at `Sources/BossMacApp.swift:433`.
 
-This is a direct tension with remit item P2 ("keep stall monitoring"). **Resolved in review:** keep the monitor in release builds, make its capture path cheap, and put it behind a settings toggle that defaults to **off**. The reviewer's rationale is that UI stalls rarely need debugging, so the default build should pay nothing for the watchdog at all.
+This is a direct tension with the remit's P2 item ("keep stall monitoring"). **Resolved in review:** keep the monitor in release builds, make its capture path cheap, and put it behind a settings toggle that defaults to **off**. The reviewer's rationale is that UI stalls rarely need debugging, so the default build should pay nothing for the watchdog at all.
 
 Note that the toggle does not make the symbolication fix redundant, and the two are not alternatives:
 
@@ -138,9 +145,9 @@ Note that the toggle does not make the symbolication fix redundant, and the two 
 
 Gating to debug builds stays rejected: a stall that only reproduces in a release build must remain diagnosable by flipping a setting, not by producing a custom build.
 
-### Finding: the largest Boss-binary leaf is off-main, and the remit's guess about where it lives looks wrong
+### Finding: the largest Boss-binary leaf is off-main, and not where the baseline distillation placed it
 
-`specialized Collection<>.firstIndex(of:) (in Boss)` at 278 top-of-stack samples is the largest Boss-binary leaf in the process. The remit expected it inside `applyWorkTree` / `ChatViewModel`.
+`specialized Collection<>.firstIndex(of:) (in Boss)` at 278 top-of-stack samples is the largest Boss-binary leaf in the process. The distilled baseline placed it inside `applyWorkTree` / `ChatViewModel` and offered it as evidence for the remit's P0 #2. The source says otherwise.
 
 A repo-wide search finds ten `firstIndex(of:)` call sites, and **none of them are on `[WorkTask]`**. The only one on a hot path is `Sources/EngineClient.swift:189`:
 
@@ -190,13 +197,13 @@ Give each card its own `ObservableObject`, subscribed to a narrow slice of the s
 
 ## Chosen approach
 
-Five changes, in dependency order. Phases 1–3 are the substance; phase 0 exists because nothing can be measured honestly until it lands.
+Four phases, in dependency order. Phases 1–3 are the substance; phase 0 exists because nothing can be measured honestly until it lands.
 
 ### Phase 0 — make measurement cheap and make the counters exist
 
 **Defer stall-backtrace symbolication.** `capture()` already returns raw addresses and is allocation-free by design. The fix is to keep them raw: store `[UInt]` addresses in `StallRecord`, and symbolicate only when a record is actually read — in `UIStallsViewer` or on export. The idle-stack pre-filter, which today forces full symbolication before it can decide to discard, is replaced by an address-range test: resolve the app image's `[start, end)` bounds **once** at startup, then test each frame numerically. That is an integer comparison per frame instead of a `dladdr` per frame, and it keeps `isIdleEventLoopStack` a pure, unit-testable function over addresses plus a range. Add a floor on symbolication frequency as a backstop.
 
-**Put the monitor behind a default-off setting.** Per review, add a Settings toggle for stall monitoring, defaulting to off, so the common case pays nothing. The monitor remains available in release builds — it is a setting, not a build gate — and the two halves of this item are complementary rather than alternative: the toggle removes the cost for users who are not debugging stalls, and the deferred symbolication is what makes the monitor affordable for the ones who are, including every capture run under the measurement protocol below. P2 is preserved: stall monitoring survives and is one toggle away.
+**Put the monitor behind a default-off setting.** Per review, add a Settings toggle for stall monitoring, defaulting to off, so the common case pays nothing. The monitor remains available in release builds — it is a setting, not a build gate — and the two halves of this item are complementary rather than alternative: the toggle removes the cost for users who are not debugging stalls, and the deferred symbolication is what makes the monitor affordable for the ones who are, including every capture run under the measurement protocol below. The remit's P2 is preserved: stall monitoring survives and is one toggle away.
 
 **Add dev-visible UI counters** on the existing `PopulationTimingLog` / `os_signpost` rails rather than a new subsystem: `applyWorkTree` calls/sec, incremental task updates/sec, engine events delivered to the main actor/sec, and card body evaluations/sec. Atomic increments, flushed on a 1 Hz timer, zero cost when nothing increments. These are the per-task regression signal — a sample tells you where time went, a counter tells you whether the fan-out actually narrowed.
 
@@ -245,13 +252,15 @@ Consequently, for every entry in the breakdown whose gate is a sample:
 - **`bazel build` and `bazel test` are unaffected by any of this** and remain fully the agent's responsibility. Only the sampling and the on-screen functional sweep need a person.
 - **An agent that cannot get the numbers must say so and stop**, not substitute reasoning about why the change should be faster. "The change looks correct" is not a measurement, and this plan does not accept it as one.
 
-Entries 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 15 and 16 all depend on a human capture. Entry 4 is the only in-scope entry that does not — it ships no behaviour change and gates entirely on unit tests, which is why it is the one place an agent can self-certify. Entries 12, 13 and 14 are deferred and unscheduled.
+Entries 1, 2, 3, 5, 6, 7, 8, 9, 10, 11 and 16 all depend on a human capture. Entry 4 is the only in-scope entry that does not — it ships no behaviour change and gates entirely on unit tests, which is why it is the one place an agent can self-certify. Entries 12, 13, 14 and 15 are deferred and unscheduled; of those, only entry 15 has a gate that is not a `sample` at all — it is a CI signal, and it is the eventual way out of this whole dependency.
 
 ### The protocol itself
 
 **Load definition.** Boss open on the kanban, populated board for the `boss` product, all columns visible, ≥3 live workers running, window frontmost, **no menu or popover open** (the baseline artifact's ~11% modal-loop contamination must not be reproduced), no scrolling or pointer movement during capture.
 
 **Stall monitoring on.** After entry 1 lands, stall monitoring defaults to off. Capture runs turn it **on** in Settings — its log is the regression signal several entries report against — and both the before- and after-sample of a given task must agree on the setting. A comparison with the monitor on for one half and off for the other is void.
+
+This rule binds entries 2–16. **Entry 1 is exempt, and has to be:** the on-vs-off delta _is_ its result, and its before-sample predates the setting entirely, because until entry 1 lands the monitor is unconditionally on with no way to turn it off. Entry 1 therefore reports three readings — the pre-change baseline, post-change with the monitor on, and post-change with it off — and is the only entry permitted to compare across settings.
 
 **Capture.**
 
@@ -287,10 +296,10 @@ sample <Boss_pid> 60 -file /tmp/boss-after-<task>.txt
 
 **Measurement is gated on human availability.** Every before/after number this plan depends on has to be captured by a person at the machine (see "Who runs this"). That is a real scheduling dependency, not a formality: an agent can land entry 5 in an afternoon and the task still cannot close until someone runs two 60-second samples. Batching captures — landing several independent entries and sampling once per batch — is tempting and is wrong for anything on the serialised `WorkBoardCard.swift` chain, where per-entry attribution is the whole point. It is acceptable for the depth-0 entries, which touch disjoint files.
 
-**Open questions for a human** (also filed as a questions manifest alongside this doc):
+**Open questions for a human.** The still-open ones — 2 and 3 — are also filed as a questions manifest alongside this doc (`boss-ui-performance-improvements.attentions.json`), which the engine reads to raise them inline in the design-doc viewer. Question 1 is answered and is therefore **not** in the manifest; it is kept here, struck through, only so the numbering that the entries below cite stays stable.
 
 1. ~~**Stall monitor disposition.**~~ **Answered in review.** Keep the monitor in release, defer symbolication so it is cheap, and add a Settings toggle that **defaults to off** — the reviewer's reasoning being that UI stalls rarely need debugging, so the default build should not pay for the watchdog. Debug-build gating remains rejected. Folded into entry 1; no longer blocking Phase 0.
-2. **Is off-main CPU in scope?** The goal says main-thread CPU. Findings 3 and 6 (`consumeLines` buffer scan, JSON decode) are real and off-main, and are currently tagged deferred on that basis. If the real concern is the process sitting at 25–90% CPU overall, they should be promoted.
+2. **Is off-main CPU in scope?** The goal says main-thread CPU. The `consumeLines` buffer-scan and engine JSON-decode findings above are both real and both off-main, and are currently tagged deferred on that basis (entries 12 and 13). If the real concern is the process sitting at 25–90% CPU overall, they should be promoted.
 3. **Is the 1.0–1.1 GB footprint in scope?** Named in the project description, absent from the goal, and not addressed by anything here.
 
 ## Proposed implementation task breakdown
@@ -299,7 +308,9 @@ Sixteen entries. Dependency depth and parallelism are called out per entry; file
 
 **Read the measurement protocol's "Who runs this" section before scheduling any of these.** Where an entry's **Metric** names sample counts, that metric is captured by a human, not by the agent implementing the entry — agents must not launch Boss.app. The implementing agent lands the code, keeps `bazel build` / `bazel test` green, and writes down which numbers the change should move and in which direction; a person captures the before/after pair and returns them. Entries whose metric needs no capture say so explicitly.
 
-Four entries form the critical path and should land in this order: **Make the stall monitor cheap and default-off** → **Introduce WorkCardSnapshot** → **Card consumes snapshot** → **Detach card from ChatViewModel observation**.
+**Land entry 1 first**, ahead of everything else. That is a measurement precondition, not a dependency: nothing needs entry 1 to compile, and it has no dependents anywhere in the ladder below. But the watchdog is ~7% of a core inside every sample this plan reads, so any before-sample captured while it is still symbolicating eagerly is contaminated before it is taken.
+
+**The critical path proper is the serialised `WorkBoardCard.swift` chain**: 3 (`FlowLayout` cache) and 4 (`WorkCardSnapshot`) → 5 (card consumes snapshot) → 6 (detach observation) → 9 (decompose body) → 10 (lazy secondary UI). Five entries deep, depths 0 through 4, and it carries the plan's headline win. Entries 3 and 4 sit concurrently at its head for different reasons — 3 because it must vacate `WorkBoardCard.swift` before entry 5 rewrites it, 4 because it is entry 5's hard dependency. Everything else (2 → 7 → 8, plus 11) runs alongside.
 
 ---
 
@@ -314,7 +325,7 @@ Two complementary halves, both from the review decision on open question 1.
 - **Effort:** medium
 - **Dependencies:** none
 - **Files:** `Sources/Diagnostics/MainThreadBacktrace.swift`, `Sources/Diagnostics/MainThreadStallMonitor.swift`, `Sources/Diagnostics/StallLog.swift`, `Sources/Diagnostics/UIStallsViewer.swift`, `Sources/BossMacApp.swift`, plus the settings view and its defaults store
-- **Metric — human capture required** (see "Who runs this"): with the monitor **on**, `MainThreadStallMonitor` inclusive samples, baseline 3166 (~7% of window), and `dyld3::MachOLoaded::findClosestSymbol` top-of-stack, baseline 2552 — target both under 300. With the monitor **off** (the new default), both must be **zero**, and that is the more important of the two readings. The agent-side gate is unit tests over `isIdleEventLoopStack` as a pure address/range function, and that flipping the setting starts and stops the monitor.
+- **Metric — human capture required** (see "Who runs this"): three readings, per the exemption this entry holds from the "both samples agree on the setting" rule. **Before**, on the unmodified build where the monitor is unconditionally on: `MainThreadStallMonitor` inclusive samples and `dyld3::MachOLoaded::findClosestSymbol` top-of-stack (document baselines 3166 — ~7% of window — and 2552, for orientation only; the entry's own before-sample is what it reports against). **After, monitor on:** target both under 300. **After, monitor off** (the new default): both must be **zero**, and that is the most important of the three. The agent-side gate is unit tests over `isIdleEventLoopStack` as a pure address/range function, and that flipping the setting starts and stops the monitor.
 - **Functional check (human):** recorded stalls still appear in the UI Stalls window with correct symbols after the change, with the setting on.
 - Scope: in-scope
 
@@ -414,7 +425,7 @@ Stop constructing hover-only chips, popovers, and confirmation dialogs for idle 
 
 ### 11. Investigate: attribute the `firstIndex(of:)` hot leaf
 
-Confirm or refute that `specialized Collection<>.firstIndex(of:) (in Boss)` — 278 top-of-stack samples, the largest Boss-binary leaf in the process — is the byte scan at `Sources/EngineClient.swift:189` in `consumeLines()`, and record which thread it runs on. Static analysis says yes and says it is off-main, which contradicts the remit's expectation that it lives in `applyWorkTree`. Output is a short investigation note under `tools/boss/docs/investigations/` plus a recommendation on whether entry 12 should be promoted out of deferred. Investigation only — no fix.
+Confirm or refute that `specialized Collection<>.firstIndex(of:) (in Boss)` — 278 top-of-stack samples, the largest Boss-binary leaf in the process — is the byte scan at `Sources/EngineClient.swift:189` in `consumeLines()`, and record which thread it runs on. Static analysis says yes and says it is off-main, which contradicts the distilled baseline's expectation that it lives in `applyWorkTree`. Output is a short investigation note under `tools/boss/docs/investigations/` plus a recommendation on whether entry 12 should be promoted out of deferred. Investigation only — no fix.
 
 - **Effort:** small
 - **Dependencies:** none — runs in parallel with everything
@@ -442,7 +453,7 @@ Cut `-[_NSJSONReader parseData:options:error:]` cost (939 samples) and `newJSONS
 
 ### 14. Cap live terminal surfaces and display-link rate
 
-Detach off-screen terminal panes from their display link and ensure hidden worker panes do not run at full refresh rate. Remit item P1.
+Detach off-screen terminal panes from their display link and ensure hidden worker panes do not run at full refresh rate. This is the remit's P1 #2, which the remit itself flags as secondary.
 
 - **Effort:** medium
 - **Dependencies:** none
@@ -451,11 +462,11 @@ Detach off-screen terminal panes from their display link and ensure hidden worke
 
 ### 15. Perf regression gate in CI
 
-Make "main-thread stall spikes when the engine floods events" a checked signal rather than a manual step, using the entry 2 counters and the entry 1 stall log. Remit item P2's automation half.
+Make "main-thread stall spikes when the engine floods events" a checked signal rather than a manual step, using the entry 2 counters and the entry 1 stall log. This is the automation half of the remit's P2 — "treat 'stall spikes when engine floods events' as a CI or manual perf checklist item" — the half that would replace the manual checklist with a machine-checked one.
 
 - **Effort:** large
 - **Dependencies:** entries 1, 2, 16
-- **Metric:** gate reproducibly fails on a seeded regression and passes on `main`. The harness must enable stall monitoring explicitly — after entry 1 it is off by default, so a gate that reads the stall log without turning it on measures nothing and passes vacuously.
+- **Metric — no `sample` capture:** gate reproducibly fails on a seeded regression and passes on `main`, which is a CI signal rather than a human reading. The one human step it does need is validating that seeded regression the first time, so that a green gate means something. The harness must also enable stall monitoring explicitly — after entry 1 it is off by default, so a gate that reads the stall log without turning it on measures nothing and passes vacuously.
 - Scope: deferred (future / not a v1 blocker) — needs a reproducible synthetic engine-event load harness that does not exist yet, and CI runners cannot capture `sample` output of a GUI app under controlled load. That last constraint is the same one that makes every entry above depend on a human capture; this entry is the eventual way out of it, which is also why it is the hardest one here. Revisit once the manual protocol has a few cycles of data behind it.
 
 ### 16. Before/after verification sweep and report
@@ -465,7 +476,7 @@ Capture the full before/after comparison across the landed work under one contro
 **This entry is human work end to end and must not be dispatched to an agent as an implementation task.** It is nothing but capture and on-screen verification: two samples under a controlled load, plus a visual sweep of the board. An agent can help afterwards by turning the returned numbers and the raw `sample` files into the write-up, and that is a reasonable way to split it — but the agent must be handed the artifacts, never asked to produce them.
 
 - **Effort:** medium (dominated by the human's time at the machine, not by the write-up)
-- **Dependencies:** entries 1, 3, 5, 6, 7, 8, 9, 10
+- **Dependencies:** entries 1, 2, 3, 5, 6, 7, 8, 9, 10 — every in-scope entry that lands a behaviour change, including entry 2, whose counters this entry reports. Entry 4 comes along transitively through 5; entry 11 is an investigation with no landed change to measure.
 - **Files:** new `tools/boss/docs/investigations/` or `postmortems/` report
 - **Metric:** the full protocol, against a clean before-sample captured with no menu or popover open — explicitly **not** against the numbers in this document, which carry ~11% modal-loop contamination. Both samples with stall monitoring in the same state; record which.
 - Scope: in-scope
@@ -474,10 +485,11 @@ Capture the full before/after comparison across the landed work under one contro
 
 **Parallelism summary.**
 
-- **Depth 0**, all concurrent: 1 (stall symbolication), 2 (counters), 3 (`FlowLayout` cache), 4 (`WorkCardSnapshot`), 11 (`firstIndex` investigation), 14 (terminals, deferred).
+- **Depth 0**, all concurrent: 1 (stall monitor — cheap capture plus the default-off toggle), 2 (counters), 3 (`FlowLayout` cache), 4 (`WorkCardSnapshot`), 11 (`firstIndex` investigation), 14 (terminals, deferred).
 - **Depth 1:** 5 (card consumes snapshot, needs 4) and 7 (event batching, needs 2) run concurrently — different files, no overlap.
 - **Depth 2:** 6 (detach observation, needs 5) and 8 (targeted invalidation, needs 7) run concurrently.
 - **Depth 3:** 9 (decompose body, needs 6).
 - **Depth 4:** 10 (lazy secondary UI, needs 9).
 - **Serialised on `WorkBoardCard.swift`:** 3 → 5 → 6 → 9 → 10. These five substantially co-edit that file and must land in that order, each forward-porting its predecessors preservingly.
-- **Final:** 16 (verification sweep), after everything in-scope.
+- **Final:** 16 (verification sweep), after every in-scope entry that lands a behaviour change — 1, 2, 3, 5, 6, 7, 8, 9, 10.
+- **Off the ladder:** 12, 13 and 15 are deferred and unscheduled (14 is deferred too, but is listed at depth 0 above because it depends on nothing). 15 would come after 16, since it needs the sweep's numbers to calibrate its threshold.
