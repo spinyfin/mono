@@ -4,6 +4,7 @@
 mod back_to_back;
 mod detection;
 mod helpers;
+mod log_excerpt;
 mod noop_validation;
 mod pre_triage;
 mod rebase_first;

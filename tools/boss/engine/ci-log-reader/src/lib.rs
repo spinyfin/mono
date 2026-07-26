@@ -222,6 +222,72 @@ impl CiLogReader for UnknownProviderReader {
     }
 }
 
+/// Reader that never shells out to `bk`/`gh` (or any other CLI). Every
+/// method returns a fixed error immediately.
+///
+/// Used as the default factory result under engine unit tests so
+/// detection/revision paths that call [`reader_for`]-shaped factories
+/// never touch the real CLIs or the macOS keychain. Production never
+/// installs this; it always uses [`reader_for`].
+#[derive(Debug, Clone, Default)]
+pub struct NoOpCiLogReader;
+
+#[async_trait]
+impl CiLogReader for NoOpCiLogReader {
+    async fn read_log_tail(&self, _job_id: &str, _n_lines: usize) -> Result<String> {
+        Err(anyhow!("CI log fetch disabled (no-op reader)"))
+    }
+
+    async fn read_log_full(&self, _job_id: &str) -> Result<String> {
+        Err(anyhow!("CI log fetch disabled (no-op reader)"))
+    }
+
+    async fn retrigger(&self, _id: &str) -> Result<String> {
+        Err(anyhow!("CI log retrigger disabled (no-op reader)"))
+    }
+
+    fn worker_cli_invocation_hint(&self, _job_id: &str) -> String {
+        "(CI log fetch disabled: no-op reader)".to_owned()
+    }
+}
+
+/// In-memory reader that returns a fixed log body. Never shells out.
+///
+/// Tests that need the pre-spawn excerpt path to *succeed* (and store a
+/// real `log_excerpt`) inject a [`CiLogReaderFactory`] that returns this
+/// rather than the real CLI-backed readers.
+#[derive(Debug, Clone)]
+pub struct FixedContentLogReader {
+    content: String,
+}
+
+impl FixedContentLogReader {
+    pub fn new(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl CiLogReader for FixedContentLogReader {
+    async fn read_log_tail(&self, _job_id: &str, n_lines: usize) -> Result<String> {
+        Ok(tail_lines(&self.content, n_lines))
+    }
+
+    async fn read_log_full(&self, _job_id: &str) -> Result<String> {
+        Ok(self.content.clone())
+    }
+
+    async fn retrigger(&self, id: &str) -> Result<String> {
+        Ok(id.to_owned())
+    }
+
+    fn worker_cli_invocation_hint(&self, job_id: &str) -> String {
+        format!("(fixed-content reader for {job_id})")
+    }
+}
+
 /// Fallback reader for a *known* provider whose `target_url` didn't carry
 /// the coordinates that provider's reader needs (currently: Buildkite's
 /// pipeline slug + build number). Distinct from [`UnknownProviderReader`]
@@ -258,6 +324,14 @@ impl CiLogReader for UnparseableCoordinatesReader {
     }
 }
 
+/// Factory that builds a provider-specific [`CiLogReader`] from a failing
+/// check's provider + `target_url`.
+///
+/// Production call sites pass [`reader_for`]. Engine unit tests default to
+/// [`noop_reader_for`] so detection/revision paths never spawn real
+/// `bk`/`gh` processes (or touch the macOS keychain under `HOME=/tmp`).
+pub type CiLogReaderFactory = fn(CiProvider, &str) -> Box<dyn CiLogReader>;
+
 /// Build a boxed reader for `provider`. Convenience factory the engine
 /// pre-spawn / pre-triage code uses to dispatch on the provider inferred
 /// from `target_url`.
@@ -276,12 +350,20 @@ pub fn reader_for(provider: CiProvider, target_url: &str) -> Box<dyn CiLogReader
     reader_for_with_binaries(provider, target_url, "bk", "gh")
 }
 
+/// Factory that always returns [`NoOpCiLogReader`]. Never shells out.
+///
+/// Default under engine unit tests for the pre-spawn log-excerpt path;
+/// production keeps using [`reader_for`].
+pub fn noop_reader_for(_provider: CiProvider, _target_url: &str) -> Box<dyn CiLogReader> {
+    Box::new(NoOpCiLogReader)
+}
+
 /// Same dispatch as [`reader_for`], but with the `bk`/`gh` binary paths
 /// overridable. Lets tests point the constructed reader at a fake script
 /// instead of the real CLI, so assertions about *which reader type got
 /// built and with what coordinates* don't depend on whether `bk`/`gh`
 /// happen to be installed or authenticated on the host running the test.
-fn reader_for_with_binaries(
+pub fn reader_for_with_binaries(
     provider: CiProvider,
     target_url: &str,
     bk_binary: &str,
@@ -880,6 +962,29 @@ exit 2
     }
 
     // ---------- reader_for dispatch -----------------------------------------
+
+    #[tokio::test]
+    async fn noop_reader_for_errors_without_spawning() {
+        // Hermetic: NoOpCiLogReader never builds a Command, so this stays
+        // green whether or not `bk`/`gh` are on PATH.
+        let r = noop_reader_for(CiProvider::Buildkite, "https://buildkite.com/o/p/builds/1#j");
+        let err = r.read_log_tail("j", 10).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("no-op reader"),
+            "expected no-op diagnostic, got: {err:#}"
+        );
+        assert!(r.read_log_full("j").await.is_err());
+        assert!(r.retrigger("j").await.is_err());
+        assert!(r.worker_cli_invocation_hint("j").contains("no-op"));
+    }
+
+    #[tokio::test]
+    async fn fixed_content_reader_returns_canned_tail() {
+        let r = FixedContentLogReader::new("line-a\nline-b\nline-c\n");
+        assert_eq!(r.read_log_tail("j", 2).await.unwrap(), "line-b\nline-c");
+        assert_eq!(r.read_log_full("j").await.unwrap(), "line-a\nline-b\nline-c\n");
+        assert_eq!(r.retrigger("run-1").await.unwrap(), "run-1");
+    }
 
     #[tokio::test]
     async fn reader_for_unknown_provider_errors_on_every_method() {

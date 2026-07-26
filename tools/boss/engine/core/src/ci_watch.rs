@@ -788,7 +788,7 @@ async fn maybe_spawn_ci_revision(
     // dispatches the revision, so the revision directive can show a
     // concrete excerpt to the worker. Best-effort — a failure here is
     // logged at debug and does not prevent the revision from running.
-    fetch_and_store_log_excerpt(work_db, attempt, failures).await;
+    fetch_and_store_log_excerpt(work_db, attempt, failures, resolve_ci_log_reader_factory()).await;
 
     // Nudge the scheduler so the reconcile loop dispatches the revision's
     // `revision_implementation` execution promptly.
@@ -796,11 +796,71 @@ async fn maybe_spawn_ci_revision(
     true
 }
 
+/// Resolve the [`crate::ci_log_reader::CiLogReaderFactory`] used by the
+/// pre-spawn log-excerpt path.
+///
+/// Production always returns [`crate::ci_log_reader::reader_for`]. Under
+/// unit tests the default is [`crate::ci_log_reader::noop_reader_for`] so
+/// detection/revision fixtures never spawn real `bk`/`gh` (or hit the
+/// macOS keychain); tests that cover excerpt storage install a custom
+/// factory via [`ci_log_reader_hooks`].
+fn resolve_ci_log_reader_factory() -> crate::ci_log_reader::CiLogReaderFactory {
+    #[cfg(test)]
+    {
+        ci_log_reader_hooks::resolve()
+    }
+    #[cfg(not(test))]
+    {
+        crate::ci_log_reader::reader_for
+    }
+}
+
+/// Test-only hooks for the pre-spawn CI log reader factory.
+///
+/// `#[tokio::test]` defaults to the `current_thread` runtime, so each
+/// test's async work stays on that test's OS thread and a `thread_local`
+/// override never collides with another test running in parallel (same
+/// rationale as `driver_teardown::test_hooks`).
+#[cfg(test)]
+pub(crate) mod ci_log_reader_hooks {
+    use std::cell::Cell;
+
+    use crate::ci_log_reader::{CiLogReaderFactory, noop_reader_for};
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<CiLogReaderFactory>> = const { Cell::new(None) };
+    }
+
+    /// Install a factory for the current test thread, or clear with `None`
+    /// to restore the default no-op.
+    pub fn set_factory(factory: Option<CiLogReaderFactory>) {
+        OVERRIDE.with(|c| c.set(factory));
+    }
+
+    pub fn reset() {
+        set_factory(None);
+    }
+
+    pub(super) fn resolve() -> CiLogReaderFactory {
+        OVERRIDE.with(|c| c.get()).unwrap_or(noop_reader_for)
+    }
+}
+
 /// Best-effort: fetch the tail of the first failing job's log and store it
 /// on the `ci_remediations` row so the worker revision directive can embed
 /// a concrete excerpt. Skips silently when no job id is available or the
 /// log fetch fails — the worker can always fetch the full log manually.
-async fn fetch_and_store_log_excerpt(work_db: &WorkDb, attempt: &CiRemediation, failures: &[RequiredCheckFailure]) {
+///
+/// `make_reader` is the injectable factory (production:
+/// [`crate::ci_log_reader::reader_for`]; tests: no-op or a recording fake).
+/// Callers must not hardcode CLI binary paths here — the factory owns
+/// provider dispatch and any test doubles.
+async fn fetch_and_store_log_excerpt(
+    work_db: &WorkDb,
+    attempt: &CiRemediation,
+    failures: &[RequiredCheckFailure],
+    make_reader: crate::ci_log_reader::CiLogReaderFactory,
+) {
     let Some((first_with_job, job_id)) = failures
         .iter()
         .find_map(|f| f.provider_job_id.as_deref().map(|id| (f, id)))
@@ -809,10 +869,11 @@ async fn fetch_and_store_log_excerpt(work_db: &WorkDb, attempt: &CiRemediation, 
     };
     // `BuildkiteLogReader` needs pipeline + build number to avoid `bk`
     // resolving its pipeline from cwd (which fails outside a repo
-    // checkout — the engine never runs with cwd inside one). `reader_for`
-    // parses both out of `target_url` internally and falls back to a
-    // reader that errors cleanly if either is unparseable.
-    let reader = crate::ci_log_reader::reader_for(first_with_job.provider, &first_with_job.target_url);
+    // checkout — the engine never runs with cwd inside one). The factory
+    // (`reader_for` in production) parses both out of `target_url`
+    // internally and falls back to a reader that errors cleanly if either
+    // is unparseable.
+    let reader = make_reader(first_with_job.provider, &first_with_job.target_url);
     match reader.read_log_tail(job_id, 100).await {
         Ok(log) if !log.is_empty() => {
             if let Err(err) = work_db.set_ci_remediation_log_excerpt(&attempt.id, &log) {
