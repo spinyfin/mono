@@ -39,6 +39,89 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
     }
 }
 
+/// The engine's [`crate::stdout_progress::WorkerEventSink`]: a
+/// `ProgressIngress::StdoutJsonl` driver's progress lands here and takes the
+/// identical fan-out the events-socket accept loop takes for a
+/// `ProgressIngress::HookCallback` driver. This impl is the whole of the
+/// stdout arm's engine-side behaviour — everything downstream of it is shared
+/// with the hook path, by construction.
+/// Implemented on `Arc<ServerState>` rather than `ServerState` because the
+/// fan-out's handlers clone the `Arc` into spawned work; `&self` is then
+/// already the `&Arc<ServerState>` they need.
+#[async_trait::async_trait]
+impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
+    async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
+        dispatch_worker_event_fanout(self, &incoming).await;
+    }
+}
+
+/// Fan one normalised worker event out to every engine subsystem that reacts
+/// to worker progress, in the order those subsystems require.
+///
+/// Transport-agnostic on purpose. Both progress ingresses converge here:
+/// [`crate::events_socket`] (a `ProgressIngress::HookCallback` driver's
+/// `boss-event` shim over the unix socket) and
+/// [`crate::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
+/// stdout stream). By the time an event reaches this function the driver has
+/// already normalised it, so which transport carried it is no longer
+/// observable — which is exactly the property that makes live-status, the
+/// staleness sweeps, and the kanban see the same shapes from either one.
+///
+/// Ordering here is load-bearing; see the per-call comments.
+pub(super) async fn dispatch_worker_event_fanout(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    // Audit *before* the live-state fan-out
+    // so an engine-side mismatch in the
+    // dispatch path can't drop the audit line
+    // — the deny is enforced harness-side by
+    // claude already, this is the independent
+    // forensic record. See
+    // [`worker_sandbox_audit`] for why.
+    crate::worker_sandbox_audit::record_if_sandbox_attempt(
+        &server_state.dispatch_event_root,
+        incoming.run_id.as_deref(),
+        &incoming.event,
+    );
+    crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
+    dispatch_live_worker_state(server_state, incoming).await;
+    // Editorial PreToolUse audit: evaluate every
+    // `gh pr|issue` Bash invocation against the
+    // product's editorial rules and record the
+    // decision in `editorial_actions`. Fire-and-
+    // forget; never blocks the event dispatch.
+    dispatch_editorial_on_pretooluse(server_state, incoming).await;
+    // Post-hoc interception fallback: for any driver
+    // that lacks real-time PreToolUse hooks (the
+    // ToolUseInterception Degrade path), this is the
+    // only place editorial/path/revision-PR/
+    // checkleft loss ever gets surfaced. No-op for
+    // Claude, which already ran those guards above.
+    dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming).await;
+    // Urgent probes fire on PostToolUse so
+    // the coordinator can redirect a worker
+    // mid-task without waiting for Stop. The
+    // tool call has already returned at this
+    // point, so no in-flight work is lost.
+    dispatch_urgent_probe_on_post_tool_use(server_state, incoming).await;
+    // ProbeReplied runs first: emit the reply for the
+    // prior probe before dispatching the next one so
+    // a single Stop never fires both reply and dispatch
+    // for the same probe (the reply text hasn't been
+    // written yet at dispatch time).
+    //
+    // Completion runs before probe dispatch: probes
+    // queued by the completion handler (e.g.
+    // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
+    // so they are delivered on the *same* Stop that
+    // triggered them rather than stalling until the
+    // next Stop (which never comes for an idle worker).
+    dispatch_probe_reply_on_stop(server_state, incoming).await;
+    dispatch_completion_on_stop(server_state, incoming).await;
+    dispatch_probe_on_stop(server_state, incoming).await;
+}
+
 pub(super) async fn dispatch_live_worker_state(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,

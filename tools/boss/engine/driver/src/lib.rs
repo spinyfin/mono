@@ -647,12 +647,11 @@ pub struct ProgressObservationWiring {
 ///   error, no log line — reproduction 2 in the decision doc), which is
 ///   disqualifying for a liveness signal specifically. Its worker process
 ///   instead emits a `stdout` JSONL stream (`thread.started` → `turn.started`
-///   → `item.started`/`item.completed` → `turn.completed`) that a
-///   driver-owned reader parses and feeds to
-///   [`AgentDriver::normalize_progress_event`]. That reader is separate
-///   plumbing, built in a later task; this variant is the documented seam it
-///   plugs into — a driver that selects it has no settings-file hook wiring
-///   to merge.
+///   → `item.started`/`item.completed` → `turn.completed`) that a reader
+///   parses and feeds to [`AgentDriver::normalize_progress_event`]. That
+///   reader is `boss_engine_stdout_progress`, attached to the engine's
+///   activity machine by `boss_engine::stdout_progress`; a driver that
+///   selects this variant has no settings-file hook wiring to merge.
 ///
 /// A driver without hook-callback wiring returns [`Self::StdoutJsonl`] here
 /// rather than an empty [`ProgressObservationWiring`] — the absence of hooks

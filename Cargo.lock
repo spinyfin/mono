@@ -419,6 +419,7 @@ dependencies = [
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
  "boss-engine-recovery",
+ "boss-engine-stdout-progress",
  "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utility-model",
@@ -592,6 +593,21 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "boss-engine-stdout-progress"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bon",
+ "boss-engine-driver",
+ "boss-engine-structured-output",
+ "boss-protocol",
+ "serde_json",
+ "tokio",
  "tracing",
 ]
 
