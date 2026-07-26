@@ -445,6 +445,7 @@ pub(super) fn reclaim_quarantined_workspace(
     repo: &str,
     main_branch: &str,
     exclude: &[String],
+    deadline: Option<Instant>,
 ) -> Result<Option<String>> {
     let quarantined = store.list_workspaces_filtered(&WorkspaceListFilter {
         repo: Some(repo),
@@ -459,7 +460,16 @@ pub(super) fn reclaim_quarantined_workspace(
 
     let mut scanned = 0usize;
     let mut reclaimed: Option<String> = None;
+    let mut timed_out = false;
     for record in available.iter().take(QUARANTINE_RECLAIM_MAX_PROBES) {
+        // Probe count alone does not bound cost: each probe includes a
+        // `jj git fetch`, so on a slow remote four of them can outlast the
+        // caller's whole lease timeout. Stop at the deadline and let the
+        // caller provision instead — same trade as the health scan.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out = true;
+            break;
+        }
         scanned += 1;
         let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch) {
             Ok(status) => status,
@@ -518,6 +528,7 @@ pub(super) fn reclaim_quarantined_workspace(
         available = available.len(),
         scanned = scanned,
         truncated = available.len() > scanned,
+        timed_out = timed_out,
         reclaimed = reclaimed.as_deref(),
     );
 

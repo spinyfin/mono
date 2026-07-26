@@ -1276,6 +1276,23 @@ impl Store {
         )?;
         try_add_column(&self.connection, "ALTER TABLE repos ADD COLUMN clone_command TEXT")?;
 
+        // Created after the ALTERs above so it also lands on a database whose
+        // `workspaces` table pre-dates the `health_status` column.
+        //
+        // The lease hot path selects candidates by (repo, state,
+        // health_status). Once the cached health verdict became authoritative
+        // — rather than something re-derived from the filesystem on every
+        // lease — this composite is what keeps candidate selection an indexed
+        // lookup instead of a scan of every workspace row for the repo.
+        self.connection
+            .execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS workspaces_repo_state_health_idx
+                    ON workspaces(repo, state, health_status);
+                "#,
+            )
+            .map_err(CubeError::Storage)?;
+
         Ok(())
     }
 }
