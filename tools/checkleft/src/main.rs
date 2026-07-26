@@ -1671,15 +1671,21 @@ async fn attach_description_context(
     plan: &ChangePlan,
 ) -> ChangeSet {
     info!("attaching commit and PR metadata");
-    // When we know the base revision, read ALL commit descriptions in the pushed
-    // range so that a BYPASS directive placed in any content commit (including
-    // when @ is an empty working-copy commit on top of the real content) is seen.
-    let commit_description = match plan {
+    // Split commit-message surfaces:
+    // - tip (`commit_description`): leakage checks (boss-ism/pr-text-leakage via
+    //   text/forbidden-pattern surfaces: changeset). Intermediate historical
+    //   messages must not re-fail a green PR when GitHub MQ/squash re-embeds them.
+    // - full range (`bypass_commit_descriptions`): BYPASS only. A directive in
+    //   any content commit (including under an empty jj WC tip) stays visible.
+    let tip_description = normalize_optional_description(vcs.current_commit_description().ok());
+    let bypass_commit_descriptions = match plan {
         ChangePlan::Scoped { base_sha, .. } => {
             normalize_optional_description(vcs.commit_descriptions_since(base_sha).ok())
-                .or_else(|| normalize_optional_description(vcs.current_commit_description().ok()))
+                .or_else(|| tip_description.clone())
         }
-        _ => normalize_optional_description(vcs.current_commit_description().ok()),
+        // Non-scoped runs only have the tip; bypass_reason falls back to
+        // commit_description, so leave the dedicated range field unset.
+        _ => None,
     };
     let change_id = resolve_change_id(env);
     let repository = resolve_repository(vcs);
@@ -1687,7 +1693,8 @@ async fn attach_description_context(
         resolve_pr_description(repository.as_deref(), change_id.as_deref(), env, vcs).await,
     );
     changeset
-        .with_commit_description(commit_description)
+        .with_commit_description(tip_description)
+        .with_bypass_commit_descriptions(bypass_commit_descriptions)
         .with_change_id(change_id)
         .with_repository(repository)
         .with_pr_description(pr_description)

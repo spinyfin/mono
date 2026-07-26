@@ -185,8 +185,12 @@ impl Vcs {
     }
 
     /// Return the concatenated commit descriptions for all commits in the range
-    /// `base_sha..HEAD` (git) / `base_sha..@` (jj).  A BYPASS directive in any
-    /// commit in the pushed range is therefore visible to the caller.
+    /// `base_sha..HEAD` (git) / `base_sha..@` (jj).
+    ///
+    /// Used for the host-only BYPASS surface (`ChangeSet::bypass_commit_descriptions`)
+    /// so a directive in any content commit remains visible. Leakage checks scan
+    /// the tip message via [`Self::current_commit_description`] instead — do not
+    /// feed this joined range into `commit_description` (MQ historical false-fail).
     pub fn commit_descriptions_since(&self, base_sha: &str) -> Result<String> {
         match self.kind {
             VcsKind::Jujutsu => {
