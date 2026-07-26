@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import os
 
 final class EngineClient: @unchecked Sendable {
     var onEvent: (@MainActor @Sendable (EngineEvent) -> Void)?
@@ -40,6 +41,17 @@ final class EngineClient: @unchecked Sendable {
     /// still armed underneath the one that actually reconnects — corrupting
     /// the backoff sequence with extra, unwanted connect attempts.
     private var reconnectScheduled = false
+
+    /// Pending engine→UI deliveries and whether a main-actor drain is
+    /// already scheduled. See [[emit]] / [[drainPendingEvents]].
+    private struct EventDrainState {
+        var pending: [EngineEvent] = []
+        var drainScheduled = false
+        /// Completed drain turns (one main-actor Task hop each). Tests
+        /// assert a burst of enqueues collapses to a single turn.
+        var completedDrainTurns: UInt64 = 0
+    }
+    private let eventDrain = OSAllocatedUnfairLock(initialState: EventDrainState())
 
     init(socketPath: String) {
         self.socketPath = socketPath
@@ -921,15 +933,77 @@ final class EngineClient: @unchecked Sendable {
         return value
     }
 
+    /// Enqueue an engine event for main-actor delivery.
+    ///
+    /// Events accumulate under `eventDrain` and a single main-actor task
+    /// drains the queue on the next turn (UI performance design entry 7).
+    /// A burst of N events from the socket queue therefore becomes one
+    /// main-actor transaction and N sequential `onEvent` callbacks, not N
+    /// separate `Task { @MainActor }` hops. Order is FIFO. This is
+    /// intentionally not the 150 ms `scheduleWorkTreeRefetch` debounce —
+    /// that coalesces *fetch requests* on a different boundary; this only
+    /// batches the hop onto the main actor.
     private func emit(_ event: EngineEvent) {
-        Task { @MainActor in
-            // Fan-out regression counter (design entry 2): one engine event
-            // delivered onto the main actor. Recorded here (inside the hop)
-            // so the rate tracks deliveries, not enqueue attempts from the
-            // client queue.
-            UIUpdateCounters.shared.recordEngineEventMainActor()
-            self.onEvent?(event)
+        let shouldSchedule = eventDrain.withLock { state -> Bool in
+            state.pending.append(event)
+            if state.drainScheduled {
+                return false
+            }
+            state.drainScheduled = true
+            return true
         }
+        guard shouldSchedule else { return }
+        Task { @MainActor in
+            self.drainPendingEvents()
+        }
+    }
+
+    /// Drain every event queued for the main actor, then clear the
+    /// schedule flag only when the queue is observed empty under the lock
+    /// so a concurrent `emit` either lands in this drain or re-arms a new
+    /// one. Counter increments happen on delivery (here), not enqueue —
+    /// preserves `UIUpdateCounters.recordEngineEventMainActor` semantics.
+    @MainActor
+    private func drainPendingEvents() {
+        while true {
+            let batch: [EngineEvent] = eventDrain.withLock { state in
+                if state.pending.isEmpty {
+                    state.drainScheduled = false
+                    return []
+                }
+                let taken = state.pending
+                state.pending.removeAll(keepingCapacity: true)
+                return taken
+            }
+            if batch.isEmpty {
+                eventDrain.withLock { $0.completedDrainTurns &+= 1 }
+                return
+            }
+            for event in batch {
+                // Fan-out regression counter (design entry 2): one engine
+                // event delivered onto the main actor. Recorded on delivery
+                // so the rate tracks deliveries, not enqueue attempts from
+                // the client queue.
+                UIUpdateCounters.shared.recordEngineEventMainActor()
+                self.onEvent?(event)
+            }
+        }
+    }
+
+    // MARK: - Testing hooks
+
+    /// Enqueue through the production accumulate-and-drain path.
+    /// Production call sites go through parse/socket code that calls
+    /// `emit` privately; tests inject events without a socket.
+    func emitForTesting(_ event: EngineEvent) {
+        emit(event)
+    }
+
+    /// Number of completed main-actor drain turns since construction.
+    /// A synchronous burst of `emitForTesting` calls must advance this
+    /// by exactly one once the drain has run.
+    func completedDrainTurnsForTesting() -> UInt64 {
+        eventDrain.withLock { $0.completedDrainTurns }
     }
 
     private func scheduleReconnect() {
