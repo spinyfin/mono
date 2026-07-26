@@ -7,10 +7,20 @@ import Foundation
 /// connection lifecycle to `ChatViewModel+Connection.swift`, attention groups
 /// to `ChatViewModel+Attentions.swift`, and so on. Keep this file about
 /// routing; put the work in the extension that owns the state.
+///
+/// `EngineClient` batches the hop onto the main actor (accumulate-and-drain
+/// on the next run-loop turn; see `EngineClient.emit`). A burst of N socket
+/// events may therefore invoke `handle` N times back-to-back inside one
+/// main-actor turn. Per-event routing stays correct; SwiftUI coalesces
+/// `@Published` writes until the end of that turn. Invalidation-driven
+/// *fetches* still go through [[scheduleWorkTreeRefetch]]'s 150 ms debounce
+/// — that is a different boundary (request coalescing), not delivery batching.
 extension ChatViewModel {
     /// Point the engine's event stream at `handle(_:)`. Called from
     /// `commonInit`; kept here so the dispatch itself stays private to this
-    /// file and every event path is visible in one place.
+    /// file and every event path is visible in one place. The callback may
+    /// fire multiple times in a single main-actor drain (see file-level
+    /// note); each call is one `EngineEvent` in arrival order.
     func bindEngineEventStream() {
         engine.onEvent = { [weak self] event in
             self?.handle(event)
