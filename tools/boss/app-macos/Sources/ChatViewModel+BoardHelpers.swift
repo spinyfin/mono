@@ -120,6 +120,25 @@ extension ChatViewModel {
         return result.sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
     }
 
+    /// True when an incremental task update must drop the revision rollup
+    /// caches (`cachedInReviewRevisionsByParentID` /
+    /// `cachedDoneRevisionsByParentID`). Same-bucket non-revision field
+    /// edits (name, priority, …) leave the caches intact; status/parent
+    /// changes on a revision row, or a kind flip into/out of revision,
+    /// invalidate them. Used by keyed invalidation in
+    /// `applyIncrementalTaskUpdate` (design entry 8).
+    func taskUpdateAffectsRevisionCache(previous: WorkTask?, updated: WorkTask) -> Bool {
+        let wasRevision = previous?.kind == "revision"
+        let isRevision = updated.kind == "revision"
+        guard wasRevision || isRevision else { return false }
+        if wasRevision != isRevision { return true }
+        return previous?.status != updated.status
+            || previous?.parentTaskId != updated.parentTaskId
+            || previous?.projectID != updated.projectID
+            || previous?.revisionSeq != updated.revisionSeq
+            || previous?.productID != updated.productID
+    }
+
     /// Groups every project- and product-level revision task by parent id
     /// for the two statuses the kanban card footer actually renders
     /// (`in_review`, `done`), in one O(total revisions) pass. Populates

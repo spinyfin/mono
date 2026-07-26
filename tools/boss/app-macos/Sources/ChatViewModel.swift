@@ -17,7 +17,7 @@ final class ChatViewModel: ObservableObject {
     /// another session; surfaces that let the user *select* a product
     /// should read [[activeProducts]] instead.
     @Published var products: [WorkProduct] = [] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
 
     /// Non-archived subset of [[products]], in the same sort order.
@@ -30,13 +30,13 @@ final class ChatViewModel: ObservableObject {
         products.filter { $0.status != "archived" }
     }
     @Published var projectsByProductID: [String: [WorkProject]] = [:] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var tasksByProjectID: [String: [WorkTask]] = [:] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var choresByProductID: [String: [WorkTask]] = [:] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     /// Revisions whose chain root is a chore. A revision inherits its
     /// `project_id` from the chain root (`insert_revision_in_tx`), so a
@@ -46,7 +46,7 @@ final class ChatViewModel: ObservableObject {
     /// Review card. Without this bucket they were silently dropped at
     /// work-tree reception and invisible in the kanban (issue #789).
     @Published var productLevelRevisionsByProductID: [String: [WorkTask]] = [:] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     /// Product-level work items (`project_id IS NULL`) that are neither
     /// chores nor revisions — `kind == "investigation"` today, and any
@@ -57,7 +57,7 @@ final class ChatViewModel: ObservableObject {
     /// catch-all here makes the omission impossible by construction: a new
     /// kind lands in a real bucket and renders instead of vanishing.
     @Published var productLevelTasksByProductID: [String: [WorkTask]] = [:] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var taskRuntimesByID: [String: WorkTaskRuntime] = [:]
     /// Project-bucket keys in [[tasksByProjectID]] currently populated for
@@ -79,7 +79,9 @@ final class ChatViewModel: ObservableObject {
     /// pushes a fresh `WorkTree` for that product. The kanban joins
     /// these against the task/chore/project name maps to render
     /// "Blocked by <prereq title>" on gated cards.
-    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:] { didSet { invalidateWorkCache() } }
+    @Published var dependenciesByProductID: [String: [WorkItemDependency]] = [:] {
+        didSet { notePublishedWorkInputChanged() }
+    }
     /// Attention items keyed by work-item id (product id for external-tracker
     /// items). Populated on product selection and on every workTree refresh.
     @Published var attentionItemsByWorkItemID: [String: [WorkAttentionItem]] = [:]
@@ -154,25 +156,25 @@ final class ChatViewModel: ObservableObject {
     /// When non-nil, the Editorial Controls sheet is presented for this product id.
     @Published var editorialControlsProductID: String?
     @Published var selectedWorkProductID: String? {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     /// When true, the board shows all project-less work items (chores,
     /// investigation tasks, etc.) and their revisions. Mutually exclusive
     /// with `selectedProjectFilterIDs`.
     @Published var filterToChoresOnly: Bool = false {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var includeChores: Bool = true {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var showBlockedOnly: Bool = false {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var showArchivedProjects: Bool = false {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     /// When true, the Review column shows only `readyForReview` cards —
     /// waiting on the operator and nothing else: no block, no in-progress
@@ -180,7 +182,7 @@ final class ChatViewModel: ObservableObject {
     /// (persisted like the other board filters below), scoped to the
     /// Review column only.
     @Published var reviewReadyOnly: Bool = false {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var selectedWorkCardID: String?
     /// Task id that the reveal animation is currently highlighting.
@@ -209,7 +211,7 @@ final class ChatViewModel: ObservableObject {
     /// event handler promotes it to `revealScrollTarget`.
     var pendingRevealScrollID: String?
     @Published var workBoardGrouping: WorkBoardGrouping = .none {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var selectedWorkNodeID: WorkNodeID?
     @Published var pendingWorkCreateRequest: WorkCreateRequest?
@@ -218,7 +220,7 @@ final class ChatViewModel: ObservableObject {
     /// Current state of an in-flight `evaluate_editorial_rules` RPC.
     @Published var editorialEvaluationState: EditorialEvaluationState = .idle
     @Published var workSearchText: String = "" {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
     @Published var isBossPanelCollapsed: Bool = false
     @Published var bossPanelWidth: CGFloat = 380
@@ -351,7 +353,7 @@ final class ChatViewModel: ObservableObject {
     /// entry, on `conflict_resolution_*` topic pushes, and on `Refresh`
     /// button taps. Phase 5 #14 of the merge-conflict design.
     @Published var conflictResolutions: [WorkConflictResolution] = [] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
 
     /// Engine-tab CI-remediation attempt list, freshest first.
@@ -359,7 +361,7 @@ final class ChatViewModel: ObservableObject {
     /// entry, on `ci_remediation_*` topic pushes, and on `Refresh`
     /// button taps. Phase 11 #37 of the merge-conflict design.
     @Published var ciRemediations: [WorkCiRemediation] = [] {
-        didSet { invalidateWorkCache() }
+        didSet { notePublishedWorkInputChanged() }
     }
 
     /// PR URLs whose most recent CI-remediation attempt succeeded,
@@ -2190,8 +2192,8 @@ final class ChatViewModel: ObservableObject {
     /// O(1) id → work-item index over every task/chore/revision bucket.
     /// Built lazily on first lookup after any change (see `rebuildTaskIndex`);
     /// replaces a linear scan of all four buckets per `task(withID:)` call.
-    /// Invalidated alongside the other caches whenever a published input
-    /// changes (every bucket `didSet` routes through `invalidateWorkCache`).
+    /// Full invalidation drops this; a same-bucket single-item update patches
+    /// the entry in place via `patchTaskIndex(with:)` instead.
     var taskIndexByID: [String: WorkTask]?
     /// Backing storage for the `dependencyPrereqsByTaskID` / `gatingPrereqsByTaskID`
     /// accessors (in ChatViewModel+Dependencies). `nil` means "invalidated —
@@ -2220,17 +2222,85 @@ final class ChatViewModel: ObservableObject {
     /// `cachedInReviewRevisionsByParentID`.
     var cachedWorkBoardRepoMode: WorkBoardRepoMode?
 
+    /// When true, published work-input `didSet` observers skip the blanket
+    /// `invalidateWorkCache()` so a caller can mutate buckets and then apply
+    /// keyed invalidation itself (see `applyIncrementalTaskUpdate`).
+    var suppressWorkCacheInvalidation = false
+
+    /// Which derived work caches to drop. A single-item update only clears
+    /// the subsets that item can affect; bulk / filter / edge changes still
+    /// use `.all`.
+    struct WorkCacheInvalidation: OptionSet {
+        let rawValue: Int
+
+        /// `cachedVisibleItems`, per-column items/sections, ambiguous-repo
+        /// names, and `workBoardRepoMode`.
+        static let boardLayout = WorkCacheInvalidation(rawValue: 1 << 0)
+        /// O(1) id → task index (`taskIndexByID`).
+        static let taskIndex = WorkCacheInvalidation(rawValue: 1 << 1)
+        /// Dependency / gating prereq graphs.
+        static let dependencies = WorkCacheInvalidation(rawValue: 1 << 2)
+        /// In-review / done revision rollup caches.
+        static let revisions = WorkCacheInvalidation(rawValue: 1 << 3)
+
+        static let all: WorkCacheInvalidation = [
+            .boardLayout, .taskIndex, .dependencies, .revisions,
+        ]
+    }
+
+    /// Default entry point for published work-input changes: drop every
+    /// derived cache. Prefer `invalidateWorkCache(_:)` from paths that know
+    /// which subsets are affected.
     func invalidateWorkCache() {
-        cachedVisibleItems = nil
-        cachedItemsByColumn.removeAll(keepingCapacity: true)
-        cachedSectionsByColumn.removeAll(keepingCapacity: true)
-        cachedAmbiguousRepoNames = nil
-        taskIndexByID = nil
-        cachedDependencyPrereqs = nil
-        cachedGatingPrereqs = nil
-        cachedInReviewRevisionsByParentID = nil
-        cachedDoneRevisionsByParentID = nil
-        cachedWorkBoardRepoMode = nil
+        invalidateWorkCache(.all)
+    }
+
+    /// Drop only the selected derived caches. Used by keyed single-item
+    /// updates so a status flip does not rebuild the dependency graph or
+    /// the full id index when bucket membership is unchanged.
+    func invalidateWorkCache(_ keys: WorkCacheInvalidation) {
+        if keys.contains(.boardLayout) {
+            cachedVisibleItems = nil
+            cachedItemsByColumn.removeAll(keepingCapacity: true)
+            cachedSectionsByColumn.removeAll(keepingCapacity: true)
+            cachedAmbiguousRepoNames = nil
+            cachedWorkBoardRepoMode = nil
+        }
+        if keys.contains(.taskIndex) {
+            taskIndexByID = nil
+        }
+        if keys.contains(.dependencies) {
+            cachedDependencyPrereqs = nil
+            cachedGatingPrereqs = nil
+        }
+        if keys.contains(.revisions) {
+            cachedInReviewRevisionsByParentID = nil
+            cachedDoneRevisionsByParentID = nil
+        }
+    }
+
+    /// Patch one entry of the live id index without dropping it. No-op when
+    /// the index has not been built yet (lazy rebuild will pick up the new
+    /// row). Call only when bucket membership is unchanged.
+    func patchTaskIndex(with task: WorkTask) {
+        guard taskIndexByID != nil else { return }
+        taskIndexByID?[task.id] = task
+    }
+
+    /// Published work-input `didSet` hook. Full invalidate unless a caller
+    /// is mid-keyed mutation under `suppressWorkCacheInvalidation`.
+    func notePublishedWorkInputChanged() {
+        guard !suppressWorkCacheInvalidation else { return }
+        invalidateWorkCache()
+    }
+
+    /// Run `body` without the bucket `didSet` observers firing a full cache
+    /// drop, so the caller can finish with keyed invalidation instead.
+    func withSuppressedWorkCacheInvalidation(_ body: () -> Void) {
+        let wasSuppressed = suppressWorkCacheInvalidation
+        suppressWorkCacheInvalidation = true
+        defer { suppressWorkCacheInvalidation = wasSuppressed }
+        body()
     }
 
     /// Inline drag-refusal banner shown next to the source card when a
