@@ -13,9 +13,57 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use boss_protocol::{LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
+use boss_protocol::{ExecutionKind, LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
 use crate::driver::ProgressFidelity;
+
+/// Attributed worker-pool label for a live run (`"main"`, `"automation"`,
+/// or `"review"`). Matches
+/// [`crate::coordinator::ExecutionCoordinator::attributed_pool_label`]:
+/// review work always reports `"review"`, automation triage and any
+/// automation-sourced work report `"automation"`, everything else
+/// reports `"main"`. Independent of which physical slot the run
+/// occupies (automation can spill into a main-pool Lower Decks slot).
+///
+/// Used at spawn registration to stamp [`LiveWorkerState::pool`] so
+/// `bossctl agents list` can render pool without joining the execution
+/// table or re-deriving attribution.
+pub fn attributed_pool_label(kind: ExecutionKind, has_source_automation: bool) -> &'static str {
+    match kind {
+        ExecutionKind::PrReview => "review",
+        ExecutionKind::AutomationTriage => "automation",
+        _ if has_source_automation => "automation",
+        _ => "main",
+    }
+}
+
+/// Pool + execution-kind stamps carried into
+/// [`LiveWorkerStateRegistry::register_spawn_with_capabilities`] so production
+/// dispatch can populate [`LiveWorkerState::pool`] / [`LiveWorkerState::kind`]
+/// without growing the register-spawn arity further. Both fields are `None`
+/// for tests and any spawn path that does not know them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveSpawnRouting {
+    /// Attributed pool (`"main"` / `"automation"` / `"review"`).
+    pub pool: Option<String>,
+    /// Execution kind snake_case string (see [`ExecutionKind::as_str`]).
+    pub kind: Option<String>,
+}
+
+impl LiveSpawnRouting {
+    /// Both fields unset — the historical test/default shape.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Stamp both fields for a production dispatch.
+    pub fn new(pool: impl Into<String>, kind: impl Into<String>) -> Self {
+        Self {
+            pool: Some(pool.into()),
+            kind: Some(kind.into()),
+        }
+    }
+}
 
 /// The model identifier the engine uses when no `SessionStart` hook
 /// has yet reported one — this is the model the launcher *asked* for,
@@ -122,7 +170,15 @@ impl LiveWorkerStateRegistry {
         shell_pid: i32,
         binding: Option<WorkItemBinding>,
     ) {
-        self.register_spawn_with_capabilities(slot_id, run_id, model, shell_pid, binding, true);
+        self.register_spawn_with_capabilities(
+            slot_id,
+            run_id,
+            model,
+            shell_pid,
+            binding,
+            true,
+            LiveSpawnRouting::none(),
+        );
     }
 
     /// Same as [`Self::register_spawn`], but takes `awaiting_input_capable`
@@ -133,6 +189,19 @@ impl LiveWorkerStateRegistry {
     /// the setter would silently default to "trust `Notification`", and it
     /// removes the window between the two calls where a concurrently
     /// delivered hook event would be evaluated against that stale default.
+    ///
+    /// `routing` carries the attributed worker pool (`"main"` /
+    /// `"automation"` / `"review"`) and the execution kind
+    /// (`"task_implementation"`, …). Production dispatch always passes
+    /// both so `bossctl agents list` can render them without joining the
+    /// execution table; tests may leave them `None` via
+    /// [`LiveSpawnRouting::none`].
+    ///
+    /// Arity is one over clippy's default: the six spawn-identity args
+    /// (slot/run/model/pid/binding/capability) predate this method's
+    /// routing stamp, and collapsing them further would obscure the
+    /// call site. Routing is already a struct to absorb pool + kind.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_spawn_with_capabilities(
         &self,
         slot_id: u8,
@@ -141,8 +210,17 @@ impl LiveWorkerStateRegistry {
         shell_pid: i32,
         binding: Option<WorkItemBinding>,
         awaiting_input_capable: bool,
+        routing: LiveSpawnRouting,
     ) {
-        let state = LiveWorkerState::new_spawning(slot_id, run_id, model, shell_pid, binding);
+        let state = LiveWorkerState::new_spawning_with_routing(
+            slot_id,
+            run_id,
+            model,
+            shell_pid,
+            binding,
+            routing.pool,
+            routing.kind,
+        );
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
@@ -769,6 +847,51 @@ mod tests {
         assert_eq!(state.work_item_id.as_deref(), Some("task_18ad1b81532ac910_4"));
         assert_eq!(state.work_item_name.as_deref(), Some("Fix fencer scraping"));
         assert_eq!(state.execution_id.as_deref(), Some("exec-1"));
+        assert!(state.pool.is_none());
+        assert!(state.kind.is_none());
+    }
+
+    #[test]
+    fn register_spawn_with_capabilities_stamps_pool_and_kind() {
+        // Production spawn paths pass attributed pool + execution kind so
+        // `bossctl agents list` can render them without joining the
+        // execution table. Tests that use `register_spawn` leave both None.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn_with_capabilities(
+            2,
+            "exec-1",
+            "claude-opus-4-7",
+            12345,
+            Some(WorkItemBinding {
+                work_item_id: "task_abc".into(),
+                work_item_name: "Fix fencer scraping".into(),
+                execution_id: "exec-1".into(),
+            }),
+            true,
+            LiveSpawnRouting::new("automation", "chore_implementation"),
+        );
+        let state = reg.get(2).unwrap();
+        assert_eq!(state.pool.as_deref(), Some("automation"));
+        assert_eq!(state.kind.as_deref(), Some("chore_implementation"));
+    }
+
+    #[test]
+    fn attributed_pool_label_matches_coordinator_routing() {
+        assert_eq!(attributed_pool_label(ExecutionKind::PrReview, false), "review");
+        assert_eq!(attributed_pool_label(ExecutionKind::PrReview, true), "review");
+        assert_eq!(
+            attributed_pool_label(ExecutionKind::AutomationTriage, false),
+            "automation"
+        );
+        assert_eq!(
+            attributed_pool_label(ExecutionKind::TaskImplementation, true),
+            "automation"
+        );
+        assert_eq!(attributed_pool_label(ExecutionKind::ChoreImplementation, false), "main");
+        assert_eq!(
+            attributed_pool_label(ExecutionKind::RevisionImplementation, false),
+            "main"
+        );
     }
 
     #[test]
@@ -930,7 +1053,7 @@ mod tests {
         // The capability travels with registration in one call, so there is
         // no window where a hook event could race a follow-up setter call.
         let reg = LiveWorkerStateRegistry::new();
-        reg.register_spawn_with_capabilities(1, "run-1", "claude-opus-4-7", 1, None, false);
+        reg.register_spawn_with_capabilities(1, "run-1", "claude-opus-4-7", 1, None, false, LiveSpawnRouting::none());
         reg.apply_event(
             1,
             &WorkerEvent::Notification {

@@ -15,6 +15,8 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
         work_item_id: None,
         work_item_name: None,
         execution_id: None,
+        pool: None,
+        kind: None,
         live_status: None,
         live_status_at: None,
         recovery_status: None,

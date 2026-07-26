@@ -116,8 +116,14 @@ pub struct StartWorkerInput {
     pub draft_pr_mode: bool,
     /// Execution kind (e.g. `"chore_implementation"`, `"revision_implementation"`).
     /// Forwarded to `WorkerSetupInput` so the worker settings file can
-    /// install kind-specific hook guards.
+    /// install kind-specific hook guards. Also stamped onto
+    /// `LiveWorkerState.kind` at registration so `bossctl agents list`
+    /// can render it without joining the execution table.
     pub execution_kind: String,
+    /// Attributed worker pool for this run (`"main"`, `"automation"`, or
+    /// `"review"`). Stamped onto `LiveWorkerState.pool` at registration.
+    /// Production dispatch always sets this; tests may leave it `None`.
+    pub pool: Option<String>,
     /// Task kind from the underlying work item (e.g. `"revision"`, `"chore"`).
     /// `None` for non-task work items (products, projects).
     /// Forwarded to `WorkerSetupInput` for defense-in-depth guard checks.
@@ -445,6 +451,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             shell_pid,
             input.work_item_binding,
             input.driver.capabilities().provides(Capability::AwaitingInputSignal),
+            // Always stamp the execution kind; production callers pass a
+            // non-empty snake_case kind, tests that leave the field at a
+            // placeholder still surface it on the wire. Pool may be
+            // `None` for tests that never set `StartWorkerInput.pool`.
+            crate::live_worker_state::LiveSpawnRouting {
+                pool: input.pool,
+                kind: Some(input.execution_kind),
+            },
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the
@@ -533,6 +547,7 @@ mod tests {
             model: "claude-opus-4-7".into(),
             draft_pr_mode: false,
             execution_kind: "chore_implementation".into(),
+            pool: Some("main".into()),
             task_kind: Some("chore".into()),
             worker_kind: WorkerKind::Standard,
             driver: crate::driver::DriverRegistry::default()
