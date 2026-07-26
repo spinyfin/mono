@@ -194,8 +194,10 @@ fn claude_md_pr_section_is_front_and_centre() {
     );
     // Resuming-work guidance must mention how to detect an
     // existing PR rather than just letting the worker open a duplicate —
-    // via `boss context` (Boss already tracks `pr_url`), not a `gh` hunt.
-    assert!(rendered.contains("Check first with `boss context`"));
+    // via `boss pr status` (Boss already tracks the PR, and resolves it
+    // correctly even for revision tasks where `task.pr_url` is NULL), not
+    // a `gh` hunt.
+    assert!(rendered.contains("Check first with `boss pr status`"));
     assert!(
         !rendered.contains("gh pr list --head"),
         "worker CLAUDE.md must not send workers to GitHub to find their own PR"
@@ -234,6 +236,45 @@ fn claude_md_has_cube_pr_create_section() {
     assert!(
         rendered.contains("jj bookmark create"),
         "expected canonical bookmark creation command",
+    );
+}
+
+#[test]
+fn claude_md_documents_pr_status_and_body_verbs() {
+    let input = sample_input();
+    let rendered = claude_md_for(&input);
+    assert!(
+        rendered.contains("boss pr status"),
+        "expected `boss pr status` to be introduced with a concrete invocation",
+    );
+    assert!(
+        rendered.contains("boss pr status --refresh"),
+        "expected the --refresh flag to be documented as a concrete invocation",
+    );
+    assert!(
+        rendered.contains("boss pr body"),
+        "expected `boss pr body` to be introduced",
+    );
+    assert!(
+        rendered.contains("boss pr status") && rendered.contains("NULL for a revision task"),
+        "expected `boss pr status` to be pointed at as the cheapest PR-discovery check, and \
+         `boss context`'s `task.pr_url` field to be called out as unreliable for revision \
+         workers (it is NULL by design — the chain root owns the PR, not the revision)",
+    );
+    // Semantics must be stated, not just the verb name: staleness and the
+    // null-body case, per the design's requirement that a worker not
+    // distrust or misuse the verb right after pushing.
+    assert!(
+        rendered.contains("not live GitHub truth"),
+        "expected the CLAUDE.md to state that boss pr status reflects a stored observation, not live state",
+    );
+    assert!(
+        rendered.contains("refresh_throttled"),
+        "expected the bounded-refresh throttling behavior to be documented",
+    );
+    assert!(
+        rendered.contains("does NOT mean the PR has an empty") || rendered.contains("brand-new PR flow"),
+        "expected the null-body case (no snapshot yet) to be explained, not left for the worker to guess",
     );
 }
 

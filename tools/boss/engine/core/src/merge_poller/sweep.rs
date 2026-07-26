@@ -1380,7 +1380,7 @@ pub(crate) fn ci_state_str(ci: &OpenPrCiStatus) -> &'static str {
 }
 
 /// Derive the `pr_mergeable_state` string from a probe's raw GitHub
-/// mergeability (T3271 / mono#2303). This is the *only* signal that reflects
+/// mergeability (mono#2303). This is the *only* signal that reflects
 /// whether the PR's head actually merges cleanly into its base — CI status
 /// and merge-queue/auto-merge arming are both silent on that question, so a
 /// client must not infer mergeability from either of them.
@@ -1496,6 +1496,9 @@ pub(crate) async fn update_pr_poll_state(
             merge_queue_detail: merge_queue_detail.as_deref(),
             preserve_merge_queue_state,
             pr_mergeable_state: mergeable_state,
+            pr_merge_state_status: (!probe.raw_merge_state_status.is_empty())
+                .then_some(probe.raw_merge_state_status.as_str()),
+            pr_head_sha: probe.head_ref_oid.as_deref(),
         },
     ) {
         Ok(outcome) => outcome,

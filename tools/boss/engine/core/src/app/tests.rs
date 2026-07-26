@@ -65,6 +65,7 @@ mod app_channel;
 mod context;
 mod engine_health_report;
 mod open_document;
+mod pr_status;
 mod proposals;
 mod session_sink_queue;
 mod t02;

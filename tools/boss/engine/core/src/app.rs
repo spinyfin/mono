@@ -78,6 +78,7 @@ mod pane_delivery;
 mod pane_ops;
 mod panes;
 mod planner_ops;
+mod pr_status;
 mod probes;
 mod products;
 mod projects;
@@ -403,6 +404,12 @@ struct ServerState {
     /// without shelling out to `gh`. Defaults to `CommandMergeProbe::new()`
     /// in production (see [`Self::new_arc_with_app_pid_and_merge_probe`]).
     merge_probe: Arc<dyn MergeProbe>,
+    /// Engine-wide bound on `boss pr status --refresh` live probes — see
+    /// [`pr_status::PrStatusRefreshBudget`]. Defaults to an empty (fresh)
+    /// window via `#[builder(default)]`; not threaded through the
+    /// `ServerState::builder()` call site.
+    #[builder(default)]
+    pr_status_refresh_budget: pr_status::PrStatusRefreshBudget,
     /// Executes the Direct merge-mechanism side effect (`gh pr merge --auto
     /// --squash`) for `handle_merge_when_ready`'s `MergeMechanism::Direct`
     /// branch. Defaults to `CommandDirectMergeExecutor` in production (see
@@ -1797,7 +1804,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetEngineVersion => engine_meta::handle_get_engine_version(ctx, r).await,
             r @ FrontendRequest::GetExecution { .. } => executions::handle_get_execution(ctx, r).await,
             r @ FrontendRequest::GetHost { .. } => hosts::handle_get_host(ctx, r).await,
+            r @ FrontendRequest::GetPrBody { .. } => pr_status::handle_get_pr_body(ctx, r).await,
             r @ FrontendRequest::GetProductDesignDoc { .. } => design_docs::handle_get_product_design_doc(ctx, r).await,
+            r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,

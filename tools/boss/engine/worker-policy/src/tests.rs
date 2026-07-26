@@ -195,6 +195,21 @@ fn get_worker_context_is_allowed() {
 }
 
 #[test]
+fn get_pr_status_and_get_pr_body_are_allowed() {
+    assert_allowed(FrontendRequest::GetPrStatus {
+        run_id: "exec_1".into(),
+        refresh: false,
+    });
+    assert_allowed(FrontendRequest::GetPrStatus {
+        run_id: "exec_1".into(),
+        refresh: true,
+    });
+    assert_allowed(FrontendRequest::GetPrBody {
+        run_id: "exec_1".into(),
+    });
+}
+
+#[test]
 fn taxonomy_reads_are_allowed() {
     assert_allowed(FrontendRequest::ListProducts);
     assert_allowed(FrontendRequest::GetWorkItem { id: "task_1".into() });
@@ -493,6 +508,27 @@ fn worker_context_result_carries_no_runtime_half_fields() {
         bundle: Box::new(worker_context_bundle()),
     };
     assert_nothing_leaked(&sanitize_event_for_worker(event));
+}
+
+/// `boss pr status` / `boss pr body` carry no `WorkExecution`/`WorkRun`
+/// rows either — same reasoning as `worker_context_result_carries_no_runtime_half_fields`.
+#[test]
+fn pr_status_and_pr_body_results_carry_no_runtime_half_fields() {
+    let status_event = FrontendEvent::PrStatusResult {
+        status: boss_protocol::PrStatusView::builder()
+            .pr_url("https://github.com/o/r/pull/1")
+            .mergeable("mergeable")
+            .build(),
+    };
+    assert_nothing_leaked(&sanitize_event_for_worker(status_event));
+
+    let body_event = FrontendEvent::PrBodyResult {
+        body: boss_protocol::PrBodyView::builder()
+            .pr_url("https://github.com/o/r/pull/1")
+            .body("## Summary\n...")
+            .build(),
+    };
+    assert_nothing_leaked(&sanitize_event_for_worker(body_event));
 }
 
 #[test]

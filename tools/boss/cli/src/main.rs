@@ -27,6 +27,7 @@ pub(crate) use serde::Serialize;
 
 mod buildkite_release;
 mod context;
+mod pr;
 mod propose;
 mod repo_resolution;
 pub(crate) use boss_github as github_app;
@@ -265,6 +266,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Context => {
             let ctx = RunContext::from_flags(&cli.global)?;
             context::run_context_command(&ctx).await
+        }
+        Commands::Pr { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            pr::run_pr_command(command, &ctx).await
         }
         Commands::Engine { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;

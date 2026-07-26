@@ -1225,6 +1225,29 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "worker_context_result",
         },
         TagCase {
+            label: "PrStatusResult",
+            event: FrontendEvent::PrStatusResult {
+                status: PrStatusView::builder()
+                    .pr_url("https://github.com/example/repo/pull/1")
+                    .mergeable("mergeable")
+                    .merge_state_status("CLEAN")
+                    .head_sha("abc123")
+                    .observed_at("1747000000")
+                    .build(),
+            },
+            expected_tag: "pr_status_result",
+        },
+        TagCase {
+            label: "PrBodyResult",
+            event: FrontendEvent::PrBodyResult {
+                body: PrBodyView::builder()
+                    .pr_url("https://github.com/example/repo/pull/1")
+                    .body("## Summary\n...")
+                    .build(),
+            },
+            expected_tag: "pr_body_result",
+        },
+        TagCase {
             label: "WorkerTierDenied",
             event: FrontendEvent::WorkerTierDenied {
                 denial: WorkerTierDenial::redirect(
@@ -1747,6 +1770,8 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProposalRejected { .. }
         | FrontendEvent::ProposalsList { .. }
         | FrontendEvent::WorkerContextResult { .. }
+        | FrontendEvent::PrStatusResult { .. }
+        | FrontendEvent::PrBodyResult { .. }
         | FrontendEvent::WorkerTierDenied { .. }
         | FrontendEvent::UnpopulateProjectResult { .. }
         | FrontendEvent::FeatureFlagsList { .. }

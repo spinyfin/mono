@@ -139,6 +139,18 @@ pub(crate) enum Commands {
     ///
     /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
     Context,
+    /// Bounded, read-only PR-state verbs over state Boss already has
+    /// stored, for a worker session that would otherwise reach for `gh pr
+    /// view` / `gh pr list --head` just to check its own PR.
+    ///
+    /// Identity is resolved from the worker session the same way `boss
+    /// context` works — no work-item argument, no `--id` flag.
+    ///
+    /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
+    Pr {
+        #[command(subcommand)]
+        command: PrCommand,
+    },
     Engine {
         #[command(subcommand)]
         command: EngineCommand,
@@ -522,6 +534,34 @@ pub(crate) enum ChoreCommand {
     /// Alias for `boss task unlink-external`. Accepts any leaf work item id.
     #[command(name = "unlink-external")]
     UnlinkExternal(TaskIdArg),
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum PrCommand {
+    /// Boss's last-observed mergeability for your own PR: `mergeable`,
+    /// `merge_state_status`, `head_sha`, and `observed_at` — sourced from
+    /// the merge poller's stored state, not a live GitHub call, unless
+    /// `--refresh` is passed. `observed_at` is a Unix epoch seconds
+    /// timestamp: compare it against your own push time to tell whether
+    /// this snapshot predates a push you just made.
+    Status(PrStatusArgs),
+    /// Boss's snapshot of your own PR's body, taken when this execution's
+    /// run started. Never a live GitHub read; `cube pr update` (with
+    /// `--body-file`) remains the only write path. A `null`/absent body in
+    /// `--json` output means no baseline was snapshotted for this
+    /// execution — see the human-readable output for what that implies.
+    Body,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct PrStatusArgs {
+    /// Request one bounded, engine-wide-rate-limited live GitHub check
+    /// instead of the stored snapshot — for the case where you just
+    /// pushed and need current state. Falls back silently to the stored
+    /// snapshot (with `refresh_throttled: true`) if the refresh budget is
+    /// exhausted; never blocks or errors on throttling.
+    #[arg(long)]
+    pub(crate) refresh: bool,
 }
 
 #[derive(Debug, Subcommand)]

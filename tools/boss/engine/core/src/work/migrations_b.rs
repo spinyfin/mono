@@ -950,6 +950,64 @@ pub(crate) fn migrate_tasks_merge_queue_detail_column(conn: &Connection) -> Resu
     Ok(())
 }
 
+/// Add `tasks.pr_merge_state_status` and `tasks.pr_head_sha` — two fields
+/// the merge poller's `gh pr view` probe already fetches every sweep
+/// (`PrLifecycleProbe::raw_merge_state_status` / `head_ref_oid`) but
+/// previously discarded after routing the CI/conflict/merge-queue
+/// dispatch decision. Persisting them costs no additional GitHub call —
+/// see `sweep::update_pr_poll_state`, which now writes both alongside the
+/// existing `pr_mergeable_state` write.
+///
+/// `pr_merge_state_status` is GitHub's raw `mergeStateStatus` enum
+/// (`"CLEAN"`, `"DIRTY"`, `"BLOCKED"`, `"BEHIND"`, `"UNSTABLE"`,
+/// `"UNKNOWN"`) — distinct from `pr_mergeable_state`, which is Boss's own
+/// normalized `mergeable`/`conflicting`/`unknown` derived from GitHub's
+/// separate `mergeable` field. `pr_head_sha` is the PR's `headRefOid` at
+/// last poll. Both back `boss pr status` (`app::pr_status`), which reads
+/// them as the "Boss already observed this" snapshot instead of every
+/// worker re-fetching the same state via `gh pr view`.
+/// Idempotent — guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_pr_status_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "pr_merge_state_status",
+            "ALTER TABLE tasks ADD COLUMN pr_merge_state_status TEXT",
+        ),
+        ("pr_head_sha", "ALTER TABLE tasks ADD COLUMN pr_head_sha TEXT"),
+        // `pr_status_observed_at`: the "last observed by anyone" timestamp
+        // `boss pr status` reports as `observed_at`, stamped by BOTH the
+        // merge poller sweep and a worker's `--refresh` call. Deliberately
+        // separate from `pr_state_polled_at`, which stays the poller's own
+        // liveness diagnostic (see `update_task_pr_poll_state`'s doc
+        // comment) — if a worker refresh could also advance
+        // `pr_state_polled_at`, a wedged poller with active worker refreshes
+        // would look alive when it isn't.
+        (
+            "pr_status_observed_at",
+            "ALTER TABLE tasks ADD COLUMN pr_status_observed_at TEXT",
+        ),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+            if column == "pr_status_observed_at" {
+                // One-time backfill for engines upgrading from before this
+                // column existed: without it, every already-polled task
+                // would report `observed_at: null` from `boss pr status`
+                // until the merge poller's next sweep happens to touch that
+                // row — and rows the poller has stopped sweeping (merged,
+                // closed) would stay null indefinitely. `pr_state_polled_at`
+                // is the closest prior observation timestamp available.
+                conn.execute(
+                    "UPDATE tasks SET pr_status_observed_at = pr_state_polled_at \
+                     WHERE pr_status_observed_at IS NULL AND pr_state_polled_at IS NOT NULL",
+                    [],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Add the external-tracker binding columns to `products` and the
 /// per-work-item upstream-ref columns to `tasks`, plus the two partial
 /// indices that support efficient lookup and uniqueness enforcement.

@@ -545,14 +545,17 @@ pub trait BranchVerifier: Send + Sync {
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
-    /// Returns the description/body of PR `pr_number` in `repo_slug`.
-    /// Used by the metadata-only CI-fix finalize gate (issue #1252) to
-    /// detect an operator-visible PR-metadata delta: a CI-fix revision
-    /// that repairs a PR-description validator via `gh pr edit --body`
-    /// makes no commit, so the head SHA never moves — the body diff is
-    /// the only evidence the worker contributed. An empty body is a
-    /// valid value (not an error), unlike the head-ref fetches.
-    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+    /// Returns `(title, body)` of PR `pr_number` in `repo_slug` in a single
+    /// `gh pr view` call. The body is used by the metadata-only CI-fix
+    /// finalize gate (issue #1252) to detect an operator-visible
+    /// PR-metadata delta: a CI-fix revision that repairs a PR-description
+    /// validator via `gh pr edit --body` makes no commit, so the head SHA
+    /// never moves — the body diff is the only evidence the worker
+    /// contributed. The title is snapshotted alongside it at execution
+    /// start so `boss pr body` can return both without a worker needing a
+    /// second `gh pr view` call. An empty body is a valid value (not an
+    /// error), unlike the head-ref fetches.
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)>;
 }
 
 /// `BranchVerifier` that shells out to `gh pr view`.
@@ -579,8 +582,8 @@ impl BranchVerifier for CommandBranchVerifier {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 
-    async fn fetch_pr_body(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
-        fetch_pr_body_cmd(repo_slug, pr_number).await
+    async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
+        fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
     }
 }
 
@@ -603,20 +606,37 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
     Ok(total)
 }
 
-/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json body` and
-/// return the PR description. An empty body is a valid result (returned
-/// as the empty string) — a PR can legitimately have no description, and
-/// the metadata-fix gate needs to distinguish "" (snapshotted empty)
-/// from a failed fetch.
-async fn fetch_pr_body_cmd(repo_slug: &str, pr_number: u64) -> Result<String> {
+/// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title,body`
+/// and return `(title, body)` from a single API round trip. An empty body
+/// is a valid result (returned as the empty string) — a PR can
+/// legitimately have no description, and the metadata-fix gate needs to
+/// distinguish "" (snapshotted empty) from a failed fetch.
+async fn fetch_pr_title_and_body_cmd(repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
     let pr_str = pr_number.to_string();
-    run_gh(
+    let display = format!("gh pr view {pr_number} -R {repo_slug} --json title,body");
+    let stdout = run_gh(
         &[
-            "pr", "view", &pr_str, "-R", repo_slug, "--json", "body", "--jq", ".body",
+            "pr",
+            "view",
+            &pr_str,
+            "-R",
+            repo_slug,
+            "--json",
+            "title,body",
+            "--jq",
+            "[.title, .body]",
         ],
-        &format!("gh pr view {pr_number} -R {repo_slug} --json body"),
+        &display,
     )
-    .await
+    .await?;
+    let mut fields: Vec<String> =
+        serde_json::from_str(&stdout).with_context(|| format!("unexpected output from `{display}`: {stdout:?}"))?;
+    if fields.len() != 2 {
+        return Err(anyhow!("unexpected output from `{display}`: {stdout:?}"));
+    }
+    let body = fields.pop().expect("checked len == 2");
+    let title = fields.pop().expect("checked len == 2");
+    Ok((title, body))
 }
 
 /// Single PR row returned from `gh pr list --head <branch> --json …`.

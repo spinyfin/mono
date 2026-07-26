@@ -871,6 +871,17 @@ pub enum FrontendEvent {
     WorkerContextResult {
         bundle: Box<WorkerContextBundle>,
     },
+    /// Reply for [`FrontendRequest::GetPrStatus`]: the caller's own PR's
+    /// mergeability as Boss last observed it (or, with `refresh: true` and
+    /// budget available, a fresh on-demand probe).
+    PrStatusResult {
+        status: PrStatusView,
+    },
+    /// Reply for [`FrontendRequest::GetPrBody`]: the caller's own PR's body
+    /// as Boss snapshotted it at the start of this execution's run.
+    PrBodyResult {
+        body: PrBodyView,
+    },
     /// Response to [`FrontendRequest::UnpopulateProject`]. `deleted`
     /// carries the ids of tasks soft-deleted; `preserved` carries the
     /// tasks that already had an execution (released and dispatched)

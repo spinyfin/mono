@@ -528,6 +528,7 @@ pub use output_types::WorkerPrCompletionTarget;
 pub use planner_runs::ClaimPlannerRunInput;
 pub use planner_runs::PlannerRunPatch;
 pub use pr_flow::PrPollStateInput;
+pub use pr_flow::PrStatusSnapshot;
 pub use pr_flow::QueuedMergeQueueMember;
 #[cfg(test)]
 pub use pr_state::FakePrStateChecker;

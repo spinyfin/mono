@@ -15,12 +15,12 @@ use crate::types::{
     CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
     CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState,
     EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState,
+    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
+    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -738,6 +738,20 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Worker → engine, read-only: the caller's own PR's body as Boss
+    /// snapshotted it at the start of this execution's run (see
+    /// `WorkDb::get_execution_pr_body_before`) — never a live GitHub read.
+    ///
+    /// Attribution matches [`Self::GetWorkerContext`] exactly (same
+    /// `run_id` cross-check, same peer-pid resolution, same
+    /// `ProposalRejected` failure shape).
+    ///
+    /// Replies with [`FrontendEvent::PrBodyResult`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    GetPrBody {
+        run_id: String,
+    },
+
     /// Read-only: fetch one markdown document's body from GitHub.
     ///
     /// Identified by the `(repo, path, ref)` triple
@@ -750,6 +764,29 @@ pub enum FrontendRequest {
         repo_remote_url: String,
         path: String,
         git_ref: String,
+    },
+
+    /// Worker → engine, read-only: the caller's own PR's mergeability as
+    /// Boss last observed it — `mergeable`, `merge_state_status`,
+    /// `head_sha`, and `observed_at`, sourced from the merge poller's
+    /// stored state, never a live GitHub call by default.
+    ///
+    /// Attribution matches [`Self::GetWorkerContext`] exactly.
+    ///
+    /// `refresh: true` requests a single, bounded, on-demand `gh pr view`
+    /// probe instead of the stored snapshot — for the case where the
+    /// caller just pushed and needs current state. The refresh is
+    /// engine-wide rate-limited: if the budget is exhausted, the stored
+    /// snapshot is returned instead with `refresh_throttled: true`, never
+    /// blocked or errored. `refresh: false` (the default) never issues a
+    /// GitHub call.
+    ///
+    /// Replies with [`FrontendEvent::PrStatusResult`], or
+    /// [`FrontendEvent::ProposalRejected`] when attribution fails.
+    GetPrStatus {
+        run_id: String,
+        #[serde(default)]
+        refresh: bool,
     },
 
     GetRun {
