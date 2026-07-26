@@ -234,6 +234,13 @@ impl WorkerCompletionHandler {
             // the auto-nudge is suppressed, not the attempt marked failed —
             // mirrors EscalationPending/NudgeBreakerParked.
             StopOutcome::BuildWaitPending { .. } => false,
+            // Worker's process tree still has live background children
+            // (a backgrounded subagent); the auto-nudge is suppressed, not
+            // the attempt marked failed — mirrors BuildWaitPending.
+            StopOutcome::BackgroundChildrenPending { .. } => false,
+            // An operator explicitly held this execution; nothing about
+            // the CI attempt changes while held — mirrors EscalationPending.
+            StopOutcome::Held { .. } => false,
             // Signal was already cleared before this worker ran — the
             // attempt has been marked succeeded by try_retire_cleared_blocking_signal.
             StopOutcome::SignalAlreadyCleared { .. } => false,

@@ -35,6 +35,8 @@ impl WorkerCompletionHandler {
         self.staged_pr_urls.forget(&execution.id);
         self.nudge_breaker.forget(&execution.id);
         self.build_wait_tracker.forget(&execution.id);
+        self.background_children_tracker.forget(&execution.id);
+        self.hold_registry.release(&execution.id);
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

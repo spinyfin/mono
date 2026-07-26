@@ -18,6 +18,7 @@ fn live(slot: u8, run: &str) -> LiveWorkerState {
         live_status: None,
         live_status_at: None,
         recovery_status: None,
+        held: false,
     }
 }
 
