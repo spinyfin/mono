@@ -2,6 +2,7 @@
 //! refuses to discard unpushed work on release.
 
 use std::path::Path;
+use std::time::Instant;
 
 use git_utils::repo_slug::parse_github_remote;
 
@@ -10,17 +11,8 @@ use crate::command_runner::{CommandRunner, RealCommandRunner};
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::health::{audit_jj_op, read_head_status};
-use crate::app::jj::{run_jj, run_jj_network};
+use crate::app::jj::{run_jj, run_jj_network, run_jj_within};
 use crate::app::repo::is_unresolved_remote_target;
-
-pub(super) fn reset_workspace(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-    main_branch: &str,
-) -> Result<()> {
-    reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None)
-}
 
 /// Resolve the GitHub remote name and `owner/repo` slug from `jj git remote
 /// list` run inside the given workspace path.
@@ -42,7 +34,7 @@ pub(super) fn resolve_github_remote_for_workspace(
     })
 }
 
-/// Variant of [`reset_workspace`] that refuses to run the destructive
+/// Fetch, then reset — refusing to run the destructive
 /// `jj new <main>` step if the workspace's `@` still has the prior
 /// lease holder's uncommitted work AND `prior_expired` says the lease
 /// we just claimed was reclaimed-out-from-under that holder. Surfaces
@@ -50,8 +42,8 @@ pub(super) fn resolve_github_remote_for_workspace(
 /// abort cleanly instead of stomping on the still-active worker.
 ///
 /// When `prior_expired` is `None` (normal release path, or a workspace
-/// that was already `free`), the guard is a no-op and behavior matches
-/// the original `reset_workspace`.
+/// that was already `free`), the guard is a no-op and this is a plain
+/// fetch-and-reset.
 ///
 /// Every `jj` invocation here also writes an audit entry
 /// (`workspace.jj_op`) so the next time someone reports "my `@`
@@ -197,12 +189,26 @@ pub(super) fn reset_workspace_on_release(
 /// TTL-expiry path ([`reset_workspace_guarded`]) and the release path
 /// ([`reset_workspace_on_release`]) can each apply their own guard between
 /// the fetch and the `jj new`. Assumes `jj git fetch` has already run.
-fn reset_workspace_after_fetch(
+pub(super) fn reset_workspace_after_fetch(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,
     main_branch: &str,
     prior_expired: Option<&crate::store::ExpiredLease>,
+) -> Result<()> {
+    reset_workspace_after_fetch_within(runner, database_path, workspace_path, main_branch, prior_expired, None)
+}
+
+/// [`reset_workspace_after_fetch`] under a caller's wall-clock `deadline`, so
+/// a time-budgeted pass (pool GC) cannot overrun its budget inside the reset
+/// the way it could inside the probe that precedes it.
+pub(super) fn reset_workspace_after_fetch_within(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+    prior_expired: Option<&crate::store::ExpiredLease>,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     // Detect the real upstream remote by URL so both the fast-forward and the
     // `jj new` target the current GitHub HEAD. For source-pool workspaces this
@@ -210,7 +216,7 @@ fn reset_workspace_after_fetch(
     // `origin`. Using URL-based detection (rather than a `has_source` proxy)
     // means the correct remote is found even when the source mirror is later
     // GC'd after provisioning.
-    let upstream_remote = detect_upstream_tracking_remote(runner, database_path, workspace_path);
+    let upstream_remote = detect_upstream_tracking_remote(runner, database_path, workspace_path, deadline);
     // Keep local `main` current so workers running `jj new main` themselves
     // (e.g. following their CLAUDE.md instruction) also branch from origin head.
     fast_forward_default_branch_to_origin(
@@ -220,6 +226,7 @@ fn reset_workspace_after_fetch(
         main_branch,
         prior_expired,
         &upstream_remote,
+        deadline,
     )?;
 
     // Branch directly from the remote-tracking bookmark, not the local one.
@@ -229,10 +236,11 @@ fn reset_workspace_after_fetch(
     // `jj new main` used the local bookmark rather than the fetched remote head).
     let remote_ref = format!("{main_branch}@{upstream_remote}");
     audit_jj_op(database_path, workspace_path, "new", &[&remote_ref], prior_expired);
-    run_jj(
+    run_jj_within(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["new", &remote_ref]),
+        deadline,
     )?;
     Ok(())
 }
@@ -248,13 +256,14 @@ fn reset_workspace_after_fetch(
 /// lingering pre-reprovision workspace cloned from a local mirror that still
 /// carries a separate `github` remote. Falls back to `"origin"` when the remote
 /// list cannot be resolved or no github.com remote is found.
-pub(super) fn detect_upstream_tracking_remote(
+fn detect_upstream_tracking_remote(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,
+    deadline: Option<Instant>,
 ) -> String {
     let invocation = RealCommandRunner::invocation(workspace_path, "jj", &["git", "remote", "list"]);
-    let remote_output = run_jj(runner, database_path, &invocation).unwrap_or_default();
+    let remote_output = run_jj_within(runner, database_path, &invocation, deadline).unwrap_or_default();
     if let Some((name, _)) = parse_github_remote(&remote_output) {
         return name;
     }
@@ -318,6 +327,7 @@ fn fast_forward_default_branch_to_origin(
     main_branch: &str,
     prior_expired: Option<&crate::store::ExpiredLease>,
     upstream_remote: &str,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let remote_target = format!("{main_branch}@{upstream_remote}");
     audit_jj_op(
@@ -339,7 +349,7 @@ fn fast_forward_default_branch_to_origin(
             "--allow-backwards",
         ],
     );
-    match run_jj(runner, database_path, &invocation) {
+    match run_jj_within(runner, database_path, &invocation, deadline) {
         Ok(_) => Ok(()),
         Err(err) if is_unresolved_remote_target(&err) => {
             eprintln!(

@@ -19,6 +19,7 @@ mod provision;
 mod reconcile;
 mod repo;
 mod reset;
+mod salvage;
 mod stage;
 mod util;
 mod workspace;

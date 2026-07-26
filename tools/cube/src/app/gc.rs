@@ -2,7 +2,7 @@
 //! unhealthy workspaces, stale logs, and the background pool GC trigger.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use git_utils::pr_bookmark;
@@ -17,7 +17,10 @@ use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reconcile::reconcile_free_workspace_health;
-use crate::app::reset::reset_workspace;
+use crate::app::reset::reset_workspace_after_fetch_within;
+use crate::app::salvage::{
+    attributed_holder, attributed_task, discard_salvage_record, gc_aged_salvage_records, salvage_workspace,
+};
 use crate::app::util::current_epoch_s;
 
 /// Pool-wide gc runs at most once per 24 hours (when there is no known
@@ -221,44 +224,69 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
-/// exists that `gc_aged_unhealthy_workspaces` can actually reset — used to
-/// decide whether a completed-but-partial pass should be retried after
+/// exists that `gc_aged_unhealthy_workspaces` would pick up — used to decide
+/// whether a completed-but-partial pass should be retried after
 /// POOL_GC_BACKLOG_RETRY_SECS instead of waiting a full day.
 ///
-/// Deliberately excludes `Quarantined` workspaces even though
-/// `gc_aged_unhealthy_workspaces` also considers them: quarantine is only
-/// ever lifted against evidence from a live reuse probe (an unpushed-work
-/// check), and a quarantined workspace whose `@` genuinely still holds
-/// unpushed work stays quarantined forever — its `unhealthy_since` never
-/// advances, so counting it here would pin the retry interval at
-/// POOL_GC_BACKLOG_RETRY_SECS permanently instead of settling back to
-/// AUTO_GC_INTERVAL_SECS once the resettable (Dirty/Conflicted) backlog is
-/// actually drained. Dirty/Conflicted workspaces have no such refusal path —
-/// `gc_aged_unhealthy_workspaces` resets them unconditionally once aged past
-/// the threshold — so they are a reliable "will make progress next pass"
-/// signal. Running the live probe here to distinguish resettable from stuck
-/// quarantined workspaces would defeat the point of this being a cheap,
-/// read-only check (see `gc_aged_unhealthy_workspaces`'s quarantine probe).
+/// The candidate predicate here must mirror `gc_aged_unhealthy_workspaces`'s
+/// exactly, including `Quarantined` and its "no `unhealthy_since` means treat
+/// as old" allowance. It previously matched only `Dirty`/`Conflicted`, on the
+/// reasoning that a quarantined workspace holding unpushed work stayed
+/// quarantined forever and would therefore pin the retry interval at 5
+/// minutes permanently. Retention now expires — age plus a successful salvage
+/// reclaims exactly those rows — so that reasoning no longer holds, and the
+/// mismatch had a real cost: with a backlog that is mostly quarantined, a
+/// partial 20-second pass stamps completion, this returns `false`, and the
+/// next auto GC waits AUTO_GC_INTERVAL_SECS (24h) rather than
+/// POOL_GC_BACKLOG_RETRY_SECS (5m). The free pool stays withheld far longer
+/// than the 24h retention TTL implies — the "effective free collapses while
+/// GC sleeps" failure this whole change exists to fix.
+///
+/// This deliberately does not distinguish "will succeed" from "will be tried
+/// and refused". A candidate whose salvage keeps failing genuinely is
+/// outstanding work, and retrying it every POOL_GC_BACKLOG_RETRY_SECS is the
+/// correct answer for the rest of the backlog it is sharing a pass with;
+/// telling the two apart needs the live probe, which is exactly the cost this
+/// check exists to avoid.
 pub(super) fn pool_gc_has_aged_unhealthy_backlog(store: &Store, now_epoch_s: i64) -> Result<bool> {
     let max_age_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
     let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
     let records = store.list_workspaces_filtered(&WorkspaceListFilter::default())?;
-    Ok(records.into_iter().any(|record| {
-        if record.state == WorkspaceState::Leased {
-            return false;
-        }
-        let is_unhealthy = matches!(
-            record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
-        );
-        if !is_unhealthy {
-            return false;
-        }
-        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
-            return false;
-        };
-        unhealthy_since <= threshold_epoch_s
-    }))
+    Ok(records
+        .into_iter()
+        .any(|record| aged_unhealthy_since(&record, threshold_epoch_s).is_some()))
+}
+
+/// The shared candidate predicate for the aged-unhealthy passes: `Some(since)`
+/// when `record` is a free workspace whose unhealthy clock started at or
+/// before `threshold_epoch_s`, `None` when it is not a candidate at all.
+///
+/// Factored out so `pool_gc_has_aged_unhealthy_backlog` (which decides *when*
+/// the next pass runs) and `gc_aged_unhealthy_workspaces` (which does the
+/// work) cannot drift apart again.
+fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Option<i64> {
+    if record.state == WorkspaceState::Leased {
+        return None;
+    }
+    if !matches!(
+        record.health_status,
+        Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
+    ) {
+        return None;
+    }
+    // A quarantined row written before the timestamp was stamped on that path
+    // has no age to compare; treat it as old rather than stranding it forever
+    // — the reuse probe is what actually decides whether it is safe to touch.
+    // Dirty/conflicted rows keep the strict behaviour.
+    let unhealthy_since = match (
+        record.unhealthy_since_epoch_s,
+        record.health_status == Some(WorkspaceHealth::Quarantined),
+    ) {
+        (Some(since), _) => since,
+        (None, true) => 0,
+        (None, false) => return None,
+    };
+    (unhealthy_since <= threshold_epoch_s).then_some(unhealthy_since)
 }
 
 /// Trigger a pool GC pass, throttled so it does not run on every lease.
@@ -379,6 +407,15 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
 
     gc_stale_workspace_logs(&store);
 
+    // Salvage records are themselves retained, not kept forever — the failure
+    // mode this whole change is about does not get to reappear one level up.
+    if let Ok(now) = current_epoch_s() {
+        let removed = gc_aged_salvage_records(database_path.as_deref(), now);
+        if removed > 0 {
+            eprintln!("cube: auto gc: removed {removed} salvage record(s) past their retention window");
+        }
+    }
+
     // Sweep consumed bookmarks from every non-leased workspace. Each workspace
     // runs jj git fetch; a broken/unreachable remote times out after
     // network_cmd_timeout() and is skipped so one slow workspace cannot block
@@ -445,6 +482,7 @@ pub(super) fn reclaim_quarantined_workspace(
     repo: &str,
     main_branch: &str,
     exclude: &[String],
+    deadline: Option<Instant>,
 ) -> Result<Option<String>> {
     let quarantined = store.list_workspaces_filtered(&WorkspaceListFilter {
         repo: Some(repo),
@@ -459,9 +497,18 @@ pub(super) fn reclaim_quarantined_workspace(
 
     let mut scanned = 0usize;
     let mut reclaimed: Option<String> = None;
+    let mut timed_out = false;
     for record in available.iter().take(QUARANTINE_RECLAIM_MAX_PROBES) {
+        // Probe count alone does not bound cost: each probe includes a
+        // `jj git fetch`, so on a slow remote four of them can outlast the
+        // caller's whole lease timeout. Stop at the deadline and let the
+        // caller provision instead — same trade as the health scan.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            timed_out = true;
+            break;
+        }
         scanned += 1;
-        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch) {
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch, deadline) {
             Ok(status) => status,
             Err(error) => {
                 eprintln!(
@@ -518,24 +565,39 @@ pub(super) fn reclaim_quarantined_workspace(
         available = available.len(),
         scanned = scanned,
         truncated = available.len() > scanned,
+        timed_out = timed_out,
         reclaimed = reclaimed.as_deref(),
     );
 
     Ok(reclaimed)
 }
 
-/// During pool GC, reset any non-leased free workspace that has been
+/// During pool GC, reclaim any non-leased free workspace that has been
 /// continuously `dirty`, `conflicted` or `quarantined` for longer than
-/// `max_age_secs`. Emits a `workspace.unhealthy_gc_reset` audit event for each
-/// workspace that is reclaimed so the discarded work is traceable.
-/// Returns the number of workspaces successfully recycled.
+/// `max_age_secs` — the retention TTL. Returns the number of workspaces
+/// successfully recycled.
 ///
-/// `quarantined` rows are handled differently from the other two: they are
-/// there because the dirty-reclaim guard refused to reset them, so age alone
-/// is never enough. The guard's probe is re-run first and the reset happens
-/// only if `@` holds nothing that would be left behind. Age still gates the
-/// attempt, giving an operator a window to inspect a fresh quarantine before
-/// cube touches it.
+/// ## Retention is bounded, and expiry is not destructive
+///
+/// A workspace released with unpushed work is withheld from the pool so the
+/// work stays reachable. That protection had no clock: nothing ever decided
+/// the work was no longer wanted, so "preserved" meant "forever", and the pool
+/// filled with permanently ineligible entries that every lease still paid to
+/// consider. This function is the clock.
+///
+/// Expiring retention must never mean losing work, so every candidate is
+/// probed before it is touched, and one that still holds work no remote has is
+/// **salvaged to a durable record first** (see [`crate::app`]'s salvage
+/// module: manifest, per-commit git-format patches, outside the workspace and
+/// outside the jj store). Only a successful salvage licenses the reset. A
+/// salvage that fails leaves the workspace retained and tries again next pass
+/// — a stuck workspace is a far smaller problem than a lost afternoon.
+///
+/// `quarantined` rows reach the same place by the same route. They exist
+/// because the dirty-reclaim guard refused a reset, so age alone was never
+/// enough to clear them; now age plus a successful salvage is. Age still gates
+/// the attempt either way, giving an operator a window to inspect a fresh
+/// quarantine before cube touches it.
 ///
 /// `deadline`, when set, is checked before starting work on each candidate;
 /// once passed, remaining candidates are left for the next pass rather than
@@ -566,29 +628,10 @@ pub(super) fn gc_aged_unhealthy_workspaces(
             eprintln!("cube: unhealthy gc: time budget exhausted, deferring remaining candidates to next pass");
             break;
         }
-        if record.state == WorkspaceState::Leased {
+        let Some(unhealthy_since) = aged_unhealthy_since(&record, threshold_epoch_s) else {
             continue;
-        }
-        let is_unhealthy = matches!(
-            record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
-        );
-        if !is_unhealthy {
-            continue;
-        }
-        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
-        // A quarantined row written before the timestamp was stamped on that
-        // path has no age to compare; treat it as old rather than stranding it
-        // forever — the probe below is what actually decides whether it is
-        // safe to touch. Dirty/conflicted rows keep the strict behaviour.
-        let unhealthy_since = match (record.unhealthy_since_epoch_s, is_quarantined) {
-            (Some(since), _) => since,
-            (None, true) => 0,
-            (None, false) => continue,
         };
-        if unhealthy_since > threshold_epoch_s {
-            continue;
-        }
+        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
         if !workspace_path_exists(&record) {
             continue;
         }
@@ -626,62 +669,130 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         let prior_health = record.health_status.map(|h| h.as_str()).unwrap_or("unknown");
         let age_secs = now_epoch_s.saturating_sub(unhealthy_since);
 
-        // Quarantine is only ever lifted against evidence: re-run the
-        // dirty-reclaim guard's probe and leave the workspace alone unless it
-        // now reports that nothing on `@` would be left behind.
-        if is_quarantined {
-            match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch) {
-                Ok(status) if status.is_reusable() => {
-                    audit!(
-                        database_path,
-                        "workspace.quarantine_cleared",
-                        repo = record.repo,
-                        workspace_id = record.workspace_id,
-                        source = "unhealthy_gc",
-                        reuse_reason = status.reuse_reason(),
-                        head_change_id = status.head_change_id(),
-                        head_parent_bookmarks = status.head_parent_bookmarks(),
-                        age_secs = age_secs,
-                    );
-                }
-                Ok(status) => {
+        // Look before touching anything. The probe fetches first, so the
+        // "does any remote already have this?" verdict is current rather than
+        // a stale local view — the same reason the release-time guard fetches.
+        //
+        // `deadline` is threaded all the way into the subprocess timeouts, not
+        // merely consulted before the candidate is picked: the fetch inside
+        // this probe is 120s per attempt with two retries behind it, so one
+        // slow remote could otherwise hold a lease for several minutes and
+        // blow both this pass's 20s budget and the engine's 90s lease timeout.
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch, deadline)
+        {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!(
+                    "cube: retention: {}: reuse probe failed, leaving retained: {e}",
+                    record.workspace_id,
+                );
+                audit!(
+                    database_path,
+                    "workspace.retention_probe_error",
+                    repo = record.repo,
+                    workspace_id = record.workspace_id,
+                    prior_health = prior_health,
+                    age_secs = age_secs,
+                    error = e.to_string(),
+                );
+                continue;
+            }
+        };
+
+        // Anything the workspace holds that no remote has gets salvaged before
+        // the reset. A failed salvage is a hard stop for this workspace: the
+        // whole basis for bounding retention is that expiry cannot lose work.
+        // "Failed" includes any capture that cannot be proven complete — an
+        // empty log after a probe that refused reuse, or a stack larger than
+        // the export cap — see `salvage_workspace`.
+        let mut salvaged_to: Option<PathBuf> = None;
+        if !status.is_reusable() {
+            match salvage_workspace(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
+                Ok(path) => {
+                    let path_str = path.display().to_string();
                     eprintln!(
-                        "cube: unhealthy gc: {} still holds unpushed work; leaving quarantined",
+                        "cube: retention: {} held unpushed work; salvaged to {path_str} before reclaiming",
                         record.workspace_id,
                     );
                     audit!(
                         database_path,
-                        "workspace.quarantine_reclaim_refused",
+                        "workspace.retention_salvaged",
                         repo = record.repo,
                         workspace_id = record.workspace_id,
-                        source = "unhealthy_gc",
+                        prior_health = prior_health,
+                        prior_holder = attributed_holder(&record),
+                        prior_task = attributed_task(&record),
+                        age_secs = age_secs,
                         head_change_id = status.head_change_id(),
-                        head_is_empty = status.head_is_empty(),
-                        head_parent_bookmarks = status.head_parent_bookmarks(),
                         unpushed_commits = status.unpushed_summary(),
+                        salvage_path = path_str,
                     );
-                    continue;
+                    salvaged_to = Some(path);
                 }
                 Err(e) => {
                     eprintln!(
-                        "cube: unhealthy gc: {}: quarantine probe failed: {e}",
+                        "cube: retention: {}: salvage failed, leaving retained rather than \
+                         reclaiming: {e}",
                         record.workspace_id,
                     );
                     audit!(
                         database_path,
-                        "workspace.quarantine_reclaim_error",
+                        "workspace.retention_salvage_failed",
                         repo = record.repo,
                         workspace_id = record.workspace_id,
-                        source = "unhealthy_gc",
+                        prior_health = prior_health,
+                        age_secs = age_secs,
+                        head_change_id = status.head_change_id(),
+                        unpushed_commits = status.unpushed_summary(),
                         error = e.to_string(),
                     );
                     continue;
                 }
             }
+        } else if is_quarantined {
+            audit!(
+                database_path,
+                "workspace.quarantine_cleared",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                source = "unhealthy_gc",
+                reuse_reason = status.reuse_reason(),
+                head_change_id = status.head_change_id(),
+                head_parent_bookmarks = status.head_parent_bookmarks(),
+                age_secs = age_secs,
+            );
         }
 
-        if let Err(e) = reset_workspace(runner, database_path, &record.workspace_path, &main_branch) {
-            eprintln!("cube: unhealthy gc: {}: reset failed: {e}", record.workspace_id,);
+        // `probe_workspace_reuse` already fetched, so finish the reset from
+        // there rather than paying a second network round trip per workspace
+        // in a time-budgeted pass. Bounded by the same deadline as everything
+        // else in this candidate's turn.
+        if let Err(e) = reset_workspace_after_fetch_within(
+            runner,
+            database_path,
+            &record.workspace_path,
+            &main_branch,
+            None,
+            deadline,
+        ) {
+            eprintln!("cube: retention: {}: reset failed: {e}", record.workspace_id,);
+            // The reclaim this salvage was taken for did not happen, so the
+            // live workspace is still the source of truth and still retained.
+            // Drop the copy: keeping it would have the next pass write a
+            // second one, and repeated reset failures would multiply full
+            // copies of the same stack until the salvage TTL.
+            if let Some(path) = &salvaged_to {
+                discard_salvage_record(path);
+                audit!(
+                    database_path,
+                    "workspace.retention_salvage_discarded",
+                    repo = record.repo,
+                    workspace_id = record.workspace_id,
+                    salvage_path = path.display().to_string(),
+                    reason = "reset_failed",
+                    error = e.to_string(),
+                );
+            }
             continue;
         }
 
@@ -703,21 +814,32 @@ pub(super) fn gc_aged_unhealthy_workspaces(
             }
         }
 
+        let salvaged_to = salvaged_to.map(|p| p.display().to_string());
         audit!(
             database_path,
             "workspace.unhealthy_gc_reset",
             workspace_id = record.workspace_id,
             repo = record.repo,
             prior_health = prior_health,
-            prior_holder = record.holder.as_deref(),
-            prior_task = record.task.as_deref(),
+            prior_holder = attributed_holder(&record),
+            prior_task = attributed_task(&record),
+            prior_release_reason = record.last_release_reason.as_deref(),
             unhealthy_since_epoch_s = unhealthy_since,
             age_secs = age_secs,
+            max_age_secs = max_age_secs,
+            salvage_path = salvaged_to.as_deref(),
         );
 
         eprintln!(
-            "cube: unhealthy gc: reset {} (was {} for {}s)",
-            record.workspace_id, prior_health, age_secs,
+            "cube: retention: reclaimed {} (retained {} for {}s, TTL {}s{})",
+            record.workspace_id,
+            prior_health,
+            age_secs,
+            max_age_secs,
+            salvaged_to
+                .as_deref()
+                .map(|p| format!("; salvaged to {p}"))
+                .unwrap_or_default(),
         );
         recycled += 1;
     }

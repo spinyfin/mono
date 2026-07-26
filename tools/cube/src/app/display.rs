@@ -23,7 +23,118 @@ pub(super) fn effective_state_display(record: &WorkspaceRecord) -> String {
     }
 }
 
-pub(super) fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
+/// Render a duration the way an operator reads a retention age: `3h`, `2.4d`.
+pub(super) fn format_age(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 90 * 60 {
+        format!("{}m", secs / 60)
+    } else if secs < 48 * 3600 {
+        format!("{:.1}h", secs as f64 / 3600.0)
+    } else {
+        format!("{:.1}d", secs as f64 / 86_400.0)
+    }
+}
+
+/// How much of the pool is being withheld, why, and for how long.
+///
+/// Retention going unbounded is what turned a healthy 173-workspace free pool
+/// into an effective free pool of 3 and took dispatch down with it. That is a
+/// condition an operator should be able to see coming from `cube workspace
+/// list`, so it is summarised inline rather than left to be reconstructed from
+/// the audit log after the fact.
+#[derive(Debug, Default, Clone, serde::Serialize, bon::Builder)]
+#[builder(on(String, into))]
+pub(super) struct RetentionSummary {
+    /// Free workspaces withheld from leasing because they are unhealthy.
+    pub(super) retained: usize,
+    /// Of those, the ones held specifically because they carry unpushed work.
+    pub(super) unpushed_work_preserved: usize,
+    /// Of those, the ones the dirty-reclaim guard quarantined.
+    pub(super) quarantined: usize,
+    /// Retained longer than the configured TTL — awaiting the next GC pass.
+    pub(super) past_ttl: usize,
+    /// Age of the oldest retained workspace, in seconds.
+    pub(super) oldest_retained_secs: i64,
+    /// Free workspaces that are actually available to lease right now.
+    pub(super) effective_free: usize,
+    pub(super) ttl_secs: i64,
+}
+
+pub(super) fn retention_summary(records: &[WorkspaceRecord], now_epoch_s: i64, ttl_secs: i64) -> RetentionSummary {
+    let mut summary = RetentionSummary {
+        ttl_secs,
+        ..Default::default()
+    };
+    for record in records {
+        if record.state != WorkspaceState::Free {
+            continue;
+        }
+        match record.health_status {
+            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined) => {}
+            _ => {
+                summary.effective_free += 1;
+                continue;
+            }
+        }
+        summary.retained += 1;
+        if record.health_status == Some(WorkspaceHealth::Quarantined) {
+            summary.quarantined += 1;
+        }
+        if record.last_release_reason.as_deref() == Some("unpushed_work_preserved") {
+            summary.unpushed_work_preserved += 1;
+        }
+        if let Some(since) = record.unhealthy_since_epoch_s {
+            let age = now_epoch_s.saturating_sub(since);
+            summary.oldest_retained_secs = summary.oldest_retained_secs.max(age);
+            if age >= ttl_secs {
+                summary.past_ttl += 1;
+            }
+        }
+    }
+    summary
+}
+
+/// The trailing block `cube workspace list` prints under the rows. Returns
+/// `None` when nothing is being withheld — there is no condition to report.
+pub(super) fn format_retention_summary(summary: &RetentionSummary) -> Option<String> {
+    if summary.retained == 0 {
+        return None;
+    }
+    let dim = Style::new().dim();
+    let mut reasons = Vec::new();
+    if summary.unpushed_work_preserved > 0 {
+        reasons.push(format!("{} holding unpushed work", summary.unpushed_work_preserved));
+    }
+    if summary.quarantined > 0 {
+        reasons.push(format!("{} quarantined", summary.quarantined));
+    }
+    let reason_text = if reasons.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", reasons.join(", "))
+    };
+    let headline = format!(
+        "Retention: {} workspace(s) withheld{}, oldest {}; {} free to lease.",
+        summary.retained,
+        reason_text,
+        format_age(summary.oldest_retained_secs),
+        summary.effective_free,
+    );
+    let ttl_line = format!(
+        "           TTL {}; {} past it, awaiting the next gc pass. \
+         Reclaimed work is salvaged first — see `cube workspace salvage`.",
+        format_age(summary.ttl_secs),
+        summary.past_ttl,
+    );
+    let headline = if summary.effective_free == 0 {
+        style(headline).red().bold().to_string()
+    } else {
+        style(headline).yellow().to_string()
+    };
+    Some(format!("\n{headline}\n{}", dim.apply_to(ttl_line)))
+}
+
+pub(super) fn format_workspace_list(records: &[WorkspaceRecord], now_epoch_s: i64) -> String {
     if records.is_empty() {
         return "No workspaces match.".to_string();
     }
@@ -57,6 +168,22 @@ pub(super) fn format_workspace_list(records: &[WorkspaceRecord]) -> String {
             state_styled,
             dim.apply_to(path),
         ));
+
+        // Why a free workspace is being withheld, and for how long. Without
+        // this the operator sees `free-dirty` and has no way to tell a
+        // workspace released ten minutes ago from one that has been out of the
+        // pool for days.
+        if record.state == WorkspaceState::Free
+            && let Some(since) = record.unhealthy_since_epoch_s
+        {
+            let reason = record.last_release_reason.as_deref().unwrap_or("unhealthy");
+            lines.push(format!(
+                "    {}  {} for {}",
+                dim.apply_to(format!("{:<label_w$}", "retained")),
+                reason,
+                format_age(now_epoch_s.saturating_sub(since)),
+            ));
+        }
 
         if record.state == WorkspaceState::Leased {
             if let Some(holder) = &record.holder {

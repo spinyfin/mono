@@ -128,6 +128,21 @@ pub struct WorkspaceRecord {
     /// or released clean. A dirty→conflicted (or vice-versa) transition while
     /// continuously unhealthy does NOT reset this clock.
     pub unhealthy_since_epoch_s: Option<i64>,
+    /// The `holder` this workspace had when its last lease ended, snapshotted
+    /// on the release / quarantine / TTL-expiry paths just before `holder` is
+    /// nulled.
+    ///
+    /// `holder` and `task` describe the *current* lease and must be cleared
+    /// when there is none — otherwise `cube workspace list` would show a free
+    /// workspace as held. But retention GC runs long after the release, and by
+    /// then the live columns are always `NULL`, so the salvage manifest's
+    /// "whose work is this?" fields (and the `prior_holder` / `prior_task`
+    /// audit fields on the same path) were reliably empty in practice. These
+    /// two columns keep the breadcrumb without lying about the lease state.
+    pub last_holder: Option<String>,
+    /// The `task` this workspace had when its last lease ended. See
+    /// [`WorkspaceRecord::last_holder`].
+    pub last_task: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

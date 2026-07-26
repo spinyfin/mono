@@ -2,6 +2,7 @@
 //! hands a worker a ready-to-use workspace and takes it back afterwards.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use serde_json::json;
@@ -15,7 +16,10 @@ use crate::setup::StepStatus;
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config};
 
-use crate::app::display::{effective_state_display, format_workspace_list, human_workspace_detail};
+use crate::app::display::{
+    effective_state_display, format_age, format_retention_summary, format_workspace_list, human_workspace_detail,
+    retention_summary,
+};
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::excludes::ensure_boss_infra_excluded;
 use crate::app::gc::{
@@ -36,6 +40,7 @@ use crate::app::reset::{
     PRESERVED_UNPUSHED_RELEASE_REASON, PreservedWorkingCopy, ReleaseResetOutcome, reset_workspace_guarded,
     reset_workspace_on_release,
 };
+use crate::app::salvage::list_salvage_records;
 use crate::app::util::{current_epoch_s, holder_identity, repo_lock_path, resolve_release_lease};
 use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase};
 
@@ -66,6 +71,114 @@ const DEFAULT_LEASE_TTL_SECS: i64 = 24 * 60 * 60;
 /// is quarantined instead of the lease call hard-failing. See
 /// [`crate::metadata::WorkspaceHealth::Quarantined`].
 pub(super) const DIRTY_RECLAIM_QUARANTINE_REASON: &str = "dirty_reclaim_quarantined";
+
+/// Hard cap on live `jj status` probes performed by one lease's pre-claim
+/// health scan, across both candidate categories.
+///
+/// The scan needs exactly one hit — the first clean workspace ends it — so
+/// running it to exhaustion was pure waste. Before this cap, a repo whose free
+/// pool had gone all-dirty spent ~17s per lease serially re-probing every free
+/// workspace (measured: 106 probes at 2.1–10.0/s depending on host load, 100%
+/// of them skipped for `dirty_working_copy`) and then provisioned a fresh
+/// workspace anyway. Dispatch timed out at the caller's 30s bound while cube
+/// was still walking a list whose answer it had already written to SQLite.
+///
+/// Eight is deliberately small: a workspace that fails its probe has just had
+/// its cached health corrected in the registry, so the next lease's candidate
+/// set is smaller. Stopping early and provisioning costs ~6s and always
+/// succeeds; scanning further is a gamble on the Nth entry being clean when
+/// N-1 were not.
+const LEASE_HEALTH_SCAN_MAX_PROBES: usize = 8;
+
+/// How many of [`LEASE_HEALTH_SCAN_MAX_PROBES`] one lease may spend
+/// re-validating workspaces the registry *already* records as unhealthy.
+///
+/// This is the staleness policy for the cached `health_status`. Cached
+/// verdicts are trusted by default — that is the whole point — but a
+/// workspace an operator cleaned out of band should not be withheld longer
+/// than necessary, so a lease that walks past its effective-free candidates
+/// without finding one usable spends its remaining probe budget re-checking a
+/// small rotating window of the cached-unhealthy set (cursor persisted in
+/// `pool_metadata`, see [`STALE_HEALTH_CURSOR_KEY_PREFIX`]).
+///
+/// ## What this does and does not guarantee
+///
+/// Lease revalidation is **opportunistic, not a coverage guarantee.** The scan
+/// stops at the first clean workspace it finds, and effective-free candidates
+/// are probed before this window, so in a healthy pool a lease returns before
+/// the window is ever reached — no revalidation happens at all, by design:
+/// paying for it would re-add exactly the per-lease cost this scan exists to
+/// remove. The cursor advances only across entries a lease actually probed
+/// (see [`stale_revalidation_window`] and its caller), so the rotation never
+/// skips an entry it did not look at; what it does not promise is that any
+/// particular lease reaches the window.
+///
+/// Revalidation therefore kicks in exactly when it matters — when the
+/// effective-free set is empty or all-dirty and the pool is under pressure —
+/// and the reliable recovery paths are the other three: the pool GC's
+/// `reconcile_free_workspace_health` pass promotes recovered workspaces
+/// wholesale, `cube workspace reconcile` does it on demand, and `--prefer`
+/// always probes its named target regardless of this window. Do not read lease
+/// traffic alone as healing stale dirty cache.
+const STALE_HEALTH_REVALIDATE_PER_LEASE: usize = 3;
+
+/// Wall-clock budget for the whole pre-claim health scan. Belt to
+/// [`LEASE_HEALTH_SCAN_MAX_PROBES`]'s braces: probe *count* is a poor proxy
+/// for probe *cost* on a loaded host (the same 106-workspace scan took 46s at
+/// one point and 182s at another), so the scan also stops at a deadline and
+/// provisions instead.
+const LEASE_HEALTH_SCAN_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for the quarantine-reclaim scan that runs after the
+/// health scan when nothing usable was found. Its probes each include a
+/// `jj git fetch`, so it is bounded in time as well as in probe count.
+const QUARANTINE_RECLAIM_BUDGET: Duration = Duration::from_secs(5);
+
+/// `pool_metadata` key prefix for the per-repo cursor that rotates which
+/// cached-unhealthy workspaces get re-probed. Persisting it (rather than, say,
+/// randomising) is what makes the rotation cover the whole set instead of
+/// re-checking whichever entries a random draw happens to favour.
+const STALE_HEALTH_CURSOR_KEY_PREFIX: &str = "stale_health_cursor:";
+
+pub(super) fn stale_health_cursor_key(repo: &str) -> String {
+    format!("{STALE_HEALTH_CURSOR_KEY_PREFIX}{repo}")
+}
+
+/// Pick the rotating slice of `cached_unhealthy` this lease *may* re-probe,
+/// starting at `cursor`.
+///
+/// Returns indices only. Deliberately does NOT return a next-cursor value:
+/// the cursor is advanced by [`advanced_stale_cursor`] afterwards, using the
+/// number of these entries the scan actually reached. Computing it here is
+/// what produced the original bug — the cursor was persisted up front, off the
+/// *planned* window, and the scan then usually exited at the first clean
+/// effective-free candidate without probing any of them. Three entries were
+/// skipped per lease while the audit trail and the comments claimed they had
+/// been revalidated, so a workspace cleaned out of band could stay cached
+/// dirty indefinitely.
+pub(super) fn stale_revalidation_window(len: usize, cursor: i64, per_lease: usize) -> Vec<usize> {
+    if len == 0 || per_lease == 0 {
+        return Vec::new();
+    }
+    let start = cursor.rem_euclid(len as i64) as usize;
+    let take = per_lease.min(len);
+    (0..take).map(|offset| (start + offset) % len).collect()
+}
+
+/// Where the rotation cursor lands after a lease probed `probed` entries of
+/// the window that started at `cursor`.
+///
+/// `probed` is the count of window entries the scan genuinely reached, which
+/// is what makes the rotation honest: a lease that probed none leaves the
+/// cursor where it was, and the next lease re-offers the same entries rather
+/// than the set being silently skipped past.
+pub(super) fn advanced_stale_cursor(len: usize, cursor: i64, probed: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let start = cursor.rem_euclid(len as i64) as usize;
+    ((start + probed) % len) as i64
+}
 
 pub(super) fn run_workspace(
     command: WorkspaceCommand,
@@ -313,8 +426,9 @@ pub(super) fn run_workspace(
                 );
             }
 
-            // ── Health-check phase ──────────────────────────────────────────
-            // Before claiming any workspace, inspect each free candidate:
+            // ── Health-scan phase ───────────────────────────────────────────
+            // Before claiming any workspace, inspect a *bounded* set of free
+            // candidates:
             //   - Clean → use immediately (update DB if stale-dirty)
             //   - ConflictedBookmarks → save as first repairable candidate
             //     (keep looking for a clean one; repair before claim)
@@ -324,11 +438,38 @@ pub(super) fn run_workspace(
             // The repo lock is held throughout, so no concurrent lease can
             // steal a workspace between the health check and the claim.
             //
-            // Stale health reconciliation: workspaces previously marked
-            // dirty/conflicted in the DB are included as secondary candidates
-            // (after effective-free ones). If on-disk `jj status` shows they
-            // are now clean, the DB is updated and they are used. This prevents
-            // stale DB health from permanently hiding a recovered workspace.
+            // ## Why this is bounded, and what "bounded" means here
+            //
+            // The registry already records each free workspace's health in
+            // SQLite (`health_status`, plus `unhealthy_since_epoch_s`). This
+            // scan used to ignore that and re-derive it from the filesystem
+            // for *every* free workspace on *every* lease — an O(free pool)
+            // serial walk of `jj status` calls whose answer was already
+            // committed. On a pool whose free workspaces had all gone dirty
+            // that cost ~17s per lease and produced 18,374
+            // `workspace.health_check_skipped reason=dirty_working_copy`
+            // events against 259 leases: every single probe re-confirmed a
+            // fact the DB held, and the lease provisioned a fresh workspace at
+            // the end regardless.
+            //
+            // So: the cached verdict is authoritative, and the scan is bounded
+            // three ways —
+            //   1. Workspaces cached as unhealthy are NOT probed, except for a
+            //      small rotating revalidation window (see
+            //      [`STALE_HEALTH_REVALIDATE_PER_LEASE`]) that a lease reaches
+            //      only after its effective-free candidates come up empty.
+            //      That window is opportunistic; pool GC's reconcile pass is
+            //      what reliably un-sticks a cleaned-out-of-band workspace.
+            //   2. At most [`LEASE_HEALTH_SCAN_MAX_PROBES`] live probes run.
+            //   3. The whole scan stops at [`LEASE_HEALTH_SCAN_BUDGET`].
+            // Hitting any bound is not a failure: provisioning is the designed
+            // fallback and always succeeds for a reachable repo.
+            //
+            // Retention itself (why the cached-unhealthy set grows without
+            // limit in the first place) is bounded separately by the pool GC's
+            // aged-unhealthy reclaim, not here.
+            let scan_started = Instant::now();
+            let scan_deadline = scan_started + LEASE_HEALTH_SCAN_BUDGET;
 
             let effective_free = store.list_workspaces_filtered(&WorkspaceListFilter {
                 repo: Some(&repo),
@@ -336,11 +477,11 @@ pub(super) fn run_workspace(
                 ..Default::default()
             })?;
 
-            // Secondary candidates: free workspaces whose cached health in the
-            // DB is dirty or conflicted. Checked only after all effective-free
-            // candidates fail, so we avoid running `jj status` on them when a
-            // clean workspace is already available.
-            let stale_unhealthy: Vec<WorkspaceRecord> = {
+            // Free workspaces whose cached health in the DB is dirty or
+            // conflicted. These are NOT scanned wholesale any more; only the
+            // rotating revalidation window below (and an explicit `--prefer`)
+            // reaches them.
+            let cached_unhealthy: Vec<WorkspaceRecord> = {
                 let mut d = store.list_workspaces_filtered(&WorkspaceListFilter {
                     repo: Some(&repo),
                     effective_state: Some(EffectiveState::FreeDirty),
@@ -356,39 +497,69 @@ pub(super) fn run_workspace(
                 d
             };
 
-            // All free candidates: effective-free first (preferred), then
-            // stale-unhealthy. This combined list is used for the ordered_ids
-            // below so --prefer can reference either category.
-            let all_free: Vec<&WorkspaceRecord> = effective_free.iter().chain(stale_unhealthy.iter()).collect();
+            // Rotate the revalidation window across leases so the
+            // cached-unhealthy set is covered evenly rather than the same few
+            // entries being re-probed. The cursor is persisted per repo; a
+            // failure to read or write it degrades to "start from the top",
+            // never to a longer scan.
+            //
+            // It is advanced AFTER the scan, by the number of these entries
+            // the scan actually probed — see `advanced_stale_cursor`. The scan
+            // below orders effective-free candidates first and breaks at the
+            // first clean one, so a lease frequently returns without reaching
+            // this window at all; advancing up front (as this did originally)
+            // silently skipped those entries and left an out-of-band-cleaned
+            // workspace cached dirty indefinitely.
+            let cursor_key = stale_health_cursor_key(&repo);
+            let cursor = store.get_pool_metadata_i(&cursor_key).unwrap_or(None).unwrap_or(0);
+            let revalidate_idx =
+                stale_revalidation_window(cached_unhealthy.len(), cursor, STALE_HEALTH_REVALIDATE_PER_LEASE);
+            let revalidate: Vec<&WorkspaceRecord> = revalidate_idx.iter().map(|i| &cached_unhealthy[*i]).collect();
+            // Which ids belong to the window, so the post-scan cursor advance
+            // counts only those — a `--prefer` that happens to name a
+            // cached-unhealthy workspace outside the window is an explicit
+            // request, not a rotation step, and must not move the cursor.
+            let revalidate_ids: std::collections::HashSet<&str> =
+                revalidate.iter().map(|w| w.workspace_id.as_str()).collect();
 
-            // Ordering: try the --prefer workspace first; effective-free before
-            // stale-dirty so we skip the stale-dirty jj-status cost when a clean
-            // candidate is already available.
+            // All free candidates, used only so `--prefer` can name a
+            // cached-unhealthy workspace outside the revalidation window.
+            let all_free: Vec<&WorkspaceRecord> = effective_free.iter().chain(cached_unhealthy.iter()).collect();
+
+            // Ordering: the --prefer workspace first (from either category —
+            // an explicit request always earns its probe), then effective-free
+            // candidates, then this lease's revalidation window.
             // Workspaces listed in --exclude are skipped entirely so the engine
             // can avoid re-offering a workspace it just refused (e.g. occupancy
             // guard) without looping forever on the same candidate.
-            let ordered_ids: Vec<String> = {
-                let mut v = Vec::new();
+            let ordered: Vec<&WorkspaceRecord> = {
+                let mut queue: Vec<&WorkspaceRecord> = Vec::new();
                 if let Some(pref) = prefer.as_deref()
-                    && all_free.iter().any(|w| w.workspace_id == pref)
-                    && !exclude.contains(&pref.to_string())
+                    && let Some(w) = all_free.iter().find(|w| w.workspace_id == pref)
                 {
-                    v.push(pref.to_string());
+                    queue.push(w);
                 }
-                for w in &effective_free {
-                    if !v.contains(&w.workspace_id) && !exclude.contains(&w.workspace_id) {
-                        v.push(w.workspace_id.clone());
-                    }
-                }
-                for w in &stale_unhealthy {
-                    if !v.contains(&w.workspace_id) && !exclude.contains(&w.workspace_id) {
-                        v.push(w.workspace_id.clone());
+                queue.extend(effective_free.iter());
+                queue.extend(revalidate.iter().copied());
+
+                let mut v: Vec<&WorkspaceRecord> = Vec::new();
+                for w in queue {
+                    if !v.iter().any(|e| e.workspace_id == w.workspace_id) && !exclude.contains(&w.workspace_id) {
+                        v.push(w);
                     }
                 }
                 v
             };
 
             let mut health_checks: Vec<serde_json::Value> = Vec::new();
+            // Live probes actually performed, and how the scan ended.
+            let mut probes = 0usize;
+            let mut revalidations = 0usize;
+            // Of those, the ones drawn from this lease's rotation window —
+            // the only ones that may advance the persisted cursor.
+            let mut window_revalidations = 0usize;
+            let mut promoted_to_clean = 0usize;
+            let mut scan_truncated: Option<&'static str> = None;
             // first clean workspace found
             let mut clean_candidate: Option<String> = None;
             // first conflicted-but-repairable workspace found
@@ -399,11 +570,16 @@ pub(super) fn run_workspace(
             // freed slot rather than surfacing a "broken-empty" failure.
             let mut broken_empty: Vec<(String, PathBuf)> = Vec::new();
 
-            for ws_id in &ordered_ids {
-                let ws = all_free
-                    .iter()
-                    .find(|w| w.workspace_id == *ws_id)
-                    .expect("ordered_ids built from all_free");
+            for ws in &ordered {
+                let ws_id = &ws.workspace_id;
+                if probes >= LEASE_HEALTH_SCAN_MAX_PROBES {
+                    scan_truncated = Some("max_probes");
+                    break;
+                }
+                if Instant::now() >= scan_deadline {
+                    scan_truncated = Some("time_budget");
+                    break;
+                }
 
                 if !workspace_path_exists(ws) {
                     // Will be reconciled; skip for health-check purposes.
@@ -413,6 +589,17 @@ pub(super) fn run_workspace(
                         "reason": "directory_missing",
                     }));
                     continue;
+                }
+
+                probes += 1;
+                if matches!(
+                    ws.health_status,
+                    Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
+                ) {
+                    revalidations += 1;
+                    if revalidate_ids.contains(ws_id.as_str()) {
+                        window_revalidations += 1;
+                    }
                 }
 
                 // Any error from check_workspace_health skips this workspace
@@ -455,6 +642,7 @@ pub(super) fn run_workspace(
                         // DB (stale dirty/conflicted), update the DB so
                         // subsequent `list` and GC passes see the correct state.
                         if was_stale_dirty {
+                            promoted_to_clean += 1;
                             store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Clean)?;
                             audit!(
                                 database_path,
@@ -501,6 +689,7 @@ pub(super) fn run_workspace(
                                             "was_stale_dirty": was_stale_dirty,
                                         }));
                                         if was_stale_dirty {
+                                            promoted_to_clean += 1;
                                             store.update_workspace_health(&repo, ws_id, WorkspaceHealth::Clean)?;
                                             audit!(
                                                 database_path,
@@ -632,6 +821,63 @@ pub(super) fn run_workspace(
                 }
             }
 
+            // Advance the rotation cursor by what this lease genuinely
+            // revalidated, now that the scan is over and that number is known.
+            // A lease that never reached the window leaves the cursor where it
+            // was, so the next lease re-offers the same entries instead of the
+            // set being skipped past unprobed.
+            if window_revalidations > 0 {
+                let next_cursor = advanced_stale_cursor(cached_unhealthy.len(), cursor, window_revalidations);
+                if let Err(e) = store.set_pool_metadata_i(&cursor_key, next_cursor) {
+                    eprintln!("warning: cube could not persist the health revalidation cursor for `{repo}`: {e}");
+                }
+            }
+
+            // One aggregate event for the whole scan, instead of one per
+            // candidate. The per-candidate `workspace.health_check_skipped`
+            // events above still fire for workspaces this lease actually
+            // probed — they are now bounded to LEASE_HEALTH_SCAN_MAX_PROBES
+            // per lease rather than one per free workspace, which is what
+            // turned the audit log into 18k rows of the same fact.
+            let scan_elapsed_ms = scan_started.elapsed().as_millis() as u64;
+            let scan_outcome = if clean_candidate.is_some() {
+                "clean"
+            } else if conflicted_candidate.is_some() {
+                "conflicted_repairable"
+            } else {
+                "none"
+            };
+            audit!(
+                database_path,
+                "workspace.health_scan",
+                repo = repo,
+                effective_free = effective_free.len(),
+                cached_unhealthy = cached_unhealthy.len(),
+                trusted_cache_skips = cached_unhealthy.len().saturating_sub(revalidations),
+                probed = probes,
+                revalidated = revalidations,
+                revalidation_window = revalidate_idx.len(),
+                window_revalidated = window_revalidations,
+                promoted_to_clean = promoted_to_clean,
+                truncated = scan_truncated,
+                elapsed_ms = scan_elapsed_ms,
+                outcome = scan_outcome,
+            );
+            let scan_summary = json!({
+                "effective_free": effective_free.len(),
+                "cached_unhealthy": cached_unhealthy.len(),
+                "trusted_cache_skips": cached_unhealthy.len().saturating_sub(revalidations),
+                "probed": probes,
+                "max_probes": LEASE_HEALTH_SCAN_MAX_PROBES,
+                "revalidated": revalidations,
+                "revalidation_window": revalidate_idx.len(),
+                "window_revalidated": window_revalidations,
+                "promoted_to_clean": promoted_to_clean,
+                "truncated": scan_truncated,
+                "elapsed_ms": scan_elapsed_ms,
+                "outcome": scan_outcome,
+            });
+
             // Decide which workspace to use: prefer clean, fall back to the
             // first repairable conflicted workspace, then to a quarantined one
             // that can be verifiably reclaimed, otherwise auto-create a fresh
@@ -653,6 +899,7 @@ pub(super) fn run_workspace(
                     &repo,
                     &repo_record.main_branch,
                     &exclude,
+                    Some(Instant::now() + QUARANTINE_RECLAIM_BUDGET),
                 ) {
                     Ok(Some(reclaimed_id)) => {
                         health_checks.push(json!({
@@ -965,6 +1212,7 @@ pub(super) fn run_workspace(
                 "workspace": workspace,
                 "setup": setup_report,
                 "health_check": health_checks,
+                "health_scan": scan_summary,
             });
             RunResult::new(message, payload)
         }
@@ -1327,8 +1575,8 @@ pub(super) fn run_workspace(
             // we materialize the listing — otherwise `list` would surface
             // a row that the next `lease` is going to fail on. Scope the
             // reconcile to the same repo filter the user asked for.
-            let reconciled =
-                reconcile_missing_workspaces(&mut store, database_path, repo.as_deref(), current_epoch_s()?)?;
+            let now = current_epoch_s()?;
+            let reconciled = reconcile_missing_workspaces(&mut store, database_path, repo.as_deref(), now)?;
             let filter = WorkspaceListFilter {
                 repo: repo.as_deref(),
                 effective_state: parsed_effective_state,
@@ -1336,12 +1584,70 @@ pub(super) fn run_workspace(
                 ..Default::default()
             };
             let records = store.list_workspaces_filtered(&filter)?;
-            let message = format_workspace_list(&records);
+
+            // Retention is summarised over the *unfiltered* pool for the repos
+            // in scope. "How much of the pool is being withheld" is not a
+            // question a `--state leased` filter should be able to answer with
+            // zero — the whole point is that it stays visible.
+            let retention_source = if parsed_effective_state.is_some() || holder.is_some() {
+                store.list_workspaces_filtered(&WorkspaceListFilter {
+                    repo: repo.as_deref(),
+                    ..Default::default()
+                })?
+            } else {
+                records.clone()
+            };
+            let ttl_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
+            let retention = retention_summary(&retention_source, now, ttl_secs);
+
+            let mut message = format_workspace_list(&records, now);
+            if let Some(block) = format_retention_summary(&retention) {
+                message.push_str(&block);
+            }
             RunResult::new(
                 message,
                 json!({
                     "workspaces": records,
                     "reconciled": reconciled,
+                    "retention": retention,
+                }),
+            )
+        }
+        WorkspaceCommand::Salvage { repo, workspace } => {
+            let records = list_salvage_records(database_path, repo.as_deref(), workspace.as_deref())?;
+            let now = current_epoch_s()?;
+            let message = if records.is_empty() {
+                "No salvaged work.".to_string()
+            } else {
+                let mut lines = Vec::with_capacity(records.len() * 2 + 2);
+                for record in &records {
+                    lines.push(format!(
+                        "{}  ({} ago)",
+                        record.manifest.summary_line(),
+                        format_age(now.saturating_sub(record.manifest.salvaged_at_epoch_s)),
+                    ));
+                    lines.push(format!(
+                        "    {} commit(s) at {}",
+                        record.manifest.commits.len(),
+                        record.path.display(),
+                    ));
+                }
+                lines.push(String::new());
+                lines.push(
+                    "Apply a record's patches/ in order with `git apply` in any checkout of the repo.".to_string(),
+                );
+                lines.join("\n")
+            };
+            RunResult::new(
+                message,
+                json!({
+                    "salvage": records
+                        .iter()
+                        .map(|r| json!({
+                            "path": r.path.display().to_string(),
+                            "manifest": r.manifest,
+                        }))
+                        .collect::<Vec<_>>(),
                 }),
             )
         }

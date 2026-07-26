@@ -115,6 +115,7 @@ fn workspace_lease_surfaces_stale_recovery_failure() {
                 stderr: "Error: workspace operation failed".to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
     ]);
 
@@ -250,6 +251,7 @@ fn workspace_lease_skips_op_diverged_unrecoverable_and_provisions_new() {
                 stderr: "Error: workspace operation failed".to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         // Fallback: auto-provision a fresh workspace and reset it.
         ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
@@ -325,6 +327,7 @@ fn workspace_lease_health_check_stale_op_signature_recovered_and_leased() {
                     .to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         // Recovery: update-stale succeeds.
         ExpectedCommand::ok(
@@ -421,6 +424,7 @@ fn workspace_lease_health_check_stale_status_unrecoverable_falls_through_to_new_
                     .to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         // Recovery attempt: update-stale fails.
         ExpectedCommand {
@@ -434,6 +438,7 @@ fn workspace_lease_health_check_stale_status_unrecoverable_falls_through_to_new_
                 stderr: "Error: workspace operation failed".to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         // Fallback: auto-provision a fresh workspace and reset it.
         ExpectedCommand::workspace_add_mono(&workspace_root, &staging),

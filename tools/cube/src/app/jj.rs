@@ -2,7 +2,7 @@
 //! recovery, and the small query helpers built on top.
 
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
@@ -142,6 +142,36 @@ pub(super) fn is_retryable_network_error(err: &CubeError) -> bool {
     }
 }
 
+/// How long a subprocess started *right now* may run, given a caller's
+/// wall-clock `deadline` and the operation's own `default` per-attempt bound:
+/// the smaller of the two. `None` means the deadline has already passed and no
+/// new subprocess should be started at all.
+///
+/// This is what makes a caller's time budget mean something. Probe *count* was
+/// never a bound on probe *cost*: one `jj git fetch` against a slow remote is
+/// [`DEFAULT_NETWORK_CMD_TIMEOUT_SECS`] (120s) per attempt with
+/// [`NETWORK_CMD_RETRIES`] retries behind it, so a single candidate could
+/// outlast a 20-second GC budget — and the engine's 90-second lease timeout —
+/// several times over while the pass believed itself bounded.
+pub(super) fn budgeted_timeout(deadline: Option<Instant>, default: Duration) -> Option<Duration> {
+    let Some(deadline) = deadline else {
+        return Some(default);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(default.min(remaining))
+    }
+}
+
+fn deadline_exceeded(invocation: &CommandInvocation) -> CubeError {
+    CubeError::DeadlineExceeded {
+        program: invocation.program.clone(),
+        args: invocation.args.clone(),
+    }
+}
+
 /// [`run_jj`] for a network operation (e.g. `jj git fetch`): the same
 /// recovery behaviour, plus a bounded retry on a timeout or transient
 /// network failure. A non-transient failure (auth, conflict, bad revset)
@@ -153,11 +183,29 @@ pub(super) fn run_jj_network(
     database_path: Option<&Path>,
     invocation: &CommandInvocation,
 ) -> Result<String> {
+    run_jj_network_within(runner, database_path, invocation, None)
+}
+
+/// [`run_jj_network`] under a caller's wall-clock `deadline`: every attempt is
+/// bounded by whatever the deadline has left (never more than
+/// [`network_cmd_timeout`]), and no retry is started once it has passed.
+pub(super) fn run_jj_network_within(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    invocation: &CommandInvocation,
+    deadline: Option<Instant>,
+) -> Result<String> {
     let mut attempt: u32 = 0;
     loop {
-        match run_jj(runner, database_path, invocation) {
+        match run_jj_within(runner, database_path, invocation, deadline) {
             Ok(out) => return Ok(out),
-            Err(err) if attempt < NETWORK_CMD_RETRIES && is_retryable_network_error(&err) => {
+            // A retry that cannot fit inside the caller's remaining budget is
+            // not a retry, it is an overrun: surface the failure instead.
+            Err(err)
+                if attempt < NETWORK_CMD_RETRIES
+                    && is_retryable_network_error(&err)
+                    && budgeted_timeout(deadline, network_cmd_timeout()).is_some() =>
+            {
                 attempt += 1;
                 eprintln!(
                     "cube: network command `{} {}` failed transiently (attempt {attempt}/{NETWORK_CMD_RETRIES}); retrying: {err}",
@@ -200,7 +248,22 @@ pub(super) fn run_jj(
     database_path: Option<&Path>,
     invocation: &CommandInvocation,
 ) -> Result<String> {
-    let timeout = network_cmd_timeout();
+    run_jj_within(runner, database_path, invocation, None)
+}
+
+/// [`run_jj`] under a caller's wall-clock `deadline`. Every subprocess this
+/// spawns — the invocation itself and each recovery retry — is bounded by
+/// whatever the deadline has left, and a deadline that has already passed
+/// yields [`CubeError::DeadlineExceeded`] without spawning anything.
+pub(super) fn run_jj_within(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    invocation: &CommandInvocation,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let Some(timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+        return Err(deadline_exceeded(invocation));
+    };
     match runner.run_with_timeout(invocation, timeout) {
         Ok(out) => Ok(out),
         Err(err) => {
@@ -221,7 +284,10 @@ pub(super) fn run_jj(
                     program = invocation.program,
                     args = invocation.args,
                 );
-                return match runner.run_with_timeout(invocation, timeout) {
+                let Some(retry_timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+                    return Err(err);
+                };
+                return match runner.run_with_timeout(invocation, retry_timeout) {
                     Ok(out) => Ok(out),
                     Err(_) => Err(err),
                 };
@@ -263,7 +329,10 @@ pub(super) fn run_jj(
                 program = invocation.program,
                 args = invocation.args,
             );
-            match runner.run_with_timeout(invocation, timeout) {
+            let Some(retry_timeout) = budgeted_timeout(deadline, network_cmd_timeout()) else {
+                return Err(deadline_exceeded(invocation));
+            };
+            match runner.run_with_timeout(invocation, retry_timeout) {
                 Ok(out) => Ok(out),
                 Err(retry_err) => Err(CubeError::StaleRecoveryFailed {
                     workspace_path: invocation.cwd.clone(),

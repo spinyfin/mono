@@ -2,13 +2,15 @@
 //! stale working copies, and the reuse verdict for its `@`.
 
 use std::path::Path;
+use std::time::Instant;
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::{audit, reuse_guard};
 
 use crate::app::errors::Result;
 use crate::app::jj::{
-    jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj, run_jj_network,
+    jj_needs_colocate_init, jj_update_stale_recovery_kind, network_cmd_timeout, run_jj, run_jj_network_within,
+    run_jj_within,
 };
 
 /// Outcome of a pre-lease health check on a free workspace.
@@ -269,7 +271,19 @@ pub(super) fn read_head_status(
     workspace_path: &Path,
     main_branch: &str,
 ) -> Result<HeadStatus> {
-    let output = run_jj(
+    read_head_status_within(runner, database_path, workspace_path, main_branch, None)
+}
+
+/// [`read_head_status`] under a caller's wall-clock `deadline`; every `jj`
+/// invocation it makes is bounded by whatever the deadline has left.
+pub(super) fn read_head_status_within(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    workspace_path: &Path,
+    main_branch: &str,
+    deadline: Option<Instant>,
+) -> Result<HeadStatus> {
+    let output = run_jj_within(
         runner,
         database_path,
         &RealCommandRunner::invocation(
@@ -277,6 +291,7 @@ pub(super) fn read_head_status(
             "jj",
             &["log", "--no-graph", "-r", "@", "-T", reuse_guard::HEAD_STATUS_TEMPLATE],
         ),
+        deadline,
     )?;
     let head = reuse_guard::parse_head_status(&output, main_branch);
 
@@ -284,7 +299,7 @@ pub(super) fn read_head_status(
     // an empty `@` sitting on main is the steady state and needs no probe.
     let unpushed = if reuse_guard::needs_unpushed_probe(&head) {
         let revset = reuse_guard::unpushed_work_revset(main_branch);
-        let output = run_jj(
+        let output = run_jj_within(
             runner,
             database_path,
             &RealCommandRunner::invocation(
@@ -301,6 +316,7 @@ pub(super) fn read_head_status(
                     reuse_guard::UNPUSHED_PROBE_TEMPLATE,
                 ],
             ),
+            deadline,
         )?;
         reuse_guard::parse_unpushed_commits(&output)
     } else {
@@ -322,17 +338,25 @@ pub(super) fn read_head_status(
 /// work orphaned and refuse. Used by the quarantine-reclaim paths, which need
 /// the verdict *without* performing the reset that `reset_workspace_guarded`
 /// couples it to.
+///
+/// `deadline` is mandatory rather than optional-by-omission because both
+/// callers run inside a time-budgeted pass and the fetch here is the single
+/// most expensive thing either of them does: 120s per attempt, twice retried,
+/// against a slow remote. Pass `None` only for a genuinely unbounded run (the
+/// operator-invoked `cube workspace gc`).
 pub(super) fn probe_workspace_reuse(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,
     main_branch: &str,
+    deadline: Option<Instant>,
 ) -> Result<HeadStatus> {
     audit_jj_op(database_path, workspace_path, "git", &["fetch"], None);
-    run_jj_network(
+    run_jj_network_within(
         runner,
         database_path,
         &RealCommandRunner::invocation(workspace_path, "jj", &["git", "fetch"]),
+        deadline,
     )?;
-    read_head_status(runner, database_path, workspace_path, main_branch)
+    read_head_status_within(runner, database_path, workspace_path, main_branch, deadline)
 }

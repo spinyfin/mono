@@ -319,6 +319,7 @@ steps:
             stderr: "boom".to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     };
     let lease_runner = lease_runner_with_setup(&workspace_path, "abc1234", vec![failing]);
 
@@ -379,6 +380,7 @@ steps:
             stderr: "boom".to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     };
     let lease_runner = lease_runner_with_setup(&workspace_path, "abc1234", vec![failing]);
 

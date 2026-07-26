@@ -263,7 +263,16 @@ pub(crate) use boss_protocol::EXECUTION_KIND_PR_REVIEW;
 /// returned and the engine was awaiting it unboundedly. With this
 /// timeout the engine surfaces a `cube_workspace_lease_failed` event
 /// and either falls back or fails cleanly within seconds.
-const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// Raised 30s → 90s as an explicit stopgap, NOT as a fix. The real bound
+/// belongs to cube and now lives there: `cube workspace lease` caps its
+/// pre-claim health scan by probe count and by wall clock, so lease latency
+/// no longer grows with the size of the free pool. This engine-side number
+/// is only the outer backstop for the remaining tail — the `jj workspace
+/// add` + setup-step provisioning path, ~6s nominal but network- and
+/// host-load-dependent. A lease that takes longer than 90s is a cube bug to
+/// be fixed in cube; do not keep raising this number in its place.
+const CUBE_LEASE_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Same upper bound for `cube repo ensure`. `ensure_repo` is normally
 /// fast (it's an idempotent record lookup), but the same hang class

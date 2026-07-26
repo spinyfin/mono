@@ -1733,3 +1733,551 @@ fn workspace_lease_fast_forwards_using_github_remote_when_source_exists() {
     assert_eq!(result.payload["workspace"]["head_commit"], "cafe5678");
     runner.assert_exhausted();
 }
+
+// ── Bounded health scan ─────────────────────────────────────────────────────
+// Regression cover for the dispatch outage: a free pool that had gone
+// all-dirty made every lease serially re-probe every free workspace, ~17s of
+// `jj status` calls re-deriving a verdict already committed to SQLite, before
+// provisioning a fresh workspace anyway. The lease then blew past the
+// caller's 30s bound. These tests pin the three bounds that replaced it.
+
+/// Build a pool of `count` workspaces whose cached health in the registry is
+/// already `dirty`, and return their ids in the order the scan considers them.
+fn seed_cached_dirty_pool(
+    workspace_root: &std::path::Path,
+    database_path: &std::path::Path,
+    count: usize,
+) -> Vec<String> {
+    use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+
+    let ids: Vec<String> = (1..=count).map(|n| format!("mono-agent-{n:03}")).collect();
+    let candidates: Vec<WorkspaceCandidate> = ids
+        .iter()
+        .map(|id| {
+            let path = workspace_root.join(id);
+            std::fs::create_dir_all(path.join(".jj")).expect("workspace dir");
+            WorkspaceCandidate {
+                workspace_id: id.clone(),
+                workspace_path: path,
+            }
+        })
+        .collect();
+
+    let mut store = Store::open_at(database_path).unwrap();
+    store.sync_workspaces("mono", &candidates).unwrap();
+    for id in &ids {
+        store
+            .update_workspace_health("mono", id, WorkspaceHealth::Dirty)
+            .unwrap();
+    }
+    ids
+}
+
+/// The `jj` sequence a freshly auto-created workspace goes through: create,
+/// reset, read head.
+fn auto_create_commands(workspace_root: &std::path::Path, new_id: &str, head: &str) -> Vec<ExpectedCommand> {
+    let new_path = workspace_root.join(new_id);
+    let staging = workspace_root.join(format!(".incoming-{new_id}"));
+    vec![
+        ExpectedCommand::workspace_add_mono(workspace_root, &staging),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            head,
+        ),
+    ]
+}
+
+#[test]
+fn workspace_lease_trusts_cached_dirty_health_instead_of_reprobing_the_pool() {
+    // Ten workspaces, all recorded `dirty` in the registry. The old scan ran
+    // `jj status` against all ten (and would have against a hundred); the
+    // bounded one probes only this lease's revalidation window and provisions.
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+    let ids = seed_cached_dirty_pool(&workspace_root, &database_path, 10);
+
+    // Cursor starts at 0, so the window is the first three by id — and each
+    // is still dirty on disk, so none is promoted.
+    let mut commands: Vec<ExpectedCommand> = ids
+        .iter()
+        .take(3)
+        .map(|id| {
+            ExpectedCommand::ok(
+                workspace_root.join(id),
+                "jj",
+                &["status", "--no-pager"],
+                jj_status_dirty(),
+            )
+        })
+        .collect();
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-011", "fresh011"));
+    let runner = FakeRunner::new(commands);
+
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "cached health"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("lease should provision rather than walk the whole dirty pool");
+    // Exhaustion is the assertion that matters: exactly three `jj status`
+    // probes ran, not ten.
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-011");
+    let scan = &result.payload["health_scan"];
+    assert_eq!(scan["cached_unhealthy"], 10);
+    assert_eq!(scan["probed"], 3);
+    assert_eq!(scan["revalidated"], 3);
+    assert_eq!(scan["trusted_cache_skips"], 7);
+    assert_eq!(scan["outcome"], "none");
+}
+
+#[test]
+fn workspace_lease_revalidation_window_rotates_across_leases() {
+    // The cached-unhealthy set is not ignored forever — each lease re-probes a
+    // different slice, so a workspace cleaned out of band is picked back up
+    // within ceil(N / STALE_HEALTH_REVALIDATE_PER_LEASE) leases.
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+    let ids = seed_cached_dirty_pool(&workspace_root, &database_path, 9);
+
+    let dirty_probe = |id: &String| {
+        ExpectedCommand::ok(
+            workspace_root.join(id),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_dirty(),
+        )
+    };
+
+    // Lease 1 probes ids[0..3], lease 2 probes ids[3..6] — no overlap.
+    let mut commands: Vec<ExpectedCommand> = ids[0..3].iter().map(dirty_probe).collect();
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-010", "fresh010"));
+    commands.extend(ids[3..6].iter().map(dirty_probe));
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-011", "fresh011"));
+    let runner = FakeRunner::new(commands);
+
+    for task in ["rotate one", "rotate two"] {
+        run_with_dependencies(
+            Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", task]),
+            Some(&database_path),
+            &runner,
+        )
+        .expect("lease");
+    }
+    runner.assert_exhausted();
+}
+
+#[test]
+fn workspace_lease_health_scan_stops_at_the_probe_cap() {
+    // Twelve workspaces with no cached health at all (so every one is a
+    // first-class candidate) that all turn out dirty on disk. The scan must
+    // stop at the probe cap and provision rather than walking all twelve.
+    use crate::metadata::WorkspaceCandidate;
+
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let ids: Vec<String> = (1..=12).map(|n| format!("mono-agent-{n:03}")).collect();
+    {
+        let candidates: Vec<WorkspaceCandidate> = ids
+            .iter()
+            .map(|id| {
+                let path = workspace_root.join(id);
+                std::fs::create_dir_all(path.join(".jj")).expect("workspace dir");
+                WorkspaceCandidate {
+                    workspace_id: id.clone(),
+                    workspace_path: path,
+                }
+            })
+            .collect();
+        let mut store = Store::open_at(&database_path).unwrap();
+        store.sync_workspaces("mono", &candidates).unwrap();
+    }
+
+    let mut commands: Vec<ExpectedCommand> = ids
+        .iter()
+        .take(8)
+        .map(|id| {
+            ExpectedCommand::ok(
+                workspace_root.join(id),
+                "jj",
+                &["status", "--no-pager"],
+                jj_status_dirty(),
+            )
+        })
+        .collect();
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-013", "fresh013"));
+    let runner = FakeRunner::new(commands);
+
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "probe cap"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("lease should provision once the probe cap is hit");
+    runner.assert_exhausted();
+
+    let scan = &result.payload["health_scan"];
+    assert_eq!(scan["effective_free"], 12);
+    assert_eq!(scan["probed"], 8);
+    assert_eq!(scan["truncated"], "max_probes");
+    assert_eq!(result.payload["workspace"]["workspace_id"], "mono-agent-013");
+}
+
+#[test]
+fn workspace_lease_prefer_reaches_a_cached_dirty_workspace_outside_the_window() {
+    // `--prefer` is an explicit request and always earns its probe, even when
+    // the named workspace is cached as dirty and this lease's rotation window
+    // would not have reached it. A recovered workspace is promoted and used.
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+    let ids = seed_cached_dirty_pool(&workspace_root, &database_path, 10);
+
+    // ids[8] is well outside the cursor-0 window of ids[0..3].
+    let preferred = &ids[8];
+    let preferred_path = workspace_root.join(preferred);
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(
+            preferred_path.clone(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_clean(),
+        ),
+        ExpectedCommand::ok(preferred_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(
+            preferred_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            preferred_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(preferred_path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(
+            preferred_path.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            "pref009",
+        ),
+    ]);
+
+    let result = run_with_dependencies(
+        Cli::parse_from([
+            "cube",
+            "workspace",
+            "lease",
+            "mono",
+            "--task",
+            "prefer outside window",
+            "--prefer",
+            preferred,
+        ]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("lease");
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], preferred.as_str());
+    let scan = &result.payload["health_scan"];
+    assert_eq!(scan["probed"], 1);
+    assert_eq!(scan["promoted_to_clean"], 1);
+}
+
+#[test]
+fn stale_revalidation_window_rotates_and_wraps() {
+    use crate::app::workspace::{advanced_stale_cursor, stale_revalidation_window};
+
+    // Empty set: nothing to revalidate, cursor stays put.
+    assert_eq!(stale_revalidation_window(0, 0, 3), Vec::<usize>::new());
+    assert_eq!(advanced_stale_cursor(0, 0, 0), 0);
+
+    // Walks forward three at a time — when all three are actually probed.
+    assert_eq!(stale_revalidation_window(10, 0, 3), vec![0, 1, 2]);
+    assert_eq!(advanced_stale_cursor(10, 0, 3), 3);
+    assert_eq!(stale_revalidation_window(10, 3, 3), vec![3, 4, 5]);
+    assert_eq!(advanced_stale_cursor(10, 3, 3), 6);
+    // …and wraps around the end of the list.
+    assert_eq!(stale_revalidation_window(10, 9, 3), vec![9, 0, 1]);
+    assert_eq!(advanced_stale_cursor(10, 9, 3), 2);
+
+    // Fewer entries than the window: every entry is covered exactly once.
+    assert_eq!(stale_revalidation_window(2, 0, 3), vec![0, 1]);
+    assert_eq!(advanced_stale_cursor(2, 0, 2), 0);
+
+    // A cursor left over from a larger pool (or a corrupt negative value)
+    // still lands inside the list rather than panicking.
+    assert_eq!(stale_revalidation_window(4, 97, 2), vec![1, 2]);
+    assert_eq!(advanced_stale_cursor(4, 97, 2), 3);
+    assert_eq!(stale_revalidation_window(4, -1, 2), vec![3, 0]);
+    assert_eq!(advanced_stale_cursor(4, -1, 2), 1);
+
+    // A lease that reached only part of its window advances only that far,
+    // so the entries it never probed come up again next lease instead of
+    // being skipped past.
+    assert_eq!(advanced_stale_cursor(10, 0, 0), 0);
+    assert_eq!(advanced_stale_cursor(10, 0, 1), 1);
+    assert_eq!(stale_revalidation_window(10, 1, 3), vec![1, 2, 3]);
+
+    // Covering the whole set takes ceil(N / per_lease) leases *that reach
+    // their window*: the rotation itself is complete. Whether a given lease
+    // gets that far is a separate, deliberately opportunistic question —
+    // see STALE_HEALTH_REVALIDATE_PER_LEASE.
+    let mut cursor = 0i64;
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..4 {
+        let window = stale_revalidation_window(10, cursor, 3);
+        cursor = advanced_stale_cursor(10, cursor, window.len());
+        seen.extend(window);
+    }
+    assert_eq!(
+        seen.len(),
+        10,
+        "every cached-unhealthy entry revalidated within 4 window-reaching leases"
+    );
+}
+
+/// The revalidation cursor may only move across entries a lease actually
+/// probed.
+///
+/// The scan orders effective-free candidates ahead of the rotation window and
+/// stops at the first clean one, so the ordinary healthy-pool lease never
+/// reaches the window at all. The cursor used to be computed and persisted up
+/// front, off the *planned* window — so three cached-dirty entries were
+/// skipped per lease while nothing had looked at them, and a workspace an
+/// operator cleaned out of band could stay cached dirty indefinitely between
+/// GC passes despite the documented rotation.
+#[test]
+fn lease_leaves_the_revalidation_cursor_alone_when_a_clean_candidate_ends_the_scan() {
+    use crate::app::workspace::stale_health_cursor_key;
+    use crate::metadata::WorkspaceCandidate;
+
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+    let dirty_ids = seed_cached_dirty_pool(&workspace_root, &database_path, 6);
+
+    // One healthy, cached-clean workspace alongside the six cached-dirty ones.
+    // It sorts last by id, but effective-free candidates are ordered ahead of
+    // the revalidation window regardless.
+    let clean_id = "mono-agent-090";
+    let clean_path = workspace_root.join(clean_id);
+    std::fs::create_dir_all(clean_path.join(".jj")).expect("clean workspace dir");
+    {
+        let mut candidates: Vec<WorkspaceCandidate> = dirty_ids
+            .iter()
+            .map(|id| WorkspaceCandidate {
+                workspace_id: id.clone(),
+                workspace_path: workspace_root.join(id),
+            })
+            .collect();
+        candidates.push(WorkspaceCandidate {
+            workspace_id: clean_id.to_string(),
+            workspace_path: clean_path.clone(),
+        });
+        let mut store = Store::open_at(&database_path).unwrap();
+        store.sync_workspaces("mono", &candidates).unwrap();
+    }
+
+    // Lease one: the clean candidate answers immediately. Not one entry of the
+    // rotation window is touched.
+    let first = FakeRunner::new({
+        let mut c = vec![ExpectedCommand::ok(
+            clean_path.clone(),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_clean(),
+        )];
+        c.extend(vec![
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["git", "fetch"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["git", "remote", "list"],
+                "origin\tgit@github.com:spinyfin/mono.git\n",
+            ),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+                "",
+            ),
+            ExpectedCommand::ok(clean_path.clone(), "jj", &["new", "main@origin"], ""),
+            ExpectedCommand::ok(
+                clean_path.clone(),
+                "jj",
+                &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+                "clean090",
+            ),
+        ]);
+        c
+    });
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "healthy pool"]),
+        Some(&database_path),
+        &first,
+    )
+    .expect("lease");
+    first.assert_exhausted();
+
+    assert_eq!(result.payload["workspace"]["workspace_id"], clean_id);
+    let scan = &result.payload["health_scan"];
+    assert_eq!(scan["probed"], 1, "the scan stops at the first clean candidate");
+    assert_eq!(scan["revalidation_window"], 3);
+    assert_eq!(scan["window_revalidated"], 0, "the window was never reached");
+
+    assert_eq!(
+        Store::open_at(&database_path)
+            .unwrap()
+            .get_pool_metadata_i(&stale_health_cursor_key("mono"))
+            .unwrap(),
+        None,
+        "a lease that probed no window entry must not move the cursor",
+    );
+
+    // The consequence that matters: the next lease — which does reach the
+    // window, the clean workspace now being leased — re-offers the SAME first
+    // three ids rather than the ones the up-front advance would have skipped
+    // to.
+    let dirty_probe = |id: &String| {
+        ExpectedCommand::ok(
+            workspace_root.join(id),
+            "jj",
+            &["status", "--no-pager"],
+            jj_status_dirty(),
+        )
+    };
+    let mut second_commands: Vec<ExpectedCommand> = dirty_ids[0..3].iter().map(dirty_probe).collect();
+    second_commands.extend(auto_create_commands(&workspace_root, "mono-agent-091", "fresh091"));
+    let second = FakeRunner::new(second_commands);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "now under pressure"]),
+        Some(&database_path),
+        &second,
+    )
+    .expect("lease");
+    // Exhaustion IS the assertion: ids[0..3] were probed, not ids[3..6].
+    second.assert_exhausted();
+
+    assert_eq!(
+        Store::open_at(&database_path)
+            .unwrap()
+            .get_pool_metadata_i(&stale_health_cursor_key("mono"))
+            .unwrap(),
+        Some(3),
+        "the cursor advances once entries are genuinely probed",
+    );
+}
+
+/// The other way a lease can fail to reach its window: a heavy walk of dirty
+/// effective-free candidates burns the entire probe budget first. That must
+/// not advance the cursor past the cached-unhealthy entries it never looked
+/// at either.
+#[test]
+fn lease_does_not_skip_unprobed_window_entries_when_the_probe_cap_is_exhausted() {
+    use crate::app::workspace::stale_health_cursor_key;
+    use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(&workspace_root).expect("workspace root");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    // Ten candidates with no cached health (all dirty on disk) plus five
+    // cached-dirty ones. The probe cap is 8, so the walk never gets past the
+    // effective-free set.
+    let free_ids: Vec<String> = (1..=10).map(|n| format!("mono-agent-{n:03}")).collect();
+    let cached_ids: Vec<String> = (20..=24).map(|n| format!("mono-agent-{n:03}")).collect();
+    {
+        let candidates: Vec<WorkspaceCandidate> = free_ids
+            .iter()
+            .chain(cached_ids.iter())
+            .map(|id| {
+                let path = workspace_root.join(id);
+                std::fs::create_dir_all(path.join(".jj")).expect("workspace dir");
+                WorkspaceCandidate {
+                    workspace_id: id.clone(),
+                    workspace_path: path,
+                }
+            })
+            .collect();
+        let mut store = Store::open_at(&database_path).unwrap();
+        store.sync_workspaces("mono", &candidates).unwrap();
+        for id in &cached_ids {
+            store
+                .update_workspace_health("mono", id, WorkspaceHealth::Dirty)
+                .unwrap();
+        }
+    }
+
+    let mut commands: Vec<ExpectedCommand> = free_ids
+        .iter()
+        .take(8)
+        .map(|id| {
+            ExpectedCommand::ok(
+                workspace_root.join(id),
+                "jj",
+                &["status", "--no-pager"],
+                jj_status_dirty(),
+            )
+        })
+        .collect();
+    commands.extend(auto_create_commands(&workspace_root, "mono-agent-025", "fresh025"));
+    let runner = FakeRunner::new(commands);
+
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "cap exhausted"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("lease");
+    runner.assert_exhausted();
+
+    let scan = &result.payload["health_scan"];
+    assert_eq!(scan["truncated"], "max_probes");
+    assert_eq!(scan["probed"], 8);
+    assert_eq!(scan["revalidation_window"], 3);
+    assert_eq!(
+        scan["window_revalidated"], 0,
+        "the budget was gone before the window came up",
+    );
+
+    assert_eq!(
+        Store::open_at(&database_path)
+            .unwrap()
+            .get_pool_metadata_i(&stale_health_cursor_key("mono"))
+            .unwrap(),
+        None,
+        "cached-unhealthy ids that were never probed are not rotated past",
+    );
+}

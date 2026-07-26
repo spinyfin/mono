@@ -573,6 +573,8 @@ steps:
             last_release_reason: None,
             health_status: None,
             unhealthy_since_epoch_s: None,
+            last_holder: None,
+            last_task: None,
         }
     }
 

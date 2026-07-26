@@ -89,6 +89,22 @@ pub enum CubeError {
         args: Vec<String>,
         timeout_secs: u64,
     },
+    /// A caller's wall-clock budget was already exhausted, so the command was
+    /// never started. Distinct from [`CubeError::CommandTimedOut`] (which
+    /// means a subprocess *ran* and was killed): this one costs nothing and is
+    /// how a time-budgeted pass declines to start work it cannot finish.
+    #[error(
+        "did not start `{program} {}`: the caller's time budget was already exhausted",
+        args.join(" ")
+    )]
+    DeadlineExceeded { program: String, args: Vec<String> },
+    /// A retention salvage could not be proven complete, so the workspace it
+    /// was taken for must NOT be reclaimed. See `crate::app::salvage`'s module
+    /// docs: `Ok` from a salvage is what licenses a destructive reset, so
+    /// "captured nothing" and "captured only the newest N of more than N" are
+    /// failures rather than smaller records.
+    #[error("salvage of workspace `{workspace_id}` is incomplete: {reason}")]
+    SalvageIncomplete { workspace_id: String, reason: String },
     #[error("failed to serialize output: {0}")]
     Json(#[from] serde_json::Error),
     #[error("workspace `{workspace_path}` is stale and could not be auto-recovered: {cause}")]
@@ -170,6 +186,8 @@ impl CubeError {
             | Self::LockIo { .. }
             | Self::CommandFailed { .. }
             | Self::CommandTimedOut { .. }
+            | Self::DeadlineExceeded { .. }
+            | Self::SalvageIncomplete { .. }
             | Self::Json(_)
             | Self::StaleRecoveryFailed { .. } => ExitCode::FAILURE,
             // Surfaced as its own exit code so the engine's heartbeat

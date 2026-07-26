@@ -31,6 +31,7 @@ pub(super) fn failing_cmd(cwd: PathBuf, program: &str, args: &[&str], stderr: &s
             stderr: stderr.to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     }
 }
 

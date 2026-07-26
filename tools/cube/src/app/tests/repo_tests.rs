@@ -461,6 +461,7 @@ fn repo_ensure_falls_back_to_main_when_detection_fails() {
                 stderr: "fatal: could not read from remote repository".to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         ExpectedCommand::ok(
             defaults.repo_root.clone(),
@@ -1108,6 +1109,7 @@ fn repo_ensure_propagates_unrelated_track_failure() {
                 stderr: "Error: Failed to load repo: some unrelated jj failure".to_string(),
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
     ]);
 
