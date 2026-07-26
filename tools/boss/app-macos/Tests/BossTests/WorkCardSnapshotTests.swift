@@ -1172,7 +1172,133 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    // MARK: - WorkCardLiveStatus (entry 6 observation detach)
+
+    /// Live-status resolution is pure and lives outside the card so the
+    /// column container can stamp it into the snapshot without the card
+    /// observing `LiveWorkerStateStore`.
+    func testLiveStatusNilOutsideDoing() {
+        let task = Self.makeTask(status: "active")
+        let live = Self.makeLiveState(liveStatus: "Working")
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .backlog, runtime: nil, liveState: live
+        ))
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .review, runtime: nil, liveState: live
+        ))
+    }
+
+    func testLiveStatusDispatchPendingReadyIsWaitingForSlot() {
+        let task = Self.makeTask(status: "todo", autostart: true)
+        let runtime = WorkTaskRuntime(
+            workItemID: task.id,
+            executionStatus: "ready",
+            runStatus: nil,
+            executionID: "exec-1",
+            dispatchRetryAt: nil,
+            dispatchWaitReason: nil,
+            dispatchWaitSince: nil
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: runtime, liveState: nil
+            ),
+            "Waiting for a slot"
+        )
+    }
+
+    func testLiveStatusDispatchPendingNotReadyIsQueued() {
+        let task = Self.makeTask(status: "todo", autostart: true)
+        let runtime = WorkTaskRuntime(
+            workItemID: task.id,
+            executionStatus: "waiting_dependency",
+            runStatus: nil,
+            executionID: nil,
+            dispatchRetryAt: nil,
+            dispatchWaitReason: nil,
+            dispatchWaitSince: nil
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: runtime, liveState: nil
+            ),
+            "Queued"
+        )
+    }
+
+    func testLiveStatusUsesDispatcherWaitReason() {
+        let task = Self.makeTask(status: "todo", autostart: true)
+        let runtime = WorkTaskRuntime(
+            workItemID: task.id,
+            executionStatus: "ready",
+            runStatus: nil,
+            executionID: "exec-1",
+            dispatchRetryAt: nil,
+            dispatchWaitReason: "pool_exhausted",
+            dispatchWaitSince: nil
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: runtime, liveState: nil
+            ),
+            "Waiting — worker pool full"
+        )
+    }
+
+    func testLiveStatusPrefersRecoveryOverLiveStatus() {
+        let task = Self.makeTask(status: "active")
+        let live = Self.makeLiveState(
+            liveStatus: "Editing Models.swift",
+            recoveryStatus: "Recovering from API error…"
+        )
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: nil, liveState: live
+            ),
+            "Recovering from API error…"
+        )
+    }
+
+    func testLiveStatusNilDuringConflictRemediation() {
+        var task = Self.makeTask(status: "blocked")
+        task.blockedReason = "merge_conflict"
+        let live = Self.makeLiveState(liveStatus: "Resolving")
+        XCTAssertNil(WorkCardLiveStatus.resolve(
+            task: task, column: .doing, runtime: nil, liveState: live
+        ))
+    }
+
+    func testLiveStatusPassesThroughWorkerLiveStatus() {
+        let task = Self.makeTask(status: "active")
+        let live = Self.makeLiveState(liveStatus: "Editing Models.swift")
+        XCTAssertEqual(
+            WorkCardLiveStatus.resolve(
+                task: task, column: .doing, runtime: nil, liveState: live
+            ),
+            "Editing Models.swift"
+        )
+    }
+
     // MARK: - Helpers
+
+    private static func makeLiveState(
+        liveStatus: String?,
+        recoveryStatus: String? = nil
+    ) -> WorkerLiveState {
+        WorkerLiveState(
+            slotId: 1,
+            runId: "exec-1",
+            model: "m",
+            shellPid: 1,
+            lastEventAt: "t",
+            currentTool: nil,
+            lastToolEndedAt: nil,
+            activity: .working,
+            liveStatus: liveStatus,
+            liveStatusAt: "t",
+            recoveryStatus: recoveryStatus
+        )
+    }
 
     private static func makeTask(
         id: String = "task_\(UUID().uuidString)",

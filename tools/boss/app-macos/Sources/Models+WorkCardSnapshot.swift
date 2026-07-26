@@ -408,3 +408,90 @@ struct WorkCardSnapshot: Equatable {
         )
     }
 }
+
+// ===========================================================================
+// Pre-resolved free-text live-status subtitle for a kanban card.
+//
+// Built by the column container before [[WorkCardSnapshot.build]] so
+// time-relative phrasing is fixed at snapshot construction and the
+// snapshot stays pure / Equatable-stable (design entry 6 — observation
+// detach). Cards no longer re-resolve this from `LiveWorkerStateStore`.
+// ===========================================================================
+
+enum WorkCardLiveStatus {
+    /// Free-text live-status subtitle for a Doing-lane card, or `nil`
+    /// when the card should show no status line (other columns; mid
+    /// conflict/CI remediation / AI-review; no live signal).
+    ///
+    /// `now` is injectable so unit tests can freeze relative-time labels
+    /// (`AutomationTime.relative` / dispatch retry countdown).
+    static func resolve(
+        task: WorkTask,
+        column: WorkBoardColumnKey,
+        runtime: WorkTaskRuntime?,
+        liveState: WorkerLiveState?,
+        now: Date = Date()
+    ) -> String? {
+        guard column == .doing else { return nil }
+
+        let isDispatchPending = task.status == "todo" && task.autostart
+        let dispatchRetryAt = runtime?.dispatchRetryAt.flatMap(AutomationTime.parse)
+        let isDispatchRetryPending = isDispatchPending && (dispatchRetryAt.map { $0 > now } ?? false)
+        let isResolvingConflicts = task.status == "blocked"
+            && task.blockedReason == "merge_conflict"
+        let isRemediatingCI = task.status == "blocked"
+            && task.blockedReason == "ci_failure"
+        let isAIReviewing = task.aiReviewing && task.status == "active"
+
+        if isDispatchRetryPending, let dispatchRetryAtRaw = runtime?.dispatchRetryAt {
+            return "Retrying dispatch — next attempt \(AutomationTime.relative(dispatchRetryAtRaw, now: now))"
+        }
+        // The dispatcher's real defer reason, when known — replaces the
+        // generic "Waiting for a slot" so an operator isn't sent hunting
+        // for free capacity when the actual cause is serialization or
+        // gating (`chain_serialized` previously read as slot exhaustion
+        // for ~20 minutes with 8+ slots free).
+        if isDispatchPending, let reason = runtime?.dispatchWaitReason {
+            let label = dispatchWaitReasonLabel(reason)
+            if let sinceRaw = runtime?.dispatchWaitSince {
+                return "\(label) (\(AutomationTime.relative(sinceRaw, now: now)))"
+            }
+            return label
+        }
+        // No `dispatchWaitReason` means the scheduler hasn't stamped a
+        // defer reason for this row — either because it hasn't reached
+        // `ready` yet (no execution row at all, or still
+        // `waiting_dependency`) or because it just became `ready` and
+        // the scheduler hasn't evaluated it against the pool. Only the
+        // latter is an actual capacity wait; genuine pool exhaustion
+        // always gets stamped `pool_exhausted` (handled above) within
+        // one scheduler pass. Claiming "Waiting for a slot" for the
+        // former misdirects diagnosis toward pool capacity when the
+        // pool had free workers the whole time.
+        if isDispatchPending {
+            return runtime?.executionStatus == "ready" ? "Waiting for a slot" : "Queued"
+        }
+        if isResolvingConflicts { return nil }
+        if isRemediatingCI { return nil }
+        if isAIReviewing { return nil }
+        // Transient-recovery banner wins outright — a worker being
+        // auto-resumed after a Claude API error looks idle to every
+        // other signal, so without this the card would silently show
+        // stale/no text instead of "recovering from API error …".
+        if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
+            return recovering
+        }
+        return liveState?.liveStatus
+    }
+
+    private static func dispatchWaitReasonLabel(_ reason: String) -> String {
+        switch reason {
+        case "pool_exhausted":
+            return "Waiting — worker pool full"
+        case "pending_first_attempt":
+            return "Waiting for a slot"
+        default:
+            return "Waiting — \(reason)"
+        }
+    }
+}
