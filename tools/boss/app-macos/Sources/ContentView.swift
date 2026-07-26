@@ -1043,41 +1043,16 @@ struct ContentView: View {
 
     @ViewBuilder
     private func workSectionItems(_ items: [WorkTask], column: WorkBoardColumnKey) -> some View {
-        let selectedID = model.selectedTask?.id
-        let highlightID = model.revealHighlightID
-        let frontierIDs = model.depFrontierHighlightIDs
-        let revisionIDs = model.revisionHighlightIDs
-        let selectedRevisionParentID = model.selectedRevisionParentID
-        // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
-        // the default (ungrouped) board layout each column is a single section,
-        // so this was the actual eagerly-built list of every card in the
-        // column regardless of scroll position. Combined with the whole-model
-        // `@Published` invalidation that hover badges trigger (any card's
-        // `onDepBadgeHover`/`onRevisionBadgeHover` re-renders every card in
-        // every column), a plain `VStack` here meant hovering one badge while
-        // scrolling re-evaluated and re-hit-tested every card on the board,
-        // not just the visible ones. `LazyVStack` + `ScrollViewReader` +
-        // `.id(task.id)` below is the supported combo for reveal-scroll, so
-        // this doesn't change that behavior.
-        LazyVStack(alignment: .leading, spacing: 10) {
-            ForEach(items) { task in
-                let isSelected = selectedID == task.id
-                let isRevealed = highlightID == task.id
-                let isFrontierHighlighted = frontierIDs.contains(task.id) || revisionIDs.contains(task.id) || selectedRevisionParentID == task.id
-                WorkBoardCardItem(
-                    task: task,
-                    projectName: model.cardProjectBadge(for: task),
-                    column: column,
-                    runtime: column == .doing ? model.taskRuntime(for: task.id) : nil,
-                    isSelected: isSelected,
-                    isRevealed: isRevealed,
-                    isFrontierHighlighted: isFrontierHighlighted,
-                    model: model,
-                    liveStates: model.liveWorkerStates
-                )
-                .id(task.id)
-            }
-        }
+        // Column container observes `ChatViewModel` + `LiveWorkerStateStore`
+        // and builds each card's `WorkCardSnapshot` (design entry 6). Cards
+        // hold a non-observing model reference for action dispatch only.
+        WorkBoardSectionItemsView(
+            items: items,
+            column: column,
+            boardStyle: kanbanBoardStyle,
+            model: model,
+            liveStates: model.liveWorkerStates
+        )
     }
 
     @ViewBuilder

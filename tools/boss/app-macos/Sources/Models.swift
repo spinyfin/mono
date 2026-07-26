@@ -415,7 +415,7 @@ extension WorkTask {
     /// scheduling reaches them — so they belong visually with active work,
     /// not with unscheduled backlog items. The card renders a distinct
     /// hourglass indicator to distinguish "queued" from "working"; see
-    /// `WorkBoardCardItem.liveStatusForCard` for how the subtitle picks
+    /// `WorkCardLiveStatus.resolve` for how the subtitle picks
     /// apart "not yet scheduled" from "genuinely waiting on pool capacity".
     ///
     /// A row the engine gave up starting (`dispatchFailedReason` set) is

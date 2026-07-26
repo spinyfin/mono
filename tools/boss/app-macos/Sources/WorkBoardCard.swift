@@ -13,251 +13,151 @@ private let kanbanDocLinkLog = Logger(
     category: "kanban-doc-link"
 )
 
-private func dispatchWaitReasonLabel(_ reason: String) -> String {
-    switch reason {
-    case "pool_exhausted":
-        return "Waiting — worker pool full"
-    case "pending_first_attempt":
-        return "Waiting for a slot"
-    default:
-        return "Waiting — \(reason)"
+/// Column-local card list. Observes `ChatViewModel` so model publishes
+/// (selection, highlights, drag/merge notices, `taskRuntimesByID`, prereq
+/// caches, …) recompute per-card `WorkCardSnapshot`s once per column
+/// (design entry 6). Also observes `LiveWorkerStateStore` so Doing-lane
+/// live-status ticks rebuild snapshots without every card subscribing.
+/// Cards stay non-observing and receive snapshots as values —
+/// `.equatable()` skips bodies whose snapshot did not change.
+struct WorkBoardSectionItemsView: View {
+    let items: [WorkTask]
+    let column: WorkBoardColumnKey
+    let boardStyle: KanbanBoardStyle
+    /// Observed here so snapshot construction re-runs when model state
+    /// that feeds cards changes (including pure `taskRuntimesByID`
+    /// updates for Doing dispatch/slot status). Cards hold a
+    /// non-observing reference for action dispatch only.
+    @ObservedObject var model: ChatViewModel
+    /// Observed here so live-state publishes rebuild Doing snapshots once
+    /// per section instead of invalidating every mounted card.
+    @ObservedObject var liveStates: LiveWorkerStateStore
+
+    var body: some View {
+        let selectedID = model.selectedTask?.id
+        let highlightID = model.revealHighlightID
+        let frontierIDs = model.depFrontierHighlightIDs
+        let revisionIDs = model.revisionHighlightIDs
+        let selectedRevisionParentID = model.selectedRevisionParentID
+        let dragRefusal = model.dragRefusalNotice
+        let mergeFeedback = model.mergeFeedbackNotice
+        // Lazy so off-screen cards aren't instantiated/hit-tested at all — with
+        // the default (ungrouped) board layout each column is a single section,
+        // so this was the actual eagerly-built list of every card in the
+        // column regardless of scroll position. Combined with whole-model
+        // `@Published` invalidation that hover badges trigger, a plain
+        // `VStack` here meant hovering one badge while scrolling re-evaluated
+        // and re-hit-tested every card on the board, not just the visible
+        // ones. `LazyVStack` + `ScrollViewReader` + `.id(task.id)` below is
+        // the supported combo for reveal-scroll, so this doesn't change that
+        // behavior. Entry 6 further stops per-card observation of the model /
+        // live store: the container rebuilds snapshots; `.equatable()` skips
+        // card bodies whose snapshot did not change.
+        LazyVStack(alignment: .leading, spacing: 10) {
+            ForEach(items) { task in
+                let isSelected = selectedID == task.id
+                let isFrontierHighlighted = frontierIDs.contains(task.id)
+                    || revisionIDs.contains(task.id)
+                    || selectedRevisionParentID == task.id
+                let liveState: WorkerLiveState? = {
+                    guard column == .doing,
+                          let executionID = model.taskRuntime(for: task.id)?.executionID
+                    else { return nil }
+                    return liveStates.byRunID[executionID]
+                }()
+                let snapshot = model.workCardSnapshot(
+                    for: task,
+                    column: column,
+                    isSelected: isSelected,
+                    isFrontierHighlighted: isFrontierHighlighted,
+                    boardStyle: boardStyle,
+                    liveState: liveState
+                )
+                WorkBoardCardItem(
+                    task: task,
+                    column: column,
+                    snapshot: snapshot,
+                    model: model,
+                    isRevealed: highlightID == task.id,
+                    dragRefusalMessage: dragRefusal?.taskID == task.id
+                        ? dragRefusal?.message : nil,
+                    mergeFeedbackMessage: mergeFeedback?.taskID == task.id
+                        ? mergeFeedback?.message : nil
+                )
+                .id(task.id)
+            }
+        }
     }
 }
 
-/// Wrapper for a single kanban card. Observes `LiveWorkerStateStore`
-/// so live-state pushes invalidate the card without touching
-/// `ContentView` or `ChatViewModel`. Doing-column cards re-resolve
-/// their live state on every store publish; other columns ignore the
-/// store entirely.
-
+/// Wrapper for a single kanban card. Receives a pre-built
+/// [[WorkCardSnapshot]] and resolved banner messages as **values** from
+/// the column container — it does **not** observe `ChatViewModel` or
+/// `LiveWorkerStateStore`. Holding `model` without `@ObservedObject`
+/// keeps action dispatch (`selectWorkCard`, terminal, merge, delete)
+/// without the "any of 77 `@Published` properties invalidates every
+/// visible card" fan-out (design entry 6).
 struct WorkBoardCardItem: View {
     let task: WorkTask
-    let projectName: String?
+    /// Board column for action routing / debug logs only (value, not observed).
     let column: WorkBoardColumnKey
-    let runtime: WorkTaskRuntime?
-    let isSelected: Bool
+    let snapshot: WorkCardSnapshot
+    /// Non-observing; action dispatch only. Column container owns
+    /// observation and snapshot construction.
+    let model: ChatViewModel
     var isRevealed: Bool = false
-    /// True when this card is part of the actionable prerequisite
-    /// frontier for a currently-hovered Dependency badge. Adds an
-    /// amber border overlay so the reader can see "what needs to happen
-    /// next" without opening the popover.
-    var isFrontierHighlighted: Bool = false
-    @ObservedObject var model: ChatViewModel
-    @ObservedObject var liveStates: LiveWorkerStateStore
+    /// Pre-resolved by the column container from `dragRefusalNotice`.
+    var dragRefusalMessage: String? = nil
+    /// Pre-resolved by the column container from `mergeFeedbackNotice`.
+    var mergeFeedbackMessage: String? = nil
     @Environment(\.openWindow) private var openWindow
-    /// Captured into the equatable snapshot so a board-style flip
-    /// invalidates already-mounted card bodies (see `WorkCardSnapshot.boardStyle`).
-    @Environment(\.kanbanBoardStyle) private var boardStyle
     @State private var showingDeleteConfirmation = false
 
     var body: some View {
-        let liveState: WorkerLiveState? = {
-            guard column == .doing,
-                  let executionID = runtime?.executionID
-            else { return nil }
-            return liveStates.byRunID[executionID]
-        }()
-
-        // A dispatch-pending card has status=todo+autostart=true; it
-        // landed in Doing because the engine intends to run it. This
-        // covers two distinct waits — the row may not have an execution
-        // yet (queued for scheduling; T2655 incident) or it may be `ready`
-        // and genuinely waiting on pool capacity — see `liveStatusForCard`
-        // below, which picks the subtitle apart by `runtime?.executionStatus`
-        // instead of assuming capacity is always the cause.
-        let isDispatchPending = task.status == "todo" && task.autostart
-
-        // `dispatchRetryAt` is set only while the engine is withholding
-        // this execution from dispatch because a *pre-spawn* attempt
-        // already failed and is backing off before retrying — a
-        // genuinely different wait than "no free slot" (T215 incident:
-        // the card read "Waiting for a slot" while dispatch had actually
-        // already failed and given up). Once the retry cap is exhausted
-        // the engine clears `autostart` and stamps `dispatchFailedReason`
-        // instead, which already renders its own failure banner outside
-        // the Doing column — this is only the brief in-process backoff
-        // window before that.
-        let dispatchRetryAt: Date? = runtime?.dispatchRetryAt.flatMap(AutomationTime.parse)
-        let isDispatchRetryPending = isDispatchPending && (dispatchRetryAt.map { $0 > Date() } ?? false)
-
-        // A conflict-resolution card is status=blocked+merge_conflict with
-        // an active resolution attempt. It routes to Doing for the duration
-        // of the worker run; we surface a distinct "resolving conflicts"
-        // indicator rather than the generic agent-activity dot.
-        let isResolvingConflicts = column == .doing
-            && task.status == "blocked"
-            && task.blockedReason == "merge_conflict"
-
-        // A CI-remediation card is status=blocked+ci_failure with an active
-        // remediation attempt. Symmetric to the merge-conflict path above.
-        let isRemediatingCI = column == .doing
-            && task.status == "blocked"
-            && task.blockedReason == "ci_failure"
-
-        let isAIReviewing = column == .doing && task.aiReviewing && task.status == "active"
-
-        let liveStatusForCard: String? = {
-            guard column == .doing else { return nil }
-            if isDispatchRetryPending, let dispatchRetryAtRaw = runtime?.dispatchRetryAt {
-                return "Retrying dispatch — next attempt \(AutomationTime.relative(dispatchRetryAtRaw, now: Date()))"
-            }
-            // The dispatcher's real defer reason, when known — replaces the
-            // generic "Waiting for a slot" so an operator isn't sent hunting
-            // for free capacity when the actual cause is serialization or
-            // gating (the T251 incident: `chain_serialized` read as slot
-            // exhaustion for ~20 minutes with 8+ slots free).
-            if isDispatchPending, let reason = runtime?.dispatchWaitReason {
-                let label = dispatchWaitReasonLabel(reason)
-                if let sinceRaw = runtime?.dispatchWaitSince {
-                    return "\(label) (\(AutomationTime.relative(sinceRaw, now: Date())))"
-                }
-                return label
-            }
-            // No `dispatchWaitReason` means the scheduler hasn't stamped a
-            // defer reason for this row — either because it hasn't reached
-            // `ready` yet (no execution row at all, or still
-            // `waiting_dependency`) or because it just became `ready` and
-            // the scheduler hasn't evaluated it against the pool. Only the
-            // latter is an actual capacity wait; genuine pool exhaustion
-            // always gets stamped `pool_exhausted` (handled above) within
-            // one scheduler pass. Claiming "Waiting for a slot" for the
-            // former misdirects diagnosis toward pool capacity when the
-            // pool had free workers the whole time (T2655 incident).
-            if isDispatchPending {
-                return runtime?.executionStatus == "ready" ? "Waiting for a slot" : "Queued"
-            }
-            if isResolvingConflicts { return nil }
-            if isRemediatingCI { return nil }
-            if isAIReviewing { return nil }
-            // Transient-recovery banner wins outright — a worker being
-            // auto-resumed after a Claude API error looks idle to every
-            // other signal, so without this the card would silently show
-            // stale/no text instead of "recovering from API error …".
-            if let recovering = liveState?.recoveryStatus, !recovering.isEmpty {
-                return recovering
-            }
-            return liveState?.liveStatus
-        }()
-
-        // Read precomputed prereq caches — O(1) per card instead of
-        // scanning all dependency edges and tasks on every render pass.
-        let cachedGating = model.gatingPrereqsByTaskID[task.id] ?? []
-        let blockedBy: String? = {
-            if task.status == "blocked" {
-                let names = cachedGating.filter { $0.kind != .unknown }.map(\.title)
-                return names.isEmpty ? nil : names.joined(separator: ", ")
-            }
-            if task.blockedReason == "dependency" {
-                let rows = model.dependencyPrereqsByTaskID[task.id] ?? []
-                guard !rows.isEmpty else { return nil }
-                return rows.map(\.title).joined(separator: ", ")
-            }
-            return nil
-        }()
-
-        let gatingPrereqs = cachedGating
-        let isAutoBlocked = task.status == "blocked"
-            && task.lastStatusActor == "engine"
-            && !cachedGating.isEmpty
-        let dragRefusal: String? = (model.dragRefusalNotice?.taskID == task.id)
-            ? model.dragRefusalNotice?.message
-            : nil
-        let mergeFeedback: String? = (model.mergeFeedbackNotice?.taskID == task.id)
-            ? model.mergeFeedbackNotice?.message
-            : nil
-        let repoChip = model.repoChip(for: task)
-        let designDocProject: WorkProject? = (task.kind == "design" || task.kind == "design_postmortem")
-            ? task.projectID.flatMap { model.project(withID: $0) }
-            : nil
-        // Design and design-postmortem cards resolve their doc-link state
-        // from the parent PROJECT; project-less docs-backed items
-        // (investigations) carry an engine-resolved state on the task itself
-        // (`docLinkState`). Prefer the project state when present, else fall
-        // back to the per-task state so investigation cards render the same
-        // Review-lane doc-link icon.
-        let designDocState: ProjectDesignDocState? = designDocProject
-            .map { model.designDocStateByProjectID[$0.id] ?? .notSet }
-            ?? task.docLinkState
-        let externalRefLink = ExternalRefLinkPresentation.forTask(task)
-        // Roll-up rows must render wherever the parent's OWN card lands, not
-        // just in Review/Done. A revision that reaches in_review/done never
-        // gets a standalone card (see `workItems(in:)`'s rollup filter), so
-        // gating this on `column` left revisions with no visual
-        // representation at all whenever the parent's card landed somewhere
-        // else — e.g. a parent blocked for a non-review reason renders in
-        // Backlog (T2189/T2143: `reveal_work_item` had nothing to point at).
-        let inReviewRevisions: [WorkTask] = (
-            model.inReviewRevisions(forParentTaskID: task.id) + model.doneRevisions(forParentTaskID: task.id)
-        ).sorted { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
-        let parentShortID: Int? = task.kind == "revision"
-            ? task.parentTaskId.flatMap { model.workTask(withID: $0)?.shortID }
-            : nil
-
-        // Build the slim Equatable snapshot once per card-item evaluation.
-        // Closures stay outside the snapshot so `.equatable()` on the card
-        // can skip body re-evaluation when only action-handler identity
+        // Action closures stay outside the snapshot so `.equatable()` on
+        // the card body can skip re-evaluation when only handler identity
         // would differ (design entry 5 / `WorkCardSnapshot`).
         let onOpenTerminal: (() -> Void)? = {
+            guard snapshot.showsTerminalButton else { return nil }
             if (column == .review || column == .done),
                let prURL = task.prURL, !prURL.isEmpty {
                 return { model.openReviewTerminal(for: task) }
             }
-            if liveState != nil {
-                return { model.openLiveWorkspaceTerminal(for: task) }
+            return { model.openLiveWorkspaceTerminal(for: task) }
+        }()
+        let onMergeWhenReady: (() -> Void)? = snapshot.showsMergeWhenReady
+            ? { model.mergeWhenReady(for: task) }
+            : nil
+        let onOpenDesignDoc: (() -> Void)? = {
+            guard snapshot.showsDesignDocAffordance else { return nil }
+            if (task.kind == "design" || task.kind == "design_postmortem"),
+               let projectID = task.projectID,
+               let proj = model.project(withID: projectID) {
+                return { model.openProjectDesignDoc(proj) }
+            }
+            if task.docLinkState != nil {
+                return { model.openTaskDoc(task) }
+            }
+            // Snapshot said the affordance shows (resolved design-doc
+            // state) but project lookup failed at action-build time —
+            // still wire a best-effort open via project re-lookup on tap.
+            if let projectID = task.projectID {
+                return {
+                    if let proj = model.project(withID: projectID) {
+                        model.openProjectDesignDoc(proj)
+                    }
+                }
             }
             return nil
         }()
-        let onMergeWhenReady: (() -> Void)? = (
-            column == .review
-                && task.status == "in_review"
-                && task.prURL.map { !$0.isEmpty } == true
-                && task.mergeQueueState == nil
-        ) ? { model.mergeWhenReady(for: task) } : nil
-        let terminalTooltip = (column == .review || column == .done)
-            ? "Open terminal on PR branch"
-            : "Open terminal in workspace"
-        let deferredScopeItems = column == .review
-            ? model.deferredScopeAttentions(forWorkItemID: task.id)
-            : []
-        let snapshot = WorkCardSnapshot.build(
-            task: task,
-            context: WorkCardSnapshotContext(
-                column: column,
-                projectName: projectName,
-                isSelected: isSelected,
-                runtime: runtime,
-                liveState: liveState,
-                liveStatus: liveStatusForCard,
-                blockedBy: blockedBy,
-                isAutoBlocked: isAutoBlocked,
-                gatingPrereqs: gatingPrereqs,
-                repoChip: repoChip,
-                showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
-                showsCIAutoFixedBadge: model.showsCIAutoFixedBadge(forPR: task.prURL),
-                ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
-                isFrontierHighlighted: isFrontierHighlighted,
-                designDocState: designDocState,
-                externalRefLink: externalRefLink,
-                ambiguousRepoNames: model.ambiguousVisibleRepoNames,
-                inReviewRevisions: inReviewRevisions.map(WorkCardRevisionRollup.init(revision:)),
-                parentShortID: parentShortID,
-                deferredScopeItems: deferredScopeItems,
-                deferredScopeActionInFlightIDs: model.deferredScopeActionInFlightIDs,
-                showsTerminalButton: onOpenTerminal != nil,
-                terminalTooltip: terminalTooltip,
-                showsMergeWhenReady: onMergeWhenReady != nil,
-                boardStyle: boardStyle
-            )
-        )
 
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                model.selectWorkCard(isSelected ? nil : task.id)
+                model.selectWorkCard(snapshot.isSelected ? nil : task.id)
             } label: {
                 WorkBoardCardView(
                     snapshot: snapshot,
-                    onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
-                        ?? (task.docLinkState != nil ? { model.openTaskDoc(task) } : nil),
+                    onOpenDesignDoc: onOpenDesignDoc,
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
                     },
@@ -273,12 +173,8 @@ struct WorkBoardCardItem: View {
                 )
                 // `WorkBoardCardView` is `Equatable` over its snapshot only:
                 // without `.equatable()`, every re-render of the column
-                // (any of 77 `ChatViewModel` `@Published`s, live-state
-                // ticks on sibling cards) rebuilds and re-lays-out every
-                // card body — the `AG::LayoutDescriptor::compare` →
-                // `WorkTask.==` hot path. `.equatable()` lets SwiftUI
-                // skip body evaluation for cards whose snapshot is
-                // unchanged. Closures are intentionally outside `==`.
+                // rebuilds and re-lays-out every card body. Closures are
+                // intentionally outside `==`.
                 .equatable()
             }
             .buttonStyle(.plain)
@@ -293,10 +189,10 @@ struct WorkBoardCardItem: View {
             .overlay(
                 RoundedRectangle(cornerRadius: 12, style: .continuous)
                     .strokeBorder(
-                        Color.green.opacity(isFrontierHighlighted ? 0.7 : 0),
+                        Color.green.opacity(snapshot.isFrontierHighlighted ? 0.7 : 0),
                         lineWidth: 2
                     )
-                    .animation(.easeInOut(duration: 0.15), value: isFrontierHighlighted)
+                    .animation(.easeInOut(duration: 0.15), value: snapshot.isFrontierHighlighted)
             )
             .contextMenu {
                 if let id = task.shortID {
@@ -316,9 +212,9 @@ struct WorkBoardCardItem: View {
             }
             .popover(
                 isPresented: Binding(
-                    get: { isSelected },
+                    get: { snapshot.isSelected },
                     set: { isPresented in
-                        if !isPresented, isSelected {
+                        if !isPresented, snapshot.isSelected {
                             model.selectWorkCard(nil)
                         }
                     }
@@ -332,14 +228,14 @@ struct WorkBoardCardItem: View {
                 WorkDispatchFailureBanner(reason: dispatchFailedReason, errorText: task.dispatchFailedError)
             }
 
-            if let dragRefusal {
-                WorkDragRefusalBanner(message: dragRefusal) {
+            if let dragRefusalMessage {
+                WorkDragRefusalBanner(message: dragRefusalMessage) {
                     model.clearDragRefusal()
                 }
             }
 
-            if let mergeFeedback {
-                WorkMergeFeedbackBanner(message: mergeFeedback) {
+            if let mergeFeedbackMessage {
+                WorkMergeFeedbackBanner(message: mergeFeedbackMessage) {
                     model.clearMergeFeedback()
                 }
             }
@@ -369,7 +265,7 @@ struct WorkBoardCardItem: View {
     //   event    — what triggered the log ("appeared" or "prURL-changed")
     //   id       — work_item_id (T-number correlates with engine logs)
     //   kind     — task kind ("investigation", "design", …)
-    //   column   — board column the card routes to ("review", "doing", …)
+    //   column   — board column the card routes to (from snapshot context)
     //   prURL    — the exact pr_url value the app received from the engine
     //              ("<nil>" = field absent/null on the wire; "empty" = "")
     //   link     — whether PRURLLink will render ("shown" or "skipped")
