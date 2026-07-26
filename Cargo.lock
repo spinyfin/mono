@@ -545,6 +545,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-codex-auth",
+ "boss-engine-codex-hook-trust",
  "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utils",

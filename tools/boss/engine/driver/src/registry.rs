@@ -195,6 +195,7 @@ mod tests {
             settings_path: None,
             non_opus_auto_mode: false,
             permission_mode_override: None,
+            run_id: None,
         });
         // StubDriver emits `{binary} --model {model}\n` — deliberately
         // distinct from Claude's command line.
@@ -212,6 +213,7 @@ mod tests {
             settings_path: None,
             non_opus_auto_mode: false,
             permission_mode_override: None,
+            run_id: None,
         });
         assert!(
             claude_plan.command.starts_with("claude"),

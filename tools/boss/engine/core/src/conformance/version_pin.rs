@@ -180,16 +180,27 @@ fn fixture_carries_required_envelope_types_for_pinned_version() {
 #[test]
 fn codex_exec_spawn_satisfies_shared_flag_contract() {
     // Pin against the shared spawn contract, not only the test double's
-    // hardcoded command string. When a production CodexDriver lands, feed its
-    // SpawnPlan into the same assert_codex_exec_spawn_contract.
+    // hardcoded command string.
     let plan = codex_shaped_driver().spawn_invocation(crate::driver::SpawnRequest {
         model: "gpt-5.5",
         effort: None,
         settings_path: None,
         non_opus_auto_mode: false,
         permission_mode_override: None,
+        run_id: None,
     });
     assert_codex_exec_spawn_contract(&plan);
+
+    // Production CodexDriver must satisfy the same required/forbidden flags.
+    let production = crate::driver::CodexDriver.spawn_invocation(crate::driver::SpawnRequest {
+        model: "gpt-5.6-terra",
+        effort: Some("high"),
+        settings_path: None,
+        non_opus_auto_mode: false,
+        permission_mode_override: None,
+        run_id: Some("version-pin-codex"),
+    });
+    assert_codex_exec_spawn_contract(&production);
 }
 
 #[test]

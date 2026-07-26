@@ -77,6 +77,12 @@ pub struct PermissionInput {
     /// path-guard hook). Remote SSH workers set this because their
     /// `events_socket_path` is a forwarded `/tmp` socket, not a Boss data dir.
     pub is_remote: bool,
+    /// Absolute path to the materialised `boss-path-guard.py` script, when
+    /// the local path-guard applies. `None` for remote workers.
+    pub path_guard_script: Option<PathBuf>,
+    /// Absolute path to the materialised `boss-checkleft-push-guard.py`
+    /// script, when the local checkleft push guard applies. `None` for remote.
+    pub checkleft_guard_script: Option<PathBuf>,
 }
 
 /// What a driver's [`Capability::PermissionPolicy`] rendering produces,
@@ -105,6 +111,96 @@ pub struct PermissionArtifacts {
     /// Extra environment variables the spawn flow must set on the worker
     /// process (e.g. Codex's `CODEX_HOME`).
     pub env: Vec<(String, String)>,
+}
+
+/// Merge [`PermissionArtifacts::extra_args`] into a pane spawn command line.
+///
+/// Permission args win over defaults already present on the command: each
+/// flag in `extra_args` that already appears in `command` is stripped (with
+/// its value when the next extra_arg is not a flag) and then re-inserted so
+/// Codex's default `--sandbox workspace-write` is replaced by Reviewer's
+/// `--sandbox read-only` rather than duplicated.
+///
+/// Args are shell-quoted for safe insertion into the pane command string.
+/// Empty `extra_args` leaves `command` unchanged (Claude path).
+pub fn apply_permission_extra_args(command: &str, extra_args: &[String]) -> String {
+    if extra_args.is_empty() {
+        return command.to_owned();
+    }
+
+    let mut cmd = command.to_owned();
+
+    // Strip flags that extra_args will re-introduce so policy values win.
+    let mut i = 0usize;
+    while i < extra_args.len() {
+        let arg = &extra_args[i];
+        if arg.starts_with('-') {
+            let takes_value = i + 1 < extra_args.len() && !extra_args[i + 1].starts_with('-');
+            cmd = strip_cli_flag_token(&cmd, arg, takes_value);
+            i += if takes_value { 2 } else { 1 };
+        } else {
+            i += 1;
+        }
+    }
+
+    let insert = extra_args
+        .iter()
+        .map(|a| boss_ssh_transport::shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Prefer inserting before `-m` / stdin redirect so flags stay together
+    // with the rest of the CLI options (Codex and Claude both put model
+    // after flags).
+    if let Some(pos) = cmd.find(" -m ") {
+        format!("{} {}{}", &cmd[..pos], insert, &cmd[pos..])
+    } else if let Some(pos) = cmd.find(" < ") {
+        format!("{} {}{}", &cmd[..pos], insert, &cmd[pos..])
+    } else if let Some(pos) = cmd.rfind('\n') {
+        format!("{} {}{}", &cmd[..pos], insert, &cmd[pos..])
+    } else {
+        format!("{cmd} {insert}")
+    }
+}
+
+/// Remove ` flag` (and optionally its following value token) from a generated
+/// pane command. Only used on engine-built command lines (whitespace-delimited
+/// flags); not a general shell parser.
+fn strip_cli_flag_token(command: &str, flag: &str, takes_value: bool) -> String {
+    let needle = format!(" {flag}");
+    let Some(start) = command.find(&needle) else {
+        // Flag at the very start of the command (no leading space).
+        if command == flag || command.starts_with(&format!("{flag} ")) || command.starts_with(&format!("{flag}\n")) {
+            let after = flag.len();
+            if takes_value {
+                let rest = command[after..].trim_start();
+                let skipped = command[after..].len() - rest.len();
+                let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+                return command[after + skipped + token_end..].trim_start().to_owned();
+            }
+            return command[after..].trim_start().to_owned();
+        }
+        return command.to_owned();
+    };
+    let after_flag = start + needle.len();
+    if !takes_value {
+        return format!("{}{}", &command[..start], &command[after_flag..]);
+    }
+    let rest = &command[after_flag..];
+    let rest_trimmed = rest.trim_start();
+    let ws = rest.len() - rest_trimmed.len();
+    // Value may be shell-quoted (`'workspace-write'`) or bare.
+    let token_end = if let Some(inside) = rest_trimmed.strip_prefix('\'') {
+        // Find closing unescaped single quote (shell_quote form).
+        inside
+            .find('\'')
+            .map(|i| i + 2) // include both quotes
+            .unwrap_or(rest_trimmed.len())
+    } else {
+        rest_trimmed.find(char::is_whitespace).unwrap_or(rest_trimmed.len())
+    };
+    let end = after_flag + ws + token_end;
+    format!("{}{}", &command[..start], &command[end..])
 }
 
 /// A named capability Boss needs from an agent driver.
@@ -729,7 +825,8 @@ pub struct TurnEnd {
 /// turns it into the PreToolUse hook entries that guard the tool-call surface
 /// (path guard, boss-launch guard, PR-redirect guard, checkleft push guard,
 /// revision PR guard).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ToolUseInterceptionConfig {
     /// Parent directory of the engine events socket (the Boss data dir). The
     /// path guard uses this to fence workers off the engine's runtime state.
@@ -750,6 +847,12 @@ pub struct ToolUseInterceptionConfig {
     /// PR-redirect guard and the checkleft push guard because their deny rules
     /// already block push operations.
     pub is_standard_worker: bool,
+    /// Execution / run id — used by Codex to locate the Boss-owned per-run
+    /// `CODEX_HOME` when arming hooks. Claude ignores this.
+    pub run_id: Option<String>,
+    /// Workspace path (Codex project trust / hooks observation cwd). Claude
+    /// ignores this.
+    pub workspace_path: Option<PathBuf>,
 }
 
 /// The PreToolUse hook entries the driver wires for [`Capability::ToolUseInterception`].
@@ -1008,7 +1111,7 @@ pub fn default_structured_output_wiring(request: &StructuredOutputRequest<'_>) -
 /// field is a concept that holds across backends: the resolved model/effort,
 /// an optional rendered settings/config path, the corp-laptop
 /// auto-permissions override, and an optional forced permission mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct SpawnRequest<'a> {
     /// Resolved model slug (e.g. `"opus"`, `"sonnet"`).
     pub model: &'a str,
@@ -1026,6 +1129,10 @@ pub struct SpawnRequest<'a> {
     /// capability-restricted answer agent), suppressing the model-derived
     /// choice. `None` keeps the default per-model behaviour.
     pub permission_mode_override: Option<&'a str>,
+    /// Execution / run id. Codex uses this to resolve the Boss-owned per-run
+    /// `CODEX_HOME` (see [`codex::codex_home_for_run`]). Claude ignores it.
+    /// `None` only for fixtures that do not provision a real home.
+    pub run_id: Option<&'a str>,
 }
 
 /// One environment adjustment a [`SpawnPlan`] applies to the worker pane
@@ -1726,10 +1833,13 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
             is_revision: true,
             is_standard_worker: true,
+            run_id: Some("run-1".into()),
+            workspace_path: Some(PathBuf::from("/ws")),
         };
         assert!(config.is_revision);
         assert!(config.is_standard_worker);
         assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
+        assert_eq!(config.run_id.as_deref(), Some("run-1"));
     }
 
     #[test]

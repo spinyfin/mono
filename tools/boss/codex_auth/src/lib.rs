@@ -118,6 +118,15 @@ impl AuthFingerprint {
         let s = self.as_str();
         if s.len() >= 16 { &s[..16] } else { s }
     }
+
+    /// Rehydrate a fingerprint previously obtained from [`Self::as_str`].
+    ///
+    /// Used when a driver persists the provision fingerprint on
+    /// `DriverRuntimeState` and later rebuilds an [`AuthSnapshot`] for
+    /// refresh adoption. Does not re-hash; the string is treated as opaque.
+    pub fn from_stored(hex: impl Into<String>) -> Self {
+        Self(hex.into())
+    }
 }
 
 impl std::fmt::Display for AuthFingerprint {

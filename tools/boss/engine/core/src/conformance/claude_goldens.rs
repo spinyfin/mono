@@ -66,6 +66,7 @@ fn golden_spawn_line_opus_with_settings() {
         settings_path: Some(settings.as_path()),
         non_opus_auto_mode: false,
         permission_mode_override: None,
+        run_id: None,
     });
     assert_eq!(
         plan.env,
@@ -87,6 +88,7 @@ fn golden_spawn_line_sonnet_skip_permissions() {
         settings_path: None,
         non_opus_auto_mode: false,
         permission_mode_override: None,
+        run_id: None,
     });
     assert_eq!(
         plan.command,
@@ -102,6 +104,7 @@ fn golden_spawn_line_sonnet_corp_auto_mode() {
         settings_path: None,
         non_opus_auto_mode: true,
         permission_mode_override: None,
+        run_id: None,
     });
     assert_eq!(
         plan.command,
@@ -117,6 +120,7 @@ fn golden_spawn_line_dont_ask_override() {
         settings_path: None,
         non_opus_auto_mode: false,
         permission_mode_override: Some("dontAsk"),
+        run_id: None,
     });
     assert_eq!(
         plan.command,
