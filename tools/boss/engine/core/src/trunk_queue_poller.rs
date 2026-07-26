@@ -1602,8 +1602,9 @@ pub trait TrunkEvictionEvidence: Send + Sync {
 /// Production evidence: shells out to `bk` and `gh`.
 ///
 /// Deliberately untested end-to-end — neither binary is available and
-/// authenticated in CI, mirroring the pre-existing posture for
-/// `find_trunk_merge_eviction_build` and `ci_watch::fetch_and_store_log_excerpt`.
+/// authenticated in CI. Tests substitute the whole channel via
+/// [`TrunkEvictionEvidence`] (same injection idea as
+/// `ci_watch::fetch_and_store_log_excerpt`'s [`crate::ci_log_reader::CiLogReaderFactory`]).
 /// The logic these methods wrap lives in pure, covered functions
 /// ([`newest_trunk_bot_comment`], [`bot_comment_merge_failure_marker`], and
 /// `boss_ci_log_reader`'s own parser); what is left here is argument
@@ -1677,12 +1678,12 @@ fn newest_trunk_bot_comment(body: &[u8]) -> Option<String> {
 }
 
 /// The `bk` binary invoked to discover Buildkite evidence for a Trunk
-/// eviction. Hardcoded rather than configurable — mirrors
-/// `ci_watch::fetch_and_store_log_excerpt`'s existing precedent and accepts
-/// that the shell-out itself goes untested (there is no `bk` binary in CI);
-/// the pure JSON parser and an end-to-end fake-binary test cover the
-/// discovery logic in `boss_ci_log_reader`. Tests substitute the whole
-/// channel via [`TrunkEvictionEvidence`] instead.
+/// eviction. Hardcoded on the production [`CliEvictionEvidence`] path —
+/// tests never hit this constant because they inject
+/// [`TrunkEvictionEvidence`] doubles instead (parallel to
+/// `ci_watch`'s injectable [`crate::ci_log_reader::CiLogReaderFactory`]).
+/// The pure JSON parser and an end-to-end fake-binary test cover the
+/// discovery logic in `boss_ci_log_reader`.
 const BK_BINARY: &str = "bk";
 
 /// Classify a Trunk queue eviction, then route it to the ledger that can

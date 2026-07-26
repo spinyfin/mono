@@ -752,7 +752,7 @@ async fn an_evicted_entry_keeps_its_intent_active_for_the_remediation_path() {
 /// The evidence channels are stubbed ([`StubEvictionEvidence`]) rather than
 /// shelled out, so this exercises the whole poller → classify → `ci_watch`
 /// wiring for the test-failure arm; the `bk`/`gh` invocations themselves stay
-/// untested, mirroring the `fetch_and_store_log_excerpt` precedent.
+/// untested (same injection posture as `ci_watch`'s `CiLogReaderFactory`).
 #[tokio::test]
 async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
     let (_tmp, db) = crate::test_support::open_db();
