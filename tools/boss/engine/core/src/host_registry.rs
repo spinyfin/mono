@@ -7,6 +7,7 @@
 /// on every engine startup via `uname` + `gh auth status`.
 use std::collections::{BTreeSet, HashMap};
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
 use boss_event_bus::Event;
@@ -201,7 +202,20 @@ pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<
 /// Probe the local host and return `(capability, source)` pairs. Every
 /// returned row has `source = "auto"`. Failures for individual probes
 /// are logged and skipped; the remainder still land.
+///
+/// Cached process-wide: `uname` + `gh auth status` are stable for the
+/// life of an engine process (design: probe once at startup). Without
+/// the cache, every fresh `WorkDb::open` / schema-template init re-ran
+/// the full probe — and `gh auth status` alone was ~0.7s against a real
+/// `gh` (network + keychain). That cost was paid once per unit test that
+/// opened a WorkDb, dominating suites that open many databases.
 fn discover_local_capabilities() -> Vec<(String, String)> {
+    static CACHED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CACHED.get_or_init(discover_local_capabilities_uncached).clone()
+}
+
+/// Uncached probe body. See [`discover_local_capabilities`].
+fn discover_local_capabilities_uncached() -> Vec<(String, String)> {
     let mut caps: Vec<(String, String)> = Vec::new();
 
     // OS family
