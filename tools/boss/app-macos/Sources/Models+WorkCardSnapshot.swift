@@ -80,10 +80,11 @@ struct WorkCardSnapshotContext: Equatable {
     var terminalTooltip: String = "Open terminal on PR branch"
     /// True when the caller will supply an `onMergeWhenReady` closure.
     var showsMergeWhenReady: Bool = false
-    /// Board chrome style. Must live on the equatable snapshot so
+    /// Board chrome style captured into the equatable snapshot so
     /// `.equatable()` re-evaluates card bodies when the user flips
-    /// `boss.kanban.boardStyle` (environment alone is invisible to
-    /// `WorkBoardCardView.==`).
+    /// `boss.kanban.boardStyle` (an `@Environment` read alone is
+    /// invisible to `WorkBoardCardView.==` and would leave mounted
+    /// cards on stale fill/border/shadow).
     var boardStyle: KanbanBoardStyle = .classic
 }
 
