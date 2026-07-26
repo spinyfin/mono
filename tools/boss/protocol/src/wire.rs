@@ -1196,10 +1196,10 @@ pub enum FrontendRequest {
         state: Option<ProposalState>,
     },
 
-    /// Read-only: enumerate `kind = 'revision'` rows for a product. Revisions
-    /// are excluded from `ListTasks` and `ListChores` by design; this request
-    /// is the only way to list them in bulk. Replies with
-    /// [`FrontendEvent::RevisionsList`].
+    /// Read-only: enumerate `kind = 'revision'` rows for a product.
+    /// Revisions are also returned by [`Self::ListTasks`]; this request
+    /// remains the dedicated bulk path that can scope to a single parent
+    /// via `parent_id`. Replies with [`FrontendEvent::RevisionsList`].
     ListRevisions {
         product_id: String,
         /// Phase 3 dep filter (Q6). See [`Self::ListProjects`].

@@ -1,5 +1,79 @@
 use super::*;
 
+/// `list_tasks` (and therefore `boss task list` / `ListTasks`) must return
+/// chore and revision rows — never silently drop them. Narrow kind-only
+/// verbs (`list_chores`, `list_revisions`) remain available; the general
+/// list surface is flavor-complete.
+#[test]
+fn list_tasks_includes_chore_and_revision_kinds() {
+    let db = WorkDb::open(temp_db_path("list-tasks-all-kinds")).unwrap();
+    let product_id = make_revision_product(&db, "list-all-kinds");
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product_id.clone(),
+            name: "List kinds project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: false,
+        })
+        .unwrap();
+    let project_task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product_id.clone())
+                .project_id(project.id.clone())
+                .name("A project task")
+                .build(),
+        )
+        .unwrap();
+    let chore_id = make_in_review_chore(&db, &product_id, "https://github.com/spinyfin/mono/pull/4242");
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&chore_id), &checker).unwrap();
+
+    let product_wide = db.list_tasks(&product_id, None, None, false).unwrap();
+    let kinds: std::collections::HashSet<_> = product_wide.iter().map(|t| t.kind.clone()).collect();
+    assert!(
+        kinds.contains(&TaskKind::Chore),
+        "list_tasks must include chore rows; got kinds {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&TaskKind::Revision),
+        "list_tasks must include revision rows; got kinds {kinds:?}"
+    );
+    assert!(
+        kinds.contains(&TaskKind::ProjectTask) || kinds.contains(&TaskKind::Design),
+        "list_tasks must still include project-scoped rows; got kinds {kinds:?}"
+    );
+    assert!(
+        product_wide.iter().any(|t| t.id == chore_id),
+        "expected chore {chore_id} in product-wide list"
+    );
+    assert!(
+        product_wide.iter().any(|t| t.id == revision.id),
+        "expected revision {} in product-wide list",
+        revision.id
+    );
+    assert!(
+        product_wide.iter().any(|t| t.id == project_task.id),
+        "expected project task {} in product-wide list",
+        project_task.id
+    );
+
+    // Project-scoped list still returns project-bound rows (design + task
+    // + any revision that inherited the project). Chores have no project_id
+    // and correctly stay out of the project filter.
+    let project_scoped = db.list_tasks(&product_id, Some(&project.id), None, false).unwrap();
+    assert!(
+        project_scoped.iter().any(|t| t.id == project_task.id),
+        "project-scoped list must include the project task"
+    );
+    assert!(
+        !project_scoped.iter().any(|t| t.id == chore_id),
+        "project-scoped list must not invent a project for project-less chores"
+    );
+}
+
 #[test]
 fn metadata_get_returns_none_for_missing_key() {
     let path = temp_db_path("meta-missing");

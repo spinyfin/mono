@@ -392,9 +392,9 @@ pub(crate) enum TaskCommand {
     /// Spans the *entire* work-item space — every kind (`project_task`,
     /// `chore`, `design`, `investigation`, `revision`) across every
     /// product — so a chore- or revision-backed PR is found just as
-    /// readily as a project task. This sidesteps the `task list` blind
-    /// spot (it omits chores and revisions), which is the only other way
-    /// to map a PR back to its work item.
+    /// readily as a project task. Prefer this over scanning `task list`
+    /// when the PR number is known: it is O(1) on the number and surfaces
+    /// revision children under the owning row.
     ///
     /// `--repo` is optional: a PR number is unique within a repo, so it
     /// is only needed when the same number exists in more than one repo.
@@ -493,11 +493,10 @@ pub(crate) enum TaskCommand {
     /// not a block.
     #[command(name = "create-revision")]
     CreateRevision(RevisionCreateArgs),
-    /// List `kind = 'revision'` tasks for a product. Revisions are excluded
-    /// from `task list` and `chore list` by default; this is the only way to
-    /// enumerate them in bulk. Scope with `--product`, `--status`,
-    /// `--priority`, or `--parent` (filter to one parent task's revision
-    /// chain).
+    /// List `kind = 'revision'` tasks for a product. Revisions also appear
+    /// in `boss task list`; this verb remains useful when you want only
+    /// revisions (or one parent chain via `--parent`). Scope with
+    /// `--product`, `--status`, `--priority`, or `--parent`.
     #[command(name = "list-revisions")]
     ListRevisions(RevisionListArgs),
 }
@@ -2095,6 +2094,11 @@ pub(crate) struct TaskCreateArgs {
     pub(crate) target_symbol: Vec<String>,
 }
 
+/// Args for `boss task list`. Returns every leaf work-item kind for the
+/// product (project tasks, design, investigation, design_postmortem,
+/// followup, chore, revision). Narrow with `--project` (excludes
+/// project-less chores) or use `boss chore list` / `boss task list-revisions`
+/// for single-kind views.
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskListArgs {
     #[arg(long)]

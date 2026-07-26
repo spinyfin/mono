@@ -267,6 +267,16 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // the field is only meaningful for Review-lane tasks. Mirrors the
     // `show_effort` pattern.
     let show_ready = tasks.iter().any(|t| t.pr_url.is_some());
+    // KIND is rendered whenever the view mixes kinds (or is pure
+    // chore/revision/etc.). Homogeneous project-task lists stay narrow;
+    // once `boss task list` can return every leaf kind, the column is what
+    // keeps chore/revision rows distinguishable from project tasks.
+    let show_kind = tasks.iter().any(|t| {
+        !matches!(
+            t.kind,
+            boss_protocol::TaskKind::ProjectTask | boss_protocol::TaskKind::Task
+        )
+    });
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
         header.push("#");
@@ -274,7 +284,11 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if !show_short_id || with_primary_id {
         header.push("ID");
     }
-    header.extend_from_slice(&["NAME", "STATUS", "PRIORITY"]);
+    header.push("NAME");
+    if show_kind {
+        header.push("KIND");
+    }
+    header.extend_from_slice(&["STATUS", "PRIORITY"]);
     if show_effort {
         header.push("EFFORT");
     }
@@ -302,6 +316,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
             row.push(task.id.clone());
         }
         row.push(task.name.clone());
+        if show_kind {
+            row.push(task.kind.as_str().to_owned());
+        }
         row.push(task.status.display_label().to_owned());
         row.push(task.priority.clone());
         if show_effort {
