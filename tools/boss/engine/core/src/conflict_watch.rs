@@ -432,12 +432,55 @@ pub async fn on_conflict_detected_with(
                             );
                             return reconciled;
                         }
-                    } else {
-                        // Old-style crz (no revision), still in flight.
+                    } else if active_crz.status == "pending" {
+                        // A `pending` attempt with no revision is the shape
+                        // the ladder path deliberately leaves behind when it
+                        // declines to spawn a worker this tick:
+                        // `MechanicalRungsUnavailable` (rung-1 lease failure)
+                        // and, under `ConflictRemediationMode::Deferred`,
+                        // every tick where the background remediator declined
+                        // the enqueue. That is explicitly a **retry** state —
+                        // "the attempt stays pending with no revision_task_id
+                        // so the next tick re-enters the ladder" is the whole
+                        // contract — so fall through to the shared
+                        // insert/lookup + ladder block below.
+                        //
+                        // Returning `false` here (as this branch used to)
+                        // made that contract a lie and stranded the row: once
+                        // the parent is `blocked: merge_conflict` with a
+                        // pending attempt, the `in_review` pre-flight above
+                        // no longer applies and the flip's WHERE guard always
+                        // misses, so every subsequent sweep landed here and
+                        // no-opped. Nothing was in flight, nothing was
+                        // scheduled, and the only automatic recovery was the
+                        // startup-only
+                        // `reconcile_orphaned_conflict_ladder_attempts`.
+                        //
+                        // Falling through creates nothing duplicate: the
+                        // INSERT below UNIQUE-collides with this very row and
+                        // falls back to it, and the remediation queue's own
+                        // dedup declines a second ladder run while one is
+                        // genuinely in flight.
                         tracing::debug!(
                             work_item_id = %candidate.work_item_id,
                             pr_url = %candidate.pr_url,
-                            "conflict_watch: blocked signal re-armed; active crz still in flight; no new dispatch",
+                            attempt_id = %active_crz.id,
+                            "conflict_watch: blocked signal re-armed; attempt pending with no fix vehicle; \
+                             re-entering the ladder for it",
+                        );
+                    } else {
+                        // `running` with no revision: the legacy bespoke
+                        // dispatch (`mark_conflict_resolution_running`, which
+                        // stamps a real lease/workspace/worker onto the row)
+                        // genuinely has an actor holding a cube workspace
+                        // against this PR. Re-entering would race a mechanical
+                        // rebase against it, so this one really is "leave it
+                        // alone" rather than "stranded".
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %active_crz.id,
+                            "conflict_watch: blocked signal re-armed; old-style crz still running; no new dispatch",
                         );
                         return false;
                     }
@@ -629,18 +672,37 @@ pub async fn on_conflict_detected_with(
                 .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
                 .ok()
                 .flatten();
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                base_sha_at_trigger = ?probe.base_ref_oid,
-                head_sha_before = ?probe.head_ref_oid,
-                colliding_attempt_id = ?colliding.as_ref().map(|c| c.id.as_str()),
-                colliding_status = ?colliding.as_ref().map(|c| c.status.as_str()),
-                "conflict_watch: insert_conflict_resolution UNIQUE collision; no fresh attempt created for this key",
-            );
-            work_db
+            let active = work_db
                 .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-                .unwrap_or(None)
+                .unwrap_or(None);
+            // A `pending` attempt with no revision is the row the blocked
+            // re-arm path above deliberately falls through on so the ladder
+            // can be retried for it. That collision is the *expected*
+            // outcome of a retry tick, not an anomaly — warning on it every
+            // sweep for the life of a stuck conflict would bury the genuine
+            // "an attempt was silently eaten" signal this line exists for.
+            let expected_ladder_reentry = active
+                .as_ref()
+                .is_some_and(|a| a.status == "pending" && a.revision_task_id.is_none());
+            if expected_ladder_reentry {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = ?active.as_ref().map(|a| a.id.as_str()),
+                    "conflict_watch: no fresh attempt for this key; re-entering the existing pending attempt",
+                );
+            } else {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    base_sha_at_trigger = ?probe.base_ref_oid,
+                    head_sha_before = ?probe.head_ref_oid,
+                    colliding_attempt_id = ?colliding.as_ref().map(|c| c.id.as_str()),
+                    colliding_status = ?colliding.as_ref().map(|c| c.status.as_str()),
+                    "conflict_watch: insert_conflict_resolution UNIQUE collision; no fresh attempt created for this key",
+                );
+            }
+            active
         }
         Err(err) => {
             tracing::warn!(
@@ -697,6 +759,16 @@ pub async fn on_conflict_detected_with(
                 // reason: the attempt stays `pending` with no
                 // `revision_task_id`, so a declined enqueue is retried by a
                 // later detection tick rather than lost.
+                //
+                // That retry is not hypothetical: the blocked re-arm path
+                // above (`active_crz.status == "pending"` with no revision)
+                // exists precisely to route the next tick back here. Both
+                // declines below are therefore recoverable —
+                // `AlreadyInFlight` resolves when the running ladder reports
+                // its outcome, and `Cooldown` can now only be owed by an
+                // outcome that genuinely asked to be retried
+                // (`RemediationDisposition::RetryAfterCooldown`), so it
+                // lapses within one cooldown window.
                 mechanical_rungs_unavailable = true;
                 match queue.try_enqueue(candidate, a, probe) {
                     EnqueueOutcome::Enqueued => {

@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
-use crate::conflict_remediation::{ConflictRemediationJob, ConflictRemediationQueue};
+use crate::conflict_remediation::{ConflictRemediationJob, ConflictRemediationQueue, RemediationDisposition};
 use crate::work::ConflictResolution;
 
 /// Remediation job that records what it was handed and then parks until the
@@ -31,12 +31,40 @@ struct ParkingJob {
 
 #[async_trait]
 impl ConflictRemediationJob for ParkingJob {
-    async fn run(&self, candidate: PendingMergeCheck, _attempt: ConflictResolution, _probe: PrLifecycleProbe) {
+    async fn run(
+        &self,
+        candidate: PendingMergeCheck,
+        _attempt: ConflictResolution,
+        _probe: PrLifecycleProbe,
+    ) -> RemediationDisposition {
         self.seen.lock().unwrap().push(candidate.pr_url.clone());
         if let Ok(permit) = self.release.acquire().await {
             permit.forget();
         }
         self.finished.fetch_add(1, Ordering::SeqCst);
+        RemediationDisposition::Settled
+    }
+}
+
+/// Remediation job that concludes immediately with a scripted disposition —
+/// the stand-in for a ladder run that finished (rather than one that is still
+/// holding a cube lease). Records the attempt id it was handed on each run, so
+/// a test can tell a genuine second dispatch from a repeat of the first.
+struct ScriptedJob {
+    seen: Arc<std::sync::Mutex<Vec<String>>>,
+    disposition: RemediationDisposition,
+}
+
+#[async_trait]
+impl ConflictRemediationJob for ScriptedJob {
+    async fn run(
+        &self,
+        _candidate: PendingMergeCheck,
+        attempt: ConflictResolution,
+        _probe: PrLifecycleProbe,
+    ) -> RemediationDisposition {
+        self.seen.lock().unwrap().push(attempt.id.clone());
+        self.disposition
     }
 }
 
@@ -229,4 +257,108 @@ async fn repeat_passes_do_not_stack_ladder_runs_on_the_same_pr() {
     );
 
     remediation.release.add_permits(4);
+}
+
+/// The other half of the dedup contract, and the one that was broken: a
+/// **declined** enqueue must never be terminal.
+///
+/// After the first deferred detection the parent sits `blocked:
+/// merge_conflict` with a `pending` attempt and no `revision_task_id`. The
+/// `in_review` pre-flight no longer applies to it and the flip's
+/// `status='in_review'` WHERE guard always misses, so every later sweep lands
+/// in the blocked re-arm path. That path used to return "active crz still in
+/// flight; no new dispatch" for exactly this shape — so once a ladder run
+/// finished `MechanicalRungsUnavailable` (which deliberately leaves the
+/// attempt pending and starts a cooldown), *nothing* ever re-entered: no job
+/// was in flight, none was scheduled, and the only automatic recovery was the
+/// startup-only `reconcile_orphaned_conflict_ladder_attempts`.
+///
+/// So: run one ladder to `MechanicalRungsUnavailable`, confirm the next pass
+/// is declined by the cooldown (which proves it reached `try_enqueue` at all),
+/// then wait the cooldown out and assert a later pass really does dispatch a
+/// second ladder run against the same still-pending attempt.
+#[tokio::test]
+async fn a_declined_enqueue_is_retried_by_a_later_pass_rather_than_stranding_the_row() {
+    let db = Arc::new(WorkDb::open(std::path::PathBuf::from(":memory:")).unwrap());
+    let publisher = Arc::new(RecordingPublisher::default());
+    let probe = StubProbe::new();
+    let flags_dir = tempdir().unwrap();
+
+    let pr = "https://github.com/foo/bar/pull/2309";
+    let (_product, chore) = make_chore_in_review(&db, "conflicted", pr);
+    probe.set_with_base_head(
+        pr,
+        PrLifecycleState::Open(OpenPrStatus::conflict_only()),
+        "base-1",
+        "head-1",
+    );
+
+    let handler = handler_with_ladder_enabled(db.clone(), publisher.clone(), &flags_dir);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    // The rung-1-lease-failure outcome: the ladder ran, resolved nothing, and
+    // deliberately left the attempt pending for a later tick.
+    let queue = ConflictRemediationQueue::with_limits(
+        Arc::new(ScriptedJob {
+            seen: seen.clone(),
+            disposition: RemediationDisposition::RetryAfterCooldown,
+        }),
+        2,
+        // Generous: the point is only that pass 2 lands inside the window and
+        // pass 3 outside it, and a tight window makes that a load-dependent
+        // race on a busy test runner rather than an assertion about the code.
+        std::time::Duration::from_secs(2),
+    );
+
+    let pass = async || {
+        run_one_pass(
+            db.as_ref(),
+            probe.as_ref(),
+            publisher.as_ref(),
+            Some(&NoopCubeClient as &dyn CubeClient),
+            Some(&handler),
+            Some(&queue),
+        )
+        .await
+    };
+
+    pass().await;
+    assert!(
+        wait_until(|| seen.lock().unwrap().len() == 1).await,
+        "the first pass must dispatch a ladder run",
+    );
+    // The state this test is about: parent blocked, attempt pending, no fix
+    // vehicle, and no job running or scheduled.
+    let attempt = db
+        .latest_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("detection recorded an attempt");
+    assert_eq!(attempt.status, "pending");
+    assert_eq!(attempt.revision_task_id, None);
+    match db.get_work_item(&chore).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Blocked),
+        other => panic!("expected chore, got {other:?}"),
+    }
+
+    // Inside the cooldown: re-entered and correctly declined — not silently
+    // no-opped one layer up, which is what stranded the row.
+    pass().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "a pass inside the cooldown must not stack a second ladder run",
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+    pass().await;
+    assert!(
+        wait_until(|| seen.lock().unwrap().len() == 2).await,
+        "past the cooldown a later pass must actually re-dispatch the ladder; \
+         a pending attempt with no revision is a retry state, not a terminal one",
+    );
+    assert_eq!(
+        seen.lock().unwrap().as_slice(),
+        [attempt.id.clone(), attempt.id.clone()],
+        "the retry must re-enter the *same* attempt row, not create a duplicate",
+    );
 }

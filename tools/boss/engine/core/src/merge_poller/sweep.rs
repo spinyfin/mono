@@ -129,7 +129,11 @@ pub(crate) const MAX_PROBE_REFRESHES_PER_PASS: u8 = 2;
 /// GitHub. See [`PROBE_SNAPSHOT_MAX_AGE`].
 pub(crate) struct ProbeSnapshot {
     pub(crate) results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
-    taken_at: Instant,
+    /// `tokio::time::Instant`, not `std::time::Instant`, so the ageing logic
+    /// is drivable from tests under a paused clock (`tokio::time::advance`)
+    /// instead of only by a real 60-second wall-clock stall. Identical to the
+    /// std clock outside a paused runtime.
+    taken_at: tokio::time::Instant,
     refreshes_left: u8,
 }
 
@@ -137,7 +141,7 @@ impl ProbeSnapshot {
     pub(crate) fn new(results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>) -> Self {
         Self {
             results,
-            taken_at: Instant::now(),
+            taken_at: tokio::time::Instant::now(),
             refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
         }
     }
@@ -149,7 +153,21 @@ impl ProbeSnapshot {
     /// and return `true`. Stale snapshot with the per-pass refresh budget
     /// already spent → `false`, and the caller must stop: writing off a
     /// snapshot that old is worse than deferring to the next pass.
-    pub(crate) async fn ensure_fresh(&mut self, probe: &dyn MergeProbe, probe_urls: &[String]) -> bool {
+    ///
+    /// `remaining_urls` is called **only** on the re-probe path and must
+    /// yield just the candidates the pass has not walked yet. Re-probing the
+    /// pass's whole original URL set would re-fetch every candidate already
+    /// transitioned earlier in the pass, multiplying GitHub batch cost on
+    /// precisely the path that is already slow enough to have gone stale.
+    /// Nothing is lost by dropping the processed prefix: those entries are
+    /// never read again, and every candidate list is rebuilt from the DB next
+    /// pass. It is a closure rather than a slice so the common (fresh) case
+    /// allocates nothing.
+    pub(crate) async fn ensure_fresh(
+        &mut self,
+        probe: &dyn MergeProbe,
+        remaining_urls: impl FnOnce() -> Vec<String>,
+    ) -> bool {
         let age = self.taken_at.elapsed();
         if age <= PROBE_SNAPSHOT_MAX_AGE {
             return true;
@@ -164,16 +182,29 @@ impl ProbeSnapshot {
             return false;
         }
         self.refreshes_left -= 1;
+        let urls = remaining_urls();
         tracing::warn!(
             snapshot_age_ms = age.as_millis(),
             max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
-            pr_count = probe_urls.len(),
-            "merge poller: probe snapshot went stale mid-pass; re-probing before writing further state",
+            pr_count = urls.len(),
+            "merge poller: probe snapshot went stale mid-pass; re-probing the unprocessed remainder \
+             before writing further state",
         );
-        self.results = probe.probe_batch(probe_urls).await;
-        self.taken_at = Instant::now();
+        self.results = probe.probe_batch(&urls).await;
+        self.taken_at = tokio::time::Instant::now();
         true
     }
+}
+
+/// The still-unprocessed candidates' PR urls, de-duplicated and in walk
+/// order — what [`ProbeSnapshot::ensure_fresh`] re-probes when it must.
+fn remaining_probe_urls<'a>(remaining: impl IntoIterator<Item = &'a PendingMergeCheck>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    remaining
+        .into_iter()
+        .map(|c| c.pr_url.clone())
+        .filter(|url| seen.insert(url.clone()))
+        .collect()
 }
 
 /// Run one full lifecycle sweep over every chore and project_task
@@ -305,17 +336,31 @@ pub async fn run_one_pass(
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
     let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
+    // The pass's candidate walk, materialised so a mid-pass re-probe can be
+    // scoped to the part of it that has not happened yet — see
+    // [`ProbeSnapshot::ensure_fresh`].
+    let sweep_walk: Vec<&PendingMergeCheck> = in_review
+        .iter()
+        .chain(blocked_conflict.iter())
+        .chain(blocked_ci.iter())
+        .collect();
     // De-duplicate by work_item_id: a chore that's both pending and
     // blocked-on-CI (shouldn't happen but defensive) only gets one
     // probe per sweep.
     let mut seen = std::collections::HashSet::new();
-    for candidate in in_review.iter().chain(blocked_conflict.iter()).chain(blocked_ci.iter()) {
+    for idx in 0..sweep_walk.len() {
+        let candidate = sweep_walk[idx];
         if !seen.insert(candidate.work_item_id.clone()) {
             continue;
         }
         // Never transition off a snapshot that has gone stale under a
         // long-running pass — see [`ProbeSnapshot`].
-        if !snapshot.ensure_fresh(probe, &probe_urls).await {
+        if !snapshot
+            .ensure_fresh(probe, || {
+                remaining_probe_urls(sweep_walk[idx..].iter().copied().chain(stranded_blocked.iter()))
+            })
+            .await
+        {
             break;
         }
         sweep_one(
@@ -358,11 +403,21 @@ pub async fn run_one_pass(
     // re-canonicalise a still-dirty row back into the standard
     // merge_conflict / ci_failure loop, and let the normal detection path
     // spawn a fresh revision.
-    for candidate in &stranded_blocked {
-        if !snapshot.ensure_fresh(probe, &probe_urls).await {
+    for idx in 0..stranded_blocked.len() {
+        if !snapshot
+            .ensure_fresh(probe, || remaining_probe_urls(stranded_blocked[idx..].iter()))
+            .await
+        {
             break;
         }
-        sweep_stranded_blocked_remediation(work_db, &snapshot.results, publisher, candidate, &mut outcome).await;
+        sweep_stranded_blocked_remediation(
+            work_db,
+            &snapshot.results,
+            publisher,
+            &stranded_blocked[idx],
+            &mut outcome,
+        )
+        .await;
     }
     // Late-PR sweep (Bug B): recover terminal executions whose pane
     // pushed a PR after the execution was marked abandoned.
