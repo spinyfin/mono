@@ -112,7 +112,7 @@ final class TerminalLoopMonitor: @unchecked Sendable {
     // MARK: Lifecycle
 
     /// Start the 1 Hz sampler. Idempotent; call once at launch (next to
-    /// `MainThreadStallMonitor.shared.start()`).
+    /// the stall-monitor apply-from-defaults wiring).
     @MainActor
     func start() {
         guard timer == nil else { return }

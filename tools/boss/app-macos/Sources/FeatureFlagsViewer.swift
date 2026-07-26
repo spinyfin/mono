@@ -101,6 +101,10 @@ struct FeatureFlagsViewer: View {
 /// not engine state). These take effect immediately without a restart.
 private struct AppFeatureFlagsSection: View {
     @AppStorage("boss.ui.standardSearch") private var standardSearch: Bool = false
+    /// Master switch for [[MainThreadStallMonitor]]. Default off = zero cost
+    /// (no timers, no watchdog queue). Live start/stop is applied by
+    /// AppDelegate's UserDefaults observer — no relaunch required.
+    @AppStorage(MainThreadStallMonitor.enabledKey) private var stallMonitoring: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -114,6 +118,13 @@ private struct AppFeatureFlagsSection: View {
                     description: "Use SwiftUI's platform-standard .searchable() for the work-board toolbar instead of the custom search item. Flip ON to validate the standard search path.",
                     defaultEnabled: false,
                     isOn: $standardSearch
+                )
+                Divider().padding(.leading, 12)
+                appFlagRow(
+                    name: MainThreadStallMonitor.enabledKey,
+                    description: "Main-thread hang watchdog. When ON, samples heartbeats and records stalls with backtraces (UI Stalls window, Cmd-Shift-U). Default OFF: no timers and no watchdog queue.",
+                    defaultEnabled: false,
+                    isOn: $stallMonitoring
                 )
             }
             .background(
