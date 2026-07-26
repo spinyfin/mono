@@ -426,6 +426,7 @@ dependencies = [
  "boss-engine-worker-policy",
  "boss-event-bus",
  "boss-feature-flags",
+ "boss-gh-telemetry",
  "boss-github",
  "boss-github-tracker",
  "boss-log-files",
@@ -667,11 +668,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-gh-telemetry"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "boss-github"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "boss-gh-telemetry",
  "jsonwebtoken",
  "reqwest",
  "rustls",

@@ -81,6 +81,7 @@ rust_library(
         "//tools/boss/engine/utility-model",
         "//tools/boss/engine/utils",
         "//tools/boss/engine/worker-policy",
+        "//tools/boss/gh_telemetry",
         "//tools/boss/github",
         "//tools/boss/github_tracker",
         "//tools/boss/log-files",

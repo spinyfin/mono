@@ -21,7 +21,9 @@ rust_library(
     visibility = [
         "//tools/boss:__subpackages__",
     ],
-    deps = all_crate_deps(normal = True),
+    deps = [
+        "//tools/boss/gh_telemetry",
+    ] + all_crate_deps(normal = True),
 )
 
 rust_test(
@@ -38,7 +40,9 @@ rust_test(
         "BOSS_SHAKE_INSTALLATION_ID": "$(BOSS_SHAKE_INSTALLATION_ID)",
         "BOSS_SHAKE_PRIVATE_KEY_PEM": "$(BOSS_SHAKE_PRIVATE_KEY_PEM)",
     },
-    deps = all_crate_deps(
+    deps = [
+        "//tools/boss/gh_telemetry",
+    ] + all_crate_deps(
         normal = True,
         normal_dev = True,
     ),

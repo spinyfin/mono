@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use boss_github::gh_runner::pr_in_merge_queue;
 
 use boss_engine_gh_invocation::gh_output;
+use boss_gh_telemetry::{callers, scope as gh_scope};
 
 /// Outcome of a successful merge-when-ready call, whichever mechanism
 /// produced it.
@@ -58,9 +59,12 @@ impl MergeAction {
 /// message when the merge was rejected (conflicts, auth failure, PR not
 /// open, etc.).
 pub async fn gh_merge_when_ready(pr_url: &str) -> Result<MergeAction> {
-    let output = gh_output(&["pr", "merge", "--auto", "--squash", pr_url])
-        .await
-        .map_err(|e| anyhow!("failed to spawn `gh pr merge`: {e}"))?;
+    let output = gh_scope(
+        callers::MERGE_WHEN_READY,
+        gh_output(&["pr", "merge", "--auto", "--squash", pr_url]),
+    )
+    .await
+    .map_err(|e| anyhow!("failed to spawn `gh pr merge`: {e}"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -70,7 +74,10 @@ pub async fn gh_merge_when_ready(pr_url: &str) -> Result<MergeAction> {
     }
 
     // Re-probe concurrently to determine which outcome occurred.
-    let (is_merged, is_in_queue) = tokio::join!(probe_is_merged(pr_url), pr_in_merge_queue(pr_url),);
+    let (is_merged, is_in_queue) = gh_scope(callers::MERGE_WHEN_READY, async {
+        tokio::join!(probe_is_merged(pr_url), pr_in_merge_queue(pr_url))
+    })
+    .await;
 
     Ok(derive_action(is_in_queue, is_merged))
 }
@@ -118,7 +125,11 @@ impl DirectMergeExecutor for CommandDirectMergeExecutor {
 /// Returns `true` when the PR's GitHub state is `MERGED`.
 /// Returns `false` on any error (graceful degradation).
 async fn probe_is_merged(pr_url: &str) -> bool {
-    let output = gh_output(&["pr", "view", pr_url, "--json", "state", "--jq", ".state"]).await;
+    let output = gh_scope(
+        callers::MERGE_WHEN_READY,
+        gh_output(&["pr", "view", pr_url, "--json", "state", "--jq", ".state"]),
+    )
+    .await;
     let Ok(out) = output else { return false };
     if !out.status.success() {
         return false;

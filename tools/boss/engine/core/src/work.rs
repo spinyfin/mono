@@ -438,6 +438,7 @@ mod exec_status_helpers;
 mod exec_tail;
 mod execution_retention;
 mod executions_runs;
+mod github_api_usage_db;
 mod host_reconcile_queries;
 mod insert_helpers;
 mod list_filter;
@@ -504,6 +505,7 @@ pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
+pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;
 pub use mappers::ConflictResolutionInsertInput;

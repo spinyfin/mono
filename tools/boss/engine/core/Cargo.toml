@@ -11,6 +11,7 @@ boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-claude-client = { path = "../../claude_client" }
 boss-comment-anchor = { path = "../../comment_anchor" }
 boss-engine-comment-classifier = { path = "../comment-classifier" }
+boss-gh-telemetry = { path = "../../gh_telemetry" }
 boss-github = { path = "../../github" }
 boss-github-tracker = { path = "../../github_tracker" }
 boss-trunk-auth = { path = "../../trunk_auth" }

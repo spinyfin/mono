@@ -1184,6 +1184,10 @@ impl ServerState {
         if let Err(err) = crate::metrics::seed_from_db(&server_state.metrics, &server_state.work_db) {
             tracing::warn!(?err, "metrics: seed_from_db failed; starting from zeroed counters",);
         }
+        // The GitHub API usage sink is installed later, on the async
+        // server-startup path (see `crate::app::server`), not here: it
+        // spawns a writer task, and this constructor also runs from
+        // synchronous unit tests with no Tokio reactor.
 
         // Late-bind the runner to the Arc<ServerState>. Going through
         // the WorkerSpawner trait keeps the runner unaware of
