@@ -1,8 +1,21 @@
 #!/usr/bin/env python3
-"""Own a pty master; spawn shell running codex; allow inject; log master reads."""
-import os, sys, time, select, pty, subprocess, signal, threading, fcntl, termios, struct
+"""Own a pty master; spawn shell running codex; allow inject; log master reads.
 
-SCRATCH = "/tmp/codex-pane-spike"
+Apparatus honesty (Q2):
+  This is a *harness-emulated* post-exit shell, not real Ghostty interactive zsh.
+  After `codex exec` exits, the slave script does explicit `read -r LINE` then
+  `eval \"$LINE\"`. That proves: (1) master-side inject survives codex exit in
+  the tty input buffer, (2) a subsequent shell *read* can consume the line, and
+  (3) *execution* only under this constructed read/eval — do not claim pure
+  interactive-shell observation of "shell executes injected text".
+
+  Stdin shape: open-tty pane (codex inherits the slave as 0/1/2). Not `</dev/null`.
+"""
+import os, sys, time, select, pty, subprocess, signal, threading, fcntl, termios, struct
+from shutil import which
+
+SCRATCH = os.environ.get("CODEX_PANE_SPIKE_SCRATCH", "/tmp/codex-pane-spike")
+CODEX = os.environ.get("CODEX_BIN") or which("codex") or os.path.expanduser("~/.local/bin/codex")
 os.makedirs(SCRATCH, exist_ok=True)
 
 master, slave = pty.openpty()
@@ -10,15 +23,18 @@ slave_name = os.ttyname(slave)
 print(f"master_fd={master} slave={slave_name}", flush=True)
 open(f"{SCRATCH}/pty_slave.txt","w").write(slave_name)
 
-# Spawn a login-like shell on the slave that runs our script
+# Spawn a scripted shell on the slave. Post-codex path is *harness-emulated*
+# (read/eval), not an interactive prompt — see module docstring.
 script = f"""#!/bin/zsh
 echo $$ > {SCRATCH}/shell_pid.txt
 tty > {SCRATCH}/tty.txt
 python3 -c 'import os; print({{i: (os.ttyname(i) if os.isatty(i) else "notty") for i in (0,1,2)}})' > {SCRATCH}/fds_before.txt
-/Users/brianduff/.local/bin/codex exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \
+{CODEX} exec --json --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox \\
   "run: sleep 18; reply with exactly: pty-owner-done"
 echo $? > {SCRATCH}/codex_exit.txt
-# emulate shell reading next command after agent exits
+# HARNESS-EMULATED post-exit shell (not real interactive Ghostty zsh):
+# consume any line left in the tty input buffer after codex exits, record it,
+# then eval it so execution is measurable. This is a constructed stand-in.
 if read -r LINE; then
   print -r -- "$LINE" > {SCRATCH}/shell_got_line.txt
   eval "$LINE"
@@ -77,9 +93,11 @@ for _ in range(100):
         break
     time.sleep(0.1)
 
-# Wait a few seconds into the codex run, then inject via MASTER (correct path for typed input)
+# Wait a few seconds into the codex run, then inject via MASTER (correct path for
+# typed input / SendToPane). Line is expected to sit in the tty input buffer while
+# codex is foreground; harness post-exit read/eval (above) measures consumption.
 time.sleep(4)
-payload = b"echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt\n"
+payload = f"echo INJECTED_VIA_MASTER > {SCRATCH}/injected_side_effect.txt\n".encode()
 print(f"injecting via master: {payload!r}", flush=True)
 os.write(master, payload)
 open(f"{SCRATCH}/inject_time.txt","w").write(str(time.time()))

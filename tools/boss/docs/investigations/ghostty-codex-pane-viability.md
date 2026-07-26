@@ -22,11 +22,11 @@ Both cannot be true as statements about the _pane-hosted Boss shape_. This spike
 
 Throwaway only. Three layers of harness:
 
-| Layer                        | What it is                                                          | Used for                                                                        |
-| ---------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| **A. Real Ghostty window**   | `open -na Ghostty.app --args -e <script>`                           | Q1 (pane-owned pty + `shell_pid` only), Q4                                      |
-| **B. Local pty-owner**       | Python `pty.openpty()` holding the master, child shell on the slave | Q1 (master-side capture contrast), Q2 (correct input-injection path), Q3/Q5 TUI |
-| **C. Direct process / pipe** | `codex exec --json … </dev/null` with the observer owning stdout    | Q6, Q7, contrast for Q1                                                         |
+| Layer                        | What it is                                                          | Used for                                                                                                                                   |
+| ---------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| **A. Real Ghostty window**   | `open -na Ghostty.app --args -e <script>`                           | Q1 (pane-owned pty + `shell_pid` only), Q4                                                                                                 |
+| **B. Local pty-owner**       | Python `pty.openpty()` holding the master, child shell on the slave | Q1 (master-side capture contrast), Q2 (master inject + **harness-emulated** post-exit `read`/`eval` — not pure interactive zsh), Q3/Q5 TUI |
+| **C. Direct process / pipe** | `codex exec --json … </dev/null` with the observer owning stdout    | Q6, Q7, contrast for Q1                                                                                                                    |
 
 Harness scripts and selected raw captures are under [`ghostty-codex-pane-viability-artifacts/`](./ghostty-codex-pane-viability-artifacts/).
 
@@ -135,19 +135,48 @@ What blocks it, exactly:
 
 ### Claim under test
 
-Because `codex exec` runs one turn and exits with stdin closed / not consuming typed input, injected prose lands in the pty buffer and is then **executed by the shell** when it regains the foreground.
+Because `codex exec` runs one turn and exits **without consuming typed input as agent input**, injected prose can land in the pty input buffer; a subsequent shell that reads that buffer may then treat the line as a command. (Whether execution is automatic depends on the post-exit shell apparatus — see honesty notes below.)
+
+### Apparatus honesty (read this first)
+
+The positive "execution" result was **not** pure interactive-shell observation under real Ghostty zsh.
+
+`pty_owner.py` (layer B) owns the pty master and runs a **scripted** slave zsh that, **after** `codex exec` exits, **explicitly** does:
+
+```sh
+# harness-emulated post-exit shell — not a real interactive Ghostty prompt
+if read -r LINE; then
+  print -r -- "$LINE" > …/shell_got_line.txt
+  eval "$LINE"
+  echo $? > …/eval_exit.txt
+fi
+```
+
+So the empirical record is:
+
+| Layer of claim                                 | What was actually observed                                                                                                                        |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Buffer survives**                            | Master-side inject while `codex exec` is foreground is **echoed** into the master capture mid-JSONL and is **still available** after codex exits. |
+| **Subsequent shell read can consume the line** | Harness `read -r LINE` successfully returns the injected line into `shell_got_line.txt`.                                                          |
+| **Execution**                                  | Observed **only via that harness-emulated post-exit `read`/`eval`**, not via a real Ghostty interactive zsh reading the line as a typed command.  |
+
+Do **not** restate this as "we watched an interactive shell execute injected text" without disclosing the constructed `read`/`eval`. The harness deliberately emulates "shell regains foreground and runs the next line" so we can measure buffer survival + consumption; it is a stand-in, not the full interactive prompt stack.
+
+**Stdin closed vs open-tty pane:** this Q2 harness is an **open-tty** shape — codex inherits the slave as stdin/stdout/stderr (a pane-like fd topology). It is **not** `codex exec … </dev/null` (stdin closed). The accurate statement is: positional prompt already supplied; **stdin is the open tty but unused for turn input**; inject is not treated as a new agent prompt. Layer C pipe runs (`</dev/null`) are a different apparatus and were not the Q2 footgun path.
+
+**Slave write on real Ghostty (layer A)** remains a separate, non-representative negative: outsider `O_WRONLY` to the slave path + `TIOCSTI` did not reproduce typed input. That finding still stands and does **not** refute master-side inject risk.
 
 ### What we ran
 
-**Failed path (slave write from outsider, real Ghostty):** writing the payload to `/dev/ttys*` with `os.open(…, O_WRONLY)` while codex was foreground produced no side effect and no shell-consumed line. `TIOCSTI` failed with `PermissionError: [Errno 13] Permission denied`. Slave-side write is **not** a reliable stand-in for "typed into the pane."
+**Failed path (slave write from outsider, real Ghostty — not representative of SendToPane):** writing the payload to `/dev/ttys*` with `os.open(…, O_WRONLY)` while codex was foreground produced no side effect and no shell-consumed line. `TIOCSTI` failed with `PermissionError: [Errno 13] Permission denied`. Slave-side write is **not** a reliable stand-in for "typed into the pane."
 
-**Correct path (master write — what a terminal app / `SendToPane` actually does):** local pty-owner harness (`pty_owner.py`):
+**Master-write path (what a terminal app / `SendToPane` actually does):** local pty-owner harness (`pty_owner.py`) — master `os.write`, then harness post-exit `read`/`eval` as disclosed above:
 
 ```text
 injecting via master: b'echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt\n'
 … codex runs sleep 18, exits 0 …
 shell_got_line: 'echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt\n'
-injected_side_effect: 'INJECTED_VIA_MASTER\n'
+injected_side_effect: 'INJECTED_VIA_MASTER\n'   # via harness eval, not interactive zsh
 eval_exit: '0'
 ```
 
@@ -166,23 +195,27 @@ echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt
 
 ### Outcome classification
 
-| Outcome                | Observed?        |
-| ---------------------- | ---------------- |
-| Inert no-op            | No (master path) |
-| Buffered-and-discarded | No (master path) |
-| **Shell-executes-it**  | **Yes**          |
+| Outcome                                            | Observed?                      | Apparatus note                                                                                         |
+| -------------------------------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| Inert no-op                                        | No (master path)               | Line is echoed and remains readable after exit                                                         |
+| Buffered-and-discarded                             | No (master path)               | Harness `read` still gets the full line                                                                |
+| **Line available for post-exit shell consumption** | **Yes**                        | Master inject + open-tty buffer                                                                        |
+| **Execution of injected text**                     | **Yes, harness-emulated only** | Explicit post-exit `read -r` + `eval "$LINE"` in `pty_owner.py` — **not** pure interactive Ghostty zsh |
+| Real Ghostty interactive shell auto-exec           | **Not observed**               | Not claimed                                                                                            |
 
 ### Interpretation
 
-**This is a live footgun.** While `codex exec` is foreground:
+**Footgun risk is real; the apparatus must not be overstated.**
 
-- It does **not** consume the injected line as agent input (positional prompt already supplied; stdin is the tty but unused for the turn).
-- The line sits in the tty input buffer / is echoed.
-- When codex exits and the shell reads the next line, **the shell executes the injected text.**
+While `codex exec` is foreground on an open-tty pane shape:
 
-Boss `SendToPane` (or any master-side write) while a `codex exec` worker is mid-turn is therefore **not** "hygiene" — it is a safety boundary. A guard ("is this worker accepting typed input") is a **safety fix**, not optional polish.
+- It does **not** consume the injected line as agent input (positional prompt already supplied; stdin is the open tty but unused for the turn).
+- The line is echoed on the master and **survives in the input buffer** across codex exit.
+- A **subsequent shell read can consume that line**. In this spike, consumption + execution were produced by the harness's explicit `read`/`eval` after codex exited — a deliberate stand-in for "shell regains the line," not a recording of real Ghostty interactive zsh running the inject.
 
-Nuance: the footgun is about _shell post-exit_, not about codex interpreting the inject as a new turn. `codex exec` itself did not run the injected command.
+**Design implication (still holds):** Boss `SendToPane` (or any master-side write) while a `codex exec` worker is mid-turn is **not** mere hygiene. On a **real interactive pane**, the same master-side inject leaves bytes in the tty input path that an interactive shell would be expected to read as the next command once the agent process exits. A guard ("is this worker accepting typed input") remains a **safety fix** for that real shape — even though this spike's **execution proof** was harness-emulated rather than interactive-Ghostty-observed.
+
+Nuance: the footgun is about _post-exit shell consumption of buffered master input_, not about codex interpreting the inject as a new turn. `codex exec` itself did not run the injected command.
 
 ---
 
@@ -432,22 +465,22 @@ TUI and exec rollouts share this internal schema. TUI does **not** lack rollout 
 
 ## Design-claims matrix
 
-| Design / review claim                                                          | Observation                                                            | Supports / Refutes                                                             |
-| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Engine can read worker stdout JSONL when it owns the pipe/spawn                | Pipe parent reads full JSONL                                           | **Supports**                                                                   |
-| Engine can read worker stdout JSONL given only `shell_pid` under app-owned pty | 0 bytes; no `/proc` fd access; slave open does not see master stream   | **Refutes**                                                                    |
-| PR #2363 alone makes pane-shaped T-05 implementable                            | Reader helps only if topology feeds it a stream                        | **Refutes** (as a pane-topology claim)                                         |
-| Progress ingress could be `AgentJsonlFile { discovery }` via rollout           | File exists, grows live, discoverable by thread_id / dir watch         | **Supports**                                                                   |
-| `StdoutJsonl` as progress ingress for **pane-hosted** workers                  | Blocked by Q1 unless app forwards stdout                               | **Refutes for pane shape**                                                     |
-| `StdoutJsonl` for **engine-spawned** `codex exec --json`                       | Works end-to-end                                                       | **Supports**                                                                   |
-| Non-interactive v1 (`codex exec --json`) is observable at all                  | Fully observable via stdout _and_ rollout                              | **Supports** (operator's "non-interactive v1 is acceptable")                   |
-| Injected pane text during `codex exec` is inert                                | Shell executes post-exit (master inject)                               | **Refutes** — footgun                                                          |
-| `SendToPane` guard is mere hygiene                                             | Master inject → shell exec                                             | **Refutes** — **safety fix**                                                   |
-| Positional prompt auto-submits like Claude CLI                                 | Yes for TUI; exec also runs prompt without Enter                       | **Supports**                                                                   |
-| `--no-alt-screen` usable in Ghostty                                            | No alt-screen CSI; turn succeeds; TERM=xterm-ghostty                   | **Supports**                                                                   |
-| Esc aborts turn, process lives, further turns possible                         | `turn_aborted` + second `task_complete`                                | **Supports**                                                                   |
-| T-17 `exec resume` probe/nudge viable (OQ-5 never spiked)                      | Resume delivers prompt; new `turn.started`                             | **Supports**                                                                   |
-| TUI rollout has same `aggregated_output` richness as `--json`                  | Different schema (`custom_tool_call_output` vs item.aggregated_output) | **Refutes equality**; both are rich enough for progress with different parsers |
+| Design / review claim                                                          | Observation                                                                               | Supports / Refutes                                                                 |
+| ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| Engine can read worker stdout JSONL when it owns the pipe/spawn                | Pipe parent reads full JSONL                                                              | **Supports**                                                                       |
+| Engine can read worker stdout JSONL given only `shell_pid` under app-owned pty | 0 bytes; no `/proc` fd access; slave open does not see master stream                      | **Refutes**                                                                        |
+| PR #2363 alone makes pane-shaped T-05 implementable                            | Reader helps only if topology feeds it a stream                                           | **Refutes** (as a pane-topology claim)                                             |
+| Progress ingress could be `AgentJsonlFile { discovery }` via rollout           | File exists, grows live, discoverable by thread_id / dir watch                            | **Supports**                                                                       |
+| `StdoutJsonl` as progress ingress for **pane-hosted** workers                  | Blocked by Q1 unless app forwards stdout                                                  | **Refutes for pane shape**                                                         |
+| `StdoutJsonl` for **engine-spawned** `codex exec --json`                       | Works end-to-end                                                                          | **Supports**                                                                       |
+| Non-interactive v1 (`codex exec --json`) is observable at all                  | Fully observable via stdout _and_ rollout                                                 | **Supports** (operator's "non-interactive v1 is acceptable")                       |
+| Injected pane text during `codex exec` is inert                                | Master inject echoed + survives; post-exit `read` gets line; exec via harness `eval` only | **Refutes inert** (apparatus-qualified; not pure interactive zsh)                  |
+| `SendToPane` guard is mere hygiene                                             | Buffer survives master inject; real interactive panes would consume next line             | **Refutes** — **safety fix** (design implication; exec proof was harness-emulated) |
+| Positional prompt auto-submits like Claude CLI                                 | Yes for TUI; exec also runs prompt without Enter                                          | **Supports**                                                                       |
+| `--no-alt-screen` usable in Ghostty                                            | No alt-screen CSI; turn succeeds; TERM=xterm-ghostty                                      | **Supports**                                                                       |
+| Esc aborts turn, process lives, further turns possible                         | `turn_aborted` + second `task_complete`                                                   | **Supports**                                                                       |
+| T-17 `exec resume` probe/nudge viable (OQ-5 never spiked)                      | Resume delivers prompt; new `turn.started`                                                | **Supports**                                                                       |
+| TUI rollout has same `aggregated_output` richness as `--json`                  | Different schema (`custom_tool_call_output` vs item.aggregated_output)                    | **Refutes equality**; both are rich enough for progress with different parsers     |
 
 ### Immediate decisions this unblocks
 
@@ -456,7 +489,7 @@ TUI and exec rollouts share this internal schema. TUI does **not** lack rollout 
    - Pane-hosted workers → **`AgentJsonlFile` / rollout tail** (or app-forwarded stream — not observed here).
    - Engine-spawned workers → **`StdoutJsonl` is valid** (and nicer: `command_execution.aggregated_output` already normalized).  
      Reusing `engine/transcript-tail` for discovery+tail matches Q7.
-3. **`SendToPane` guard:** **Safety fix** (Q2), not hygiene.
+3. **`SendToPane` guard:** **Safety fix** (Q2), not hygiene — buffer survives master inject on open-tty `codex exec`; do not over-read the harness `eval` as pure interactive-shell proof.
 4. **T-17 `exec resume`:** **Viable** (Q6). OQ-5 can be closed on the "does it deliver / does `turn.started` fire" axis.
 
 CodexDriver skeleton + spawn/provisioning taxonomy rows that assumed "engine reads pane stdout" are **premise-affected** and should be rewritten around the topology that actually works.
@@ -502,11 +535,19 @@ Re-check these before treating any follow-up observation as comparable.
 
 ## Appendix — artifact index
 
-| File                                                                      | Contents                            |
-| ------------------------------------------------------------------------- | ----------------------------------- |
-| `ghostty-codex-pane-viability-artifacts/pty_owner.py`                     | Q1/Q2 master-owned pty harness      |
-| `ghostty-codex-pane-viability-artifacts/owner_run.log`                    | Q2 footgun result                   |
-| `ghostty-codex-pane-viability-artifacts/q5_harness.py` / `q5b_harness.py` | Esc abort harnesses                 |
-| `ghostty-codex-pane-viability-artifacts/q5b.log`                          | Esc + second-turn success log       |
-| `ghostty-codex-pane-viability-artifacts/q6_out1.jsonl` / `q6_out2.jsonl`  | exec + exec resume                  |
-| `ghostty-codex-pane-viability-artifacts/q7_stdout.jsonl`                  | exec --json stdout for tail session |
+| File                                                                      | Contents                                                                     |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `ghostty-codex-pane-viability-artifacts/pty_owner.py`                     | Q1/Q2 master-owned pty harness (post-exit `read`/`eval` is harness-emulated) |
+| `ghostty-codex-pane-viability-artifacts/owner_run.log`                    | Q2 harness summary log                                                       |
+| `ghostty-codex-pane-viability-artifacts/master_capture.txt`               | Q2 master-side capture (inject echo mid-JSONL)                               |
+| `ghostty-codex-pane-viability-artifacts/shell_got_line.txt`               | Q2 line consumed by harness `read -r` after codex exit                       |
+| `ghostty-codex-pane-viability-artifacts/injected_side_effect.txt`         | Q2 side effect from harness `eval` (not interactive zsh)                     |
+| `ghostty-codex-pane-viability-artifacts/eval_exit.txt`                    | Q2 harness `eval` exit code                                                  |
+| `ghostty-codex-pane-viability-artifacts/run_pure.sh`                      | Q1 Ghostty pure-TTY spawn script                                             |
+| `ghostty-codex-pane-viability-artifacts/q3q4_clean.txt`                   | Q3/Q4 cleaned TUI capture (no `?1049` alt-screen CSI)                        |
+| `ghostty-codex-pane-viability-artifacts/q4_env.txt`                       | Q4 `TERM=xterm-ghostty` under Ghostty                                        |
+| `ghostty-codex-pane-viability-artifacts/q5_harness.py` / `q5b_harness.py` | Esc abort harnesses                                                          |
+| `ghostty-codex-pane-viability-artifacts/q5b.log`                          | Esc + second-turn success log                                                |
+| `ghostty-codex-pane-viability-artifacts/q6_out1.jsonl` / `q6_out2.jsonl`  | exec + exec resume                                                           |
+| `ghostty-codex-pane-viability-artifacts/q7_stdout.jsonl`                  | exec --json stdout for tail session                                          |
+| `ghostty-codex-pane-viability-artifacts/q7_rollout_sample.jsonl`          | Q7 rollout file sample (same thread as `q7_stdout.jsonl`)                    |
