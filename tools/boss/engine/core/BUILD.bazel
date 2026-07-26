@@ -22,6 +22,10 @@ rust_library(
         # Read by boss_construct_scan.rs's self-test to assert the CHECKS.yaml
         # boss-ism pattern stays byte-identical to BOSS_ID_RE.
         "//:CHECKS.yaml",
+        # Reference-driver conformance goldens — include_str!'d from
+        # src/conformance/claude_goldens.rs.
+        "src/conformance/goldens/settings_standard.json.golden",
+        "src/conformance/goldens/claude_md_standard.md.golden",
     ],
     crate_name = "boss_engine",
     crate_root = "src/lib.rs",
