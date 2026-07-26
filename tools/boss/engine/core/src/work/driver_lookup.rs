@@ -10,10 +10,13 @@ impl WorkDb {
     /// [`boss_engine_effort::ENGINE_DEFAULT_DRIVER`] precedence used at
     /// spawn time ([`boss_engine_effort::resolve_driver`]).
     ///
-    /// Returns `Ok(None)` when the execution or its task/product rows
-    /// cannot be found (e.g. a Product/Project execution with no `tasks`
-    /// row) — the caller should skip post-hoc dispatch rather than guess a
-    /// driver.
+    /// Returns `Ok(None)` only when the execution or its `tasks` row cannot
+    /// be found (unknown execution, or a Product/Project execution with no
+    /// `tasks` row) — the caller should skip post-hoc dispatch rather than
+    /// guess a driver. A task whose `product_id` has no matching `products`
+    /// row (a data-integrity problem) still resolves via the task's own
+    /// `driver` or the engine default — it is not conflated with the
+    /// "no task" case, since `products` is `LEFT JOIN`ed.
     pub fn get_execution_driver_slug(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         let row: Option<(Option<String>, Option<String>)> = conn
@@ -21,7 +24,7 @@ impl WorkDb {
                 "SELECT t.driver, p.default_driver
                    FROM work_executions e
                    JOIN tasks t ON t.id = e.work_item_id
-                   JOIN products p ON p.id = t.product_id
+                   LEFT JOIN products p ON p.id = t.product_id
                   WHERE e.id = ?1",
                 [execution_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -91,6 +94,30 @@ mod tests {
         assert_eq!(
             db.get_execution_driver_slug(&execution.id).unwrap(),
             Some("copilot".to_owned()),
+        );
+    }
+
+    #[test]
+    fn task_with_missing_product_row_still_resolves_via_task_driver_or_engine_default() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "test chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+
+        // Drop the parent product behind FK enforcement, simulating the
+        // data-integrity problem of a task whose product_id row no longer
+        // exists. The LEFT JOIN must still resolve a driver rather than
+        // silently dropping the dispatch (see driver_lookup module docs).
+        let conn = db.connect().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute("DELETE FROM products WHERE id = ?1", [&product.id])
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        drop(conn);
+
+        assert_eq!(
+            db.get_execution_driver_slug(&execution.id).unwrap(),
+            Some(boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned()),
         );
     }
 

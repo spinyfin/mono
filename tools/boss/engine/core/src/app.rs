@@ -507,6 +507,16 @@ struct ServerState {
     /// which is the safe direction (worst case a worker gets three fresh
     /// denies rather than an indefinite block).
     editorial_deny_tracker: Arc<crate::editorial_hook::DenyTracker>,
+    /// Execution ids that have already logged the post-hoc-interception
+    /// loss-of-guards `warn!` (unregistered driver slug, or a registered
+    /// driver on the `AbsenceDisposition::Degrade` path). A long-running
+    /// worker on a hookless driver fires `PostToolUse` once per tool call —
+    /// without this, every one of those calls would repeat the identical
+    /// warning. First occurrence per execution stays a `warn!`; the rest
+    /// downgrade to `debug!`. In-memory only; a restart re-warns once, which
+    /// is the safe direction.
+    #[builder(default)]
+    post_hoc_interception_warned: StdMutex<std::collections::HashSet<String>>,
     /// Snapshot of the Anthropic API key captured at engine startup.
     /// Reported (as a presence bit only) by the health verb and the
     /// live-status debug verb. The engine's own inference calls no longer

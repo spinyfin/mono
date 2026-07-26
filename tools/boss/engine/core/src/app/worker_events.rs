@@ -5,6 +5,21 @@
 
 use super::*;
 
+impl ServerState {
+    /// First call for a given `execution_id` returns `true` (and remembers
+    /// it); every subsequent call for the same id returns `false`. Used to
+    /// downgrade the post-hoc-interception loss-of-guards warning from a
+    /// per-`PostToolUse`-event `warn!` to a per-execution one, so a
+    /// long-running hookless-driver worker logs the signal once instead of
+    /// once per tool call.
+    fn should_warn_post_hoc_interception_loss(&self, execution_id: &str) -> bool {
+        self.post_hoc_interception_warned
+            .lock()
+            .expect("post_hoc_interception_warned mutex poisoned")
+            .insert(execution_id.to_owned())
+    }
+}
+
 /// Update the per-slot LiveWorkerState for the run this hook event
 /// belongs to and push the new snapshot on the
 /// `worker.live_states` topic if anything changed. Hook events that
@@ -690,18 +705,27 @@ pub(super) async fn dispatch_editorial_on_pretooluse(
 /// [`boss_engine_driver::test_support::StubDriver`] without a DB or a
 /// `ServerState`.
 ///
-/// Returns `None` when `driver` declares real-time
-/// [`crate::driver::Capability::ToolUseInterception`] (Claude today) — the
-/// degrade path never applies and the caller must not log or act.
+/// Returns `None` when `driver`'s declared
+/// [`crate::driver::AbsenceDisposition`] for
+/// [`crate::driver::Capability::ToolUseInterception`] is not `Degrade` —
+/// i.e. the driver either provides real-time interception itself (Claude
+/// today) or has explicitly opted into `Refuse`/`Synthesize` for this
+/// capability via [`crate::driver::CapabilitySet::with_absence_override`].
+/// Either way this is not the degrade path and the caller must not log or
+/// act.
 fn post_hoc_interception_decision(
     driver: &dyn crate::driver::AgentDriver,
     tool_name: &str,
     tool_input: &serde_json::Value,
     tool_response: &serde_json::Value,
 ) -> Option<crate::driver::PostHocInterceptionAction> {
-    use crate::driver::{Capability, PostHocInterceptionAction};
+    use crate::driver::{AbsenceDisposition, Capability, PostHocInterceptionAction};
 
-    if driver.capabilities().provides(Capability::ToolUseInterception) {
+    let caps = driver.capabilities();
+    if caps.provides(Capability::ToolUseInterception) {
+        return None;
+    }
+    if caps.absence_disposition(Capability::ToolUseInterception) != AbsenceDisposition::Degrade {
         return None;
     }
     Some(match driver.post_hoc_interception() {
@@ -765,11 +789,23 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 
     let registry = DriverRegistry::default();
     let Some(driver) = registry.get(&driver_slug) else {
-        tracing::debug!(
-            execution_id,
-            driver = %driver_slug,
-            "post_hoc_interception: unregistered driver slug; skipping",
-        );
+        // An unregistered slug (e.g. a task/product configured with a
+        // `driver` that has no `DriverRegistry` entry yet) is exactly the
+        // hookless-driver situation this dispatch exists to make non-silent:
+        // there is no driver instance to consult a PostHocInterceptionFn on,
+        // so the outcome is the implicit Accept, but the loss of guards is
+        // real and must be logged the same as the registered-but-hookless
+        // case below.
+        let message = "post_hoc_interception: driver slug is not registered in the DriverRegistry — this tool call \
+             ran WITHOUT editorial enforcement, the path guard, the revision-PR guard, and the checkleft \
+             push guard. No driver instance is available to run a post-hoc review, so the outcome is the \
+             implicit Accept. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver \
+             crate.";
+        if server_state.should_warn_post_hoc_interception_loss(execution_id) {
+            tracing::warn!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{message}");
+        } else {
+            tracing::debug!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{message}");
+        }
         return;
     };
 
@@ -781,15 +817,15 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
         return;
     };
 
-    tracing::warn!(
-        execution_id,
-        driver = %driver_slug,
-        tool_name = %tool_name,
-        "post_hoc_interception: driver has no real-time PreToolUse hook surface — this tool call ran \
+    let loss_of_guards_message = "post_hoc_interception: driver has no real-time PreToolUse hook surface — this tool call ran \
          WITHOUT editorial enforcement, the path guard, the revision-PR guard, and the checkleft push \
          guard. Post-hoc review can only detect problems after the tool already ran; it cannot prevent \
-         the call. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver crate.",
-    );
+         the call. See PostHocInterceptionFn / PostHocInterceptionAction in the agent-driver crate.";
+    if server_state.should_warn_post_hoc_interception_loss(execution_id) {
+        tracing::warn!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{loss_of_guards_message}");
+    } else {
+        tracing::debug!(execution_id, driver = %driver_slug, tool_name = %tool_name, "{loss_of_guards_message}");
+    }
 
     match action {
         PostHocInterceptionAction::Accept => {
@@ -808,7 +844,7 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
                 reason = %reason,
                 "post_hoc_interception: driver's post-hoc adapter flagged this tool output for \
                  revision — the underlying command has already run and cannot be undone; this is a \
-                 detect-after-the-fact signal for a human/operator, not an enforced block",
+                 detect-after-the-fact signal, not an enforced block",
             );
         }
     }
@@ -1400,7 +1436,9 @@ mod editorial_gate_tests {
 mod post_hoc_interception_decision_tests {
     use super::post_hoc_interception_decision;
     use crate::driver::test_support::StubDriver;
-    use crate::driver::{Capability, CapabilitySet, DriverDescriptor, ModelMenu, PostHocInterceptionAction};
+    use crate::driver::{
+        AbsenceDisposition, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PostHocInterceptionAction,
+    };
     use serde_json::json;
 
     fn descriptor(name: &'static str) -> DriverDescriptor {
@@ -1473,5 +1511,22 @@ mod post_hoc_interception_decision_tests {
                 reason: "flagged by fixture".to_owned(),
             }),
         );
+    }
+
+    /// A driver that does not provide ToolUseInterception but has
+    /// explicitly overridden its absence disposition to `Refuse` (rather
+    /// than the `Degrade` default) must not be routed through the degrade
+    /// path — dispatch is expected to have refused this driver before any
+    /// tool call could run, so treating it as "degraded" here would be
+    /// logged as if it were silently accepting reduced fidelity when its
+    /// declared policy is the opposite.
+    #[test]
+    fn driver_with_refuse_override_is_not_applicable() {
+        let caps =
+            CapabilitySet::new([]).with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
+        let driver = StubDriver::new(descriptor("refuses-without-interception"), caps);
+        let outcome =
+            post_hoc_interception_decision(&driver, "Bash", &json!({"command": "ls"}), &json!({"output": "ok"}));
+        assert_eq!(outcome, None);
     }
 }
