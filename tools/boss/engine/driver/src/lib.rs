@@ -77,6 +77,12 @@ pub struct PermissionInput {
     /// path-guard hook). Remote SSH workers set this because their
     /// `events_socket_path` is a forwarded `/tmp` socket, not a Boss data dir.
     pub is_remote: bool,
+    /// Absolute path to the materialised `boss-path-guard.py` script, when
+    /// the local path-guard applies. `None` for remote workers.
+    pub path_guard_script: Option<PathBuf>,
+    /// Absolute path to the materialised `boss-checkleft-push-guard.py`
+    /// script, when the local checkleft push guard applies. `None` for remote.
+    pub checkleft_guard_script: Option<PathBuf>,
 }
 
 /// What a driver's [`Capability::PermissionPolicy`] rendering produces,
@@ -729,7 +735,8 @@ pub struct TurnEnd {
 /// turns it into the PreToolUse hook entries that guard the tool-call surface
 /// (path guard, boss-launch guard, PR-redirect guard, checkleft push guard,
 /// revision PR guard).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, bon::Builder)]
+#[builder(on(String, into))]
 pub struct ToolUseInterceptionConfig {
     /// Parent directory of the engine events socket (the Boss data dir). The
     /// path guard uses this to fence workers off the engine's runtime state.
@@ -750,6 +757,12 @@ pub struct ToolUseInterceptionConfig {
     /// PR-redirect guard and the checkleft push guard because their deny rules
     /// already block push operations.
     pub is_standard_worker: bool,
+    /// Execution / run id — used by Codex to locate the Boss-owned per-run
+    /// `CODEX_HOME` when arming hooks. Claude ignores this.
+    pub run_id: Option<String>,
+    /// Workspace path (Codex project trust / hooks observation cwd). Claude
+    /// ignores this.
+    pub workspace_path: Option<PathBuf>,
 }
 
 /// The PreToolUse hook entries the driver wires for [`Capability::ToolUseInterception`].
@@ -1008,7 +1021,7 @@ pub fn default_structured_output_wiring(request: &StructuredOutputRequest<'_>) -
 /// field is a concept that holds across backends: the resolved model/effort,
 /// an optional rendered settings/config path, the corp-laptop
 /// auto-permissions override, and an optional forced permission mode.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct SpawnRequest<'a> {
     /// Resolved model slug (e.g. `"opus"`, `"sonnet"`).
     pub model: &'a str,
@@ -1026,6 +1039,10 @@ pub struct SpawnRequest<'a> {
     /// capability-restricted answer agent), suppressing the model-derived
     /// choice. `None` keeps the default per-model behaviour.
     pub permission_mode_override: Option<&'a str>,
+    /// Execution / run id. Codex uses this to resolve the Boss-owned per-run
+    /// `CODEX_HOME` (see [`codex::codex_home_for_run`]). Claude ignores it.
+    /// `None` only for fixtures that do not provision a real home.
+    pub run_id: Option<&'a str>,
 }
 
 /// One environment adjustment a [`SpawnPlan`] applies to the worker pane
@@ -1726,10 +1743,13 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
             is_revision: true,
             is_standard_worker: true,
+            run_id: Some("run-1".into()),
+            workspace_path: Some(PathBuf::from("/ws")),
         };
         assert!(config.is_revision);
         assert!(config.is_standard_worker);
         assert_eq!(config.data_dir.unwrap(), PathBuf::from("/Library/Boss"));
+        assert_eq!(config.run_id.as_deref(), Some("run-1"));
     }
 
     #[test]

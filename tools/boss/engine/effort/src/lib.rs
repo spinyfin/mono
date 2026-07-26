@@ -136,6 +136,7 @@ impl SpawnConfig {
                 settings_path,
                 non_opus_auto_mode,
                 permission_mode_override: None,
+                run_id: None,
             })
             .command)
     }

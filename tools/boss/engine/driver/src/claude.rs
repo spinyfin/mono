@@ -451,6 +451,7 @@ impl AgentDriver for ClaudeDriver {
             settings_path,
             non_opus_auto_mode,
             permission_mode_override,
+            run_id: _,
         } = request;
         let mut cmd = format!("claude --model {model}");
         if let Some(e) = effort {
@@ -553,18 +554,13 @@ impl AgentDriver for ClaudeDriver {
         _input: &PermissionInput,
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
-        // TODO(@brianduff,2026-12-31): the settings/deny-rule rendering this
-        // needs (`worker_setup::settings_value`/`permissions_value`/`deny_rules`,
-        // the reviewer/triage/answer-agent rule builders, and the path-guard
-        // constants) lives in `boss_engine::worker_setup`. The dependency edge
-        // is one-way `core -> driver`, so this crate cannot reach it;
-        // implementing this method requires porting that rendering into this
-        // crate first (mirroring the `WorkspaceProvisioning` helpers already
-        // moved into this file). Once implemented, this returns a single
-        // settings file in `config_files` with `extra_args`/`env` empty —
-        // behaviourally identical to the pre-`PermissionArtifacts`
-        // single-`PathBuf` return.
-        unimplemented!("blocked on migrating worker_setup's settings/deny-rule rendering into the driver crate")
+        // Claude's permission/hooks rendering still lives in
+        // `boss_engine::worker_setup` (settings.json + deny rules + hooks).
+        // The spawn flow continues to use that path for Claude; this method
+        // returns empty artifacts so call sites that invoke it generically
+        // (Codex + Claude) do not panic. Porting the full settings renderer
+        // into this crate remains follow-on work.
+        Ok(PermissionArtifacts::default())
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
@@ -1101,6 +1097,8 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-settings/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: true,
+            run_id: None,
+            workspace_path: None,
         }
     }
 
@@ -1111,6 +1109,8 @@ mod tests {
             checkleft_guard_script: None,
             is_revision: false,
             is_standard_worker: true,
+            run_id: None,
+            workspace_path: None,
         }
     }
 
@@ -1219,6 +1219,8 @@ mod tests {
             checkleft_guard_script: Some(PathBuf::from("/tmp/boss-checkleft-push-guard.py")),
             is_revision: false,
             is_standard_worker: false,
+            run_id: None,
+            workspace_path: None,
         };
         let wiring = ClaudeDriver.tool_use_interception_wiring(&config);
         // path guard + boss-launch guard = 2 (no PR redirect, no checkleft)
@@ -1501,6 +1503,7 @@ mod tests {
             settings_path: None,
             non_opus_auto_mode: false,
             permission_mode_override: None,
+            run_id: None,
         }
     }
 

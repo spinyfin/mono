@@ -188,6 +188,7 @@ fn codex_exec_spawn_satisfies_shared_flag_contract() {
         settings_path: None,
         non_opus_auto_mode: false,
         permission_mode_override: None,
+        run_id: None,
     });
     assert_codex_exec_spawn_contract(&plan);
 }

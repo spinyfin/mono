@@ -465,13 +465,70 @@ impl ExecutionRunner for PaneSpawnRunner {
         // own concern, carried on the `SpawnPlan.env` built here — the engine
         // renders those directives generically without knowing which driver
         // or which vars they name.
-        let spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
+        // Materialise local guard scripts before permission config so Codex
+        // can wire absolute paths into CODEX_HOME PreToolUse hooks.
+        let settings_dir = crate::worker_setup::worker_settings_dir();
+        let path_guard_script = if matches!(worker_kind, crate::worker_setup::WorkerKind::Standard)
+            || matches!(worker_kind, crate::worker_setup::WorkerKind::Reviewer)
+            || matches!(worker_kind, crate::worker_setup::WorkerKind::Triage)
+            || matches!(worker_kind, crate::worker_setup::WorkerKind::AnswerAgent)
+        {
+            crate::worker_setup::ensure_path_guard_script_in(&settings_dir).ok()
+        } else {
+            None
+        };
+        let checkleft_guard_script = crate::worker_setup::ensure_checkleft_push_guard_script_in(&settings_dir).ok();
+
+        // Permission artifacts (Codex: hooks + trust attest into CODEX_HOME;
+        // Claude: empty — settings still come from worker_setup).
+        let permission_input = crate::driver::PermissionInput {
+            worker_kind: match worker_kind {
+                crate::worker_setup::WorkerKind::Standard => crate::driver::WorkerKind::Standard,
+                crate::worker_setup::WorkerKind::Reviewer => crate::driver::WorkerKind::Reviewer,
+                crate::worker_setup::WorkerKind::Triage => crate::driver::WorkerKind::Triage,
+                crate::worker_setup::WorkerKind::AnswerAgent => crate::driver::WorkerKind::AnswerAgent,
+            },
+            workspace_path: workspace_path.to_path_buf(),
+            events_socket_path: self.events_socket_path(),
+            boss_event_path: self.boss_event_binary(),
+            run_id: execution.id.clone(),
+            lease_id: lease_id.clone(),
+            execution_kind: execution.kind.as_str().to_owned(),
+            task_kind: work_item_task_kind(work_item).map(str::to_owned),
+            is_remote: false,
+            path_guard_script: path_guard_script.clone(),
+            checkleft_guard_script: checkleft_guard_script.clone(),
+        };
+        let permission_artifacts = driver
+            .write_permission_config(&permission_input, &settings_dir)
+            .await
+            .with_context(|| {
+                format!(
+                    "writing permission/hook config for execution {} (driver={})",
+                    execution.id,
+                    driver.descriptor().name
+                )
+            })?;
+
+        let mut spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
             effort: spawn_config.effort_value,
             settings_path: Some(&worker_settings_path),
             non_opus_auto_mode: spawner.non_opus_auto_mode(),
             permission_mode_override,
+            run_id: Some(execution.id.as_str()),
         });
+        // Merge permission-policy env (e.g. Codex CODEX_HOME) without
+        // duplicating keys the spawn plan already set.
+        for (key, value) in permission_artifacts.env {
+            if !spawn_plan
+                .env
+                .iter()
+                .any(|d| matches!(d, crate::driver::EnvDirective::Set(k, _) if k == &key))
+            {
+                spawn_plan.env.push(crate::driver::EnvDirective::Set(key, value));
+            }
+        }
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",
