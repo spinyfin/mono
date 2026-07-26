@@ -519,33 +519,64 @@ async fn dispatch_run(
     .await?;
     info!("resolving changeset for run");
     let changeset = attach_description_context(changeset_from_plan(vcs, &plan)?, vcs, env, &plan).await;
-    info!(
-        changed_files = changeset.changed_files.len(),
-        "resolved changeset for run"
-    );
+    let file_count = changeset.changed_files.len();
+    info!(changed_files = file_count, "resolved changeset for run");
 
     // The progress UI is purely additive on the interactive path. When it is
     // disabled the reporter is a no-op and output is byte-identical to before.
     let style = OutputStyle::detect_for_stdout();
-    let progress_enabled = matches!(format, OutputFormat::Human)
-        && should_show_progress(
-            show_progress,
-            style.level,
-            std::io::stdout().is_terminal(),
-            stderr().is_terminal(),
-            detect_ci(),
-        );
-    let mut live =
-        progress_enabled.then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
-    let reporter: Arc<dyn ProgressReporter> = match &live {
-        Some(progress) => progress.reporter(make_render_findings(style)),
-        None => Arc::new(NoopProgressReporter),
-    };
+    if matches!(format, OutputFormat::Human) {
+        print!("{}", render_run_scope_line(&plan, file_count, style));
+    }
 
-    let run_started_at = Instant::now();
-    let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
-    let elapsed = run_started_at.elapsed();
-    sort_results_for_output(&mut results);
+    // With no modified files (and no `--all`), there is nothing for any check
+    // to run against — skip invoking the runner entirely rather than letting
+    // every check independently discover it has zero files to look at.
+    let skip_run = !matches!(plan, ChangePlan::All) && file_count == 0;
+
+    let (results, elapsed) = if skip_run {
+        if matches!(format, OutputFormat::Json) {
+            print_json_results(&[])?;
+        }
+        (Vec::new(), Duration::ZERO)
+    } else {
+        let progress_enabled = matches!(format, OutputFormat::Human)
+            && should_show_progress(
+                show_progress,
+                style.level,
+                std::io::stdout().is_terminal(),
+                stderr().is_terminal(),
+                detect_ci(),
+            );
+        let mut live = progress_enabled
+            .then(|| LiveProgress::new(Box::new(TermRenderer::stdout()), DEFAULT_DEBOUNCE, !show_skipped));
+        let reporter: Arc<dyn ProgressReporter> = match &live {
+            Some(progress) => progress.reporter(make_render_findings(style)),
+            None => Arc::new(NoopProgressReporter),
+        };
+
+        let run_started_at = Instant::now();
+        let mut results = runner.run_changeset_with_progress(&changeset, reporter).await?;
+        let elapsed = run_started_at.elapsed();
+        sort_results_for_output(&mut results);
+
+        match format {
+            OutputFormat::Human => {
+                if let Some(mut progress) = live.take() {
+                    // Stop the render loop, leaving the final per-check status block on
+                    // screen; the findings already streamed into the log area above it,
+                    // so only the summary footer remains to print.
+                    progress.finalize();
+                    print!("{}", render_human_footer(&results, style, elapsed));
+                } else {
+                    print_human_results(&results, elapsed);
+                }
+            }
+            OutputFormat::Json => print_json_results(&results)?,
+        }
+
+        (results, elapsed)
+    };
     let total_findings: usize = results.iter().map(|r| r.findings.len()).sum();
     info!(
         elapsed_ms = elapsed.as_millis(),
@@ -553,21 +584,6 @@ async fn dispatch_run(
         total_findings,
         "run complete"
     );
-
-    match format {
-        OutputFormat::Human => {
-            if let Some(mut progress) = live.take() {
-                // Stop the render loop, leaving the final per-check status block on
-                // screen; the findings already streamed into the log area above it,
-                // so only the summary footer remains to print.
-                progress.finalize();
-                print!("{}", render_human_footer(&results, style, elapsed));
-            } else {
-                print_human_results(&results, elapsed);
-            }
-        }
-        OutputFormat::Json => print_json_results(&results)?,
-    }
 
     // Generate SARIF once if needed for file writing or upload.
     let needs_sarif = upload || annotations.contains(&AnnotationBackend::Sarif);
@@ -2054,6 +2070,26 @@ fn make_render_findings(style: OutputStyle) -> RenderFindings {
         }
         out
     })
+}
+
+/// The leading line printed before a run starts, announcing the file scope
+/// checks are about to run against — mirrors the `checks:` prefix and colouring
+/// of the trailing summary line so the two bookend the run consistently.
+fn render_run_scope_line(plan: &ChangePlan, file_count: usize, style: OutputStyle) -> String {
+    if matches!(plan, ChangePlan::All) {
+        return format!(
+            "{}: running checks on all files in the repo\n",
+            style.paint_info("checks")
+        );
+    }
+    if file_count == 0 {
+        return format!("{}: Skipping checks - no modified files\n", style.paint_info("checks"));
+    }
+    let noun = if file_count == 1 { "file" } else { "files" };
+    format!(
+        "{}: running checks on {file_count} modified {noun}\n",
+        style.paint_info("checks")
+    )
 }
 
 /// The trailing summary the interactive path prints after finalizing the status
