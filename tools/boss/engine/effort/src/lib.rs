@@ -76,7 +76,7 @@ impl SpawnConfig {
     /// Worker spawn line written into the libghostty pane via the
     /// spawn RPC's `initial_input`. Delegates to
     /// [`boss_engine_driver::ClaudeDriver::spawn_invocation`], which owns the
-    /// Claude-specific command-line logic (Spawn capability, P1422 Depth 1).
+    /// Claude-specific command-line logic (Spawn capability).
     ///
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
     /// need to construct a driver instance directly.

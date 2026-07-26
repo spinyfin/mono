@@ -732,15 +732,10 @@ pub enum PostHocInterceptionAction {
 pub type PostHocInterceptionFn =
     fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
 
-/// Driver-neutral inputs for the [`Capability::Spawn`] capability.
-///
-/// Replaces the previous Claude-shaped positional parameters
-/// (`settings_path`, `non_opus_auto_mode`, `permission_mode_override`) that
-/// made `spawn_invocation` impossible for another driver to implement
-/// meaningfully. Every field here is a concept that holds across backends:
-/// the resolved model/effort, an optional rendered settings/config path, the
-/// corp-laptop auto-permissions override, and an optional forced permission
-/// mode.
+/// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
+/// field is a concept that holds across backends: the resolved model/effort,
+/// an optional rendered settings/config path, the corp-laptop
+/// auto-permissions override, and an optional forced permission mode.
 #[derive(Debug, Clone, Copy)]
 pub struct SpawnRequest<'a> {
     /// Resolved model slug (e.g. `"opus"`, `"sonnet"`).
@@ -778,13 +773,9 @@ pub enum EnvDirective {
 
 /// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
 /// the environment adjustments and command line the spawn flow applies to
-/// the worker pane, verbatim and in order.
-///
-/// Replaces the previous bare `String` return. A driver now owns both its
-/// command line and any environment requirements (e.g. Claude's unset
-/// `ANTHROPIC_API_KEY`, a future Codex driver's exported `CODEX_HOME`)
-/// instead of the engine hardcoding driver-specific env manipulation
-/// alongside a driver-opaque command string.
+/// the worker pane, verbatim and in order. A driver owns both its command
+/// line and its environment requirements (e.g. Claude's unset
+/// `ANTHROPIC_API_KEY`, a Codex driver's exported `CODEX_HOME`).
 #[derive(Debug, Clone, Default)]
 pub struct SpawnPlan {
     /// Environment adjustments to apply in the pane shell, in order, before
@@ -813,9 +804,7 @@ pub trait AgentDriver: Send + Sync {
     // ── Spawn capability ────────────────────────────────────────────────────
 
     /// Build the [`SpawnPlan`] — environment adjustments plus the command
-    /// line — written into the pane as the spawn command. Replaces
-    /// `boss_engine::effort::SpawnConfig::claude_invocation` for the Claude
-    /// driver.
+    /// line — written into the pane as the spawn command.
     ///
     /// `request.permission_mode_override`, when `Some`, forces
     /// `--permission-mode <mode>` and suppresses the model-derived `auto` /
