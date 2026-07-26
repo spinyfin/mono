@@ -403,7 +403,10 @@ pub const REVISION_PR_GUARD_COMMAND: &str = concat!(
 /// `boss_engine::worker_setup::render_claude_md`.
 const CLAUDE_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
-     via claude hooks.";
+     via claude hooks.\n\
+     For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
+     `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
+     strong stated justification.";
 
 /// Reference implementation of [`AgentDriver`] for Claude Code.
 ///
@@ -1368,6 +1371,10 @@ mod tests {
         assert!(
             preamble.contains("Boss-managed"),
             "preamble must describe Boss session: {preamble}"
+        );
+        assert!(
+            preamble.contains("checkleft run") && preamble.contains("checkleft --all"),
+            "preamble must direct ordinary validation to scoped checkleft: {preamble}"
         );
     }
 

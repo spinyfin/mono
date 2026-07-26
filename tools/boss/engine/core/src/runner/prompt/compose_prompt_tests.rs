@@ -877,8 +877,11 @@ fn bazel_gate_present_for_chore_on_bazel_workspace_seam_on() {
              verb:\n{prompt}",
     );
     assert!(
-        prompt.contains("FOREGROUND") && prompt.contains("run_in_background"),
-        "gate must mandate foreground execution and forbid the background-and-idle anti-pattern (issue #976):\n{prompt}",
+        prompt.contains("build-class command")
+            && prompt.contains("checkleft")
+            && prompt.contains("FOREGROUND")
+            && prompt.contains("run_in_background"),
+        "gate must require foreground execution for Bazel, checkleft, and tests, and forbid the background-and-idle anti-pattern (issue #976):\n{prompt}",
     );
 }
 
