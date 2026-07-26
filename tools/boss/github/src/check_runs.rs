@@ -1,8 +1,45 @@
 //! CI check-run helpers: provider classification, job-id parsing, and
-//! the REST `/commits/{sha}/check-runs` fetcher used by the merge-queue
-//! rebounce detector.
+//! the REST fetchers used by the merge-queue rebounce detector
+//! (`/commits/{sha}/check-runs` and the legacy `/commits/{sha}/status`
+//! combined-status endpoint that Buildkite still posts to on mono).
 
 use crate::gh_runner::gh_output;
+
+/// Verdict bucket a legacy commit-status / GraphQL `StatusContext`
+/// `state` value maps to. Shared by the GraphQL rollup classifier
+/// (`merge_poller::normalize_leaf`) and the REST `/commits/{sha}/status`
+/// parser ([`parse_commit_statuses_for_failures`]) so the two paths
+/// cannot drift on which states count as failures.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatusContextVerdict {
+    /// Terminal success (`SUCCESS`).
+    Pass,
+    /// Terminal failure. `conclusion` is the uppercased state token
+    /// (`FAILURE` / `ERROR`) kept verbatim for the worker prompt /
+    /// `ci_remediations.failed_checks` JSON — matching the GraphQL
+    /// rollup path's spelling.
+    Fail { conclusion: String },
+    /// Non-terminal (`PENDING` / `EXPECTED` / unknown).
+    InFlight,
+}
+
+/// Classify a legacy commit-status / `StatusContext` `state` value.
+/// Accepts either case; GitHub's REST combined-status endpoint returns
+/// lowercase (`failure`) while GraphQL returns uppercase (`FAILURE`).
+///
+/// Values per GitHub's commit-status API: SUCCESS / FAILURE / ERROR /
+/// PENDING / EXPECTED. Only `FAILURE` and `ERROR` are terminal fails.
+pub fn classify_status_context_state(state: &str) -> StatusContextVerdict {
+    let upper = state.to_ascii_uppercase();
+    match upper.as_str() {
+        "SUCCESS" => StatusContextVerdict::Pass,
+        "FAILURE" | "ERROR" => StatusContextVerdict::Fail { conclusion: upper },
+        // PENDING (running), EXPECTED (branch protection lists the
+        // context but no run has reported yet), empty, or anything
+        // else GitHub may add later → wait for a terminal verdict.
+        _ => StatusContextVerdict::InFlight,
+    }
+}
 
 /// CI provider inferred from a check's `targetUrl` host. The CI-watch
 /// `CiLogReader` impls (Buildkite + GitHub Actions) dispatch on this;
@@ -81,10 +118,22 @@ pub fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> 
     }
 }
 
-/// Fetch the failing CI check runs for a specific commit SHA via the GitHub
+/// Fetch the failing CI checks for a specific commit SHA via the GitHub
 /// REST API. Used for merge-queue rebounce detection where the failing SHA is
 /// the synthetic merge commit (`before_commit_sha`) assembled by the queue on
 /// a `gh-readonly-queue/*` branch — not the PR head.
+///
+/// Reads **both** surfaces GitHub exposes for a commit's CI:
+///   - `/commits/{sha}/check-runs` — modern check runs (GitHub Actions,
+///     most CI integrations).
+///   - `/commits/{sha}/status` — legacy commit statuses (Buildkite on
+///     mono still posts only these; check-runs returns `total_count: 0`
+///     for every mono merge-queue synthetic commit).
+///
+/// Status-context failures are classified with
+/// [`classify_status_context_state`] — the same mapping the GraphQL
+/// rollup path uses in `merge_poller::normalize_leaf` — so the two
+/// "did CI fail" answers cannot drift apart.
 ///
 /// `owner_repo` must be in `"owner/repo"` form (e.g. `"spinyfin/mono"`).
 ///
@@ -92,9 +141,24 @@ pub fn parse_provider_job_id(provider: CiProvider, url: &str) -> Option<String> 
 /// `ci_remediations.failed_checks` JSON can carry the build URL, job id,
 /// and provider — the same data the CI-fix revision directive shows the
 /// worker for per-branch failures. Best-effort: any network or parse error
-/// returns an empty vec; the insert still succeeds with `"[]"` so the worker
-/// can attempt manual discovery.
+/// on either endpoint contributes nothing from that surface; an empty
+/// combined result is still a valid return so the caller can fall back to
+/// a generic directive.
 pub async fn fetch_failing_checks_for_commit(owner_repo: &str, commit_sha: &str) -> Vec<RequiredCheckFailure> {
+    let mut failures = fetch_failing_check_runs(owner_repo, commit_sha).await;
+    let status_failures = fetch_failing_commit_statuses(owner_repo, commit_sha).await;
+    // Prefer check-run rows when both surfaces name the same check
+    // (dedup by name, first wins). Check runs typically carry richer
+    // job-id fragments; status contexts are the Buildkite-only fallback.
+    for failure in status_failures {
+        if !failures.iter().any(|f| f.name == failure.name) {
+            failures.push(failure);
+        }
+    }
+    failures
+}
+
+async fn fetch_failing_check_runs(owner_repo: &str, commit_sha: &str) -> Vec<RequiredCheckFailure> {
     let api_path = format!("repos/{owner_repo}/commits/{commit_sha}/check-runs");
     let output = gh_output(&["api", &api_path]).await;
     let output = match output {
@@ -113,6 +177,27 @@ pub async fn fetch_failing_checks_for_commit(owner_repo: &str, commit_sha: &str)
         }
     };
     parse_check_runs_for_failures(&output.stdout)
+}
+
+async fn fetch_failing_commit_statuses(owner_repo: &str, commit_sha: &str) -> Vec<RequiredCheckFailure> {
+    let api_path = format!("repos/{owner_repo}/commits/{commit_sha}/status");
+    let output = gh_output(&["api", &api_path]).await;
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                commit_sha,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "github: gh api commit status failed for merge-queue commit",
+            );
+            return Vec::new();
+        }
+        Err(err) => {
+            tracing::debug!(?err, commit_sha, "github: failed to spawn gh for commit status",);
+            return Vec::new();
+        }
+    };
+    parse_commit_statuses_for_failures(&output.stdout)
 }
 
 /// Pure parser for the GitHub REST `/commits/{sha}/check-runs` response body.
@@ -170,6 +255,51 @@ pub fn parse_check_runs_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
         failures.push(RequiredCheckFailure {
             name,
             conclusion: conclusion.to_owned(),
+            target_url,
+            provider,
+            provider_job_id,
+        });
+    }
+    failures
+}
+
+/// Pure parser for the GitHub REST `/commits/{sha}/status` (combined
+/// status) response body. Returns `RequiredCheckFailure` records for
+/// every status context whose `state` is a terminal failure per
+/// [`classify_status_context_state`].
+///
+/// This is the surface Buildkite posts on mono — check-runs are empty
+/// for merge-queue synthetic commits, so without this parser every
+/// mono queue ejection looks like "no failing checks". Field names
+/// match the REST combined-status schema (`context`, `state`,
+/// `target_url`); the GraphQL rollup path uses camelCase
+/// (`targetUrl`) but the same state vocabulary.
+pub fn parse_commit_statuses_for_failures(body: &[u8]) -> Vec<RequiredCheckFailure> {
+    let body: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let statuses = match body["statuses"].as_array() {
+        Some(arr) => arr,
+        None => return Vec::new(),
+    };
+    let mut failures = Vec::new();
+    for status in statuses {
+        let state = status["state"].as_str().unwrap_or("");
+        let conclusion = match classify_status_context_state(state) {
+            StatusContextVerdict::Fail { conclusion } => conclusion,
+            StatusContextVerdict::Pass | StatusContextVerdict::InFlight => continue,
+        };
+        let name = status["context"].as_str().unwrap_or_default().to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        let target_url = status["target_url"].as_str().unwrap_or_default().to_owned();
+        let provider = provider_for_url(&target_url);
+        let provider_job_id = parse_provider_job_id(provider, &target_url);
+        failures.push(RequiredCheckFailure {
+            name,
+            conclusion,
             target_url,
             provider,
             provider_job_id,
@@ -305,6 +435,119 @@ mod tests {
         for (url, expected) in cases {
             assert_eq!(super::provider_for_url(url), *expected, "provider_for_url({url:?})",);
         }
+    }
+
+    /// Status-context state classification is the single spelling of
+    /// "did this legacy commit status fail" shared with
+    /// `merge_poller::normalize_leaf`. FAILURE and ERROR terminal-fail;
+    /// SUCCESS passes; everything else waits.
+    #[test]
+    fn classify_status_context_state_matches_rollup_rules() {
+        assert_eq!(classify_status_context_state("SUCCESS"), StatusContextVerdict::Pass);
+        assert_eq!(classify_status_context_state("success"), StatusContextVerdict::Pass);
+        assert_eq!(
+            classify_status_context_state("FAILURE"),
+            StatusContextVerdict::Fail {
+                conclusion: "FAILURE".into()
+            }
+        );
+        // REST combined-status returns lowercase; conclusion is uppercased
+        // to match the GraphQL rollup path's spelling.
+        assert_eq!(
+            classify_status_context_state("failure"),
+            StatusContextVerdict::Fail {
+                conclusion: "FAILURE".into()
+            }
+        );
+        assert_eq!(
+            classify_status_context_state("error"),
+            StatusContextVerdict::Fail {
+                conclusion: "ERROR".into()
+            }
+        );
+        assert_eq!(classify_status_context_state("PENDING"), StatusContextVerdict::InFlight);
+        assert_eq!(
+            classify_status_context_state("EXPECTED"),
+            StatusContextVerdict::InFlight
+        );
+        assert_eq!(classify_status_context_state(""), StatusContextVerdict::InFlight);
+    }
+
+    /// Regression (mono merge-queue ejections): Buildkite posts legacy
+    /// commit statuses, not check runs. A queue-ejected commit whose CI
+    /// is reported only via `/commits/{sha}/status` must still surface
+    /// as failing checks — otherwise the rebounce detector refuses to
+    /// flip the row (empty `failures` guard).
+    #[test]
+    fn parse_commit_statuses_for_failures_returns_failing_contexts() {
+        let body = br#"{
+            "state": "failure",
+            "total_count": 3,
+            "statuses": [
+                {
+                    "context": "buildkite/mono/checks",
+                    "state": "failure",
+                    "target_url": "https://buildkite.com/spinyfin/mono/builds/42#job-abc"
+                },
+                {
+                    "context": "buildkite/mono/bazel-build-test",
+                    "state": "failure",
+                    "target_url": "https://buildkite.com/spinyfin/mono/builds/42#job-def"
+                },
+                {
+                    "context": "buildkite/mono/lint",
+                    "state": "success",
+                    "target_url": "https://buildkite.com/spinyfin/mono/builds/42#job-ghi"
+                },
+                {
+                    "context": "codecov/project",
+                    "state": "pending",
+                    "target_url": "https://codecov.io/gh/spinyfin/mono"
+                }
+            ]
+        }"#;
+        let failures = parse_commit_statuses_for_failures(body);
+        assert_eq!(failures.len(), 2, "only terminal-fail statuses");
+        assert_eq!(failures[0].name, "buildkite/mono/checks");
+        assert_eq!(failures[0].conclusion, "FAILURE");
+        assert_eq!(
+            failures[0].target_url,
+            "https://buildkite.com/spinyfin/mono/builds/42#job-abc"
+        );
+        assert_eq!(failures[0].provider, CiProvider::Buildkite);
+        assert_eq!(failures[0].provider_job_id.as_deref(), Some("job-abc"));
+        assert_eq!(failures[1].name, "buildkite/mono/bazel-build-test");
+        assert_eq!(failures[1].conclusion, "FAILURE");
+    }
+
+    #[test]
+    fn parse_commit_statuses_for_failures_treats_error_as_failure() {
+        let body = br#"{
+            "state": "failure",
+            "statuses": [
+                {
+                    "context": "ci/crash",
+                    "state": "error",
+                    "target_url": "https://buildkite.com/org/p/builds/1"
+                }
+            ]
+        }"#;
+        let failures = parse_commit_statuses_for_failures(body);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].conclusion, "ERROR");
+    }
+
+    #[test]
+    fn parse_commit_statuses_for_failures_empty_on_malformed_or_green() {
+        assert!(parse_commit_statuses_for_failures(b"not json").is_empty());
+        assert!(parse_commit_statuses_for_failures(b"{}").is_empty());
+        let green = br#"{
+            "state": "success",
+            "statuses": [
+                {"context": "ci", "state": "success", "target_url": ""}
+            ]
+        }"#;
+        assert!(parse_commit_statuses_for_failures(green).is_empty());
     }
 
     /// `parse_provider_job_id` extracts the provider-native job id from the

@@ -212,10 +212,40 @@ pub(crate) async fn check_merge_queue_rebounce(
             );
             continue;
         };
+        // Per-episode dedup *before* the check-runs/status round trip.
+        // The timeline keeps historical `RemovedFromMergeQueueEvent`s
+        // forever (including on PRs that have since re-queued and
+        // merged), so without this short-circuit every full sweep would
+        // re-fetch CI evidence for already-handled discriminators —
+        // log noise and wasted GitHub quota on rows that are no longer
+        // live (historically 1000+ re-fetches for a single PR episode).
+        // `on_merge_queue_rebounce_detected`'s INSERT OR IGNORE is the
+        // authoritative no-op; this just avoids the surrounding work.
+        match work_db.ci_remediation_exists_for_head_sha_at_trigger(&candidate.work_item_id, before_commit_sha) {
+            Ok(true) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    before_commit_sha,
+                    "merge poller: rebounce episode already recorded; skipping re-fetch",
+                );
+                continue;
+            }
+            Ok(false) => {}
+            Err(err) => {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    ?err,
+                    "merge poller: failed to check rebounce dedup; continuing",
+                );
+            }
+        }
         // Fetch the failing CI checks for the synthetic merge commit so the
         // worker revision directive can show the exact build URL, job id,
         // and a log excerpt — without the worker having to rediscover them.
         // Best-effort: an empty result falls back to generic instructions.
+        // Reads both check-runs and legacy commit statuses (Buildkite on
+        // mono posts only the latter — see `fetch_failing_checks_for_commit`).
         let failures = match repo_from_pr_url(&candidate.pr_url) {
             Some(owner_repo) => fetch_failing_checks_for_commit(owner_repo, before_commit_sha).await,
             None => Vec::new(),

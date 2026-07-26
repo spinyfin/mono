@@ -975,32 +975,51 @@ async fn on_queue_side_failure_detected(
         labels,
     } = episode;
     if failures.is_empty() {
-        // Defence in depth, mirroring `on_ci_failure_detected`'s guard.
+        // Defence in depth for the Trunk arm only.
         //
-        // A queue-side failure with no failing check to name is not a CI
+        // A Trunk eviction with no failing build to name is not a CI
         // failure we can act on: `failed_checks` lands empty, the worker
         // prompt has nothing to point at, and a CI attempt is spent on a
-        // task that cannot be completed. On T792/T793 that combination did
-        // real damage — the worker, told to find a build that did not exist
-        // and denied any bail-out, force-pushed an empty commit over the
-        // PR's entire contents. Refuse the flip instead.
+        // task that cannot be completed. That combination previously did
+        // real damage — the worker, told to find a build that did not
+        // exist and denied any bail-out, force-pushed an empty commit
+        // over a PR's entire contents. Refuse the flip for Trunk.
         //
-        // This should now be unreachable from the Trunk arm:
         // `trunk_queue_poller::handle_trunk_queue_eviction` classifies the
         // eviction first and only routes here when it has build evidence or
         // no positive merge-side signal. Kept because a silent, budget-
         // consuming misroute is a far worse failure mode than a refusal,
         // and because `warn!` makes any future caller that trips it visible
         // rather than mysterious.
+        //
+        // GitHub-native merge-queue rebounce is different: a confirmed
+        // `reason: failed_checks` timeline event is unambiguous evidence
+        // of failure even when the evidence-enrichment lookup comes back
+        // empty (mono's Buildkite posts legacy commit statuses; a
+        // check-runs-only fetch returned `[]` for every mono ejection,
+        // and this guard then refused every flip). A card that lies green
+        // is worse than a fix revision with a vague prompt; fall through
+        // and let the insert land with `failed_checks = "[]"` so the
+        // worker prompt's rebounce generic directive fires.
+        if failure_kind == "trunk_queue_eviction" {
+            tracing::warn!(
+                work_item_id = %candidate.work_item_id,
+                pr_url = %candidate.pr_url,
+                discriminator,
+                failure_kind,
+                "ci_watch: Trunk queue-side failure carried no failing checks; refusing to flip the row \
+                 (nothing for a fix revision to act on)",
+            );
+            return false;
+        }
         tracing::warn!(
             work_item_id = %candidate.work_item_id,
             pr_url = %candidate.pr_url,
             discriminator,
             failure_kind,
-            "ci_watch: queue-side failure carried no failing checks; refusing to flip the row \
-             (nothing for a fix revision to act on)",
+            "ci_watch: queue-side failure carried no failing checks; flipping with a generic directive \
+             (confirmed failed_checks ejection is authoritative)",
         );
-        return false;
     }
     if auto_pr_maintenance_disabled(work_db, candidate, labels) {
         return false;

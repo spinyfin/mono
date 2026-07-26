@@ -252,29 +252,26 @@ pub(crate) enum LeafVerdict {
 /// behaviour) silently classifies every StatusContext leaf as InFlight
 /// because both fields read empty, which is why a green Buildkite-only
 /// PR stayed pinned on the yellow-clock badge indefinitely.
+///
+/// StatusContext state mapping is delegated to
+/// [`boss_github::classify_status_context_state`] — the same function the
+/// merge-queue rebounce path uses when reading REST `/commits/{sha}/status`
+/// — so the two "did CI fail" answers cannot drift apart.
 pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
     let typename = leaf.get("__typename").and_then(|v| v.as_str()).unwrap_or("");
 
-    // StatusContext: `state` carries the verdict. Values per GitHub's
-    // commit-status API: SUCCESS / FAILURE / ERROR / PENDING / EXPECTED.
-    // Dispatch on `__typename` when present; fall back to "has `state`
-    // but no `conclusion`" so older fixtures (and any future leaf shape
-    // that mirrors StatusContext) classify correctly.
+    // StatusContext: `state` carries the verdict. Dispatch on
+    // `__typename` when present; fall back to "has `state` but no
+    // `conclusion`" so older fixtures (and any future leaf shape that
+    // mirrors StatusContext) classify correctly.
     let has_status_context_shape = typename.eq_ignore_ascii_case("StatusContext")
         || (leaf.get("state").is_some() && leaf.get("conclusion").is_none());
     if has_status_context_shape {
-        let state = leaf
-            .get("state")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        return match state.as_str() {
-            "SUCCESS" => LeafVerdict::Pass,
-            "FAILURE" | "ERROR" => LeafVerdict::Fail { conclusion: state },
-            // PENDING (running), EXPECTED (branch protection lists the
-            // context but no run has reported yet), empty, or anything
-            // else GitHub may add later → wait for a terminal verdict.
-            _ => LeafVerdict::InFlight,
+        let state = leaf.get("state").and_then(|v| v.as_str()).unwrap_or("");
+        return match boss_github::classify_status_context_state(state) {
+            boss_github::StatusContextVerdict::Pass => LeafVerdict::Pass,
+            boss_github::StatusContextVerdict::Fail { conclusion } => LeafVerdict::Fail { conclusion },
+            boss_github::StatusContextVerdict::InFlight => LeafVerdict::InFlight,
         };
     }
 

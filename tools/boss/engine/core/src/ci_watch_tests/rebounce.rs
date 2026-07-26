@@ -82,6 +82,140 @@ async fn rebounce_flips_in_review_to_blocked_ci_failure() {
     );
 }
 
+/// Regression: a queue-ejected commit whose CI is reported as **legacy
+/// status contexts** (Buildkite on mono — check-runs empty,
+/// `/commits/{sha}/status` carries FAILURE contexts) must still flip the
+/// row. Pre-fix, `fetch_failing_checks_for_commit` was check-runs-only
+/// and the empty-`failures` guard then refused every mono merge-queue
+/// ejection; the card stayed green. This exercises the full path:
+/// REST status body → shared StatusContext classifier → rebounce flip.
+#[tokio::test]
+async fn rebounce_with_legacy_status_context_failures_flips_the_row() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    // Matches the observed mono PR #2391 shape: Buildkite posts only
+    // legacy commit statuses on the synthetic queue commit.
+    let status_body = br#"{
+        "state": "failure",
+        "total_count": 2,
+        "statuses": [
+            {
+                "context": "buildkite/mono/checks",
+                "state": "failure",
+                "target_url": "https://buildkite.com/spinyfin/mono/builds/99#job-checks"
+            },
+            {
+                "context": "buildkite/mono/bazel-build-test",
+                "state": "failure",
+                "target_url": "https://buildkite.com/spinyfin/mono/builds/99#job-bazel"
+            }
+        ]
+    }"#;
+    let failures = boss_github::parse_commit_statuses_for_failures(status_body);
+    assert_eq!(
+        failures.len(),
+        2,
+        "status-context parser must surface both Buildkite failures"
+    );
+    assert!(
+        boss_github::parse_check_runs_for_failures(br#"{"total_count":0,"check_runs":[]}"#).is_empty(),
+        "fixture invariant: check-runs are empty on mono queue commits"
+    );
+
+    let pr = "https://github.com/spinyfin/mono/pull/2391";
+    let (product, chore) = make_in_review(&db, "C-rebounce-status-ctx", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let discriminator = "52008a9cd49f3bda610ce497a886d5c5437545b7";
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature-branch"),
+        discriminator,
+        &[],
+        &failures,
+    )
+    .await;
+    assert!(
+        flipped,
+        "a confirmed failed_checks ejection with status-context evidence must flip the row"
+    );
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("active attempt row");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+    assert_eq!(attempt.before_commit_sha.as_deref(), Some(discriminator));
+    let checks: Vec<serde_json::Value> = serde_json::from_str(&attempt.failed_checks).expect("valid JSON");
+    assert_eq!(checks.len(), 2);
+    assert_eq!(checks[0]["name"].as_str(), Some("buildkite/mono/checks"));
+    assert_eq!(checks[0]["conclusion"].as_str(), Some("FAILURE"));
+    assert_eq!(checks[0]["provider"].as_str(), Some("buildkite"));
+    assert_eq!(checks[0]["provider_job_id"].as_str(), Some("job-checks"));
+}
+
+/// A confirmed GitHub-native `failed_checks` ejection still flips even
+/// when evidence enrichment returns nothing. The empty-`failures` guard
+/// is Trunk-only; a card that lies green is worse than a fix revision
+/// with the rebounce generic directive.
+#[tokio::test]
+async fn rebounce_with_empty_failures_still_flips_with_generic_directive() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/2399";
+    let (product, chore) = make_in_review(&db, "C-rebounce-empty-fail", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let sha = "empty-evidence-synthetic-sha";
+
+    let flipped = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature"),
+        sha,
+        &[],
+        &[],
+    )
+    .await;
+    assert!(
+        flipped,
+        "confirmed merge-queue failed_checks ejection must flip even with empty failures"
+    );
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("attempt row must exist so subsequent sweeps dedup");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("merge_queue_rebounce"));
+    assert_eq!(attempt.before_commit_sha.as_deref(), Some(sha));
+    assert_eq!(
+        attempt.failed_checks, "[]",
+        "empty evidence lands as [] so the worker prompt's generic rebounce directive fires"
+    );
+
+    // Second probe of the same episode is a no-op (dedup via INSERT OR IGNORE)
+    // — the pre-fix refusal path re-fired every poll forever with no row.
+    let again = on_merge_queue_rebounce_detected(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        Some("feature"),
+        sha,
+        &[],
+        &[],
+    )
+    .await;
+    assert!(!again, "already-recorded empty-evidence rebounce must not re-flip");
+    assert!(
+        db.ci_remediation_exists_for_head_sha_at_trigger(&chore, sha).unwrap(),
+        "dedup key must be present for the merge-queue pre-fetch short-circuit"
+    );
+}
+
 /// When reconciliation detects a merge-queue rebounce and is supplied with
 /// the failing check data (from `fetch_failing_checks_for_commit`), those
 /// checks must be stored on the `ci_remediations` row so the revision
