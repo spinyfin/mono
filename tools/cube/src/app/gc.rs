@@ -2,7 +2,7 @@
 //! unhealthy workspaces, stale logs, and the background pool GC trigger.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use git_utils::pr_bookmark;
@@ -17,8 +17,10 @@ use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reconcile::reconcile_free_workspace_health;
-use crate::app::reset::reset_workspace_after_fetch;
-use crate::app::salvage::{gc_aged_salvage_records, salvage_workspace};
+use crate::app::reset::reset_workspace_after_fetch_within;
+use crate::app::salvage::{
+    attributed_holder, attributed_task, discard_salvage_record, gc_aged_salvage_records, salvage_workspace,
+};
 use crate::app::util::current_epoch_s;
 
 /// Pool-wide gc runs at most once per 24 hours (when there is no known
@@ -222,44 +224,69 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
-/// exists that `gc_aged_unhealthy_workspaces` can actually reset — used to
-/// decide whether a completed-but-partial pass should be retried after
+/// exists that `gc_aged_unhealthy_workspaces` would pick up — used to decide
+/// whether a completed-but-partial pass should be retried after
 /// POOL_GC_BACKLOG_RETRY_SECS instead of waiting a full day.
 ///
-/// Deliberately excludes `Quarantined` workspaces even though
-/// `gc_aged_unhealthy_workspaces` also considers them: quarantine is only
-/// ever lifted against evidence from a live reuse probe (an unpushed-work
-/// check), and a quarantined workspace whose `@` genuinely still holds
-/// unpushed work stays quarantined forever — its `unhealthy_since` never
-/// advances, so counting it here would pin the retry interval at
-/// POOL_GC_BACKLOG_RETRY_SECS permanently instead of settling back to
-/// AUTO_GC_INTERVAL_SECS once the resettable (Dirty/Conflicted) backlog is
-/// actually drained. Dirty/Conflicted workspaces have no such refusal path —
-/// `gc_aged_unhealthy_workspaces` resets them unconditionally once aged past
-/// the threshold — so they are a reliable "will make progress next pass"
-/// signal. Running the live probe here to distinguish resettable from stuck
-/// quarantined workspaces would defeat the point of this being a cheap,
-/// read-only check (see `gc_aged_unhealthy_workspaces`'s quarantine probe).
+/// The candidate predicate here must mirror `gc_aged_unhealthy_workspaces`'s
+/// exactly, including `Quarantined` and its "no `unhealthy_since` means treat
+/// as old" allowance. It previously matched only `Dirty`/`Conflicted`, on the
+/// reasoning that a quarantined workspace holding unpushed work stayed
+/// quarantined forever and would therefore pin the retry interval at 5
+/// minutes permanently. Retention now expires — age plus a successful salvage
+/// reclaims exactly those rows — so that reasoning no longer holds, and the
+/// mismatch had a real cost: with a backlog that is mostly quarantined, a
+/// partial 20-second pass stamps completion, this returns `false`, and the
+/// next auto GC waits AUTO_GC_INTERVAL_SECS (24h) rather than
+/// POOL_GC_BACKLOG_RETRY_SECS (5m). The free pool stays withheld far longer
+/// than the 24h retention TTL implies — the "effective free collapses while
+/// GC sleeps" failure this whole change exists to fix.
+///
+/// This deliberately does not distinguish "will succeed" from "will be tried
+/// and refused". A candidate whose salvage keeps failing genuinely is
+/// outstanding work, and retrying it every POOL_GC_BACKLOG_RETRY_SECS is the
+/// correct answer for the rest of the backlog it is sharing a pass with;
+/// telling the two apart needs the live probe, which is exactly the cost this
+/// check exists to avoid.
 pub(super) fn pool_gc_has_aged_unhealthy_backlog(store: &Store, now_epoch_s: i64) -> Result<bool> {
     let max_age_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
     let threshold_epoch_s = now_epoch_s.saturating_sub(max_age_secs);
     let records = store.list_workspaces_filtered(&WorkspaceListFilter::default())?;
-    Ok(records.into_iter().any(|record| {
-        if record.state == WorkspaceState::Leased {
-            return false;
-        }
-        let is_unhealthy = matches!(
-            record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
-        );
-        if !is_unhealthy {
-            return false;
-        }
-        let Some(unhealthy_since) = record.unhealthy_since_epoch_s else {
-            return false;
-        };
-        unhealthy_since <= threshold_epoch_s
-    }))
+    Ok(records
+        .into_iter()
+        .any(|record| aged_unhealthy_since(&record, threshold_epoch_s).is_some()))
+}
+
+/// The shared candidate predicate for the aged-unhealthy passes: `Some(since)`
+/// when `record` is a free workspace whose unhealthy clock started at or
+/// before `threshold_epoch_s`, `None` when it is not a candidate at all.
+///
+/// Factored out so `pool_gc_has_aged_unhealthy_backlog` (which decides *when*
+/// the next pass runs) and `gc_aged_unhealthy_workspaces` (which does the
+/// work) cannot drift apart again.
+fn aged_unhealthy_since(record: &WorkspaceRecord, threshold_epoch_s: i64) -> Option<i64> {
+    if record.state == WorkspaceState::Leased {
+        return None;
+    }
+    if !matches!(
+        record.health_status,
+        Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
+    ) {
+        return None;
+    }
+    // A quarantined row written before the timestamp was stamped on that path
+    // has no age to compare; treat it as old rather than stranding it forever
+    // — the reuse probe is what actually decides whether it is safe to touch.
+    // Dirty/conflicted rows keep the strict behaviour.
+    let unhealthy_since = match (
+        record.unhealthy_since_epoch_s,
+        record.health_status == Some(WorkspaceHealth::Quarantined),
+    ) {
+        (Some(since), _) => since,
+        (None, true) => 0,
+        (None, false) => return None,
+    };
+    (unhealthy_since <= threshold_epoch_s).then_some(unhealthy_since)
 }
 
 /// Trigger a pool GC pass, throttled so it does not run on every lease.
@@ -481,7 +508,7 @@ pub(super) fn reclaim_quarantined_workspace(
             break;
         }
         scanned += 1;
-        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch) {
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch, deadline) {
             Ok(status) => status,
             Err(error) => {
                 eprintln!(
@@ -601,29 +628,10 @@ pub(super) fn gc_aged_unhealthy_workspaces(
             eprintln!("cube: unhealthy gc: time budget exhausted, deferring remaining candidates to next pass");
             break;
         }
-        if record.state == WorkspaceState::Leased {
+        let Some(unhealthy_since) = aged_unhealthy_since(&record, threshold_epoch_s) else {
             continue;
-        }
-        let is_unhealthy = matches!(
-            record.health_status,
-            Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted) | Some(WorkspaceHealth::Quarantined)
-        );
-        if !is_unhealthy {
-            continue;
-        }
-        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
-        // A quarantined row written before the timestamp was stamped on that
-        // path has no age to compare; treat it as old rather than stranding it
-        // forever — the probe below is what actually decides whether it is
-        // safe to touch. Dirty/conflicted rows keep the strict behaviour.
-        let unhealthy_since = match (record.unhealthy_since_epoch_s, is_quarantined) {
-            (Some(since), _) => since,
-            (None, true) => 0,
-            (None, false) => continue,
         };
-        if unhealthy_since > threshold_epoch_s {
-            continue;
-        }
+        let is_quarantined = record.health_status == Some(WorkspaceHealth::Quarantined);
         if !workspace_path_exists(&record) {
             continue;
         }
@@ -664,7 +672,14 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         // Look before touching anything. The probe fetches first, so the
         // "does any remote already have this?" verdict is current rather than
         // a stale local view — the same reason the release-time guard fetches.
-        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch) {
+        //
+        // `deadline` is threaded all the way into the subprocess timeouts, not
+        // merely consulted before the candidate is picked: the fetch inside
+        // this probe is 120s per attempt with two retries behind it, so one
+        // slow remote could otherwise hold a lease for several minutes and
+        // blow both this pass's 20s budget and the engine's 90s lease timeout.
+        let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch, deadline)
+        {
             Ok(status) => status,
             Err(e) => {
                 eprintln!(
@@ -687,9 +702,12 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         // Anything the workspace holds that no remote has gets salvaged before
         // the reset. A failed salvage is a hard stop for this workspace: the
         // whole basis for bounding retention is that expiry cannot lose work.
-        let mut salvaged_to: Option<String> = None;
+        // "Failed" includes any capture that cannot be proven complete — an
+        // empty log after a probe that refused reuse, or a stack larger than
+        // the export cap — see `salvage_workspace`.
+        let mut salvaged_to: Option<PathBuf> = None;
         if !status.is_reusable() {
-            match salvage_workspace(runner, database_path, &record, &main_branch, now_epoch_s) {
+            match salvage_workspace(runner, database_path, &record, &main_branch, now_epoch_s, deadline) {
                 Ok(path) => {
                     let path_str = path.display().to_string();
                     eprintln!(
@@ -702,14 +720,14 @@ pub(super) fn gc_aged_unhealthy_workspaces(
                         repo = record.repo,
                         workspace_id = record.workspace_id,
                         prior_health = prior_health,
-                        prior_holder = record.holder.as_deref(),
-                        prior_task = record.task.as_deref(),
+                        prior_holder = attributed_holder(&record),
+                        prior_task = attributed_task(&record),
                         age_secs = age_secs,
                         head_change_id = status.head_change_id(),
                         unpushed_commits = status.unpushed_summary(),
                         salvage_path = path_str,
                     );
-                    salvaged_to = Some(path_str);
+                    salvaged_to = Some(path);
                 }
                 Err(e) => {
                     eprintln!(
@@ -747,9 +765,34 @@ pub(super) fn gc_aged_unhealthy_workspaces(
 
         // `probe_workspace_reuse` already fetched, so finish the reset from
         // there rather than paying a second network round trip per workspace
-        // in a time-budgeted pass.
-        if let Err(e) = reset_workspace_after_fetch(runner, database_path, &record.workspace_path, &main_branch, None) {
+        // in a time-budgeted pass. Bounded by the same deadline as everything
+        // else in this candidate's turn.
+        if let Err(e) = reset_workspace_after_fetch_within(
+            runner,
+            database_path,
+            &record.workspace_path,
+            &main_branch,
+            None,
+            deadline,
+        ) {
             eprintln!("cube: retention: {}: reset failed: {e}", record.workspace_id,);
+            // The reclaim this salvage was taken for did not happen, so the
+            // live workspace is still the source of truth and still retained.
+            // Drop the copy: keeping it would have the next pass write a
+            // second one, and repeated reset failures would multiply full
+            // copies of the same stack until the salvage TTL.
+            if let Some(path) = &salvaged_to {
+                discard_salvage_record(path);
+                audit!(
+                    database_path,
+                    "workspace.retention_salvage_discarded",
+                    repo = record.repo,
+                    workspace_id = record.workspace_id,
+                    salvage_path = path.display().to_string(),
+                    reason = "reset_failed",
+                    error = e.to_string(),
+                );
+            }
             continue;
         }
 
@@ -771,14 +814,15 @@ pub(super) fn gc_aged_unhealthy_workspaces(
             }
         }
 
+        let salvaged_to = salvaged_to.map(|p| p.display().to_string());
         audit!(
             database_path,
             "workspace.unhealthy_gc_reset",
             workspace_id = record.workspace_id,
             repo = record.repo,
             prior_health = prior_health,
-            prior_holder = record.holder.as_deref(),
-            prior_task = record.task.as_deref(),
+            prior_holder = attributed_holder(&record),
+            prior_task = attributed_task(&record),
             prior_release_reason = record.last_release_reason.as_deref(),
             unhealthy_since_epoch_s = unhealthy_since,
             age_secs = age_secs,

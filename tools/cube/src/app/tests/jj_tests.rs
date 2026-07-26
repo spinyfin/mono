@@ -53,6 +53,7 @@ fn run_jj_push_retries_once_on_transient_failure_then_succeeds() {
                 timeout_secs: 300,
             }),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
         ExpectedCommand::ok(cwd.clone(), "jj", push_args, ""),
     ]);
@@ -87,6 +88,7 @@ fn run_jj_push_returns_immediately_on_non_retryable_failure() {
             stderr: "fatal: permission denied (publickey)".to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     }]);
 
     let err = run_jj_push(&runner, &RealCommandRunner::invocation(&cwd, "jj", push_args))
@@ -111,6 +113,7 @@ fn run_jj_propagates_non_stale_errors_unchanged() {
             stderr: "Error: something else entirely".to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     }]);
 
     let invocation = CommandInvocation {

@@ -95,18 +95,31 @@ const LEASE_HEALTH_SCAN_MAX_PROBES: usize = 8;
 ///
 /// This is the staleness policy for the cached `health_status`. Cached
 /// verdicts are trusted by default — that is the whole point — but a
-/// workspace an operator cleaned out of band must not be withheld forever, so
-/// each lease re-probes a small rotating window of the cached-unhealthy set
-/// (cursor persisted in `pool_metadata`, see
-/// [`STALE_HEALTH_CURSOR_KEY_PREFIX`]). Every cached-unhealthy workspace is
-/// therefore re-probed at least once every `ceil(N / 3)` leases; at the
-/// observed N≈107 and 259 leases per audit window that is ~7 revalidations
-/// per workspace per window, against 107 probes *per lease* before.
+/// workspace an operator cleaned out of band should not be withheld longer
+/// than necessary, so a lease that walks past its effective-free candidates
+/// without finding one usable spends its remaining probe budget re-checking a
+/// small rotating window of the cached-unhealthy set (cursor persisted in
+/// `pool_metadata`, see [`STALE_HEALTH_CURSOR_KEY_PREFIX`]).
 ///
-/// Revalidation is not the only path back: the pool GC's
+/// ## What this does and does not guarantee
+///
+/// Lease revalidation is **opportunistic, not a coverage guarantee.** The scan
+/// stops at the first clean workspace it finds, and effective-free candidates
+/// are probed before this window, so in a healthy pool a lease returns before
+/// the window is ever reached — no revalidation happens at all, by design:
+/// paying for it would re-add exactly the per-lease cost this scan exists to
+/// remove. The cursor advances only across entries a lease actually probed
+/// (see [`stale_revalidation_window`] and its caller), so the rotation never
+/// skips an entry it did not look at; what it does not promise is that any
+/// particular lease reaches the window.
+///
+/// Revalidation therefore kicks in exactly when it matters — when the
+/// effective-free set is empty or all-dirty and the pool is under pressure —
+/// and the reliable recovery paths are the other three: the pool GC's
 /// `reconcile_free_workspace_health` pass promotes recovered workspaces
 /// wholesale, `cube workspace reconcile` does it on demand, and `--prefer`
-/// always probes its named target regardless of this window.
+/// always probes its named target regardless of this window. Do not read lease
+/// traffic alone as healing stale dirty cache.
 const STALE_HEALTH_REVALIDATE_PER_LEASE: usize = 3;
 
 /// Wall-clock budget for the whole pre-claim health scan. Belt to
@@ -123,28 +136,48 @@ const QUARANTINE_RECLAIM_BUDGET: Duration = Duration::from_secs(5);
 
 /// `pool_metadata` key prefix for the per-repo cursor that rotates which
 /// cached-unhealthy workspaces get re-probed. Persisting it (rather than, say,
-/// randomising) makes the revalidation interval a stated guarantee rather than
-/// an expectation.
+/// randomising) is what makes the rotation cover the whole set instead of
+/// re-checking whichever entries a random draw happens to favour.
 const STALE_HEALTH_CURSOR_KEY_PREFIX: &str = "stale_health_cursor:";
 
-fn stale_health_cursor_key(repo: &str) -> String {
+pub(super) fn stale_health_cursor_key(repo: &str) -> String {
     format!("{STALE_HEALTH_CURSOR_KEY_PREFIX}{repo}")
 }
 
-/// Pick the rotating slice of `cached_unhealthy` this lease will re-probe, and
-/// return it with the cursor value to persist for the next lease.
+/// Pick the rotating slice of `cached_unhealthy` this lease *may* re-probe,
+/// starting at `cursor`.
 ///
-/// Split out from the lease body so the rotation guarantee ("every entry is
-/// revalidated within ceil(N/K) leases") is directly testable without driving
-/// a full lease.
-pub(super) fn stale_revalidation_window(len: usize, cursor: i64, per_lease: usize) -> (Vec<usize>, i64) {
+/// Returns indices only. Deliberately does NOT return a next-cursor value:
+/// the cursor is advanced by [`advanced_stale_cursor`] afterwards, using the
+/// number of these entries the scan actually reached. Computing it here is
+/// what produced the original bug — the cursor was persisted up front, off the
+/// *planned* window, and the scan then usually exited at the first clean
+/// effective-free candidate without probing any of them. Three entries were
+/// skipped per lease while the audit trail and the comments claimed they had
+/// been revalidated, so a workspace cleaned out of band could stay cached
+/// dirty indefinitely.
+pub(super) fn stale_revalidation_window(len: usize, cursor: i64, per_lease: usize) -> Vec<usize> {
     if len == 0 || per_lease == 0 {
-        return (Vec::new(), 0);
+        return Vec::new();
     }
     let start = cursor.rem_euclid(len as i64) as usize;
     let take = per_lease.min(len);
-    let picked: Vec<usize> = (0..take).map(|offset| (start + offset) % len).collect();
-    (picked, ((start + take) % len) as i64)
+    (0..take).map(|offset| (start + offset) % len).collect()
+}
+
+/// Where the rotation cursor lands after a lease probed `probed` entries of
+/// the window that started at `cursor`.
+///
+/// `probed` is the count of window entries the scan genuinely reached, which
+/// is what makes the rotation honest: a lease that probed none leaves the
+/// cursor where it was, and the next lease re-offers the same entries rather
+/// than the set being silently skipped past.
+pub(super) fn advanced_stale_cursor(len: usize, cursor: i64, probed: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let start = cursor.rem_euclid(len as i64) as usize;
+    ((start + probed) % len) as i64
 }
 
 pub(super) fn run_workspace(
@@ -423,8 +456,10 @@ pub(super) fn run_workspace(
             // three ways —
             //   1. Workspaces cached as unhealthy are NOT probed, except for a
             //      small rotating revalidation window (see
-            //      [`STALE_HEALTH_REVALIDATE_PER_LEASE`]) that keeps a
-            //      cleaned-out-of-band workspace from being withheld forever.
+            //      [`STALE_HEALTH_REVALIDATE_PER_LEASE`]) that a lease reaches
+            //      only after its effective-free candidates come up empty.
+            //      That window is opportunistic; pool GC's reconcile pass is
+            //      what reliably un-sticks a cleaned-out-of-band workspace.
             //   2. At most [`LEASE_HEALTH_SCAN_MAX_PROBES`] live probes run.
             //   3. The whole scan stops at [`LEASE_HEALTH_SCAN_BUDGET`].
             // Hitting any bound is not a failure: provisioning is the designed
@@ -462,21 +497,30 @@ pub(super) fn run_workspace(
                 d
             };
 
-            // Rotate the revalidation window across leases so every cached
-            // -unhealthy workspace comes up for re-probe on a bounded
-            // schedule. The cursor is persisted per repo; a failure to read or
-            // write it degrades to "start from the top", never to a longer
-            // scan.
+            // Rotate the revalidation window across leases so the
+            // cached-unhealthy set is covered evenly rather than the same few
+            // entries being re-probed. The cursor is persisted per repo; a
+            // failure to read or write it degrades to "start from the top",
+            // never to a longer scan.
+            //
+            // It is advanced AFTER the scan, by the number of these entries
+            // the scan actually probed — see `advanced_stale_cursor`. The scan
+            // below orders effective-free candidates first and breaks at the
+            // first clean one, so a lease frequently returns without reaching
+            // this window at all; advancing up front (as this did originally)
+            // silently skipped those entries and left an out-of-band-cleaned
+            // workspace cached dirty indefinitely.
             let cursor_key = stale_health_cursor_key(&repo);
             let cursor = store.get_pool_metadata_i(&cursor_key).unwrap_or(None).unwrap_or(0);
-            let (revalidate_idx, next_cursor) =
+            let revalidate_idx =
                 stale_revalidation_window(cached_unhealthy.len(), cursor, STALE_HEALTH_REVALIDATE_PER_LEASE);
-            if !revalidate_idx.is_empty()
-                && let Err(e) = store.set_pool_metadata_i(&cursor_key, next_cursor)
-            {
-                eprintln!("warning: cube could not persist the health revalidation cursor for `{repo}`: {e}");
-            }
             let revalidate: Vec<&WorkspaceRecord> = revalidate_idx.iter().map(|i| &cached_unhealthy[*i]).collect();
+            // Which ids belong to the window, so the post-scan cursor advance
+            // counts only those — a `--prefer` that happens to name a
+            // cached-unhealthy workspace outside the window is an explicit
+            // request, not a rotation step, and must not move the cursor.
+            let revalidate_ids: std::collections::HashSet<&str> =
+                revalidate.iter().map(|w| w.workspace_id.as_str()).collect();
 
             // All free candidates, used only so `--prefer` can name a
             // cached-unhealthy workspace outside the revalidation window.
@@ -511,6 +555,9 @@ pub(super) fn run_workspace(
             // Live probes actually performed, and how the scan ended.
             let mut probes = 0usize;
             let mut revalidations = 0usize;
+            // Of those, the ones drawn from this lease's rotation window —
+            // the only ones that may advance the persisted cursor.
+            let mut window_revalidations = 0usize;
             let mut promoted_to_clean = 0usize;
             let mut scan_truncated: Option<&'static str> = None;
             // first clean workspace found
@@ -550,6 +597,9 @@ pub(super) fn run_workspace(
                     Some(WorkspaceHealth::Dirty) | Some(WorkspaceHealth::Conflicted)
                 ) {
                     revalidations += 1;
+                    if revalidate_ids.contains(ws_id.as_str()) {
+                        window_revalidations += 1;
+                    }
                 }
 
                 // Any error from check_workspace_health skips this workspace
@@ -771,6 +821,18 @@ pub(super) fn run_workspace(
                 }
             }
 
+            // Advance the rotation cursor by what this lease genuinely
+            // revalidated, now that the scan is over and that number is known.
+            // A lease that never reached the window leaves the cursor where it
+            // was, so the next lease re-offers the same entries instead of the
+            // set being skipped past unprobed.
+            if window_revalidations > 0 {
+                let next_cursor = advanced_stale_cursor(cached_unhealthy.len(), cursor, window_revalidations);
+                if let Err(e) = store.set_pool_metadata_i(&cursor_key, next_cursor) {
+                    eprintln!("warning: cube could not persist the health revalidation cursor for `{repo}`: {e}");
+                }
+            }
+
             // One aggregate event for the whole scan, instead of one per
             // candidate. The per-candidate `workspace.health_check_skipped`
             // events above still fire for workspaces this lease actually
@@ -794,6 +856,8 @@ pub(super) fn run_workspace(
                 trusted_cache_skips = cached_unhealthy.len().saturating_sub(revalidations),
                 probed = probes,
                 revalidated = revalidations,
+                revalidation_window = revalidate_idx.len(),
+                window_revalidated = window_revalidations,
                 promoted_to_clean = promoted_to_clean,
                 truncated = scan_truncated,
                 elapsed_ms = scan_elapsed_ms,
@@ -806,6 +870,8 @@ pub(super) fn run_workspace(
                 "probed": probes,
                 "max_probes": LEASE_HEALTH_SCAN_MAX_PROBES,
                 "revalidated": revalidations,
+                "revalidation_window": revalidate_idx.len(),
+                "window_revalidated": window_revalidations,
                 "promoted_to_clean": promoted_to_clean,
                 "truncated": scan_truncated,
                 "elapsed_ms": scan_elapsed_ms,

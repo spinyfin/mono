@@ -262,6 +262,7 @@ fn pr_push_stale_push_error() {
                 .collect(),
             result: Err(push_err),
             creates_dir: None,
+            duration: std::time::Duration::ZERO,
         },
     ]);
 

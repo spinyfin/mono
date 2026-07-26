@@ -1022,6 +1022,7 @@ fn release_degrades_to_dirty_when_reset_fetch_fails() {
             stderr: "fatal: permission denied (publickey)".to_string(),
         }),
         creates_dir: None,
+        duration: std::time::Duration::ZERO,
     }]);
 
     let result = run_with_dependencies(

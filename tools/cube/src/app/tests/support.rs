@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rusqlite;
 use tempfile::TempDir;
@@ -274,12 +275,18 @@ pub(super) fn audit_events(tempdir: &TempDir) -> Vec<serde_json::Value> {
 #[derive(Default)]
 pub(super) struct FakeRunner {
     pub(super) expectations: RefCell<VecDeque<ExpectedCommand>>,
+    /// Every timeout the code under test handed to
+    /// [`CommandRunner::run_with_timeout`], in call order. Lets a test assert
+    /// that a caller's wall-clock budget actually reached the subprocess
+    /// bound, rather than the default 120s network timeout.
+    observed_timeouts: RefCell<Vec<Duration>>,
 }
 
 impl FakeRunner {
     pub(super) fn new(expectations: Vec<ExpectedCommand>) -> Self {
         Self {
             expectations: RefCell::new(expectations.into()),
+            observed_timeouts: RefCell::new(Vec::new()),
         }
     }
 
@@ -290,32 +297,70 @@ impl FakeRunner {
             self.expectations.borrow()
         );
     }
-}
 
-impl CommandRunner for FakeRunner {
-    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+    /// The timeouts passed to `run_with_timeout`, in call order.
+    pub(super) fn observed_timeouts(&self) -> Vec<Duration> {
+        self.observed_timeouts.borrow().clone()
+    }
+
+    fn next_expectation(&self, invocation: &CommandInvocation) -> ExpectedCommand {
         let expected = self
             .expectations
             .borrow_mut()
             .pop_front()
-            .expect("unexpected command invocation");
+            .unwrap_or_else(|| panic!("unexpected command invocation: {invocation:?}"));
         assert_eq!(expected.cwd, invocation.cwd);
         assert_eq!(expected.program, invocation.program);
         assert_eq!(expected.args, invocation.args);
         if let Some(path) = &expected.creates_dir {
             std::fs::create_dir_all(path).expect("create simulated workspace dir");
         }
+        expected
+    }
+}
+
+impl CommandRunner for FakeRunner {
+    fn run(&self, invocation: &CommandInvocation) -> Result<String> {
+        self.next_expectation(invocation).result
+    }
+
+    /// Honours `timeout` against the expectation's simulated `duration`, so a
+    /// test can exercise the "this subprocess outlives the caller's budget"
+    /// path the way [`crate::command_runner::RealCommandRunner`] does: sleep
+    /// until the bound, kill, and report [`CubeError::CommandTimedOut`]. The
+    /// sleep is real (bounded by `timeout`) so wall-clock-dependent logic —
+    /// notably "is there budget left for a retry?" — behaves as it would in
+    /// production.
+    fn run_with_timeout(&self, invocation: &CommandInvocation, timeout: Duration) -> Result<String> {
+        self.observed_timeouts.borrow_mut().push(timeout);
+        let expected = self.next_expectation(invocation);
+        if expected.duration > timeout {
+            std::thread::sleep(timeout);
+            return Err(CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: timeout.as_secs(),
+            });
+        }
+        if !expected.duration.is_zero() {
+            std::thread::sleep(expected.duration);
+        }
         expected.result
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into))]
 pub(super) struct ExpectedCommand {
     pub(super) cwd: PathBuf,
     pub(super) program: String,
     pub(super) args: Vec<String>,
     pub(super) result: Result<String>,
     pub(super) creates_dir: Option<PathBuf>,
+    /// How long this command pretends to take. Zero (the default) is the
+    /// instant-completion behaviour every existing expectation relies on.
+    #[builder(default = Duration::ZERO)]
+    pub(super) duration: Duration,
 }
 
 impl ExpectedCommand {
@@ -326,11 +371,21 @@ impl ExpectedCommand {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             result: Ok(stdout.to_string()),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 
     pub(super) fn creating_dir(mut self, path: PathBuf) -> Self {
         self.creates_dir = Some(path);
+        self
+    }
+
+    /// Make this command take `duration` of simulated wall clock. A command
+    /// whose duration exceeds the timeout it is run under is killed and
+    /// reported as [`CubeError::CommandTimedOut`], exactly as the real runner
+    /// would — which is how a test can stand in for a slow remote.
+    pub(super) fn taking(mut self, duration: Duration) -> Self {
+        self.duration = duration;
         self
     }
 
@@ -408,6 +463,7 @@ impl ExpectedCommand {
                     .to_string(),
             }),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 
@@ -430,6 +486,7 @@ impl ExpectedCommand {
                     .to_string(),
             }),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 
@@ -452,6 +509,7 @@ impl ExpectedCommand {
                 stderr: format!("Error: No such remote bookmark: {bookmark}"),
             }),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 
@@ -480,6 +538,7 @@ impl ExpectedCommand {
                 stderr: format!("Error: Revision `{target}` doesn't exist"),
             }),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 
@@ -502,6 +561,7 @@ impl ExpectedCommand {
                     .to_string(),
             }),
             creates_dir: None,
+            duration: Duration::ZERO,
         }
     }
 }
