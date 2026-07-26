@@ -1107,7 +1107,7 @@ mod tests {
     use crate::driver::{
         CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress,
         ProgressObservationConfig, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-        WorkerErrorClass,
+        TurnEnd, WorkerErrorClass,
     };
     use async_trait::async_trait;
     use boss_engine_structured_output::StructuredOutputKind;
@@ -1155,6 +1155,9 @@ mod tests {
             unimplemented!()
         }
         fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            unimplemented!()
+        }
+        fn turn_boundary(&self, _: &WorkerEvent) -> Option<TurnEnd> {
             unimplemented!()
         }
         fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {

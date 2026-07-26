@@ -304,152 +304,152 @@ pub(super) async fn dispatch_live_worker_state(
     // hook arriving before `register_spawn` or after `release_slot`
     // is a benign no-op.
     let new_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
-    match &incoming.event {
-        crate::protocol::WorkerEvent::Stop { .. } if !is_remote_slot => {
-            server_state.live_status_manager.notify(slot_id, Trigger::Stop);
+    // The end-of-turn trigger comes from the run's driver
+    // (`Capability::TurnBoundary`), resolved once at ingress — not from this
+    // dispatcher recognising a Claude-shaped `Stop`. Checked ahead of the
+    // match because the two are disjoint: no event is both a turn boundary
+    // and a tool result.
+    if incoming.is_turn_boundary() && !is_remote_slot {
+        server_state.live_status_manager.notify(slot_id, Trigger::Stop);
+    }
+    if let crate::protocol::WorkerEvent::PostToolUse {
+        tool_name,
+        tool_input,
+        tool_response,
+        ..
+    } = &incoming.event
+    {
+        if !is_remote_slot {
+            server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
         }
-        crate::protocol::WorkerEvent::PostToolUse {
-            tool_name,
-            tool_input,
-            tool_response,
-            ..
-        } => {
-            if !is_remote_slot {
-                server_state.live_status_manager.notify(slot_id, Trigger::PostToolUse);
-            }
-            // Primary-path PR URL capture. Every worker that opens a
-            // PR does it via a Bash `gh pr create` (and also
-            // `gh pr view` / `gh pr edit`); the PR URL is printed
-            // on stdout. Catch it here, stage against the
-            // execution_id, and the on-Stop handler picks it up
-            // without ever shelling out to `jj log` to reconstruct
-            // it.
-            //
-            // Layer-1 gate: only capture URLs from deliberate `gh pr`
-            // invocations. Arbitrary Bash output (file reads, test
-            // runs, chore descriptions printed via shell) can contain
-            // PR URLs from unrelated executions; filtering by command
-            // prevents those from staging the wrong PR.
-            if tool_name == "Bash" {
-                // Check for any PR URL first so we can log a rejection
-                // when the command isn't a gh pr invocation.
-                if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response) {
-                    if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
-                        tracing::info!(
-                            execution_id = run_id,
-                            rejected_url = %pr_url,
-                            reason = "not_a_gh_pr_command",
-                            "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
-                        );
-                    } else {
-                        // Gate the URL against the product's repo before
-                        // staging. Workers running tests can emit fixture
-                        // URLs (e.g. `https://github.com/foo/bar/pull/42`)
-                        // in tool_response.stdout; without this gate those
-                        // bind to the work_item as if they were real PRs.
-                        let execution_id = run_id;
-                        let repo_url_result = server_state
-                            .work_db
-                            .get_execution(execution_id)
-                            .map(|e| e.repo_remote_url);
-                        let valid = match repo_url_result {
-                            Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
-                                Ok(()) => true,
-                                Err(reason) => {
-                                    tracing::info!(
-                                        execution_id,
-                                        rejected_url = %pr_url,
-                                        %reason,
-                                        "pr_url_capture: dropping URL — failed product-repo gate",
-                                    );
-                                    false
-                                }
-                            },
-                            Err(err) => {
-                                tracing::warn!(
+        // Primary-path PR URL capture. Every worker that opens a
+        // PR does it via a Bash `gh pr create` (and also
+        // `gh pr view` / `gh pr edit`); the PR URL is printed
+        // on stdout. Catch it here, stage against the
+        // execution_id, and the on-Stop handler picks it up
+        // without ever shelling out to `jj log` to reconstruct
+        // it.
+        //
+        // Layer-1 gate: only capture URLs from deliberate `gh pr`
+        // invocations. Arbitrary Bash output (file reads, test
+        // runs, chore descriptions printed via shell) can contain
+        // PR URLs from unrelated executions; filtering by command
+        // prevents those from staging the wrong PR.
+        if tool_name == "Bash" {
+            // Check for any PR URL first so we can log a rejection
+            // when the command isn't a gh pr invocation.
+            if let Some(pr_url) = crate::pr_url_capture::extract_pr_url_from_bash_response(tool_response) {
+                if !crate::pr_url_capture::is_gh_pr_command(tool_input) {
+                    tracing::info!(
+                        execution_id = run_id,
+                        rejected_url = %pr_url,
+                        reason = "not_a_gh_pr_command",
+                        "pr_url_capture_rejected: URL in Bash stdout rejected — command is not a gh pr invocation",
+                    );
+                } else {
+                    // Gate the URL against the product's repo before
+                    // staging. Workers running tests can emit fixture
+                    // URLs (e.g. `https://github.com/foo/bar/pull/42`)
+                    // in tool_response.stdout; without this gate those
+                    // bind to the work_item as if they were real PRs.
+                    let execution_id = run_id;
+                    let repo_url_result = server_state
+                        .work_db
+                        .get_execution(execution_id)
+                        .map(|e| e.repo_remote_url);
+                    let valid = match repo_url_result {
+                        Ok(ref repo_url) => match crate::pr_url_capture::validate_pr_url(&pr_url, repo_url) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                tracing::info!(
                                     execution_id,
                                     rejected_url = %pr_url,
-                                    ?err,
-                                    "pr_url_capture: could not load execution to validate URL; dropping for safety",
+                                    %reason,
+                                    "pr_url_capture: dropping URL — failed product-repo gate",
                                 );
                                 false
                             }
-                        };
-                        if valid {
-                            let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
-                            match outcome {
-                                crate::pr_url_capture::StagePrUrlOutcome::Staged => {
-                                    tracing::info!(
-                                        execution_id = run_id,
-                                        pr_url = %pr_url,
-                                        "pr_url_capture: staged PR URL from worker hook stream",
-                                    );
-                                }
-                                crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
-                                    // Worker emitted another PR URL after
-                                    // already staging one — typically a
-                                    // `gh pr view` follow-up referencing a
-                                    // different PR. First-writer-wins so
-                                    // the original (the worker's own
-                                    // `gh pr create`) is kept.
-                                    tracing::debug!(
-                                        execution_id = run_id,
-                                        pr_url = %pr_url,
-                                        "pr_url_capture: ignoring later URL (already staged for this execution)",
-                                    );
-                                }
-                            }
+                        },
+                        Err(err) => {
+                            tracing::warn!(
+                                execution_id,
+                                rejected_url = %pr_url,
+                                ?err,
+                                "pr_url_capture: could not load execution to validate URL; dropping for safety",
+                            );
+                            false
                         }
-                    } // else (is_gh_pr_command)
-
-                    // Revision push detection: record when a revision worker
-                    // runs `cube pr update` (or, defensively, a direct
-                    // `jj git push`) so the on_stop_inner SHA-delta gate can
-                    // confirm the revision was the one that moved the PR
-                    // head (not a concurrently-active parent worker).
-                    if crate::pr_url_capture::is_revision_push_command(tool_input) {
-                        let execution_id = run_id;
-                        match server_state.work_db.get_execution(execution_id) {
-                            Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
-                                server_state.staged_revision_pushes.record(execution_id);
+                    };
+                    if valid {
+                        let outcome = server_state.staged_pr_urls.record_if_unset(run_id, &pr_url);
+                        match outcome {
+                            crate::pr_url_capture::StagePrUrlOutcome::Staged => {
                                 tracing::info!(
-                                    execution_id,
-                                    "revision_push_capture: staged push evidence for revision",
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: staged PR URL from worker hook stream",
                                 );
                             }
-                            _ => {}
+                            crate::pr_url_capture::StagePrUrlOutcome::AlreadyStaged => {
+                                // Worker emitted another PR URL after
+                                // already staging one — typically a
+                                // `gh pr view` follow-up referencing a
+                                // different PR. First-writer-wins so
+                                // the original (the worker's own
+                                // `gh pr create`) is kept.
+                                tracing::debug!(
+                                    execution_id = run_id,
+                                    pr_url = %pr_url,
+                                    "pr_url_capture: ignoring later URL (already staged for this execution)",
+                                );
+                            }
                         }
                     }
-                }
+                } // else (is_gh_pr_command)
 
-                // proposal_channel_error detection: a `boss propose <kind>`
-                // Bash invocation that failed. Staged in-memory against the
-                // execution id; `on_stop` files an attention and increments
-                // `worker_proposals.channel_error`. See
-                // `crate::proposal_channel_error`.
-                if crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
-                    && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
-                {
-                    let command = tool_input
-                        .get("command")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("boss propose")
-                        .to_owned();
-                    if server_state
-                        .staged_proposal_channel_errors
-                        .record_if_unset(run_id, &command, &error_text)
-                    {
-                        tracing::warn!(
-                            execution_id = run_id,
-                            command = %command,
-                            error_text = %error_text,
-                            "proposal_channel_error: staged a failed `boss propose` submission",
-                        );
+                // Revision push detection: record when a revision worker
+                // runs `cube pr update` (or, defensively, a direct
+                // `jj git push`) so the on_stop_inner SHA-delta gate can
+                // confirm the revision was the one that moved the PR
+                // head (not a concurrently-active parent worker).
+                if crate::pr_url_capture::is_revision_push_command(tool_input) {
+                    let execution_id = run_id;
+                    match server_state.work_db.get_execution(execution_id) {
+                        Ok(execution) if execution.kind == crate::work::ExecutionKind::RevisionImplementation => {
+                            server_state.staged_revision_pushes.record(execution_id);
+                            tracing::info!(execution_id, "revision_push_capture: staged push evidence for revision",);
+                        }
+                        _ => {}
                     }
                 }
             }
+
+            // proposal_channel_error detection: a `boss propose <kind>`
+            // Bash invocation that failed. Staged in-memory against the
+            // execution id; `on_stop` files an attention and increments
+            // `worker_proposals.channel_error`. See
+            // `crate::proposal_channel_error`.
+            if crate::proposal_channel_error::is_boss_propose_submit_command(tool_input)
+                && let Some(error_text) = crate::proposal_channel_error::extract_channel_error(tool_response)
+            {
+                let command = tool_input
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("boss propose")
+                    .to_owned();
+                if server_state
+                    .staged_proposal_channel_errors
+                    .record_if_unset(run_id, &command, &error_text)
+                {
+                    tracing::warn!(
+                        execution_id = run_id,
+                        command = %command,
+                        error_text = %error_text,
+                        "proposal_channel_error: staged a failed `boss propose` submission",
+                    );
+                }
+            }
         }
-        _ => {}
     }
     if !is_remote_slot {
         if let (Some(prior), Some(new)) = (prior_activity, new_activity) {
@@ -944,21 +944,21 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
     }
 }
 
-/// On `Stop` hook events, pop a pending probe for the run (if any)
-/// and `SendToPane` the text to the worker's slot. The injection
-/// arrives at the pane just as the worker becomes idle, so claude
+/// On the driver's turn boundary, pop a pending probe for the run (if
+/// any) and `SendToPane` the text to the worker's slot. The injection
+/// arrives at the pane just as the worker becomes idle, so the agent
 /// treats it as the next user prompt. After a successful dispatch,
 /// records an in-flight entry (with the transcript path and current
 /// byte offset) so `dispatch_probe_reply_on_stop` can emit the
-/// matching `FrontendEvent::ProbeReplied` when the next Stop lands.
+/// matching `FrontendEvent::ProbeReplied` when the next boundary lands.
 pub(super) async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::{EngineToAppRequest, SendToPaneInput, WorkerEvent};
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    use crate::protocol::{EngineToAppRequest, SendToPaneInput};
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
@@ -1277,20 +1277,19 @@ pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id
     (Some(path_str), offset)
 }
 
-/// On the `Stop` boundary that follows a probe dispatch, take the
-/// in-flight entry for `run_id`, read transcript bytes written since
+/// On the driver's turn boundary that follows a probe dispatch, take
+/// the in-flight entry for `run_id`, read transcript bytes written since
 /// dispatch, and emit `FrontendEvent::ProbeReplied` on the per-run
-/// probe topic. Idempotent: a duplicate Stop with no in-flight
+/// probe topic. Idempotent: a duplicate boundary with no in-flight
 /// probe is a no-op, so observers never see the same `probe_id`
 /// reported twice.
 pub(super) async fn dispatch_probe_reply_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
@@ -1427,27 +1426,38 @@ pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
     latest
 }
 
-/// On `Stop` hook events, ask the completion handler whether the
-/// worker has produced a PR for its workspace branch. If so, the
+/// On the driver's turn boundary, ask the completion handler whether
+/// the worker has produced a PR for its workspace branch. If so, the
 /// linked task/chore moves to `in_review`, the execution finalises,
 /// and the cube workspace is released. If not, an `awaiting_input`
 /// signal is published for the execution topic so the pane indicator
 /// can reflect that the worker is idle without losing the active
 /// kanban state.
 ///
+/// This is the gate the whole completion subsystem hangs off — PR-URL
+/// capture, the Doing→Review transition, nudge/probe routing,
+/// effort-escalation parsing. It opens on
+/// [`crate::events_socket::IncomingHookEvent::is_turn_boundary`], the
+/// signal the run's driver produced through
+/// [`crate::driver::AgentDriver::turn_boundary`], rather than on the
+/// `WorkerEvent::Stop` variant that only exists because Claude Code fires
+/// a `Stop` hook. For Claude the two coincide exactly, so behaviour is
+/// unchanged; for a driver whose turn ends some other way, completion
+/// now follows the driver instead of needing a Claude-shaped event to
+/// impersonate.
+///
 /// Runs **before** `dispatch_probe_on_stop` in the event loop so that
 /// probes the completion handler queues (e.g. `PROBE_NO_PR`) are
-/// visible when probe dispatch fires on the same Stop boundary — if
-/// completion ran after, those probes would stall until the next Stop
-/// (which never arrives for a worker that is already idle).
+/// visible when probe dispatch fires on the same boundary — if
+/// completion ran after, those probes would stall until the next
+/// boundary (which never arrives for a worker that is already idle).
 pub(super) async fn dispatch_completion_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
 ) {
-    use crate::protocol::WorkerEvent;
-    let WorkerEvent::Stop { .. } = incoming.event else {
+    if !incoming.is_turn_boundary() {
         return;
-    };
+    }
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };

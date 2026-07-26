@@ -147,7 +147,7 @@ where
         .clone();
     tracing::info!(run_id, driver = driver_slug, "stdout progress: ingress started");
 
-    let mut reader = StdoutJsonlProgressReader::new(stream, driver);
+    let mut reader = StdoutJsonlProgressReader::new(stream, driver.clone());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {
@@ -156,12 +156,13 @@ where
             // ingress can attribute an anonymous connection to a process.
             // Here the caller owns the process being read, so `run_id` is
             // known outright and there is nothing to attribute.
-            let incoming = IncomingHookEvent {
-                peer_pid: None,
-                run_id: Some(run_id.to_owned()),
-                transcript_path: envelope.transcript_path,
-                event: envelope.event,
-            };
+            let incoming = IncomingHookEvent::resolve(
+                driver.as_ref(),
+                envelope.event,
+                Some(run_id.to_owned()),
+                envelope.transcript_path,
+                None,
+            );
             if tx.send(incoming).await.is_err() {
                 // The consumer only ever exits when this end of the channel
                 // (held by this same future) is dropped, so this arm is
@@ -452,7 +453,10 @@ mod tests {
             &self.descriptor
         }
         fn capabilities(&self) -> crate::driver::CapabilitySet {
-            crate::driver::CapabilitySet::new([crate::driver::Capability::Spawn])
+            crate::driver::CapabilitySet::new([
+                crate::driver::Capability::Spawn,
+                crate::driver::Capability::TurnBoundary,
+            ])
         }
         fn spawn_invocation(&self, _: crate::driver::SpawnRequest<'_>) -> crate::driver::SpawnPlan {
             unimplemented!()
@@ -490,6 +494,21 @@ mod tests {
                     stop_reason: boss_protocol::StopReason::Completed,
                 }),
                 other => Err(boss_protocol::NormalizeError::UnknownEvent(format!("{other:?}"))),
+            }
+        }
+        fn turn_boundary(&self, event: &boss_protocol::WorkerEvent) -> Option<crate::driver::TurnEnd> {
+            match event {
+                boss_protocol::WorkerEvent::Stop {
+                    session_id,
+                    stop_hook_active,
+                    stop_reason,
+                    ..
+                } => Some(crate::driver::TurnEnd {
+                    session_id: session_id.clone(),
+                    continuation: *stop_hook_active,
+                    reason: *stop_reason,
+                }),
+                _ => None,
             }
         }
         fn tool_use_interception_wiring(

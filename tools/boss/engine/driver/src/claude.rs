@@ -17,7 +17,7 @@ use boss_ssh_transport::shell_quote;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
     PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
-    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
+    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 pub mod structured_output;
@@ -596,6 +596,26 @@ impl AgentDriver for ClaudeDriver {
         normalize_hook_event(raw)
     }
 
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        // Claude's turn boundary is its `Stop` hook, and only that: every
+        // other hook fires mid-turn. `stop_hook_active` is Claude's name for
+        // "a stop hook pulled the agent back into another turn", which is
+        // exactly `TurnEnd::continuation`; `stop_reason` is already the
+        // sequencer-refined value.
+        match event {
+            WorkerEvent::Stop {
+                session_id,
+                stop_hook_active,
+                stop_reason,
+            } => Some(TurnEnd {
+                session_id: session_id.clone(),
+                reason: *stop_reason,
+                continuation: *stop_hook_active,
+            }),
+            _ => None,
+        }
+    }
+
     fn tool_use_interception_wiring(&self, config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
         let mut hooks: Vec<serde_json::Value> = Vec::new();
 
@@ -956,6 +976,80 @@ mod tests {
         });
         let event = ClaudeDriver.normalize_progress_event(&raw).unwrap();
         assert!(matches!(event, WorkerEvent::Stop { .. }));
+    }
+
+    // ── TurnBoundary ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn turn_boundary_reports_a_stop_event() {
+        let end = ClaudeDriver
+            .turn_boundary(&WorkerEvent::Stop {
+                session_id: "sess-1".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            })
+            .expect("Stop is Claude's turn boundary");
+        assert_eq!(end.session_id, "sess-1");
+        assert_eq!(end.reason, boss_protocol::StopReason::Completed);
+        assert!(!end.continuation);
+    }
+
+    #[test]
+    fn turn_boundary_carries_stop_hook_active_as_continuation() {
+        // `stop_hook_active` is the only Claude-specific field in the boundary;
+        // it must survive the mapping or a re-entrant stop reads as a fresh one.
+        let end = ClaudeDriver
+            .turn_boundary(&WorkerEvent::Stop {
+                session_id: "sess-1".to_owned(),
+                stop_hook_active: true,
+                stop_reason: boss_protocol::StopReason::AwaitingInput,
+            })
+            .expect("Stop is Claude's turn boundary");
+        assert!(end.continuation);
+        assert_eq!(end.reason, boss_protocol::StopReason::AwaitingInput);
+    }
+
+    #[test]
+    fn turn_boundary_rejects_every_non_stop_event() {
+        // Mid-turn hooks must not be mistaken for a boundary — completion
+        // detection and probe injection both fire off this predicate.
+        let mid_turn = [
+            WorkerEvent::SessionStart {
+                session_id: "sess-1".to_owned(),
+                source: boss_protocol::SessionStartSource::Startup,
+            },
+            WorkerEvent::UserPromptSubmit {
+                session_id: "sess-1".to_owned(),
+                prompt: "go".to_owned(),
+            },
+            WorkerEvent::PreToolUse {
+                session_id: "sess-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+            },
+            WorkerEvent::PostToolUse {
+                session_id: "sess-1".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            WorkerEvent::Notification {
+                session_id: "sess-1".to_owned(),
+                message: "permission?".to_owned(),
+            },
+            // SessionEnd is a *process* boundary, not a turn boundary: the
+            // worker is gone, so there is no turn to complete or probe into.
+            WorkerEvent::SessionEnd {
+                session_id: "sess-1".to_owned(),
+                reason: "exit".to_owned(),
+            },
+        ];
+        for event in mid_turn {
+            assert!(
+                ClaudeDriver.turn_boundary(&event).is_none(),
+                "{event:?} must not report a turn boundary",
+            );
+        }
     }
 
     #[test]
