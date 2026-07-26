@@ -63,7 +63,7 @@ use serde_json;
 use boss_protocol::ExecutionKind;
 
 use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
-use crate::driver::{AgentDriver, ClaudeDriver, ProgressObservationConfig, ToolUseInterceptionConfig};
+use crate::driver::{AgentDriver, ClaudeDriver, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig};
 use crate::ssh_transport::shell_quote;
 
 // Re-export guard command constants so the test module (which uses `use
@@ -73,6 +73,10 @@ use crate::ssh_transport::shell_quote;
 pub(crate) use crate::driver::claude::{
     BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
 };
+// Only constructed directly by tests (`ProgressIngress::HookCallback(..)`
+// fixtures) — production code only destructures it via `hooks_map_for_ingress`.
+#[cfg(test)]
+pub(crate) use crate::driver::ProgressObservationWiring;
 
 /// The kind of worker being spawned, used to select the per-kind tool
 /// denylist. Kept in this module so the denylist rules and the kind
@@ -516,23 +520,24 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     // (PermissionPolicy) and the PreToolUse interception guards
     // (ToolUseInterception) share this JSON and are extracted in later tasks;
     // for now they layer on top of the driver-produced hooks.
-    let wiring = ClaudeDriver.progress_observation_wiring(&ProgressObservationConfig {
+    let ingress = ClaudeDriver.progress_observation_wiring(&ProgressObservationConfig {
         events_socket_path: input.events_socket_path.clone(),
         lease_id: input.lease_id.clone(),
         run_id: input.run_id.clone(),
         workspace_path: input.workspace_path.clone(),
         forwarder_binary: input.boss_event_path.clone(),
     });
-    let mut hooks = wiring.hooks;
+    let mut hooks = hooks_map_for_ingress(ingress);
 
     // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
     // All interception guards are appended to the forwarder hook the driver
     // wired, which stays the first `PreToolUse` entry so the live-status
-    // machine sees every tool call before any guard can block it.
-    let pre_tool_use_hooks = hooks
-        .get_mut("PreToolUse")
-        .and_then(serde_json::Value::as_array_mut)
-        .expect("Claude ProgressObservation wiring always includes PreToolUse");
+    // machine sees every tool call before any guard can block it. A
+    // `StdoutJsonl` driver's ingress carries no hooks at all (`hooks` is
+    // empty — the documented, supported no-hooks case), so `PreToolUse` may
+    // not exist yet; `pre_tool_use_array` inserts it fresh rather than
+    // assuming a `HookCallback` driver already populated it.
+    let pre_tool_use_hooks = pre_tool_use_array(&mut hooks);
 
     let is_revision =
         input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
@@ -574,6 +579,34 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
     }
 
     value
+}
+
+/// Resolve a driver's [`ProgressIngress`] into the settings-file `hooks`
+/// map. [`ProgressIngress::StdoutJsonl`] drivers (Codex) have no
+/// hook-callback wiring at all — their progress is read from the worker's
+/// stdout by a driver-owned reader (separate plumbing, built in a later
+/// task), not this Claude-style hooks map — so this returns an empty map for
+/// that arm instead of assuming a `HookCallback` that was never produced.
+fn hooks_map_for_ingress(ingress: ProgressIngress) -> serde_json::Map<String, serde_json::Value> {
+    match ingress {
+        ProgressIngress::HookCallback(wiring) => wiring.hooks,
+        ProgressIngress::StdoutJsonl => serde_json::Map::new(),
+    }
+}
+
+/// Get (or insert) the `PreToolUse` array in `hooks`, ready for
+/// [`AgentDriver::tool_use_interception_wiring`] entries to be appended.
+///
+/// `hooks` may be empty (a `StdoutJsonl` driver's ingress) or may already
+/// carry a `PreToolUse` entry (a `HookCallback` driver's forwarder hook) —
+/// either way this returns a mutable array to extend, inserting an empty one
+/// first when absent instead of panicking on the documented no-hooks case.
+fn pre_tool_use_array(hooks: &mut serde_json::Map<String, serde_json::Value>) -> &mut Vec<serde_json::Value> {
+    hooks
+        .entry("PreToolUse".to_owned())
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+        .as_array_mut()
+        .expect("PreToolUse hook entry is always inserted as a JSON array")
 }
 
 /// Build the `permissions` object for the worker settings file.

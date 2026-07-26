@@ -1101,9 +1101,8 @@ mod tests {
     use tokio::sync::Mutex as TokioMutex;
 
     use crate::driver::{
-        CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity,
-        ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-        WorkerErrorClass,
+        CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress,
+        ProgressObservationConfig, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
     };
     use async_trait::async_trait;
     use boss_engine_structured_output::StructuredOutputKind;
@@ -1137,7 +1136,7 @@ mod tests {
         fn progress_fidelity(&self) -> ProgressFidelity {
             unimplemented!()
         }
-        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
             unimplemented!()
         }
         fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {

@@ -533,21 +533,50 @@ pub struct ProgressObservationConfig {
     pub forwarder_binary: PathBuf,
 }
 
-/// A driver's event-source wiring for [`Capability::ProgressObservation`].
+/// A driver's event-source wiring for [`Capability::ProgressObservation`]
+/// when that source is [`ProgressIngress::HookCallback`].
 ///
-/// For the Claude driver, `hooks` is the settings-file `hooks` map that routes
-/// every lifecycle + tool hook event to the `boss-event` shim, which forwards
-/// each payload to the engine events socket; the spawn flow merges this
-/// fragment into the worker settings file. A driver whose event source is
-/// configured at spawn time instead (e.g. a CLI `--output-format json`
-/// stream) returns an empty `hooks` map and wires its observation through
-/// [`AgentDriver::spawn_invocation`].
+/// `hooks` is the settings-file `hooks` map that routes every lifecycle +
+/// tool hook event to the `boss-event` shim, which forwards each payload to
+/// the engine events socket; the spawn flow merges this fragment into the
+/// worker settings file.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressObservationWiring {
     /// Hook-event name → array of hook entries. Claude wires all seven
     /// lifecycle events to the forwarder; the caller may extend the
     /// `PreToolUse` entry with interception guards (a separate capability).
     pub hooks: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The transport a driver's [`Capability::ProgressObservation`] event source
+/// rides. Two disjoint transports exist (see
+/// `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`):
+///
+/// - Claude wires a hooks map ([`ProgressObservationWiring`]) that fans every
+///   lifecycle/tool event out to the `boss-event` shim, which forwards each
+///   payload to the engine's events-socket ingress.
+/// - Codex has no equally robust hook signal for *progress*: its hook trust
+///   model fails open and silently on an untrusted/misconfigured hook (no
+///   error, no log line — reproduction 2 in the decision doc), which is
+///   disqualifying for a liveness signal specifically. Its worker process
+///   instead emits a `stdout` JSONL stream (`thread.started` → `turn.started`
+///   → `item.started`/`item.completed` → `turn.completed`) that a
+///   driver-owned reader parses and feeds to
+///   [`AgentDriver::normalize_progress_event`]. That reader is separate
+///   plumbing, built in a later task; this variant is the documented seam it
+///   plugs into — a driver that selects it has no settings-file hook wiring
+///   to merge.
+///
+/// A driver without hook-callback wiring returns [`Self::StdoutJsonl`] here
+/// rather than an empty [`ProgressObservationWiring`] — the absence of hooks
+/// is a distinct, named transport, not a degenerate case of the hook one.
+#[derive(Debug, Clone)]
+pub enum ProgressIngress {
+    /// Claude-style: a hooks map merged into the worker settings file.
+    HookCallback(ProgressObservationWiring),
+    /// Codex-style: the engine reads and parses the worker's stdout JSONL
+    /// stream; no settings-file wiring is produced.
+    StdoutJsonl,
 }
 
 /// Inputs the [`Capability::ToolUseInterception`] wiring needs to build the
@@ -691,10 +720,13 @@ pub trait AgentDriver: Send + Sync {
     fn progress_fidelity(&self) -> ProgressFidelity;
 
     /// Build the driver's event-source wiring so the worker emits a lifecycle
-    /// + tool-use stream the engine decodes into [`WorkerEvent`]s. For the
-    /// Claude driver this is the `hooks` block routing every hook event to the
-    /// `boss-event` shim; the spawn flow merges it into the worker settings.
-    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressObservationWiring;
+    /// + tool-use stream the engine decodes into [`WorkerEvent`]s. Returns a
+    /// [`ProgressIngress`]: for the Claude driver this is
+    /// [`ProgressIngress::HookCallback`] carrying the `hooks` block routing
+    /// every hook event to the `boss-event` shim, which the spawn flow merges
+    /// into the worker settings; a driver with no hook-callback wiring
+    /// returns [`ProgressIngress::StdoutJsonl`] instead.
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress;
 
     /// Decode one raw event-source payload into a typed [`WorkerEvent`] that
     /// drives the (driver-agnostic) activity machine. For the Claude driver
@@ -818,7 +850,7 @@ pub mod test_support {
 
     use super::{
         AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity,
-        ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+        ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
         WorkerErrorClass,
     };
 
@@ -858,7 +890,7 @@ pub mod test_support {
         fn progress_fidelity(&self) -> ProgressFidelity {
             unimplemented!()
         }
-        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressObservationWiring {
+        fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
             unimplemented!()
         }
         fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
