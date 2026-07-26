@@ -649,6 +649,13 @@ impl WorkDb {
         // dispatcher's pre-existing kind-floor/effort-table path, so landing
         // this migration re-models nothing already in flight.
         migrate_tasks_reasoning_column(conn)?;
+        // revision chains must be flat under the original non-revision
+        // work item. New inserts already canonicalize in
+        // `assert_parent_revisable_and_insert`; this rewrites any pre-existing
+        // nested `parent_task_id` links (revision → revision) to the chain root
+        // so the UI rollup and `list_revisions --parent <root>` surface the
+        // full chain. Idempotent; preserves status/executions/deps/history.
+        migrate_flatten_nested_revision_parents(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

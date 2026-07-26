@@ -1236,6 +1236,11 @@ impl WorkDb {
     /// from `list_tasks` and `list_chores` by design; this is the only bulk
     /// enumeration path. Optionally restrict to a single parent via
     /// `parent_id`.
+    ///
+    /// When `parent_id` is supplied, it is resolved to the chain root first:
+    /// revisions always store `parent_task_id` as the original non-revision
+    /// work item, so filtering by a revision id still returns the full flat
+    /// chain under that root.
     pub fn list_revisions(
         &self,
         product_id: &str,
@@ -1245,6 +1250,13 @@ impl WorkDb {
     ) -> Result<Vec<Task>> {
         let conn = self.connect()?;
         ensure_product_exists(&conn, product_id)?;
+
+        // Canonicalize to chain root so `--parent <revision>` and
+        // `--parent <root>` list the same flat chain.
+        let parent_id = match parent_id {
+            Some(id) => Some(chain_root(&conn, id)?),
+            None => None,
+        };
 
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let parent_clause = if parent_id.is_some() {
@@ -1258,7 +1270,7 @@ impl WorkDb {
              WHERE product_id = ?1 AND kind = 'revision'{deleted_clause}{parent_clause}
              ORDER BY created_at ASC",
         ))?;
-        let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id {
+        let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id.as_deref() {
             let rows = stmt.query_map(params![product_id, parent_id], map_task_with_parent_and_provenance)?;
             collect_rows(rows)?
         } else {

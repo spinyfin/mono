@@ -754,20 +754,14 @@ impl WorkDb {
         // blocking those from ever reaching `active` again strands a
         // live worker with no Doing card anywhere on the board. So the
         // guard is lifted only for `kind = 'revision'`, and only when
-        // the revision has no non-terminal revision child of its own
-        // (a revision-of-a-revision defers to that child exactly like
-        // a base defers to it, per the same reasoning).
+        // the revision has no non-terminal revision child of its own.
         //
-        // The child check below is deliberately one level deep, not a
-        // full descendant walk: it matches only immediate children via
-        // `child.parent_task_id = ?1`. A revision-of-a-revision-of-a-
-        // revision (three levels) would not defer correctly if the
-        // middle link were terminal while the leaf were still live.
-        // This is accepted rather than fixed here because that shape is
-        // rare in practice and the chain-tail dependency gate already
-        // serializes deeper chains; widen this to the recursive CTE
-        // used in `revision_helpers.rs`/`chain_helpers.rs` if deeper
-        // chains turn out to matter.
+        // After flat-parentage every revision's `parent_task_id` is the chain
+        // root (never another revision), so the child check below is a
+        // no-op for well-formed data — siblings are sequenced by the
+        // chain-tail dependency gate, not nested parents. The check is
+        // retained for residual pre-migration nested rows until the
+        // flatten migration has run on every open DB.
         //
         // This relaxation also narrows the reverse transition (`active`
         // back to `in_review`) to two specific paths:

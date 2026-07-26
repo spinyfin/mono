@@ -23,9 +23,10 @@ pub(crate) fn is_moot_revision_kind(created_via: &str) -> bool {
 /// Walk `tasks.parent_task_id` from `task_id` to find the originating
 /// non-revision task (the "chain root") — the task that owns the PR.
 ///
-/// Revision tasks form chains: a revision of a revision is allowed (OQ2),
-/// and all revisions in a chain share the chain root's PR. This helper
-/// returns the ID of the first ancestor whose `kind` is not `'revision'`.
+/// All revisions in a chain share the chain root's PR. New revisions always
+/// store `parent_task_id = chain root`; this walk still handles legacy
+/// nested rows (revision parented to a revision) so pre-migration data and
+/// mid-upgrade open DBs keep resolving correctly.
 ///
 /// **Broken-parent handling**: if a row's `parent_task_id` points to a
 /// task that no longer exists (soft-deleted or missing), walking stops at

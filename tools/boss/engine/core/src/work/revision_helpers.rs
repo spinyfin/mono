@@ -81,10 +81,16 @@ pub(crate) fn find_latest_active_revision_in_chain(conn: &Connection, root_id: &
 
 /// Run the create-time gate and, on success, insert a `kind = 'revision'`
 /// task row atomically. This is the single point of truth for the invariant
-/// "kind = revision ⇒ parent_task_id IS NOT NULL AND chain root has an open PR".
+/// "kind = revision ⇒ parent_task_id IS the chain root (non-revision) AND
+/// that root has an open PR".
 ///
 /// Gate order (per revision-tasks.md §Q4):
 /// 1. Resolve `input.parent_task_id` to a real task; walk to chain root.
+///    Callers may pass a revision (manual `create-revision --parent <rev>`,
+///    PR-review / CI / conflict producers against a revision work item);
+///    the stored `parent_task_id` is always the chain root so revision
+///    chains stay flat. Sequencing of back-to-back revisions is
+///    via dependency edges on the chain tail, not nested parents.
 /// 2. If chain root has no `pr_url` → [`RevisionGateError::NoPr`].
 /// 3. If chain root `status == "done"` → [`RevisionGateError::Merged`] (PR merged = task done).
 /// 4. Otherwise call `pr_checker.check(pr_url)` for the live state:
@@ -130,9 +136,13 @@ pub(crate) fn assert_parent_revisable_and_insert(
     let chain_tail_id = find_latest_active_revision_in_chain(conn, &root_id)?;
 
     // ── 6. Insert revision ──────────────────────────────────────────────────
+    // Always parent to the chain root (never to another revision). Callers
+    // may have passed a revision as `--parent`; reparenting here is what
+    // keeps every automatic and manual producer flat under the original
+    // work item so the UI's direct-child rollup sees the whole chain.
     let now = now_string();
     let depends_on = input.depends_on.clone();
-    let new_revision = insert_revision_in_tx(conn, input, &parent_id, &root)?;
+    let new_revision = insert_revision_in_tx(conn, input, &root_id, &root)?;
 
     // ── 7. Caller-supplied `--depends-on` gate ──────────────────────────────
     // Declared atomically with the row insert, same as `task create` /
@@ -543,8 +553,11 @@ pub(crate) fn revision_name_from_description(description: &str) -> String {
 
 /// Insert a `kind = 'revision'` task row. Called only after the gate passes.
 ///
-/// `parent_id` is the immediate parent (may itself be a revision).
-/// `root` is the chain root task (non-revision ancestor that owns the PR).
+/// `parent_id` is the chain root (the non-revision work item that owns the
+/// PR). Callers of [`assert_parent_revisable_and_insert`] may pass a revision
+/// as the create-time parent selector; that helper resolves to the root and
+/// passes the root id here so `parent_task_id` never points at another
+/// revision. `root` is the same row, already loaded for inherit fields.
 pub(crate) fn insert_revision_in_tx(
     conn: &Connection,
     input: CreateRevisionInput,
