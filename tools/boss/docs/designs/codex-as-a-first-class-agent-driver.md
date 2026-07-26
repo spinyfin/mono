@@ -209,9 +209,9 @@ A fourth point, verified because the whole transport design depends on it: **the
 
 ### Config discovery and isolation — the concurrency question
 
-The brief flags global-only config as _"a serious problem for concurrent workers sharing a machine."_ **Verified: `CODEX_HOME` isolates Codex's config, sessions, caches, and logs.** It does not by itself establish complete isolation, because the planned authentication source may still be shared; that is a separate acceptance gate below.
+The brief flags global-only config as _"a serious problem for concurrent workers sharing a machine."_ **Verified: it is not a problem, because `CODEX_HOME` isolates completely.**
 
-Pointing `CODEX_HOME` at a scratch directory produced a fully independent Codex home — its own `sessions/`, `state_5.sqlite`, `logs_2.sqlite`, `skills/`, `models_cache.json`, `config.toml`. Nothing leaked to `~/.codex`. Per-worker `CODEX_HOME` is therefore the isolation lever for all driver-created state and is required for correctness.
+Pointing `CODEX_HOME` at a scratch directory produced a fully independent Codex home — its own `sessions/`, `state_5.sqlite`, `logs_2.sqlite`, `skills/`, `models_cache.json`, `config.toml`. Nothing leaked to `~/.codex`. Per-worker `CODEX_HOME` is therefore the isolation lever, and it is a complete one.
 
 Layering, in precedence order:
 
@@ -238,7 +238,7 @@ Agent-rules file is **`AGENTS.md`**, not `CLAUDE.md` — already abstracted as `
 
 Auth is a **file inside `CODEX_HOME`**, not an environment variable. Consequences:
 
-- A per-worker `CODEX_HOME` must have `auth.json` present. The spike used a symlink to the host file, which proves only that Codex can read it. It does **not** establish that concurrent runs are safe if Codex refreshes or rewrites that file. T-31 must choose and test the policy: immutable per-run snapshot with explicit refresh handling, a supported read-only reference, or a provider-supported alternative. The implementation must not claim complete isolation before that test passes.
+- A per-worker `CODEX_HOME` must have `auth.json` present. Symlinking the host's is sufficient (that is what the spike did) and avoids duplicating a credential per workspace.
 - There is **no collision** with the `unset ANTHROPIC_API_KEY` line at `engine/core/src/runner/pane_spawn.rs:382`. It is inert for Codex. It is still a Claude-ism sitting in shared spawn code and belongs behind the driver — see [G-1](#g-1-spawn).
 - Codex may also authenticate by API key. Boss should not care; it should treat `CODEX_HOME` as opaque auth state and let the operator provision it.
 
@@ -333,7 +333,7 @@ Classification per the brief: **(a)** implementable against the current trait, *
 | G-1  | `Spawn`                 | `codex exec` + flags                           | **(b)**  | Signature is Claude-shaped                 |
 | G-2  | `WorkspaceProvisioning` | `AGENTS.md`, `CODEX_HOME`, trust registry      | **(a)**  | Fits; needs `CODEX_HOME` lifecycle         |
 | G-3  | `PermissionPolicy`      | 3 sandbox modes, `writable_roots`, `.rules`    | **(b)**  | Trait is a file path; Codex needs argv+env |
-| G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)**  | Blocked only by T3326                      |
+| G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)**  | Needs Codex descriptor + model-aware runtime menu adapter |
 | G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)**  | **Transport is not abstracted** — top gap  |
 | G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(a)**† | Declared deny-only; gated on T-01          |
 | G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)**  | Native, but no trait method                |
@@ -379,7 +379,7 @@ The method now takes Boss's abstract policy and returns `PermissionArtifacts { c
 
 Codex fits the `ModelMenu` model cleanly, but **not as the fixed `Degrade` case this doc originally recorded**. On 0.145.0 the effort ladder is per-model and reaches six values (`low, medium, high, xhigh, max, ultra`) — meeting or exceeding Boss's 5-value ladder on the newer models, and varying between models within one catalog. So the mapping is neither a uniform degrade nor a static table: it must be resolved per selected model from `codex debug models` at runtime.
 
-The remaining Codex work is to provide its descriptor and model-aware menu; the already-landed registry and driver-local effort seam should be reused rather than duplicated.
+The remaining Codex-specific work is to add a `CodexDriver` descriptor and a runtime menu adapter that reads the available models and their effort ladders, then presents only the effort values supported by the selected model. The already-landed registry and driver-local effort seam should be reused rather than duplicated; this is not blocked on, or a reason to reopen, the completed T3326 work.
 
 ### G-5 `ProgressObservation` — the top gap
 
@@ -638,7 +638,7 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 <a id="oq-1-hook-trust-provisioning"></a>
 **OQ-1 — How does Boss provision Codex hook trust, and detect a hook that did not run?** The original form of this question ("do hooks fire under `codex exec`?") is **answered: they do, on 0.145.0**, and `PreToolUse` deny genuinely blocks. What replaces it is narrower and more operational. Hooks run only when trusted, via `--dangerously-bypass-hook-trust` or a persisted `[hooks] trusted_hash`; an untrusted hook is skipped in complete silence, as is a hook whose command is missing. The bypass flag is not an acceptable default because it would also trust project-local `.codex/` hooks originating in the repository under work. So: what is `trusted_hash` computed over, can Boss stamp it deterministically when it regenerates worker config, and is there any observable signal that a configured hook did not fire?
 
-**This question is now load-bearing rather than exploratory.** The [operator decision](#operator-decision) makes hooks Codex's guardrail carrier, so the answer must become an enforceable per-run gate, not merely a written conclusion. Before a worker is allowed to run with hook-carried guardrails, Boss must attest against that worker's exact generated config, trusted hash, and handler path that the guard is armed. An absent attestation is a dispatch failure; silence cannot be interpreted as success. → [T-01](#t-01-codex-hook-trust-provisioning).
+**This question is now load-bearing rather than exploratory.** The [operator decision](#operator-decision) makes hooks Codex's guardrail carrier, so T-01 must establish deterministic trust provisioning and whether a skipped hook can be observed before the first Codex worker runs. → [T-01](#t-01-codex-hook-trust-provisioning).
 
 <a id="oq-2"></a>
 **OQ-2 — Version pinning and churn. Now evidenced rather than precautionary.** The `--json` stream still carries **no schema version**, and re-running this analysis across 0.137.0 → 0.145.0 produced four concrete breaks in eight minor versions: a removed flag that would have made the prescribed launch command fail (`-a`), an added `usage` field, a changed item-ID base, a second meaning for `error` items, plus four new `TurnItem` variants and a new hook event. None of it was announced on the wire. This is no longer a hypothetical risk — it is the observed release cadence. Recommendation firms up accordingly: **pin the tested version, add `--strict-config` for the config half, and gate upgrades on the conformance harness (T1483 / [T-22](#t-22-extend-the-reference-driver-conformance-harness-a-12-amends-t1483))**. Note `--strict-config` covers config keys only; nothing validates the event stream, so the harness remains the sole defence there. "Pin the agent CLI version" is still a policy decision with operational cost, and still the operator's call.
@@ -646,11 +646,9 @@ Design _for_, do not design _now_. Three seams, with attachment points:
 <a id="oq-3-what-is-the-codex-rules-execpolicy-format"></a>
 **OQ-3 — What is the Codex `.rules` execpolicy format?** On 0.145.0 `--ignore-rules` is a **documented** `codex exec` flag (_"Do not load user or project execpolicy `.rules` files"_) rather than the binary-string inference it was on 0.137.0, which raises confidence that the system is real and reachable. It might restore some per-command deny fidelity natively — as a fail-closed, config-declared alternative to the hook that carries Codex's guardrails today, and potentially a cheaper answer than the follow-on shim project. Still unexamined — I did not want to design against a surface I had not run.
 
-**OQ-4 — Rollout disk growth.** `~/.codex` on this host holds 279 active + 241 archived rollouts at ~865 MB. Per-worker `CODEX_HOME` multiplies this across workspaces. `--ephemeral` avoids it entirely but would forfeit `TranscriptAccess`. The retention implementation must operate only on an execution-scoped, Boss-owned root returned by the driver during provisioning and persisted with the execution. It must never sweep the engine process's `CODEX_HOME` or infer ownership from a rollout's `cwd`. This is T3531, gated on T3679 and Codex provisioning.
+**OQ-4 — Rollout disk growth.** `~/.codex` on this host holds 279 active + 241 archived rollouts at ~865 MB. Per-worker `CODEX_HOME` multiplies this across workspaces. `--ephemeral` avoids it entirely but would forfeit `TranscriptAccess`. Needs a retention policy; not a v1 blocker.
 
-**OQ-5 — `codex exec` is one turn per process.** Claude's probe/nudge injects into a live session; Codex requires `codex exec resume`, a new process. This is not eligible for implementation-by-assumption: T-32 must establish ordering, delivery evidence, process and pane ownership, cancellation, and recovery semantics first. T-17 implements only the proven contract. Until then, Codex is ineligible for work kinds that require steering, urgent probes, or an interrupt stronger than process termination.
-
-**OQ-7 — How does a Ghostty-pane worker hand stdout to the engine?** P1422's stdout-reader implementation is deliberately a generic `AsyncRead` helper; it states that Boss currently owns no worker stdout because the app hosts workers in Ghostty panes. A reader alone therefore does not make Codex observable. T-30 must define and implement the PTY or pipe handoff, preserve the terminal's visible output, carry the execution identity, bound backpressure, and treat EOF as the worker's stream end. No Codex phase can claim progress or completion until this is proven against a real pane.
+**OQ-5 — `codex exec` is one turn per process.** Claude's probe/nudge injects into a live session; Codex requires `codex exec resume`, a new process. I believe this is tractable ([T-17](#t-17-controlverbs-on-the-trait-plus-codex-probenudge-via-exec-resume-a-7)) but it is the least-validated part of this design — I did not spike resume-based probing, and pane lifecycle across a process restart is exactly where surprises live.
 
 <a id="oq-6-codex-exec-review"></a>
 **OQ-6 — Is `codex exec review` a better substrate for Boss's review kind than a plain read-only exec run?** New in this pass ([D-3](#delta-that-changes-a-tasks-scope)). It is purpose-built, takes `--base` / `--commit` / `--uncommitted`, and has a dedicated `codex-auto-review` model. It may also impose its own output shape that does not match Boss's `ReviewResult`. Unexamined; folded into [T-25](#t-25-codex-eligibility-for-review-and-conflict-resolution-kinds).
@@ -665,7 +663,7 @@ The original pass paired that risk with a claim that has since been **withdrawn*
 
 ## Proposed P1422 amendments
 
-Discrete, filed-work-item-sized. The original design pass could not create Boss work items; this revision materializes the new lifecycle prerequisite as T3679 and the immediate P3330 gates as T3681 through T3686. The remaining entries stay as the coordinator's handoff until they are independently scheduled.
+Discrete, filed-work-item-sized. The original design pass could not create Boss work items; this revision materializes the immediate P3330 gates as T3681 through T3686. The remaining entries stay as the coordinator's handoff until they are independently scheduled.
 
 | #    | Proposed name                                                                        | Effort    | Amends / new                                                                      | Brief                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ---- | ------------------------------------------------------------------------------------ | --------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -681,7 +679,6 @@ Discrete, filed-work-item-sized. The original design pass could not create Boss 
 | A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New** — deferred                                                                | `worker_setup.rs:364` tells the worker _"A PreToolUse hook blocks these"_. The original pass rated this a correctness defect because the sentence was false for a Codex worker; under hook-based interception **it is true for both drivers**, so the defect is gone and this is hygiene. Still worth doing — shared prompt prose should not hardcode one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces. Deferred, not closed.                             |
 | A-11 | Resolve or delete `progress_fidelity()`                                              | `trivial` | **New**                                                                           | Landed: spawn records each driver's fidelity on the live-worker slot, and the stale-worker sweep consults `ProgressFidelity::stale_threshold_secs`. A Codex driver's declared tier now affects stale detection.                                                                                                                                                                                                                                                                                                              |
 | A-12 | Extend T1483's conformance harness to cover transport and turn boundaries            | `medium`  | **Amends T1483**                                                                  | T1483 (blocked on T1476 + T1479) was scoped against a Claude-shaped driver. It must also assert: stdout-JSONL ingress produces the same `WorkerEvent` sequence as hook ingress; a turn boundary drives completion identically from either source; and a pinned agent-CLI version is verified, given Codex's unversioned stream ([OQ-2](#oq-2)).                                                                                                                                                                              |
-| A-13 | Persist driver-owned per-execution runtime state                                     | `medium`  | **New: T3679**                                                                    | Provisioning must return an opaque cleanup handle that is persisted with the execution and supplied to the resolved driver on every teardown path. This is the ownership boundary for a per-run `CODEX_HOME`, transcript archive, socket, or temporary credential state. It must survive engine restart and orphan recovery. A teardown must never infer the target from the engine environment or sweep a shared provider home.                                                                                             |
 
 **Verdict on the existing tasks, as required by the brief:** T3324 (cut over every call site) remains sufficient and correctly scoped. T3326's registry-backed menu and driver-local effort work landed. T1476's shared file contract is present but its remaining prerequisite role needs verification; it still does not cover PR-URL capture (A-5). T1479 is now extraction-only (A-2). PR #2361 carries the T3325 trait-method work while leaving the synthesizer separate (A-4). T3328's transport work landed (A-1). T1483 still needs the cross-transport coverage in A-12.
 
@@ -811,17 +808,17 @@ The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet
 
 ### T-11 `CodexDriver` spawn and workspace provisioning
 
-Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `AGENTS.md`, pre-stamped project trust, and `external_config_migration_prompts` disabled). Provisioning must return the execution-scoped cleanup handle defined by T3679. Authentication follows the policy and concurrency proof from T-31; an unverified symlink to the interactive `auth.json` is not an acceptable implementation. Produces a Codex worker that starts, but whose progress is not yet observed.
+Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `auth.json` symlink, `AGENTS.md`, pre-stamped project trust, `external_config_migration_prompts` disabled). Produces a Codex worker that starts, but whose progress is not yet observed.
 
 **Includes Codex's guardrail wiring**, which the [operator decision](#operator-decision) puts here rather than in a separate shim project: emit Boss's existing guard scripts (the path/checkleft scripts begin at `worker_setup.rs:972` and `:1131`, with wiring at `:580-610`) plus editorial enforcement into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML, and stamp hook trust per T-01's finding. The guard-script emission is currently hardcoded to Claude settings-file grammar and must become driver-supplied — the scripts themselves are reusable as-is, since Codex's payloads carry `tool_name: "Bash"` and Claude's `tool_input` shape ([D-2](#deltas-that-change-the-design)). Handle the inline-`--body` editorial case as a `Deny` with a corrective reason, per [the editorial case](#the-editorial-case-precisely).
 
 - **Effort:** `large`
-- **Depends on:** T-01, T-10, T-31, T3679
+- **Depends on:** T-01, T-10
 - **Scope:** in-scope
 
 ### T-12 `CodexDriver` progress normaliser
 
-Map Codex's stream envelopes onto `WorkerEvent`: `thread.started`, `turn.started`, `turn.completed`, `item.started` / `item.completed` across the `TurnItem` variants. It builds on the landed stdout reader and in-flight PR #2361 turn boundary. This makes the driver capable of decoding the stream; T-30 is the separate PTY or pipe attachment that makes a real pane worker observable end-to-end.
+Map Codex's stream envelopes onto `WorkerEvent`: `thread.started`, `turn.started`, `turn.completed`, `item.started` / `item.completed` across the `TurnItem` variants. It builds on the landed stdout reader and in-flight PR #2361 turn boundary. This makes the driver capable of decoding the stream.
 
 Three constraints from the 0.145.0 delta pass, each a real trap: item IDs are **0-based** and must not be treated as ordinal or 1-based; `item.completed` with `type:"error"` carries **operational warnings as well as** turn failures, so it must not be mapped unconditionally to a failed turn; and the `TurnItem` enum grew by four variants across eight minor versions, so unknown variants must be ignored-with-logging rather than rejected.
 
@@ -867,10 +864,10 @@ Derive Codex's rollout path from `thread_id` + `CODEX_HOME` and generalise `engi
 
 ### T-17 `ControlVerbs` on the trait, plus Codex probe/nudge via `exec resume` (A-7)
 
-Put probe/interrupt/stop/reap on the trait, route `transient_recovery.rs` through `classify_error` instead of `classify_claude_error`, and implement only the resume semantics established by T-32. Do not silently model a new `codex exec resume` process as a live-session message injection. Delivery confirmation, pane ownership, cancellation, and recovery must match the spike's contract.
+Put probe/interrupt/stop/reap on the trait, route `transient_recovery.rs` through `classify_error` instead of `classify_claude_error`, and implement Codex probing as `codex exec resume` with delivery confirmed by observing a new `turn.started`. This is the least-validated area of the design ([OQ-5](#risks--open-questions)) and may need its own spike.
 
 - **Effort:** `large`
-- **Depends on:** T-12, T-32
+- **Depends on:** T-12
 - **Scope:** in-scope
 
 ### T-18 `TurnBoundary` engine synthesizer (remainder of T3325)
@@ -957,45 +954,13 @@ Replace or supplement `codex exec` with the persistent app-server protocol, givi
 - **Depends on:** T-23
 - **Scope:** deferred (future / not a v1 blocker) — experimental upstream surface; revisit once it stabilises
 
-### T-30 Attach a Ghostty-pane Codex stdout stream to the engine
-
-P1422's generic stdout reader is not connected to any production worker: Boss writes commands into Ghostty panes and owns no `ChildStdout`. Implement the missing transport handoff for a Codex pane. The chosen mechanism may be a pipe, a PTY tap, or an app-to-engine stream, but it must preserve what the operator sees in the terminal while giving the engine one run-correlated, bounded stream. Verify a real Codex pane drives the existing reader through `thread.started`, tool activity, `turn.completed`, EOF, and an intentionally slow sink without deadlocking the pane.
-
-- **Effort:** `large`
-- **Depends on:** T-12
-- **Scope:** in-scope — gates all claims of Codex progress, completion, PR capture, and Phase-1 acceptance
-
-### T-31 Codex authentication isolation and refresh contract
-
-The spike proves that a per-run `CODEX_HOME` can read a symlinked interactive `auth.json`; it does not prove that concurrent workers remain safe if Codex refreshes or rewrites the file. Establish the supported ownership model with a reproducible concurrent-run test. Choose and implement either immutable per-run snapshots with a defined refresh path, a supported read-only reference, or another documented provider mechanism. The result must leave worker homes isolated without exposing credentials in logs or duplicating mutable shared state accidentally.
-
-- **Effort:** `small`
-- **Depends on:** none
-- **Scope:** in-scope — gates T-11
-
-### T-32 Codex `exec resume` control-verb semantics spike
-
-Before implementing probe or nudge, run a controlled resumed turn through the same pane topology planned for production. Establish whether a resumed process preserves the thread, how Boss identifies and owns the replacement process, what event proves delivery, what interruption means during handoff, and how crash recovery distinguishes a completed original turn from a failed resumed turn. Specify the trait-level contract from the observed behavior; if equivalent live-session steering cannot be represented honestly, keep Codex ineligible for probe-dependent work kinds rather than degrading silently.
-
-- **Effort:** `small`
-- **Depends on:** T-30
-- **Scope:** in-scope — gates T-17
-
-### T-33 Retain only driver-owned Codex rollout state
-
-Revise the retained T3531 prototype to consume the per-execution cleanup handle from T3679. Keep its tested retention-policy work, but do not sweep the engine's default `CODEX_HOME`, inspect the operator's interactive rollout tree, or infer ownership from a rollout `cwd`. The Codex driver owns the created root; teardown receives that root and applies retention only there, idempotently and without turning a successful work item into a failure.
-
-- **Effort:** `medium`
-- **Depends on:** T3679, T-11
-- **Scope:** in-scope — tracked as Boss T3531
-
 ### Parallelism
 
 At the same depth, these may run in parallel:
 
-- **Depth 0:** T-01, T-08, T-27, T-31 — genuinely independent. **Start T-01 and T-31 first regardless of slack:** both gate safe Codex provisioning.
+- **Depth 0:** T-01, T-08, T-27 — genuinely independent. **Start T-01 first regardless of slack:** it is the only hard gate, it is `small`, and T-11 cannot land without it.
 - **Depth 1:** PR #2361 supplies the in-flight turn-boundary routing; T-12 follows T-11 and that PR.
-- **Depth 2:** T-12 supplies the Codex normaliser; T-30 attaches its stream to a real pane; T-32 then establishes resume semantics. T-13, T-14, T-16, and T-17 follow their stated edges.
+- **Depth 2:** T-12 supplies the Codex normaliser. T-13, T-14, T-16, and T-17 follow their stated edges.
 - **Not in this graph:** T-02 and T-03 belong to the follow-on `PATH`-shim project and are independent of everything above.
 
 **File-overlap cautions — order these rather than running them concurrently:**
