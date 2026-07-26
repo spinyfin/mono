@@ -517,6 +517,44 @@ fn task_roundtrips_with_effort_and_model_set() {
     assert_eq!(task.model_override, task2.model_override);
 }
 
+#[test]
+fn task_decodes_without_effort_provenance_fields() {
+    let raw = sample_task_json(json!({}));
+    let task: Task = serde_json::from_value(raw).unwrap();
+    assert!(task.effort_matched_rule.is_none());
+    assert!(task.effort_reasons.is_none());
+}
+
+#[test]
+fn task_skips_none_effort_provenance_on_encode() {
+    let task: Task = serde_json::from_value(sample_task_json(json!({}))).unwrap();
+    let encoded = serde_json::to_value(&task).unwrap();
+    let obj = encoded.as_object().unwrap();
+    assert!(!obj.contains_key("effort_matched_rule"));
+    assert!(!obj.contains_key("effort_reasons"));
+}
+
+#[test]
+fn task_roundtrips_with_effort_provenance() {
+    let raw = sample_task_json(json!({
+        "effort_level": "medium",
+        "effort_matched_rule": "rule 3 (multi-subsystem)",
+        "effort_reasons": "names protocol types + engine core surfaces",
+    }));
+    let task: Task = serde_json::from_value(raw).unwrap();
+    assert_eq!(task.effort_level, Some(EffortLevel::Medium));
+    assert_eq!(task.effort_matched_rule.as_deref(), Some("rule 3 (multi-subsystem)"));
+    assert_eq!(
+        task.effort_reasons.as_deref(),
+        Some("names protocol types + engine core surfaces")
+    );
+
+    let reencoded = serde_json::to_value(&task).unwrap();
+    let task2: Task = serde_json::from_value(reencoded).unwrap();
+    assert_eq!(task.effort_matched_rule, task2.effort_matched_rule);
+    assert_eq!(task.effort_reasons, task2.effort_reasons);
+}
+
 // ── StatusActor round-trip / classification tests ────────────────────────
 
 #[test]

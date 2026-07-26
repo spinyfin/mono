@@ -197,6 +197,21 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<String>,
 
+    /// Set or clear the heuristic matched-rule provenance for
+    /// `effort_level` (see [`crate::Task::effort_matched_rule`]).
+    /// `None` → leave unchanged. `Some("")` → clear (write NULL). A
+    /// non-empty string is stored verbatim. When `effort_level` is
+    /// patched without also supplying provenance, the engine clears
+    /// both provenance columns so a hand-set level is detectable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// Set or clear the heuristic reasons provenance for `effort_level`
+    /// (see [`crate::Task::effort_reasons`]). Same empty-string-clears
+    /// contract as [`Self::effort_matched_rule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
+
     pub goal: Option<String>,
     /// Model slug override. `None` → leave unchanged. `Some("")` →
     /// clear the column. Any other string is stored verbatim (no

@@ -43,7 +43,7 @@ use async_trait::async_trait;
 use boss_protocol::{
     Confidence, CreateProductInput, CreateProjectInput, CreateTaskInput, DependencyDirection, EffortLevel,
     ListDependenciesInput, PLANNER_OUTCOME_STAGED, PlannerInput, PlannerOutput, ProductContext, ProjectContext,
-    ProposedEdge, ProposedTask, SetProjectDesignDocInput, TaskBrief, TaskKind,
+    ProposedEdge, ProposedTask, SetProjectDesignDocInput, TaskBrief, TaskKind, WorkItem,
 };
 
 use boss_design_doc_fetcher::DocFetchOutcome;
@@ -109,7 +109,8 @@ fn e(dependent: &'static str, prerequisite: &'static str) -> E {
 
 /// The `[effort-classification]` audit line the Planner appends per task, in
 /// the format the coordinator/engine emit. The fixtures embed it in each task's
-/// description so the test can assert the Materializer preserves it verbatim.
+/// description so the test can assert the Materializer lifts it into the
+/// first-class provenance columns and strips it from the stored description.
 fn effort_line(effort: EffortLevel) -> String {
     let level = match effort {
         EffortLevel::Trivial => "trivial",
@@ -474,8 +475,8 @@ fn total_blocks_edges(db: &WorkDb, tasks: &HashMap<String, boss_protocol::Task>)
 }
 
 /// Assert the materialized project graph matches the fixture exactly: the same
-/// set of tasks (name, kind, effort, staged, effort-audit in description), the
-/// same provenance tag, and the same dependency edges — no more, no fewer.
+/// set of tasks (name, kind, effort, staged, effort provenance columns), the
+/// same planner-run tag, and the same dependency edges — no more, no fewer.
 fn assert_graph_matches(db: &WorkDb, product_id: &str, project_id: &str, run_id: &str, fixture: &Fixture) {
     let tasks = materialized_tasks(db, product_id, project_id);
     assert_eq!(
@@ -499,9 +500,32 @@ fn assert_graph_matches(db: &WorkDb, product_id: &str, project_id: &str, run_id:
             spec.name
         );
         assert!(!task.autostart, "[{}] {:?} must be staged", fixture.label, spec.name);
+        // First-class provenance replaces description tag-stuffing: the
+        // materializer lifts the audit line into columns and strips it.
+        // `list_tasks` uses the base SELECT (no provenance columns), so
+        // re-fetch via `get_work_item` (wide mapper) for the provenance
+        // assertion — same path as `boss task show`.
         assert!(
-            task.description.contains("[effort-classification]"),
-            "[{}] {:?} keeps its effort-classification line",
+            !task.description.contains("[effort-classification]"),
+            "[{}] {:?} must not keep the effort-classification tag in description",
+            fixture.label,
+            spec.name
+        );
+        let full = match db.get_work_item(&task.id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t,
+            other => panic!("[{}] expected task/chore, got {other:?}", fixture.label),
+        };
+        assert_eq!(
+            full.effort_matched_rule.as_deref(),
+            Some("fixture"),
+            "[{}] {:?} should carry lifted effort_matched_rule provenance",
+            fixture.label,
+            spec.name
+        );
+        assert_eq!(
+            full.effort_reasons.as_deref(),
+            Some("ground-truth fixture"),
+            "[{}] {:?} should carry lifted effort_reasons provenance",
             fixture.label,
             spec.name
         );

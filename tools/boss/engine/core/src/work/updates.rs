@@ -279,6 +279,8 @@ impl WorkDb {
         if let Some(priority_patch) = patch.priority {
             task.priority = normalize_priority(Some(&priority_patch))?;
         }
+        let effort_level_patched = patch.effort_level.is_some();
+        let effort_provenance_patched = patch.effort_matched_rule.is_some() || patch.effort_reasons.is_some();
         if let Some(effort_patch) = patch.effort_level {
             // Empty string clears the column; anything else must
             // parse as one of the five allowed levels. Invalid
@@ -301,6 +303,23 @@ impl WorkDb {
             } else {
                 Some(trimmed.parse::<ReasoningMode>().map_err(|e| anyhow::anyhow!(e))?)
             };
+        }
+        // Effort provenance: explicit patch values win. When `effort_level`
+        // is changed without also supplying provenance, clear both columns
+        // so a hand-set level is detectable by the absence of
+        // `effort_matched_rule` (and so a clear of effort_level does not
+        // leave orphan provenance behind).
+        if effort_level_patched && !effort_provenance_patched {
+            task.effort_matched_rule = None;
+            task.effort_reasons = None;
+        }
+        apply_optional_string_patch(&mut task.effort_matched_rule, patch.effort_matched_rule);
+        apply_optional_string_patch(&mut task.effort_reasons, patch.effort_reasons);
+        if task.effort_level.is_none() {
+            // Provenance cannot outlive its level — same invariant as
+            // blocked_detail / blocked_reason.
+            task.effort_matched_rule = None;
+            task.effort_reasons = None;
         }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
         apply_optional_string_patch(&mut task.driver, patch.driver);
@@ -420,6 +439,7 @@ impl WorkDb {
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
                  reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
+                 effort_matched_rule = ?24, effort_reasons = ?25,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -450,6 +470,8 @@ impl WorkDb {
                 tags_value,
                 task.human_driven as i64,
                 task.completion_summary,
+                task.effort_matched_rule,
+                task.effort_reasons,
             ],
         )?;
 

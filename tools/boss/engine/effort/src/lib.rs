@@ -333,20 +333,132 @@ pub fn resolve_spawn_config_in(
     })
 }
 
-/// Heuristic-classification audit marker the Planner/materializer appends
-/// to a task's `description` when its `effort_level` was derived by the
-/// coordinator's heuristic pass (see `materializer.rs`, `planner.rs`). Its
-/// *absence* means any `effort_level` on the row was typed explicitly by a
-/// human/coordinator rather than heuristically classified.
+/// Heuristic-classification audit marker the Planner historically
+/// appended to a task's `description` when its `effort_level` was derived
+/// by the coordinator's heuristic pass (see `materializer.rs`,
+/// `planner.rs`). Prefer the first-class columns
+/// `tasks.effort_matched_rule` / `tasks.effort_reasons` for new writes —
+/// stuffing this tag into `description` races autostart when applied as a
+/// follow-up update after create. The tag remains recognised on read so
+/// pre-migration rows and transitional Planner output still classify
+/// correctly.
 pub const EFFORT_CLASSIFICATION_TAG: &str = "[effort-classification]";
 
+/// Parsed contents of one `[effort-classification] …` audit line (or of
+/// the first-class provenance columns that replace it).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EffortClassificationProvenance {
+    /// e.g. `"rule 3 (multi-subsystem)"`.
+    pub matched_rule: Option<String>,
+    /// e.g. `"names protocol types + engine core surfaces"`.
+    pub reasons: Option<String>,
+}
+
 /// True when the row's `effort_level` was typed by a human rather than
-/// derived by the Planner's heuristic pass — i.e. `description` carries no
-/// heuristic classification audit tag. Used by `boss product audit-effort`
+/// derived by the Planner/coordinator heuristic.
+///
+/// Prefers the first-class `effort_matched_rule` column; falls back to a
+/// legacy `[effort-classification]` tag in `description` for rows written
+/// before the columns existed. Used by `boss product audit-effort`
 /// (design doc `boothby.md`, action 8) to scope its drifted-row re-run to
 /// rows a human never hand-set.
-pub fn effort_is_hand_set(description: &str) -> bool {
+pub fn effort_is_hand_set(description: &str, effort_matched_rule: Option<&str>) -> bool {
+    if effort_matched_rule.is_some_and(|s| !s.is_empty()) {
+        return false;
+    }
     !description.contains(EFFORT_CLASSIFICATION_TAG)
+}
+
+/// Parse a single `[effort-classification] level=\`…\` matched-rule=\`…\`
+/// reasons="…"` line into structured provenance. Returns `None` when the
+/// line does not start with [`EFFORT_CLASSIFICATION_TAG`]. Missing keys
+/// yield `None` for that field; the level is ignored here because it is
+/// already stored as `tasks.effort_level`.
+pub fn parse_effort_classification_line(line: &str) -> Option<EffortClassificationProvenance> {
+    let line = line.trim();
+    if !line.starts_with(EFFORT_CLASSIFICATION_TAG) {
+        return None;
+    }
+    let rest = line[EFFORT_CLASSIFICATION_TAG.len()..].trim();
+    Some(EffortClassificationProvenance {
+        matched_rule: extract_backtick_field(rest, "matched-rule"),
+        reasons: extract_quoted_field(rest, "reasons").or_else(|| extract_backtick_field(rest, "reasons")),
+    })
+}
+
+/// Strip a trailing (or any) `[effort-classification] …` line and the
+/// blank separator before it from `description`, returning the cleaned
+/// description plus any parsed provenance. When no audit line is present
+/// the description is returned unchanged and provenance is `None`.
+pub fn strip_effort_classification_from_description(
+    description: &str,
+) -> (String, Option<EffortClassificationProvenance>) {
+    let Some(idx) = description.find(EFFORT_CLASSIFICATION_TAG) else {
+        return (description.to_owned(), None);
+    };
+    // The audit line is the first line starting at `idx` (may have
+    // leading whitespace on that line; `find` lands on the tag itself).
+    let after_tag = &description[idx..];
+    let line_end = after_tag.find('\n').unwrap_or(after_tag.len());
+    let line = after_tag[..line_end].trim();
+    let provenance = parse_effort_classification_line(line);
+    let clean = description[..idx].trim_end().to_owned();
+    (clean, provenance)
+}
+
+/// Resolve description + effort provenance for a create path.
+///
+/// Explicit `matched_rule` / `reasons` win; otherwise any
+/// `[effort-classification]` tag in `description` is lifted into the
+/// structured fields and stripped from the description so the worker
+/// never sees the audit boilerplate. Returns
+/// `(clean_description, matched_rule, reasons)`.
+pub fn resolve_effort_provenance_for_create(
+    description: String,
+    explicit_matched_rule: Option<String>,
+    explicit_reasons: Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    let (clean, parsed) = strip_effort_classification_from_description(&description);
+    let explicit_rule = normalize_optional_string(explicit_matched_rule);
+    let explicit_reasons = normalize_optional_string(explicit_reasons);
+    if explicit_rule.is_some() || explicit_reasons.is_some() {
+        return (clean, explicit_rule, explicit_reasons);
+    }
+    if let Some(p) = parsed {
+        return (
+            clean,
+            normalize_optional_string(p.matched_rule),
+            normalize_optional_string(p.reasons),
+        );
+    }
+    // No tag, no explicit provenance — keep the original description
+    // (which equals `clean` when no tag was present).
+    (clean, None, None)
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|s| {
+        let t = s.trim();
+        if t.is_empty() { None } else { Some(t.to_owned()) }
+    })
+}
+
+/// Extract `key=\`value\`` from a free-form key=value audit line.
+fn extract_backtick_field(haystack: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=`");
+    let start = haystack.find(&needle)? + needle.len();
+    let end = haystack[start..].find('`')? + start;
+    let value = haystack[start..end].trim();
+    if value.is_empty() { None } else { Some(value.to_owned()) }
+}
+
+/// Extract `key="value"` (double-quoted) from a free-form key=value audit line.
+fn extract_quoted_field(haystack: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let start = haystack.find(&needle)? + needle.len();
+    let end = haystack[start..].find('"')? + start;
+    let value = haystack[start..end].trim();
+    if value.is_empty() { None } else { Some(value.to_owned()) }
 }
 
 // ---------------------------------------------------------------------------
@@ -1093,11 +1205,47 @@ mod tests {
 
     #[test]
     fn effort_is_hand_set_detects_tag_presence_and_absence() {
-        assert!(effort_is_hand_set("plain human-typed description"));
-        assert!(effort_is_hand_set(""));
+        assert!(effort_is_hand_set("plain human-typed description", None));
+        assert!(effort_is_hand_set("", None));
         assert!(!effort_is_hand_set(
-            "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\""
+            "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"",
+            None
         ));
+        // Structured provenance wins over a bare description.
+        assert!(!effort_is_hand_set("plain", Some("rule 3 (multi-subsystem)")));
+        // Empty matched_rule is treated as absent.
+        assert!(effort_is_hand_set("plain", Some("")));
+    }
+
+    #[test]
+    fn parse_effort_classification_line_extracts_rule_and_reasons() {
+        let p = parse_effort_classification_line(
+            "[effort-classification] level=`medium` matched-rule=`rule 3 (multi-subsystem)` reasons=\"names engine + protocol\"",
+        )
+        .unwrap();
+        assert_eq!(p.matched_rule.as_deref(), Some("rule 3 (multi-subsystem)"));
+        assert_eq!(p.reasons.as_deref(), Some("names engine + protocol"));
+        assert!(parse_effort_classification_line("not an audit line").is_none());
+    }
+
+    #[test]
+    fn strip_and_resolve_lift_tag_out_of_description() {
+        let raw = "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"";
+        let (clean, parsed) = strip_effort_classification_from_description(raw);
+        assert_eq!(clean, "Do the thing.");
+        assert_eq!(parsed.unwrap().matched_rule.as_deref(), Some("rule 5"));
+
+        let (clean, rule, reasons) = resolve_effort_provenance_for_create(raw.to_owned(), None, None);
+        assert_eq!(clean, "Do the thing.");
+        assert_eq!(rule.as_deref(), Some("rule 5"));
+        assert_eq!(reasons.as_deref(), Some("x"));
+
+        // Explicit flags win and the tag is still stripped.
+        let (clean, rule, reasons) =
+            resolve_effort_provenance_for_create(raw.to_owned(), Some("rule 3".into()), Some("explicit".into()));
+        assert_eq!(clean, "Do the thing.");
+        assert_eq!(rule.as_deref(), Some("rule 3"));
+        assert_eq!(reasons.as_deref(), Some("explicit"));
     }
 
     #[test]
