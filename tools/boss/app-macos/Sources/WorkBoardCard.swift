@@ -318,6 +318,15 @@ struct WorkBoardCardItem: View {
 /// must not force a re-layout. Board style lives on the snapshot (not
 /// `@Environment`) so a `boss.kanban.boardStyle` flip participates in
 /// `==` and re-styles already-mounted cards.
+///
+/// The body is a thin shell over five equatable subviews (design entry
+/// 9) — revision header, title row, live-status row, badge strip, and
+/// footer/PR row — each comparing its own snapshot slice so AttributeGraph
+/// can skip subtrees whose inputs did not move. A live-status flip
+/// re-lays-out the status row, not the whole card. Card chrome
+/// (background / border / shadow / hover) stays here because it depends
+/// on selection, blocked, deferred, and board-style fields that cross
+/// every sub-region.
 struct WorkBoardCardView: View, @MainActor Equatable {
     let snapshot: WorkCardSnapshot
     /// Invoked when the user taps the design-doc affordance. Only
@@ -343,7 +352,6 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
     @State private var isHovered: Bool = false
-    @State private var showMergeConfirmation: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.snapshot == rhs.snapshot
@@ -355,326 +363,37 @@ struct WorkBoardCardView: View, @MainActor Equatable {
         // is intentional instrumentation (unfair-lock increment).
         let _ = UIUpdateCounters.shared.recordCardBodyEvaluation()
         let snap = snapshot
+        // Precompute so the empty-footer gate does not re-slice inside the
+        // ViewBuilder, and so an empty footer never inserts a trailing
+        // VStack spacing gap after the badge strip.
+        let footerSlice = WorkBoardCardFooterSlice(snapshot: snap)
         VStack(alignment: .leading, spacing: 8) {
-            if snap.kind == "revision", let seq = snap.revisionSeq {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    RevisionBadge(seq: seq)
-                    if let origin = snap.engineRevisionOrigin {
-                        EngineRevisionBadge(origin: origin)
-                    }
-                    if let parentID = snap.parentShortID {
-                        Text("revises T" + String(parentID))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Spacer(minLength: 0)
-                }
+            if let revision = WorkBoardCardRevisionHeaderSlice(snapshot: snap) {
+                WorkBoardCardRevisionHeader(slice: revision)
+                    .equatable()
             }
-            HStack(alignment: .top, spacing: 6) {
-                if let activityState = snap.activityState {
-                    AgentActivityDot(state: activityState)
-                        .padding(.top, 5)
-                }
-                if let slotId = snap.assignedSlotId,
-                   let character = TrekCharacter.forSlot(slotId),
-                   let nsImage = TrekIconAssets.image(character, size: .small) {
-                    Image(nsImage: nsImage)
-                        .resizable()
-                        .interpolation(.high)
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 20, height: 26)
-                        .clipShape(RoundedRectangle(cornerRadius: 3, style: .continuous))
-                        .help("\(character.displayName) (slot \(slotId))")
-                }
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        if snap.showsBlockedLock {
-                            Image(systemName: "lock.fill")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .accessibilityLabel("Blocked")
-                        }
-                        Text(snap.name)
-                            .font(.body.weight(.medium))
-                            .foregroundStyle(.primary)
-                            .multilineTextAlignment(.leading)
-                            // Revision descriptions can be multi-paragraph; cap
-                            // the card body to 2 lines so the card stays compact.
-                            // The full text is accessible via the detail popover.
-                            .lineLimit(snap.kind == "revision" ? 2 : nil)
-                            .truncationMode(.tail)
-                    }
-                    if let blockedBy = snap.blockedBy, !blockedBy.isEmpty {
-                        let prefix = snap.status == "blocked" ? "Blocked by" : "Waiting on:"
-                        Text("\(prefix) \(blockedBy)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .help("\(prefix) \(blockedBy)")
-                    }
-                }
-                // Pin the title column to the remaining lane width so the
-                // title text wraps within the card instead of overflowing past
-                // the right edge on long, low-break-opportunity names (#1172).
-                .frame(maxWidth: .infinity, alignment: .leading)
+            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: snap))
+                .equatable()
+            if let liveStatus = WorkBoardCardLiveStatusRowSlice(snapshot: snap) {
+                WorkBoardCardLiveStatusRow(slice: liveStatus)
+                    .equatable()
             }
-
-            // Free-form tags. Gated on the precomputed visibility flag so
-            // zero-tag cards contribute zero height / zero gap.
-            if snap.hasTagChips {
-                let tagChips = WorkTagPresentation.chips(for: snap.tags)
-                FlowLayout(horizontalSpacing: 4, verticalSpacing: 3) {
-                    ForEach(tagChips.labels, id: \.self) { label in
-                        WorkTagChip(text: label)
-                    }
-                    if let overflow = tagChips.overflow, overflow > 0 {
-                        WorkTagChip(text: "+\(overflow)")
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: 36, alignment: .topLeading)
-                .clipped()
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Tags: \(tagChips.labels.joined(separator: ", "))")
-            }
-
-            if snap.hasLiveStatus, let liveStatus = snap.liveStatus {
-                HStack(alignment: .firstTextBaseline, spacing: 4) {
-                    WorkerWaitingIndicator(
-                        activity: snap.liveStatusActivity,
-                        lastEventAt: snap.liveStatusLastEventAt
-                    )
-                    Text(liveStatus)
-                        .font(.caption)
-                        .foregroundStyle(liveStatusColor)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                        .help(liveStatus)
-                        .accessibilityLabel("Live status: \(liveStatus)")
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-
-            // Wrap the whole metadata cluster so a full badge set flows onto
-            // additional lines within the lane width instead of overflowing
-            // past the card's right edge and clipping (#1172).
-            FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
-                if snap.showsHighPriorityChip {
-                    PriorityChip(priority: .high)
-                }
-                if snap.showsEffortChip, let effortLevel = snap.effortLevel {
-                    EffortChip(effortLevel: effortLevel)
-                }
-                if snap.showsReasoningChip {
-                    ReasoningChip()
-                }
-                if snap.showsDeferredBadge {
-                    FutureScopeBadge()
-                }
-                if snap.showsProjectBadge, let projectName = snap.projectName {
-                    WorkStatusBadge(text: projectName)
-                }
-                if snap.showsAIReviewingBadge {
-                    ReviewingAIBadge()
-                }
-                if snap.showsResolvingConflictsBadge {
-                    ResolvingConflictsBadge()
-                } else if snap.showsResolvingCIBadge {
-                    ResolvingCIFailureBadge()
-                } else if let blockedText = snap.blockedBadgeText {
-                    WorkStatusBadge(
-                        text: blockedText,
-                        tooltip: snap.blockedBadgeTooltip,
-                        hasMoreInfo: snap.blockedBadgeHasMoreInfo
-                    )
-                    .onHover { hovering in
-                        if snap.isDependencyBlockedBadge {
-                            onDepBadgeHover?(hovering)
-                        }
-                    }
-                }
-                if snap.showsAutoBlockedChain {
-                    Image(systemName: "link")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.orange)
-                        .help(snap.autoBlockTooltip)
-                        .accessibilityLabel("Auto-blocked by dependencies")
-                        .accessibilityValue(snap.autoBlockTooltip)
-                        .onHover { hovering in
-                            onDepBadgeHover?(hovering)
-                        }
-                }
-                if snap.conflictClearedBadgeVisible {
-                    ConflictClearedBadge()
-                }
-                if snap.showsCIAutoFixedBadge {
-                    CIAutoFixedBadge()
-                }
-                if snap.showsCIFailureChip, let ciFailureBadge = snap.ciFailureBadge {
-                    CIFailureChip(badge: ciFailureBadge)
-                }
-                if snap.showsRepoChip, let repoChip = snap.repoChip {
-                    RepoChipView(presentation: repoChip)
-                }
-                if snap.showsAutomationBadge {
-                    Image(systemName: "wand.and.stars")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.purple)
-                        .help("Created by automation")
-                        .accessibilityLabel("Created by automation")
-                }
-                if snap.showsPlannerStagedBadge {
-                    Image(systemName: "sparkle.magnifyingglass")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.indigo)
-                        .help("Staged by the Planner — release the project to begin dispatch")
-                        .accessibilityLabel("Staged by the Planner")
-                }
-                if snap.showsExternalRefLink, let extRef = snap.externalRefLink {
-                    ExternalRefLinkView(presentation: extRef)
-                }
-                // Doc-link icon. Eligibility is already encoded in
-                // `showsDesignDocAffordance` + `designDocState`.
-                if snap.showsDesignDocAffordance,
-                   let state = snap.designDocState,
-                   let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
-                    Button {
-                        onOpenDesignDoc?()
-                    } label: {
-                        Image(systemName: presentation.systemImage)
-                            .font(.caption)
-                            .foregroundStyle(presentation.tint)
-                            .accessibilityLabel(presentation.accessibilityLabel)
-                    }
-                    .buttonStyle(.plain)
-                    .help(presentation.tooltip)
-                }
-                if snap.showsTerminalButton, let openTerminal = onOpenTerminal {
-                    Button {
-                        openTerminal()
-                    } label: {
-                        Image(systemName: "terminal")
-                            .font(.caption)
-                            .foregroundStyle(Color.secondary)
-                            .accessibilityLabel(snap.terminalTooltip)
-                    }
-                    .buttonStyle(.plain)
-                    .help(snap.terminalTooltip)
-                }
-                if snap.showsMergeWhenReady {
-                    Button {
-                        showMergeConfirmation = true
-                    } label: {
-                        Image(systemName: "arrow.triangle.merge")
-                            .font(.caption)
-                            .foregroundStyle(Color.secondary)
-                            .accessibilityLabel("Merge when ready")
-                    }
-                    .buttonStyle(.plain)
-                    .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                    .confirmationDialog(
-                        "Merge When Ready",
-                        isPresented: $showMergeConfirmation,
-                        titleVisibility: .visible
-                    ) {
-                        Button("Confirm Merge When Ready") {
-                            onMergeWhenReady?()
-                        }
-                        Button("Cancel", role: .cancel) {}
-                    } message: {
-                        Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
-                    }
-                }
-                if snap.showsDeferredScopeBadge {
-                    DeferredScopeCardBadge(
-                        items: snap.deferredScopeItems,
-                        actionInFlightIDs: snap.deferredScopeActionInFlightIDs,
-                        onAccept: { onAcceptDeferredScope?($0) },
-                        onCreateTask: { onCreateTaskFromDeferredScope?($0) }
-                    )
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            if snap.hasPRRow, let prURL = snap.prURL {
-                HStack(alignment: .center, spacing: 6) {
-                    if let mergeQueueState = snap.mergeQueueState {
-                        MergeQueueBadge(
-                            mergeQueueState: mergeQueueState,
-                            detail: snap.mergeQueueDetail,
-                            ciRequiredState: snap.ciRequiredState,
-                            prMergeableState: snap.prMergeableState
-                        )
-                        .layoutPriority(-1)
-                    } else if let ciState = snap.ciRequiredState {
-                        PrCiIndicator(
-                            state: ciState,
-                            detail: snap.ciRequiredDetail,
-                            prMergeableState: snap.prMergeableState
-                        )
-                    }
-                    PRURLLink(
-                        urlString: prURL,
-                        font: .caption,
-                        ambiguousRepoNames: snap.ambiguousRepoNames
-                    )
-                    .layoutPriority(1)
-                    if snap.hasInProgressRevision {
-                        PrInRevisionIndicator()
-                            .onHover { hovering in
-                                onRevisionBadgeHover?(hovering)
-                            }
-                    }
-                    Spacer(minLength: 0)
-                    if let id = snap.shortID {
-                        Text("T" + String(id))
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .accessibilityLabel("T" + String(id))
-                            .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                    }
-                }
-            }
-
-            if snap.hasReviewRow, let reviewState = snap.reviewRequiredState {
-                HStack(spacing: 6) {
-                    PrReviewIndicator(state: reviewState, detail: snap.reviewRequiredDetail)
-                    Spacer(minLength: 0)
-                }
-            }
-
-            // Second PR row for a revision whose parent PR differs from
-            // its own (avoids the #1829 double-link). Visibility is
-            // precomputed on the snapshot.
-            if snap.hasRevisionParentPRRow, let prURL = snap.revisionParentPrUrl {
-                HStack(alignment: .center, spacing: 6) {
-                    PRURLLink(
-                        urlString: prURL,
-                        font: .caption,
-                        ambiguousRepoNames: snap.ambiguousRepoNames
-                    )
-                    Spacer(minLength: 0)
-                }
-            }
-
-            if snap.hasStandaloneShortID, let id = snap.shortID {
-                HStack {
-                    Spacer(minLength: 0)
-                    Text("T" + String(id))
-                        .font(.system(.caption2, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("T" + String(id))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
-                }
-            }
-
-            if snap.hasInReviewRevisions {
-                Divider()
-                    .padding(.vertical, 2)
-                ForEach(snap.inReviewRevisions) { revision in
-                    RevisionRollupLine(revision: revision)
-                }
+            WorkBoardCardBadgeStrip(
+                slice: WorkBoardCardBadgeStripSlice(snapshot: snap),
+                onOpenDesignDoc: onOpenDesignDoc,
+                onDepBadgeHover: onDepBadgeHover,
+                onOpenTerminal: onOpenTerminal,
+                onMergeWhenReady: onMergeWhenReady,
+                onAcceptDeferredScope: onAcceptDeferredScope,
+                onCreateTaskFromDeferredScope: onCreateTaskFromDeferredScope
+            )
+            .equatable()
+            if !footerSlice.isEmpty {
+                WorkBoardCardFooter(
+                    slice: footerSlice,
+                    onRevisionBadgeHover: onRevisionBadgeHover
+                )
+                .equatable()
             }
         }
         .padding(.horizontal, 12)
@@ -698,23 +417,6 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
             }
-        }
-    }
-
-    /// Tint for the live-status subtitle row. Red for errored runs, a
-    /// dimmer grey when the worker is idle, and the normal `.secondary`
-    /// grey otherwise. The `waitingForInput` case is intentionally
-    /// *not* tinted: it now carries its meaning via the explicit
-    /// `WorkerWaitingIndicator` icon + tooltip instead of an ambiguous
-    /// accent-blue subtitle (hue alone is an accessibility problem).
-    private var liveStatusColor: Color {
-        switch snapshot.liveStatusActivity {
-        case .errored:
-            return .red
-        case .idle:
-            return Color(nsColor: .tertiaryLabelColor)
-        default:
-            return .secondary
         }
     }
 
@@ -777,7 +479,3 @@ struct WorkBoardCardView: View, @MainActor Equatable {
         }
     }
 }
-
-/// The `⟳ R<n>` chip rendered on revision cards in Backlog/Doing.
-/// Uses the accent color so the chip reads as an affordance rather than
-/// metadata text, and clearly signals "this is a revision" at a glance.

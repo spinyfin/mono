@@ -1172,6 +1172,257 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertNotEqual(a, b)
     }
 
+    // MARK: - Card body subview slices (entry 9 decomposition)
+
+    /// A live-status flip must invalidate only the live-status slice —
+    /// title / badge / footer / revision slices stay equal so AttributeGraph
+    /// can skip those subtrees under `.equatable()`.
+    func testLiveStatusFlipIsolatesToLiveStatusSlice() {
+        let task = Self.makeTask(name: "Ship", status: "active")
+        let base = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .doing,
+                liveStatus: "Thinking",
+                liveStatusActivity: .working,
+                liveStatusLastEventAt: "2026-01-01T00:00:00Z"
+            )
+        )
+        let flipped = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .doing,
+                liveStatus: "Waiting for input",
+                liveStatusActivity: .waitingForInput,
+                liveStatusLastEventAt: "2026-01-01T00:00:01Z"
+            )
+        )
+
+        XCTAssertNotEqual(
+            WorkBoardCardLiveStatusRowSlice(snapshot: base),
+            WorkBoardCardLiveStatusRowSlice(snapshot: flipped)
+        )
+        XCTAssertEqual(
+            WorkBoardCardTitleRowSlice(snapshot: base),
+            WorkBoardCardTitleRowSlice(snapshot: flipped)
+        )
+        XCTAssertEqual(
+            WorkBoardCardBadgeStripSlice(snapshot: base),
+            WorkBoardCardBadgeStripSlice(snapshot: flipped)
+        )
+        XCTAssertEqual(
+            WorkBoardCardFooterSlice(snapshot: base),
+            WorkBoardCardFooterSlice(snapshot: flipped)
+        )
+        XCTAssertNil(WorkBoardCardRevisionHeaderSlice(snapshot: base))
+        XCTAssertNil(WorkBoardCardRevisionHeaderSlice(snapshot: flipped))
+
+        // View-level equality follows the same isolation: only the
+        // live-status row compares unequal.
+        XCTAssertNotEqual(
+            WorkBoardCardLiveStatusRow(slice: WorkBoardCardLiveStatusRowSlice(snapshot: base)!),
+            WorkBoardCardLiveStatusRow(slice: WorkBoardCardLiveStatusRowSlice(snapshot: flipped)!)
+        )
+        XCTAssertEqual(
+            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: base)),
+            WorkBoardCardTitleRow(slice: WorkBoardCardTitleRowSlice(snapshot: flipped))
+        )
+        XCTAssertEqual(
+            WorkBoardCardBadgeStrip(slice: WorkBoardCardBadgeStripSlice(snapshot: base)),
+            WorkBoardCardBadgeStrip(slice: WorkBoardCardBadgeStripSlice(snapshot: flipped))
+        )
+        XCTAssertEqual(
+            WorkBoardCardFooter(slice: WorkBoardCardFooterSlice(snapshot: base)),
+            WorkBoardCardFooter(slice: WorkBoardCardFooterSlice(snapshot: flipped))
+        )
+    }
+
+    /// Title renames must not re-equate the live-status or footer slices.
+    func testTitleRenameIsolatesToTitleSlice() {
+        let before = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_title", name: "Before"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        let after = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_title", name: "After"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+
+        XCTAssertNotEqual(
+            WorkBoardCardTitleRowSlice(snapshot: before),
+            WorkBoardCardTitleRowSlice(snapshot: after)
+        )
+        XCTAssertEqual(
+            WorkBoardCardLiveStatusRowSlice(snapshot: before),
+            WorkBoardCardLiveStatusRowSlice(snapshot: after)
+        )
+        XCTAssertEqual(
+            WorkBoardCardBadgeStripSlice(snapshot: before),
+            WorkBoardCardBadgeStripSlice(snapshot: after)
+        )
+        XCTAssertEqual(
+            WorkBoardCardFooterSlice(snapshot: before),
+            WorkBoardCardFooterSlice(snapshot: after)
+        )
+    }
+
+    /// Badge presence (e.g. high priority) must not re-equate title or
+    /// live-status slices.
+    func testPriorityBadgeFlipIsolatesToBadgeStripSlice() {
+        let low = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_pri", name: "Ship", priority: "medium"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        let high = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_pri", name: "Ship", priority: "high"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+
+        XCTAssertNotEqual(
+            WorkBoardCardBadgeStripSlice(snapshot: low),
+            WorkBoardCardBadgeStripSlice(snapshot: high)
+        )
+        XCTAssertEqual(
+            WorkBoardCardTitleRowSlice(snapshot: low),
+            WorkBoardCardTitleRowSlice(snapshot: high)
+        )
+        XCTAssertEqual(
+            WorkBoardCardLiveStatusRowSlice(snapshot: low),
+            WorkBoardCardLiveStatusRowSlice(snapshot: high)
+        )
+        XCTAssertEqual(
+            WorkBoardCardFooterSlice(snapshot: low),
+            WorkBoardCardFooterSlice(snapshot: high)
+        )
+    }
+
+    /// PR URL / CI state changes stay on the footer slice.
+    func testPRRowFlipIsolatesToFooterSlice() {
+        var bareTask = Self.makeTask(id: "task_pr", name: "Ship")
+        bareTask.shortID = 12
+        let bare = WorkCardSnapshot.build(
+            task: bareTask,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+
+        var withPRTask = Self.makeTask(
+            id: "task_pr",
+            name: "Ship",
+            prURL: "https://github.com/spinyfin/mono/pull/1"
+        )
+        withPRTask.shortID = 12
+        withPRTask.ciRequiredState = "success"
+        let withPR = WorkCardSnapshot.build(
+            task: withPRTask,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+
+        XCTAssertNotEqual(
+            WorkBoardCardFooterSlice(snapshot: bare),
+            WorkBoardCardFooterSlice(snapshot: withPR)
+        )
+        XCTAssertEqual(
+            WorkBoardCardTitleRowSlice(snapshot: bare),
+            WorkBoardCardTitleRowSlice(snapshot: withPR)
+        )
+        XCTAssertEqual(
+            WorkBoardCardBadgeStripSlice(snapshot: bare),
+            WorkBoardCardBadgeStripSlice(snapshot: withPR)
+        )
+        XCTAssertEqual(
+            WorkBoardCardLiveStatusRowSlice(snapshot: bare),
+            WorkBoardCardLiveStatusRowSlice(snapshot: withPR)
+        )
+    }
+
+    /// Revision header appears only for revision cards with a seq, and
+    /// parent-short-id churn is confined to that slice.
+    func testRevisionHeaderSliceGatingAndIsolation() {
+        let ordinary = WorkCardSnapshot.build(
+            task: Self.makeTask(name: "Ship"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        XCTAssertNil(WorkBoardCardRevisionHeaderSlice(snapshot: ordinary))
+
+        var revTaskA = Self.makeTask(id: "task_rev", kind: "revision", name: "Fix")
+        revTaskA.revisionSeq = 2
+        let revA = WorkCardSnapshot.build(
+            task: revTaskA,
+            context: WorkCardSnapshotContext(column: .doing, parentShortID: 10)
+        )
+
+        var revTaskB = Self.makeTask(id: "task_rev", kind: "revision", name: "Fix")
+        revTaskB.revisionSeq = 2
+        let revB = WorkCardSnapshot.build(
+            task: revTaskB,
+            context: WorkCardSnapshotContext(column: .doing, parentShortID: 11)
+        )
+        let headerA = WorkBoardCardRevisionHeaderSlice(snapshot: revA)
+        let headerB = WorkBoardCardRevisionHeaderSlice(snapshot: revB)
+        XCTAssertNotNil(headerA)
+        XCTAssertNotNil(headerB)
+        XCTAssertNotEqual(headerA, headerB)
+
+        // Parent-id is header-only; title still shares name/kind.
+        XCTAssertEqual(
+            WorkBoardCardTitleRowSlice(snapshot: revA),
+            WorkBoardCardTitleRowSlice(snapshot: revB)
+        )
+        XCTAssertEqual(
+            WorkBoardCardRevisionHeader(slice: headerA!),
+            WorkBoardCardRevisionHeader(slice: headerA!)
+        )
+        XCTAssertNotEqual(
+            WorkBoardCardRevisionHeader(slice: headerA!),
+            WorkBoardCardRevisionHeader(slice: headerB!)
+        )
+    }
+
+    /// Badge-strip view equality ignores action-handler identity, matching
+    /// the card-level closure rule so `.equatable()` is not forced by
+    /// rebuilt closures from the column container.
+    func testBadgeStripEquatableIgnoresClosures() {
+        let snap = WorkCardSnapshot.build(
+            task: Self.makeTask(name: "Ship"),
+            context: WorkCardSnapshotContext(
+                column: .review,
+                showsTerminalButton: true,
+                showsMergeWhenReady: true
+            )
+        )
+        let slice = WorkBoardCardBadgeStripSlice(snapshot: snap)
+        let a = WorkBoardCardBadgeStrip(
+            slice: slice,
+            onOpenTerminal: { /* a */ },
+            onMergeWhenReady: { /* a */ }
+        )
+        let b = WorkBoardCardBadgeStrip(
+            slice: slice,
+            onOpenTerminal: { /* b */ },
+            onMergeWhenReady: { /* b */ }
+        )
+        XCTAssertEqual(a, b)
+    }
+
+    /// Empty footers report `isEmpty` so the card shell can omit the
+    /// trailing sibling and avoid a phantom VStack spacing gap.
+    func testFooterSliceIsEmptyWhenNoSectionsRender() {
+        // No shortID and no PR → no standalone id, no PR row, no review.
+        let snap = WorkCardSnapshot.build(
+            task: Self.makeTask(name: "Ship"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        XCTAssertTrue(WorkBoardCardFooterSlice(snapshot: snap).isEmpty)
+
+        var withIDTask = Self.makeTask(name: "Ship")
+        withIDTask.shortID = 7
+        let withID = WorkCardSnapshot.build(
+            task: withIDTask,
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        XCTAssertFalse(WorkBoardCardFooterSlice(snapshot: withID).isEmpty)
+    }
+
     // MARK: - WorkCardLiveStatus (entry 6 observation detach)
 
     /// Live-status resolution is pure and lives outside the card so the
