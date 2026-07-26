@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use boss_engine_driver::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
     ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, WorkerErrorClass,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
@@ -98,7 +98,7 @@ impl AgentDriver for CodexShapedDriver {
     }
 
     fn capabilities(&self) -> CapabilitySet {
-        CapabilitySet::new([Capability::ProgressObservation])
+        CapabilitySet::new([Capability::ProgressObservation, Capability::TurnBoundary])
     }
 
     fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
@@ -170,6 +170,24 @@ impl AgentDriver for CodexShapedDriver {
             },
             (other, _) => return Err(NormalizeError::UnknownEvent(other.to_owned())),
         })
+    }
+
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        // Codex's native `turn.completed` event normalises to this Stop shape.
+        // Unlike Claude, Codex has no continuation signal, and its stdout
+        // envelope does not distinguish a more specific end reason.
+        match event {
+            WorkerEvent::Stop {
+                session_id,
+                stop_reason,
+                ..
+            } => Some(TurnEnd {
+                session_id: session_id.clone(),
+                reason: *stop_reason,
+                continuation: false,
+            }),
+            _ => None,
+        }
     }
 
     fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
@@ -275,6 +293,31 @@ async fn parses_a_codex_turn_into_activity_events() {
     // The `agent_message` item the driver has no mapping for.
     assert_eq!(stats.unrecognised_envelopes, 1);
     assert_eq!(stats.non_json_lines, 0);
+}
+
+#[test]
+fn codex_turn_completed_is_a_non_continuation_turn_boundary() {
+    let driver = CodexShapedDriver::new();
+    let event = driver
+        .normalize_progress_event(&serde_json::json!({"type": "turn.completed", "usage": {}}))
+        .expect("Codex turn.completed must normalise");
+
+    assert_eq!(
+        driver.turn_boundary(&event),
+        Some(TurnEnd {
+            session_id: FALLBACK_SESSION.to_owned(),
+            reason: boss_protocol::StopReason::Completed,
+            continuation: false,
+        }),
+    );
+    assert!(
+        driver
+            .turn_boundary(&WorkerEvent::UserPromptSubmit {
+                session_id: FALLBACK_SESSION.to_owned(),
+                prompt: String::new(),
+            })
+            .is_none()
+    );
 }
 
 #[tokio::test]
