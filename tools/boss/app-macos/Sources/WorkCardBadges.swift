@@ -963,6 +963,64 @@ struct ReasoningChip: View {
     }
 }
 
+/// Presentation helpers for free-form work-item tags on kanban cards.
+/// Pure functions so unit tests can assert truncation / overflow / empty
+/// collapse without standing up a SwiftUI hierarchy.
+enum WorkTagPresentation {
+    /// Engine write-path cap (mirrors `WORK_ITEM_TAG_MAX_LEN`). Chips still
+    /// truncate display to this length in case a pre-cap row sneaks through.
+    static let maxTagLength = 24
+    /// Engine write-path cap (mirrors `WORK_ITEM_TAG_MAX_COUNT`).
+    static let maxTagCount = 5
+    /// Max chips rendered on a card; remaining collapse into a `+N` chip.
+    static let maxVisibleChips = 5
+
+    /// Truncate a single tag for chip display. Empty/whitespace-only → nil
+    /// (caller drops it). Length is Unicode scalar count, matching the
+    /// engine write validator.
+    static func displayLabel(for raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.count <= maxTagLength { return trimmed }
+        let end = trimmed.index(trimmed.startIndex, offsetBy: maxTagLength - 1)
+        return String(trimmed[..<end]) + "…"
+    }
+
+    /// Visible chip labels plus optional overflow count for `+N`.
+    /// Empty input → empty labels and nil overflow so the tag row
+    /// collapses entirely (zero height, zero gap).
+    static func chips(for tags: [String]) -> (labels: [String], overflow: Int?) {
+        let labels = tags.compactMap(displayLabel(for:))
+        guard !labels.isEmpty else { return ([], nil) }
+        if labels.count <= maxVisibleChips {
+            return (labels, nil)
+        }
+        let visible = Array(labels.prefix(maxVisibleChips))
+        let overflow = labels.count - maxVisibleChips
+        return (visible, overflow)
+    }
+}
+
+/// Neutral free-form tag chip for kanban cards. Visually quieter than
+/// status/priority chips so tags stay subordinate to title and status.
+struct WorkTagChip: View {
+    let text: String
+
+    var body: some View {
+        Text(text)
+            .font(.caption2.weight(.medium))
+            .foregroundStyle(Color(nsColor: .secondaryLabelColor))
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color(nsColor: .quaternaryLabelColor).opacity(0.18))
+            .clipShape(Capsule())
+            .help(text)
+            .accessibilityLabel("Tag \(text)")
+    }
+}
+
 /// Effort-level chip rendered on kanban cards. Only shown when the
 /// task carries a non-nil effort_level — unset rows must not masquerade
 /// as medium.

@@ -1082,6 +1082,26 @@ pub(crate) async fn run_update_leaf(
         args.driver.as_deref().filter(|_| !args.unset_driver),
         model_override.as_deref().filter(|s| !s.is_empty()),
     )?;
+    let tags = if args.clear_tags {
+        Some(Vec::new())
+    } else {
+        args.tags.map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_owned())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+    };
+    let add_tags = if args.add_tags.is_empty() {
+        None
+    } else {
+        Some(args.add_tags)
+    };
+    let remove_tags = if args.remove_tags.is_empty() {
+        None
+    } else {
+        Some(args.remove_tags)
+    };
     let patch = WorkItemPatch {
         name: args.name,
         description: args.description,
@@ -1109,11 +1129,14 @@ pub(crate) async fn run_update_leaf(
         // maps to NULL in the engine (clears the field). The engine rejects
         // a non-empty detail with no accompanying blocked_reason.
         blocked_detail: args.blocked_detail,
+        tags,
+        add_tags,
+        remove_tags,
         ..WorkItemPatch::default()
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --blocked-reason, or --blocked-detail",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {

@@ -216,6 +216,29 @@ pub struct WorkItemPatch {
     /// trailing `/`. See [`Product::worker_branch_prefix`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_branch_prefix: Option<String>,
+
+    /// Replace the full free-form tag set on a leaf work item. `None` →
+    /// leave unchanged. `Some(vec![])` → clear all tags. Applied before
+    /// [`add_tags`](Self::add_tags) / [`remove_tags`](Self::remove_tags)
+    /// when those are also set in the same patch. Only honoured on
+    /// task/chore updates; ignored for product/project. Validated
+    /// against [`crate::WORK_ITEM_TAG_MAX_LEN`] /
+    /// [`crate::WORK_ITEM_TAG_MAX_COUNT`] at the engine boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+
+    /// Tags to append (order-preserving, de-duplicated against the
+    /// current set). Applied after [`tags`](Self::tags) when both are
+    /// set. `None` → no adds. Only honoured on task/chore updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add_tags: Option<Vec<String>>,
+
+    /// Tags to remove (exact string match). Applied after
+    /// [`tags`](Self::tags) / [`add_tags`](Self::add_tags). Unknown
+    /// names are ignored. `None` → no removes. Only honoured on
+    /// task/chore updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remove_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, bon::Builder)]

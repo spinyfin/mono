@@ -720,6 +720,25 @@ struct WorkBoardCardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            // Free-form tags. The whole block is gated on non-empty chips so
+            // zero-tag cards contribute zero height / zero gap (no reserved
+            // empty strip). Caps + truncation live in `WorkTagPresentation`.
+            let tagChips = WorkTagPresentation.chips(for: task.tags)
+            if !tagChips.labels.isEmpty {
+                FlowLayout(horizontalSpacing: 4, verticalSpacing: 3) {
+                    ForEach(tagChips.labels, id: \.self) { label in
+                        WorkTagChip(text: label)
+                    }
+                    if let overflow = tagChips.overflow, overflow > 0 {
+                        WorkTagChip(text: "+\(overflow)")
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: 36, alignment: .topLeading)
+                .clipped()
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Tags: \(tagChips.labels.joined(separator: ", "))")
+            }
+
             if let liveStatus, !liveStatus.isEmpty {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     WorkerWaitingIndicator(

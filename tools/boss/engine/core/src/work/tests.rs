@@ -601,6 +601,7 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         dispatch_failed_reason: None,
         dispatch_failed_error: None,
         dispatch_failed_at: None,
+        tags: vec![],
     }
 }
 
@@ -645,4 +646,5 @@ mod t30;
 mod t31;
 mod t32;
 mod t33;
+mod work_item_tags_tests;
 mod work_item_write_tests;

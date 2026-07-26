@@ -656,6 +656,9 @@ impl WorkDb {
         // so the UI rollup and `list_revisions --parent <root>` surface the
         // full chain. Idempotent; preserves status/executions/deps/history.
         migrate_flatten_nested_revision_parents(conn)?;
+        // `tasks.tags`: free-form ordered label strings for kanban cards.
+        // JSON array text, default `[]`. Caps enforced at write.
+        migrate_tasks_tags_column(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

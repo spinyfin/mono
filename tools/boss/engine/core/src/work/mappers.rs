@@ -299,7 +299,31 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // targeted read — so a `false` here is display-only, never a
         // dispatch decision.
         deferred: false,
+        // Free-form kanban tags. Trailing column on the wide SELECTs only
+        // (`query_task`, `get_work_tree`, short-id lookup); empty here for
+        // base-SELECT paths that do not need tags.
+        tags: Vec::new(),
     })
+}
+
+/// Decode the JSON array stored in `tasks.tags`. Empty/NULL/`[]` → empty
+/// vec. Corrupt JSON is treated as a row-level conversion error rather
+/// than silently dropped, matching other JSON text columns.
+pub(crate) fn decode_task_tags(raw: Option<String>) -> rusqlite::Result<Vec<String>> {
+    let Some(raw) = raw.filter(|s| !s.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    if raw == "[]" {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw)
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, e.into()))
+}
+
+/// Encode tags for storage in `tasks.tags`. Always a JSON array (never
+/// NULL) so the column's NOT NULL DEFAULT stays honest.
+pub(crate) fn encode_task_tags(tags: &[String]) -> String {
+    serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_owned())
 }
 
 /// Like [`map_task`] but reads a trailing `source_automation_id` column
@@ -337,10 +361,11 @@ pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Re
 
 /// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
 /// `archived_reason` column (index 38), `dispatch_failed_*` (39-41),
-/// `blocked_detail` (42), and `deferred` (43). Used by `query_task` and
-/// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
-/// `get_work_item`) surface why the engine auto-archived a row, the
-/// verbatim blocked-status detail, and the future-scope classification.
+/// `blocked_detail` (42), `deferred` (43), and `tags` (44). Used by
+/// `query_task` and `get_work_item_by_short_id` so single-item lookups
+/// (`boss task show`, `get_work_item`) surface why the engine auto-archived
+/// a row, the verbatim blocked-status detail, the future-scope
+/// classification, and free-form kanban tags.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.archived_reason = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
@@ -349,6 +374,7 @@ pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>)
     task.dispatch_failed_at = row.get::<_, Option<String>>(41)?.filter(|s| !s.is_empty());
     task.blocked_detail = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
     task.deferred = row.get::<_, i64>(43)? != 0;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(44)?)?;
     Ok(task)
 }
 
@@ -414,9 +440,9 @@ pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &R
 /// also reads `origin_task_short_id` (index 41), `origin_pr_number`
 /// (index 42), `completed_at` (index 43), the trailing
 /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
-/// columns (indices 44-46), `blocked_detail` (index 47), and `deferred`
-/// (index 48). Used by `get_work_tree` for both task and chore queries,
-/// which append these columns at the end.
+/// columns (indices 44-46), `blocked_detail` (index 47), `deferred`
+/// (index 48), and `tags` (index 49). Used by `get_work_tree` for both
+/// task and chore queries, which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
     task.origin_task_short_id = row.get(41)?;
@@ -427,6 +453,7 @@ pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<
     task.dispatch_failed_at = row.get::<_, Option<String>>(46)?.filter(|s| !s.is_empty());
     task.blocked_detail = row.get::<_, Option<String>>(47)?.filter(|s| !s.is_empty());
     task.deferred = row.get::<_, i64>(48)? != 0;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(49)?)?;
     Ok(task)
 }
 
