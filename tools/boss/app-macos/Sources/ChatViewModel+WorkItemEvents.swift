@@ -237,8 +237,9 @@ extension ChatViewModel {
     ///
     /// Cache invalidation is keyed (design entry 8): when bucket membership
     /// and kind are unchanged, `taskIndexByID` is patched in place and the
-    /// dependency / revision caches are only dropped when edges or revision
-    /// rows actually change. Project-membership, kind, or unknown-previous
+    /// dependency / revision caches are only dropped when their baked-in
+    /// snapshots would go stale (status / name for prereq rows; any field
+    /// on a revision row). Project-membership, kind, or unknown-previous
     /// updates still full-invalidate.
     private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
         // Fan-out regression counter (design entry 2): single-task board update.
@@ -258,9 +259,11 @@ extension ChatViewModel {
             let taskID = updatedTask.id
 
             // Evict the id from every bucket it might previously have lived
-            // in (chore arm included) so a kind/project flip cannot leave a
-            // stale twin behind. Dictionary values are Arrays — copy out,
-            // mutate, write back; `dict[key]?.removeAll` discards the copy.
+            // in (chore arm included) so a kind/project/product flip cannot
+            // leave a stale twin behind. Dictionary values are Arrays —
+            // copy out, mutate, write back; `dict[key]?.removeAll` discards
+            // the copy. Product-scoped maps are scanned across all keys so a
+            // productID change does not leave the row under the old product.
             for key in Array(tasksByProjectID.keys) {
                 guard var bucket = tasksByProjectID[key] else { continue }
                 let before = bucket.count
@@ -269,25 +272,28 @@ extension ChatViewModel {
                     tasksByProjectID[key] = bucket
                 }
             }
-            if var chores = choresByProductID[productID] {
-                let before = chores.count
-                chores.removeAll { $0.id == taskID }
-                if chores.count != before {
-                    choresByProductID[productID] = chores
+            for key in Array(choresByProductID.keys) {
+                guard var bucket = choresByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    choresByProductID[key] = bucket
                 }
             }
-            if var revisions = productLevelRevisionsByProductID[productID] {
-                let before = revisions.count
-                revisions.removeAll { $0.id == taskID }
-                if revisions.count != before {
-                    productLevelRevisionsByProductID[productID] = revisions
+            for key in Array(productLevelRevisionsByProductID.keys) {
+                guard var bucket = productLevelRevisionsByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    productLevelRevisionsByProductID[key] = bucket
                 }
             }
-            if var productLevelItems = productLevelTasksByProductID[productID] {
-                let before = productLevelItems.count
-                productLevelItems.removeAll { $0.id == taskID }
-                if productLevelItems.count != before {
-                    productLevelTasksByProductID[productID] = productLevelItems
+            for key in Array(productLevelTasksByProductID.keys) {
+                guard var bucket = productLevelTasksByProductID[key] else { continue }
+                let before = bucket.count
+                bucket.removeAll { $0.id == taskID }
+                if bucket.count != before {
+                    productLevelTasksByProductID[key] = bucket
                 }
             }
 
@@ -326,10 +332,13 @@ extension ChatViewModel {
         // caches this row can affect.
         patchTaskIndex(with: updatedTask)
         var keys: WorkCacheInvalidation = [.boardLayout]
-        // Status feeds edge satisfaction (`isWorkItemRowSatisfied`); a flip
-        // must rebuild the prereq graphs even though the edge list itself is
-        // unchanged.
-        if previous?.status != updatedTask.status {
+        // Status feeds edge satisfaction (`isWorkItemRowSatisfied`); name is
+        // baked into `WorkDependencyRow.title` at rebuild time. Either change
+        // must drop the prereq graphs so the next read rebuilds with current
+        // titles / satisfaction.
+        if previous?.status != updatedTask.status
+            || previous?.name != updatedTask.name
+        {
             keys.insert(.dependencies)
         }
         if taskUpdateAffectsRevisionCache(previous: previous, updated: updatedTask) {

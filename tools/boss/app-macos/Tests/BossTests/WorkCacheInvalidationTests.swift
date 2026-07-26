@@ -2,10 +2,11 @@ import XCTest
 @testable import Boss
 
 /// Correctness coverage for keyed work-cache invalidation (design entry 8).
-/// A same-bucket single-item update must patch `taskIndexByID` and leave
-/// dependency / revision caches intact when edges and revision rows do not
-/// change. Project membership, kind, and dependency-edge changes must still
-/// fully invalidate every derived cache.
+/// A same-bucket single-item update must patch `taskIndexByID` and drop only
+/// the derived caches whose baked-in snapshots would go stale (dep titles on
+/// name change, revision rollups on any revision-row field change). Project
+/// membership, kind, and dependency-edge changes must still fully invalidate
+/// every derived cache.
 @MainActor
 final class WorkCacheInvalidationTests: XCTestCase {
 
@@ -141,22 +142,36 @@ final class WorkCacheInvalidationTests: XCTestCase {
         )
     }
 
-    func testNameOnlyUpdateDoesNotDropDependencyCaches() {
+    func testNameOnlyUpdateDropsDependencyCachesSoTitlesRefresh() {
         let model = makeModel()
         let taskA = makeTask(id: "task_a", projectID: "proj_a", status: "todo")
         let taskB = makeTask(id: "task_b", projectID: "proj_a", status: "blocked")
+        // Unrelated revision so a non-revision rename must not drop rollups.
+        var revision = makeTask(
+            id: "rev_1",
+            projectID: "proj_a",
+            kind: "revision",
+            status: "in_review"
+        )
+        revision.parentTaskId = "task_a"
+        revision.revisionSeq = 1
         let edge = WorkItemDependency(
             dependentID: "task_b",
             prerequisiteID: "task_a",
             relation: "blocks"
         )
-        seedWorkTree(model, tasks: [taskA, taskB], dependencies: [edge])
+        seedWorkTree(model, tasks: [taskA, taskB, revision], dependencies: [edge])
 
         _ = model.task(withID: "task_a")
         _ = model.dependencyPrereqsByTaskID
         _ = model.gatingPrereqsByTaskID
+        _ = model.inReviewRevisions(forParentTaskID: "task_a")
         XCTAssertNotNil(model.cachedDependencyPrereqs)
-        XCTAssertNotNil(model.cachedGatingPrereqs)
+        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+        XCTAssertEqual(
+            model.dependencyPrereqs(for: "task_b").first?.title,
+            "Task task_a"
+        )
 
         var renamed = makeTask(id: "task_a", projectID: "proj_a", status: "todo")
         renamed.name = "Renamed A"
@@ -167,13 +182,75 @@ final class WorkCacheInvalidationTests: XCTestCase {
             "name-only update must keep the patched id index"
         )
         XCTAssertEqual(model.taskIndexByID?["task_a"]?.name, "Renamed A")
-        XCTAssertNotNil(
+        // Titles are baked into WorkDependencyRow at rebuild time; name
+        // changes must drop the prereq graphs so the next read rebuilds.
+        XCTAssertNil(
             model.cachedDependencyPrereqs,
-            "name-only update must not drop dependency caches (edges unchanged)"
+            "name-only update must drop dependency caches so titles refresh"
         )
-        XCTAssertNotNil(
+        XCTAssertNil(
             model.cachedGatingPrereqs,
-            "name-only update must not drop gating caches (edges unchanged)"
+            "name-only update must drop gating caches so titles refresh"
+        )
+        XCTAssertEqual(
+            model.dependencyPrereqs(for: "task_b").first?.title,
+            "Renamed A",
+            "rebuilt prereq rows must carry the new title"
+        )
+        // Non-revision name flip must not discard revision rollups.
+        XCTAssertNotNil(
+            model.cachedInReviewRevisionsByParentID,
+            "non-revision name change must leave revision caches intact"
+        )
+        XCTAssertTrue(
+            model.cachedItemsByColumn.isEmpty,
+            "board layout caches must still invalidate on name change"
+        )
+    }
+
+    func testRevisionRenameDropsRollupCachesAndRebuildsWithNewName() {
+        let model = makeModel()
+        let parent = makeTask(id: "task_x", projectID: "proj_a", status: "in_review")
+        var revision = makeTask(
+            id: "rev_1",
+            projectID: "proj_a",
+            kind: "revision",
+            status: "in_review"
+        )
+        revision.parentTaskId = "task_x"
+        revision.revisionSeq = 1
+        revision.name = "Old revision title"
+        seedWorkTree(model, tasks: [parent, revision])
+
+        _ = model.task(withID: "rev_1")
+        let warmed = model.inReviewRevisions(forParentTaskID: "task_x")
+        XCTAssertEqual(warmed.map(\.name), ["Old revision title"])
+        XCTAssertNotNil(model.cachedInReviewRevisionsByParentID)
+
+        var renamed = revision
+        renamed.name = "New revision title"
+        model.applyEventForTest(.workItemUpdated(item: .task(renamed)))
+
+        XCTAssertNotNil(
+            model.taskIndexByID,
+            "same-bucket revision rename still patches the id index"
+        )
+        XCTAssertEqual(model.taskIndexByID?["rev_1"]?.name, "New revision title")
+        XCTAssertNil(
+            model.cachedInReviewRevisionsByParentID,
+            "revision display-field change must drop the revision rollup caches"
+        )
+        XCTAssertNil(
+            model.cachedDoneRevisionsByParentID,
+            "revision display-field change must drop both in-review and done caches"
+        )
+        XCTAssertEqual(
+            model.inReviewRevisions(forParentTaskID: "task_x").map(\.name),
+            ["New revision title"]
+        )
+        XCTAssertEqual(
+            model.inReviewRevisions(forParentTaskID: "task_x").map(\.id),
+            ["rev_1"]
         )
     }
 
@@ -273,6 +350,20 @@ final class WorkCacheInvalidationTests: XCTestCase {
         var done = revision
         done.status = "done"
         XCTAssertTrue(model.taskUpdateAffectsRevisionCache(previous: revision, updated: done))
+
+        // Display-only fields also invalidate: rollups store full snapshots.
+        var renamed = revision
+        renamed.name = "Renamed revision"
+        XCTAssertTrue(
+            model.taskUpdateAffectsRevisionCache(previous: revision, updated: renamed),
+            "revision rename must drop rollup caches"
+        )
+        var prLinked = revision
+        prLinked.prURL = "https://github.com/org/repo/pull/1"
+        XCTAssertTrue(
+            model.taskUpdateAffectsRevisionCache(previous: revision, updated: prLinked),
+            "revision PR-URL change must drop rollup caches"
+        )
     }
 
     // MARK: - Helpers

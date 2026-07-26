@@ -122,21 +122,16 @@ extension ChatViewModel {
 
     /// True when an incremental task update must drop the revision rollup
     /// caches (`cachedInReviewRevisionsByParentID` /
-    /// `cachedDoneRevisionsByParentID`). Same-bucket non-revision field
-    /// edits (name, priority, …) leave the caches intact; status/parent
-    /// changes on a revision row, or a kind flip into/out of revision,
-    /// invalidate them. Used by keyed invalidation in
+    /// `cachedDoneRevisionsByParentID`). Rollups store full `WorkTask`
+    /// snapshots, so any field change on a revision row (name, PR URL,
+    /// status, parent, seq, …) — or a kind flip into/out of revision —
+    /// must invalidate them. Non-revision same-bucket edits leave the
+    /// caches intact. Used by keyed invalidation in
     /// `applyIncrementalTaskUpdate` (design entry 8).
     func taskUpdateAffectsRevisionCache(previous: WorkTask?, updated: WorkTask) -> Bool {
         let wasRevision = previous?.kind == "revision"
         let isRevision = updated.kind == "revision"
-        guard wasRevision || isRevision else { return false }
-        if wasRevision != isRevision { return true }
-        return previous?.status != updated.status
-            || previous?.parentTaskId != updated.parentTaskId
-            || previous?.projectID != updated.projectID
-            || previous?.revisionSeq != updated.revisionSeq
-            || previous?.productID != updated.productID
+        return wasRevision || isRevision
     }
 
     /// Groups every project- and product-level revision task by parent id
