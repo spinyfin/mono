@@ -1,13 +1,25 @@
 //! Verified pane-injection delivery.
 //!
 //! `SendToPane` only proves the engine handed bytes to the app, which
-//! writes them to the worker's pty. It does not prove Claude Code's
-//! CLI treated them as a pending user prompt. Text injected while the
-//! worker is idle at its prompt (the `Stop`-boundary probe path) has
-//! proven reliable, but text injected while the worker is actively
+//! writes them to the worker's pty. It does not prove the foreground
+//! process treated them as a pending user prompt. Text injected while
+//! the worker is idle at its prompt (the `Stop`-boundary probe path)
+//! has proven reliable, but text injected while the worker is actively
 //! mid-turn — the urgent `PostToolUse` probe path, and the
 //! chore-update auto-notice, which can land at any point in a turn —
-//! races the TUI's input handling.
+//! races the TUI's input handling. Worse, when the foreground process
+//! does not consume stdin at all (e.g. `codex exec`), injected bytes
+//! survive in the tty input buffer and are later executed by the
+//! interactive shell (ghostty-codex-pane-viability investigation, Q2
+//! Layer D). That is a **safety** issue, not hygiene.
+//!
+//! Before any write, [`ServerState::inject_pane_text_verified`] therefore
+//! consults live [`boss_protocol::WorkerActivity`]: only
+//! [`boss_protocol::WorkerActivity::Idle`] and
+//! [`boss_protocol::WorkerActivity::WaitingForInput`] accept typed
+//! input ([`boss_protocol::WorkerActivity::accepts_typed_input`]). A
+//! refusal is surfaced as [`PaneInjectOutcome::NotAcceptingInput`] —
+//! never silently dropped, and never gated on a single driver.
 //!
 //! The probe-6 incident originally looked like a silent delivery
 //! loss: the engine logged "injected" and the worker ran on for 20+
@@ -20,18 +32,20 @@
 //! re-delivering the text (the previous behavior here) risks handing
 //! the worker the same instruction twice.
 //!
-//! [`ServerState::inject_pane_text_verified`] closes the observability
-//! gap without over-correcting into duplicate delivery: it waits for a
-//! `UserPromptSubmit` hook — the CLI's own confirmation that it
-//! enqueued something as the next prompt — and, since that hook firing
-//! for pane-injected text (as opposed to text the CLI itself echoed)
-//! has never been validated end-to-end, it also falls back to scanning
-//! the worker's session transcript for the injected text before giving
-//! up. Callers that get back [`PaneInjectOutcome::Unconfirmed`] must
-//! not treat that as "lost" and auto-redeliver — they should record the
-//! unconfirmed state and let whoever is watching the probe topic decide.
+//! When the activity guard passes, this path still closes the
+//! observability gap without over-correcting into duplicate delivery:
+//! it waits for a `UserPromptSubmit` hook — the CLI's own confirmation
+//! that it enqueued something as the next prompt — and, since that hook
+//! firing for pane-injected text (as opposed to text the CLI itself
+//! echoed) has never been validated end-to-end, it also falls back to
+//! scanning the worker's session transcript for the injected text
+//! before giving up. Callers that get back
+//! [`PaneInjectOutcome::Unconfirmed`] must not treat that as "lost" and
+//! auto-redeliver — they should record the unconfirmed state and let
+//! whoever is watching the probe topic decide.
 
 use super::*;
+use boss_protocol::WorkerActivity;
 
 /// Outcome of [`ServerState::inject_pane_text_verified`].
 #[derive(Debug)]
@@ -47,6 +61,14 @@ pub(crate) enum PaneInjectOutcome {
     /// Callers must record this as an observable "unconfirmed" state
     /// rather than treating it as a failure and re-delivering the text.
     Unconfirmed,
+    /// Refused before any pty write: the slot's live
+    /// [`WorkerActivity`] is not one that accepts typed input
+    /// ([`WorkerActivity::accepts_typed_input`]), or no live state is
+    /// registered for the slot. `activity` is `None` when the registry
+    /// has no entry for the slot (fail closed — unknown is not
+    /// "accepting"). Callers must surface this rather than silently
+    /// drop the text or re-issue the write.
+    NotAcceptingInput { activity: Option<WorkerActivity> },
     /// `SendToPane` itself failed at the transport or app layer.
     /// Carries enough detail for callers that need a typed error
     /// (e.g. [`ServerState::send_input_to_worker`]'s `SendInputError`)
@@ -170,15 +192,37 @@ impl ServerState {
         let _ = waiter.tx.send(prompt.to_owned());
     }
 
+    /// Live activity for `slot_id`, if any, used by the typed-input
+    /// guard. Missing state fails closed — see
+    /// [`PaneInjectOutcome::NotAcceptingInput`].
+    pub(super) fn pane_typed_input_activity(&self, slot_id: u8) -> Option<WorkerActivity> {
+        self.live_worker_states.get(slot_id).map(|s| s.activity)
+    }
+
+    /// True when `slot_id` has a live worker whose
+    /// [`WorkerActivity::accepts_typed_input`].
+    pub(super) fn pane_accepts_typed_input(&self, slot_id: u8) -> bool {
+        self.pane_typed_input_activity(slot_id)
+            .is_some_and(WorkerActivity::accepts_typed_input)
+    }
+
     /// Write `text` into `run_id`'s worker pane (`slot_id`) and wait up
     /// to `verify_timeout` for confirmation that the CLI actually
     /// enqueued it as the next prompt, rather than merely accepting the
-    /// pty write. Confirmation comes from either of two independent
-    /// signals — a matching `UserPromptSubmit` hook, or (since that
-    /// hook firing for pane-injected text has never been validated
-    /// end-to-end) a scan of the worker's session transcript for the
-    /// injected text — so a gap in one signal doesn't by itself produce
-    /// a false "unconfirmed".
+    /// pty write.
+    ///
+    /// **Activity guard (first):** refuses with
+    /// [`PaneInjectOutcome::NotAcceptingInput`] when the slot's live
+    /// [`WorkerActivity`] is not accepting typed input (or is unknown).
+    /// No bytes are written to the pty in that case — this is the
+    /// safety fix for mid-turn / non-consuming foreground processes.
+    ///
+    /// **Confirmation (when the guard passes):** either a matching
+    /// `UserPromptSubmit` hook, or (since that hook firing for
+    /// pane-injected text has never been validated end-to-end) a scan
+    /// of the worker's session transcript for the injected text — so a
+    /// gap in one signal doesn't by itself produce a false
+    /// "unconfirmed".
     ///
     /// `transcript_path`/`offset_bytes` should be captured by the
     /// caller *before* this call (the same snapshot used for reply
@@ -197,6 +241,17 @@ impl ServerState {
         offset_bytes: u64,
         verify_timeout: Duration,
     ) -> PaneInjectOutcome {
+        let activity = self.pane_typed_input_activity(slot_id);
+        if !activity.is_some_and(WorkerActivity::accepts_typed_input) {
+            tracing::warn!(
+                run_id,
+                slot_id,
+                activity = activity.map(WorkerActivity::as_str),
+                "pane injection refused: worker is not accepting typed input"
+            );
+            return PaneInjectOutcome::NotAcceptingInput { activity };
+        }
+
         let (token, waiter) = self.register_delivery_waiter(run_id, &text);
         let request = EngineToAppRequest::SendToPane(SendToPaneInput {
             slot_id,

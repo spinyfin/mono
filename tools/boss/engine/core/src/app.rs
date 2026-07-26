@@ -105,12 +105,12 @@ use server::{
     resolve_status_actor, signal_shell_pids,
 };
 
-// Re-import pane-op error types so the `tests` child module can access them via `use super::*`.
-// Only the test module references these by name; production code calls the
-// `ServerState` methods and matches on the returned error with `{err}`/`{err:?}`,
-// never the concrete type — so this import is dead outside `#[cfg(test)]`.
+// Re-import pane-op error types so child modules can match on them via
+// `use super::*`. Production code (chore-update notify) matches
+// `SendInputError::NotAcceptingInput` to requeue; tests use the full set.
+use pane_ops::SendInputError;
 #[cfg(test)]
-use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError, SendInputError};
+use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
 use worker_events::{dispatch_probe_if_idle, dispatch_worker_event_fanout};

@@ -1676,7 +1676,8 @@ async fn chore_update_notify_sends_message_to_live_worker() {
         )
         .unwrap();
 
-    // Register a live worker slot for this chore.
+    // Register a live worker slot for this chore, parked at Idle so
+    // the typed-input activity guard allows the chore-update inject.
     let run_id = "exec-notify-test";
     server_state.worker_registry.register_run_slot(run_id, 4);
     server_state.live_worker_states.register_spawn(
@@ -1689,6 +1690,14 @@ async fn chore_update_notify_sends_message_to_live_worker() {
             work_item_name: "Test chore".into(),
             execution_id: run_id.into(),
         }),
+    );
+    server_state.live_worker_states.apply_event(
+        4,
+        &crate::protocol::WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
     );
 
     // Register an app session to capture the outgoing SendToPane.

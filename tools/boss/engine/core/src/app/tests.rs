@@ -61,6 +61,58 @@ pub(super) fn make_session_sink() -> Arc<SessionSink> {
     Arc::new(SessionSink::new(shutdown_tx))
 }
 
+/// Register `run_id` → `slot_id` and seed live state at
+/// [`boss_protocol::WorkerActivity::Idle`] so
+/// [`ServerState::inject_pane_text_verified`] / `send_input_to_worker`
+/// accept typed input. Production spawn leaves activity at `Spawning`
+/// until the first SessionStart/Stop; tests that only exercise the
+/// pane-write path skip that lifecycle and park the worker at Idle.
+pub(super) fn register_idle_worker(server_state: &ServerState, run_id: &str, slot_id: u8) {
+    use boss_protocol::{WorkerActivity, WorkerEvent};
+    server_state.worker_registry.register_run_slot(run_id, slot_id);
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, run_id.to_owned(), "claude-opus-4-7", 0, None);
+    server_state.live_worker_states.apply_event(
+        slot_id,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(slot_id).unwrap().activity,
+        WorkerActivity::Idle,
+        "register_idle_worker precondition: slot must be Idle",
+    );
+}
+
+/// Like [`register_idle_worker`], but leaves activity at
+/// [`boss_protocol::WorkerActivity::Working`] (a PreToolUse with no
+/// balancing Stop). Used to assert the typed-input guard refuses
+/// mid-turn injection.
+pub(super) fn register_working_worker(server_state: &ServerState, run_id: &str, slot_id: u8) {
+    use boss_protocol::{WorkerActivity, WorkerEvent};
+    server_state.worker_registry.register_run_slot(run_id, slot_id);
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, run_id.to_owned(), "claude-opus-4-7", 0, None);
+    server_state.live_worker_states.apply_event(
+        slot_id,
+        &WorkerEvent::PreToolUse {
+            session_id: "test-sess".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+        },
+    );
+    assert_eq!(
+        server_state.live_worker_states.get(slot_id).unwrap().activity,
+        WorkerActivity::Working,
+        "register_working_worker precondition: slot must be Working",
+    );
+}
+
 mod app_channel;
 mod context;
 mod engine_health_report;
