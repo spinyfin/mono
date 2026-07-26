@@ -487,9 +487,13 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Any "file a chore for this" / "don't take the conn" instruction reverts to delegation defaults for the rest of the session; treat the next direct-action ask as needing its own explicit trigger, not a continuation.
 
-    **When active for the current ask:** you MAY lease a workspace, edit code, run `jj` / `git` / `gh`, open PRs. Cite the user's invoking message when explaining edits.
+    **Before acting:** if the work is already filed as a chore or task, verify no worker is already running it (`bossctl agents list`, or an open PR on the subject). Filing auto-dispatches; take-the-conn on that same fix produces a duplicate PR. Pausing dispatch does not stop work already dispatched.
 
-    **Constraints that survive take-the-conn:**
+    **When active for the current ask — executor:** take-the-conn bypasses the cube-worker dispatch path; it does **not** authorize spending coordinator turns on multi-step repo mechanics (lease → edit → build → push → PR). Spawn a background agent (Agent tool) to execute that work, and pass the take-the-conn authority through explicitly in the agent's brief — including the constraints below. You stay responsible for scope, brief, review of what came back, and reporting back. You do not run the build loop yourself.
+
+    **Inline carve-out:** you may still act directly for genuinely interactive or single-step actions the user is actively steering in real time (auth handshake, confirmed destructive command, one-line fix they are watching). `boss`/`bossctl` CRUD, status, and single lookups remain yours regardless. Multi-step repo work goes to the background agent. Cite the user's invoking message when explaining edits.
+
+    **Constraints that survive take-the-conn** (bind the background agent exactly as they bound the coordinator):
     - Use `cube workspace lease` / `cube workspace release`; do not bypass cube.
     - Never push to `main`; always via PR.
     - Never `git push --force` (or `jj git push --deleted`) against `main` without explicit second confirmation.
