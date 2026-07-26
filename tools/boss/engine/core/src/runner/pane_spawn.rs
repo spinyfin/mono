@@ -70,10 +70,8 @@ mod render_env_directive_tests {
 
 #[cfg(test)]
 mod apply_permission_extra_args_tests {
-    use crate::driver::{
-        CodexDriver, WorkerKind, apply_permission_extra_args, codex::codex_sandbox_extra_args,
-    };
     use crate::driver::{AgentDriver, SpawnRequest};
+    use crate::driver::{CodexDriver, WorkerKind, apply_permission_extra_args, codex::codex_sandbox_extra_args};
 
     #[test]
     fn empty_extra_args_leave_command_unchanged() {
@@ -96,10 +94,7 @@ mod apply_permission_extra_args_tests {
             "Codex spawn default includes workspace-write: {}",
             plan.command
         );
-        let merged = apply_permission_extra_args(
-            &plan.command,
-            &codex_sandbox_extra_args(WorkerKind::Reviewer),
-        );
+        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer));
         assert!(
             merged.contains("read-only"),
             "Reviewer must get --sandbox read-only: {merged}"
@@ -437,18 +432,32 @@ impl ExecutionRunner for PaneSpawnRunner {
         // CODEX_HOME): a silent failure would make every teardown path
         // no-op, leak Boss-owned homes, and skip auth adopt. Fail the
         // spawn so the caller can retry rather than leave an untracked home.
-        // Claude returns None and a failed write of None is still a DB
-        // health signal — surface it rather than continue half-spawned.
-        self.work_db
-            .set_driver_runtime_state(&execution.id, runtime_state.as_ref())
-            .with_context(|| {
-                format!(
-                    "persisting driver_runtime_state after provision for execution {} \
-                     (driver={})",
-                    execution.id,
-                    driver.descriptor().name,
-                )
-            })?;
+        // Claude returns None (no out-of-workspace state); clearing a stale
+        // payload is best-effort and must not block spawn.
+        match runtime_state.as_ref() {
+            Some(state) => {
+                self.work_db
+                    .set_driver_runtime_state(&execution.id, Some(state))
+                    .with_context(|| {
+                        format!(
+                            "persisting driver_runtime_state after provision for execution {} \
+                             (driver={})",
+                            execution.id,
+                            driver.descriptor().name,
+                        )
+                    })?;
+            }
+            None => {
+                if let Err(err) = self.work_db.set_driver_runtime_state(&execution.id, None) {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        driver = driver.descriptor().name,
+                        error = %format!("{err:#}"),
+                        "failed to clear driver_runtime_state after provision (non-fatal; no runtime state)",
+                    );
+                }
+            }
+        }
 
         // Structured-output artifacts (PR URL / review findings / triage
         // decision / followups): create the engine-owned scratch dir and clear
@@ -582,10 +591,8 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Apply permission-policy CLI args (e.g. Codex `--sandbox read-only`
         // for Reviewer). Must run after spawn_invocation so policy replaces
         // any driver default flags rather than being ignored.
-        spawn_plan.command = crate::driver::apply_permission_extra_args(
-            &spawn_plan.command,
-            &permission_artifacts.extra_args,
-        );
+        spawn_plan.command =
+            crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",

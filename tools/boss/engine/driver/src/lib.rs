@@ -190,9 +190,9 @@ fn strip_cli_flag_token(command: &str, flag: &str, takes_value: bool) -> String 
     let rest_trimmed = rest.trim_start();
     let ws = rest.len() - rest_trimmed.len();
     // Value may be shell-quoted (`'workspace-write'`) or bare.
-    let token_end = if rest_trimmed.starts_with('\'') {
+    let token_end = if let Some(inside) = rest_trimmed.strip_prefix('\'') {
         // Find closing unescaped single quote (shell_quote form).
-        rest_trimmed[1..]
+        inside
             .find('\'')
             .map(|i| i + 2) // include both quotes
             .unwrap_or(rest_trimmed.len())

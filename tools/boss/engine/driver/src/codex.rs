@@ -235,10 +235,7 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind) -> &'static str {
 
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
 pub fn codex_sandbox_extra_args(worker_kind: WorkerKind) -> Vec<String> {
-    vec![
-        "--sandbox".into(),
-        codex_sandbox_for_worker_kind(worker_kind).into(),
-    ]
+    vec!["--sandbox".into(), codex_sandbox_for_worker_kind(worker_kind).into()]
 }
 
 /// Refuse to delete a path unless it is a strict, canonicalized child of the
@@ -281,8 +278,8 @@ pub fn assert_codex_home_safe_to_delete(codex_home: &Path) -> anyhow::Result<()>
         return Ok(());
     }
 
-    let home_canon = fs::canonicalize(codex_home)
-        .with_context(|| format!("canonicalize CODEX_HOME {}", codex_home.display()))?;
+    let home_canon =
+        fs::canonicalize(codex_home).with_context(|| format!("canonicalize CODEX_HOME {}", codex_home.display()))?;
     if home_canon == root_canon {
         bail!(
             "refusing to delete CODEX_HOME {} — equals Boss homes root {}",
@@ -749,10 +746,7 @@ impl AgentDriver for CodexDriver {
         // Empty/missing run_id: fall back to a non-empty leaf so CODEX_HOME
         // never resolves to the shared homes root. Production always passes
         // the execution id; fixtures may omit it.
-        let run_id = request
-            .run_id
-            .filter(|id| !id.is_empty())
-            .unwrap_or("unknown-run");
+        let run_id = request.run_id.filter(|id| !id.is_empty()).unwrap_or("unknown-run");
         let codex_home = codex_home_for_run(run_id).unwrap_or_else(|_| {
             // sanitize_run_id_for_home only fails on empty; unknown-run is safe.
             codex_homes_root().join("unknown-run")
@@ -1214,7 +1208,8 @@ mod tests {
             plan.command
         );
         assert!(
-            plan.command.contains(&format!("model_reasoning_effort={}", shell_quote("high"))),
+            plan.command
+                .contains(&format!("model_reasoning_effort={}", shell_quote("high"))),
             "must pass shell-quoted effort: {}",
             plan.command
         );
@@ -1486,10 +1481,7 @@ else:
             codex_sandbox_extra_args(WorkerKind::Reviewer),
             vec!["--sandbox".to_owned(), "read-only".to_owned()]
         );
-        assert_eq!(
-            codex_sandbox_for_worker_kind(WorkerKind::Standard),
-            "workspace-write"
-        );
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Standard), "workspace-write");
         // Final command after permission merge must prefer reviewer read-only
         // over the spawn-plan default workspace-write.
         let plan = CodexDriver.spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
@@ -1498,10 +1490,7 @@ else:
             "spawn default is workspace-write: {}",
             plan.command
         );
-        let merged = crate::apply_permission_extra_args(
-            &plan.command,
-            &codex_sandbox_extra_args(WorkerKind::Reviewer),
-        );
+        let merged = crate::apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer));
         assert!(
             merged.contains("--sandbox") && merged.contains("read-only"),
             "Reviewer must get --sandbox read-only after extra_args apply: {merged}"
