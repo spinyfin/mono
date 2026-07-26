@@ -190,3 +190,38 @@ async fn set_project_status_fires_when_project_status_none() {
     let calls = tracker.set_project_status_calls();
     assert_eq!(calls, vec!["spy#35"]);
 }
+
+/// Behavior 6 skips items with no project membership (`project_item_id` absent).
+/// Repo/label-sourced issues must not re-queue set_project_status every tick.
+#[tokio::test]
+async fn set_project_status_skipped_when_no_project_membership() {
+    let db = in_memory_db();
+    let product = setup_product_with_tracker(&db);
+
+    let chore = seed_active_chore(&db, &product.id, "spy#36", 36);
+    assert_eq!(chore.status, TaskStatus::Active);
+
+    let item = UpstreamItem {
+        upstream_ref: upstream_ref_without_project(36),
+        project_status: None,
+        ..open_item(36, "Repo-only issue 36")
+    };
+    assert!(item.upstream_ref.raw.get("project_item_id").is_none());
+
+    let tracker = SpyTracker::new(vec![item]);
+    let registry = spy_registry(Arc::clone(&tracker));
+    let metrics = Registry::new();
+    register_metrics(&metrics);
+
+    let outcome = run_one_pass(&db, &registry, &metrics, &noop_pub(), &ambient_resolver()).await;
+
+    assert_eq!(
+        outcome.in_progress_set_succeeded, 0,
+        "must not count success when there is no project membership"
+    );
+    assert_eq!(outcome.in_progress_set_failed, 0);
+    assert!(
+        tracker.set_project_status_calls().is_empty(),
+        "set_project_status must not be called without project_item_id"
+    );
+}

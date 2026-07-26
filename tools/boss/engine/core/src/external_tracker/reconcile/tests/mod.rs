@@ -275,6 +275,17 @@ fn upstream_ref(id: u64) -> UpstreamRef {
     UpstreamRef {
         kind: "spy".to_owned(),
         canonical_id: format!("spy#{id}"),
+        // Board-style items carry project_item_id so Behavior 6 can fire.
+        // Repo-only fixtures omit the field via `upstream_ref_without_project`.
+        raw: json!({ "issue_number": id, "project_item_id": format!("PVTI_spy_{id}") }),
+    }
+}
+
+/// Upstream ref for items not on a project board (no Status column to update).
+fn upstream_ref_without_project(id: u64) -> UpstreamRef {
+    UpstreamRef {
+        kind: "spy".to_owned(),
+        canonical_id: format!("spy#{id}"),
         raw: json!({ "issue_number": id }),
     }
 }
