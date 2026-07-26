@@ -24,7 +24,7 @@ use boss_protocol::WorkItemBinding;
 use thiserror::Error;
 use tokio::time::Duration;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::{AgentDriver, Capability, ClaudeDriver};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -121,7 +121,7 @@ pub struct StartWorkerInput {
     /// Worker kind — forwarded to `WorkerSetupInput` to select the per-kind
     /// tool denylist. Defaults to [`WorkerKind::Standard`] for all
     /// current callers; set to [`WorkerKind::Reviewer`] when spawning a
-    /// reviewer worker (task 3 of P992).
+    /// reviewer worker.
     pub worker_kind: WorkerKind,
 }
 
@@ -344,7 +344,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // The subtle case is an **ack timeout** (`SendToAppError::Timeout`):
     // the request WAS delivered to the app, but no reply arrived within
     // the window. This is *ambiguous* — the app may already have hosted
-    // the pane (the T267 incident: post-sleep the app's RPC queue drained
+    // the pane (seen previously: post-sleep the app's RPC queue drained
     // slowly, the ack timed out, yet the `claude` process had started and
     // kept working). Treating that as a spawn failure releases the cube
     // lease out from under a live pane and re-dispatches a duplicate
@@ -423,12 +423,21 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     //    see "Spawning" with the launch-default model — no more
     //    "Claude Unknown" while we wait for SessionStart to fire.
     if let Some(live_states) = spawner.live_worker_state_registry() {
-        live_states.register_spawn(
+        // Ask the driver, rather than assume: this derives the capability
+        // from the actual driver's declared capabilities and passes it
+        // straight into registration, so there is no window between spawn
+        // and a follow-up setter call where a concurrently delivered hook
+        // event would be evaluated against a stale default. This call site
+        // needs no further change once spawning stops hardcoding
+        // `ClaudeDriver` (see the driver-abstraction design doc's "Extract
+        // the Claude Spawn capability" task).
+        live_states.register_spawn_with_capabilities(
             slot_id,
             input.run_id.clone(),
             input.model,
             shell_pid,
             input.work_item_binding,
+            ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
         );
         // Declare this slot's driver-reported progress fidelity so
         // `stale_worker_sweep` judges cadence-based staleness against the
@@ -868,9 +877,9 @@ mod tests {
         assert!(keys.contains(&"BOSS_TASK_ID"));
     }
 
-    /// T267 regression: a `SpawnWorkerPane` ack timeout must NOT surface
-    /// as a spawn failure. The app may have hosted the pane anyway (the
-    /// incident: a slow post-sleep RPC drain made the ack time out while
+    /// Regression test: a `SpawnWorkerPane` ack timeout must NOT surface
+    /// as a spawn failure. The app may have hosted the pane anyway (seen
+    /// previously: a slow post-sleep RPC drain made the ack time out while
     /// the `claude` process had already started). `start_worker` returns
     /// `Ok` with `ack_timed_out` set, `shell_pid = 0`, and the
     /// engine-claimed slot — and it registers the run→slot mapping so the
