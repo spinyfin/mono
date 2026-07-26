@@ -3,8 +3,9 @@ import os
 
 /// One recorded main-thread stall: the moment the watchdog noticed the
 /// main queue had gone unresponsive for longer than the configured
-/// threshold, the symbolicated backtrace of the (blocked) main thread
-/// captured at that moment, and a coarse tag for what was frontmost.
+/// threshold, the raw main-thread return addresses captured at that
+/// moment (symbolicated lazily on read/export), and a coarse tag for
+/// what was frontmost.
 ///
 /// `durationMs` is the stall length **measured at detection** — the
 /// watchdog records as soon as it crosses the threshold (so a genuine
@@ -25,8 +26,10 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
     /// Coarse "what was active" tag — typically the frontmost window
     /// title (which surfaces the pane/agent name in the Boss UI).
     let context: String
-    /// Symbolicated main-thread frames, innermost first.
-    let backtrace: [String]
+    /// Raw main-thread return addresses, innermost first. Kept unsymbolicated
+    /// on the capture path so the watchdog never pays for `dladdr`; resolve
+    /// via [[symbolicatedBacktrace]] in the viewer or on export.
+    let frameAddresses: [UInt]
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -35,7 +38,7 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         case heartbeatIntervalMs = "heartbeat_interval_ms"
         case thresholdMs = "threshold_ms"
         case context
-        case backtrace
+        case frameAddresses = "frame_addresses"
     }
 
     init(
@@ -45,7 +48,7 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         heartbeatIntervalMs: Double,
         thresholdMs: Double,
         context: String,
-        backtrace: [String]
+        frameAddresses: [UInt]
     ) {
         self.id = id
         self.tsEpochMs = tsEpochMs
@@ -53,7 +56,48 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         self.heartbeatIntervalMs = heartbeatIntervalMs
         self.thresholdMs = thresholdMs
         self.context = context
-        self.backtrace = backtrace
+        self.frameAddresses = frameAddresses
+    }
+
+    /// Encode addresses as hex strings so JSON numbers cannot lose low
+    /// bits of a 64-bit pointer (IEEE doubles only keep 53 bits of
+    /// integer precision).
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        tsEpochMs = try c.decode(Int64.self, forKey: .tsEpochMs)
+        durationMs = try c.decode(Double.self, forKey: .durationMs)
+        heartbeatIntervalMs = try c.decode(Double.self, forKey: .heartbeatIntervalMs)
+        thresholdMs = try c.decode(Double.self, forKey: .thresholdMs)
+        context = try c.decode(String.self, forKey: .context)
+        let hexes = try c.decode([String].self, forKey: .frameAddresses)
+        frameAddresses = try hexes.map { hex in
+            let trimmed = hex.hasPrefix("0x") || hex.hasPrefix("0X")
+                ? String(hex.dropFirst(2))
+                : hex
+            guard let value = UInt(trimmed, radix: 16) else {
+                throw DecodingError.dataCorruptedError(
+                    forKey: .frameAddresses,
+                    in: c,
+                    debugDescription: "invalid frame address hex: \(hex)"
+                )
+            }
+            return value
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(tsEpochMs, forKey: .tsEpochMs)
+        try c.encode(durationMs, forKey: .durationMs)
+        try c.encode(heartbeatIntervalMs, forKey: .heartbeatIntervalMs)
+        try c.encode(thresholdMs, forKey: .thresholdMs)
+        try c.encode(context, forKey: .context)
+        try c.encode(
+            frameAddresses.map { "0x" + String($0, radix: 16) },
+            forKey: .frameAddresses
+        )
     }
 
     /// A copy with `durationMs` replaced. Used when the watchdog grows an
@@ -68,8 +112,15 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
             heartbeatIntervalMs: heartbeatIntervalMs,
             thresholdMs: thresholdMs,
             context: context,
-            backtrace: backtrace
+            frameAddresses: frameAddresses
         )
+    }
+
+    /// Lazily symbolicate the stored addresses for display or export.
+    /// Safe to call repeatedly — `MainThreadBacktrace.symbolicate`
+    /// memoizes per address.
+    func symbolicatedBacktrace() -> [String] {
+        MainThreadBacktrace.symbolicatedStrings(frameAddresses)
     }
 }
 
@@ -244,7 +295,8 @@ final class StallLog: @unchecked Sendable {
 
     /// Render `records` as a human-readable report suitable for pasting
     /// into a bug. Pure so the format is unit-testable. Records are
-    /// printed newest-first.
+    /// printed newest-first. Symbolicates each record's frame addresses
+    /// at dump time (export path).
     static func formattedDump(_ records: [StallRecord], generatedAt: Date = Date()) -> String {
         let iso = ISO8601DateFormatter()
         iso.formatOptions = [.withInternetDateTime]
@@ -259,10 +311,11 @@ final class StallLog: @unchecked Sendable {
             let when = iso.string(from: Date(timeIntervalSince1970: Double(rec.tsEpochMs) / 1000.0))
             out += "\n"
             out += String(format: "── %@  ≥%.0f ms  [%@]\n", when, rec.durationMs, rec.context)
-            if rec.backtrace.isEmpty {
+            let frames = rec.symbolicatedBacktrace()
+            if frames.isEmpty {
                 out += "   (no backtrace captured)\n"
             } else {
-                for frame in rec.backtrace {
+                for frame in frames {
                     out += "   \(frame)\n"
                 }
             }

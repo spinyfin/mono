@@ -18,6 +18,10 @@ import os
 /// the heartbeat sequence number), so a 3-second freeze produces a
 /// single entry rather than dozens.
 ///
+/// Capture keeps raw return addresses only. Symbolication (`dladdr`)
+/// is deferred to read/export time so a discarded idle-stack capture
+/// never pays for 64-frame resolution on the watchdog path.
+///
 /// This is diagnostic instrumentation, not a fix: it tells us whether
 /// the main thread is blocked and by what (see the Ghostty pane
 /// sluggishness shake), so a regression shows up as a recorded stall
@@ -30,6 +34,12 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         var thresholdMs: Double = 250
         var pollIntervalMs: Double = 50
         var maxFrames: Int = 64
+        /// Soft floor: minimum milliseconds between *new* stall records
+        /// that pass the idle-stack filter. Same-beat freezes are already
+        /// deduped via `recordedBeat`; this caps thrash across rapid beat
+        /// advances so the eventual read/export symbolication cannot be
+        /// flooded. Zero disables.
+        var minRecordIntervalMs: Double = 100
     }
 
     let log: StallLog
@@ -62,6 +72,9 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     /// `tick()` can grow its duration while the freeze persists. Touched
     /// only from `tick()`/`start()` on the watchdog queue.
     private var ongoingRecordId: UUID?
+    /// Monotonic timestamp of the last *new* record, for the soft
+    /// symbolication-frequency floor (`minRecordIntervalMs`).
+    private var lastRecordNanos: UInt64 = 0
     private let watchdogQueue = DispatchQueue(
         label: "boss.diagnostics.stall-watchdog",
         qos: .utility
@@ -72,12 +85,14 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         self.log = log
     }
 
-    /// The app's own executable image name (e.g. "Boss"), used to tell a
-    /// genuine app-code hang from a backtrace that's landed back in the
-    /// idle event loop. `nil` (e.g. under `swift test`, with no app
-    /// bundle) disables the app-frame check, so idle-leaf stacks are
-    /// still filtered on symbol alone.
-    private static let appImageName: String? = Bundle.main.executableURL?.lastPathComponent
+    /// App executable image `[start, end)`, resolved once at first use
+    /// so the idle-stack pre-filter is pure integer comparisons per
+    /// frame. `nil` when the image cannot be found (e.g. under tests
+    /// with no app bundle) — the filter then keeps every capture.
+    private static let appImageRange: MainThreadBacktrace.AppImageRange? = {
+        let name = Bundle.main.executableURL?.lastPathComponent
+        return MainThreadBacktrace.resolveAppImageRange(imageName: name)
+    }()
 
     /// Begin monitoring. Must be called on the main thread (it captures
     /// the main thread's Mach port via `mach_thread_self()`). Idempotent.
@@ -99,6 +114,7 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         // Safe to set here: the watchdog timer is resumed below, so no
         // `tick()` can be running yet.
         ongoingRecordId = nil
+        lastRecordNanos = 0
 
         let interval = DispatchTimeInterval.milliseconds(Int(config.heartbeatIntervalMs))
         let hb = DispatchSource.makeTimerSource(queue: .main)
@@ -138,7 +154,10 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     }
 
     /// Watchdog — runs off the main thread. Detects an overdue heartbeat
-    /// and records one stall per episode.
+    /// and records one stall per episode. Never symbolicating here is
+    /// load-bearing: under a busy main thread this path fires often, and
+    /// most captures are idle-stack false positives discarded by the
+    /// address-range filter below.
     private func tick() {
         let now = DispatchTime.now().uptimeNanoseconds
         let snap = state.withLock {
@@ -167,30 +186,42 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         state.withLock { $0.recordedBeat = snap.beat }
 
         let addresses = MainThreadBacktrace.capture(thread: mainThreadPort, maxFrames: config.maxFrames)
-        let symbolicated = MainThreadBacktrace.symbolicate(addresses)
 
         // The capture above can land after the main thread has already
         // unwound back to its idle wait (poll granularity, or the whole
         // process having been CPU-starved/backgrounded rather than the
         // main thread itself blocked). That backtrace has no app frame
         // on it at all — it isn't a real hang, so don't log it as one.
-        // `recordedBeat` above is still updated, so a persistently idle
-        // stack doesn't get re-captured every tick.
-        guard !MainThreadBacktrace.isIdleEventLoopStack(symbolicated, appImage: Self.appImageName) else {
+        // Integer range test only; no `dladdr`. `recordedBeat` above is
+        // still updated, so a persistently idle stack doesn't get
+        // re-captured every tick.
+        guard !MainThreadBacktrace.isIdleEventLoopStack(
+            addresses,
+            appImageRange: Self.appImageRange
+        ) else {
             ongoingRecordId = nil
             return
         }
 
-        let frames = MainThreadBacktrace.format(symbolicated)
+        // Soft floor on record (→ eventual symbolication) frequency.
+        if config.minRecordIntervalMs > 0, lastRecordNanos != 0 {
+            let elapsedMs = Double(now &- lastRecordNanos) / 1_000_000.0
+            if elapsedMs < config.minRecordIntervalMs {
+                ongoingRecordId = nil
+                return
+            }
+        }
+
         let record = StallRecord(
             tsEpochMs: Int64(Date().timeIntervalSince1970 * 1000),
             durationMs: durationMs,
             heartbeatIntervalMs: config.heartbeatIntervalMs,
             thresholdMs: config.thresholdMs,
             context: snap.ctx,
-            backtrace: frames
+            frameAddresses: addresses
         )
         ongoingRecordId = record.id
+        lastRecordNanos = now
         log.record(record)
     }
 

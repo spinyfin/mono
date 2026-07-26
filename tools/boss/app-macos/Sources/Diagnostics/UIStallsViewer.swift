@@ -10,11 +10,17 @@ import SwiftUI
 /// The log is a plain `@unchecked Sendable` class rather than an
 /// `ObservableObject`, so this view polls a snapshot on a timer (the
 /// same approach [[MetricsViewer]] uses for engine counters).
+///
+/// Backtraces are stored as raw addresses on each [[StallRecord]] and
+/// symbolicated lazily here (and on export) — never on the capture path.
 struct UIStallsViewer: View {
     @AppStorage("boss.uiStalls.visible") private var isOpen = false
     @State private var records: [StallRecord] = []
     @State private var window: SinceWindow = .fiveMinutes
     @State private var expanded: Set<UUID> = []
+    /// Memo of symbolicated frames per record id so expand/collapse and
+    /// the 1 Hz poll do not re-enter `dladdr` for the same stall.
+    @State private var symbolicatedCache: [UUID: [String]] = [:]
 
     private let pollTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -82,7 +88,8 @@ struct UIStallsViewer: View {
                     ForEach(records.reversed()) { rec in
                         StallRow(
                             record: rec,
-                            isExpanded: expanded.contains(rec.id)
+                            isExpanded: expanded.contains(rec.id),
+                            frames: expanded.contains(rec.id) ? frames(for: rec) : nil
                         ) { toggle(rec.id) }
                         Divider().padding(.leading, 14)
                     }
@@ -115,10 +122,22 @@ struct UIStallsViewer: View {
         } else {
             records = log.snapshot()
         }
+        // Drop cache entries for stalls that have aged out of the ring.
+        let live = Set(records.map(\.id))
+        symbolicatedCache = symbolicatedCache.filter { live.contains($0.key) }
     }
 
     private func toggle(_ id: UUID) {
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+    }
+
+    /// Lazily symbolicate on first expand; subsequent expands hit the
+    /// view-local cache (and `MainThreadBacktrace`'s per-address memo).
+    private func frames(for rec: StallRecord) -> [String] {
+        if let cached = symbolicatedCache[rec.id] { return cached }
+        let frames = rec.symbolicatedBacktrace()
+        symbolicatedCache[rec.id] = frames
+        return frames
     }
 
     private func copyReport() {
@@ -132,6 +151,9 @@ struct UIStallsViewer: View {
 private struct StallRow: View {
     let record: StallRecord
     let isExpanded: Bool
+    /// Symbolicated frames when expanded; `nil` while collapsed so the
+    /// parent defers `dladdr` until the row is opened.
+    let frames: [String]?
     let onToggle: () -> Void
 
     var body: some View {
@@ -158,13 +180,14 @@ private struct StallRow: View {
             .buttonStyle(.plain)
 
             if isExpanded {
-                if record.backtrace.isEmpty {
+                let shown = frames ?? []
+                if shown.isEmpty {
                     Text("No backtrace captured (the frame walk failed — see MainThreadBacktrace).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.leading, 24)
                 } else {
-                    Text(record.backtrace.joined(separator: "\n"))
+                    Text(shown.joined(separator: "\n"))
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
