@@ -184,6 +184,10 @@ See [`docs/surface-findings-github-ui.md`](docs/surface-findings-github-ui.md)
 for workflow YAML snippets, required permissions/secrets, and setup instructions
 for each backend.
 
+## Manual playground (checkleft-sandbox)
+
+A private scratch repo, [`brianduff/checkleft-sandbox`](https://github.com/brianduff/checkleft-sandbox), exercises checkleft as an external consumer (prebuilt binary via rules_multitool, real Rust + Bazel tree). It is not part of automated testing. Operator notes: [`docs/checkleft-sandbox.md`](docs/checkleft-sandbox.md).
+
 ## Notes
 
 - `checkleft` shells out to `git` or `jj` to discover repository state.
