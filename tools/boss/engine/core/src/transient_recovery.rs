@@ -516,6 +516,7 @@ pub async fn run_one_pass(
                         // Reap termination path: tear down any driver-owned
                         // state outside the workspace.
                         crate::driver_teardown::teardown_driver_workspace(
+                            work_db,
                             &execution_id,
                             orphaned.workspace_path.as_deref().map(std::path::Path::new),
                         )

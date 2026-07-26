@@ -6593,6 +6593,7 @@ impl ExecutionCoordinator {
                         // since a driver may key its out-of-workspace state
                         // by run id alone.
                         crate::driver_teardown::teardown_driver_workspace(
+                            &self.work_db,
                             &execution.id,
                             cleared.workspace_path.as_deref().map(std::path::Path::new),
                         )
@@ -6746,7 +6747,12 @@ impl ExecutionCoordinator {
                 // out-of-workspace state from the workspace path never
                 // races a concurrent re-lease of the same workspace once
                 // cube has it back.
-                crate::driver_teardown::teardown_driver_workspace(&execution.id, Some(&lease.workspace_path)).await;
+                crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
+                    &execution.id,
+                    Some(&lease.workspace_path),
+                )
+                .await;
                 let released = match adapter.release_workspace(&lease.lease_id).await {
                     Ok(()) => true,
                     Err(release_err) => {
@@ -7291,7 +7297,12 @@ impl ExecutionCoordinator {
         // out-of-workspace state from the workspace path never races a
         // concurrent re-lease of the same workspace once cube has it back.
         if release_workspace {
-            crate::driver_teardown::teardown_driver_workspace(&execution.id, Some(&lease.workspace_path)).await;
+            crate::driver_teardown::teardown_driver_workspace(
+                &self.work_db,
+                &execution.id,
+                Some(&lease.workspace_path),
+            )
+            .await;
         }
 
         let released = if release_workspace {

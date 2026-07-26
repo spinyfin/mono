@@ -778,6 +778,7 @@ async fn auto_reap_dead_lease(
     // `mark_execution_orphaned` preserves `workspace_path`, so the
     // pre-call `execution` snapshot is still current.
     crate::driver_teardown::teardown_driver_workspace(
+        ctx.work_db,
         &execution.id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
     )

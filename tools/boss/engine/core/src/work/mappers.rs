@@ -489,6 +489,9 @@ pub(crate) fn map_execution(row: &Row<'_>) -> rusqlite::Result<WorkExecution> {
         branch_naming,
         dispatch_wait_reason: row.get(23)?,
         dispatch_wait_since: row.get(24)?,
+        driver_runtime_state: row
+            .get::<_, Option<String>>(25)?
+            .and_then(|raw| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&raw).ok()),
     })
 }
 

@@ -1139,10 +1139,20 @@ mod tests {
         fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
             unimplemented!()
         }
-        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn provision_workspace(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::driver::DriverRuntimeState>> {
             unimplemented!()
         }
-        async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
+        async fn teardown_workspace(
+            &self,
+            _: Option<&Path>,
+            _: &str,
+            _: Option<&crate::driver::DriverRuntimeState>,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
         async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {

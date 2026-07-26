@@ -504,7 +504,12 @@ impl AgentDriver for ClaudeDriver {
     ///   in `jj status` / `git status`
     /// - Pre-seeds `~/.claude.json` so the folder-trust dialog does not block
     ///   the headless worker session
-    async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, _run_id: &str) -> anyhow::Result<()> {
+    async fn provision_workspace(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        _run_id: &str,
+    ) -> anyhow::Result<Option<super::DriverRuntimeState>> {
         let config_dir = workspace.join(CLAUDE_DESCRIPTOR.config_dir);
         std::fs::create_dir_all(&config_dir).with_context(|| format!("creating {}", config_dir.display()))?;
 
@@ -521,14 +526,25 @@ impl AgentDriver for ClaudeDriver {
         // swallowed by pre_trust_workspace.
         pre_trust_workspace(workspace);
 
-        Ok(())
+        // Claude creates no per-run state outside the cube workspace, so
+        // there is nothing for teardown (or a future retention sweep) to
+        // clean up. A Codex driver would return its Boss-owned CODEX_HOME
+        // (or archive root) here instead.
+        Ok(None)
     }
 
     /// No-op: Claude needs no teardown. It creates no per-run state outside
     /// the cube workspace — the `.claude/` config dir `provision_workspace`
     /// writes lives inside the workspace, which cube owns and tears down
-    /// itself.
-    async fn teardown_workspace(&self, _workspace: Option<&Path>, _run_id: &str) -> anyhow::Result<()> {
+    /// itself. `runtime_state` is expected to be `None` for Claude and is
+    /// ignored; we deliberately do not invent a cleanup target from the
+    /// engine environment or by scanning a shared provider home.
+    async fn teardown_workspace(
+        &self,
+        _workspace: Option<&Path>,
+        _run_id: &str,
+        _runtime_state: Option<&super::DriverRuntimeState>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1411,10 +1427,14 @@ mod tests {
         }
 
         let driver = ClaudeDriver;
-        driver
+        let runtime_state = driver
             .provision_workspace(workspace.path(), "hello prompt", "run-1")
             .await
             .unwrap();
+        assert!(
+            runtime_state.is_none(),
+            "Claude creates no out-of-workspace runtime state"
+        );
 
         // Prompt file at the descriptor-derived path.
         let prompt_path = workspace.path().join(".claude").join("initial-prompt.txt");
@@ -1450,7 +1470,7 @@ mod tests {
         std::fs::write(workspace.path().join("marker.txt"), "untouched").unwrap();
 
         ClaudeDriver
-            .teardown_workspace(Some(workspace.path()), "run-1")
+            .teardown_workspace(Some(workspace.path()), "run-1", None)
             .await
             .unwrap();
 
@@ -1471,7 +1491,7 @@ mod tests {
         // Callers pass `None` when the workspace path was never recorded or
         // was already cleared by a racing teardown; the no-op impl must not
         // require a path to succeed.
-        ClaudeDriver.teardown_workspace(None, "run-1").await.unwrap();
+        ClaudeDriver.teardown_workspace(None, "run-1", None).await.unwrap();
     }
 
     fn spawn_request(model: &str) -> SpawnRequest<'_> {
