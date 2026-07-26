@@ -592,6 +592,10 @@ struct WorkBoardCardView: View {
     @State private var showMergeConfirmation: Bool = false
 
     var body: some View {
+        // Fan-out regression counter (design entry 2): each body evaluation
+        // is the fan-out signal Phase 1 work is meant to narrow. Side-effect
+        // is intentional instrumentation (unfair-lock increment).
+        let _ = UIUpdateCounters.shared.recordCardBodyEvaluation()
         VStack(alignment: .leading, spacing: 8) {
             if task.kind == "revision", let seq = task.revisionSeq {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {

@@ -443,6 +443,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // JSONL mirror (App Nap incident, 2026-07-15) — see
         // [[DisplayPowerMonitor]].
         DisplayPowerMonitor.shared.start()
+
+        // 1 Hz flush of board fan-out counters (applyWorkTree, incremental
+        // task updates, main-actor engine deliveries, card body evals).
+        // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
+        // the population signposter. See [[UIUpdateCounters]].
+        UIUpdateCounters.shared.start()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

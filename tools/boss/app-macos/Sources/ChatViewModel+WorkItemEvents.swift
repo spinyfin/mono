@@ -19,6 +19,8 @@ extension ChatViewModel {
         taskRuntimes: [WorkTaskRuntime],
         dependencies: [WorkItemDependency]
     ) {
+        // Fan-out regression counter (design entry 2): full work-tree applies.
+        UIUpdateCounters.shared.recordApplyWorkTree()
         // Population-timing (T2101 R1): time this @MainActor apply burst
         // and its two hot sub-steps. `popCtx` carries the flow/seq tag
         // decoded off-main so every segment of one fetch reads together.
@@ -233,6 +235,8 @@ extension ChatViewModel {
     /// based on its current `projectID` and `kind`, removing any stale entry
     /// from other buckets first (handles the rare case where these change).
     private func applyIncrementalTaskUpdate(_ updatedTask: WorkTask, isChore: Bool) {
+        // Fan-out regression counter (design entry 2): single-task board update.
+        UIUpdateCounters.shared.recordIncrementalTaskUpdate()
         let productID = updatedTask.productID
         if isChore {
             var chores = choresByProductID[productID] ?? []
