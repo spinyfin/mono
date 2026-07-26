@@ -492,6 +492,15 @@ pub(crate) fn reconcile_work_item_execution(
     } else {
         desired_status
     };
+    // Human-driven items never get an agent execution — they occupy a
+    // lane for a human and close only via `boss task complete --summary`.
+    if work_item_is_human_driven(conn, work_item_id)? {
+        tracing::debug!(
+            work_item_id,
+            "reconcile: item is human-driven — never minting an agent execution",
+        );
+        return Ok(());
+    }
     // Deferred/future-scope items are auto-unblocked and left schedulable,
     // but never auto-dispatched: skip minting or promoting any execution
     // until a human explicitly approves the item (which clears `deferred`).
@@ -747,6 +756,15 @@ pub(crate) fn reconcile_revision_execution(
         ExecutionStatus::Ready
     };
 
+    // Human-driven revisions (unlikely, but the gate is kind-agnostic)
+    // never get an agent execution.
+    if work_item_is_human_driven(conn, &task.id)? {
+        tracing::debug!(
+            task_id = %task.id,
+            "reconcile_revision: item is human-driven — never minting an agent execution",
+        );
+        return Ok(());
+    }
     // Same future-scope suppression as `reconcile_work_item_execution`: a
     // deferred revision is left settled/unblocked but never auto-dispatched
     // until a human approves it (clearing `deferred`). Placed after the
@@ -911,6 +929,18 @@ pub(crate) fn request_execution_in_tx_with_live_check<F: FnOnce(&str) -> bool>(
                 );
             }
         }
+    }
+
+    // Human-driven rows never spawn an agent worker — explicit start is
+    // refused so `bossctl work start` / kanban drag cannot accidentally
+    // dispatch. Entering Doing is still allowed via UpdateWorkItem status
+    // flip without a follow-on RequestExecution.
+    if work_item_is_human_driven(conn, &work_item_id)? {
+        bail!(
+            "cannot start {work_item_id}: item is human-driven — no agent worker will run. \
+             Move it to Doing to mark the human work in-flight, then close it with \
+             `boss task complete {work_item_id} --summary \"…\"` when finished."
+        );
     }
 
     // Q8: explicit `RequestExecution` against a gated work item is

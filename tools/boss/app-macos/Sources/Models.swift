@@ -83,6 +83,15 @@ struct WorkTask: Identifiable, Hashable {
     /// `deferred_scope` attention marker. Rendered as a muted "Future"
     /// badge on the card. Defaults to `false` when absent from the wire.
     var deferred: Bool = false
+    /// When `true`, a person performs or judges this work — no agent
+    /// worker is spawned and nothing auto-completes the row. The card
+    /// may sit in Doing for days by design. Close only via
+    /// `boss task complete --summary`. Rendered as a "Human" badge so
+    /// it is never confused with a stalled agent run. Defaults to
+    /// `false` when absent from the wire.
+    var humanDriven: Bool = false
+    /// Prose outcome from the human close ritual. `nil` until closed.
+    var completionSummary: String? = nil
     /// Aggregate required-CI state at last merge-poller probe. One of:
     /// `"in_progress"`, `"success"`, `"fail"`, `"unknown"`. `nil` until the
     /// first probe completes. Only rendered when `status == "in_review"` and

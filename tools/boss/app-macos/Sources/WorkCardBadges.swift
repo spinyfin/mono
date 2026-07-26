@@ -787,6 +787,31 @@ struct FutureScopeBadge: View {
     }
 }
 
+/// Badge for a human-driven work item (`human_driven == true`).
+/// Deliberately distinct from agent-work chrome so a card sitting in
+/// Doing for days is never mistaken for a stalled agent run. Person
+/// glyph + "Human" label; blue tint so it reads as "waiting on you".
+struct HumanDrivenBadge: View {
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: "person.fill")
+                .font(.caption2)
+            Text("Human")
+                .font(.caption.weight(.semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(Color.blue)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 3)
+        .background(Color.blue.opacity(0.12))
+        .clipShape(Capsule())
+        .layoutPriority(-1)
+        .help("Human-driven work — a person performs or judges this, not an agent. The card may sit in Doing for days by design. No worker is spawned. Close with `boss task complete --summary \"…\"`.")
+        .accessibilityLabel("Human-driven work item")
+    }
+}
+
 struct WorkStatusBadge: View {
     let text: String
     var emphasized: Bool = false

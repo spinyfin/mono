@@ -40,6 +40,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "effortLevel",
         "reasoning",
         "deferred",
+        "humanDriven",
         "shortID",
         "prURL",
         "revisionParentPrUrl",
@@ -87,6 +88,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         "dispatchFailedReason",
         "dispatchFailedError",
         "dispatchFailedAt",
+        "completionSummary",
     ]
 
     /// Fails when a new stored property is added to `WorkTask` without
@@ -147,6 +149,7 @@ final class WorkCardSnapshotTests: XCTestCase {
         base.parentTaskId = nil
         base.externalRef = nil
         base.docLinkState = nil
+        base.completionSummary = nil
 
         var other = Self.makeTask(
             id: "task_shared",
@@ -177,6 +180,7 @@ final class WorkCardSnapshotTests: XCTestCase {
             webURL: "https://github.com/spinyfin/mono/issues/999"
         )
         other.docLinkState = .broken(reason: "missing path")
+        other.completionSummary = "done by hand, no agent run"
 
         let context = WorkCardSnapshotContext(column: .backlog)
         let a = WorkCardSnapshot.build(task: base, context: context)
@@ -241,6 +245,9 @@ final class WorkCardSnapshotTests: XCTestCase {
             }),
             ("dispatchFailedAt", { t in
                 var t = t; t.dispatchFailedAt = "2099-01-01T00:00:00Z"; return t
+            }),
+            ("completionSummary", { t in
+                var t = t; t.completionSummary = "shipped without agent run"; return t
             }),
         ]
 
@@ -351,6 +358,16 @@ final class WorkCardSnapshotTests: XCTestCase {
                 },
                 mutate: {
                     var t = $0; t.deferred = true; return t
+                }
+            ),
+            Case(
+                name: "humanDriven",
+                context: backlog,
+                base: {
+                    var t = Self.makeTask(id: "task_1"); t.humanDriven = false; return t
+                },
+                mutate: {
+                    var t = $0; t.humanDriven = true; return t
                 }
             ),
             Case(

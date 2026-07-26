@@ -26,6 +26,32 @@ pub(crate) fn migrate_tasks_deferred(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Add the `human_driven` column to `tasks` for older databases. A
+/// human-driven work item occupies a lane (can sit in Doing) but never
+/// spawns an agent worker and never auto-completes — only an explicit
+/// human close with a summary moves it out. Older rows default to 0 so
+/// historical agent-driven behaviour is preserved across the upgrade.
+pub(crate) fn migrate_tasks_human_driven(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "human_driven")? {
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN human_driven INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Add the `completion_summary` column to `tasks` for older databases.
+/// Written by the human close ritual (`boss task complete --summary`) for
+/// human-driven rows; `NULL` for every other row and for human-driven rows
+/// that have not yet been closed.
+pub(crate) fn migrate_tasks_completion_summary(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "completion_summary")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN completion_summary TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Add `last_status_actor` to `tasks` and `projects` so the engine
 /// can distinguish a status it set itself (`'engine'`) from one a
 /// human typed at the CLI / kanban (`'human'`). The dependencies

@@ -17,6 +17,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let effortLevel: String?
     let showsReasoningChip: Bool
     let showsDeferredBadge: Bool
+    let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let projectName: String?
     let showsAIReviewingBadge: Bool
@@ -53,6 +54,7 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.effortLevel = snapshot.effortLevel
         self.showsReasoningChip = snapshot.showsReasoningChip
         self.showsDeferredBadge = snapshot.showsDeferredBadge
+        self.showsHumanDrivenBadge = snapshot.showsHumanDrivenBadge
         self.showsProjectBadge = snapshot.showsProjectBadge
         self.projectName = snapshot.projectName
         self.showsAIReviewingBadge = snapshot.showsAIReviewingBadge
@@ -121,6 +123,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
             }
             if slice.showsDeferredBadge {
                 FutureScopeBadge()
+            }
+            if slice.showsHumanDrivenBadge {
+                HumanDrivenBadge()
             }
             if slice.showsProjectBadge, let projectName = slice.projectName {
                 WorkStatusBadge(text: projectName)

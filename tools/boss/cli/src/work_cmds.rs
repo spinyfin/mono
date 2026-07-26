@@ -677,8 +677,9 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .project_id(project.id)
                     .name(name)
                     .maybe_description(description)
-                    .autostart(!ctx.no_autostart)
+                    .autostart(!ctx.no_autostart && !args.human_driven)
                     .deferred(args.deferred)
+                    .human_driven(args.human_driven)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
@@ -736,6 +737,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
         TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
+        TaskCommand::Complete(args) => run_complete_human_driven(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         TaskCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
@@ -799,8 +801,9 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .product_id(product.id)
                     .name(name)
                     .maybe_description(description)
-                    .autostart(!ctx.no_autostart)
+                    .autostart(!ctx.no_autostart && !args.human_driven)
                     .deferred(args.deferred)
+                    .human_driven(args.human_driven)
                     .depends_on(depends_on)
                     .maybe_priority(args.priority.map(|priority| priority.as_str().to_owned()))
                     .created_via(CREATED_VIA_CLI)
@@ -1122,6 +1125,7 @@ pub(crate) async fn run_update_leaf(
         // re-parks it. `None` (flag omitted) leaves the classification
         // unchanged.
         deferred: args.deferred,
+        human_driven: args.human_driven,
         // Preserve the empty-string "clear" wire form: `--blocked-reason ""`
         // maps to NULL in the engine (clears the field).
         blocked_reason: args.blocked_reason,
@@ -1136,7 +1140,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {
@@ -1149,6 +1153,54 @@ pub(crate) async fn run_update_leaf(
     let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {
         print_task_details(&format!("Updated {label}"), &item, None, false);
+    })
+}
+
+/// Close a human-driven work item with a required outcome summary.
+///
+/// Engine enforces: row must be `human_driven`, summary must be non-empty,
+/// and the status flips to `done` with `completion_summary` stored.
+pub(crate) async fn run_complete_human_driven(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskCompleteArgs,
+) -> Result<(), CliError> {
+    let summary = args.summary.trim();
+    if summary.is_empty() {
+        return Err(CliError::usage(
+            "--summary is required and must be non-empty: the human judgement \
+             that closes a human-driven work item cannot be blank",
+        ));
+    }
+    let product_hint = match (args.product, args.project) {
+        (Some(prod), _) => Some(prod),
+        (None, Some(proj)) => product_id_from_typed_selector(client, &proj).await?,
+        (None, None) => None,
+    };
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, product_hint).await?;
+    // Refuse early with a clear message when the row is not human-driven,
+    // so operators don't discover the engine error after the fact.
+    let current = get_work_item(client, &resolved_id).await?;
+    let (current_task, _) = expect_leaf_work_item(current)?;
+    if !current_task.human_driven {
+        return Err(CliError::usage(format!(
+            "{resolved_id} is not human-driven; `boss task complete` is only for rows \
+             filed with `--human-driven` (or marked via `boss task update --human-driven true`). \
+             For ordinary agent work, use `boss task move --to done` after the PR merges."
+        )));
+    }
+    let patch = WorkItemPatch {
+        status: Some("done".to_owned()),
+        completion_summary: Some(summary.to_owned()),
+        // Ensure the flag stays set if a race cleared it; complete is
+        // meaningless without it and the engine also checks the row flag.
+        human_driven: Some(true),
+        ..WorkItemPatch::default()
+    };
+    let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
+    let item = with_display_status(item);
+    print_entity(ctx, &serde_json::json!({ label: item }), || {
+        print_task_details(&format!("Completed human-driven {label}"), &item, None, false);
     })
 }
 

@@ -561,6 +561,8 @@ fn make_bare_task(id: &str, kind: &str, parent: Option<&str>, pr: Option<&str>, 
         updated_at: ts.to_owned(),
         autostart: true,
         deferred: false,
+        human_driven: false,
+        completion_summary: None,
         last_status_actor: "human".to_owned(),
         priority: "medium".to_owned(),
         created_via: "cli".to_owned(),
@@ -615,6 +617,7 @@ mod t04;
 mod ci_remediation_tests;
 mod design_doc_audit_tests;
 mod effort_model_tests;
+mod human_driven_tests;
 mod resolve_repo_tests;
 mod schema_migration_tests;
 mod short_id_alloc_tests;

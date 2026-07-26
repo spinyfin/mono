@@ -299,6 +299,12 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // targeted read — so a `false` here is display-only, never a
         // dispatch decision.
         deferred: false,
+        // Human-driven classification. Same trailing-column pattern as
+        // deferred; `work_item_is_human_driven` does a targeted read for
+        // dispatch/completion gates.
+        human_driven: false,
+        // Human close-out summary; trailing column on wide SELECTs only.
+        completion_summary: None,
         // Free-form kanban tags. Trailing column on the wide SELECTs only
         // (`query_task`, `get_work_tree`, short-id lookup); empty here for
         // base-SELECT paths that do not need tags.
@@ -361,11 +367,12 @@ pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Re
 
 /// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
 /// `archived_reason` column (index 38), `dispatch_failed_*` (39-41),
-/// `blocked_detail` (42), `deferred` (43), and `tags` (44). Used by
-/// `query_task` and `get_work_item_by_short_id` so single-item lookups
-/// (`boss task show`, `get_work_item`) surface why the engine auto-archived
-/// a row, the verbatim blocked-status detail, the future-scope
-/// classification, and free-form kanban tags.
+/// `blocked_detail` (42), `deferred` (43), `tags` (44), `human_driven`
+/// (45), and `completion_summary` (46). Used by `query_task` and
+/// `get_work_item_by_short_id` so single-item lookups (`boss task show`,
+/// `get_work_item`) surface why the engine auto-archived a row, the
+/// verbatim blocked-status detail, future-scope / human-driven
+/// classification, free-form kanban tags, and any human close summary.
 pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent_and_provenance(row)?;
     task.archived_reason = row.get::<_, Option<String>>(38)?.filter(|s| !s.is_empty());
@@ -375,6 +382,8 @@ pub(crate) fn map_task_with_parent_provenance_and_archived_reason(row: &Row<'_>)
     task.blocked_detail = row.get::<_, Option<String>>(42)?.filter(|s| !s.is_empty());
     task.deferred = row.get::<_, i64>(43)? != 0;
     task.tags = decode_task_tags(row.get::<_, Option<String>>(44)?)?;
+    task.human_driven = row.get::<_, i64>(45)? != 0;
+    task.completion_summary = row.get::<_, Option<String>>(46)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
@@ -441,7 +450,8 @@ pub(crate) fn map_task_with_external_ref_parent_and_source_automation_id(row: &R
 /// (index 42), `completed_at` (index 43), the trailing
 /// `dispatch_failed_reason` / `dispatch_failed_error` / `dispatch_failed_at`
 /// columns (indices 44-46), `blocked_detail` (index 47), `deferred`
-/// (index 48), and `tags` (index 49). Used by `get_work_tree` for both
+/// (index 48), `tags` (index 49), `human_driven` (index 50), and
+/// `completion_summary` (index 51). Used by `get_work_tree` for both
 /// task and chore queries, which append these columns at the end.
 pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_external_ref_parent_and_source_automation_id(row)?;
@@ -454,6 +464,8 @@ pub(crate) fn map_task_with_external_ref_parent_source_and_provenance(row: &Row<
     task.blocked_detail = row.get::<_, Option<String>>(47)?.filter(|s| !s.is_empty());
     task.deferred = row.get::<_, i64>(48)? != 0;
     task.tags = decode_task_tags(row.get::<_, Option<String>>(49)?)?;
+    task.human_driven = row.get::<_, i64>(50)? != 0;
+    task.completion_summary = row.get::<_, Option<String>>(51)?.filter(|s| !s.is_empty());
     Ok(task)
 }
 
