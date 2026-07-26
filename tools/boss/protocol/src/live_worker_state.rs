@@ -200,6 +200,23 @@ pub struct LiveWorkerState {
     pub work_item_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    /// Attributed worker pool this run belongs to: `"main"`,
+    /// `"automation"`, or `"review"`. Independent of which physical
+    /// slot it occupies — automation work can spill into a main-pool
+    /// Lower Decks slot and still reports `"automation"` here, matching
+    /// [`crate::WorkerPoolEntry::name`] / the coordinator's
+    /// attributed-pool label. `None` for spawns outside the work-item
+    /// dispatch path (tests; any future direct-launch flow).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+    /// Execution kind of the run powering this slot (e.g.
+    /// `"task_implementation"`, `"automation_triage"`, `"pr_review"`),
+    /// matching [`crate::ExecutionKind::as_str`]. Surfaced so
+    /// `bossctl agents list` can show what kind of work a live pane is
+    /// doing without a separate execution-table join. `None` for
+    /// spawns outside the work-item dispatch path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     /// True while an operator has placed an explicit hold on this run via
     /// `bossctl agents hold` — exempting it from the idle-park and
     /// auto-reap sweeps until released or the run ends. Surfaced so
@@ -216,13 +233,35 @@ impl LiveWorkerState {
     /// worker with (later replaced by the `SessionStart`-reported
     /// value once a hook arrives). `binding` is the work-item
     /// linkage for the run — pass `None` from call sites that don't
-    /// have one (tests; future direct-launch).
+    /// have one (tests; future direct-launch). `pool` and `kind` are
+    /// the attributed worker pool (`"main"` / `"automation"` /
+    /// `"review"`) and the execution kind (`"task_implementation"`,
+    /// …); production dispatch always passes both, tests may leave
+    /// them `None`.
     pub fn new_spawning(
         slot_id: u8,
         run_id: impl Into<String>,
         model: impl Into<String>,
         shell_pid: i32,
         binding: Option<WorkItemBinding>,
+    ) -> Self {
+        Self::new_spawning_with_routing(slot_id, run_id, model, shell_pid, binding, None, None)
+    }
+
+    /// Like [`Self::new_spawning`], but also stamps the attributed
+    /// worker `pool` and execution `kind` that production dispatch
+    /// knows at spawn time. The engine reducer's
+    /// `register_spawn_with_capabilities` calls this so
+    /// `bossctl agents list` can render pool + kind without joining
+    /// the execution table.
+    pub fn new_spawning_with_routing(
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        pool: Option<String>,
+        kind: Option<String>,
     ) -> Self {
         let (work_item_id, work_item_name, execution_id) = match binding {
             Some(b) => (Some(b.work_item_id), Some(b.work_item_name), Some(b.execution_id)),
@@ -244,6 +283,8 @@ impl LiveWorkerState {
             work_item_id,
             work_item_name,
             execution_id,
+            pool,
+            kind,
             held: false,
         }
     }
@@ -305,10 +346,32 @@ mod tests {
         assert!(state.work_item_id.is_none());
         assert!(state.work_item_name.is_none());
         assert!(state.execution_id.is_none());
+        assert!(state.pool.is_none());
+        assert!(state.kind.is_none());
         assert!(state.live_status.is_none());
         assert!(state.live_status_at.is_none());
         assert!(state.recovery_status.is_none());
         assert!(!state.held);
+    }
+
+    #[test]
+    fn new_spawning_with_routing_stamps_pool_and_kind() {
+        let state = LiveWorkerState::new_spawning_with_routing(
+            2,
+            "exec-9",
+            "claude-opus-4-7",
+            0,
+            Some(WorkItemBinding {
+                work_item_id: "task_abc".into(),
+                work_item_name: "Fix fencer scraping".into(),
+                execution_id: "exec-9".into(),
+            }),
+            Some("automation".into()),
+            Some("chore_implementation".into()),
+        );
+        assert_eq!(state.pool.as_deref(), Some("automation"));
+        assert_eq!(state.kind.as_deref(), Some("chore_implementation"));
+        assert_eq!(state.work_item_id.as_deref(), Some("task_abc"));
     }
 
     #[test]
@@ -371,6 +434,8 @@ mod tests {
             work_item_id: Some("task_42".into()),
             work_item_name: Some("Fix fencer scraping".into()),
             execution_id: Some("run-7".into()),
+            pool: Some("main".into()),
+            kind: Some("task_implementation".into()),
             held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -385,6 +450,8 @@ mod tests {
         assert!(!json.contains("work_item_id"), "json: {json}");
         assert!(!json.contains("work_item_name"), "json: {json}");
         assert!(!json.contains("execution_id"), "json: {json}");
+        assert!(!json.contains("\"pool\""), "json: {json}");
+        assert!(!json.contains("\"kind\""), "json: {json}");
     }
 
     #[test]
@@ -420,6 +487,8 @@ mod tests {
             work_item_id: None,
             work_item_name: None,
             execution_id: None,
+            pool: None,
+            kind: None,
             held: false,
         };
         let json = serde_json::to_string(&original).unwrap();
@@ -446,5 +515,7 @@ mod tests {
         let parsed: LiveWorkerState = serde_json::from_str(json).unwrap();
         assert!(parsed.live_status.is_none());
         assert!(parsed.live_status_at.is_none());
+        assert!(parsed.pool.is_none());
+        assert!(parsed.kind.is_none());
     }
 }

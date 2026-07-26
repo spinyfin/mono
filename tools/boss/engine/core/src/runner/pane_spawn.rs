@@ -621,6 +621,15 @@ impl ExecutionRunner for PaneSpawnRunner {
             execution_id: execution.id.clone(),
         });
 
+        // Attributed pool (not physical slot occupancy): automation that
+        // spilled into Lower Decks still reports `"automation"`. Matches
+        // `ExecutionCoordinator::attributed_pool_label`.
+        let has_source_automation = matches!(
+            self.work_db.source_automation_id_for_work_item(&execution.work_item_id),
+            Ok(Some(_))
+        );
+        let pool = crate::live_worker_state::attributed_pool_label(execution.kind.clone(), has_source_automation);
+
         let started = start_worker(
             spawner.as_ref(),
             StartWorkerInput {
@@ -638,6 +647,7 @@ impl ExecutionRunner for PaneSpawnRunner {
                 model: spawn_config.model.clone(),
                 draft_pr_mode: spawner.draft_pr_mode(),
                 execution_kind: execution.kind.as_str().to_owned(),
+                pool: Some(pool.to_owned()),
                 task_kind: work_item_task_kind(work_item).map(str::to_owned),
                 // Per-kind worker posture (reviewer/triage/answer-agent are
                 // restricted; everything else is a Standard implementer),
@@ -1897,6 +1907,16 @@ mod pane_spawn_tests {
             state.execution_id.as_deref(),
             Some("exec-test-1"),
             "execution_id should match the WorkExecution row id"
+        );
+        assert_eq!(
+            state.pool.as_deref(),
+            Some("main"),
+            "ordinary chore work attributes to the main pool"
+        );
+        assert_eq!(
+            state.kind.as_deref(),
+            Some("chore_implementation"),
+            "execution kind should match the WorkExecution row"
         );
     }
 

@@ -528,6 +528,17 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
             .as_ref()
             .and_then(remote_worker_model_override)
             .unwrap_or_else(|| "claude".to_owned());
+        // Attributed pool + execution kind, same stamps the local spawn
+        // path writes via `StartWorkerInput` — remote workers never go
+        // through `start_worker`, so this registration is the only
+        // chance to surface them on `LiveWorkerState`.
+        let has_source_automation = matches!(
+            server_state
+                .work_db
+                .source_automation_id_for_work_item(&execution.work_item_id),
+            Ok(Some(_))
+        );
+        let pool = crate::live_worker_state::attributed_pool_label(execution.kind.clone(), has_source_automation);
         // shell_pid is a local-process concept; a remote worker has no
         // local pid, so 0 (the live state stores it but the value is
         // only meaningful for the local ancestor-walk correlation that
@@ -544,6 +555,7 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
             0,
             binding,
             ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
+            crate::live_worker_state::LiveSpawnRouting::new(pool, execution.kind.as_str()),
         );
         tracing::info!(
             run_id,
