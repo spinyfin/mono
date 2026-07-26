@@ -810,6 +810,99 @@ pub enum PostHocInterceptionAction {
 pub type PostHocInterceptionFn =
     fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
 
+/// Free-text feed the engine's primary-path PR-URL capture consumes from a
+/// completed tool observation.
+///
+/// The driver owns the *shape* of tool input/output (Claude's
+/// `tool_response.{stdout,stderr}` object vs Codex's bare
+/// `aggregated_output` string, Claude's `{ "command": "…" }` vs a bare
+/// command string). The engine owns the *algorithm*: it runs the shared
+/// `find_first_pr_url` regex over [`Self::output_text`] and the shared
+/// `gh pr` / `cube pr` command gates over [`Self::command`]. Drivers must
+/// not invent a second extraction algorithm — they only supply the text
+/// the existing one scans.
+///
+/// Built by [`AgentDriver::pr_url_capture_feed`] (and its default,
+/// [`default_pr_url_capture_feed`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrUrlCaptureFeed {
+    /// Free text the engine feeds to the shared PR-URL regex
+    /// (`boss_engine_structured_output::pr_url::find_first_pr_url`). For
+    /// Claude this is `stdout` then `stderr` (joined so the first URL in
+    /// stdout still wins); for a Codex-shaped normaliser this is the
+    /// `command_execution.aggregated_output` string.
+    pub output_text: String,
+    /// The shell command that produced the output, used for the
+    /// `is_gh_pr_command` / `is_revision_push_command` gates. Empty when
+    /// the observation carries no command surface (the gates then reject).
+    pub command: String,
+}
+
+/// Default [`AgentDriver::pr_url_capture_feed`] body: Claude's PostToolUse
+/// Bash shape **and** the Codex-style bare-string shape produced when a
+/// stdout-JSONL normaliser maps `item.command` / `item.aggregated_output`
+/// straight into `WorkerEvent::PostToolUse`'s `tool_input` /
+/// `tool_response` as strings.
+///
+/// Returns `None` when `tool_name` is not `"Bash"` (the Claude tool name
+/// every current normaliser — including the Codex-shaped one — maps
+/// command execution onto) or when `tool_response` has no scannable
+/// surface at all.
+///
+/// Keeping both shapes in the default means:
+/// - Claude's capture path is unchanged (object shape hits the object arm).
+/// - A hookless driver that normalises to bare strings gets PR-URL capture
+///   without a second regex and without waiting for a specialised override.
+/// - A future driver with a third shape overrides the trait method.
+pub fn default_pr_url_capture_feed(
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> Option<PrUrlCaptureFeed> {
+    if tool_name != "Bash" {
+        return None;
+    }
+
+    let command = tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .or_else(|| tool_input.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    let output_text = if let Some(text) = tool_response.as_str() {
+        // Codex `command_execution.aggregated_output` (and any other
+        // normaliser that puts free text directly on tool_response).
+        text.to_owned()
+    } else if tool_response.is_object() {
+        // Claude Bash tool_response: prefer stdout, fall back to stderr.
+        // Concatenating preserves "first URL in stdout wins over stderr"
+        // when the shared regex scans left-to-right — identical to
+        // `pr_url_capture::extract_pr_url_from_bash_response`.
+        let stdout = tool_response.get("stdout").and_then(|v| v.as_str()).unwrap_or("");
+        let stderr = tool_response.get("stderr").and_then(|v| v.as_str()).unwrap_or("");
+        if stdout.is_empty()
+            && stderr.is_empty()
+            && tool_response.get("stdout").is_none()
+            && tool_response.get("stderr").is_none()
+        {
+            // Object with neither field — not a Bash response shape we know.
+            return None;
+        }
+        if stdout.is_empty() {
+            stderr.to_owned()
+        } else if stderr.is_empty() {
+            stdout.to_owned()
+        } else {
+            format!("{stdout}\n{stderr}")
+        }
+    } else {
+        return None;
+    };
+
+    Some(PrUrlCaptureFeed { output_text, command })
+}
+
 /// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
 /// field is a concept that holds across backends: the resolved model/effort,
 /// an optional rendered settings/config path, the corp-laptop
@@ -1026,6 +1119,37 @@ pub trait AgentDriver: Send + Sync {
     /// need not be overridden.
     fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
         None
+    }
+
+    // ── ProgressObservation → PR-URL primary-path feed ──────────────────────
+
+    /// Supply free text (and the command that produced it) from a completed
+    /// tool observation so the engine's primary-path PR-URL capture can run
+    /// the **shared** regex against it.
+    ///
+    /// The engine never reads a Claude `tool_response` payload shape directly
+    /// for this path anymore: it asks the driver. Claude's default
+    /// ([`default_pr_url_capture_feed`]) preserves the historical
+    /// `stdout`/`stderr` scan; a stdout-JSONL driver whose normaliser places
+    /// `aggregated_output` as a bare string on `tool_response` is also
+    /// handled by that default. Override only when a driver has a third
+    /// shape.
+    ///
+    /// Returns `None` when this observation is not a scannable tool surface
+    /// (wrong tool name, unrecognised response shape). Returning `Some` with
+    /// empty `output_text` is fine — the engine finds no URL and does nothing.
+    ///
+    /// **Do not poll GitHub for the branch's PR here.** That is a different
+    /// mechanism (the cold-path reconstruction in `completion::detect_pr`)
+    /// with different failure modes; inventing it as a feed would mask a
+    /// broken stream extraction path.
+    fn pr_url_capture_feed(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        tool_response: &serde_json::Value,
+    ) -> Option<PrUrlCaptureFeed> {
+        default_pr_url_capture_feed(tool_name, tool_input, tool_response)
     }
 
     // ── PromptComposition capability ────────────────────────────────────────
@@ -1555,6 +1679,99 @@ mod tests {
                 })
                 .is_none(),
             "a driver without Capability::TurnBoundary must not claim a boundary",
+        );
+    }
+
+    // ── pr_url_capture_feed / default_pr_url_capture_feed ──────────────────
+
+    #[test]
+    fn default_feed_reads_claude_bash_stdout_stderr_shape() {
+        let input = serde_json::json!({
+            "command": "cube pr create --branch boss/exec_x --title t"
+        });
+        let response = serde_json::json!({
+            "stdout": "https://github.com/spinyfin/mono/pull/458",
+            "stderr": "",
+        });
+        let feed = default_pr_url_capture_feed("Bash", &input, &response).expect("feed");
+        assert_eq!(feed.output_text, "https://github.com/spinyfin/mono/pull/458");
+        assert_eq!(feed.command, "cube pr create --branch boss/exec_x --title t");
+        assert_eq!(
+            boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+        );
+    }
+
+    #[test]
+    fn default_feed_prefers_stdout_url_over_stderr_url() {
+        let input = serde_json::json!({ "command": "gh pr create --title t" });
+        let response = serde_json::json!({
+            "stdout": "https://github.com/spinyfin/mono/pull/458",
+            "stderr": "https://github.com/spinyfin/mono/pull/100",
+        });
+        let feed = default_pr_url_capture_feed("Bash", &input, &response).expect("feed");
+        assert_eq!(
+            boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+        );
+    }
+
+    #[test]
+    fn default_feed_falls_back_to_stderr_when_stdout_empty() {
+        let input = serde_json::json!({ "command": "gh pr create --title t" });
+        let response = serde_json::json!({
+            "stdout": "",
+            "stderr": "Created: https://github.com/spinyfin/mono/pull/458\n",
+        });
+        let feed = default_pr_url_capture_feed("Bash", &input, &response).expect("feed");
+        assert_eq!(
+            boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/458"),
+        );
+    }
+
+    #[test]
+    fn default_feed_reads_codex_aggregated_output_string_shape() {
+        // Mirrors what a stdout-JSONL normaliser emits after mapping
+        // `item.command` / `item.aggregated_output` onto PostToolUse as
+        // bare strings (see stdout-progress Codex-shaped test driver).
+        let input = serde_json::json!("/bin/zsh -lc 'cube pr create --branch boss/x --title t'");
+        let response = serde_json::json!("https://github.com/spinyfin/mono/pull/99\n");
+        let feed = default_pr_url_capture_feed("Bash", &input, &response).expect("feed");
+        assert_eq!(feed.command, "/bin/zsh -lc 'cube pr create --branch boss/x --title t'");
+        assert_eq!(
+            boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/99"),
+        );
+    }
+
+    #[test]
+    fn default_feed_rejects_non_bash_tools() {
+        let input = serde_json::json!({ "command": "gh pr create" });
+        let response = serde_json::json!({
+            "stdout": "https://github.com/spinyfin/mono/pull/1",
+        });
+        assert!(default_pr_url_capture_feed("Read", &input, &response).is_none());
+    }
+
+    #[test]
+    fn default_feed_rejects_unrecognised_response_shape() {
+        let input = serde_json::json!({ "command": "gh pr create" });
+        assert!(default_pr_url_capture_feed("Bash", &input, &serde_json::json!(null)).is_none());
+        assert!(default_pr_url_capture_feed("Bash", &input, &serde_json::json!(42)).is_none());
+        assert!(default_pr_url_capture_feed("Bash", &input, &serde_json::json!({ "other": true })).is_none());
+    }
+
+    #[test]
+    fn trait_default_pr_url_capture_feed_matches_free_function() {
+        // StubDriver uses the trait default; it must match the free function
+        // so an un-overridden driver still feeds PR-URL capture.
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([]));
+        let input = serde_json::json!("cube pr create --branch b");
+        let response = serde_json::json!("see https://github.com/o/r/pull/7\n");
+        assert_eq!(
+            driver.pr_url_capture_feed("Bash", &input, &response),
+            default_pr_url_capture_feed("Bash", &input, &response),
         );
     }
 }
