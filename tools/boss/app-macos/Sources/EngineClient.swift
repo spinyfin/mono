@@ -923,6 +923,11 @@ final class EngineClient: @unchecked Sendable {
 
     private func emit(_ event: EngineEvent) {
         Task { @MainActor in
+            // Fan-out regression counter (design entry 2): one engine event
+            // delivered onto the main actor. Recorded here (inside the hop)
+            // so the rate tracks deliveries, not enqueue attempts from the
+            // client queue.
+            UIUpdateCounters.shared.recordEngineEventMainActor()
             self.onEvent?(event)
         }
     }
