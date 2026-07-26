@@ -174,6 +174,14 @@ final class ChatViewModel: ObservableObject {
     @Published var showArchivedProjects: Bool = false {
         didSet { invalidateWorkCache() }
     }
+    /// When true, the Review column shows only `readyForReview` cards —
+    /// waiting on the operator and nothing else: no block, no in-progress
+    /// revision, CI green, no merge conflict. Sticky across app restarts
+    /// (persisted like the other board filters below), scoped to the
+    /// Review column only.
+    @Published var reviewReadyOnly: Bool = false {
+        didSet { invalidateWorkCache() }
+    }
     @Published var selectedWorkCardID: String?
     /// Task id that the reveal animation is currently highlighting.
     /// Set by `revealWorkCard`; cleared after 1.5 s. Views observe
@@ -998,6 +1006,7 @@ final class ChatViewModel: ObservableObject {
     private let includeChoresDefaultsKey = "boss.work.includeChores"
     private let showBlockedOnlyDefaultsKey = "boss.work.showBlockedOnly"
     private let showArchivedProjectsDefaultsKey = "boss.work.showArchivedProjects"
+    private let reviewReadyOnlyDefaultsKey = "boss.work.reviewReadyOnly"
     private let workBoardGroupingDefaultsKey = "boss.work.grouping"
     private let bossPanelCollapsedDefaultsKey = "boss.work.bossPanelCollapsed"
     private let bossPanelWidthDefaultsKey = "boss.work.bossPanelWidth"
@@ -1047,6 +1056,7 @@ final class ChatViewModel: ObservableObject {
         }
         showBlockedOnly = defaults.bool(forKey: showBlockedOnlyDefaultsKey)
         showArchivedProjects = defaults.bool(forKey: showArchivedProjectsDefaultsKey)
+        reviewReadyOnly = defaults.bool(forKey: reviewReadyOnlyDefaultsKey)
         if let groupingRaw = defaults.string(forKey: workBoardGroupingDefaultsKey),
            let grouping = WorkBoardGrouping(rawValue: groupingRaw) {
             workBoardGrouping = grouping
@@ -1211,6 +1221,12 @@ final class ChatViewModel: ObservableObject {
         defaults.set(value, forKey: showArchivedProjectsDefaultsKey)
     }
 
+    func setReviewReadyOnly(_ value: Bool) {
+        guard reviewReadyOnly != value else { return }
+        reviewReadyOnly = value
+        defaults.set(value, forKey: reviewReadyOnlyDefaultsKey)
+    }
+
     /// Persist (or clear, when `nil`) the selected product so the next
     /// launch restores the board the operator left open.
     func persistSelectedProductID(_ productID: String?) {
@@ -1300,6 +1316,7 @@ final class ChatViewModel: ObservableObject {
         showBlockedOnly = false
         filterToChoresOnly = false
         includeChores = true
+        reviewReadyOnly = false
     }
 
     func triggerRevealScroll(_ taskID: String) {

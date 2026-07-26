@@ -162,6 +162,13 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
+    /// `true` when this is a Review-lane card waiting on the operator and
+    /// nothing else: an open PR with no blocked pill, no `in revision`
+    /// badge, all required CI checks green, and no merge conflict with the
+    /// base branch. Engine-computed (not derived in the view layer) so the
+    /// CLI and any future surface agree with the board. Mirrors
+    /// `Task.ready_for_review` on the wire; `false` when absent.
+    var readyForReview: Bool = false
     /// Resolved doc-link state for a **project-less** docs-backed item —
     /// chiefly `kind == "investigation"`. Mirrors `Task.doc_link_state`
     /// on the wire: the engine resolves the task's own `doc_*` columns

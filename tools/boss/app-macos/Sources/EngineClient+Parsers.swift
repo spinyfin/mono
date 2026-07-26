@@ -244,6 +244,7 @@ extension EngineClient {
                 .flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 },
             sourceAutomationId: payload["source_automation_id"] as? String,
             aiReviewing: (payload["ai_reviewing"] as? Bool) ?? false,
+            readyForReview: (payload["ready_for_review"] as? Bool) ?? false,
             docLinkState: parseDocLinkState(payload["doc_link_state"]),
             originTaskShortId: (payload["origin_task_short_id"] as? NSNumber)?.intValue,
             originPrNumber: (payload["origin_pr_number"] as? NSNumber)?.intValue,

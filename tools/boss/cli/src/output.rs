@@ -253,6 +253,10 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // one — i.e. when the caller passed `--deleted`. Keeps the common
     // live-only listing unchanged. Mirrors the `show_effort` pattern.
     let show_deleted = tasks.iter().any(|t| t.deleted_at.is_some());
+    // Only render the READY column when at least one row carries a PR —
+    // the field is only meaningful for Review-lane tasks. Mirrors the
+    // `show_effort` pattern.
+    let show_ready = tasks.iter().any(|t| t.pr_url.is_some());
     let mut header: Vec<&str> = Vec::new();
     if show_short_id {
         header.push("#");
@@ -265,6 +269,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         header.push("EFFORT");
     }
     header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
+    if show_ready {
+        header.push("READY");
+    }
     if show_deleted {
         header.push("DELETED");
     }
@@ -289,6 +296,13 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         row.push(task.project_id.clone().unwrap_or_default());
         row.push(ordinal);
         row.push(task.pr_url.clone().unwrap_or_default());
+        if show_ready {
+            row.push(if task.ready_for_review {
+                "yes".to_owned()
+            } else {
+                String::new()
+            });
+        }
         if show_deleted {
             row.push(task.deleted_at.clone().unwrap_or_default());
         }
@@ -919,6 +933,7 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     }
     if let Some(pr_url) = &task.pr_url {
         println!("PR URL: {}", pr_url);
+        println!("Ready for review: {}", if task.ready_for_review { "yes" } else { "no" });
     }
     if !task.description.is_empty() {
         println!("Description: {}", task.description);

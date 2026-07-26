@@ -794,6 +794,29 @@ pub struct Task {
     #[builder(default)]
     pub ai_reviewing: bool,
 
+    /// `true` when this is a Review-lane card waiting on *the operator* and
+    /// nothing else — it could be reviewed and merged right now. All of:
+    /// `status == "in_review"` with a `pr_url` set, `blocked_reason` is
+    /// `None` (no blocked pill / merge-conflict lock), `has_in_progress_revision`
+    /// is `false` (no `in revision` badge), `ci_required_state ==
+    /// Some("success")` (a still-running or unknown CI state is NOT ready —
+    /// there is nothing to merge yet), and `pr_mergeable_state ==
+    /// Some("mergeable")` (not conflicting with the base branch).
+    ///
+    /// This is a derived projection set by the engine's `get_work_tree`
+    /// path (not a stored DB column), computed straight from the same
+    /// polled PR facts (`ci_required_state`, `pr_mergeable_state`) that
+    /// back the CI/mergeability indicators — deliberately NOT derived from
+    /// `blocked_reason`/`status` alone, which only reflect the last
+    /// reconciliation pass over those facts and can lag a fresher poll.
+    /// Because those facts are themselves refreshed by the periodic merge
+    /// poller (`merge_poller::sweep`), this field can be stale by up to one
+    /// poll interval — the same staleness window every other PR-state
+    /// affordance on the card already has.
+    #[serde(default, skip_serializing_if = "is_false")]
+    #[builder(default)]
+    pub ready_for_review: bool,
+
     /// Resolved doc-link state for a **project-less** docs-backed work
     /// item — chiefly `kind = 'investigation'`. Parity with the design
     /// card's doc-link icon, which is resolved from the parent
