@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 use boss_protocol::{LiveWorkerState, SessionStartSource, WorkItemBinding, WorkerActivity, WorkerEvent};
 
+use crate::driver::ProgressFidelity;
+
 /// The model identifier the engine uses when no `SessionStart` hook
 /// has yet reported one — this is the model the launcher *asked* for,
 /// surfaced so the UI can render the real model name immediately
@@ -54,6 +56,27 @@ struct Inner {
     /// directory-trust prompt fires before `SessionStart`, so the normal
     /// `Notification`→`WaitingForInput` path is never triggered for it).
     spawned_at: HashMap<u8, i64>,
+    /// Per-slot [`ProgressFidelity`] tier declared by the driver running
+    /// this slot, set by [`LiveWorkerStateRegistry::set_progress_fidelity`]
+    /// after spawn. Consulted by `crate::stale_worker_sweep` to decide
+    /// whether — and at what threshold — cadence-based staleness applies to
+    /// this slot. Absent (no entry) defaults to [`ProgressFidelity::Rich`]
+    /// — today's only driver (Claude) and every existing call site that
+    /// never sets this explicitly, so the default preserves current
+    /// behaviour unchanged. Deliberately kept out of [`LiveWorkerState`]
+    /// itself: that struct is the wire format the app/bossctl consume, and
+    /// this value has no UI consumer, only the sweep's.
+    ///
+    /// In-memory only, and not persisted or rehydrated anywhere: if the
+    /// engine restarts while a worker is alive, this map starts empty and
+    /// the slot re-defaults to `Rich` until the driver re-declares (which
+    /// today only happens at spawn, not on rehydrate). For a `Coarse`- or
+    /// `Minimal`-tier driver this silently re-enables cadence-based
+    /// staleness judgement for a slot the exemption was meant to protect —
+    /// a live worker mid-turn with no per-tool event can then be swept as
+    /// stale. No-op today (Claude is `Rich`), but a real gap for the first
+    /// non-`Rich` driver.
+    progress_fidelity: HashMap<u8, ProgressFidelity>,
 }
 
 impl LiveWorkerStateRegistry {
@@ -85,6 +108,33 @@ impl LiveWorkerStateRegistry {
         guard
             .spawned_at
             .insert(slot_id, boss_engine_utils::epoch_time::now_epoch_secs());
+        // A fresh occupant starts with no declared fidelity (defaults to
+        // Rich via `progress_fidelity_for_slot`) until the spawn flow calls
+        // `set_progress_fidelity` — never inherit the prior occupant's tier
+        // across a slot recycle.
+        guard.progress_fidelity.remove(&slot_id);
+    }
+
+    /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
+    /// spawn flow calls this right after `register_spawn` with the
+    /// resolved driver's `progress_fidelity()`. Slots this is never called
+    /// for (e.g. most tests) default to [`ProgressFidelity::Rich`] via
+    /// [`Self::progress_fidelity_for_slot`].
+    pub fn set_progress_fidelity(&self, slot_id: u8, fidelity: ProgressFidelity) {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.progress_fidelity.insert(slot_id, fidelity);
+    }
+
+    /// The declared [`ProgressFidelity`] tier for `slot_id`, or
+    /// [`ProgressFidelity::Rich`] if never declared. Read by
+    /// `crate::stale_worker_sweep`.
+    pub fn progress_fidelity_for_slot(&self, slot_id: u8) -> ProgressFidelity {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard
+            .progress_fidelity
+            .get(&slot_id)
+            .copied()
+            .unwrap_or(ProgressFidelity::Rich)
     }
 
     /// Drop the entry for `slot_id`. Called when the engine releases
@@ -94,6 +144,7 @@ impl LiveWorkerStateRegistry {
         guard.by_slot.remove(&slot_id);
         guard.notification_pending.remove(&slot_id);
         guard.spawned_at.remove(&slot_id);
+        guard.progress_fidelity.remove(&slot_id);
     }
 
     /// Snapshot of every entry. Used by the frontend RPC handler and
@@ -1002,5 +1053,44 @@ mod tests {
         let second = reg.mark_stalled_spawns(now + 10, STALLED_SPAWN_THRESHOLD_SECS);
         assert!(second.is_empty(), "should not fire again after first transition");
         assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::WaitingForInput);
+    }
+
+    #[test]
+    fn progress_fidelity_defaults_to_rich_when_never_set() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Rich);
+        // Even for a slot that was never registered at all.
+        assert_eq!(reg.progress_fidelity_for_slot(9), ProgressFidelity::Rich);
+    }
+
+    #[test]
+    fn set_progress_fidelity_round_trips() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_progress_fidelity(1, ProgressFidelity::Coarse);
+        assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Coarse);
+    }
+
+    #[test]
+    fn register_spawn_resets_fidelity_on_slot_recycle() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_progress_fidelity(1, ProgressFidelity::Minimal);
+        assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Minimal);
+
+        // Slot 1 is recycled for a new run — must not inherit the prior
+        // occupant's declared tier.
+        reg.register_spawn(1, "run-2", "claude-opus-4-7", 2, None);
+        assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Rich);
+    }
+
+    #[test]
+    fn release_slot_clears_progress_fidelity() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_progress_fidelity(1, ProgressFidelity::Coarse);
+        reg.release_slot(1);
+        assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Rich);
     }
 }
