@@ -97,6 +97,10 @@ struct WorkBoardSectionItemsView: View {
 /// keeps action dispatch (`selectWorkCard`, terminal, merge, delete)
 /// without the "any of 77 `@Published` properties invalidates every
 /// visible card" fan-out (design entry 6).
+///
+/// Secondary UI (selection popover, delete confirmation) is attached
+/// only while its presentation flag is true so idle cards do not carry
+/// `WorkCardPopoverView` / dialog graph nodes (design entry 10).
 struct WorkBoardCardItem: View {
     let task: WorkTask
     /// Board column for action routing / debug logs only (value, not observed).
@@ -210,16 +214,11 @@ struct WorkBoardCardItem: View {
                     showingDeleteConfirmation = true
                 }
             }
-            .popover(
-                isPresented: Binding(
-                    get: { snapshot.isSelected },
-                    set: { isPresented in
-                        if !isPresented, snapshot.isSelected {
-                            model.selectWorkCard(nil)
-                        }
-                    }
-                ),
-                arrowEdge: .trailing
+            // Selection popover: attach only while selected so the ~700-line
+            // `WorkCardPopoverView` tree is not in every idle card's graph.
+            .lazyWorkCardSelectionPopover(
+                isSelected: snapshot.isSelected,
+                onDismiss: { model.selectWorkCard(nil) }
             ) {
                 WorkCardPopoverView(model: model, task: task)
             }
@@ -242,7 +241,8 @@ struct WorkBoardCardItem: View {
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
-        .confirmationDialog(
+        // Delete confirmation: same lazy rule — dialog nodes only while open.
+        .lazyConfirmationDialog(
             "Delete \"\(task.name)\"?",
             isPresented: $showingDeleteConfirmation,
             titleVisibility: .visible
@@ -476,6 +476,64 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             return Color(nsColor: .separatorColor).opacity(0.5)
         case .airy, .minimal:
             return .clear
+        }
+    }
+}
+
+// MARK: - Lazy secondary UI (design entry 10)
+
+/// Presentation modifiers that only enter AttributeGraph while their
+/// flag is true. Idle cards therefore do not carry popover content
+/// (`WorkCardPopoverView`) or confirmation-dialog nodes.
+extension View {
+    /// Attaches a trailing selection popover only while `isSelected` is
+    /// true. When selection flips on, the modifier mounts with
+    /// `isPresented == true` and presents; dismiss clears selection via
+    /// `onDismiss`, which drops the modifier on the next body pass.
+    @ViewBuilder
+    func lazyWorkCardSelectionPopover<Content: View>(
+        isSelected: Bool,
+        onDismiss: @escaping () -> Void,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        if isSelected {
+            self.popover(
+                isPresented: Binding(
+                    get: { true },
+                    set: { presented in
+                        if !presented {
+                            onDismiss()
+                        }
+                    }
+                ),
+                arrowEdge: .trailing,
+                content: content
+            )
+        } else {
+            self
+        }
+    }
+
+    /// Attaches a confirmation dialog only while `isPresented` is true
+    /// so idle cards do not retain dialog actions/message view nodes.
+    @ViewBuilder
+    func lazyConfirmationDialog<A: View, M: View>(
+        _ title: String,
+        isPresented: Binding<Bool>,
+        titleVisibility: Visibility = .automatic,
+        @ViewBuilder actions: () -> A,
+        @ViewBuilder message: () -> M
+    ) -> some View {
+        if isPresented.wrappedValue {
+            self.confirmationDialog(
+                title,
+                isPresented: isPresented,
+                titleVisibility: titleVisibility,
+                actions: actions,
+                message: message
+            )
+        } else {
+            self
         }
     }
 }

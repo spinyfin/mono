@@ -3,6 +3,15 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+/// Detail popover for a selected work card.
+///
+/// **Lazy secondary UI (design entry 10):** this view must not sit in the
+/// AttributeGraph of an idle card. `WorkBoardCardItem` attaches it only
+/// while `snapshot.isSelected` is true via
+/// `lazyWorkCardSelectionPopover`, so the ~700 lines of view code below
+/// are evaluated for the one presented card — not for every visible card
+/// on an idle board. Nested sheets (repo picker) follow the same rule
+/// and mount only while their own presentation flag is true.
 struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
@@ -22,6 +31,33 @@ struct WorkCardPopoverView: View {
     @State private var showAllAbandonedAttempts: Bool = false
 
     var body: some View {
+        // Content is only in-graph while the parent card is selected
+        // (see type docs). Keep the body as one presented surface.
+        popoverContent
+            .padding(20)
+            .frame(width: 360, alignment: .leading)
+            .onAppear {
+                model.loadExecutions(taskId: task.id)
+            }
+            // Repo-picker sheet: same lazy rule as the card popover —
+            // mount only while the picker is actually open.
+            .lazyWorkCardRepoPickerSheet(
+                isPresented: $presentingRepoPicker,
+                presentation: model.repoOverridePresentation(for: task),
+                recentURLs: model.recentRepoURLs(forProduct: task.productID),
+                onSelect: { url in
+                    model.setRepoOverride(for: task.id, to: url)
+                    presentingRepoPicker = false
+                },
+                onClear: {
+                    model.setRepoOverride(for: task.id, to: nil)
+                    presentingRepoPicker = false
+                }
+            )
+    }
+
+    @ViewBuilder
+    private var popoverContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -135,26 +171,6 @@ struct WorkCardPopoverView: View {
                     model.deleteSelectedWorkItem()
                 }
             }
-        }
-        .padding(20)
-        .frame(width: 360, alignment: .leading)
-        .onAppear {
-            model.loadExecutions(taskId: task.id)
-        }
-        .sheet(isPresented: $presentingRepoPicker) {
-            RepoOverridePicker(
-                presentation: model.repoOverridePresentation(for: task),
-                recentURLs: model.recentRepoURLs(forProduct: task.productID),
-                onCancel: { presentingRepoPicker = false },
-                onSelect: { url in
-                    model.setRepoOverride(for: task.id, to: url)
-                    presentingRepoPicker = false
-                },
-                onClear: {
-                    model.setRepoOverride(for: task.id, to: nil)
-                    presentingRepoPicker = false
-                }
-            )
         }
     }
 
@@ -415,6 +431,33 @@ struct WorkCardPopoverView: View {
                 Text("Not set")
                     .font(.body)
             }
+        }
+    }
+}
+
+/// Nested sheet attachment for the repo override picker: only enters
+/// the graph while `isPresented` is true (design entry 10).
+private extension View {
+    @ViewBuilder
+    func lazyWorkCardRepoPickerSheet(
+        isPresented: Binding<Bool>,
+        presentation: RepoOverridePresentation,
+        recentURLs: [String],
+        onSelect: @escaping (String) -> Void,
+        onClear: @escaping () -> Void
+    ) -> some View {
+        if isPresented.wrappedValue {
+            self.sheet(isPresented: isPresented) {
+                RepoOverridePicker(
+                    presentation: presentation,
+                    recentURLs: recentURLs,
+                    onCancel: { isPresented.wrappedValue = false },
+                    onSelect: onSelect,
+                    onClear: onClear
+                )
+            }
+        } else {
+            self
         }
     }
 }

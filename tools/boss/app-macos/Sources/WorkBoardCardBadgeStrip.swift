@@ -223,7 +223,8 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 }
                 .buttonStyle(.plain)
                 .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                .confirmationDialog(
+                // Dialog nodes only while confirming (design entry 10).
+                .lazyConfirmationDialog(
                     "Merge When Ready",
                     isPresented: $showMergeConfirmation,
                     titleVisibility: .visible
