@@ -490,6 +490,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-codex-hook-trust"
+version = "0.1.0"
+dependencies = [
+ "bon",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
+
+[[package]]
 name = "boss-engine-comment-classifier"
 version = "0.1.0"
 dependencies = [
