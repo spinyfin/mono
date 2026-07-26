@@ -1,0 +1,251 @@
+# Boss worker rules
+
+You are running inside a Boss-managed worker session. The engine
+spawned you in a leased cube workspace and observes this session
+via claude hooks.
+For ordinary pre-push validation, run `checkleft run` with no flags; use
+`checkleft --all` only in CI, when modifying checkleft itself, or with a
+strong stated justification.
+
+## Pull requests are the deliverable
+
+**A task is not complete until a PR exists.** Local commits are NOT enough.
+
+- Open a PR with `cube pr create` once commits exist and tests pass.
+- **If a PR already exists** (resuming or addressing review),
+push new commits to it with `cube pr update`; do NOT open a
+duplicate. `cube pr create` is safe to retry: if a prior call
+already created the PR (e.g. your tool killed an earlier
+invocation on a timeout but the push had actually landed), it
+returns that PR's URL instead of erroring. Use `cube pr update`
+only when you have new commits to push onto an already-open PR;
+it errors if none does. Check first with `boss pr status` — one
+local round trip against the engine, not GitHub. Do NOT rely on
+`boss context`'s `task.pr_url` field for this: it is NULL for a
+revision task by design (a revision never owns its own PR — the
+chain root does), so an empty `task.pr_url` does NOT mean "no
+PR exists" when you're a revision worker. `boss pr status`
+resolves your actually-bound PR correctly either way.
+- Do not hard-wrap PR bodies.
+- **NEVER pass the PR body as `--body "<inline text>"`** — the shell
+evaluates backticks and `$(...)` inside double-quoted strings, which
+corrupts any body that contains inline code. Always write the body to
+a file and use `--body-file` (see the recipe below).
+- Print the PR URL on its own line as the last thing in your final response.
+- Before pushing, run `jj diff -r @`. If the diff is empty,
+do NOT commit, push, or open a PR — stop and explain.
+
+## Checking your own PR's state
+
+Boss already stores most of what you'd otherwise ask GitHub for.
+These read your own PR only — never another run's — and cost one
+local round trip against the engine, not a GitHub API call:
+
+- `boss pr status` — includes your resolved `pr_url`, the
+cheapest way to answer "do I already have a PR?" before
+deciding between `cube pr create` and `cube pr update`. Prefer
+this over `boss context`'s `task.pr_url` field: that field is
+NULL for a revision task by design (the chain root owns the PR,
+not the revision), so it reads as "no PR" even when one exists.
+`boss pr status` also returns `mergeable`, `merge_state_status`,
+`head_sha`, and `observed_at` for your own PR, e.g.:
+```sh
+boss pr status --json
+```
+This is Boss's **last stored observation from the merge poller,
+not live GitHub truth** — `observed_at` (Unix epoch seconds) is
+the timestamp of that observation, not of your call. Right after
+a push, the stored snapshot usually still reflects the *pre-push*
+state. If you need current state (e.g. right after `cube pr
+update` to see whether the push cleared a conflict), pass
+`--refresh` for one bounded, rate-limited live check:
+```sh
+boss pr status --refresh --json
+```
+A refresh can be silently throttled (`refresh_throttled: true`
+in the response) if the engine-wide budget is exhausted — in
+that case you still get the last stored snapshot, never an error
+or a hang. Never loop calling `--refresh` waiting for a state
+change: the engine's own merge poller is what watches your PR to
+green after you push, not you — the same "do not babysit CI"
+principle your task prompt states applies here too.
+- `boss pr body` — the PR title and body/description Boss
+snapshotted when this run started, for a read-modify-write of
+the description without a `gh pr view` round trip. If the
+response's `body` is null (`--json`) or says "(none stored)"
+(text), it means this run began a brand-new PR flow — there is
+nothing to diff against yet, you are about to write the first
+description via `cube pr
+create --body-file`. It does NOT mean the PR has an empty
+description; an intentionally empty one is stored as `""`, not
+null. Only fall back to `gh pr view --json body` if you must
+confirm the null case is not a fetch failure rather than a
+new-PR flow.
+
+## Your workspace
+
+- Workspace path: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
+- Cube lease id: `lease-conformance-golden`
+
+Lease held for the lifetime of this run. Do not lease, release,
+or mutate cube state.
+
+## VCS
+
+Use `jj` for all VCS. Do not invoke `git` directly except via `gh`.
+
+- `jj git fetch` to sync; `jj new main@origin` for a fresh task;
+`jj edit <bookmark>` to resume.
+- `jj describe -m '...'` to set commit messages;
+`jj bookmark create <name> -r @` to name a commit.
+- **NEVER push branches or open PRs with bare VCS commands** (`jj git push`,
+`git push`, `gh pr create`). A PreToolUse hook blocks these. Use:
+- `cube pr create --branch <name>` — new PR (pushes branch + opens PR, jj-aware, no GIT_DIR needed)
+- `cube pr update --branch <name>` — existing PR (pushes new commits to it)
+- Never `jj git push --deleted` or `git push --delete`
+without explicit user approval.
+- `.claude/` is gitignored by the engine. Do not force-track
+or commit anything inside it (no `--force`,
+no `jj file track .claude/...`).
+
+### Commit messages must be inline
+
+Always pass `-m "…"` to `git commit`, `git rebase`, `jj commit`,
+`jj describe`, and amend/squash flows (`git commit --amend`,
+`jj squash`, `jj split`). The worker environment has no usable
+`$EDITOR` — commands that fall through to one fail. Fix by
+re-running with `-m`.
+
+## Creating a PR from a jj workspace
+
+Cube workspaces are secondary jj workspaces. There is no `.git/`
+at the workspace root, so bare `gh` calls fail with
+`fatal: not a git repository`. Use `cube pr create` instead —
+it resolves the remote `owner/repo` from `jj git remote` and
+passes `-R <owner/repo>` to `gh`, so no `GIT_DIR` guess is needed.
+
+### Canonical PR creation recipe
+
+Write the PR body to a temp file — never embed it inline on the command
+line. This protects backticks, `$(...)`, and `${VAR}` from shell evaluation.
+
+```sh
+jj describe -m "your commit message"
+jj bookmark create my-feature -r @
+body=$(mktemp)
+cat > "$body" << 'PRBODY'
+## Summary
+Your description here. Inline code like `crate-name` and `$(cmd)` is safe.
+PRBODY
+cube pr create --branch my-feature --title "Your PR title" --body-file "$body"
+```
+
+`cube pr create` is safe to retry: if an open PR already exists for
+the branch, it returns that PR's URL instead of erroring, without
+pushing again. Use `cube pr update` only when you have new commits
+to push onto an already-open PR (see below). `cube pr create` handles
+the push and `--allow-new` automatically; never call `jj git push` directly.
+
+To update an existing PR (push new commits to it):
+
+```sh
+cube pr update --branch my-feature   # pushes to the PR; errors if none exists
+```
+
+### `origin` is the real GitHub upstream (shared object store)
+
+Every cube workspace is a **secondary jj workspace** that SHARES one
+object store with its siblings — there is no per-workspace clone. That
+store has a single `origin` remote pointing at the real GitHub upstream.
+
+- **Only use `cube pr create` / `cube pr update` for pushes and PR operations**:
+they push to GitHub by URL and resolve `-R <owner/repo>` for `gh`
+automatically, so PR creation Just Works without `.git/` at the root.
+Direct `jj git push`, `git push`, or `gh pr create` calls are blocked
+by a PreToolUse hook in every worker session.
+- Because the store is shared, a `jj git fetch` in ANY workspace
+advances the remote-tracking bookmarks (e.g. `main@origin`) seen by
+ALL of them. Don't be alarmed if refs move without you fetching.
+- A solid belt-and-suspenders check that a push actually landed is to
+compare your local commit against GitHub's head sha (do not infer
+success from the push command's own output alone):
+
+```sh
+# local commit you intended to ship
+jj log -r my-feature --no-graph -T commit_id
+# what GitHub actually has (must match)
+gh api repos/<owner>/<repo>/branches/my-feature --jq .commit.sha
+# for a specific PR head:
+gh api repos/<owner>/<repo>/pulls/<n> --jq .head.sha
+```
+
+## Merge-conflict telemetry
+
+If you ever run `cube workspace rebase` mid-task (e.g. to sync with
+`main` before pushing, or because a push was rejected) and it reports
+`REBASED_WITH_CONFLICTS`, resolve the conflicts as normal, then
+AFTER resolving run:
+
+```sh
+boss engine conflicts record-producer --execution-id <your execution id> \
+--head-branch <branch> --base-branch <main_branch> --files <comma-separated conflicted paths>
+```
+
+using the `branch`, `main_branch`, and conflicted-file list `cube
+workspace rebase` printed (or `jj resolve --list` if you need it
+again). This is telemetry only — best-effort, never blocks or
+reverts your actual work — but it is the only way the engine learns
+about conflicts you resolve on your own, before they'd ever reach
+the reviewed in-PR conflict-resolution flow.
+
+## Reuse before you build
+
+Before implementing any cross-cutting capability (an API/HTTP client,
+config loading, caching, logging wiring, retry/backoff, or similar
+infrastructure), search the repo for an existing implementation
+first. If one exists, reuse or extend it instead of writing a new
+one. If duplication is genuinely necessary, say so explicitly in the
+PR description with the reason — a justified, operator-visible
+exception is the only way to avoid a "revision required"
+reuse/duplication finding from the automated reviewer.
+
+## Boundaries
+
+- Do not modify files outside this workspace. Sibling workspaces
+under `~/Documents/dev/workspaces/` belong to other workers.
+- Do not modify cube's database, lease state, or workspace registry.
+- `~/Library/Application Support/Boss/` is coordinator/engine-only.
+Never read, write, or touch it. Ask the coordinator for
+work-taxonomy context; do not query the DB yourself.
+`bossctl` is coordinator-only.
+
+## Running Boss itself
+
+Never launch the Boss macOS app, and never start an engine that can
+reach production state. This machine is someone's laptop: the app
+puts a window on their screen while they are working, and it
+terminates the engine they are using and starts its own in its
+place. That applies however the launch is spelled — `open`, the
+bundle executable, a copy you unpacked yourself, `bazel run` of an
+app-macos target.
+
+To exercise a real engine, start an isolated one:
+
+```sh
+env -u BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- \
+--socket-path /tmp/boss-test-$(uuidgen).sock
+```
+
+Any `--socket-path` other than `/tmp/boss-engine.sock` puts the
+engine in test-fixture mode, where the db, events socket, pid file
+and control token are all derived from that socket's path. Unset
+`BOSS_EVENTS_SOCKET` because your pane inherits one pointing at
+production. Point a client at the same `--socket-path` to drive it.
+
+`bazel build` and `bazel test` are unaffected. Verifying the GUI is
+not something you can do — say so in the PR and leave it to a human.
+
+## Coordinator
+
+The coordinator may probe this session between turns. Treat probes
+as questions from a human reviewer — short, specific answers.

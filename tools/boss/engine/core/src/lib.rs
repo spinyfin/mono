@@ -23,6 +23,8 @@ pub use boss_comment_anchor as comments_anchor;
 pub use boss_engine_comment_classifier as comment_classifier;
 pub mod completion;
 pub mod config;
+#[cfg(test)]
+mod conformance;
 pub use boss_conflict_diagnosis as conflict_diagnosis;
 pub mod conflict_ladder;
 pub mod conflict_remediation;
