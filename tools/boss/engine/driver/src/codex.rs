@@ -164,12 +164,15 @@ pub fn codex_homes_root() -> PathBuf {
     }
 }
 
-/// Absolute path of the Boss-owned per-run `CODEX_HOME` for `run_id`.
+/// Sanitize `run_id` to a single path segment under the homes root.
 ///
-/// Deterministic so [`CodexDriver::spawn_invocation`] and
-/// [`CodexDriver::provision_workspace`] agree without threading the path
-/// through [`SpawnRequest`]. Never points at the interactive Codex home.
-pub fn codex_home_for_run(run_id: &str) -> PathBuf {
+/// Refuses empty ids (and ids that sanitize to empty): an empty segment would
+/// make [`codex_home_for_run`] resolve to the homes root itself, which teardown
+/// must never delete.
+pub fn sanitize_run_id_for_home(run_id: &str) -> anyhow::Result<String> {
+    if run_id.is_empty() {
+        bail!("empty run_id refused for Boss-owned CODEX_HOME");
+    }
     // Sanitize path segments: execution ids are already slug-like, but refuse
     // `..` / separators so a malformed id cannot escape the homes root.
     let safe: String = run_id
@@ -182,7 +185,119 @@ pub fn codex_home_for_run(run_id: &str) -> PathBuf {
             }
         })
         .collect();
-    codex_homes_root().join(safe)
+    if safe.is_empty() {
+        bail!("run_id {run_id:?} sanitized to empty; refused for Boss-owned CODEX_HOME");
+    }
+    Ok(safe)
+}
+
+/// Absolute path of the Boss-owned per-run `CODEX_HOME` for `run_id`.
+///
+/// Deterministic so [`CodexDriver::spawn_invocation`] and
+/// [`CodexDriver::provision_workspace`] agree without threading the path
+/// through [`SpawnRequest`]. Never points at the interactive Codex home.
+///
+/// # Errors
+///
+/// Returns an error for empty / unsafe `run_id` values that would resolve to
+/// the homes root (see [`sanitize_run_id_for_home`]).
+pub fn codex_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
+    let safe = sanitize_run_id_for_home(run_id)?;
+    let home = codex_homes_root().join(safe);
+    // Logical containment: a join of a single segment under an absolute root
+    // always starts with that root; keep the check so a future root change
+    // cannot silently open an escape.
+    let root = codex_homes_root();
+    if !home.starts_with(&root) || home == root {
+        bail!(
+            "resolved CODEX_HOME {} is not a strict child of homes root {}",
+            home.display(),
+            root.display()
+        );
+    }
+    Ok(home)
+}
+
+/// Sandbox mode for Codex `exec --sandbox` from Boss's abstract worker kind.
+///
+/// Reviewer is OS-enforced read-only; every other kind uses workspace-write
+/// (structural Boss data-dir fence). Single source of truth for
+/// [`CodexDriver::write_permission_config`]'s `extra_args` — the spawn plan's
+/// default is overridden when pane_spawn applies those args.
+pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind) -> &'static str {
+    match worker_kind {
+        WorkerKind::Reviewer => "read-only",
+        // Standard / Triage / AnswerAgent: workspace-write is the
+        // structural Boss-data-dir fence (design execution shape).
+        WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "workspace-write",
+    }
+}
+
+/// CLI `extra_args` that encode sandbox policy for the spawn flow.
+pub fn codex_sandbox_extra_args(worker_kind: WorkerKind) -> Vec<String> {
+    vec![
+        "--sandbox".into(),
+        codex_sandbox_for_worker_kind(worker_kind).into(),
+    ]
+}
+
+/// Refuse to delete a path unless it is a strict, canonicalized child of the
+/// Boss-owned homes root. Prevents an empty/malicious `codex_home` in
+/// persisted runtime state from wiping the shared root or an unrelated tree.
+pub fn assert_codex_home_safe_to_delete(codex_home: &Path) -> anyhow::Result<()> {
+    if codex_home.as_os_str().is_empty() {
+        bail!("refusing teardown with empty codex_home path");
+    }
+    let root = codex_homes_root();
+    if root.as_os_str().is_empty() {
+        bail!("refusing teardown: Boss codex homes root is empty");
+    }
+
+    // Canonicalize the root when it exists so macOS `/var` → `/private/var`
+    // does not false-negative `starts_with`. If the root has never been
+    // created, fall back to the logical path.
+    let root_canon = match fs::canonicalize(&root) {
+        Ok(p) => p,
+        Err(_) => root.clone(),
+    };
+
+    if !codex_home.exists() {
+        // Nothing to delete; still require logical containment so a bad
+        // payload is reported rather than silently no-op'd forever.
+        if codex_home == root || codex_home == root_canon {
+            bail!(
+                "refusing teardown: codex_home {} equals homes root {}",
+                codex_home.display(),
+                root_canon.display()
+            );
+        }
+        if !(codex_home.starts_with(&root) || codex_home.starts_with(&root_canon)) {
+            bail!(
+                "refusing teardown: codex_home {} is outside homes root {}",
+                codex_home.display(),
+                root_canon.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let home_canon = fs::canonicalize(codex_home)
+        .with_context(|| format!("canonicalize CODEX_HOME {}", codex_home.display()))?;
+    if home_canon == root_canon {
+        bail!(
+            "refusing to delete CODEX_HOME {} — equals Boss homes root {}",
+            home_canon.display(),
+            root_canon.display()
+        );
+    }
+    if !home_canon.starts_with(&root_canon) {
+        bail!(
+            "refusing to delete CODEX_HOME {} — outside Boss homes root {}",
+            home_canon.display(),
+            root_canon.display()
+        );
+    }
+    Ok(())
 }
 
 /// Opaque payload persisted on the execution as [`DriverRuntimeState`].
@@ -300,13 +415,20 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
         CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
     );
 
+    // Default sandbox is workspace-write. Permission policy may replace it
+    // via [`PermissionArtifacts::extra_args`] (`--sandbox read-only` for
+    // Reviewer) applied by the spawn flow — do not hardcode a second source
+    // of truth here without also applying extra_args.
     let mut cmd = String::from("codex exec --json --strict-config --sandbox workspace-write");
     cmd.push_str(" -m ");
-    cmd.push_str(model);
+    // Model / effort tokens come from operator config and work-item metadata;
+    // shell-quote so a future slug with spaces/metacharacters cannot break
+    // the pane command line.
+    cmd.push_str(&shell_quote(model));
     if let Some(e) = effort {
         // Per-model effort: `-c model_reasoning_effort=<level>`.
         cmd.push_str(" -c model_reasoning_effort=");
-        cmd.push_str(e);
+        cmd.push_str(&shell_quote(e));
     }
     cmd.push(' ');
     cmd.push_str(&prompt_cat);
@@ -624,8 +746,17 @@ impl AgentDriver for CodexDriver {
     }
 
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
-        let run_id = request.run_id.unwrap_or("unknown-run");
-        let codex_home = codex_home_for_run(run_id);
+        // Empty/missing run_id: fall back to a non-empty leaf so CODEX_HOME
+        // never resolves to the shared homes root. Production always passes
+        // the execution id; fixtures may omit it.
+        let run_id = request
+            .run_id
+            .filter(|id| !id.is_empty())
+            .unwrap_or("unknown-run");
+        let codex_home = codex_home_for_run(run_id).unwrap_or_else(|_| {
+            // sanitize_run_id_for_home only fails on empty; unknown-run is safe.
+            codex_homes_root().join("unknown-run")
+        });
         let body = build_codex_exec_command(&request);
         let command = wrap_codex_command_for_pane(&body);
         SpawnPlan {
@@ -654,7 +785,8 @@ impl AgentDriver for CodexDriver {
         prompt_text: &str,
         run_id: &str,
     ) -> anyhow::Result<Option<DriverRuntimeState>> {
-        let codex_home = codex_home_for_run(run_id);
+        let codex_home = codex_home_for_run(run_id)
+            .with_context(|| format!("resolving Boss-owned CODEX_HOME for run_id {run_id:?}"))?;
         fs::create_dir_all(&codex_home)
             .with_context(|| format!("creating Boss-owned CODEX_HOME {}", codex_home.display()))?;
 
@@ -707,6 +839,11 @@ impl AgentDriver for CodexDriver {
         let runtime = CodexRuntimeState::from_driver_runtime_state(state)?;
         let codex_home = &runtime.codex_home;
 
+        // Homes-root containment before any adopt / delete. An empty run_id
+        // (or a tampered runtime-state payload) must never make remove_dir_all
+        // target the shared root or an out-of-tree path.
+        assert_codex_home_safe_to_delete(codex_home)?;
+
         // Rebuild the AuthSnapshot handle the auth crate expects for adopt.
         let snapshot = AuthSnapshot {
             auth_path: codex_home.join(boss_codex_auth::AUTH_JSON_NAME),
@@ -734,6 +871,8 @@ impl AgentDriver for CodexDriver {
             }
         }
 
+        // Re-check after adopt: path identity must still be a contained child.
+        assert_codex_home_safe_to_delete(codex_home)?;
         if codex_home.exists() {
             fs::remove_dir_all(codex_home)
                 .with_context(|| format!("removing Boss-owned CODEX_HOME {}", codex_home.display()))?;
@@ -753,7 +892,12 @@ impl AgentDriver for CodexDriver {
         input: &PermissionInput,
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
-        let codex_home = codex_home_for_run(&input.run_id);
+        let codex_home = codex_home_for_run(&input.run_id).with_context(|| {
+            format!(
+                "CodexDriver::write_permission_config: resolving CODEX_HOME for run_id {:?}",
+                input.run_id
+            )
+        })?;
         if !codex_home.exists() {
             bail!(
                 "CodexDriver::write_permission_config: CODEX_HOME {} does not exist; \
@@ -790,16 +934,12 @@ impl AgentDriver for CodexDriver {
         let codex_bin = resolve_codex_bin();
         write_hooks_and_attest(&codex_home, &input.workspace_path, &interception, &codex_bin)?;
 
-        let sandbox = match input.worker_kind {
-            WorkerKind::Reviewer => "read-only",
-            // Standard / Triage / AnswerAgent: workspace-write is the
-            // structural Boss-data-dir fence (design execution shape).
-            _ => "workspace-write",
-        };
-
+        // Sandbox mode is the permission-policy artifact the spawn flow must
+        // apply (see pane_spawn apply_permission_extra_args). `--strict-config`
+        // stays on the spawn plan's base command (required flag contract).
         Ok(PermissionArtifacts {
             config_files: vec![codex_home.join("config.toml")],
-            extra_args: vec!["--sandbox".into(), sandbox.into(), "--strict-config".into()],
+            extra_args: codex_sandbox_extra_args(input.worker_kind),
             env: vec![("CODEX_HOME".into(), codex_home.display().to_string())],
         })
     }
@@ -1069,13 +1209,13 @@ mod tests {
             plan.command
         );
         assert!(
-            plan.command.contains("-m gpt-5.6-terra"),
-            "must pass model: {}",
+            plan.command.contains(&format!("-m {}", shell_quote("gpt-5.6-terra"))),
+            "must pass shell-quoted model: {}",
             plan.command
         );
         assert!(
-            plan.command.contains("model_reasoning_effort=high"),
-            "must pass effort: {}",
+            plan.command.contains(&format!("model_reasoning_effort={}", shell_quote("high"))),
+            "must pass shell-quoted effort: {}",
             plan.command
         );
         assert!(
@@ -1326,6 +1466,112 @@ else:
         assert!(guards.len() >= 2);
         for g in &guards {
             assert!(g.command_path.is_file(), "{:?}", g.command_path);
+        }
+    }
+
+    #[test]
+    fn empty_run_id_refused_for_codex_home() {
+        let err = codex_home_for_run("").expect_err("empty run_id must fail");
+        assert!(
+            err.to_string().contains("empty"),
+            "expected empty-run_id error, got {err:#}"
+        );
+        assert!(sanitize_run_id_for_home("").is_err());
+    }
+
+    #[test]
+    fn reviewer_sandbox_extra_args_are_read_only() {
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer), "read-only");
+        assert_eq!(
+            codex_sandbox_extra_args(WorkerKind::Reviewer),
+            vec!["--sandbox".to_owned(), "read-only".to_owned()]
+        );
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::Standard),
+            "workspace-write"
+        );
+        // Final command after permission merge must prefer reviewer read-only
+        // over the spawn-plan default workspace-write.
+        let plan = CodexDriver.spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
+        assert!(
+            plan.command.contains("--sandbox workspace-write"),
+            "spawn default is workspace-write: {}",
+            plan.command
+        );
+        let merged = crate::apply_permission_extra_args(
+            &plan.command,
+            &codex_sandbox_extra_args(WorkerKind::Reviewer),
+        );
+        assert!(
+            merged.contains("--sandbox") && merged.contains("read-only"),
+            "Reviewer must get --sandbox read-only after extra_args apply: {merged}"
+        );
+        assert!(
+            !merged.contains("workspace-write"),
+            "default sandbox must be replaced, not duplicated: {merged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn teardown_refuses_codex_home_outside_homes_root() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        fs::create_dir_all(&homes).unwrap();
+        let outside = tmp.path().join("not-a-boss-home");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("marker"), "keep").unwrap();
+
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            unsafe {
+                std::env::set_var(CODEX_HOMES_ROOT_ENV, &homes);
+            }
+        }
+
+        let state = CodexRuntimeState {
+            codex_home: outside.clone(),
+            auth_source_path: tmp.path().join("auth.json"),
+            auth_fingerprint: "fp".into(),
+            auth_policy: "SnapshotWithRefreshAdoption".into(),
+        }
+        .to_driver_runtime_state();
+
+        let err = CodexDriver
+            .teardown_workspace(None, "run-bad", Some(&state))
+            .await
+            .expect_err("teardown must refuse out-of-root home");
+        assert!(
+            err.to_string().contains("outside") || err.to_string().contains("refusing"),
+            "expected containment error, got {err:#}"
+        );
+        assert!(
+            outside.join("marker").is_file(),
+            "must not delete a path outside homes root"
+        );
+
+        // Homes root itself must never be deleted.
+        let root_state = CodexRuntimeState {
+            codex_home: homes.clone(),
+            auth_source_path: tmp.path().join("auth.json"),
+            auth_fingerprint: "fp".into(),
+            auth_policy: "SnapshotWithRefreshAdoption".into(),
+        }
+        .to_driver_runtime_state();
+        let err = CodexDriver
+            .teardown_workspace(None, "run-root", Some(&root_state))
+            .await
+            .expect_err("teardown must refuse homes root");
+        assert!(
+            err.to_string().contains("equals") || err.to_string().contains("refusing"),
+            "expected root-equals error, got {err:#}"
+        );
+        assert!(homes.is_dir(), "homes root must remain");
+
+        {
+            let _guard = ENV_LOCK.lock().unwrap();
+            unsafe {
+                std::env::remove_var(CODEX_HOMES_ROOT_ENV);
+            }
         }
     }
 }

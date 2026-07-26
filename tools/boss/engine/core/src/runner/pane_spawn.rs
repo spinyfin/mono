@@ -68,6 +68,52 @@ mod render_env_directive_tests {
     }
 }
 
+#[cfg(test)]
+mod apply_permission_extra_args_tests {
+    use crate::driver::{
+        CodexDriver, WorkerKind, apply_permission_extra_args, codex::codex_sandbox_extra_args,
+    };
+    use crate::driver::{AgentDriver, SpawnRequest};
+
+    #[test]
+    fn empty_extra_args_leave_command_unchanged() {
+        let cmd = "exec claude --model opus\n";
+        assert_eq!(apply_permission_extra_args(cmd, &[]), cmd);
+    }
+
+    #[test]
+    fn reviewer_sandbox_replaces_workspace_write_default() {
+        let plan = CodexDriver.spawn_invocation(SpawnRequest {
+            model: "gpt-5.6-terra",
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some("exec-review-1"),
+        });
+        assert!(
+            plan.command.contains("workspace-write"),
+            "Codex spawn default includes workspace-write: {}",
+            plan.command
+        );
+        let merged = apply_permission_extra_args(
+            &plan.command,
+            &codex_sandbox_extra_args(WorkerKind::Reviewer),
+        );
+        assert!(
+            merged.contains("read-only"),
+            "Reviewer must get --sandbox read-only: {merged}"
+        );
+        assert!(
+            !merged.contains("workspace-write"),
+            "default sandbox must be replaced: {merged}"
+        );
+        // Required contract flags survive the rewrite.
+        assert!(merged.contains("--json"), "{merged}");
+        assert!(merged.contains("--strict-config"), "{merged}");
+    }
+}
+
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
 /// per-lease worker config files, asks the macOS app to host a
 /// worker pane, and registers the returned shell pid against the
@@ -387,20 +433,22 @@ impl ExecutionRunner for PaneSpawnRunner {
                     execution.id,
                 )
             })?;
-        if let Err(err) = self
-            .work_db
+        // Persist must succeed when the driver returned state (Codex
+        // CODEX_HOME): a silent failure would make every teardown path
+        // no-op, leak Boss-owned homes, and skip auth adopt. Fail the
+        // spawn so the caller can retry rather than leave an untracked home.
+        // Claude returns None and a failed write of None is still a DB
+        // health signal — surface it rather than continue half-spawned.
+        self.work_db
             .set_driver_runtime_state(&execution.id, runtime_state.as_ref())
-        {
-            // Persistence failure is non-fatal for Claude (no state) but
-            // would strand a future Codex home. Log loudly so an operator
-            // can see it; spawn continues so a flaky DB write does not
-            // strand a successfully provisioned workspace.
-            tracing::error!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "failed to persist driver_runtime_state after provision (non-fatal)",
-            );
-        }
+            .with_context(|| {
+                format!(
+                    "persisting driver_runtime_state after provision for execution {} \
+                     (driver={})",
+                    execution.id,
+                    driver.descriptor().name,
+                )
+            })?;
 
         // Structured-output artifacts (PR URL / review findings / triage
         // decision / followups): create the engine-owned scratch dir and clear
@@ -520,15 +568,24 @@ impl ExecutionRunner for PaneSpawnRunner {
         });
         // Merge permission-policy env (e.g. Codex CODEX_HOME) without
         // duplicating keys the spawn plan already set.
-        for (key, value) in permission_artifacts.env {
+        for (key, value) in &permission_artifacts.env {
             if !spawn_plan
                 .env
                 .iter()
-                .any(|d| matches!(d, crate::driver::EnvDirective::Set(k, _) if k == &key))
+                .any(|d| matches!(d, crate::driver::EnvDirective::Set(k, _) if k == key))
             {
-                spawn_plan.env.push(crate::driver::EnvDirective::Set(key, value));
+                spawn_plan
+                    .env
+                    .push(crate::driver::EnvDirective::Set(key.clone(), value.clone()));
             }
         }
+        // Apply permission-policy CLI args (e.g. Codex `--sandbox read-only`
+        // for Reviewer). Must run after spawn_invocation so policy replaces
+        // any driver default flags rather than being ignored.
+        spawn_plan.command = crate::driver::apply_permission_extra_args(
+            &spawn_plan.command,
+            &permission_artifacts.extra_args,
+        );
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
             "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",
