@@ -92,6 +92,8 @@ enum PopulationSignpost {
         static let decode: StaticString = "population-decode"
         static let apply: StaticString = "population-apply"
         static let render: StaticString = "population-render"
+        /// 1 Hz flush of [[UIUpdateCounters]] rates.
+        static let uiUpdateRates: StaticString = "ui-update-rates"
     }
 }
 
