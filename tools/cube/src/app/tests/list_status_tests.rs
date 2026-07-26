@@ -428,3 +428,239 @@ fn workspace_list_returns_filtered_rows() {
         run_with_dependencies(list_bad, Some(&database_path), &FakeRunner::default()).expect_err("invalid state");
     assert!(matches!(error, CubeError::InvalidArgument(_)));
 }
+
+// ── Retention observability ─────────────────────────────────────────────────
+// Retention going unbounded is what collapsed the effective free pool from 173
+// to 3 and took dispatch down with it. That condition has to be visible from
+// `cube workspace list` before it becomes an outage, not reconstructable from
+// the audit log afterwards.
+
+/// Seed a pool with a mix of retained and available workspaces and return the
+/// store, so the summary can be exercised without driving a lease.
+fn seed_retention_pool(database_path: &std::path::Path, workspace_root: &std::path::Path, now: i64) {
+    use crate::metadata::{WorkspaceCandidate, WorkspaceHealth};
+    use crate::store::Store;
+
+    let ids = ["mono-agent-001", "mono-agent-002", "mono-agent-003", "mono-agent-004"];
+    let candidates: Vec<WorkspaceCandidate> = ids
+        .iter()
+        .map(|id| {
+            let path = workspace_root.join(id);
+            std::fs::create_dir_all(path.join(".jj")).expect("workspace dir");
+            WorkspaceCandidate {
+                workspace_id: (*id).to_string(),
+                workspace_path: path,
+            }
+        })
+        .collect();
+
+    let mut store = Store::open_at(database_path).unwrap();
+    store.sync_workspaces("mono", &candidates).unwrap();
+
+    // 001: retained 3 days holding unpushed work — well past a 24h TTL.
+    store
+        .update_workspace_health("mono", "mono-agent-001", WorkspaceHealth::Dirty)
+        .unwrap();
+    store
+        .set_workspace_unhealthy_since("mono", "mono-agent-001", now - 3 * 86_400)
+        .unwrap();
+    // 002: quarantined 2 hours ago — inside the window.
+    store
+        .update_workspace_health("mono", "mono-agent-002", WorkspaceHealth::Quarantined)
+        .unwrap();
+    store
+        .set_workspace_unhealthy_since("mono", "mono-agent-002", now - 2 * 3_600)
+        .unwrap();
+    // 003, 004: free and usable.
+}
+
+#[test]
+fn workspace_list_reports_retention_and_annotates_withheld_rows() {
+    use crate::store::Store;
+
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let now = current_epoch_s().unwrap();
+    seed_retention_pool(&database_path, &workspace_root, now);
+
+    // The dirty-reclaim reason is what explains the row to an operator.
+    {
+        let conn = rusqlite::Connection::open(&database_path).unwrap();
+        conn.execute(
+            "UPDATE workspaces SET last_release_reason = 'unpushed_work_preserved' \
+             WHERE workspace_id = 'mono-agent-001'",
+            [],
+        )
+        .unwrap();
+    }
+    drop(Store::open_at(&database_path).unwrap());
+
+    let runner = FakeRunner::default();
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "list"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("list");
+    runner.assert_exhausted();
+
+    let retention = &result.payload["retention"];
+    assert_eq!(retention["retained"], 2);
+    assert_eq!(retention["unpushed_work_preserved"], 1);
+    assert_eq!(retention["quarantined"], 1);
+    assert_eq!(retention["effective_free"], 2);
+    assert_eq!(
+        retention["past_ttl"], 1,
+        "only the 3-day-old row is past the 24h default TTL"
+    );
+    assert_eq!(retention["oldest_retained_secs"].as_i64().unwrap(), 3 * 86_400);
+
+    assert!(
+        result.message.contains("Retention: 2 workspace(s) withheld"),
+        "list must surface the retention condition inline: {}",
+        result.message
+    );
+    assert!(
+        result.message.contains("unpushed_work_preserved for 3.0d"),
+        "a withheld row must say why and for how long: {}",
+        result.message
+    );
+    assert!(
+        result.message.contains("cube workspace salvage"),
+        "the summary must point at where reclaimed work goes: {}",
+        result.message
+    );
+}
+
+#[test]
+fn workspace_list_retention_summary_survives_a_state_filter() {
+    // "How much of the pool is withheld" must not be answerable with zero just
+    // because the caller filtered the rows down to something else.
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+    let now = current_epoch_s().unwrap();
+    seed_retention_pool(&database_path, &workspace_root, now);
+
+    let runner = FakeRunner::default();
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "list", "--state", "free"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("list");
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["workspaces"].as_array().unwrap().len(), 2);
+    assert_eq!(result.payload["retention"]["retained"], 2);
+}
+
+#[test]
+fn workspace_list_omits_retention_block_when_nothing_is_withheld() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    std::fs::create_dir_all(workspace_root.join("mono-agent-001").join(".jj")).unwrap();
+    seed_mono_repo(&workspace_root, &database_path);
+    {
+        use crate::metadata::WorkspaceCandidate;
+        use crate::store::Store;
+        let mut store = Store::open_at(&database_path).unwrap();
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-001"),
+                }],
+            )
+            .unwrap();
+    }
+
+    let runner = FakeRunner::default();
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "list"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("list");
+    runner.assert_exhausted();
+
+    assert_eq!(result.payload["retention"]["retained"], 0);
+    assert!(
+        !result.message.contains("Retention:"),
+        "no condition, no noise: {}",
+        result.message
+    );
+}
+
+#[test]
+fn workspace_salvage_lists_recovered_work_with_apply_instructions() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let dir = crate::app::salvage::salvage_dir(Some(&database_path))
+        .unwrap()
+        .join("mono")
+        .join("mono-agent-042-1700000000");
+    std::fs::create_dir_all(dir.join("patches")).unwrap();
+    std::fs::write(dir.join("patches/001-abcd1234.diff"), "diff --git a/x b/x\n").unwrap();
+    std::fs::write(
+        dir.join("manifest.json"),
+        serde_json::json!({
+            "schema": 1,
+            "repo": "mono",
+            "workspace_id": "mono-agent-042",
+            "workspace_path": "/tmp/mono-agent-042",
+            "main_branch": "main",
+            "salvaged_at_epoch_s": 1_700_000_000i64,
+            "unhealthy_since_epoch_s": 1_699_000_000i64,
+            "retained_secs": 1_000_000i64,
+            "prior_health": "dirty",
+            "last_release_reason": "unpushed_work_preserved",
+            "holder": "boss@localhost",
+            "task": "fix the thing",
+            "commits": [{
+                "change_id": "abcd1234",
+                "commit_id": "6e6b90bc",
+                "description": "half-finished refactor",
+                "patch": "patches/001-abcd1234.diff",
+            }],
+            "restore_hint": "",
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let runner = FakeRunner::default();
+    let result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "salvage"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("salvage");
+    runner.assert_exhausted();
+
+    let salvage = result.payload["salvage"].as_array().expect("salvage array");
+    assert_eq!(salvage.len(), 1);
+    assert_eq!(salvage[0]["manifest"]["workspace_id"], "mono-agent-042");
+    assert_eq!(salvage[0]["manifest"]["task"], "fix the thing");
+    assert!(result.message.contains("mono/mono-agent-042"));
+    assert!(result.message.contains("half-finished refactor"));
+    assert!(
+        result.message.contains("git apply"),
+        "the listing must say how to get the work back: {}",
+        result.message
+    );
+
+    // Filtering by a different workspace finds nothing.
+    let empty = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "salvage", "--workspace", "mono-agent-999"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("salvage");
+    assert_eq!(empty.payload["salvage"].as_array().unwrap().len(), 0);
+    assert_eq!(empty.message, "No salvaged work.");
+}

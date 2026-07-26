@@ -13,15 +13,6 @@ use crate::app::health::{audit_jj_op, read_head_status};
 use crate::app::jj::{run_jj, run_jj_network};
 use crate::app::repo::is_unresolved_remote_target;
 
-pub(super) fn reset_workspace(
-    runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
-    workspace_path: &Path,
-    main_branch: &str,
-) -> Result<()> {
-    reset_workspace_guarded(runner, database_path, workspace_path, main_branch, None)
-}
-
 /// Resolve the GitHub remote name and `owner/repo` slug from `jj git remote
 /// list` run inside the given workspace path.
 pub(super) fn resolve_github_remote_for_workspace(
@@ -42,7 +33,7 @@ pub(super) fn resolve_github_remote_for_workspace(
     })
 }
 
-/// Variant of [`reset_workspace`] that refuses to run the destructive
+/// Fetch, then reset — refusing to run the destructive
 /// `jj new <main>` step if the workspace's `@` still has the prior
 /// lease holder's uncommitted work AND `prior_expired` says the lease
 /// we just claimed was reclaimed-out-from-under that holder. Surfaces
@@ -50,8 +41,8 @@ pub(super) fn resolve_github_remote_for_workspace(
 /// abort cleanly instead of stomping on the still-active worker.
 ///
 /// When `prior_expired` is `None` (normal release path, or a workspace
-/// that was already `free`), the guard is a no-op and behavior matches
-/// the original `reset_workspace`.
+/// that was already `free`), the guard is a no-op and this is a plain
+/// fetch-and-reset.
 ///
 /// Every `jj` invocation here also writes an audit entry
 /// (`workspace.jj_op`) so the next time someone reports "my `@`
@@ -197,7 +188,7 @@ pub(super) fn reset_workspace_on_release(
 /// TTL-expiry path ([`reset_workspace_guarded`]) and the release path
 /// ([`reset_workspace_on_release`]) can each apply their own guard between
 /// the fetch and the `jj new`. Assumes `jj git fetch` has already run.
-fn reset_workspace_after_fetch(
+pub(super) fn reset_workspace_after_fetch(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,

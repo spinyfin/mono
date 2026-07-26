@@ -16,7 +16,10 @@ use crate::setup::StepStatus;
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config};
 
-use crate::app::display::{effective_state_display, format_workspace_list, human_workspace_detail};
+use crate::app::display::{
+    effective_state_display, format_age, format_retention_summary, format_workspace_list, human_workspace_detail,
+    retention_summary,
+};
 use crate::app::errors::{CubeError, Result, RunResult};
 use crate::app::excludes::ensure_boss_infra_excluded;
 use crate::app::gc::{
@@ -37,6 +40,7 @@ use crate::app::reset::{
     PRESERVED_UNPUSHED_RELEASE_REASON, PreservedWorkingCopy, ReleaseResetOutcome, reset_workspace_guarded,
     reset_workspace_on_release,
 };
+use crate::app::salvage::list_salvage_records;
 use crate::app::util::{current_epoch_s, holder_identity, repo_lock_path, resolve_release_lease};
 use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase};
 
@@ -1505,8 +1509,8 @@ pub(super) fn run_workspace(
             // we materialize the listing — otherwise `list` would surface
             // a row that the next `lease` is going to fail on. Scope the
             // reconcile to the same repo filter the user asked for.
-            let reconciled =
-                reconcile_missing_workspaces(&mut store, database_path, repo.as_deref(), current_epoch_s()?)?;
+            let now = current_epoch_s()?;
+            let reconciled = reconcile_missing_workspaces(&mut store, database_path, repo.as_deref(), now)?;
             let filter = WorkspaceListFilter {
                 repo: repo.as_deref(),
                 effective_state: parsed_effective_state,
@@ -1514,12 +1518,70 @@ pub(super) fn run_workspace(
                 ..Default::default()
             };
             let records = store.list_workspaces_filtered(&filter)?;
-            let message = format_workspace_list(&records);
+
+            // Retention is summarised over the *unfiltered* pool for the repos
+            // in scope. "How much of the pool is being withheld" is not a
+            // question a `--state leased` filter should be able to answer with
+            // zero — the whole point is that it stays visible.
+            let retention_source = if parsed_effective_state.is_some() || holder.is_some() {
+                store.list_workspaces_filtered(&WorkspaceListFilter {
+                    repo: repo.as_deref(),
+                    ..Default::default()
+                })?
+            } else {
+                records.clone()
+            };
+            let ttl_secs = config::load_config().unwrap_or_default().unhealthy_gc.max_age_secs();
+            let retention = retention_summary(&retention_source, now, ttl_secs);
+
+            let mut message = format_workspace_list(&records, now);
+            if let Some(block) = format_retention_summary(&retention) {
+                message.push_str(&block);
+            }
             RunResult::new(
                 message,
                 json!({
                     "workspaces": records,
                     "reconciled": reconciled,
+                    "retention": retention,
+                }),
+            )
+        }
+        WorkspaceCommand::Salvage { repo, workspace } => {
+            let records = list_salvage_records(database_path, repo.as_deref(), workspace.as_deref())?;
+            let now = current_epoch_s()?;
+            let message = if records.is_empty() {
+                "No salvaged work.".to_string()
+            } else {
+                let mut lines = Vec::with_capacity(records.len() * 2 + 2);
+                for record in &records {
+                    lines.push(format!(
+                        "{}  ({} ago)",
+                        record.manifest.summary_line(),
+                        format_age(now.saturating_sub(record.manifest.salvaged_at_epoch_s)),
+                    ));
+                    lines.push(format!(
+                        "    {} commit(s) at {}",
+                        record.manifest.commits.len(),
+                        record.path.display(),
+                    ));
+                }
+                lines.push(String::new());
+                lines.push(
+                    "Apply a record's patches/ in order with `git apply` in any checkout of the repo.".to_string(),
+                );
+                lines.join("\n")
+            };
+            RunResult::new(
+                message,
+                json!({
+                    "salvage": records
+                        .iter()
+                        .map(|r| json!({
+                            "path": r.path.display().to_string(),
+                            "manifest": r.manifest,
+                        }))
+                        .collect::<Vec<_>>(),
                 }),
             )
         }

@@ -14,6 +14,10 @@ use crate::app::gc::{
     POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, gc_aged_unhealthy_workspaces, maybe_trigger_pool_gc,
     pool_gc_has_aged_unhealthy_backlog,
 };
+use crate::app::salvage::{
+    SALVAGE_COMMIT_LIMIT, SALVAGE_LOG_TEMPLATE, SALVAGE_RETENTION_SECS, gc_aged_salvage_records, list_salvage_records,
+    salvage_dir, salvage_revset,
+};
 use crate::app::util::current_epoch_s;
 
 #[test]
@@ -757,7 +761,8 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
 
     // FakeRunner sequence:
     // 1. gc_workspace_bookmarks: fetch, log (no consumed bookmarks), gc_collect pr remote
-    // 2. gc_aged_unhealthy_workspaces → reset_workspace: fetch, remote list, bookmark set, jj new
+    // 2. gc_aged_unhealthy_workspaces → probe (fetch + head status), then
+    //    remote list, bookmark set, jj new
     let gc_runner = FakeRunner::new(vec![
         // gc_workspace_bookmarks
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
@@ -775,8 +780,9 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
             "",
         ),
         gc_pr_remote_noop_command(&ws_path),
-        // gc_aged_unhealthy_workspaces → reset_workspace
+        // gc_aged_unhealthy_workspaces → probe (fetch + head status), then reset
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
+        head_status_command(&ws_path, &head_status_output("abcd1234", true, "main", "main", "main")),
         ExpectedCommand::ok(
             ws_path.clone(),
             "jj",
@@ -857,10 +863,11 @@ fn setup_unhealthy_gc_scenario(
     (store, ws_path)
 }
 
-/// The command sequence `reset_workspace` issues against a workspace.
-fn reset_commands_for(ws_path: &std::path::Path) -> Vec<ExpectedCommand> {
+/// The destructive half of a reset, with no leading `jj git fetch`. The
+/// retention path probes first (which fetches), so it finishes the reset from
+/// there rather than fetching twice per workspace inside a time-budgeted pass.
+fn reset_after_fetch_commands_for(ws_path: &std::path::Path) -> Vec<ExpectedCommand> {
     vec![
-        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
         ExpectedCommand::ok(
             ws_path.to_path_buf(),
             "jj",
@@ -877,8 +884,35 @@ fn reset_commands_for(ws_path: &std::path::Path) -> Vec<ExpectedCommand> {
     ]
 }
 
-fn reset_runner_for(ws_path: &std::path::Path) -> FakeRunner {
-    FakeRunner::new(reset_commands_for(ws_path))
+/// The command sequence salvage issues: one `jj log` over the salvage revset,
+/// then one `jj diff` per captured commit. Built from the real constants so a
+/// change to either drifts the test rather than silently passing.
+fn salvage_commands_for(ws_path: &std::path::Path, log_output: &str, diffs: &[(&str, &str)]) -> Vec<ExpectedCommand> {
+    let revset = salvage_revset("main");
+    let mut v = vec![ExpectedCommand::ok(
+        ws_path.to_path_buf(),
+        "jj",
+        &[
+            "log",
+            "--no-graph",
+            "-n",
+            SALVAGE_COMMIT_LIMIT,
+            "-r",
+            &revset,
+            "-T",
+            SALVAGE_LOG_TEMPLATE,
+        ],
+        log_output,
+    )];
+    for (commit_id, diff) in diffs {
+        v.push(ExpectedCommand::ok(
+            ws_path.to_path_buf(),
+            "jj",
+            &["diff", "--no-pager", "--git", "-r", commit_id],
+            diff,
+        ));
+    }
+    v
 }
 
 #[test]
@@ -899,7 +933,14 @@ fn gc_resets_aged_dirty_workspace_to_clean() {
     let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
     let max_age_secs = 5 * 86_400;
 
-    let runner = reset_runner_for(&ws_path);
+    // Retention expiry always probes first. Here `@` is empty and on main, so
+    // there is nothing to salvage and the reset proceeds straight away.
+    let mut script = vec![
+        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(&ws_path, &head_status_output("abcd1234", true, "main", "main", "main")),
+    ];
+    script.extend(reset_after_fetch_commands_for(&ws_path));
+    let runner = FakeRunner::new(script);
     gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
     runner.assert_exhausted();
 
@@ -970,7 +1011,12 @@ fn gc_resets_aged_conflicted_workspace_to_clean() {
     let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
     let max_age_secs = 5 * 86_400;
 
-    let runner = reset_runner_for(&ws_path);
+    let mut script = vec![
+        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(&ws_path, &head_status_output("abcd1234", true, "main", "main", "main")),
+    ];
+    script.extend(reset_after_fetch_commands_for(&ws_path));
+    let runner = FakeRunner::new(script);
     gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
     runner.assert_exhausted();
 
@@ -1004,7 +1050,7 @@ fn gc_reclaims_aged_quarantined_workspace_once_nothing_is_orphaned() {
         head_status_command(&ws_path, &head_status_output("abcd1234", true, "", "", "")),
         unpushed_probe_command(&ws_path, ""),
     ];
-    script.extend(reset_commands_for(&ws_path));
+    script.extend(reset_after_fetch_commands_for(&ws_path));
     let runner = FakeRunner::new(script);
 
     let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
@@ -1026,11 +1072,44 @@ fn gc_reclaims_aged_quarantined_workspace_once_nothing_is_orphaned() {
     assert_eq!(cleared[0]["reuse_reason"], "nothing_orphaned");
 }
 
-/// The protection that must survive the reclaim path: an aged quarantine
-/// whose `@` still holds work no remote has is left exactly as it is. GC
-/// must never reset it on age alone.
+/// The protection that must survive the retention TTL: a workspace whose `@`
+/// still holds work no remote has is left exactly as it is *while it is inside
+/// its retention window*. Age is the only thing that ever lets cube touch it,
+/// and the window has to elapse first.
 #[test]
-fn gc_leaves_aged_quarantined_workspace_with_unpushed_work_alone() {
+fn gc_leaves_quarantined_workspace_with_unpushed_work_alone_inside_the_ttl() {
+    let (tempdir, database_path) = with_database_path();
+    let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+    store
+        .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Quarantined)
+        .expect("mark quarantined");
+
+    let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    // Half a day into a one-day retention window.
+    let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 43_200;
+    let max_age_secs = 86_400;
+
+    // Nothing may be issued at all: the workspace is not even a candidate yet.
+    let runner = FakeRunner::default();
+    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    runner.assert_exhausted();
+    assert_eq!(recycled, 0);
+
+    let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    assert_eq!(
+        ws_after.health_status,
+        Some(crate::metadata::WorkspaceHealth::Quarantined),
+        "retention inside the window is untouched",
+    );
+}
+
+/// Retention is bounded, not removed. Past the TTL, a quarantined workspace
+/// whose `@` still holds unpushed work is reclaimed — but only after the work
+/// has been written to a durable salvage record. Before this, that workspace
+/// was withheld forever.
+#[test]
+fn gc_salvages_unpushed_work_before_reclaiming_past_the_ttl() {
     let (tempdir, database_path) = with_database_path();
     let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
 
@@ -1040,9 +1119,74 @@ fn gc_leaves_aged_quarantined_workspace_with_unpushed_work_alone() {
 
     let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
     let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 60 * 86_400;
-    let max_age_secs = 5 * 86_400;
+    let max_age_secs = 86_400;
 
-    // The probe runs and refuses; no reset commands may follow.
+    let mut script = vec![
+        ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        head_status_command(
+            &ws_path,
+            &head_status_output("abcd1234", false, "wip-bookmark", "wip-bookmark", ""),
+        ),
+        unpushed_probe_command(&ws_path, "abcd1234\t6e6b90bc\n"),
+    ];
+    script.extend(salvage_commands_for(
+        &ws_path,
+        "abcd1234\t6e6b90bc\thalf-finished refactor\n",
+        &[("6e6b90bc", "diff --git a/x b/x\n+one\n")],
+    ));
+    script.extend(reset_after_fetch_commands_for(&ws_path));
+    let runner = FakeRunner::new(script);
+
+    let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
+    runner.assert_exhausted();
+    assert_eq!(recycled, 1, "an expired retention is reclaimed once salvaged");
+
+    let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    assert_eq!(ws_after.health_status, None, "workspace returns to the pool");
+    assert_eq!(ws_after.unhealthy_since_epoch_s, None);
+
+    // The work is retrievable: manifest, commit index, and a real patch.
+    let records = list_salvage_records(Some(&database_path), None, None).expect("salvage records");
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    assert_eq!(record.manifest.workspace_id, "mono-agent-001");
+    assert_eq!(record.manifest.repo, "mono");
+    assert_eq!(record.manifest.prior_health, "quarantined");
+    assert_eq!(record.manifest.commits.len(), 1);
+    assert_eq!(record.manifest.commits[0].change_id, "abcd1234");
+    assert_eq!(record.manifest.commits[0].description, "half-finished refactor");
+    let patch = std::fs::read_to_string(record.path.join(&record.manifest.commits[0].patch)).expect("patch file");
+    assert!(patch.contains("+one"), "the patch holds the actual work: {patch}");
+    assert!(record.path.join("commits.txt").exists());
+
+    let events = audit_events(&tempdir);
+    let salvaged: Vec<_> = events
+        .iter()
+        .filter(|e| e["event"] == "workspace.retention_salvaged")
+        .collect();
+    assert_eq!(salvaged.len(), 1);
+    assert_eq!(salvaged[0]["unpushed_commits"], "abcd1234:6e6b90bc");
+    assert_eq!(salvaged[0]["workspace_id"], "mono-agent-001");
+}
+
+/// If the work cannot be captured, the workspace is NOT reclaimed. Bounding
+/// retention is only defensible while expiry cannot lose anything, so a failed
+/// salvage has to be a hard stop rather than something the reset proceeds past.
+#[test]
+fn gc_leaves_workspace_retained_when_salvage_fails() {
+    let (tempdir, database_path) = with_database_path();
+    let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+    store
+        .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+        .expect("mark dirty");
+
+    let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 60 * 86_400;
+    let max_age_secs = 86_400;
+
+    // The salvage log call fails; no reset commands may follow it.
+    let revset = salvage_revset("main");
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], ""),
         head_status_command(
@@ -1050,26 +1194,84 @@ fn gc_leaves_aged_quarantined_workspace_with_unpushed_work_alone() {
             &head_status_output("abcd1234", false, "wip-bookmark", "wip-bookmark", ""),
         ),
         unpushed_probe_command(&ws_path, "abcd1234\t6e6b90bc\n"),
+        ExpectedCommand::no_such_remote_bookmark(
+            ws_path.to_path_buf(),
+            "jj",
+            &[
+                "log",
+                "--no-graph",
+                "-n",
+                SALVAGE_COMMIT_LIMIT,
+                "-r",
+                &revset,
+                "-T",
+                SALVAGE_LOG_TEMPLATE,
+            ],
+        ),
     ]);
 
     let recycled = gc_aged_unhealthy_workspaces(&runner, &store, Some(&database_path), fake_now, max_age_secs, None);
     runner.assert_exhausted();
-    assert_eq!(recycled, 0, "no matter how old, unpushed work is never discarded");
+    assert_eq!(recycled, 0, "a workspace whose work could not be captured is not reset");
 
     let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
     assert_eq!(
         ws_after.health_status,
-        Some(crate::metadata::WorkspaceHealth::Quarantined),
+        Some(crate::metadata::WorkspaceHealth::Dirty),
+        "the workspace stays retained and is retried next pass",
     );
 
     let events = audit_events(&tempdir);
-    let refused: Vec<_> = events
+    let failed: Vec<_> = events
         .iter()
-        .filter(|e| e["event"] == "workspace.quarantine_reclaim_refused")
+        .filter(|e| e["event"] == "workspace.retention_salvage_failed")
         .collect();
-    assert_eq!(refused.len(), 1);
-    assert_eq!(refused[0]["source"], "unhealthy_gc");
-    assert_eq!(refused[0]["unpushed_commits"], "abcd1234:6e6b90bc");
+    assert_eq!(failed.len(), 1);
+}
+
+/// The salvage store is itself retained rather than growing forever — the
+/// failure mode this whole change is about does not get to reappear one level
+/// up.
+#[test]
+fn gc_removes_salvage_records_past_their_retention_window() {
+    let (_tempdir, database_path) = with_database_path();
+    let root = salvage_dir(Some(&database_path)).expect("salvage dir").join("mono");
+
+    let write_record = |id: &str, salvaged_at: i64| {
+        let dir = root.join(format!("{id}-{salvaged_at}"));
+        std::fs::create_dir_all(dir.join("patches")).unwrap();
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({
+                "schema": 1,
+                "repo": "mono",
+                "workspace_id": id,
+                "workspace_path": "/tmp/x",
+                "main_branch": "main",
+                "salvaged_at_epoch_s": salvaged_at,
+                "unhealthy_since_epoch_s": salvaged_at,
+                "retained_secs": 0,
+                "prior_health": "dirty",
+                "last_release_reason": serde_json::Value::Null,
+                "holder": serde_json::Value::Null,
+                "task": serde_json::Value::Null,
+                "commits": [],
+                "restore_hint": "",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    };
+
+    let now = 2_000_000_000i64;
+    let fresh = write_record("mono-agent-001", now - 3600);
+    let stale = write_record("mono-agent-002", now - SALVAGE_RETENTION_SECS - 3600);
+
+    let removed = gc_aged_salvage_records(Some(&database_path), now);
+    assert_eq!(removed, 1);
+    assert!(fresh.exists(), "a record inside the window is kept");
+    assert!(!stale.exists(), "a record past the window is removed");
 }
 
 #[test]

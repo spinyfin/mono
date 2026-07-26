@@ -52,48 +52,77 @@ impl RepoResolver {
     }
 }
 
-/// Default number of days a free workspace may remain unhealthy (dirty or
-/// conflicted) before pool GC reclaims it. Override with
-/// `[unhealthy-gc] max-age-days` in `cube.toml` or the
-/// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable.
-pub const DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS: u64 = 5;
+/// Default retention window for a free workspace that is being withheld from
+/// the pool because it is unhealthy (dirty, conflicted, or quarantined),
+/// before pool GC salvages its work and reclaims it.
+///
+/// **24 hours, down from 5 days.** The old threshold provably never fired:
+/// across a pool of 106 withheld workspaces the oldest had been retained 4.2
+/// days (p50 1.3 days), so retention was in practice unbounded while the
+/// effective free pool collapsed from 173 to 3 and dispatch started timing
+/// out. A threshold that the steady state never reaches is not a threshold.
+///
+/// Why 24 hours specifically:
+///
+/// - It matches cube's own lease TTL (`DEFAULT_LEASE_TTL_SECS`, 24h). A
+///   holder that has not come back within a day is already presumed dead by
+///   cube's clock; retention of that holder's leftovers should not outlive
+///   the lease that produced them.
+/// - The pool degrades from healthy to all-dirty within hours at the observed
+///   dispatch rate (259 leases per audit window, 29 of the last 60 minting
+///   fresh workspaces), so anything measured in days is far outside the loop
+///   it needs to close.
+/// - Expiry is non-destructive: the work is salvaged to a durable record
+///   first (see [`crate::app`]'s salvage module), so a shorter window costs
+///   findability, not data.
+/// - It is the human window too. Someone who has not gone back to yesterday's
+///   crashed worker by the next day re-runs the task; they do not resume the
+///   tree.
+///
+/// Override with `[unhealthy-gc] max-age-hours` (or `max-age-days`) in
+/// `cube.toml`, or the `CUBE_UNHEALTHY_GC_MAX_AGE_HOURS` /
+/// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variables.
+pub const DEFAULT_UNHEALTHY_GC_MAX_AGE_HOURS: u64 = 24;
 
-const SECS_PER_DAY: i64 = 86_400;
+const SECS_PER_HOUR: i64 = 3_600;
+const HOURS_PER_DAY: u64 = 24;
 
 /// Controls the time-bounded reclaim of free workspaces that have been
-/// continuously unhealthy (dirty or conflicted) for too long.
+/// continuously unhealthy (dirty, conflicted, or quarantined) for too long.
 ///
-/// Both `dirty` and `conflicted` workspaces share the same `max-age-days`
-/// threshold. The struct is designed so a separate, more-aggressive
-/// threshold for conflicted workspaces can be added as a new optional field
-/// later without a schema/redesign.
-#[derive(Debug, Clone, Deserialize)]
+/// All unhealthy states share the same threshold. The struct is designed so a
+/// separate, more-aggressive threshold for one of them can be added as a new
+/// optional field later without a schema/redesign.
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct UnhealthyGcConfig {
-    /// How many days a free workspace can remain unhealthy before pool GC
-    /// resets it back to clean. Defaults to [`DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS`].
-    /// Overridable via the `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable.
+    /// How many hours a free workspace can be retained while unhealthy before
+    /// pool GC salvages and resets it. Takes precedence over
+    /// [`Self::max_age_days`]. Defaults to
+    /// [`DEFAULT_UNHEALTHY_GC_MAX_AGE_HOURS`].
+    #[serde(rename = "max-age-hours")]
+    pub max_age_hours: Option<u64>,
+    /// Day-granularity form of [`Self::max_age_hours`], kept so existing
+    /// `cube.toml` files keep working. Retention is now tuned in hours, so
+    /// this is the coarse alias rather than the primary knob.
     #[serde(rename = "max-age-days")]
-    pub max_age_days: u64,
-}
-
-impl Default for UnhealthyGcConfig {
-    fn default() -> Self {
-        Self {
-            max_age_days: DEFAULT_UNHEALTHY_GC_MAX_AGE_DAYS,
-        }
-    }
+    pub max_age_days: Option<u64>,
 }
 
 impl UnhealthyGcConfig {
-    /// Returns the configured max unhealthy age in seconds, applying any
-    /// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS` environment variable override.
+    /// Returns the configured retention window in seconds.
+    ///
+    /// Precedence, most specific first: `CUBE_UNHEALTHY_GC_MAX_AGE_HOURS`,
+    /// `CUBE_UNHEALTHY_GC_MAX_AGE_DAYS`, `max-age-hours`, `max-age-days`,
+    /// then [`DEFAULT_UNHEALTHY_GC_MAX_AGE_HOURS`].
     pub fn max_age_secs(&self) -> i64 {
-        let days = std::env::var("CUBE_UNHEALTHY_GC_MAX_AGE_DAYS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(self.max_age_days);
-        (days as i64).saturating_mul(SECS_PER_DAY)
+        let env_u64 = |key: &str| std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok());
+        let hours = env_u64("CUBE_UNHEALTHY_GC_MAX_AGE_HOURS")
+            .or_else(|| env_u64("CUBE_UNHEALTHY_GC_MAX_AGE_DAYS").map(|d| d.saturating_mul(HOURS_PER_DAY)))
+            .or(self.max_age_hours)
+            .or_else(|| self.max_age_days.map(|d| d.saturating_mul(HOURS_PER_DAY)))
+            .unwrap_or(DEFAULT_UNHEALTHY_GC_MAX_AGE_HOURS);
+        (hours as i64).saturating_mul(SECS_PER_HOUR)
     }
 }
 
@@ -196,6 +225,27 @@ mod tests {
             r.resolve_clone_command("frontend-api").as_deref(),
             Some("mint clone frontend-api")
         );
+    }
+
+    #[test]
+    fn unhealthy_gc_retention_defaults_to_twenty_four_hours() {
+        // The old default was 5 days, which the observed pool never reached:
+        // the oldest retained workspace was 4.2 days old while dispatch was
+        // already failing. A threshold the steady state never crosses is not
+        // a threshold.
+        assert_eq!(UnhealthyGcConfig::default().max_age_secs(), 24 * 3_600);
+    }
+
+    #[test]
+    fn unhealthy_gc_max_age_hours_wins_over_max_age_days() {
+        let cfg: CubeConfig = toml::from_str("[unhealthy-gc]\nmax-age-hours = 6\nmax-age-days = 5\n").expect("parse");
+        assert_eq!(cfg.unhealthy_gc.max_age_secs(), 6 * 3_600);
+    }
+
+    #[test]
+    fn unhealthy_gc_max_age_days_still_honoured_for_existing_configs() {
+        let cfg: CubeConfig = toml::from_str("[unhealthy-gc]\nmax-age-days = 2\n").expect("parse");
+        assert_eq!(cfg.unhealthy_gc.max_age_secs(), 48 * 3_600);
     }
 
     #[test]
