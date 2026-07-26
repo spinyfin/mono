@@ -1378,6 +1378,31 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         "passing a work_runs.id where an execution_id is expected must surface as RowMissing — not be silently absorbed as an AlreadySet no-op",
     );
 
+    // Provider-session identity is one engine-owned value on the latest run:
+    // first claim starts, the same id resumes across process restart, and a
+    // changed id replaces it without accumulating history.
+    assert!(
+        !db.claim_run_progress_session_identity(&execution.id, "thread-a")
+            .unwrap()
+    );
+    assert!(
+        db.claim_run_progress_session_identity(&execution.id, "thread-a")
+            .unwrap()
+    );
+    assert!(
+        !db.claim_run_progress_session_identity(&execution.id, "thread-b")
+            .unwrap()
+    );
+    assert!(
+        db.claim_run_progress_session_identity(&execution.id, "thread-b")
+            .unwrap()
+    );
+    assert!(db.clear_run_progress_session_identity(&execution.id).unwrap());
+    assert!(
+        !db.claim_run_progress_session_identity(&execution.id, "thread-b")
+            .unwrap()
+    );
+
     let _ = std::fs::remove_file(path);
 }
 

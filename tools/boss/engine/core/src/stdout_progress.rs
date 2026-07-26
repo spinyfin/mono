@@ -33,10 +33,19 @@
 //! pipe all attach unchanged once a `StdoutJsonl` driver and a spawn path that
 //! can hand over a stream exist.
 
+use std::sync::Arc;
+
 use boss_engine_stdout_progress::{ReaderStats, StdoutJsonlProgressReader};
 use tokio::io::AsyncRead;
 
 use crate::events_socket::IncomingHookEvent;
+
+impl crate::driver::ProgressIdentityStore for crate::work::WorkDb {
+    fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String> {
+        self.claim_run_progress_session_identity(run_id, session_id)
+            .map_err(|err| format!("{err:#}"))
+    }
+}
 
 /// Where decoded progress events go.
 ///
@@ -45,6 +54,14 @@ use crate::events_socket::IncomingHookEvent;
 /// its dispatch fan-out, and tests implement it to record what arrived.
 #[async_trait::async_trait]
 pub trait WorkerEventSink: Send + Sync {
+    /// Engine-owned persistence for provider session identity.
+    ///
+    /// Lightweight test sinks may return `None`; production `ServerState`
+    /// supplies WorkDb so a Codex resume marker never lives in CODEX_HOME.
+    fn progress_identity_store(&self) -> Option<Arc<dyn crate::driver::ProgressIdentityStore>> {
+        None
+    }
+
     /// Handle one decoded progress event. Called once per envelope, in stream
     /// order. [`run_stdout_progress_ingress`] queues decoded envelopes onto a
     /// bounded channel ahead of this call, so a slow dispatch (the engine's
@@ -147,7 +164,7 @@ where
         .clone();
     tracing::info!(run_id, driver = driver_slug, "stdout progress: ingress started");
 
-    let mut reader = StdoutJsonlProgressReader::for_run(stream, driver.clone(), run_id);
+    let mut reader = StdoutJsonlProgressReader::for_run(stream, driver.clone(), run_id, sink.progress_identity_store());
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {

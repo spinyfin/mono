@@ -876,6 +876,7 @@ dependencies = [
 name = "boss-transcript-tail"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",

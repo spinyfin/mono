@@ -44,7 +44,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::driver::AgentDriver;
+use crate::driver::{AgentDriver, TranscriptSessionNormalizer};
 use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::metrics::Registry;
@@ -774,11 +774,28 @@ impl LiveStatusManager {
 /// `run_slot_loop` so the wiring itself — not just
 /// `AgentDriver::normalize_transcript_entry` in isolation — has test
 /// coverage.
-fn normalize_lines(driver: &dyn AgentDriver, lines: Vec<Value>) -> Vec<Value> {
+fn normalize_lines(
+    driver: &dyn AgentDriver,
+    session: &mut Option<Box<dyn TranscriptSessionNormalizer>>,
+    lines: Vec<Value>,
+) -> Vec<Value> {
     lines
         .into_iter()
-        .map(|raw| driver.normalize_transcript_entry(raw))
+        .map(|raw| match session.as_mut() {
+            Some(session) => session.normalize_transcript_entry(raw),
+            None => driver.normalize_transcript_entry(raw),
+        })
         .collect()
+}
+
+fn start_transcript_tail(driver: &dyn AgentDriver, run_id: &str, path: PathBuf) -> Result<TranscriptTail, String> {
+    match driver
+        .transcript_containment_root(run_id)
+        .map_err(|err| format!("{err:#}"))?
+    {
+        Some(root) => TranscriptTail::new_contained(path, root).map_err(|err| err.to_string()),
+        None => Ok(TranscriptTail::new(path)),
+    }
 }
 
 /// Per-slot loop body. Receives triggers on `rx`, runs the
@@ -807,6 +824,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
+    let mut transcript_session = driver.transcript_session();
     let mut transcript_buffer: Vec<Value> = Vec::new();
     let mut post_tool_use_count: u32 = 0;
     let mut last_success_at: Option<Instant> = None;
@@ -971,7 +989,18 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 debug_store.update(slot_id, |snap| {
                     snap.transcript_path = Some(path_str);
                 });
-                tail = Some(TranscriptTail::new(path));
+                match start_transcript_tail(driver.as_ref(), &run_id, path) {
+                    Ok(started) => tail = Some(started),
+                    Err(err) => {
+                        tracing::warn!(
+                            slot_id,
+                            run_id = %run_id,
+                            %err,
+                            "live_status: transcript path failed driver containment policy",
+                        );
+                        continue;
+                    }
+                }
             } else {
                 tracing::info!(
                     slot_id,
@@ -990,7 +1019,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     new_lines_count = new_lines.len();
                     // Normalise through the run's driver before anything
                     // downstream (redaction, summarisation) sees the entry.
-                    transcript_buffer.extend(normalize_lines(driver.as_ref(), new_lines));
+                    transcript_buffer.extend(normalize_lines(driver.as_ref(), &mut transcript_session, new_lines));
                 }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");
@@ -1132,6 +1161,8 @@ mod tests {
     use boss_engine_structured_output::fallback::FallbackCandidate;
     use boss_protocol::{NormalizeError, WorkerEvent};
     use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A provider that resolves no credential, so a slot loop reaches
     /// `SummarizerOutcome::NoApiKey` and never issues a network call — the
@@ -1230,7 +1261,8 @@ mod tests {
             serde_json::json!({"tool_name": "Bash"}),
             serde_json::json!({"tool_name": "Read"}),
         ];
-        let out = normalize_lines(&MarkingDriver, lines);
+        let mut session = None;
+        let out = normalize_lines(&MarkingDriver, &mut session, lines);
         assert_eq!(out.len(), 2);
         for line in &out {
             assert_eq!(line["marked"], serde_json::Value::Bool(true));
@@ -1266,13 +1298,48 @@ mod tests {
                 "payload":{"type":"turn_aborted","reason":"interrupted"}
             }),
         ];
-        let normalized = normalize_lines(&crate::driver::CodexDriver::default(), lines);
+        let driver = crate::driver::CodexDriver::default();
+        let mut session = driver.transcript_session();
+        let normalized = normalize_lines(&driver, &mut session, lines);
         let rendered = live_status::redact_and_assemble(&normalized);
 
         assert!(rendered.contains("inspecting the split module"), "{rendered}");
         assert!(rendered.contains("Bash(cargo test -p boss-engine)"), "{rendered}");
         assert!(rendered.contains("all tests passed"), "{rendered}");
         assert!(rendered.contains("turn aborted: interrupted"), "{rendered}");
+    }
+
+    #[test]
+    fn codex_sensitive_command_and_correlated_output_are_both_dropped() {
+        let lines = vec![
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"secret-call",
+                    "name":"exec",
+                    "input":"cat /Users/operator/.ssh/id_rsa"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"secret-call",
+                    "output":"PRIVATE KEY BODY"
+                }
+            }),
+        ];
+        let driver = crate::driver::CodexDriver::default();
+        let mut session = driver.transcript_session();
+        let normalized = normalize_lines(&driver, &mut session, lines);
+        let rendered = live_status::redact_and_assemble(&normalized);
+
+        assert!(rendered.is_empty(), "sensitive call/output leaked: {rendered}");
+        assert_eq!(
+            normalized[1]["tool_input"]["command"],
+            "cat /Users/operator/.ssh/id_rsa"
+        );
     }
 
     #[derive(Default)]
@@ -1304,6 +1371,122 @@ mod tests {
         async fn transcript_path(&self, _run_id: &str) -> Option<PathBuf> {
             self.path.lock().await.clone()
         }
+    }
+
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: this engine test binary has no other test mutating the
+            // Codex homes override. The prior value is restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_live_status_slot_uses_run_driver_and_redacted_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes = tmp.path().join("homes");
+        let run_id = "run-codex-live-status";
+        let day = homes.join(run_id).join("sessions/2026/07/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let transcript = day.join("rollout-2026-07-26T00-00-00-thread.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"inspecting codex rollout safely"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"secret-call",
+                    "name":"exec",
+                    "input":"cat /Users/operator/.ssh/id_rsa"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"secret-call",
+                    "output":"PRIVATE KEY BODY"
+                }
+            }),
+        ];
+        let jsonl = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript, jsonl).unwrap();
+        let _env = EnvRestore::set(crate::driver::codex::CODEX_HOMES_ROOT_ENV, &homes);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content":[{"type":"text","text":"reading the Codex rollout"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(9, run_id, "gpt-5.6-terra", 0, None);
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript.clone())));
+        manager.start_slot(
+            9,
+            LiveStatusRun::new(run_id, Arc::new(crate::driver::CodexDriver::default())),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(9, Trigger::ActivityChanged(WorkerActivity::Working));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(9).and_then(|state| state.live_status).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex live-status slot did not summarize the rollout");
+
+        let requests = server.received_requests().await.unwrap();
+        let request = requests.first().expect("summarizer request");
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(body.contains("inspecting codex rollout safely"), "{body}");
+        assert!(!body.contains("id_rsa"), "sensitive command leaked: {body}");
+        assert!(!body.contains("PRIVATE KEY BODY"), "sensitive output leaked: {body}");
+        assert_eq!(
+            registry.get(9).unwrap().live_status.as_deref(),
+            Some("reading the Codex rollout")
+        );
+        manager.stop_slot(9);
     }
 
     #[test]

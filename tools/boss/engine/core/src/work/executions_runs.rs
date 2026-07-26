@@ -1616,6 +1616,57 @@ impl WorkDb {
         Ok(path.flatten())
     }
 
+    /// Atomically claim the one current provider session id for an execution.
+    ///
+    /// Returns `true` when the latest run already held `session_id` (resume)
+    /// and `false` when this call installed a new identity (startup). The
+    /// value lives in engine-owned SQLite, not the agent-writable provider
+    /// home, and is bounded to one string on the latest run row.
+    pub fn claim_run_progress_session_identity(&self, execution_id: &str, session_id: &str) -> Result<bool> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT id, progress_session_id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![execution_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((run_id, prior)) = row else {
+            bail!("no work_runs row for execution {execution_id}");
+        };
+        let resumed = prior.as_deref() == Some(session_id);
+        if !resumed {
+            tx.execute(
+                "UPDATE work_runs SET progress_session_id = ?2 WHERE id = ?1",
+                params![run_id, session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(resumed)
+    }
+
+    /// Clear the engine-owned provider session identity during normal
+    /// execution teardown. Returns `false` when no run row exists.
+    pub fn clear_run_progress_session_identity(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET progress_session_id = NULL
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// `true` when at least one `work_runs` row exists for `execution_id`,
     /// regardless of its `transcript_path` or `status`.
     ///

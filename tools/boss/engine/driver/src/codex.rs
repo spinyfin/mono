@@ -26,15 +26,15 @@ use serde::{Deserialize, Serialize};
 
 mod progress;
 
-use progress::{CodexProgressSession, normalize_rollout};
+use progress::{CodexProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
     PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
     ProgressSessionConfig, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, StructuredOutputArtifacts,
-    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
-    WorkerKind, default_structured_output_wiring,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
+    TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -997,10 +997,11 @@ impl AgentDriver for CodexDriver {
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
         // Stateless compatibility path for direct callers. Stdout ingestion
         // owns a durable per-reader session via `progress_session` below.
-        CodexProgressSession::new(None).normalize_progress_event(raw)
+        CodexProgressSession::new(None, None, None, None).normalize_progress_event(raw)
     }
 
     fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        let homes_root = codex_homes_root();
         let codex_home = config
             .run_id
             .as_deref()
@@ -1011,7 +1012,12 @@ impl AgentDriver for CodexDriver {
                     None
                 }
             });
-        Some(Box::new(CodexProgressSession::new(codex_home)))
+        Some(Box::new(CodexProgressSession::new(
+            codex_home,
+            Some(homes_root),
+            config.run_id.clone(),
+            config.identity_store.clone(),
+        )))
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
@@ -1060,6 +1066,22 @@ impl AgentDriver for CodexDriver {
         // stdout reader creates its per-ingress progress session.
         let _ = raw;
         None
+    }
+
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        Some(Box::new(CodexTranscriptSession::default()))
+    }
+
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        let homes_root = codex_homes_root();
+        let codex_home = codex_home_for_run(run_id)?;
+        let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
+            anyhow!(
+                "Codex transcript root for run {run_id:?} is missing, symlinked, replaced, or outside {}",
+                homes_root.display()
+            )
+        })?;
+        Ok(Some(sessions))
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {

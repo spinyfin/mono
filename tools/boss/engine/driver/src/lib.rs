@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
@@ -785,9 +786,28 @@ pub enum ProgressIngress {
 /// envelope. Mutable correlation therefore belongs to the reader session,
 /// not the registry's shared [`AgentDriver`] instance. `run_id` also lets a
 /// driver resolve run-owned artifacts without scanning another run's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ProgressSessionConfig {
     pub run_id: Option<String>,
+    pub identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+}
+
+impl std::fmt::Debug for ProgressSessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressSessionConfig")
+            .field("run_id", &self.run_id)
+            .field("has_identity_store", &self.identity_store.is_some())
+            .finish()
+    }
+}
+
+/// Engine-owned durable storage for one run's current provider session id.
+///
+/// The driver must not persist this identity inside an agent-writable home.
+/// Implementations atomically compare and replace the one bounded identity
+/// for `run_id`; `Ok(true)` means the same id was already present (resume).
+pub trait ProgressIdentityStore: Send + Sync {
+    fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
 }
 
 /// Mutable normalizer owned by one progress ingress.
@@ -799,6 +819,15 @@ pub trait ProgressSessionNormalizer: Send {
     fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
     fn transcript_path_for_session(&mut self, raw: &serde_json::Value) -> Option<String>;
+}
+
+/// Mutable normalizer owned by one transcript consumer.
+///
+/// Some transcript dialects put tool input and output in separate records.
+/// Per-tail state correlates those records without leaking call ids across
+/// concurrently running slots.
+pub trait TranscriptSessionNormalizer: Send {
+    fn normalize_transcript_entry(&mut self, raw: serde_json::Value) -> serde_json::Value;
 }
 
 /// A turn-ended signal for [`Capability::TurnBoundary`]: the driver-agnostic
@@ -1438,6 +1467,21 @@ pub trait AgentDriver: Send + Sync {
     /// Returns `None` when the payload carries no (or an empty) transcript
     /// path; the caller retries on a later payload.
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String>;
+
+    /// Create mutable correlation state for one transcript tail.
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        None
+    }
+
+    /// Canonical root a local transcript must remain beneath at every read.
+    ///
+    /// `Ok(None)` is the legacy unrestricted path used by drivers whose
+    /// transcript path is itself authoritative. A contained driver returns a
+    /// root; an invalid or replaced run home returns `Err` so callers reject
+    /// the transcript rather than falling back to an unrestricted open.
+    fn transcript_containment_root(&self, _run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        Ok(None)
+    }
 
     /// Normalise a raw transcript JSONL entry to the canonical redactable
     /// field shape that `boss_engine_live_status_redact` and the live-status

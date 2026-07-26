@@ -59,7 +59,7 @@
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-use boss_engine_driver::{AgentDriver, ProgressSessionConfig, ProgressSessionNormalizer};
+use boss_engine_driver::{AgentDriver, ProgressIdentityStore, ProgressSessionConfig, ProgressSessionNormalizer};
 use boss_protocol::WorkerEvent;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
@@ -198,13 +198,19 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// The run context is passed only to the driver's per-ingress normalizer;
     /// the generic reader remains unaware of driver-specific workspace or
     /// transcript layouts.
-    pub fn for_run(stream: R, driver: Arc<dyn AgentDriver>, run_id: impl Into<String>) -> Self {
+    pub fn for_run(
+        stream: R,
+        driver: Arc<dyn AgentDriver>,
+        run_id: impl Into<String>,
+        identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+    ) -> Self {
         Self::with_config_and_session(
             stream,
             driver,
             ReaderConfig::default(),
             ProgressSessionConfig {
                 run_id: Some(run_id.into()),
+                identity_store,
             },
         )
     }
