@@ -1,11 +1,12 @@
 # Ghostty + Codex pane viability spike
 
 - **Date:** 2026-07-26
-- **Work item:** task_18c5d06ab766c0a8_167 (ghostty + codex pane viability)
+- **Work item:** ghostty + codex pane viability
 - **Kind:** empirical throwaway harness — no Boss integration, no CodexDriver code
 - **Pinned versions (re-checked before each observation cluster):**
   - `codex-cli 0.145.0` (`/Users/brianduff/.local/bin/codex` → `~/.codex/packages/standalone/current/bin/codex`)
-  - Ghostty `1.3.1` (stable) (`/Applications/Ghostty.app`)
+  - Ghostty `1.3.1` (stable) (`/Applications/Ghostty.app`) — Layer A outsider topology only
+  - **GhosttyKit** prebuilt `ghosttykit-5659cef` (`spinyfin/ghostty-prebuilts`, same pin as `MODULE.bazel` `@ghostty_kit`, sha256 `82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1`) — Layer D embed topology
 - **Host:** macOS (Darwin), no `/proc/<pid>/fd`
 - **Related:** [codex-progress-channel-decision-2026-07-24.md](./codex-progress-channel-decision-2026-07-24.md); Codex driver design (PR discussion around §A-1 / OQ-5 / T-05 / T-17); PR #2363 (engine-side stdout JSONL reader)
 
@@ -18,27 +19,101 @@ Two careful positions currently contradict each other on an empirical question:
 
 Both cannot be true as statements about the _pane-hosted Boss shape_. This spike settles that (Q1) and six neighboring execution-shape questions by observation.
 
+**Revision:** The first pass answered "can an **engine-like outsider** with only `shell_pid` read stdout?" It did **not** answer whether the **Boss app surface / GhosttyKit embedder** can observe or inject. Treating "outsider cannot open the slave" as "reading pane content is impossible" is a category error if GhosttyKit exposes surface text to the embedding process. Layer D re-tests Q1/Q2 on that honest apparatus.
+
 ## Method / apparatus
 
-Throwaway only. Three layers of harness:
+Throwaway only. Four layers of harness:
 
-| Layer                        | What it is                                                          | Used for                                                                                                                                   |
-| ---------------------------- | ------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| **A. Real Ghostty window**   | `open -na Ghostty.app --args -e <script>`                           | Q1 (pane-owned pty + `shell_pid` only), Q4                                                                                                 |
-| **B. Local pty-owner**       | Python `pty.openpty()` holding the master, child shell on the slave | Q1 (master-side capture contrast), Q2 (master inject + **harness-emulated** post-exit `read`/`eval` — not pure interactive zsh), Q3/Q5 TUI |
-| **C. Direct process / pipe** | `codex exec --json … </dev/null` with the observer owning stdout    | Q6, Q7, contrast for Q1                                                                                                                    |
+| Layer                        | What it is                                                                                                                                                                         | Used for                                                                                                                 |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| **A. Real Ghostty window**   | `open -na Ghostty.app --args -e <script>`                                                                                                                                          | Q1 outsider topology (pane-owned pty + `shell_pid` only), Q4                                                             |
+| **B. Local pty-owner**       | Python `pty.openpty()` holding the master, child shell on the slave                                                                                                                | Q1 master-side capture contrast; Q2 master inject + **harness-emulated** post-exit `read`/`eval` (first pass); Q3/Q5 TUI |
+| **C. Direct process / pipe** | `codex exec --json … </dev/null` with the observer owning stdout                                                                                                                   | Q6, Q7, contrast for Q1 engine-spawn                                                                                     |
+| **D. GhosttyKit embed host** | Minimal AppKit process embedding libghostty via the **same APIs Boss uses** (`ghostty_surface_new` / `ghostty_surface_read_text` / `ghostty_surface_text` + `ghostty_surface_key`) | **Q1 embed topology**, **Q2 Boss-equivalent inject** (real interactive shell)                                            |
 
-Harness scripts and selected raw captures are under [`ghostty-codex-pane-viability-artifacts/`](./ghostty-codex-pane-viability-artifacts/).
+Harness scripts and selected raw captures are under [`ghostty-codex-pane-viability-artifacts/`](./ghostty-codex-pane-viability-artifacts/). Layer D source + evidence: [`ghosttykit_host/`](./ghostty-codex-pane-viability-artifacts/ghosttykit_host/).
 
 Prompts were deliberately short (`reply with exactly: …`, `sleep N`) to limit cost/time.
 
 ---
 
-## Q1 — Can a separate process read the agent's stdout when the terminal app owns the pty?
+## GhosttyKit apparatus (Layer D)
+
+### What Boss actually uses
+
+From `tools/boss/app-macos/Sources/Ghostty/`:
+
+| Operation              | Boss call site                                                         | GhosttyKit C API                                                                                                           |
+| ---------------------- | ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| Bootstrap              | `GhosttyRuntime` / `GhosttyBootstrap`                                  | `ghostty_init`, `ghostty_config_new`, `ghostty_app_new`                                                                    |
+| Embed surface          | `GhosttyTerminalHostView.makeSurface`                                  | `ghostty_surface_new` with `GHOSTTY_PLATFORM_MACOS` + `nsview`                                                             |
+| Spawn worker           | `TerminalLaunchSpec.initialInput` → surface config                     | `ghostty_surface_config_s.initial_input` typed into the pane shell                                                         |
+| Observe pane text      | Claude monitor scrape in `GhosttyTerminalHostView.readVisibleContents` | **`ghostty_surface_read_text(surface, selection, &text)`** with `GHOSTTY_POINT_VIEWPORT` top-left → bottom-right           |
+| SendToPane / intervene | `WorkersWorkspaceModel.sendToPane` → `host.submitText`                 | **`ghostty_surface_text`** (paste path) then **`ghostty_surface_key` Return** (`keycode 0x24`, `unshifted_codepoint 0x0D`) |
+| Interrupt              | `host.sendInterrupt`                                                   | `ghostty_surface_key` Esc (`keycode 0x35`)                                                                                 |
+| Shell pid for engine   | `ghostty_surface_foreground_pid`                                       | same                                                                                                                       |
+
+The engine never holds the pty master; it receives `shell_pid` after attach. Observation of pane content, if any, must happen **in the app process that owns GhosttyKit** (or via a file channel such as rollout). Layer D tests that app-side path without wiring production Boss.
+
+### Throwaway host
+
+[`ghostty-codex-pane-viability-artifacts/ghosttykit_host/`](./ghostty-codex-pane-viability-artifacts/ghosttykit_host/) is a minimal SwiftPM AppKit executable that:
+
+1. Links the **pinned** GhosttyKit xcframework (`ghosttykit-5659cef`, not the Bazel analysis stub at `ThirdParty/`).
+2. Creates a window + `NSView`, `ghostty_surface_new`, default shell + `initial_input` running a pane script with `codex exec --json … "run: sleep 18; reply with exactly: gkit-embed-done"`.
+3. Polls **`ghostty_surface_read_text`** (viewport + screen) every 0.5s — same selection shape Boss uses for the Claude monitor.
+4. Mid-run (~t=6s) injects via **Boss-equivalent `submitText`** (`ghostty_surface_text` + Return).
+5. After the script returns to the interactive shell prompt, injects again post-exit.
+
+Commands:
+
+```sh
+cd tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host
+# materialize pinned xcframework (not committed; see README.md)
+curl -fsSL -o /tmp/GhosttyKit-5659cef.tar.gz \
+  "https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-5659cef/GhosttyKit-5659cef.tar.gz"
+# sha256 must be 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
+tar -xzf /tmp/GhosttyKit-5659cef.tar.gz && mv GhosttyKit.xcframework .local-GhosttyKit.xcframework
+./run.sh   # swift build -c release && ghosttykit_spike
+# committed evidence snapshot under evidence/
+```
+
+Pinned stamps from the successful run (`evidence/PINS.txt`, `evidence/codex_version.txt`):
+
+```text
+codex-cli 0.145.0
+ghosttykit_prebuilt: ghosttykit-5659cef
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+```
+
+### Layer D raw outcome (headline)
+
+| Signal                                                       | Result                                                                                         |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| `saw_thread_started` via surface text                        | **true** at t≈2.2s                                                                             |
+| `saw_gkit_embed_done` via surface text                       | **true** at t≈26.2s                                                                            |
+| Full `--json` JSONL recoverable in viewport                  | **yes** (`thread.started` / `turn.*` / `item.*` / agent text)                                  |
+| Mid-`codex exec` inject via GhosttyKit                       | echoed mid-stream; **not** agent-consumed                                                      |
+| Post-script **interactive zsh** executed buffered mid-inject | **yes** — `injected_side_effect.txt` = `GKIT_INJECT_VIA_SURFACE_TEXT` (**not** harness `eval`) |
+| Post-exit inject on idle shell                               | **yes** — `post_exit_side_effect.txt` = `GKIT_POST_EXIT_INJECT`                                |
+| `codex_exit`                                                 | `0`                                                                                            |
+
+Evidence: `ghosttykit_host/evidence/SUMMARY.txt`, `host.log`, `viewport_final.txt`.
+
+---
+
+## Q1 — Dual topology: outsider `shell_pid` vs GhosttyKit embedder
 
 ### Claim under test
 
-Reproduce the Boss shape: pane-hosted process; outside observer holds only `shell_pid`. Is stdout readable from outside?
+Two **different** observers — do not collapse them:
+
+1. **Outsider / engine-like (Layers A/B/C):** separate process holds only `shell_pid` (and maybe the slave tty path). Can it read stdout?
+2. **Embedder / app-like (Layer D):** process that owns the GhosttyKit surface. Can it observe worker output via GhosttyKit APIs?
+
+### Topology 1 — outsider with only `shell_pid` (first pass; still stands)
 
 ### What we ran
 
@@ -109,7 +184,7 @@ Stdout is fully readable by the parent (as expected):
 
 A local pty-owner that holds the **master** also captures every byte of codex JSONL (see Q2 harness: `master_capture bytes: 898`).
 
-### Interpretation
+### Interpretation (topology 1 only)
 
 **No. An outside process that holds only `shell_pid` cannot read the pane-hosted agent's stdout on this host.**
 
@@ -119,23 +194,63 @@ What blocks it, exactly:
 2. **The data path is master←slave.** Writes to the slave go to the terminal emulator's master buffer. Opening the slave path from a third process and reading yields **0 bytes** (observed), not a shared copy of the stream.
 3. **Debugger-level access** (`ptrace` / Instruments / SIP-off `dtruss`) is the only realistic way to steal another process's fds, and is not a Boss-engine transport.
 
-### What this settles about the #2363 dispute
+This is the **engine-only** topology. It does **not** speak to whether the GhosttyKit owner can observe surface text — that is Topology 2 below.
 
-| Statement                                                                                                 | Verdict against observation                                                                                        |
-| --------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| "Engine-side stdout JSONL reader works when the **engine spawns** codex and owns the pipe/pty master"     | **Supported.** Direct pipe and local master harness both see full JSONL.                                           |
-| "Engine-side stdout JSONL reader works when the **app owns the pty** and the engine only has `shell_pid`" | **Refuted.** Q1 observed zero readable bytes; no macOS mechanism without the master or the pipe end.               |
-| "PR #2363 makes T-05 implementable against the _current_ app/engine pane split"                           | **Refuted as stated**, unless the app also forwards the stream (or the design stops relying on pane-owned stdout). |
+### Topology 2 — embedding process owns GhosttyKit (Layer D)
 
-**Subtlety (do not flatten to yes/no):** #2363's reader code can be correct and useful for an _engine-spawned_ worker. It is not a solution to the _app-owned-pty + shell_pid-only_ shape. Those are different topologies. The design and the review were talking past each other.
+```sh
+# ghosttykit_spike (Layer D) owns surface; polls:
+#   ghostty_surface_read_text(surface, GHOSTTY_POINT_VIEWPORT, …)
+# while pane shell runs codex exec --json …
+```
+
+Observed from the **same process** that called `ghostty_surface_new` (`evidence/host.log`):
+
+```text
+[2.2] OBSERVED thread.started in surface text
+[26.2] OBSERVED gkit-embed-done in surface text
+```
+
+`evidence/viewport_final.txt` contains the full exec JSONL dialect, including:
+
+```jsonl
+{"type":"thread.started","thread_id":"019f9e22-a1d8-7660-8657-7c39f7a6e43e"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{…,"text":"gkit-embed-done"}}
+{"type":"turn.completed","usage":{…}}
+```
+
+JSONL is recovered as **rendered terminal text** (what the surface shows), not as a raw master-fd stream. For `codex exec --json` this is effectively byte-faithful line content; a TUI would be screen-scraped (cursor noise), which is a different recovery quality.
+
+`GHOSTTY_POINT_SCREEN` returned the same content as viewport for this short session (1997 bytes each).
+
+### Q1 dual-topology summary
+
+| Topology                                     | Observer                     | Result                                                                                         |
+| -------------------------------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
+| App-owned pty, outsider has only `shell_pid` | Engine-like separate process | **Cannot read** (0 bytes; no `/proc` fd; slave open ≠ master stream)                           |
+| Engine spawns and owns pipe/pty master       | Engine parent                | **Can read** full JSONL                                                                        |
+| **GhosttyKit embedder owns surface**         | App process (Boss-like)      | **Can observe** via `ghostty_surface_read_text` — full JSONL / agent text recovered in Layer D |
+
+### What this settles about the #2363 dispute (revised)
+
+| Statement                                                                                                 | Verdict against observation                                                                                |
+| --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| "Engine-side stdout JSONL reader works when the **engine spawns** codex and owns the pipe/pty master"     | **Supported.** Direct pipe and local master harness both see full JSONL.                                   |
+| "Engine-side stdout JSONL reader works when the **app owns the pty** and the engine only has `shell_pid`" | **Refuted.** Outsider Q1 observed zero readable bytes.                                                     |
+| "The **app** (GhosttyKit owner) can observe pane-hosted worker output"                                    | **Supported (Layer D).** `ghostty_surface_read_text` recovers exec JSONL while codex runs.                 |
+| "PR #2363 makes T-05 implementable against the _current_ app/engine pane split **from the engine alone**" | **Still refuted** for engine-only topology. App-forwarding or file-tail still required for engine ingress. |
+| "Reading pane content is impossible because outsider cannot open the slave"                               | **Category error.** Outsider block ≠ embedder block.                                                       |
+
+**Subtlety (do not flatten):** #2363's reader remains correct for engine-spawn. Pane-hosted progress for the **engine** still needs app-forwarded stream, rollout tail, or equivalent — but the **app** is not blind: GhosttyKit already exposes the surface text Boss uses for Claude monitoring.
 
 ---
 
-## Q2 — What happens when text is injected into the pty of a pane running `codex exec`?
+## Q2 — Dual topology: master inject vs GhosttyKit SendToPane
 
 ### Claim under test
 
-Because `codex exec` runs one turn and exits **without consuming typed input as agent input**, injected prose can land in the pty input buffer; a subsequent shell that reads that buffer may then treat the line as a command. (Whether execution is automatic depends on the post-exit shell apparatus — see honesty notes below.)
+What happens when text is injected into a pane running `codex exec` — via (B) raw master write / harness-emulated post-exit shell, vs (D) Boss-equivalent GhosttyKit `submitText` into a real interactive shell.
 
 ### Apparatus honesty (read this first)
 
@@ -203,21 +318,80 @@ echo INJECTED_VIA_MASTER > /tmp/codex-pane-spike/injected_side_effect.txt
 | **Execution of injected text**                     | **Yes, harness-emulated only** | Explicit post-exit `read -r` + `eval "$LINE"` in `pty_owner.py` — **not** pure interactive Ghostty zsh |
 | Real Ghostty interactive shell auto-exec           | **Not observed**               | Not claimed                                                                                            |
 
-### Interpretation
+### Interpretation (Layer B apparatus)
 
-**Footgun risk is real; the apparatus must not be overstated.**
+**Footgun risk is real on Layer B; execution claim was apparatus-qualified.**
 
 While `codex exec` is foreground on an open-tty pane shape:
 
 - It does **not** consume the injected line as agent input (positional prompt already supplied; stdin is the open tty but unused for the turn).
 - The line is echoed on the master and **survives in the input buffer** across codex exit.
-- A **subsequent shell read can consume that line**. In this spike, consumption + execution were produced by the harness's explicit `read`/`eval` after codex exited — a deliberate stand-in for "shell regains the line," not a recording of real Ghostty interactive zsh running the inject.
+- A **subsequent shell read can consume that line**. In Layer B, consumption + execution were produced by the harness's explicit `read`/`eval` after codex exited — a deliberate stand-in, not pure interactive zsh.
 
-**Design implication (still holds):** Boss `SendToPane` (or any master-side write) while a `codex exec` worker is mid-turn is **not** mere hygiene. On a **real interactive pane**, the same master-side inject leaves bytes in the tty input path that an interactive shell would be expected to read as the next command once the agent process exits. A guard ("is this worker accepting typed input") remains a **safety fix** for that real shape — even though this spike's **execution proof** was harness-emulated rather than interactive-Ghostty-observed.
+Layer D (next) removes the interactive-shell caveat.
 
-Nuance: the footgun is about _post-exit shell consumption of buffered master input_, not about codex interpreting the inject as a new turn. `codex exec` itself did not run the injected command.
+### Topology D — GhosttyKit SendToPane-equivalent (Layer D; stronger apparatus)
+
+**Apparatus honesty:** Layer D inject uses the **same path as Boss `SendToPane` / `GhosttyTerminalHostView.submitText`**: `ghostty_surface_text` then `ghostty_surface_key` Return. The pane shell is GhosttyKit's default interactive zsh (not a constructed `read`/`eval`). Mid-inject runs while `codex exec` is foreground; post-exit inject runs after the pane script returns to the interactive prompt.
+
+What we ran (see `ghosttykit_host/Sources/main.swift`, `evidence/host.log`):
+
+```text
+[6.2] INJECT mid_codex body=echo GKIT_INJECT_VIA_SURFACE_TEXT > …/injected_side_effect.txt
+[6.2] INJECT mid_codex Return sent
+… codex continues sleep 18 …
+[26.2] OBSERVED gkit-embed-done in surface text
+[26.2] SIDE_EFFECT after mid inject (interactive shell): GKIT_INJECT_VIA_SURFACE_TEXT
+[26.2] INJECT post_exit body=echo GKIT_POST_EXIT_INJECT > …/post_exit_side_effect.txt
+[26.2] INJECT post_exit Return sent
+… post_exit_side_effect: GKIT_POST_EXIT_INJECT
+codex_exit: 0
+```
+
+Viewport mid-stream shows the inject **echoed** into the JSONL visual stream (codex does not treat it as a new agent prompt):
+
+```jsonl
+{"type":"turn.started"}
+{"type":"item.completed","item":{…,"text":"Running the requested command."}}
+echo GKIT_INJECT_VIA_SURFACE_TEXT > …/injected_side_effect.txt
+{"type":"item.started","item":{…,"command":"/bin/zsh -lc 'sleep 18'",…}}
+…
+{"type":"item.completed","item":{…,"text":"gkit-embed-done"}}
+{"type":"turn.completed",…}
+SCRIPT_DONE
+… % echo GKIT_INJECT_VIA_SURFACE_TEXT > …/injected_side_effect.txt   # interactive zsh ran buffered line
+… % echo GKIT_POST_EXIT_INJECT > …/post_exit_side_effect.txt
+```
+
+### Outcome classification (dual topology)
+
+| Outcome                             | Layer B (pty master + harness `eval`) | Layer D (GhosttyKit + interactive zsh)                           |
+| ----------------------------------- | ------------------------------------- | ---------------------------------------------------------------- |
+| Inert no-op                         | No                                    | No                                                               |
+| Echoed mid-JSONL while codex runs   | Yes                                   | Yes                                                              |
+| Codex treats inject as agent prompt | No                                    | No                                                               |
+| Buffer survives codex exit          | Yes                                   | Yes                                                              |
+| Subsequent shell consumes line      | Yes (harness `read -r`)               | **Yes (real interactive zsh)**                                   |
+| Execution of injected command       | Yes, **harness-emulated `eval` only** | **Yes, interactive shell** (`GKIT_INJECT_VIA_SURFACE_TEXT` file) |
+| Post-exit SendToPane on idle shell  | Not primary                           | **Yes** (`GKIT_POST_EXIT_INJECT`)                                |
+
+### Interpretation (revised)
+
+**Footgun is confirmed on the honest GhosttyKit / interactive-shell apparatus, not only the harness stand-in.**
+
+While `codex exec` is foreground on an open-tty pane shape:
+
+- It does **not** consume the injected line as agent input.
+- GhosttyKit inject (`ghostty_surface_text` + Return) is echoed and **survives** in the tty input path across codex exit.
+- When the pane returns to an **interactive shell**, that shell **executes** the buffered line (Layer D side-effect file). Layer B's harness `read`/`eval` was a valid stand-in; Layer D removes the "not pure interactive zsh" caveat for the execution claim.
+
+**Design implication (strengthened):** Boss `SendToPane` while a `codex exec` worker is mid-turn is a **safety issue**, not hygiene. A guard ("is this worker accepting typed input") remains required for real interactive panes.
+
+Nuance unchanged: the footgun is post-exit shell consumption of buffered input, not codex interpreting the inject as a new turn.
 
 ---
+
+> **Q3–Q7:** CLI-level results; Layer D does not change them. Left as first-pass observations below.
 
 ## Q3 — Does `codex "$(cat prompt.txt)"` auto-submit its positional prompt?
 
@@ -465,58 +639,62 @@ TUI and exec rollouts share this internal schema. TUI does **not** lack rollout 
 
 ## Design-claims matrix
 
-| Design / review claim                                                          | Observation                                                                               | Supports / Refutes                                                                 |
-| ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| Engine can read worker stdout JSONL when it owns the pipe/spawn                | Pipe parent reads full JSONL                                                              | **Supports**                                                                       |
-| Engine can read worker stdout JSONL given only `shell_pid` under app-owned pty | 0 bytes; no `/proc` fd access; slave open does not see master stream                      | **Refutes**                                                                        |
-| PR #2363 alone makes pane-shaped T-05 implementable                            | Reader helps only if topology feeds it a stream                                           | **Refutes** (as a pane-topology claim)                                             |
-| Progress ingress could be `AgentJsonlFile { discovery }` via rollout           | File exists, grows live, discoverable by thread_id / dir watch                            | **Supports**                                                                       |
-| `StdoutJsonl` as progress ingress for **pane-hosted** workers                  | Blocked by Q1 unless app forwards stdout                                                  | **Refutes for pane shape**                                                         |
-| `StdoutJsonl` for **engine-spawned** `codex exec --json`                       | Works end-to-end                                                                          | **Supports**                                                                       |
-| Non-interactive v1 (`codex exec --json`) is observable at all                  | Fully observable via stdout _and_ rollout                                                 | **Supports** (operator's "non-interactive v1 is acceptable")                       |
-| Injected pane text during `codex exec` is inert                                | Master inject echoed + survives; post-exit `read` gets line; exec via harness `eval` only | **Refutes inert** (apparatus-qualified; not pure interactive zsh)                  |
-| `SendToPane` guard is mere hygiene                                             | Buffer survives master inject; real interactive panes would consume next line             | **Refutes** — **safety fix** (design implication; exec proof was harness-emulated) |
-| Positional prompt auto-submits like Claude CLI                                 | Yes for TUI; exec also runs prompt without Enter                                          | **Supports**                                                                       |
-| `--no-alt-screen` usable in Ghostty                                            | No alt-screen CSI; turn succeeds; TERM=xterm-ghostty                                      | **Supports**                                                                       |
-| Esc aborts turn, process lives, further turns possible                         | `turn_aborted` + second `task_complete`                                                   | **Supports**                                                                       |
-| T-17 `exec resume` probe/nudge viable (OQ-5 never spiked)                      | Resume delivers prompt; new `turn.started`                                                | **Supports**                                                                       |
-| TUI rollout has same `aggregated_output` richness as `--json`                  | Different schema (`custom_tool_call_output` vs item.aggregated_output)                    | **Refutes equality**; both are rich enough for progress with different parsers     |
+| Design / review claim                                                             | Observation                                                                          | Supports / Refutes                                            |
+| --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
+| Engine can read worker stdout JSONL when it owns the pipe/spawn                   | Pipe parent reads full JSONL                                                         | **Supports**                                                  |
+| Engine can read worker stdout JSONL given only `shell_pid` under app-owned pty    | 0 bytes; no `/proc` fd access; slave open does not see master stream                 | **Refutes**                                                   |
+| **App / GhosttyKit owner can observe pane-hosted worker output**                  | Layer D: `ghostty_surface_read_text` recovers full exec JSONL + agent text           | **Supports**                                                  |
+| PR #2363 alone makes pane-shaped T-05 implementable **from the engine**           | Reader helps only if topology feeds the engine a stream                              | **Refutes** (engine-only); app can still scrape/forward       |
+| Progress ingress could be `AgentJsonlFile { discovery }` via rollout              | File exists, grows live, discoverable by thread_id / dir watch                       | **Supports**                                                  |
+| `StdoutJsonl` as progress ingress for **pane-hosted** workers **into the engine** | Blocked by outsider Q1 unless app forwards or engine uses file channel               | **Refutes for engine←pane without forward**                   |
+| `StdoutJsonl` for **engine-spawned** `codex exec --json`                          | Works end-to-end                                                                     | **Supports** (keep)                                           |
+| Non-interactive v1 (`codex exec --json`) is observable at all                     | Fully observable via stdout (engine-spawn), rollout, **or app surface scrape**       | **Supports**                                                  |
+| Injected pane text during `codex exec` is inert                                   | Master + GhosttyKit inject echoed + survives; **interactive zsh executes** (Layer D) | **Refutes inert**                                             |
+| `SendToPane` guard is mere hygiene                                                | Layer D interactive-shell execution after mid-inject                                 | **Refutes** — **safety fix**                                  |
+| Positional prompt auto-submits like Claude CLI                                    | Yes for TUI; exec also runs prompt without Enter                                     | **Supports** (Q3; unchanged)                                  |
+| `--no-alt-screen` usable in Ghostty                                               | No alt-screen CSI; turn succeeds; TERM=xterm-ghostty                                 | **Supports** (Q4; unchanged)                                  |
+| Esc aborts turn, process lives, further turns possible                            | `turn_aborted` + second `task_complete`                                              | **Supports** (Q5; unchanged)                                  |
+| T-17 `exec resume` probe/nudge viable (OQ-5 never spiked)                         | Resume delivers prompt; new `turn.started`                                           | **Supports** (Q6; unchanged)                                  |
+| TUI rollout has same `aggregated_output` richness as `--json`                     | Different schema (`custom_tool_call_output` vs item.aggregated_output)               | **Refutes equality**; both rich enough with different parsers |
 
 ### Immediate decisions this unblocks
 
-1. **Codex v1 shape:** Non-interactive `codex exec --json` is empirically fine for observation **if and only if** the observer owns stdout **or** tails the rollout. Pane-owned stdout alone is not enough (Q1).
+1. **Codex v1 shape:** Non-interactive `codex exec --json` is empirically fine for observation **when** the observer owns stdout, tails the rollout, **or is the GhosttyKit embedder** scraping surface text. Pane-owned stdout alone is not enough for an **engine outsider** (Q1 topology 1).
 2. **Progress ingress:**
-   - Pane-hosted workers → **`AgentJsonlFile` / rollout tail** (or app-forwarded stream — not observed here).
-   - Engine-spawned workers → **`StdoutJsonl` is valid** (and nicer: `command_execution.aggregated_output` already normalized).  
-     Reusing `engine/transcript-tail` for discovery+tail matches Q7.
-3. **`SendToPane` guard:** **Safety fix** (Q2), not hygiene — buffer survives master inject on open-tty `codex exec`; do not over-read the harness `eval` as pure interactive-shell proof.
-4. **T-17 `exec resume`:** **Viable** (Q6). OQ-5 can be closed on the "does it deliver / does `turn.started` fire" axis.
+   - Engine reading **pane-hosted** workers → still needs **`AgentJsonlFile` / rollout tail** or an **app-forwarded** channel (surface scrape lives in the app, not the engine).
+   - Engine-spawned workers → **`StdoutJsonl` is valid** (keep).
+   - App-local features (Claude-monitor-style) → **`ghostty_surface_read_text` is valid now** (Layer D).
+3. **`SendToPane` guard:** **Safety fix** (Q2 Layer D), not hygiene — interactive shell executed buffered inject after `codex exec`.
+4. **T-17 `exec resume`:** **Viable** (Q6). Unchanged by embed revision.
 
-CodexDriver skeleton + spawn/provisioning taxonomy rows that assumed "engine reads pane stdout" are **premise-affected** and should be rewritten around the topology that actually works.
+CodexDriver skeleton + spawn/provisioning taxonomy rows that assumed "engine reads pane stdout via shell_pid" remain **premise-affected**. Rows that assumed "nobody can read pane content" should distinguish engine vs app.
 
 ---
 
 ## Surprises (not on the original seven)
 
 1. **`codex exec` under a shell pipeline changes fd topology.** `codex … | tee file` makes codex stdout a pipe even inside Ghostty; pure TTY inherit is the honest pane shape. Measure both, don't confuse them.
-2. **Slave-path write ≠ typed input on modern macOS.** `TIOCSTI` is permission-denied; writing the slave is unreliable. Only master-side inject (app / pty owner) reproduces `SendToPane`.
+2. **Slave-path write ≠ typed input on modern macOS.** `TIOCSTI` is permission-denied; writing the slave is unreliable. Only master-side / GhosttyKit inject reproduces `SendToPane`.
 3. **Stdout JSONL and rollout JSONL are different dialects.** A driver cannot treat them as the same parser with a different source. Abort lives in rollout `event_msg.turn_aborted`; exec stdout uses `turn.started` / `turn.completed` / `item.*`.
 4. **TUI positional prompt auto-runs but does not auto-exit.** Process lifecycle differs sharply from `codex exec`.
 5. **Resume reuses `thread_id` and emits `thread.started` again** on the new process — handy for correlation, easy to misread as a brand-new thread if you only key on the event type.
 6. **Ghostty on macOS CLI:** `ghostty +new-window` is unsupported; `open -na Ghostty.app --args -e …` is the working launch path. `login -flp` wraps `-e` commands.
 7. **Rollout appears essentially immediately** (t≈0 in dir watch) — discovery latency is not a practical obstacle.
+8. **GhosttyKit surface scrape recovers full `codex exec --json` lines** (Layer D) — the embedder is not subject to the outsider `shell_pid` block. This was the category-error correction for the outsider-vs-embedder conflation.
+9. **Interactive zsh really does execute buffered GhosttyKit inject** after `codex exec` (Layer D side-effect files) — stronger than the Layer B harness `eval` stand-in.
 
 ---
 
 ## Residual unknowns
 
-- **App-forwarded stream:** If the Boss macOS app ever grew "mirror pane bytes to engine," Q1's block would lift without changing codex. Not tested (no Boss integration in this spike).
+- **App-forwarded stream to engine:** Layer D proves the app can scrape; it does **not** implement engine IPC for that scrape. Wiring surface text (or a master tee) into the engine remains design work.
+- **Whether surface scrape is a good long-term progress channel:** Recovered text is rendered scrollback, not a dedicated master tee. Fine for short `codex exec --json` lines; weaker for noisy TUI. Rollout tail may still be preferable for engine ingress.
 - **`codex exec` + Esc:** Esc abort was tested on **TUI**, not on `exec` (exec is non-interactive; there is no Esc surface). Abort-via-signal (SIGINT/SIGTERM) to `exec` mid-turn was not spiked.
 - **`--ephemeral`:** Claimed to skip session files; not re-verified.
-- **Windows / Linux pane topology:** macOS-specific blocks (`/proc` absence, `TIOCSTI` denial) may differ; Linux `/proc/pid/fd` still does not let you _read_ another process's open write-end usefully without `splice`/ptrace games — likely same conclusion, different error path.
+- **Windows / Linux pane topology:** macOS-specific outsider blocks (`/proc` absence, `TIOCSTI` denial) may differ; embedder APIs are GhosttyKit/libghostty-specific.
 - **Rollout rotation / multi-day sessions / resume path stability across days:** not stressed.
-- **Whether Ghostty itself can be asked (API) for scrollback text** as an alternative observer channel: not tested.
-- **Cost / rate limits:** one TUI run printed a usage-limit tip ("2 usage limit resets available"); not characterized further.
+- **Deep scrollback beyond viewport/screen:** Layer D used `GHOSTTY_POINT_VIEWPORT` and `GHOSTTY_POINT_SCREEN` (same content in the short run). Very long sessions may need scrolling/selection variants; not stressed.
+- **Cost / rate limits:** one TUI run printed a usage-limit tip; not characterized further.
 
 ---
 
@@ -529,6 +707,11 @@ codex-cli 0.145.0
 $ /Applications/Ghostty.app/Contents/MacOS/ghostty +version
 Ghostty 1.3.1
   channel: stable
+
+$ # GhosttyKit (Layer D) — MODULE.bazel @ghostty_kit
+ghosttykit-5659cef
+sha256: 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
+url: https://github.com/spinyfin/ghostty-prebuilts/releases/download/ghosttykit-5659cef/GhosttyKit-5659cef.tar.gz
 ```
 
 Re-check these before treating any follow-up observation as comparable.
@@ -551,3 +734,10 @@ Re-check these before treating any follow-up observation as comparable.
 | `ghostty-codex-pane-viability-artifacts/q6_out1.jsonl` / `q6_out2.jsonl`  | exec + exec resume                                                           |
 | `ghostty-codex-pane-viability-artifacts/q7_stdout.jsonl`                  | exec --json stdout for tail session                                          |
 | `ghostty-codex-pane-viability-artifacts/q7_rollout_sample.jsonl`          | Q7 rollout file sample (same thread as `q7_stdout.jsonl`)                    |
+| `ghostty-codex-pane-viability-artifacts/ghosttykit_host/`                 | **Layer D** throwaway GhosttyKit embed host (source + README + run.sh)       |
+| `ghosttykit_host/Sources/main.swift`                                      | Embed host: surface create, `read_text` poll, `submitText` inject            |
+| `ghosttykit_host/evidence/SUMMARY.txt`                                    | Layer D headline results                                                     |
+| `ghosttykit_host/evidence/host.log`                                       | Layer D timed host log (observe + inject)                                    |
+| `ghosttykit_host/evidence/viewport_final.txt`                             | Layer D full surface scrape (JSONL + injects)                                |
+| `ghosttykit_host/evidence/injected_side_effect.txt`                       | Mid-inject executed by **interactive zsh**                                   |
+| `ghosttykit_host/evidence/post_exit_side_effect.txt`                      | Post-exit SendToPane-equivalent success                                      |

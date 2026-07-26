@@ -1,0 +1,1 @@
+echo GKIT_POST_EXIT_INJECT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/post_exit_side_effect.txt

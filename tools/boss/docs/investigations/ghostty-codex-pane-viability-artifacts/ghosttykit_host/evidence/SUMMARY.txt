@@ -1,0 +1,17 @@
+reason: post_exit_window
+saw_thread_started: true
+saw_gkit_embed_done: true
+viewport_final_bytes: 1997
+screen_final_bytes: 1997
+viewport_contains_thread_started: true
+viewport_contains_gkit_embed_done: true
+viewport_contains_jsonl_turn: true
+mid_inject_side_effect: GKIT_INJECT_VIA_SURFACE_TEXT
+post_exit_side_effect: GKIT_POST_EXIT_INJECT
+codex_exit: 0
+shell_pid_file: 6676
+tty: /dev/ttys009
+foreground_pid_at_end: 6320
+snapshot_count: 9
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path
