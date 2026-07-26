@@ -433,7 +433,29 @@ impl LiveWorkerStateRegistry {
             }
             WorkerEvent::SessionEnd { .. } => {
                 state.activity = WorkerActivity::Terminated;
-                state.current_tool = None;
+                // Deliberately does NOT clear `current_tool`. On the normal
+                // path `Stop` has already cleared it, so preserving it here
+                // is a no-op. On the ABNORMAL path — a `SessionEnd` that
+                // arrives while a `PreToolUse` is still unbalanced — the
+                // unbalanced tool is the single most valuable piece of
+                // evidence the engine holds: the worker was mid-tool when
+                // the session claimed to end, so the claim is contradicted
+                // by the worker's own hook stream and the process is very
+                // likely still running. `husk_pane_sweep` reads exactly
+                // this field (via
+                // [`crate::husk_pane_sweep::live_process_evidence`]) before
+                // it kills a pane's process, and clearing it here erased
+                // the contradiction at precisely the moment it mattered.
+                //
+                // 2026-07-26: six live workers received a synchronized
+                // `SessionEnd { reason: "other" }` burst inside 250ms while
+                // their `claude` processes kept running (three were inside a
+                // multi-minute foreground `bazel` build, so no further hook
+                // was ever going to arrive). This arm flipped all six to
+                // `Terminated` and wiped their in-flight tool; 107 seconds
+                // later the husk sweep retired five of them, killing live
+                // work. Keeping `current_tool` is what lets the corroboration
+                // guard see through a `SessionEnd` the process did not honor.
                 notification_pending.remove(&slot_id);
             }
         }
@@ -945,6 +967,59 @@ mod tests {
         );
         let state = reg.get(1).unwrap();
         assert_eq!(state.activity, WorkerActivity::Terminated);
+    }
+
+    /// Regression test for the 2026-07-26 mass husk-retirement: a
+    /// `SessionEnd` that arrives while a `PreToolUse` is still unbalanced
+    /// must NOT erase the in-flight tool.
+    ///
+    /// That unbalanced tool is the evidence
+    /// `husk_pane_sweep::live_process_evidence` uses to prove the worker is
+    /// still running before an irreversible kill. Clearing it here made a
+    /// worker inside a multi-minute foreground `bazel` build — which emits
+    /// no further hook by definition — indistinguishable from a genuinely
+    /// dead one, and five such workers were SIGTERMed mid-work.
+    #[test]
+    fn session_end_preserves_a_tool_still_in_flight() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 4242, None);
+        reg.apply_event(1, &pre_tool("Bash"));
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionEnd {
+                session_id: "s".into(),
+                reason: "other".into(),
+            },
+        );
+
+        let state = reg.get(1).unwrap();
+        assert_eq!(state.activity, WorkerActivity::Terminated);
+        assert_eq!(
+            state.current_tool.as_deref(),
+            Some("Bash"),
+            "an unbalanced PreToolUse must survive SessionEnd — it is the proof the process is still working",
+        );
+    }
+
+    /// The normal path is unaffected: `Stop` already cleared the tool, so
+    /// a `SessionEnd` after a clean turn boundary still leaves it unset.
+    #[test]
+    fn session_end_after_stop_leaves_no_tool_in_flight() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 4242, None);
+        reg.apply_event(1, &pre_tool("Bash"));
+        reg.apply_event(1, &stop_event());
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionEnd {
+                session_id: "s".into(),
+                reason: "other".into(),
+            },
+        );
+
+        let state = reg.get(1).unwrap();
+        assert_eq!(state.activity, WorkerActivity::Terminated);
+        assert!(state.current_tool.is_none());
     }
 
     #[test]

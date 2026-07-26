@@ -59,6 +59,34 @@
 //! for the new run instead of being mistaken for the same husk observed
 //! twice.
 //!
+//! ## Liveness corroboration (why "the engine forgot it" is not enough)
+//!
+//! Two-pass confirmation guards against a *transient* bookkeeping gap. It
+//! does nothing about a bookkeeping gap that is simply WRONG and stays
+//! wrong, which is what happened on 2026-07-26: six live workers received a
+//! synchronized `SessionEnd { reason: "other" }` burst inside 250ms while
+//! their `claude` processes kept running. `apply_event` flipped each to
+//! `WorkerActivity::Terminated`, [`crate::app::ServerState::list_husk_panes`]
+//! filters terminal entries out of its live set, and so five slots looked
+//! like husks on two consecutive passes and were retired 107 seconds later —
+//! SIGTERMing five workers mid-work, three of them inside a foreground
+//! `bazel` build. `retire_pane`'s own guard re-read the same wrong
+//! bookkeeping and agreed.
+//!
+//! The lesson is that a sweep whose action is irreversible must not take
+//! engine bookkeeping as its only input. [`live_process_evidence`] is the
+//! second, independent opinion: the OS (`kill(pid, 0)`) plus the worker's
+//! own hook stream. It runs in both places — when a pane is *classified*
+//! (so a live worker is never flagged, never counted, and never appears in
+//! `bossctl agents list --all` as a husk) and again inside `retire_pane`
+//! (so the break-glass verb and any future caller inherit it too).
+//!
+//! ## Mass-retirement circuit breaker
+//!
+//! Even with corroboration, a pass that wants to retire many panes at once
+//! is evidence about the engine, not about the panes. See
+//! [`MAX_RETIREMENTS_PER_PASS`].
+//!
 //! ## Cadence
 //!
 //! Runs every [`DEFAULT_INTERVAL`] and fires once immediately on boot, same
@@ -68,8 +96,9 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::HostedPaneEntry;
+use boss_protocol::{HostedPaneEntry, LiveWorkerState};
 
+use crate::dead_pid_sweep::PidStatus;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 
 /// How often the husk-pane sweep runs. 60s mirrors every other periodic
@@ -77,6 +106,117 @@ use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 /// earliest a genuine husk is retired is one interval after it is first
 /// observed.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How recent a hook event must be to count as corroboration that the
+/// worker behind a *terminal* live-state entry is still running. Mirrors
+/// [`crate::dead_pid_sweep::DEAD_PID_CORROBORATION_SECS`] deliberately:
+/// both guards answer the same question ("is this process really gone?")
+/// and should not drift apart.
+pub const HUSK_LIVENESS_CORROBORATION_SECS: i64 = 120;
+
+/// Most panes this sweep will retire in a single pass before tripping the
+/// mass-retirement circuit breaker.
+///
+/// Retiring a pane is irreversible: it SIGTERMs the worker's process group
+/// and destroys whatever uncommitted work that worker held. Several panes
+/// going husk *within the same 60s pass* is not the shape a genuine leak
+/// takes — leaks are produced by one release RPC failing at a time, and the
+/// sweep reclaims them one or two per pass. A burst is far better explained
+/// by engine-side amnesia: one bad global signal (see the `SessionEnd`
+/// burst documented in [`crate::live_worker_state::LiveWorkerStateRegistry::apply_event`])
+/// invalidating the bookkeeping for every slot at once.
+///
+/// The two failure modes are not symmetric. Wrongly retiring N live workers
+/// destroys N workers' in-flight work and cannot be undone. Wrongly
+/// *declining* to retire N genuine husks leaves N stray panes the operator
+/// can reclaim at leisure with `bossctl agents retire-pane <slot>` — the
+/// break-glass verb this sweep automates, which is unaffected by the
+/// breaker. Choose the recoverable failure.
+pub const MAX_RETIREMENTS_PER_PASS: usize = 3;
+
+/// Decide whether a live-state entry contradicts the claim that its pane is
+/// a husk — i.e. whether the worker process behind it is demonstrably still
+/// running. `Some(evidence)` means "do not retire this pane", with
+/// `evidence` naming the contradicting signal for the log.
+///
+/// A husk candidate reaches this function only when the engine's own
+/// bookkeeping says the slot is free (no entry, or a terminal one). That
+/// bookkeeping is exactly what the 2026-07-26 incident proved untrustworthy,
+/// so this is a second, independent opinion sourced from the OS and from the
+/// worker's own hook stream.
+///
+/// Corroboration needs BOTH halves, because neither is sufficient alone:
+///
+/// - **PID liveness alone is not enough.** A genuine husk keeps its
+///   `shell_pid` alive: the pane hosts a shell, `claude` exited inside it,
+///   and the shell lingers. `kill(pid, 0)` reports that shell as alive for a
+///   husk and for a live worker identically, so treating "pid alive" as
+///   "worker alive" would disable the sweep entirely.
+/// - **Hook recency alone is not enough.** `last_event_at` is engine-side
+///   bookkeeping too, and a slot recycled under a stale entry can carry a
+///   prior run's timestamp.
+///
+/// Together they are strong: a shell process that still exists AND a worker
+/// that either has an unbalanced `PreToolUse` outstanding or emitted a hook
+/// within [`HUSK_LIVENESS_CORROBORATION_SECS`] is a worker doing work.
+///
+/// The tool-in-flight half is what covers the long-quiet case that hook
+/// recency cannot: a worker inside a multi-minute foreground `bazel build`
+/// emits nothing at all between its `PreToolUse` and the eventual
+/// `PostToolUse`, so a pure recency window would age it out and kill it
+/// mid-build. This mirrors
+/// [`crate::dead_pid_sweep`]'s `corroborating_liveness` for the same reason.
+pub(crate) fn live_process_evidence(state: &LiveWorkerState, now_epoch_secs: i64) -> Option<String> {
+    // Guard before probing: `kill(0, 0)` signals the caller's own process
+    // group, and a negative pid signals an arbitrary one. A slot that never
+    // reported a shell pid offers no corroboration either way.
+    if state.shell_pid <= 0 {
+        return None;
+    }
+    let status = crate::dead_pid_sweep::probe_pid(state.shell_pid);
+    live_process_evidence_with(state, &status, now_epoch_secs)
+}
+
+/// [`live_process_evidence`] with the PID probe injected, so the decision
+/// is unit-testable without spawning real processes.
+pub(crate) fn live_process_evidence_with(
+    state: &LiveWorkerState,
+    pid_status: &PidStatus,
+    now_epoch_secs: i64,
+) -> Option<String> {
+    if state.shell_pid <= 0 {
+        return None;
+    }
+    // Only an affirmative `ESRCH` clears the way to retire. `EPERM` (process
+    // exists, owned by someone else) and `Unknown` are read conservatively as
+    // "the process may well be there" — the conservative direction here is
+    // sparing the pane, since the alternative is an unrecoverable kill.
+    if matches!(pid_status, PidStatus::Dead) {
+        return None;
+    }
+    let pid = state.shell_pid;
+
+    // An unbalanced `PreToolUse`: the worker entered a tool and never left
+    // it. Survives arbitrarily long quiet periods, which is the whole point.
+    if let Some(tool) = state.current_tool.as_deref() {
+        return Some(format!(
+            "shell pid {pid} is alive and tool `{tool}` is still in flight (last hook {})",
+            state.last_event_at.as_deref().unwrap_or("never"),
+        ));
+    }
+
+    // Otherwise fall back to hook recency.
+    let cutoff = crate::live_worker_state::iso8601_utc(now_epoch_secs - HUSK_LIVENESS_CORROBORATION_SECS);
+    if let Some(event) = state.last_event_at.as_deref()
+        && event >= cutoff.as_str()
+    {
+        return Some(format!(
+            "shell pid {pid} is alive and a hook event arrived at {event}, within {HUSK_LIVENESS_CORROBORATION_SECS}s",
+        ));
+    }
+
+    None
+}
 
 /// Abstracts the app round-trips this sweep needs so it is unit-testable
 /// without a full `ServerState`/app session. Implemented by
@@ -109,6 +249,12 @@ pub struct HuskPaneSweepOutcome {
     /// `true` when this pass's `list_husk_candidates` call failed and the
     /// pass was skipped conservatively.
     pub list_failed: bool,
+    /// `Some(n)` when the mass-retirement circuit breaker tripped: `n`
+    /// confirmed husks — more than [`MAX_RETIREMENTS_PER_PASS`] — were held
+    /// back rather than retired. Those candidates stay confirmed, so the
+    /// breaker keeps tripping (and keeps logging) until an operator resolves
+    /// the disagreement; it never silently degrades into retiring them.
+    pub breaker_tripped: Option<usize>,
 }
 
 impl crate::sweep_loop::SweepOutcome for HuskPaneSweepOutcome {
@@ -120,13 +266,14 @@ impl crate::sweep_loop::SweepOutcome for HuskPaneSweepOutcome {
         // when `retired > 0` left that first pass invisible: five live
         // workers were retired with no trace of which slots were flagged
         // or what the live set held when they were flagged.
-        self.retired > 0 || self.pending_confirmation > 0
+        self.retired > 0 || self.pending_confirmation > 0 || self.breaker_tripped.is_some()
     }
 
     fn log(&self) {
         tracing::info!(
             retired = self.retired,
             pending_confirmation = self.pending_confirmation,
+            breaker_tripped = ?self.breaker_tripped,
             "husk-pane sweep: retired app-hosted pane(s) the engine no longer tracks",
         );
     }
@@ -201,6 +348,52 @@ pub async fn run_one_pass(
             "husk-pane sweep: app-hosted pane with no engine-tracked run observed; \
              awaiting next-pass confirmation before retiring (next pass WILL kill this pane's process)",
         );
+    }
+
+    // Mass-retirement circuit breaker. See `MAX_RETIREMENTS_PER_PASS` for why
+    // a burst is read as engine-side amnesia rather than as a burst of
+    // genuine orphans, and why holding back is the recoverable failure.
+    //
+    // `seen_husks` has already been carried forward by `confirm_two_pass`, so
+    // these candidates stay confirmed: the breaker re-trips (and re-logs)
+    // every pass for as long as the condition holds, instead of quietly
+    // relaxing into a mass kill on some later pass.
+    if confirmed.len() > MAX_RETIREMENTS_PER_PASS {
+        outcome.breaker_tripped = Some(confirmed.len());
+        tracing::error!(
+            confirmed = confirmed.len(),
+            max_per_pass = MAX_RETIREMENTS_PER_PASS,
+            slots = ?confirmed.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
+            "husk-pane sweep: MASS-RETIREMENT CIRCUIT BREAKER TRIPPED — {} panes confirmed as husks in a single \
+             pass exceeds the {MAX_RETIREMENTS_PER_PASS}-per-pass limit. Retiring nothing: a burst this size is \
+             far more likely to be engine bookkeeping that went wrong for every slot at once than that many \
+             simultaneously-orphaned panes, and retiring a live worker is unrecoverable. Verify the panes by hand \
+             and reclaim genuine husks with `bossctl agents retire-pane <slot>`.",
+            confirmed.len(),
+        );
+        for pane in &confirmed {
+            tracing::error!(
+                slot_id = pane.slot_id,
+                run_id = %pane.run_id,
+                task_title = ?pane.task_title,
+                "husk-pane sweep: held back by the mass-retirement circuit breaker; pane NOT retired",
+            );
+        }
+        for pane in confirmed {
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(Stage::HuskPaneReconcile, Outcome::Skipped, pane.run_id.clone())
+                        .with_worker(crate::coordinator::worker_id_for_slot(pane.slot_id))
+                        .with_details(serde_json::json!({
+                            "slot_id": pane.slot_id,
+                            "task_title": pane.task_title,
+                            "skipped_reason": "mass_retirement_circuit_breaker",
+                            "max_per_pass": MAX_RETIREMENTS_PER_PASS,
+                        })),
+                )
+                .await;
+        }
+        return outcome;
     }
 
     for pane in confirmed {
@@ -419,5 +612,186 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].execution_id, "exec-second");
+    }
+
+    // ─── mass-retirement circuit breaker ─────────────────────────────────────
+
+    fn husks(count: usize) -> Vec<HostedPaneEntry> {
+        (0..count).map(|i| husk(i as u8, &format!("exec-{i}"))).collect()
+    }
+
+    /// Exactly [`MAX_RETIREMENTS_PER_PASS`] confirmed husks is under the
+    /// limit and must still be retired — the breaker must not shrink the
+    /// sweep's normal reclaim behaviour.
+    #[tokio::test]
+    async fn breaker_allows_a_pass_at_the_limit() {
+        let batch = husks(MAX_RETIREMENTS_PER_PASS);
+        let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut seen = HashSet::new();
+
+        run_one_pass(&source, &sink, &mut seen).await;
+        let second = run_one_pass(&source, &sink, &mut seen).await;
+
+        assert_eq!(second.retired, MAX_RETIREMENTS_PER_PASS);
+        assert_eq!(second.breaker_tripped, None);
+        assert_eq!(source.retired().len(), MAX_RETIREMENTS_PER_PASS);
+    }
+
+    /// Regression test for the 2026-07-26 incident's blast radius: five
+    /// panes confirmed in one pass must retire NOTHING. Whatever produced
+    /// five simultaneous husks is a statement about the engine, not about
+    /// five independently-orphaned panes, and the kill is irreversible.
+    #[tokio::test]
+    async fn breaker_trips_and_retires_nothing_above_the_limit() {
+        let batch = husks(MAX_RETIREMENTS_PER_PASS + 2);
+        let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch)]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut seen = HashSet::new();
+
+        run_one_pass(&source, &sink, &mut seen).await;
+        let second = run_one_pass(&source, &sink, &mut seen).await;
+
+        assert_eq!(second.breaker_tripped, Some(MAX_RETIREMENTS_PER_PASS + 2));
+        assert_eq!(second.retired, 0, "the breaker must retire nothing at all");
+        assert!(
+            source.retired().is_empty(),
+            "no pane may be torn down while the breaker is tripped"
+        );
+
+        // Every held-back pane is reported as skipped, so the burst is
+        // visible in the dispatch stream and not merely in the log.
+        let events = sink.events().await;
+        assert_eq!(events.len(), MAX_RETIREMENTS_PER_PASS + 2);
+        assert!(events.iter().all(|event| event.outcome == "skipped"));
+        assert!(
+            events
+                .iter()
+                .all(|event| event.details["skipped_reason"] == "mass_retirement_circuit_breaker")
+        );
+    }
+
+    /// A tripped breaker must not silently relax on the next pass: the
+    /// candidates stay confirmed, so the sweep keeps refusing (and keeps
+    /// logging) rather than eventually performing the mass kill it just
+    /// declined.
+    #[tokio::test]
+    async fn breaker_stays_tripped_while_the_burst_persists() {
+        let batch = husks(MAX_RETIREMENTS_PER_PASS + 2);
+        let source = ScriptedSource::new(vec![Some(batch.clone()), Some(batch.clone()), Some(batch)]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut seen = HashSet::new();
+
+        run_one_pass(&source, &sink, &mut seen).await;
+        run_one_pass(&source, &sink, &mut seen).await;
+        let third = run_one_pass(&source, &sink, &mut seen).await;
+
+        assert_eq!(third.breaker_tripped, Some(MAX_RETIREMENTS_PER_PASS + 2));
+        assert_eq!(third.retired, 0);
+        assert!(source.retired().is_empty());
+    }
+
+    /// Once the burst subsides to a plausible size, the sweep resumes
+    /// reclaiming genuine husks — the breaker is a rate limit, not a latch
+    /// that disables the sweep forever.
+    #[tokio::test]
+    async fn breaker_resets_once_the_burst_subsides() {
+        let big = husks(MAX_RETIREMENTS_PER_PASS + 2);
+        let small = vec![husk(0, "exec-0")];
+        let source = ScriptedSource::new(vec![Some(big.clone()), Some(big), Some(small)]);
+        let sink = RecordingDispatchEventSink::new();
+        let mut seen = HashSet::new();
+
+        run_one_pass(&source, &sink, &mut seen).await;
+        let tripped = run_one_pass(&source, &sink, &mut seen).await;
+        assert_eq!(tripped.retired, 0);
+
+        let third = run_one_pass(&source, &sink, &mut seen).await;
+        assert_eq!(third.breaker_tripped, None);
+        assert_eq!(third.retired, 1, "a single husk is retired normally again");
+        assert_eq!(source.retired(), vec![0]);
+    }
+
+    // ─── liveness corroboration ──────────────────────────────────────────────
+
+    /// Build a live-state entry overriding only the fields the corroboration
+    /// decision reads.
+    fn state_with(shell_pid: i32, last_event_at: Option<&str>, current_tool: Option<&str>) -> LiveWorkerState {
+        let mut state = LiveWorkerState::new_spawning(1, "exec-run", "claude-opus-4-7", shell_pid, None);
+        state.activity = boss_protocol::WorkerActivity::Terminated;
+        state.last_event_at = last_event_at.map(ToOwned::to_owned);
+        state.current_tool = current_tool.map(ToOwned::to_owned);
+        state
+    }
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// The incident's core shape: a worker inside a long foreground `bazel`
+    /// build. Its last hook is an unbalanced `PreToolUse` from far outside
+    /// the recency window — recency alone would age it out and kill it — but
+    /// the tool in flight proves it is mid-work.
+    #[test]
+    fn tool_in_flight_corroborates_life_however_long_the_quiet() {
+        let state = state_with(
+            4242,
+            Some(&crate::live_worker_state::iso8601_utc(NOW - 3_600)),
+            Some("Bash"),
+        );
+        let evidence = live_process_evidence_with(&state, &PidStatus::Alive, NOW).expect("must be spared");
+        assert!(evidence.contains("Bash"), "evidence should name the tool: {evidence}");
+    }
+
+    /// The mid-inference victims' shape: no tool in flight, but a hook
+    /// inside the corroboration window.
+    #[test]
+    fn recent_hook_corroborates_life_without_a_tool_in_flight() {
+        let state = state_with(
+            4242,
+            Some(&crate::live_worker_state::iso8601_utc(
+                NOW - HUSK_LIVENESS_CORROBORATION_SECS + 10,
+            )),
+            None,
+        );
+        assert!(live_process_evidence_with(&state, &PidStatus::Alive, NOW).is_some());
+    }
+
+    /// A quiet worker with no tool in flight is NOT corroborated — this is
+    /// what keeps the sweep able to reclaim real husks, whose shell also
+    /// stays alive after `claude` exits.
+    #[test]
+    fn alive_pid_alone_does_not_corroborate() {
+        let state = state_with(
+            4242,
+            Some(&crate::live_worker_state::iso8601_utc(
+                NOW - HUSK_LIVENESS_CORROBORATION_SECS - 10,
+            )),
+            None,
+        );
+        assert_eq!(live_process_evidence_with(&state, &PidStatus::Alive, NOW), None);
+    }
+
+    /// A dead shell pid is decisive the other way: nothing to protect, so
+    /// even a tool that looked in-flight cannot spare the pane.
+    #[test]
+    fn dead_pid_is_never_corroborated() {
+        let state = state_with(4242, Some(&crate::live_worker_state::iso8601_utc(NOW)), Some("Bash"));
+        assert_eq!(live_process_evidence_with(&state, &PidStatus::Dead, NOW), None);
+    }
+
+    /// A slot that never reported a shell pid offers no corroboration and
+    /// must not be probed (`kill(0, 0)` would signal our own process group).
+    #[test]
+    fn missing_shell_pid_yields_no_evidence() {
+        let state = state_with(0, Some(&crate::live_worker_state::iso8601_utc(NOW)), Some("Bash"));
+        assert_eq!(live_process_evidence(&state, NOW), None);
+        assert_eq!(live_process_evidence_with(&state, &PidStatus::Alive, NOW), None);
+    }
+
+    /// `EPERM` means the process exists but is not ours — read as "alive"
+    /// so an ambiguous probe never justifies an irreversible kill.
+    #[test]
+    fn permission_denied_probe_is_read_as_alive() {
+        let state = state_with(4242, Some(&crate::live_worker_state::iso8601_utc(NOW)), Some("Bash"));
+        assert!(live_process_evidence_with(&state, &PidStatus::PermissionDenied, NOW).is_some());
     }
 }
