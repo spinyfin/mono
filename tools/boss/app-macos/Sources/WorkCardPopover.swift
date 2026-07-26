@@ -3,6 +3,19 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+/// Detail popover for a selected work card.
+///
+/// **Lazy secondary UI (design entry 10):** this view must not sit in the
+/// AttributeGraph of an idle card. `WorkBoardCardItem` attaches it only
+/// while `snapshot.isSelected` is true via
+/// `lazyWorkCardSelectionPopover`, so the ~700 lines of view code below
+/// are evaluated for the one presented card — not for every visible card
+/// on an idle board.
+///
+/// Nested sheets stay **always attached** on this popover content so the
+/// sheet inherits the popover window context and SwiftUI sees a normal
+/// false→true `isPresented` transition (conditional mount-with-true
+/// fights macOS popover windowing and can dismiss/re-anchor the host).
 struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
@@ -22,6 +35,36 @@ struct WorkCardPopoverView: View {
     @State private var showAllAbandonedAttempts: Bool = false
 
     var body: some View {
+        // Content is only in-graph while the parent card is selected
+        // (see type docs). Keep the body as one presented surface.
+        popoverContent
+            .padding(20)
+            .frame(width: 360, alignment: .leading)
+            .onAppear {
+                model.loadExecutions(taskId: task.id)
+            }
+            // Always-attached sheet: idle cost is one unpresented sheet on
+            // the single selected popover; conditional insert broke the
+            // popover window-context contract and remounted with true.
+            .sheet(isPresented: $presentingRepoPicker) {
+                RepoOverridePicker(
+                    presentation: model.repoOverridePresentation(for: task),
+                    recentURLs: model.recentRepoURLs(forProduct: task.productID),
+                    onCancel: { presentingRepoPicker = false },
+                    onSelect: { url in
+                        model.setRepoOverride(for: task.id, to: url)
+                        presentingRepoPicker = false
+                    },
+                    onClear: {
+                        model.setRepoOverride(for: task.id, to: nil)
+                        presentingRepoPicker = false
+                    }
+                )
+            }
+    }
+
+    @ViewBuilder
+    private var popoverContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 6) {
@@ -135,26 +178,6 @@ struct WorkCardPopoverView: View {
                     model.deleteSelectedWorkItem()
                 }
             }
-        }
-        .padding(20)
-        .frame(width: 360, alignment: .leading)
-        .onAppear {
-            model.loadExecutions(taskId: task.id)
-        }
-        .sheet(isPresented: $presentingRepoPicker) {
-            RepoOverridePicker(
-                presentation: model.repoOverridePresentation(for: task),
-                recentURLs: model.recentRepoURLs(forProduct: task.productID),
-                onCancel: { presentingRepoPicker = false },
-                onSelect: { url in
-                    model.setRepoOverride(for: task.id, to: url)
-                    presentingRepoPicker = false
-                },
-                onClear: {
-                    model.setRepoOverride(for: task.id, to: nil)
-                    presentingRepoPicker = false
-                }
-            )
         }
     }
 

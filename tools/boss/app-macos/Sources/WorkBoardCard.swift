@@ -97,6 +97,11 @@ struct WorkBoardSectionItemsView: View {
 /// keeps action dispatch (`selectWorkCard`, terminal, merge, delete)
 /// without the "any of 77 `@Published` properties invalidates every
 /// visible card" fan-out (design entry 6).
+///
+/// Selection popover content (`WorkCardPopoverView`) is attached only
+/// while the card is selected so idle cards do not hold that tree
+/// (design entry 10). Confirmation dialogs stay always-attached — they
+/// are cheap, and mount-with-true is an intermittent presentation failure.
 struct WorkBoardCardItem: View {
     let task: WorkTask
     /// Board column for action routing / debug logs only (value, not observed).
@@ -210,16 +215,20 @@ struct WorkBoardCardItem: View {
                     showingDeleteConfirmation = true
                 }
             }
-            .popover(
+            // Selection popover: attach only while selected so the ~700-line
+            // `WorkCardPopoverView` tree is not in every idle card's graph.
+            // isPresented reads live model selection (not a constant true) so
+            // dismiss set(false) and subsequent get stay consistent.
+            .lazyWorkCardSelectionPopover(
+                isSelected: snapshot.isSelected,
                 isPresented: Binding(
-                    get: { snapshot.isSelected },
-                    set: { isPresented in
-                        if !isPresented, snapshot.isSelected {
+                    get: { model.selectedTask?.id == task.id },
+                    set: { presented in
+                        if !presented {
                             model.selectWorkCard(nil)
                         }
                     }
-                ),
-                arrowEdge: .trailing
+                )
             ) {
                 WorkCardPopoverView(model: model, task: task)
             }
@@ -242,6 +251,8 @@ struct WorkBoardCardItem: View {
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
+        // Always-attached: confirmationDialog needs false→true while
+        // installed; mount-with-true is a known intermittent failure.
         .confirmationDialog(
             "Delete \"\(task.name)\"?",
             isPresented: $showingDeleteConfirmation,
@@ -476,6 +487,39 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             return Color(nsColor: .separatorColor).opacity(0.5)
         case .airy, .minimal:
             return .clear
+        }
+    }
+}
+
+// MARK: - Lazy secondary UI (design entry 10)
+
+extension View {
+    /// Attaches a trailing selection popover only while `isSelected` is
+    /// true so idle cards do not hold `WorkCardPopoverView`.
+    ///
+    /// `isPresented` must read **live** selection (e.g. model
+    /// `selectedTask?.id == task.id`), not a constant `true`. Constant
+    /// get fights SwiftUI after dismiss (`set(false)` then `get` still
+    /// true). User dismiss → `set(false)` clears selection → get is
+    /// false → next body pass drops this modifier. Selecting another
+    /// card updates the model first; this card rebuilds with
+    /// `isSelected == false` and removes the presenter after selection
+    /// has already moved (reselect mounts cleanly on the new card with
+    /// a live true binding).
+    @ViewBuilder
+    func lazyWorkCardSelectionPopover<Content: View>(
+        isSelected: Bool,
+        isPresented: Binding<Bool>,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        if isSelected {
+            self.popover(
+                isPresented: isPresented,
+                arrowEdge: .trailing,
+                content: content
+            )
+        } else {
+            self
         }
     }
 }
