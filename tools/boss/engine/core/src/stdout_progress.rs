@@ -345,10 +345,12 @@ mod tests {
     #[tokio::test]
     async fn unknown_driver_slug_is_an_error_not_a_panic() {
         let sink = ActivitySink::new();
-        let err = run_stdout_progress_ingress("exec-1", "codex", CLAUDE_SHAPED_STDOUT.as_bytes(), &sink)
+        // Use a slug that is not (and must not be) in the default registry.
+        // `"codex"` is a real built-in driver; do not reuse it here.
+        let err = run_stdout_progress_ingress("exec-1", "not-a-driver", CLAUDE_SHAPED_STDOUT.as_bytes(), &sink)
             .await
-            .expect_err("no 'codex' driver is registered yet");
-        assert_eq!(err.0, "codex");
+            .expect_err("unregistered slug must error");
+        assert_eq!(err.0, "not-a-driver");
         assert!(sink.seen.lock().unwrap().is_empty());
     }
 

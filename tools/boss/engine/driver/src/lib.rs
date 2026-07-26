@@ -1387,11 +1387,13 @@ pub trait AgentDriver: Send + Sync {
 }
 
 pub mod claude;
+pub mod codex;
 pub mod registry;
 
 // Also available in-module for trait signatures (pub use is an import + re-export).
 pub use boss_protocol::DriverRuntimeState;
 pub use claude::ClaudeDriver;
+pub use codex::CodexDriver;
 pub use registry::{DriverRegistry, UnknownDriverSlug};
 
 /// Shared test fixture for crates that need an [`AgentDriver`] stand-in

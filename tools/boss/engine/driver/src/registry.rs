@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use super::{AgentDriver, CapabilityResolver, ClaudeDriver};
+use super::{AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver};
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
 ///
@@ -34,7 +34,8 @@ impl std::error::Error for UnknownDriverSlug {}
 /// concrete driver type.
 ///
 /// The default registry contains all built-in drivers. Future drivers
-/// (`CopilotDriver`, `CodexDriver`) register themselves here when added.
+/// (e.g. `CopilotDriver`) register themselves here when added via
+/// [`Self::with_driver`] or by extending [`Default`].
 pub struct DriverRegistry {
     drivers: HashMap<&'static str, Arc<dyn AgentDriver>>,
 }
@@ -43,6 +44,7 @@ impl Default for DriverRegistry {
     fn default() -> Self {
         let mut drivers: HashMap<&'static str, Arc<dyn AgentDriver>> = HashMap::new();
         drivers.insert("claude", Arc::new(ClaudeDriver));
+        drivers.insert("codex", Arc::new(CodexDriver));
         Self { drivers }
     }
 }
@@ -101,11 +103,57 @@ mod tests {
     }
 
     #[test]
+    fn default_registry_contains_codex() {
+        let reg = DriverRegistry::default();
+        let driver = reg.require("codex").expect("default registry must contain 'codex'");
+        assert_eq!(driver.descriptor().name, "codex");
+        assert_eq!(driver.descriptor().config_dir, ".codex");
+        assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
+    }
+
+    /// Acceptance: `--driver codex` resolves in the registry and the
+    /// dispatch capability gate evaluates against Codex's real `CapabilitySet`
+    /// — not a registry-lookup failure.
+    #[test]
+    fn codex_dispatch_gate_uses_declared_capability_set() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let resolver = reg.resolver("codex").expect("codex is registered");
+        // Chore is phase-1 eligible; gate must succeed (no Refuse) against
+        // Codex's declared set.
+        let plan = resolver
+            .check_dispatch(&TaskKind::Chore)
+            .expect("Codex CapabilitySet must clear the chore dispatch gate");
+        assert_eq!(plan.driver_name, "codex");
+        assert!(
+            plan.provided.contains(&Capability::Spawn),
+            "gate must see Codex's declared Spawn, not an empty set: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.provided.contains(&Capability::ToolUseInterception),
+            "ToolUseInterception is declared deny-only: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.degraded.contains(&Capability::ToolProvisioning)
+                || !plan.provided.contains(&Capability::ToolProvisioning),
+            "ToolProvisioning must be absent/degraded for Codex: {plan:?}"
+        );
+        // Design tasks still require-strict ToolUseInterception + StructuredOutput;
+        // Codex provides both, so Design must also clear the gate.
+        resolver
+            .check_dispatch(&TaskKind::Design)
+            .expect("Codex provides ToolUseInterception + StructuredOutput for Design");
+    }
+
+    #[test]
     fn unknown_slug_returns_none() {
         let reg = DriverRegistry::default();
         assert!(reg.get("copilot").is_none());
-        assert!(reg.resolver("codex").is_none());
-        assert!(reg.require("codex").is_err());
+        assert!(reg.resolver("not-a-driver").is_none());
+        assert!(reg.require("not-a-driver").is_err());
     }
 
     #[test]
@@ -113,6 +161,13 @@ mod tests {
         let reg = DriverRegistry::default();
         assert!(reg.resolver("claude").is_some());
         assert!(reg.require("claude").is_ok());
+    }
+
+    #[test]
+    fn resolver_for_codex_succeeds() {
+        let reg = DriverRegistry::default();
+        assert!(reg.resolver("codex").is_some());
+        assert!(reg.require("codex").is_ok());
     }
 
     /// Acceptance for the call-site cutover: a second registered driver
