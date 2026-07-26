@@ -761,6 +761,9 @@ name = "boss-log-files"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
+ "chrono",
+ "serde_json",
  "tempfile",
 ]
 
@@ -868,6 +871,7 @@ name = "bossctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bon",
  "boss-build-info",
  "boss-client",
  "boss-engine",

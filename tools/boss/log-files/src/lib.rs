@@ -5,13 +5,18 @@
 //!
 //! - **Path resolution** ([`paths`]): which file backs each [`LogSource`]
 //!   under a state root, plus the `BOSS_ENGINE_AUDIT_PATH` override and the
-//!   default `~/Library/Application Support/Boss` state root.
+//!   default `~/Library/Application Support/Boss` state root. Multi-file
+//!   sources (rotated segments, day-dated diagnostics) are enumerated via
+//!   [`resolve_log_source_files`].
 //! - **Rotated-segment naming + ordering** ([`segments`]): the
 //!   `<base>.<unix_seconds>` filename scheme introduced in PR #1081, the
 //!   enumeration of those segments alongside a live file, and their
 //!   chronological (ascending-timestamp) ordering.
 //! - **Line/grep reading** ([`reader`]): missing-file-tolerant readers used
 //!   to tail and follow the rotated logs.
+//! - **Structured query** ([`query`]): time-window selection, field-aware
+//!   filters (target / level / key=value), capped tails, and explicit
+//!   truncation reporting — so a truncated result is never silent.
 //!
 //! Before this crate existed, the format lived in two places that had to be
 //! kept in lockstep by hand: the engine writer/pruner in
@@ -31,15 +36,22 @@
 //! change it without a migration for files already on disk.
 
 mod paths;
+mod query;
 mod reader;
 mod segments;
 
 pub use paths::{
-    AUDIT_PATH_ENV, CONTROL_TOKEN_FILENAME, ENGINE_AUDIT_FILENAME, ENGINE_TRACE_FILENAME, EVENTS_SOCKET_FILENAME,
-    LogSource, STATE_DB_FILENAME, audit_path_override, default_audit_log_path, default_control_token_path,
-    default_events_socket_path, default_state_db_path, default_state_root, resolve_log_source_path,
+    AUDIT_PATH_ENV, CONTROL_TOKEN_FILENAME, DIAGNOSTICS_DIR, DISPATCH_EVENTS_DIR, DISPATCH_EVENTS_LIVE_FILENAME,
+    ENGINE_AUDIT_FILENAME, ENGINE_TRACE_FILENAME, EVENTS_SOCKET_FILENAME, LogSource, POPULATION_TIMING_PREFIX,
+    SPAWN_DIAGNOSTICS_PREFIX, STATE_DB_FILENAME, audit_path_override, day_rotated_files, default_audit_log_path,
+    default_control_token_path, default_events_socket_path, default_state_db_path, default_state_root,
+    resolve_log_source_files, resolve_log_source_path,
 };
-pub use reader::{collect_tail_lines, read_file_lines, read_new_content};
+pub use query::{
+    LogFilter, QueryResult, follow_line_matches, line_matches, now_epoch_ms, parse_time_spec, query_log_files,
+    query_source_files, record_timestamp_ms, truncation_notice,
+};
+pub use reader::{collect_tail_lines, read_file_lines, read_new_content, read_new_content_filtered};
 pub use segments::{
     next_rotated_path, next_rotated_path_from, now_unix_secs, rotated_segment_path, rotated_segments,
     segments_with_live,

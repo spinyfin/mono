@@ -228,28 +228,63 @@ enum Command {
     /// Read engine diagnostic logs. Works file-scan-only — no running engine
     /// required. Resolves log paths automatically from the Boss state root.
     ///
-    /// The primary log (`engine`, default) is `engine-trace.jsonl` —
-    /// structured JSONL tracing events from the running engine. The `audit`
-    /// log is `engine-audit.log` — compact lifecycle records (start, socket
-    /// bind, shutdown) useful for timeline reconstruction after an incident.
+    /// Spans rotated and day-dated files transparently as one chronological
+    /// stream. Default behaviour is still a short tail; use `--since` /
+    /// field filters / a larger `--tail` (or `--tail 0` for unlimited) for
+    /// incident queries. When the result is capped, a truncation notice is
+    /// printed to stderr so a short answer is never mistaken for absence.
     ///
-    /// Output is plain text suitable for copy/paste into a shake report.
+    /// Sources:
+    /// - `engine` (default) — `engine-trace.jsonl` + rotated segments
+    /// - `audit` — `engine-audit.log` (+ rotated, if any)
+    /// - `dispatch` — `dispatch-events/current.jsonl`
+    /// - `spawn` — `diagnostics/spawn-YYYY-MM-DD.jsonl`
+    /// - `population-timing` — `diagnostics/engine-population-timing-*.jsonl`
     Logs {
-        /// Which log to read.
-        /// `engine` → `engine-trace.jsonl` (structured trace, primary);
-        /// `audit`  → `engine-audit.log` (lifecycle events).
+        /// Which log / diagnostic stream to read.
         #[arg(value_enum, default_value_t = LogSource::Engine)]
         source: LogSource,
-        /// Print the last N lines (default 50).
+        /// Print the last N matching lines (default 50). `0` means unlimited.
         #[arg(short = 'n', long = "tail", default_value_t = 50)]
         tail: usize,
         /// Stream appended lines live, like `tail -f`. Polls every 250 ms;
-        /// press Ctrl-C to stop.
+        /// press Ctrl-C to stop. Initial output still honours `--tail` and
+        /// filters; the live stream keeps field/grep filters but ignores
+        /// `--since`/`--until`.
         #[arg(short = 'f', long)]
         follow: bool,
-        /// Filter to lines containing this substring (case-sensitive).
+        /// Raw case-sensitive substring match on the whole line. Prefer
+        /// `--target` / `--level` / `--field` / `--execution-id` for
+        /// structured JSONL — substring grep false-positives on message
+        /// bodies (e.g. a module name appearing in an unrelated event).
         #[arg(long)]
         grep: Option<String>,
+        /// Only records at or after this time. Accepts relative offsets
+        /// (`30m`, `6h`, `2d`, `90s`), RFC3339 (`2026-07-26T06:20:00Z`),
+        /// a date (`2026-07-26`), or an epoch integer (seconds or ms).
+        #[arg(long)]
+        since: Option<String>,
+        /// Only records at or before this time. Same formats as `--since`.
+        #[arg(long)]
+        until: Option<String>,
+        /// Match the JSON `target` field (tracing module path). Exact match
+        /// or module-prefix (`boss_engine::app` matches
+        /// `boss_engine::app::server`). Does **not** search message bodies.
+        #[arg(long)]
+        target: Option<String>,
+        /// Match the JSON `level` field case-insensitively (`info`, `ERROR`).
+        #[arg(long)]
+        level: Option<String>,
+        /// Match a structured field `key=value` (repeatable). Checks the
+        /// top-level key, then a nested `fields` object. All `--field`
+        /// constraints are ANDed.
+        #[arg(long = "field", value_name = "KEY=VALUE")]
+        fields: Vec<String>,
+        /// Match `execution_id` or `run_id` (top-level or under `fields`).
+        /// Convenience for the common "what happened to this execution?"
+        /// query across trace / dispatch / spawn sources.
+        #[arg(long)]
+        execution_id: Option<String>,
         /// Override the Boss state root (defaults to
         /// `$HOME/Library/Application Support/Boss`).
         #[arg(long)]
@@ -488,13 +523,20 @@ impl std::fmt::Display for TranscriptFormat {
     }
 }
 
-/// Which engine log file `bossctl logs` should read.
+/// Which engine log / diagnostic stream `bossctl logs` should read.
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq)]
 pub(crate) enum LogSource {
     /// `engine-trace.jsonl` — structured tracing events (primary log).
     Engine,
     /// `engine-audit.log` — lifecycle events (start, socket bind, shutdown).
     Audit,
+    /// `dispatch-events/current.jsonl` — dispatch pipeline stage events.
+    Dispatch,
+    /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
+    Spawn,
+    /// `diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`.
+    #[value(name = "population-timing")]
+    PopulationTiming,
 }
 
 impl std::fmt::Display for LogSource {
@@ -502,6 +544,9 @@ impl std::fmt::Display for LogSource {
         match self {
             LogSource::Engine => write!(f, "engine"),
             LogSource::Audit => write!(f, "audit"),
+            LogSource::Dispatch => write!(f, "dispatch"),
+            LogSource::Spawn => write!(f, "spawn"),
+            LogSource::PopulationTiming => write!(f, "population-timing"),
         }
     }
 }
@@ -1196,12 +1241,28 @@ async fn dispatch(cli: Cli) -> Result<()> {
             tail,
             follow,
             grep,
+            since,
+            until,
+            target,
+            level,
+            fields,
+            execution_id,
             state_root,
         } => {
+            let query = logs::LogsQuery {
+                tail,
+                grep,
+                since,
+                until,
+                target,
+                level,
+                fields,
+                execution_id,
+            };
             if follow {
-                logs::logs_follow(source, state_root, tail, grep).await
+                logs::logs_follow(source, state_root, query).await
             } else {
-                logs::logs_tail(cli.json, source, state_root, tail, grep.as_deref())
+                logs::logs_tail(cli.json, source, state_root, query)
             }
         }
     }

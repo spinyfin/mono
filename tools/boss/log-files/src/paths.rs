@@ -24,21 +24,66 @@ pub const EVENTS_SOCKET_FILENAME: &str = "events.sock";
 /// Filename of the engine-control token under the state root.
 pub const CONTROL_TOKEN_FILENAME: &str = "engine-control.token";
 
-/// Which engine log file a reader is targeting.
+/// Directory under the state root holding the dispatch event stream.
+pub const DISPATCH_EVENTS_DIR: &str = "dispatch-events";
+
+/// Live dispatch-events filename inside [`DISPATCH_EVENTS_DIR`].
+pub const DISPATCH_EVENTS_LIVE_FILENAME: &str = "current.jsonl";
+
+/// Directory under the state root holding day-rotated diagnostic JSONL files.
+pub const DIAGNOSTICS_DIR: &str = "diagnostics";
+
+/// Day-rotated filename prefix for worker-spawn diagnostics
+/// (`spawn-YYYY-MM-DD.jsonl`).
+pub const SPAWN_DIAGNOSTICS_PREFIX: &str = "spawn-";
+
+/// Day-rotated filename prefix for engine population-timing diagnostics
+/// (`engine-population-timing-YYYY-MM-DD.jsonl`).
+pub const POPULATION_TIMING_PREFIX: &str = "engine-population-timing-";
+
+/// Which engine log / diagnostic stream a reader is targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSource {
     /// `engine-trace.jsonl` — structured tracing events (primary log).
     EngineTrace,
     /// `engine-audit.log` — lifecycle events (start, socket bind, shutdown).
     Audit,
+    /// `dispatch-events/current.jsonl` — dispatch pipeline stage events.
+    Dispatch,
+    /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
+    Spawn,
+    /// `diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`.
+    PopulationTiming,
 }
 
 impl LogSource {
-    /// The bare filename this source resolves to under a state root.
-    pub fn filename(self) -> &'static str {
+    /// A short name suitable for CLI display / JSON `"source"` fields.
+    pub fn as_str(self) -> &'static str {
         match self {
-            LogSource::EngineTrace => ENGINE_TRACE_FILENAME,
-            LogSource::Audit => ENGINE_AUDIT_FILENAME,
+            LogSource::EngineTrace => "engine",
+            LogSource::Audit => "audit",
+            LogSource::Dispatch => "dispatch",
+            LogSource::Spawn => "spawn",
+            LogSource::PopulationTiming => "population-timing",
+        }
+    }
+
+    /// True when this source uses the `<base>.<unix_seconds>` rotation scheme
+    /// (trace + audit). Day-rotated and single-file sources return false.
+    pub fn uses_timestamp_rotation(self) -> bool {
+        matches!(self, LogSource::EngineTrace | LogSource::Audit)
+    }
+
+    /// The bare live filename this source resolves to under a state root, when
+    /// it is a single live file (trace / audit / dispatch). Day-rotated
+    /// sources have no single live filename — use
+    /// [`resolve_log_source_files`] instead.
+    pub fn filename(self) -> Option<&'static str> {
+        match self {
+            LogSource::EngineTrace => Some(ENGINE_TRACE_FILENAME),
+            LogSource::Audit => Some(ENGINE_AUDIT_FILENAME),
+            LogSource::Dispatch => Some(DISPATCH_EVENTS_LIVE_FILENAME),
+            LogSource::Spawn | LogSource::PopulationTiming => None,
         }
     }
 }
@@ -86,14 +131,79 @@ pub fn audit_path_override() -> Option<PathBuf> {
     }
 }
 
-/// Resolve a [`LogSource`] to its on-disk path under `state_root`. The audit
-/// log honours [`AUDIT_PATH_ENV`]; the trace log is always
-/// `<state_root>/engine-trace.jsonl`.
+/// Resolve a [`LogSource`] to its primary live on-disk path under `state_root`.
+///
+/// - Trace: `<state_root>/engine-trace.jsonl`
+/// - Audit: [`AUDIT_PATH_ENV`] override, else `<state_root>/engine-audit.log`
+/// - Dispatch: `<state_root>/dispatch-events/current.jsonl`
+/// - Spawn / population-timing: the diagnostics directory (day files live under it)
+///
+/// Prefer [`resolve_log_source_files`] when reading — it returns every segment
+/// that participates in the logical stream (rotated + day-dated).
 pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf {
     match source {
         LogSource::Audit => audit_path_override().unwrap_or_else(|| state_root.join(ENGINE_AUDIT_FILENAME)),
         LogSource::EngineTrace => state_root.join(ENGINE_TRACE_FILENAME),
+        LogSource::Dispatch => state_root.join(DISPATCH_EVENTS_DIR).join(DISPATCH_EVENTS_LIVE_FILENAME),
+        LogSource::Spawn | LogSource::PopulationTiming => state_root.join(DIAGNOSTICS_DIR),
     }
+}
+
+/// Every file that participates in the logical stream for `source`, in
+/// chronological order (oldest first). Callers scan this list as one stream;
+/// they never need to know about rotation or day-dating.
+///
+/// - Trace / audit: rotated segments (oldest first) then the live file.
+/// - Dispatch: the single `current.jsonl` (and any `<name>.<unix_s>` siblings
+///   if present, for forward-compat with future rotation).
+/// - Spawn / population-timing: day-dated files under `diagnostics/`, sorted
+///   by the date embedded in the filename.
+pub fn resolve_log_source_files(source: LogSource, state_root: &Path) -> Vec<PathBuf> {
+    match source {
+        LogSource::EngineTrace | LogSource::Audit => {
+            let base = resolve_log_source_path(source, state_root);
+            crate::segments::segments_with_live(&base)
+        }
+        LogSource::Dispatch => {
+            let base = resolve_log_source_path(source, state_root);
+            crate::segments::segments_with_live(&base)
+        }
+        LogSource::Spawn => day_rotated_files(&state_root.join(DIAGNOSTICS_DIR), SPAWN_DIAGNOSTICS_PREFIX),
+        LogSource::PopulationTiming => day_rotated_files(&state_root.join(DIAGNOSTICS_DIR), POPULATION_TIMING_PREFIX),
+    }
+}
+
+/// Enumerate day-rotated files named `<prefix>YYYY-MM-DD.jsonl` under `dir`,
+/// sorted ascending by the date suffix (filename order == chronological).
+pub fn day_rotated_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let suffix = ".jsonl";
+    let mut files: Vec<PathBuf> = read_dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| {
+                    let Some(rest) = n.strip_prefix(prefix) else {
+                        return false;
+                    };
+                    let Some(date) = rest.strip_suffix(suffix) else {
+                        return false;
+                    };
+                    // YYYY-MM-DD
+                    date.len() == 10
+                        && date.as_bytes().get(4) == Some(&b'-')
+                        && date.as_bytes().get(7) == Some(&b'-')
+                        && date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// Resolve the default audit-log path: [`AUDIT_PATH_ENV`] if set, otherwise
@@ -120,8 +230,11 @@ mod tests {
 
     #[test]
     fn log_source_filenames_match_constants() {
-        assert_eq!(LogSource::EngineTrace.filename(), "engine-trace.jsonl");
-        assert_eq!(LogSource::Audit.filename(), "engine-audit.log");
+        assert_eq!(LogSource::EngineTrace.filename(), Some("engine-trace.jsonl"));
+        assert_eq!(LogSource::Audit.filename(), Some("engine-audit.log"));
+        assert_eq!(LogSource::Dispatch.filename(), Some("current.jsonl"));
+        assert_eq!(LogSource::Spawn.filename(), None);
+        assert_eq!(LogSource::PopulationTiming.filename(), None);
     }
 
     #[test]
@@ -178,5 +291,43 @@ mod tests {
         unsafe {
             std::env::remove_var(AUDIT_PATH_ENV);
         }
+    }
+
+    #[test]
+    fn dispatch_resolves_under_dispatch_events() {
+        let root = Path::new("/tmp/boss-state");
+        assert_eq!(
+            resolve_log_source_path(LogSource::Dispatch, root),
+            root.join("dispatch-events/current.jsonl")
+        );
+    }
+
+    #[test]
+    fn day_rotated_files_orders_by_date_and_filters_prefix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join("spawn-2026-07-20.jsonl"), b"x").unwrap();
+        std::fs::write(dir.path().join("spawn-2026-07-19.jsonl"), b"x").unwrap();
+        std::fs::write(dir.path().join("spawn-2026-07-21.jsonl"), b"x").unwrap();
+        // Noise: wrong prefix, wrong suffix, bad date shape.
+        std::fs::write(dir.path().join("engine-population-timing-2026-07-20.jsonl"), b"x").unwrap();
+        std::fs::write(dir.path().join("spawn-2026-07-20.txt"), b"x").unwrap();
+        std::fs::write(dir.path().join("spawn-not-a-date.jsonl"), b"x").unwrap();
+
+        let files = day_rotated_files(dir.path(), SPAWN_DIAGNOSTICS_PREFIX);
+        assert_eq!(files.len(), 3);
+        assert!(files[0].to_string_lossy().ends_with("spawn-2026-07-19.jsonl"));
+        assert!(files[1].to_string_lossy().ends_with("spawn-2026-07-20.jsonl"));
+        assert!(files[2].to_string_lossy().ends_with("spawn-2026-07-21.jsonl"));
+    }
+
+    #[test]
+    fn resolve_log_source_files_spawn_lists_day_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = dir.path().join(DIAGNOSTICS_DIR);
+        std::fs::create_dir_all(&diag).unwrap();
+        std::fs::write(diag.join("spawn-2026-07-25.jsonl"), b"{}\n").unwrap();
+        std::fs::write(diag.join("spawn-2026-07-26.jsonl"), b"{}\n").unwrap();
+        let files = resolve_log_source_files(LogSource::Spawn, dir.path());
+        assert_eq!(files.len(), 2);
     }
 }

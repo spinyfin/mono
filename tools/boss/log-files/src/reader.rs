@@ -1,14 +1,19 @@
 //! Missing-file-tolerant line/grep readers over rotated logs.
 //!
-//! These are the primitives `bossctl logs tail` / `follow` go through. They
-//! are deliberately file-scan-only and never touch the engine RPC, so they
-//! work even when the engine is wedged.
+//! These are the primitives `bossctl logs` go through for simple tails and
+//! follow. They are deliberately file-scan-only and never touch the engine
+//! RPC, so they work even when the engine is wedged.
+//!
+//! For time windows, structured field filters, and truncation reporting, use
+//! [`crate::query`] instead — [`collect_tail_lines`] is the thin "last N
+//! lines with optional substring grep" helper kept for simple call sites.
 
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use anyhow::Result;
 
+use crate::query::{LogFilter, query_log_files};
 use crate::segments::segments_with_live;
 
 /// Read every line of `path` matching the optional `grep` substring filter.
@@ -31,13 +36,15 @@ pub fn read_file_lines(path: &Path, grep: Option<&str>) -> Result<Vec<String>> {
 /// Collect the last `tail_n` lines across the live file and all rotated
 /// segments of `base_path`. Segments are read oldest-first (see
 /// [`segments_with_live`]) so the returned slice is in chronological order.
+///
+/// `tail_n == 0` returns every matching line (no cap).
 pub fn collect_tail_lines(base_path: &Path, tail_n: usize, grep: Option<&str>) -> Result<Vec<String>> {
-    let mut all_lines: Vec<String> = Vec::new();
-    for seg in segments_with_live(base_path) {
-        all_lines.extend(read_file_lines(&seg, grep)?);
-    }
-    let start = all_lines.len().saturating_sub(tail_n);
-    Ok(all_lines[start..].to_vec())
+    let paths = segments_with_live(base_path);
+    let filter = LogFilter {
+        grep: grep.map(|s| s.to_owned()),
+        ..Default::default()
+    };
+    Ok(query_log_files(&paths, &filter, tail_n)?.lines)
 }
 
 /// Read bytes appended to `path` since `from_pos`. Returns the new (filtered)
@@ -45,6 +52,16 @@ pub fn collect_tail_lines(base_path: &Path, tail_n: usize, grep: Option<&str>) -
 /// A partial trailing line (no newline yet) is left for the next poll so a
 /// half-written JSON record is never emitted.
 pub fn read_new_content(path: &Path, from_pos: u64, grep: Option<&str>) -> Result<(Vec<String>, u64)> {
+    let filter = LogFilter {
+        grep: grep.map(|s| s.to_owned()),
+        ..Default::default()
+    };
+    read_new_content_filtered(path, from_pos, &filter)
+}
+
+/// Like [`read_new_content`] but applies a full [`LogFilter`] (time windows
+/// are ignored — follow is always "now").
+pub fn read_new_content_filtered(path: &Path, from_pos: u64, filter: &LogFilter) -> Result<(Vec<String>, u64)> {
     let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(from_pos))?;
     let mut buf = Vec::new();
@@ -61,7 +78,7 @@ pub fn read_new_content(path: &Path, from_pos: u64, grep: Option<&str>) -> Resul
     let lines: Vec<String> = text
         .lines()
         .filter(|l| !l.is_empty())
-        .filter(|l| grep.is_none_or(|g| l.contains(g)))
+        .filter(|l| crate::query::follow_line_matches(l, filter))
         .map(|s| s.to_owned())
         .collect();
     Ok((lines, new_pos))
