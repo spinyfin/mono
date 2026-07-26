@@ -59,7 +59,7 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
             heartbeatIntervalMs: 100,
             thresholdMs: 250,
             context: "Picard",
-            backtrace: ["0   Boss  0x0000 frame + 0"]
+            frameAddresses: [0x10abc, 0xdead_beef_0000]
         )
         let data = try JSONEncoder().encode(rec)
         let json = try XCTUnwrap(String(data: data, encoding: .utf8))
@@ -67,9 +67,71 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertTrue(json.contains("\"duration_ms\""))
         XCTAssertTrue(json.contains("\"heartbeat_interval_ms\""))
         XCTAssertTrue(json.contains("\"threshold_ms\""))
+        XCTAssertTrue(json.contains("\"frame_addresses\""))
+        // Addresses encoded as hex strings (JSON numbers would lose bits).
+        XCTAssertTrue(json.contains("0x10abc") || json.contains("0x0000000000010abc"))
+        // Durable writer path: symbolicated strings must be present so JSONL
+        // remains useful after process death (raw ASLR addresses alone are not).
+        XCTAssertTrue(json.contains("\"backtrace\""), "durable JSONL must include symbolicated backtrace")
 
         let decoded = try JSONDecoder().decode(StallRecord.self, from: data)
-        XCTAssertEqual(decoded, rec)
+        XCTAssertEqual(decoded.id, rec.id)
+        XCTAssertEqual(decoded.frameAddresses, [0x10abc, 0xdead_beef_0000])
+        XCTAssertEqual(decoded.context, "Picard")
+        // Encode fills backtrace; decode must retain it for offline reload.
+        XCTAssertEqual(try XCTUnwrap(decoded.backtrace).count, 2)
+        XCTAssertFalse(try XCTUnwrap(decoded.backtrace).isEmpty)
+    }
+
+    func testStallRecordDecodeAcceptsAddressOnlyWithoutBacktrace() throws {
+        // Intermediate JSONL lines may lack `backtrace`; decode must not
+        // fail, and live symbolication still works from frame_addresses.
+        let json = """
+        {"context":"Data","duration_ms":300,"frame_addresses":["0x1","0x2"],\
+        "heartbeat_interval_ms":100,"id":"00000000-0000-0000-0000-000000000002",\
+        "threshold_ms":250,"ts_epoch_ms":1700000000000}
+        """
+        let decoded = try JSONDecoder().decode(StallRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.frameAddresses, [1, 2])
+        XCTAssertNil(decoded.backtrace)
+        XCTAssertFalse(decoded.symbolicatedBacktrace().isEmpty)
+    }
+
+    func testStallRecordDecodeAcceptsLegacyBacktraceWithoutFrameAddresses() throws {
+        // True pre-address-storage JSONL wrote only symbolicated `backtrace`
+        // strings — no `frame_addresses` key. Decode must default addresses
+        // to [] and prefer the durable backtrace for display/export.
+        let json = """
+        {"backtrace":["0  Boss  0x1 foo + 0","1  Boss  0x2 bar + 4"],\
+        "context":"Legacy","duration_ms":400,"heartbeat_interval_ms":100,\
+        "id":"00000000-0000-0000-0000-000000000003","threshold_ms":250,\
+        "ts_epoch_ms":1700000000000}
+        """
+        let decoded = try JSONDecoder().decode(StallRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.frameAddresses, [])
+        XCTAssertEqual(
+            decoded.backtrace,
+            ["0  Boss  0x1 foo + 0", "1  Boss  0x2 bar + 4"]
+        )
+        XCTAssertEqual(
+            decoded.symbolicatedBacktrace(),
+            ["0  Boss  0x1 foo + 0", "1  Boss  0x2 bar + 4"]
+        )
+    }
+
+    func testDurableBacktracePreferredOverLiveAddresses() {
+        // After process death, reloaded records carry pre-rendered frames;
+        // prefer those over re-resolving (likely wrong) ASLR addresses.
+        let rec = StallRecord(
+            tsEpochMs: 1,
+            durationMs: 300,
+            heartbeatIntervalMs: 100,
+            thresholdMs: 250,
+            context: "offline",
+            frameAddresses: [0xdead],
+            backtrace: ["0  Boss  0x1 foo + 0"]
+        )
+        XCTAssertEqual(rec.symbolicatedBacktrace(), ["0  Boss  0x1 foo + 0"])
     }
 
     // MARK: - StallLog ring buffer
@@ -141,12 +203,14 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
     }
 
     func testFormattedDumpRendersNewestFirstWithFrames() {
+        // Addresses that will not resolve via dladdr still render as hex
+        // symbols after lazy symbolication on the export path.
         let older = makeRecord(tsEpochMs: 1_700_000_000_000, context: "Worf", duration: 300)
         let newer = makeRecord(
             tsEpochMs: 1_700_000_005_000,
             context: "Picard",
             duration: 1200,
-            backtrace: ["0   Boss  0x1 a + 0", "1   Boss  0x2 b + 4"]
+            frameAddresses: [0x1, 0x2]
         )
         let dump = StallLog.formattedDump([older, newer])
         XCTAssertTrue(dump.contains("stalls: 2"))
@@ -155,7 +219,8 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         let worfIdx = try! XCTUnwrap(dump.range(of: "Worf")).lowerBound
         XCTAssertLessThan(picardIdx, worfIdx)
         XCTAssertTrue(dump.contains("≥1200 ms"))
-        XCTAssertTrue(dump.contains("a + 0"))
+        // Lazy symbolication produces at least one rendered frame line.
+        XCTAssertTrue(dump.contains("0x"), "export path should render symbolicated frames, got:\n\(dump)")
     }
 
     // MARK: - Backtrace frame formatting
@@ -183,61 +248,123 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertFalse(frame.contains(String(repeating: "X", count: 31)))
     }
 
-    // MARK: - Idle-event-loop false-positive filtering
+    // MARK: - New-record interval floor
 
-    func testIsIdleEventLoopStackTrueForBareSystemLeaf() {
-        // The exact shape that produced the false-stall flood: leaf is
-        // the Mach message wait, and every frame is a system image — no
-        // app code anywhere on the stack.
-        let frames = [
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg_trap", offset: 0
-            ),
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 1, image: "AppKit", address: 2, symbol: "_nextEventMatchingMask", offset: 0
-            ),
-        ]
-        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+    func testAcceptsNewRecordWhenFloorDisabled() {
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 1_000_000,
+            lastRecordNanos: 999_000,
+            minRecordIntervalMs: 0
+        ))
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 1_000_000,
+            lastRecordNanos: 999_000,
+            minRecordIntervalMs: -1
+        ))
+    }
+
+    func testAcceptsNewRecordWhenNothingRecordedYet() {
+        // lastRecordNanos == 0 is the "no prior record" sentinel.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 50_000_000,
+            lastRecordNanos: 0,
+            minRecordIntervalMs: 100
+        ))
+    }
+
+    func testAcceptsNewRecordRejectsInsideFloor() {
+        // 50 ms elapsed, 100 ms floor → reject (must not commit recordedBeat).
+        let last: UInt64 = 1_000_000_000
+        let now = last + 50_000_000
+        XCTAssertFalse(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: now,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
+    }
+
+    func testAcceptsNewRecordAllowsAtAndAfterFloor() {
+        let last: UInt64 = 1_000_000_000
+        // Exactly at floor.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: last + 100_000_000,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
+        // Past floor.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: last + 250_000_000,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
+    }
+
+    // MARK: - Idle-event-loop filter (pure address + range)
+
+    /// Synthetic app image occupying `[0x1000, 0x2000)`.
+    private var testAppRange: MainThreadBacktrace.AppImageRange {
+        MainThreadBacktrace.AppImageRange(start: 0x1000, end: 0x2000)
+    }
+
+    func testIsIdleEventLoopStackTrueWhenNoAppFrame() {
+        // Pure system addresses — the false-stall flood shape. No address
+        // falls inside the app range, so the capture is discarded.
+        let addresses: [UInt] = [0x7fff_0000_0100, 0x7fff_0000_0200]
+        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack(
+            addresses, appImageRange: testAppRange
+        ))
     }
 
     func testIsIdleEventLoopStackFalseWhenAppFrameOnStack() {
-        // Same idle leaf, but the app's own image appears further up the
-        // stack (e.g. a run-loop-observer callback) — a real workload,
-        // not a bare idle wait, so this must not be filtered.
-        let frames = [
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg_trap", offset: 0
-            ),
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 1, image: "Boss", address: 2, symbol: "someAppFunction", offset: 0
-            ),
-        ]
-        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+        // Same system leaf-ish addresses, but one frame lands in the app
+        // image — a real workload, not a bare idle wait.
+        let addresses: [UInt] = [0x7fff_0000_0100, 0x1500]
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(
+            addresses, appImageRange: testAppRange
+        ))
     }
 
     func testIsIdleEventLoopStackFalseForGenuineAppHangLeaf() {
-        // A real hang: the leaf is in-app code, not the idle wait.
-        let frames = [
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 0, image: "Boss", address: 1, symbol: "expensiveLayoutPass", offset: 0
-            ),
-        ]
-        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: "Boss"))
+        // Leaf itself is in-app code.
+        let addresses: [UInt] = [0x1800]
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(
+            addresses, appImageRange: testAppRange
+        ))
     }
 
     func testIsIdleEventLoopStackFalseForEmptyBacktrace() {
-        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack([], appImage: "Boss"))
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(
+            [], appImageRange: testAppRange
+        ))
     }
 
-    func testIsIdleEventLoopStackIgnoresAppFrameCheckWhenImageUnknown() {
-        // No app image to compare against (e.g. under `swift test`) —
-        // fall back to the leaf-symbol check alone.
-        let frames = [
-            MainThreadBacktrace.SymbolicatedFrame(
-                index: 0, image: "libsystem_kernel.dylib", address: 1, symbol: "mach_msg", offset: 0
-            ),
-        ]
-        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack(frames, appImage: nil))
+    func testIsIdleEventLoopStackKeepsCaptureWhenRangeUnknown() {
+        // No app image bounds (e.g. under unit tests with no bundle) —
+        // do not filter, so real stalls are not silently dropped.
+        let addresses: [UInt] = [0x7fff_0000_0100]
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack(
+            addresses, appImageRange: nil
+        ))
+    }
+
+    func testIsIdleEventLoopStackRangeIsHalfOpen() {
+        // `end` is exclusive: address == end is outside the app image.
+        let range = MainThreadBacktrace.AppImageRange(start: 0x1000, end: 0x2000)
+        XCTAssertTrue(range.contains(0x1000))
+        XCTAssertTrue(range.contains(0x1fff))
+        XCTAssertFalse(range.contains(0x2000))
+        XCTAssertFalse(range.contains(0x0fff))
+
+        XCTAssertFalse(MainThreadBacktrace.isIdleEventLoopStack([0x1000], appImageRange: range))
+        XCTAssertTrue(MainThreadBacktrace.isIdleEventLoopStack([0x2000], appImageRange: range))
+    }
+
+    func testAppImageRangeContainsIsPure() {
+        let range = MainThreadBacktrace.AppImageRange(start: 100, end: 200)
+        XCTAssertTrue(range.contains(100))
+        XCTAssertTrue(range.contains(199))
+        XCTAssertFalse(range.contains(200))
+        XCTAssertFalse(range.contains(99))
     }
 
     func testFormatMapsSymbolicatedFramesToRenderedStrings() {
@@ -287,7 +414,7 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         tsEpochMs: Int64,
         context: String,
         duration: Double = 300,
-        backtrace: [String] = []
+        frameAddresses: [UInt] = []
     ) -> StallRecord {
         StallRecord(
             tsEpochMs: tsEpochMs,
@@ -295,7 +422,7 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
             heartbeatIntervalMs: 100,
             thresholdMs: 250,
             context: context,
-            backtrace: backtrace
+            frameAddresses: frameAddresses
         )
     }
 }

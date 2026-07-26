@@ -10,11 +10,17 @@ import SwiftUI
 /// The log is a plain `@unchecked Sendable` class rather than an
 /// `ObservableObject`, so this view polls a snapshot on a timer (the
 /// same approach [[MetricsViewer]] uses for engine counters).
+///
+/// Backtraces are stored as raw addresses on each [[StallRecord]] and
+/// symbolicated lazily here (and on export) — never on the capture path.
 struct UIStallsViewer: View {
     @AppStorage("boss.uiStalls.visible") private var isOpen = false
     @State private var records: [StallRecord] = []
     @State private var window: SinceWindow = .fiveMinutes
     @State private var expanded: Set<UUID> = []
+    /// Memo of symbolicated frames per record id so expand/collapse and
+    /// the 1 Hz poll do not re-enter `dladdr` for the same stall.
+    @State private var symbolicatedCache: [UUID: [String]] = [:]
 
     private let pollTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
@@ -82,8 +88,11 @@ struct UIStallsViewer: View {
                     ForEach(records.reversed()) { rec in
                         StallRow(
                             record: rec,
-                            isExpanded: expanded.contains(rec.id)
-                        ) { toggle(rec.id) }
+                            isExpanded: expanded.contains(rec.id),
+                            // Body only reads the cache — never symbolicating or
+                            // writing @State during view evaluation.
+                            frames: expanded.contains(rec.id) ? symbolicatedCache[rec.id] : nil
+                        ) { toggle(rec) }
                         Divider().padding(.leading, 14)
                     }
                 }
@@ -115,10 +124,33 @@ struct UIStallsViewer: View {
         } else {
             records = log.snapshot()
         }
+        // Drop cache/expansion for stalls that left the window (age-out or
+        // since-filter tighten). Leaving `expanded` set while clearing the
+        // cache produces a false "No backtrace captured" for still-expanded
+        // rows after a widen, because body only *reads* the cache.
+        let live = Set(records.map(\.id))
+        symbolicatedCache = symbolicatedCache.filter { live.contains($0.key) }
+        expanded = expanded.intersection(live)
+        // Defensive re-seed: any still-expanded live row missing a cache
+        // entry is filled on the refresh/action path (never in `body`).
+        for rec in records where expanded.contains(rec.id) && symbolicatedCache[rec.id] == nil {
+            symbolicatedCache[rec.id] = rec.symbolicatedBacktrace()
+        }
     }
 
-    private func toggle(_ id: UUID) {
-        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+    /// Expand/collapse handler. Symbolication runs here (action path),
+    /// never during `body` evaluation — mutating `@State` mid-body is
+    /// undefined in SwiftUI and can re-enter layout.
+    private func toggle(_ rec: StallRecord) {
+        let id = rec.id
+        if expanded.contains(id) {
+            expanded.remove(id)
+            return
+        }
+        expanded.insert(id)
+        if symbolicatedCache[id] == nil {
+            symbolicatedCache[id] = rec.symbolicatedBacktrace()
+        }
     }
 
     private func copyReport() {
@@ -132,6 +164,9 @@ struct UIStallsViewer: View {
 private struct StallRow: View {
     let record: StallRecord
     let isExpanded: Bool
+    /// Symbolicated frames when expanded; `nil` while collapsed so the
+    /// parent defers `dladdr` until the row is opened.
+    let frames: [String]?
     let onToggle: () -> Void
 
     var body: some View {
@@ -158,13 +193,14 @@ private struct StallRow: View {
             .buttonStyle(.plain)
 
             if isExpanded {
-                if record.backtrace.isEmpty {
+                let shown = frames ?? []
+                if shown.isEmpty {
                     Text("No backtrace captured (the frame walk failed — see MainThreadBacktrace).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .padding(.leading, 24)
                 } else {
-                    Text(record.backtrace.joined(separator: "\n"))
+                    Text(shown.joined(separator: "\n"))
                         .font(.system(.caption, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
