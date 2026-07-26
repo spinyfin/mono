@@ -45,6 +45,9 @@ struct WorkBoardCardItem: View {
     @ObservedObject var model: ChatViewModel
     @ObservedObject var liveStates: LiveWorkerStateStore
     @Environment(\.openWindow) private var openWindow
+    /// Captured into the equatable snapshot so a board-style flip
+    /// invalidates already-mounted card bodies (see `WorkCardSnapshot.boardStyle`).
+    @Environment(\.kanbanBoardStyle) private var boardStyle
     @State private var showingDeleteConfirmation = false
 
     var body: some View {
@@ -92,16 +95,6 @@ struct WorkBoardCardItem: View {
             && task.blockedReason == "ci_failure"
 
         let isAIReviewing = column == .doing && task.aiReviewing && task.status == "active"
-
-        let activityState: AgentActivityState? = column == .doing
-            ? .forDoingCard(
-                runtime: runtime,
-                liveState: liveState,
-                isDispatchPending: isDispatchPending,
-                isResolvingConflicts: isResolvingConflicts,
-                isRemediatingCI: isRemediatingCI,
-                isAIReviewing: isAIReviewing)
-            : nil
 
         let liveStatusForCard: String? = {
             guard column == .doing else { return nil }
@@ -200,71 +193,93 @@ struct WorkBoardCardItem: View {
             ? task.parentTaskId.flatMap { model.workTask(withID: $0)?.shortID }
             : nil
 
+        // Build the slim Equatable snapshot once per card-item evaluation.
+        // Closures stay outside the snapshot so `.equatable()` on the card
+        // can skip body re-evaluation when only action-handler identity
+        // would differ (design entry 5 / `WorkCardSnapshot`).
+        let onOpenTerminal: (() -> Void)? = {
+            if (column == .review || column == .done),
+               let prURL = task.prURL, !prURL.isEmpty {
+                return { model.openReviewTerminal(for: task) }
+            }
+            if liveState != nil {
+                return { model.openLiveWorkspaceTerminal(for: task) }
+            }
+            return nil
+        }()
+        let onMergeWhenReady: (() -> Void)? = (
+            column == .review
+                && task.status == "in_review"
+                && task.prURL.map { !$0.isEmpty } == true
+                && task.mergeQueueState == nil
+        ) ? { model.mergeWhenReady(for: task) } : nil
+        let terminalTooltip = (column == .review || column == .done)
+            ? "Open terminal on PR branch"
+            : "Open terminal in workspace"
+        let deferredScopeItems = column == .review
+            ? model.deferredScopeAttentions(forWorkItemID: task.id)
+            : []
+        let snapshot = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: column,
+                projectName: projectName,
+                isSelected: isSelected,
+                runtime: runtime,
+                liveState: liveState,
+                liveStatus: liveStatusForCard,
+                blockedBy: blockedBy,
+                isAutoBlocked: isAutoBlocked,
+                gatingPrereqs: gatingPrereqs,
+                repoChip: repoChip,
+                showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
+                showsCIAutoFixedBadge: model.showsCIAutoFixedBadge(forPR: task.prURL),
+                ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
+                isFrontierHighlighted: isFrontierHighlighted,
+                designDocState: designDocState,
+                externalRefLink: externalRefLink,
+                ambiguousRepoNames: model.ambiguousVisibleRepoNames,
+                inReviewRevisions: inReviewRevisions.map(WorkCardRevisionRollup.init(revision:)),
+                parentShortID: parentShortID,
+                deferredScopeItems: deferredScopeItems,
+                deferredScopeActionInFlightIDs: model.deferredScopeActionInFlightIDs,
+                showsTerminalButton: onOpenTerminal != nil,
+                terminalTooltip: terminalTooltip,
+                showsMergeWhenReady: onMergeWhenReady != nil,
+                boardStyle: boardStyle
+            )
+        )
+
         VStack(alignment: .leading, spacing: 6) {
             Button {
                 model.selectWorkCard(isSelected ? nil : task.id)
             } label: {
                 WorkBoardCardView(
-                    task: task,
-                    projectName: projectName,
-                    isSelected: isSelected,
-                    activityState: activityState,
-                    assignedSlotId: column == .doing ? liveState?.slotId : nil,
-                    liveStatus: liveStatusForCard,
-                    liveStatusActivity: isDispatchPending ? nil : (column == .doing ? liveState?.activity : nil),
-                    liveStatusLastEventAt: isDispatchPending ? nil : (column == .doing ? liveState?.lastEventAt : nil),
-                    blockedBy: blockedBy,
-                    isAutoBlocked: isAutoBlocked,
-                    gatingPrereqs: gatingPrereqs,
-                    repoChip: repoChip,
-                    showsConflictClearedBadge: model.showsConflictClearedBadge(forPR: task.prURL),
-                    showsCIAutoFixedBadge: model.showsCIAutoFixedBadge(forPR: task.prURL),
-                    ciFailureBadge: model.ciFailureBadge(forPR: task.prURL),
-                    isResolvingConflicts: isResolvingConflicts,
-                    isRemediatingCI: isRemediatingCI,
-                    isFrontierHighlighted: isFrontierHighlighted,
-                    designDocState: designDocState,
+                    snapshot: snapshot,
                     onOpenDesignDoc: designDocProject.map { proj in { model.openProjectDesignDoc(proj) } }
                         ?? (task.docLinkState != nil ? { model.openTaskDoc(task) } : nil),
-                    ciRequiredState: (column == .review || task.isInMergingSection)
-                        ? (task.ciRequiredState ?? "in_progress")
-                        : nil,
-                    ciRequiredDetail: (column == .review || task.isInMergingSection) ? task.ciRequiredDetail : nil,
-                    reviewRequiredState: column == .review ? task.reviewRequiredState : nil,
-                    reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
-                    mergeQueueState: task.isInMergingSection ? task.mergeQueueState : nil,
-                    mergeQueueDetail: task.isInMergingSection ? task.mergeQueueDetail : nil,
-                    prMergeableState: task.prMergeableState,
-                    externalRefLink: externalRefLink,
-                    ambiguousRepoNames: model.ambiguousVisibleRepoNames,
-                    inReviewRevisions: inReviewRevisions,
-                    parentShortID: parentShortID,
                     onDepBadgeHover: { hovering in
                         model.setDepBadgeHover(hovering ? task.id : nil)
                     },
                     onRevisionBadgeHover: { hovering in
                         model.setRevisionBadgeHover(hovering ? task.id : nil)
                     },
-                    onOpenTerminal: ((column == .review || column == .done) && task.prURL != nil && !(task.prURL?.isEmpty ?? true))
-                        ? { model.openReviewTerminal(for: task) }
-                        : (liveState != nil)
-                            ? { model.openLiveWorkspaceTerminal(for: task) }
-                            : nil,
-                    terminalTooltip: (column == .review || column == .done)
-                        ? "Open terminal on PR branch"
-                        : "Open terminal in workspace",
-                    onMergeWhenReady: (column == .review &&
-                                       task.status == "in_review" &&
-                                       task.prURL != nil &&
-                                       !(task.prURL?.isEmpty ?? true) &&
-                                       task.mergeQueueState == nil)
-                        ? { model.mergeWhenReady(for: task) }
-                        : nil,
-                    deferredScopeItems: column == .review ? model.deferredScopeAttentions(forWorkItemID: task.id) : [],
-                    deferredScopeActionInFlightIDs: model.deferredScopeActionInFlightIDs,
+                    onOpenTerminal: onOpenTerminal,
+                    onMergeWhenReady: onMergeWhenReady,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
-                    onCreateTaskFromDeferredScope: { id in model.createTaskFromDeferredScopeAttention(attentionID: id) }
+                    onCreateTaskFromDeferredScope: { id in
+                        model.createTaskFromDeferredScopeAttention(attentionID: id)
+                    }
                 )
+                // `WorkBoardCardView` is `Equatable` over its snapshot only:
+                // without `.equatable()`, every re-render of the column
+                // (any of 77 `ChatViewModel` `@Published`s, live-state
+                // ticks on sibling cards) rebuilds and re-lays-out every
+                // card body — the `AG::LayoutDescriptor::compare` →
+                // `WorkTask.==` hot path. `.equatable()` lets SwiftUI
+                // skip body evaluation for cards whose snapshot is
+                // unchanged. Closures are intentionally outside `==`.
+                .equatable()
             }
             .buttonStyle(.plain)
             .overlay(
@@ -398,212 +413,60 @@ struct WorkBoardCardItem: View {
 /// clears itself the next time a human retries the dispatch (drag to
 /// Doing, or `bossctl work start`).
 
-struct WorkBoardCardView: View {
-    let task: WorkTask
-    let projectName: String?
-    let isSelected: Bool
-    let activityState: AgentActivityState?
-    /// Slot id of the worker currently bound to this card, when the
-    /// card lives in the Doing lane. Drives the small crew portrait
-    /// in the title row so a glance at the board tells you which
-    /// crew member is on which task.
-    let assignedSlotId: Int?
-    /// Free-text one-sentence "what is the worker doing right now"
-    /// fed by the engine's live-status summarizer. Rendered as a
-    /// subtitle row between the title row and the footer when the
-    /// card is in the Doing lane and the string is non-empty.
-    /// `nil` collapses the row entirely so idle/blank states don't
-    /// leave awkward whitespace.
-    var liveStatus: String? = nil
-    /// Activity of the worker behind `liveStatus`. `WaitingForInput`
-    /// now surfaces a `WorkerWaitingIndicator` icon next to the
-    /// subtitle (rather than tinting the text accent-blue, which was
-    /// ambiguous and an accessibility problem); `Errored` reads in
-    /// red, `Idle` dims further than `.secondary`. The default `nil`
-    /// is treated as the plain `.secondary` colour.
-    var liveStatusActivity: WorkerActivity? = nil
-    /// ISO-8601 `last_event_at` of the worker behind `liveStatus`,
-    /// passed straight through from `LiveWorkerState`. Feeds the
-    /// "No response for …" elapsed time in the waiting indicator's
-    /// tooltip. `nil` when there is no live worker or no event yet.
-    var liveStatusLastEventAt: String? = nil
-    /// Comma-joined names of the prereqs currently gating this card.
-    /// Non-nil only on `blocked` rows — the kanban surfaces these in
-    /// the Backlog column with a lock + "Blocked by …" subtitle so the
-    /// reader can tell at a glance which Backlog items are gated and
-    /// by what.
-    let blockedBy: String?
-    /// True when the row is engine-blocked (auto-block) rather than a
-    /// human choice. Drives the chain badge in the footer per design
-    /// Q7 — manual blocks already get the lane and would double up.
-    var isAutoBlocked: Bool = false
-    /// Resolved prereq rows used by the chain badge's hover tooltip.
-    /// Empty for cards that aren't gated; populated regardless of
-    /// `isAutoBlocked` because the popover Dependencies subsection
-    /// reuses this list to render hyperlinks.
-    var gatingPrereqs: [WorkDependencyRow] = []
-    /// Per-card repo chip presentation, populated only when the
-    /// kanban is in multi-repo mode (any card override or mixed
-    /// resolved URLs across the visible board). `nil` in single-repo
-    /// mode, where the chip lives on the product header instead — see
-    /// `WorkBoardRepoMode` for the mode rule.
-    var repoChip: RepoChipPresentation? = nil
-    /// True when this card's PR was the target of a successful
-    /// conflict-resolution attempt inside the freshness window
-    /// (Phase 5 #15 of the merge-conflict design). Renders the
-    /// `"🔧 conflict cleared"` chip in the footer; ages out after 24h
-    /// via [[ChatViewModel.showsConflictClearedBadge(forPR:)]].
-    var showsConflictClearedBadge: Bool = false
-    /// True when this card's PR has a successful CI auto-fix inside
-    /// the 24h freshness window. Renders the `"✅ ci auto-fixed"` chip
-    /// per design Q11 / Phase 11 #37.
-    var showsCIAutoFixedBadge: Bool = false
-    /// In-flight / exhausted CI-failure chip for the PR, or `nil` when
-    /// no CI auto-fix is currently tracked. Renders `🟧 ci failing
-    /// (used/budget)` or `🛑 ci failing (exhausted)` per design Q11.
-    var ciFailureBadge: CiFailureBadge? = nil
-    /// True when this card is in the Doing column because a merge-
-    /// resolution worker is actively running against it. Suppresses the
-    /// blocked-row orange chrome and renders the `"resolving conflicts"`
-    /// indicator instead so the user can tell at a glance what the
-    /// active work is.
-    var isResolvingConflicts: Bool = false
-    /// True when this card is in the Doing column because a CI-remediation
-    /// worker is actively running against it. Symmetric to
-    /// [[isResolvingConflicts]]; suppresses orange chrome and renders the
-    /// `"resolving CI failure"` badge instead.
-    var isRemediatingCI: Bool = false
-    /// True when this card is a prerequisite frontier card for a
-    /// currently-hovered Dependency badge. Drives the green card background.
-    var isFrontierHighlighted: Bool = false
-    /// Resolved design-doc state for the parent project. Non-nil only
-    /// for `kind=design` tasks whose parent project has populated
-    /// `design_doc_*` columns. `nil` hides the affordance entirely.
-    var designDocState: ProjectDesignDocState? = nil
+/// Kanban card body. Consumes a slim [[WorkCardSnapshot]] plus action
+/// closures, and conforms to `Equatable` over the snapshot alone so
+/// `.equatable()` at the call site can skip body evaluation when no
+/// rendered input changed (design entry 5 — direct fix for the
+/// `AG::LayoutDescriptor::compare` → `WorkTask.==` path). Closures are
+/// intentionally outside the equatable surface: action-handler identity
+/// must not force a re-layout. Board style lives on the snapshot (not
+/// `@Environment`) so a `boss.kanban.boardStyle` flip participates in
+/// `==` and re-styles already-mounted cards.
+struct WorkBoardCardView: View, @MainActor Equatable {
+    let snapshot: WorkCardSnapshot
     /// Invoked when the user taps the design-doc affordance. Only
-    /// called when `designDocState` is non-nil and produces a
-    /// non-nil `ProjectDesignDocAffordancePresentation`.
+    /// called when `snapshot.showsDesignDocAffordance` is true.
     var onOpenDesignDoc: (() -> Void)? = nil
-    /// Aggregate required-CI state for the PR indicator. Mirrors
-    /// `WorkTask.ciRequiredState`; supplied by the parent only when the
-    /// card is in the Review lane and `task.prURL` is non-nil.
-    var ciRequiredState: String? = nil
-    /// JSON-encoded failing check detail for the CI tooltip.
-    var ciRequiredDetail: String? = nil
-    /// Required-review state for the review indicator. Mirrors
-    /// `WorkTask.reviewRequiredState`; supplied by the parent under the
-    /// same conditions as `ciRequiredState`.
-    var reviewRequiredState: String? = nil
-    /// JSON-encoded reviewer list for the review tooltip.
-    var reviewRequiredDetail: String? = nil
-    /// Merge-queue / auto-merge state for the Merging-section badge.
-    /// `"queued"` or `"auto_merge_enabled"` when the card is in the
-    /// kanban's "Merging" section; `nil` otherwise (including for a
-    /// Review-lane card, which is never in that section — see
-    /// `WorkTask.isInMergingSection`). When set, replaces the CI indicator
-    /// with `MergeQueueBadge`.
-    var mergeQueueState: String? = nil
-    /// JSON-encoded merge-queue sub-state (`{"position", "state",
-    /// "enqueued_at", "section_order"}`), mirrors `WorkTask.mergeQueueDetail`.
-    /// `nil` unless `mergeQueueState` is non-nil. Parsed by `MergeQueueBadge`
-    /// to render the queue position and readiness icon.
-    var mergeQueueDetail: String? = nil
-    /// Raw GitHub mergeability — an unconditional mirror of
-    /// `WorkTask.prMergeableState`, deliberately NOT gated on lane or
-    /// section. Whichever badge ends up rendering PR state is responsible
-    /// for pre-empting a mergeable-looking rendering when this says
-    /// `"conflicting"`; the card's job is only to make the fact available.
-    ///
-    /// Gating this to the lanes that happen to render a badge today would
-    /// re-create the bug it fixes: the value was previously supplied under
-    /// the same condition as `mergeQueueState`, so `MergeQueueBadge` — the
-    /// only reader — could apply its conflict check, but a Review-lane card
-    /// (never in the Merging section) fell through to `PrCiIndicator` with
-    /// `nil` here and rendered a green check on a PR GitHub reported as
-    /// `CONFLICTING` (mono#2366). Both readers now check it (mono#2303 for
-    /// `MergeQueueBadge`, mono#2366 for `PrCiIndicator`).
-    var prMergeableState: String? = nil
-    /// Upstream-link affordance derived from `task.externalRef`. `nil`
-    /// when the task has no external binding — the affordance is hidden
-    /// entirely in that state. Bound refs show an accent-colored `↗ #N`
-    /// link; stale refs (binding cleared upstream) show it dimmed with a
-    /// strikethrough so the history is preserved but the staleness is
-    /// communicated at a glance.
-    var externalRefLink: ExternalRefLinkPresentation? = nil
-    /// Repo names whose bare-`repo#n` PR label would be ambiguous on
-    /// the current board — see
-    /// [[ChatViewModel.ambiguousVisibleRepoNames]]. Threaded into
-    /// `PRURLLink` so a card's PR link can drop the org prefix when
-    /// its repo is unique among visible cards.
-    var ambiguousRepoNames: Set<String> = []
-    /// Revisions to display as rollup lines on this card's footer. Populated
-    /// in the Review lane (in-review revisions) and the Done lane (done
-    /// revisions). Empty for Backlog/Doing cards and parent tasks with no
-    /// nested revisions. Ordered by `revisionSeq`.
-    var inReviewRevisions: [WorkTask] = []
-    /// Short ID of the parent task, used to render "revises T<n>" on
-    /// revision cards in Backlog/Doing. `nil` for non-revision tasks
-    /// and revision tasks whose parent can't be resolved.
-    var parentShortID: Int? = nil
     /// Called with `true` when the pointer enters a Dependency badge
     /// (the text badge or the chain link icon); `false` on exit.
-    /// `nil` when the card doesn't need to report badge hover (e.g.
-    /// in the Designs viewer).
     var onDepBadgeHover: ((Bool) -> Void)? = nil
     /// Called with `true` when the pointer enters the "In revision" badge;
-    /// `false` on exit. Same hover-highlight protocol as `onDepBadgeHover`.
+    /// `false` on exit.
     var onRevisionBadgeHover: ((Bool) -> Void)? = nil
     /// Invoked when the user taps the terminal icon. `nil` hides the
-    /// button. Callers pass a closure either for a Review/Done-column
-    /// card with a PR URL (opens a fresh workspace on the PR branch) or
-    /// for a Doing-column card whose work item has a live execution
-    /// (opens a terminal in the execution's already-leased workspace) —
-    /// gated on data availability, not the column itself.
+    /// button (also gated by `snapshot.showsTerminalButton`).
     var onOpenTerminal: (() -> Void)? = nil
-    /// Tooltip/accessibility text for the terminal button; varies by
-    /// which of the two flows above `onOpenTerminal` was wired to.
-    var terminalTooltip: String = "Open terminal on PR branch"
-    /// Invoked after the user confirms the "Merge When Ready" button on a
-    /// Review-column card. `nil` hides the button — callers only pass a
-    /// closure when the card is in the Review lane, has a PR URL, and Merge
-    /// When Ready hasn't already been requested (`mergeQueueState == nil`).
-    /// Once requested, the card leaves Review for the Done column's
-    /// "Merging" section (see `WorkTask.isInMergingSection`), so the button
-    /// naturally disappears with it.
+    /// Invoked after the user confirms "Merge When Ready". `nil` hides
+    /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
-    /// Open `deferred_scope` attention items filed against this work item.
-    /// Empty hides the badge entirely — callers only populate this for
-    /// Review-lane cards (mirrors `ciRequiredState`'s column gate above).
-    var deferredScopeItems: [DeferredScopeAttention] = []
-    /// Attention item ids with an accept/create-task request currently in
-    /// flight — see `ChatViewModel.deferredScopeActionInFlightIDs`.
-    var deferredScopeActionInFlightIDs: Set<String> = []
     /// Invoked with an attention item id when the popup's "Accept" button
-    /// is tapped. `nil` when `deferredScopeItems` is always empty for this
-    /// card kind.
+    /// is tapped.
     var onAcceptDeferredScope: ((String) -> Void)? = nil
     /// Invoked with an attention item id when the popup's "Create task"
     /// button is tapped.
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
-    @Environment(\.kanbanBoardStyle) private var boardStyle
-
     @State private var isHovered: Bool = false
     @State private var showMergeConfirmation: Bool = false
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.snapshot == rhs.snapshot
+    }
 
     var body: some View {
         // Fan-out regression counter (design entry 2): each body evaluation
         // is the fan-out signal Phase 1 work is meant to narrow. Side-effect
         // is intentional instrumentation (unfair-lock increment).
         let _ = UIUpdateCounters.shared.recordCardBodyEvaluation()
+        let snap = snapshot
         VStack(alignment: .leading, spacing: 8) {
-            if task.kind == "revision", let seq = task.revisionSeq {
+            if snap.kind == "revision", let seq = snap.revisionSeq {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
                     RevisionBadge(seq: seq)
-                    if let origin = EngineRevisionOrigin(createdVia: task.createdVia) {
+                    if let origin = snap.engineRevisionOrigin {
                         EngineRevisionBadge(origin: origin)
                     }
-                    if let parentID = parentShortID {
+                    if let parentID = snap.parentShortID {
                         Text("revises T" + String(parentID))
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -612,11 +475,11 @@ struct WorkBoardCardView: View {
                 }
             }
             HStack(alignment: .top, spacing: 6) {
-                if let activityState {
+                if let activityState = snap.activityState {
                     AgentActivityDot(state: activityState)
                         .padding(.top, 5)
                 }
-                if let slotId = assignedSlotId,
+                if let slotId = snap.assignedSlotId,
                    let character = TrekCharacter.forSlot(slotId),
                    let nsImage = TrekIconAssets.image(character, size: .small) {
                     Image(nsImage: nsImage)
@@ -629,24 +492,24 @@ struct WorkBoardCardView: View {
                 }
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(alignment: .firstTextBaseline, spacing: 4) {
-                        if task.status == "blocked" && !isResolvingConflicts && !isRemediatingCI {
+                        if snap.showsBlockedLock {
                             Image(systemName: "lock.fill")
                                 .font(.caption)
                                 .foregroundStyle(.orange)
                                 .accessibilityLabel("Blocked")
                         }
-                        Text(task.name)
+                        Text(snap.name)
                             .font(.body.weight(.medium))
                             .foregroundStyle(.primary)
                             .multilineTextAlignment(.leading)
                             // Revision descriptions can be multi-paragraph; cap
                             // the card body to 2 lines so the card stays compact.
                             // The full text is accessible via the detail popover.
-                            .lineLimit(task.kind == "revision" ? 2 : nil)
+                            .lineLimit(snap.kind == "revision" ? 2 : nil)
                             .truncationMode(.tail)
                     }
-                    if let blockedBy, !blockedBy.isEmpty {
-                        let prefix = task.status == "blocked" ? "Blocked by" : "Waiting on:"
+                    if let blockedBy = snap.blockedBy, !blockedBy.isEmpty {
+                        let prefix = snap.status == "blocked" ? "Blocked by" : "Waiting on:"
                         Text("\(prefix) \(blockedBy)")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -660,11 +523,10 @@ struct WorkBoardCardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            // Free-form tags. The whole block is gated on non-empty chips so
-            // zero-tag cards contribute zero height / zero gap (no reserved
-            // empty strip). Caps + truncation live in `WorkTagPresentation`.
-            let tagChips = WorkTagPresentation.chips(for: task.tags)
-            if !tagChips.labels.isEmpty {
+            // Free-form tags. Gated on the precomputed visibility flag so
+            // zero-tag cards contribute zero height / zero gap.
+            if snap.hasTagChips {
+                let tagChips = WorkTagPresentation.chips(for: snap.tags)
                 FlowLayout(horizontalSpacing: 4, verticalSpacing: 3) {
                     ForEach(tagChips.labels, id: \.self) { label in
                         WorkTagChip(text: label)
@@ -679,11 +541,11 @@ struct WorkBoardCardView: View {
                 .accessibilityLabel("Tags: \(tagChips.labels.joined(separator: ", "))")
             }
 
-            if let liveStatus, !liveStatus.isEmpty {
+            if snap.hasLiveStatus, let liveStatus = snap.liveStatus {
                 HStack(alignment: .firstTextBaseline, spacing: 4) {
                     WorkerWaitingIndicator(
-                        activity: liveStatusActivity,
-                        lastEventAt: liveStatusLastEventAt
+                        activity: snap.liveStatusActivity,
+                        lastEventAt: snap.liveStatusLastEventAt
                     )
                     Text(liveStatus)
                         .font(.caption)
@@ -696,183 +558,178 @@ struct WorkBoardCardView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            if hasFooterContent {
-                // Wrap the whole metadata cluster so a full badge set — effort,
-                // CI status, repo, work-item id, and the trailing action chips —
-                // flows onto additional lines within the lane width instead of
-                // overflowing past the card's right edge and clipping (#1172).
-                FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
-                    let parsedPriority = WorkPriority.parse(task.priority)
-                    if parsedPriority == .high {
-                        PriorityChip(priority: parsedPriority)
-                    }
-                    if let effortLevel = task.effortLevel,
-                       !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                        EffortChip(effortLevel: effortLevel)
-                    }
-                    if task.reasoning == "investigation" {
-                        ReasoningChip()
-                    }
-                    if task.deferred {
-                        FutureScopeBadge()
-                    }
-                    if let projectName, !projectName.isEmpty {
-                        WorkStatusBadge(text: projectName)
-                    }
-                    if task.aiReviewing && task.status == "active" {
-                        ReviewingAIBadge()
-                    }
-                    if isResolvingConflicts {
-                        ResolvingConflictsBadge()
-                    } else if isRemediatingCI {
-                        ResolvingCIFailureBadge()
-                    } else if let blockedText = WorkBlockedBadge.badgeText(for: task) {
-                        let isDependencyBadge = blockedText == WorkBlockedBadge.label(forReason: "dependency")
-                        WorkStatusBadge(
-                            text: blockedText,
-                            tooltip: WorkBlockedBadge.badgeTooltip(for: task),
-                            hasMoreInfo: WorkBlockedBadge.hasMoreInfo(for: task)
-                        )
-                            .onHover { hovering in
-                                if isDependencyBadge {
-                                    onDepBadgeHover?(hovering)
-                                }
-                            }
-                    }
-                    if isAutoBlocked {
-                        Image(systemName: "link")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.orange)
-                            .help(autoBlockTooltip)
-                            .accessibilityLabel("Auto-blocked by dependencies")
-                            .accessibilityValue(autoBlockTooltip)
-                            .onHover { hovering in
-                                onDepBadgeHover?(hovering)
-                            }
-                    }
-                    if conflictClearedBadgeVisible {
-                        ConflictClearedBadge()
-                    }
-                    if showsCIAutoFixedBadge && ciFailureBadge == nil {
-                        CIAutoFixedBadge()
-                    }
-                    if let ciFailureBadge, !isRemediatingCI {
-                        CIFailureChip(badge: ciFailureBadge)
-                    }
-                    if let repoChip {
-                        RepoChipView(presentation: repoChip)
-                    }
-                    if task.sourceAutomationId != nil {
-                        Image(systemName: "wand.and.stars")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.purple)
-                            .help("Created by automation")
-                            .accessibilityLabel("Created by automation")
-                    }
-                    if task.isPlannerStaged {
-                        Image(systemName: "sparkle.magnifyingglass")
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(.indigo)
-                            .help("Staged by the Planner — release the project to begin dispatch")
-                            .accessibilityLabel("Staged by the Planner")
-                    }
-                    if let extRef = externalRefLink {
-                        ExternalRefLinkView(presentation: extRef)
-                    }
-                    // Doc-link icon. `designDocState` is non-nil for design
-                    // cards (resolved from the parent project) AND for
-                    // project-less docs-backed items like investigations
-                    // (resolved on the task itself), so the kind gate is no
-                    // longer needed — eligibility is already encoded in the
-                    // state. Other kinds carry a nil state and render nothing.
-                    if let state = designDocState,
-                       let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
-                        Button {
-                            onOpenDesignDoc?()
-                        } label: {
-                            Image(systemName: presentation.systemImage)
-                                .font(.caption)
-                                .foregroundStyle(presentation.tint)
-                                .accessibilityLabel(presentation.accessibilityLabel)
+            // Wrap the whole metadata cluster so a full badge set flows onto
+            // additional lines within the lane width instead of overflowing
+            // past the card's right edge and clipping (#1172).
+            FlowLayout(horizontalSpacing: 6, verticalSpacing: 4) {
+                if snap.showsHighPriorityChip {
+                    PriorityChip(priority: .high)
+                }
+                if snap.showsEffortChip, let effortLevel = snap.effortLevel {
+                    EffortChip(effortLevel: effortLevel)
+                }
+                if snap.showsReasoningChip {
+                    ReasoningChip()
+                }
+                if snap.showsDeferredBadge {
+                    FutureScopeBadge()
+                }
+                if snap.showsProjectBadge, let projectName = snap.projectName {
+                    WorkStatusBadge(text: projectName)
+                }
+                if snap.showsAIReviewingBadge {
+                    ReviewingAIBadge()
+                }
+                if snap.showsResolvingConflictsBadge {
+                    ResolvingConflictsBadge()
+                } else if snap.showsResolvingCIBadge {
+                    ResolvingCIFailureBadge()
+                } else if let blockedText = snap.blockedBadgeText {
+                    WorkStatusBadge(
+                        text: blockedText,
+                        tooltip: snap.blockedBadgeTooltip,
+                        hasMoreInfo: snap.blockedBadgeHasMoreInfo
+                    )
+                    .onHover { hovering in
+                        if snap.isDependencyBlockedBadge {
+                            onDepBadgeHover?(hovering)
                         }
-                        .buttonStyle(.plain)
-                        .help(presentation.tooltip)
-                    }
-                    if let openTerminal = onOpenTerminal {
-                        Button {
-                            openTerminal()
-                        } label: {
-                            Image(systemName: "terminal")
-                                .font(.caption)
-                                .foregroundStyle(Color.secondary)
-                                .accessibilityLabel(terminalTooltip)
-                        }
-                        .buttonStyle(.plain)
-                        .help(terminalTooltip)
-                    }
-                    if onMergeWhenReady != nil {
-                        Button {
-                            showMergeConfirmation = true
-                        } label: {
-                            Image(systemName: "arrow.triangle.merge")
-                                .font(.caption)
-                                .foregroundStyle(Color.secondary)
-                                .accessibilityLabel("Merge when ready")
-                        }
-                        .buttonStyle(.plain)
-                        .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                        .confirmationDialog(
-                            "Merge When Ready",
-                            isPresented: $showMergeConfirmation,
-                            titleVisibility: .visible
-                        ) {
-                            Button("Confirm Merge When Ready") {
-                                onMergeWhenReady?()
-                            }
-                            Button("Cancel", role: .cancel) {}
-                        } message: {
-                            Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
-                        }
-                    }
-                    if !deferredScopeItems.isEmpty {
-                        DeferredScopeCardBadge(
-                            items: deferredScopeItems,
-                            actionInFlightIDs: deferredScopeActionInFlightIDs,
-                            onAccept: { onAcceptDeferredScope?($0) },
-                            onCreateTask: { onCreateTaskFromDeferredScope?($0) }
-                        )
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                if snap.showsAutoBlockedChain {
+                    Image(systemName: "link")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.orange)
+                        .help(snap.autoBlockTooltip)
+                        .accessibilityLabel("Auto-blocked by dependencies")
+                        .accessibilityValue(snap.autoBlockTooltip)
+                        .onHover { hovering in
+                            onDepBadgeHover?(hovering)
+                        }
+                }
+                if snap.conflictClearedBadgeVisible {
+                    ConflictClearedBadge()
+                }
+                if snap.showsCIAutoFixedBadge {
+                    CIAutoFixedBadge()
+                }
+                if snap.showsCIFailureChip, let ciFailureBadge = snap.ciFailureBadge {
+                    CIFailureChip(badge: ciFailureBadge)
+                }
+                if snap.showsRepoChip, let repoChip = snap.repoChip {
+                    RepoChipView(presentation: repoChip)
+                }
+                if snap.showsAutomationBadge {
+                    Image(systemName: "wand.and.stars")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.purple)
+                        .help("Created by automation")
+                        .accessibilityLabel("Created by automation")
+                }
+                if snap.showsPlannerStagedBadge {
+                    Image(systemName: "sparkle.magnifyingglass")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.indigo)
+                        .help("Staged by the Planner — release the project to begin dispatch")
+                        .accessibilityLabel("Staged by the Planner")
+                }
+                if snap.showsExternalRefLink, let extRef = snap.externalRefLink {
+                    ExternalRefLinkView(presentation: extRef)
+                }
+                // Doc-link icon. Eligibility is already encoded in
+                // `showsDesignDocAffordance` + `designDocState`.
+                if snap.showsDesignDocAffordance,
+                   let state = snap.designDocState,
+                   let presentation = ProjectDesignDocAffordancePresentation.from(state: state) {
+                    Button {
+                        onOpenDesignDoc?()
+                    } label: {
+                        Image(systemName: presentation.systemImage)
+                            .font(.caption)
+                            .foregroundStyle(presentation.tint)
+                            .accessibilityLabel(presentation.accessibilityLabel)
+                    }
+                    .buttonStyle(.plain)
+                    .help(presentation.tooltip)
+                }
+                if snap.showsTerminalButton, let openTerminal = onOpenTerminal {
+                    Button {
+                        openTerminal()
+                    } label: {
+                        Image(systemName: "terminal")
+                            .font(.caption)
+                            .foregroundStyle(Color.secondary)
+                            .accessibilityLabel(snap.terminalTooltip)
+                    }
+                    .buttonStyle(.plain)
+                    .help(snap.terminalTooltip)
+                }
+                if snap.showsMergeWhenReady {
+                    Button {
+                        showMergeConfirmation = true
+                    } label: {
+                        Image(systemName: "arrow.triangle.merge")
+                            .font(.caption)
+                            .foregroundStyle(Color.secondary)
+                            .accessibilityLabel("Merge when ready")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
+                    .confirmationDialog(
+                        "Merge When Ready",
+                        isPresented: $showMergeConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Confirm Merge When Ready") {
+                            onMergeWhenReady?()
+                        }
+                        Button("Cancel", role: .cancel) {}
+                    } message: {
+                        Text("This will queue the PR for merging once all required checks pass. This action cannot be undone.")
+                    }
+                }
+                if snap.showsDeferredScopeBadge {
+                    DeferredScopeCardBadge(
+                        items: snap.deferredScopeItems,
+                        actionInFlightIDs: snap.deferredScopeActionInFlightIDs,
+                        onAccept: { onAcceptDeferredScope?($0) },
+                        onCreateTask: { onCreateTaskFromDeferredScope?($0) }
+                    )
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            if let prURL = task.prURL, !prURL.isEmpty {
+            if snap.hasPRRow, let prURL = snap.prURL {
                 HStack(alignment: .center, spacing: 6) {
-                    if let mergeQueueState {
+                    if let mergeQueueState = snap.mergeQueueState {
                         MergeQueueBadge(
                             mergeQueueState: mergeQueueState,
-                            detail: mergeQueueDetail,
-                            ciRequiredState: ciRequiredState,
-                            prMergeableState: prMergeableState
+                            detail: snap.mergeQueueDetail,
+                            ciRequiredState: snap.ciRequiredState,
+                            prMergeableState: snap.prMergeableState
                         )
                         .layoutPriority(-1)
-                    } else if let ciState = ciRequiredState {
-                        PrCiIndicator(state: ciState, detail: ciRequiredDetail, prMergeableState: prMergeableState)
+                    } else if let ciState = snap.ciRequiredState {
+                        PrCiIndicator(
+                            state: ciState,
+                            detail: snap.ciRequiredDetail,
+                            prMergeableState: snap.prMergeableState
+                        )
                     }
                     PRURLLink(
                         urlString: prURL,
                         font: .caption,
-                        ambiguousRepoNames: ambiguousRepoNames
+                        ambiguousRepoNames: snap.ambiguousRepoNames
                     )
                     .layoutPriority(1)
-                    if task.hasInProgressRevision {
+                    if snap.hasInProgressRevision {
                         PrInRevisionIndicator()
                             .onHover { hovering in
                                 onRevisionBadgeHover?(hovering)
                             }
                     }
                     Spacer(minLength: 0)
-                    if let id = task.shortID {
+                    if let id = snap.shortID {
                         Text("T" + String(id))
                             .font(.system(.caption2, design: .monospaced))
                             .foregroundStyle(.secondary)
@@ -883,32 +740,28 @@ struct WorkBoardCardView: View {
                 }
             }
 
-            if task.prURL != nil, let reviewState = reviewRequiredState {
+            if snap.hasReviewRow, let reviewState = snap.reviewRequiredState {
                 HStack(spacing: 6) {
-                    PrReviewIndicator(state: reviewState, detail: reviewRequiredDetail)
+                    PrReviewIndicator(state: reviewState, detail: snap.reviewRequiredDetail)
                     Spacer(minLength: 0)
                 }
             }
 
-            // A revision task's own `prURL` is stamped with the chain root's
-            // PR while an automated review pass holds it (see P992 in the
-            // engine); once that happens it's the identical PR already
-            // rendered above, so only show this second row when it points
-            // somewhere new — otherwise the card displays the same PR link
-            // twice (#1829 duplicate report).
-            if task.kind == "revision", let prURL = task.revisionParentPrUrl, !prURL.isEmpty,
-               !(task.prURL.map { sameGitHubPR($0, prURL) } ?? false) {
+            // Second PR row for a revision whose parent PR differs from
+            // its own (avoids the #1829 double-link). Visibility is
+            // precomputed on the snapshot.
+            if snap.hasRevisionParentPRRow, let prURL = snap.revisionParentPrUrl {
                 HStack(alignment: .center, spacing: 6) {
                     PRURLLink(
                         urlString: prURL,
                         font: .caption,
-                        ambiguousRepoNames: ambiguousRepoNames
+                        ambiguousRepoNames: snap.ambiguousRepoNames
                     )
                     Spacer(minLength: 0)
                 }
             }
 
-            if task.prURL == nil || task.prURL!.isEmpty, let id = task.shortID {
+            if snap.hasStandaloneShortID, let id = snap.shortID {
                 HStack {
                     Spacer(minLength: 0)
                     Text("T" + String(id))
@@ -920,10 +773,10 @@ struct WorkBoardCardView: View {
                 }
             }
 
-            if !inReviewRevisions.isEmpty {
+            if snap.hasInReviewRevisions {
                 Divider()
                     .padding(.vertical, 2)
-                ForEach(inReviewRevisions) { revision in
+                ForEach(snap.inReviewRevisions) { revision in
                     RevisionRollupLine(revision: revision)
                 }
             }
@@ -934,55 +787,22 @@ struct WorkBoardCardView: View {
         .background(
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .fill(cardBackground)
-                .brightness(isHovered && !isSelected ? 0.04 : 0)
+                .brightness(isHovered && !snap.isSelected ? 0.04 : 0)
                 .overlay(
                     RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .strokeBorder(borderColor, lineWidth: isSelected ? 2 : 1)
+                        .strokeBorder(borderColor, lineWidth: snap.isSelected ? 2 : 1)
                 )
         )
         .shadow(
-            color: (boardStyle == .airy || boardStyle == .elevated) ? Color.black.opacity(0.07) : .clear,
+            color: (snap.boardStyle == .airy || snap.boardStyle == .elevated) ? Color.black.opacity(0.07) : .clear,
             radius: 4, x: 0, y: 1.5
         )
-        .draggable(task.id)
+        .draggable(snap.id)
         .onHover { hovering in
             withAnimation(.easeInOut(duration: 0.15)) {
                 isHovered = hovering
             }
         }
-    }
-
-    /// The footer renders the priority chip on every card so a glance
-    /// at the board immediately separates `[HIGH]` work from the rest
-    /// without authors having to prefix names. The other footer
-    /// elements (project tag, blocked tag) appear conditionally.
-    private var hasFooterContent: Bool {
-        true
-    }
-
-    /// True when the "conflict cleared" badge may render: the cleared flag
-    /// is set AND no active "Merge Conflict" badge is showing. Enforces
-    /// the T795 mutual-exclusion invariant — the two states must never
-    /// co-render. Delegates to [[WorkBlockedBadge.conflictClearedVisible]].
-    private var conflictClearedBadgeVisible: Bool {
-        WorkBlockedBadge.conflictClearedVisible(
-            forTask: task,
-            cleared: showsConflictClearedBadge,
-            isResolvingConflicts: isResolvingConflicts
-        )
-    }
-
-    /// Tooltip body for the chain badge. Mirrors the CLI `show`
-    /// output's prereq list so a hover tells the reader the same
-    /// thing without opening the popover.
-    var autoBlockTooltip: String {
-        guard !gatingPrereqs.isEmpty else {
-            return "Auto-blocked by dependencies"
-        }
-        let summary = gatingPrereqs
-            .map { "\($0.title) (\($0.status.replacingOccurrences(of: "_", with: " ")))" }
-            .joined(separator: ", ")
-        return "Gated by: \(summary)"
     }
 
     /// Tint for the live-status subtitle row. Red for errored runs, a
@@ -992,7 +812,7 @@ struct WorkBoardCardView: View {
     /// `WorkerWaitingIndicator` icon + tooltip instead of an ambiguous
     /// accent-blue subtitle (hue alone is an accessibility problem).
     private var liveStatusColor: Color {
-        switch liveStatusActivity {
+        switch snapshot.liveStatusActivity {
         case .errored:
             return .red
         case .idle:
@@ -1003,13 +823,13 @@ struct WorkBoardCardView: View {
     }
 
     private var cardBackground: Color {
-        if isSelected {
+        if snapshot.isSelected {
             return Color.accentColor.opacity(0.08)
         }
-        if isFrontierHighlighted {
+        if snapshot.isFrontierHighlighted {
             return Color.green.opacity(0.07)
         }
-        if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
+        if snapshot.showsBlockedChrome {
             return Color.orange.opacity(0.08)
         }
         // Future-scope items get a muted neutral fill so parked work reads as
@@ -1017,10 +837,10 @@ struct WorkBoardCardView: View {
         // cards. Ranked below `blocked` so a deferred-and-gated card still
         // shows the blocked-orange chrome (the "Future" badge conveys the
         // classification either way).
-        if task.deferred {
+        if snapshot.deferred {
             return Color.secondary.opacity(0.10)
         }
-        switch boardStyle {
+        switch snapshot.boardStyle {
         case .classic, .airy:
             return Color(nsColor: .windowBackgroundColor)
         case .elevated:
@@ -1036,18 +856,18 @@ struct WorkBoardCardView: View {
     }
 
     private var borderColor: Color {
-        if isSelected {
+        if snapshot.isSelected {
             return .accentColor
         }
-        if !isResolvingConflicts && !isRemediatingCI && task.status == "blocked" {
+        if snapshot.showsBlockedChrome {
             return .orange
         }
         // Soft muted outline reinforces the parked/future-scope treatment
         // established by `cardBackground` and the "Future" badge.
-        if task.deferred {
+        if snapshot.deferred {
             return Color.secondary.opacity(0.45)
         }
-        switch boardStyle {
+        switch snapshot.boardStyle {
         case .classic:
             return Color(nsColor: .separatorColor)
         case .elevated:

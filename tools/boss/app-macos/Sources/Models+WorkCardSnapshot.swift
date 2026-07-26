@@ -11,10 +11,10 @@ import Foundation
 // `isAIReviewing`, per-badge visibility). Closures stay outside the
 // snapshot — only the presence booleans that gate their buttons land here.
 //
-// Model + builder only: the view does not consume this type yet (sibling
-// entry 5 wires `.equatable()`). Unit tests assert that two `WorkTask`s
-// differing only in non-rendered fields produce equal snapshots, and that
-// every rendered field participates in equality.
+// Consumed by `WorkBoardCardView` (entry 5 wires `.equatable()` over this
+// type). Unit tests assert that two `WorkTask`s differing only in
+// non-rendered fields produce equal snapshots, and that every rendered
+// field participates in equality.
 // ===========================================================================
 
 /// Slim rollup row for nested revisions shown under a parent card. Mirrors
@@ -59,6 +59,9 @@ struct WorkCardSnapshotContext: Equatable {
     var liveStatusLastEventAt: String? = nil
     var blockedBy: String? = nil
     var isAutoBlocked: Bool = false
+    /// Used only to precompute `autoBlockTooltip`; not stored on the
+    /// snapshot (prereq-id churn must not re-eval when the tooltip is
+    /// unchanged).
     var gatingPrereqs: [WorkDependencyRow] = []
     var repoChip: RepoChipPresentation? = nil
     var showsConflictClearedBadge: Bool = false
@@ -77,6 +80,11 @@ struct WorkCardSnapshotContext: Equatable {
     var terminalTooltip: String = "Open terminal on PR branch"
     /// True when the caller will supply an `onMergeWhenReady` closure.
     var showsMergeWhenReady: Bool = false
+    /// Board chrome style. Must live on the equatable snapshot so
+    /// `.equatable()` re-evaluates card bodies when the user flips
+    /// `boss.kanban.boardStyle` (environment alone is invisible to
+    /// `WorkBoardCardView.==`).
+    var boardStyle: KanbanBoardStyle = .classic
 }
 
 /// Equatable value type holding exactly the fields `WorkBoardCardView`
@@ -117,7 +125,6 @@ struct WorkCardSnapshot: Equatable {
     let liveStatusLastEventAt: String?
     let blockedBy: String?
     let isAutoBlocked: Bool
-    let gatingPrereqs: [WorkDependencyRow]
     let autoBlockTooltip: String
     let repoChip: RepoChipPresentation?
     let ciFailureBadge: CiFailureBadge?
@@ -137,6 +144,8 @@ struct WorkCardSnapshot: Equatable {
     let terminalTooltip: String
     let deferredScopeItems: [DeferredScopeAttention]
     let deferredScopeActionInFlightIDs: Set<String>
+    /// Card fill / border / shadow chrome (see `KanbanBoardStyle`).
+    let boardStyle: KanbanBoardStyle
 
     // MARK: - Lane / activity booleans (recomputed today in WorkBoardCardItem)
 
@@ -331,7 +340,6 @@ struct WorkCardSnapshot: Equatable {
             liveStatusLastEventAt: liveStatusLastEventAt,
             blockedBy: context.blockedBy,
             isAutoBlocked: context.isAutoBlocked,
-            gatingPrereqs: context.gatingPrereqs,
             autoBlockTooltip: autoBlockTooltip,
             repoChip: context.repoChip,
             ciFailureBadge: context.ciFailureBadge,
@@ -351,6 +359,7 @@ struct WorkCardSnapshot: Equatable {
             terminalTooltip: context.terminalTooltip,
             deferredScopeItems: context.deferredScopeItems,
             deferredScopeActionInFlightIDs: context.deferredScopeActionInFlightIDs,
+            boardStyle: context.boardStyle,
             isDispatchPending: isDispatchPending,
             isResolvingConflicts: isResolvingConflicts,
             isRemediatingCI: isRemediatingCI,
@@ -385,7 +394,10 @@ struct WorkCardSnapshot: Equatable {
             hasTagChips: !tagChips.labels.isEmpty,
             hasLiveStatus: liveStatusNonEmpty,
             hasPRRow: prURLNonEmpty,
-            hasReviewRow: prURLNonEmpty && reviewRequiredState != nil,
+            // Match pre-snapshot semantics (`task.prURL != nil` rather
+            // than non-empty): an empty-string prURL still reserved the
+            // review-indicator row when review state was present.
+            hasReviewRow: task.prURL != nil && reviewRequiredState != nil,
             hasRevisionParentPRRow: hasRevisionParentPRRow,
             hasStandaloneShortID: !prURLNonEmpty && task.shortID != nil,
             hasInReviewRevisions: !context.inReviewRevisions.isEmpty,

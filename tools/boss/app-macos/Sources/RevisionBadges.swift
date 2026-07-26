@@ -86,9 +86,11 @@ struct EngineRevisionBadge: View {
 
 /// One rollup line in a Review-lane parent card for an in-review revision.
 /// Shows `⟳ R<n>  <description truncated>  ↗` linking to the parent PR.
+/// Consumes [[WorkCardRevisionRollup]] so the card body never needs a
+/// full `WorkTask` for nested rollups.
 
 struct RevisionRollupLine: View {
-    let revision: WorkTask
+    let revision: WorkCardRevisionRollup
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {

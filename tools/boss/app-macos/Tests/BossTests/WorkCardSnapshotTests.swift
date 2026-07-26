@@ -1,11 +1,13 @@
 import XCTest
 @testable import Boss
 
-/// Unit tests for `WorkCardSnapshot` (design entry 4 of
+/// Unit tests for `WorkCardSnapshot` (design entry 4) and
+/// `WorkBoardCardView`'s snapshot-derived `Equatable` (entry 5 of
 /// `boss-ui-performance-improvements.md`). Exhaustive equality coverage:
 /// non-rendered `WorkTask` fields preserve snapshot equality; every rendered
 /// field flips it; Mirror classification fails when `WorkTask` gains a field
-/// that is not listed here.
+/// that is not listed here. Card-view `==` tracks the snapshot (including
+/// board style) and ignores closures.
 ///
 /// Gate:
 /// 1. Two `WorkTask`s that differ only in non-rendered fields produce
@@ -17,6 +19,9 @@ import XCTest
 ///    alone flips `==`), so a field that is later rendered by the card but
 ///    omitted from the snapshot builder is forced into the classification
 ///    list and must grow a mutation case here.
+/// 4. `WorkBoardCardView.==` follows the snapshot and ignores action
+///    closures so `.equatable()` can skip unchanged card bodies.
+@MainActor
 final class WorkCardSnapshotTests: XCTestCase {
 
     // MARK: - Exhaustive WorkTask stored-property classification
@@ -868,6 +873,83 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertEqual(backlog.prMergeableState, "mergeable")
     }
 
+    /// Pre-snapshot gate was `task.prURL != nil` (not non-empty). Empty
+    /// string still reserves the review-indicator row when review state
+    /// is present; the PR link row (`hasPRRow`) stays suppressed.
+    func testHasReviewRowAllowsEmptyPRURL() {
+        var emptyURL = Self.makeTask(status: "in_review", prURL: "")
+        emptyURL.reviewRequiredState = "approved"
+        let emptySnap = WorkCardSnapshot.build(
+            task: emptyURL,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+        XCTAssertTrue(emptySnap.hasReviewRow)
+        XCTAssertFalse(emptySnap.hasPRRow)
+
+        var nilURL = Self.makeTask(status: "in_review", prURL: nil)
+        nilURL.reviewRequiredState = "approved"
+        let nilSnap = WorkCardSnapshot.build(
+            task: nilURL,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+        XCTAssertFalse(nilSnap.hasReviewRow)
+        XCTAssertFalse(nilSnap.hasPRRow)
+    }
+
+    /// Board style is an equatable input so `.equatable()` re-evaluates
+    /// card chrome when the user flips `boss.kanban.boardStyle`.
+    func testBoardStyleParticipatesInEquality() {
+        let task = Self.makeTask()
+        let classic = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(column: .backlog, boardStyle: .classic)
+        )
+        let airy = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(column: .backlog, boardStyle: .airy)
+        )
+        XCTAssertEqual(classic.boardStyle, .classic)
+        XCTAssertEqual(airy.boardStyle, .airy)
+        XCTAssertNotEqual(classic, airy)
+    }
+
+    /// Gating prereq *rows* are not stored on the snapshot — only the
+    /// precomputed tooltip participates in equality. Prereq-id churn
+    /// with an identical tooltip must not force body re-eval.
+    func testGatingPrereqIDsDoNotAffectEqualityWhenTooltipMatches() {
+        let task = Self.makeTask(status: "blocked")
+        let rowA = WorkDependencyRow(
+            id: "prereq_a",
+            title: "Phase 1",
+            status: "todo",
+            kind: .task
+        )
+        let rowB = WorkDependencyRow(
+            id: "prereq_b",
+            title: "Phase 1",
+            status: "todo",
+            kind: .task
+        )
+        let a = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .backlog,
+                isAutoBlocked: true,
+                gatingPrereqs: [rowA]
+            )
+        )
+        let b = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .backlog,
+                isAutoBlocked: true,
+                gatingPrereqs: [rowB]
+            )
+        )
+        XCTAssertEqual(a.autoBlockTooltip, b.autoBlockTooltip)
+        XCTAssertEqual(a, b)
+    }
+
     func testMergeQueueStateOnlyWhenInMergingSection() {
         var task = Self.makeTask(status: "in_review", prURL: "https://github.com/x/y/pull/4")
         task.mergeQueueState = "queued"
@@ -1035,6 +1117,59 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertTrue(snap.hasStandaloneShortID)
         XCTAssertEqual(snap.shortID, 42)
         XCTAssertFalse(snap.hasPRRow)
+    }
+
+    // MARK: - WorkBoardCardView Equatable (entry 5)
+
+    /// Closures must not participate in `==` — otherwise every parent
+    /// re-render that rebuilds action handlers would defeat `.equatable()`.
+    func testCardViewEquatableIgnoresClosures() {
+        let snap = WorkCardSnapshot.build(
+            task: Self.makeTask(name: "Ship it"),
+            context: WorkCardSnapshotContext(column: .backlog)
+        )
+        let a = WorkBoardCardView(
+            snapshot: snap,
+            onOpenTerminal: { /* a */ },
+            onMergeWhenReady: { /* a */ }
+        )
+        let b = WorkBoardCardView(
+            snapshot: snap,
+            onOpenTerminal: { /* b — different identity */ },
+            onMergeWhenReady: { /* b */ }
+        )
+        XCTAssertEqual(a, b)
+    }
+
+    /// Snapshot inequality must surface on the view so `.equatable()`
+    /// re-evaluates body when rendered inputs change.
+    func testCardViewEquatableTracksSnapshot() {
+        let base = Self.makeTask(name: "Before")
+        let changed = Self.makeTask(id: base.id, name: "After")
+        let ctx = WorkCardSnapshotContext(column: .backlog)
+        let a = WorkBoardCardView(snapshot: WorkCardSnapshot.build(task: base, context: ctx))
+        let b = WorkBoardCardView(snapshot: WorkCardSnapshot.build(task: changed, context: ctx))
+        XCTAssertNotEqual(a, b)
+    }
+
+    /// Board-style flip must surface on the view so already-mounted
+    /// cards re-style instead of keeping previous chrome under
+    /// `.equatable()`.
+    func testCardViewEquatableTracksBoardStyle() {
+        let task = Self.makeTask(name: "Ship")
+        let a = WorkBoardCardView(
+            snapshot: WorkCardSnapshot.build(
+                task: task,
+                context: WorkCardSnapshotContext(column: .backlog, boardStyle: .classic)
+            )
+        )
+        let b = WorkBoardCardView(
+            snapshot: WorkCardSnapshot.build(
+                task: task,
+                context: WorkCardSnapshotContext(column: .backlog, boardStyle: .elevated)
+            )
+        )
+        XCTAssertNotEqual(a, b)
     }
 
     // MARK: - Helpers
