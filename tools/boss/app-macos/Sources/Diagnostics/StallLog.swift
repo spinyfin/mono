@@ -4,7 +4,7 @@ import os
 /// One recorded main-thread stall: the moment the watchdog noticed the
 /// main queue had gone unresponsive for longer than the configured
 /// threshold, the raw main-thread return addresses captured at that
-/// moment (symbolicated lazily on read/export), and a coarse tag for
+/// moment (symbolicated lazily on live read paths), and a coarse tag for
 /// what was frontmost.
 ///
 /// `durationMs` is the stall length **measured at detection** — the
@@ -13,6 +13,13 @@ import os
 /// rather than waiting for the main thread to recover. It is therefore
 /// a lower bound on the true stall: "the main thread had already been
 /// blocked at least this long when we looked."
+///
+/// **Capture vs durability.** The in-memory ring keeps raw
+/// `frameAddresses` so the watchdog never pays for `dladdr`. The on-disk
+/// JSONL mirror also writes a `backtrace` array of symbolicated strings
+/// on the writer path: raw ASLR addresses are meaningless after process
+/// death, so durable export must carry resolved frames (or equivalent
+/// UUID+slide metadata). Live viewers still symbolicate from addresses.
 struct StallRecord: Codable, Identifiable, Sendable, Equatable {
     let id: UUID
     /// Wall-clock time the stall was detected, ms since the Unix epoch.
@@ -28,8 +35,13 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
     let context: String
     /// Raw main-thread return addresses, innermost first. Kept unsymbolicated
     /// on the capture path so the watchdog never pays for `dladdr`; resolve
-    /// via [[symbolicatedBacktrace]] in the viewer or on export.
+    /// via [[symbolicatedBacktrace]] in the live viewer.
     let frameAddresses: [UInt]
+    /// Process-death-durable symbolicated frames, written on the JSONL
+    /// writer path. `nil`/empty for live in-memory records that have not
+    /// been through encode; when present (decoded from disk), prefer this
+    /// over re-resolving addresses under a new ASLR slide.
+    let backtrace: [String]?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -39,6 +51,7 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         case thresholdMs = "threshold_ms"
         case context
         case frameAddresses = "frame_addresses"
+        case backtrace
     }
 
     init(
@@ -48,7 +61,8 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         heartbeatIntervalMs: Double,
         thresholdMs: Double,
         context: String,
-        frameAddresses: [UInt]
+        frameAddresses: [UInt],
+        backtrace: [String]? = nil
     ) {
         self.id = id
         self.tsEpochMs = tsEpochMs
@@ -57,11 +71,13 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         self.thresholdMs = thresholdMs
         self.context = context
         self.frameAddresses = frameAddresses
+        self.backtrace = backtrace
     }
 
     /// Encode addresses as hex strings so JSON numbers cannot lose low
     /// bits of a 64-bit pointer (IEEE doubles only keep 53 bits of
-    /// integer precision).
+    /// integer precision). Always also emit symbolicated `backtrace`
+    /// strings so the JSONL mirror remains useful after process death.
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(UUID.self, forKey: .id)
@@ -84,6 +100,7 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
             }
             return value
         }
+        backtrace = try c.decodeIfPresent([String].self, forKey: .backtrace)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -98,6 +115,16 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
             frameAddresses.map { "0x" + String($0, radix: 16) },
             forKey: .frameAddresses
         )
+        // Durable export: symbolicate on the encode/writer path so JSONL
+        // survives process death. Prefer a pre-filled backtrace when the
+        // record was decoded from disk; otherwise resolve live addresses.
+        let frames: [String]
+        if let backtrace, !backtrace.isEmpty {
+            frames = backtrace
+        } else {
+            frames = MainThreadBacktrace.symbolicatedStrings(frameAddresses)
+        }
+        try c.encode(frames, forKey: .backtrace)
     }
 
     /// A copy with `durationMs` replaced. Used when the watchdog grows an
@@ -112,15 +139,17 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
             heartbeatIntervalMs: heartbeatIntervalMs,
             thresholdMs: thresholdMs,
             context: context,
-            frameAddresses: frameAddresses
+            frameAddresses: frameAddresses,
+            backtrace: backtrace
         )
     }
 
-    /// Lazily symbolicate the stored addresses for display or export.
-    /// Safe to call repeatedly — `MainThreadBacktrace.symbolicate`
-    /// memoizes per address.
+    /// Frames for display or plain-text dump. Prefers durable symbolicated
+    /// strings when present (disk reload); otherwise resolves addresses
+    /// via the live `dladdr` memo.
     func symbolicatedBacktrace() -> [String] {
-        MainThreadBacktrace.symbolicatedStrings(frameAddresses)
+        if let backtrace, !backtrace.isEmpty { return backtrace }
+        return MainThreadBacktrace.symbolicatedStrings(frameAddresses)
     }
 }
 
@@ -192,6 +221,10 @@ final class StallLog: @unchecked Sendable {
 
     /// Append a stall to the ring (synchronous, lock-guarded) and queue
     /// the JSONL line for the on-disk mirror (asynchronous).
+    ///
+    /// The ring keeps the capture-path record (raw addresses). Encode runs
+    /// on the private queue and fills durable `backtrace` strings so the
+    /// JSONL mirror remains useful after process death / ASLR change.
     func record(_ rec: StallRecord) {
         ring.withLock { buf in
             buf.append(rec)

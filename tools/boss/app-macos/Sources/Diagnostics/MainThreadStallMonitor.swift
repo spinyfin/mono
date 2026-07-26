@@ -183,6 +183,23 @@ final class MainThreadStallMonitor: @unchecked Sendable {
             }
             return
         }
+
+        // Soft floor on *new* record frequency. Must run *before*
+        // committing `recordedBeat`: rejecting after the commit would
+        // permanently drop this episode (same beat never re-enters), even
+        // once the interval has elapsed. Leaving `recordedBeat` unset lets
+        // a later tick of the same freeze record successfully.
+        guard Self.acceptsNewRecord(
+            nowNanos: now,
+            lastRecordNanos: lastRecordNanos,
+            minRecordIntervalMs: config.minRecordIntervalMs
+        ) else {
+            return
+        }
+
+        // Commit the episode marker before the frame walk so an idle-stack
+        // discard (below) still prevents re-capture every poll tick. Floor
+        // rejects above deliberately skip this so they remain retryable.
         state.withLock { $0.recordedBeat = snap.beat }
 
         let addresses = MainThreadBacktrace.capture(thread: mainThreadPort, maxFrames: config.maxFrames)
@@ -203,15 +220,6 @@ final class MainThreadStallMonitor: @unchecked Sendable {
             return
         }
 
-        // Soft floor on record (→ eventual symbolication) frequency.
-        if config.minRecordIntervalMs > 0, lastRecordNanos != 0 {
-            let elapsedMs = Double(now &- lastRecordNanos) / 1_000_000.0
-            if elapsedMs < config.minRecordIntervalMs {
-                ongoingRecordId = nil
-                return
-            }
-        }
-
         let record = StallRecord(
             tsEpochMs: Int64(Date().timeIntervalSince1970 * 1000),
             durationMs: durationMs,
@@ -223,6 +231,19 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         ongoingRecordId = record.id
         lastRecordNanos = now
         log.record(record)
+    }
+
+    /// Pure floor decision: may a new stall *record* be accepted now?
+    /// `lastRecordNanos == 0` means nothing has been recorded yet (always
+    /// accept). `minRecordIntervalMs <= 0` disables the floor.
+    static func acceptsNewRecord(
+        nowNanos: UInt64,
+        lastRecordNanos: UInt64,
+        minRecordIntervalMs: Double
+    ) -> Bool {
+        guard minRecordIntervalMs > 0, lastRecordNanos != 0 else { return true }
+        let elapsedMs = Double(nowNanos &- lastRecordNanos) / 1_000_000.0
+        return elapsedMs >= minRecordIntervalMs
     }
 
     /// Coarse "what was active" tag. The frontmost window title surfaces

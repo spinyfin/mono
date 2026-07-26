@@ -70,11 +70,46 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertTrue(json.contains("\"frame_addresses\""))
         // Addresses encoded as hex strings (JSON numbers would lose bits).
         XCTAssertTrue(json.contains("0x10abc") || json.contains("0x0000000000010abc"))
-        XCTAssertFalse(json.contains("\"backtrace\""), "legacy symbolicated backtrace key must not be written")
+        // Durable writer path: symbolicated strings must be present so JSONL
+        // remains useful after process death (raw ASLR addresses alone are not).
+        XCTAssertTrue(json.contains("\"backtrace\""), "durable JSONL must include symbolicated backtrace")
 
         let decoded = try JSONDecoder().decode(StallRecord.self, from: data)
-        XCTAssertEqual(decoded, rec)
+        XCTAssertEqual(decoded.id, rec.id)
         XCTAssertEqual(decoded.frameAddresses, [0x10abc, 0xdead_beef_0000])
+        XCTAssertEqual(decoded.context, "Picard")
+        // Encode fills backtrace; decode must retain it for offline reload.
+        XCTAssertEqual(try XCTUnwrap(decoded.backtrace).count, 2)
+        XCTAssertFalse(try XCTUnwrap(decoded.backtrace).isEmpty)
+    }
+
+    func testStallRecordDecodeAcceptsAddressOnlyLegacyLines() throws {
+        // Older JSONL lines may lack `backtrace`; decode must not fail, and
+        // live symbolication still works from frame_addresses.
+        let json = """
+        {"context":"Data","duration_ms":300,"frame_addresses":["0x1","0x2"],\
+        "heartbeat_interval_ms":100,"id":"00000000-0000-0000-0000-000000000002",\
+        "threshold_ms":250,"ts_epoch_ms":1700000000000}
+        """
+        let decoded = try JSONDecoder().decode(StallRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.frameAddresses, [1, 2])
+        XCTAssertNil(decoded.backtrace)
+        XCTAssertFalse(decoded.symbolicatedBacktrace().isEmpty)
+    }
+
+    func testDurableBacktracePreferredOverLiveAddresses() {
+        // After process death, reloaded records carry pre-rendered frames;
+        // prefer those over re-resolving (likely wrong) ASLR addresses.
+        let rec = StallRecord(
+            tsEpochMs: 1,
+            durationMs: 300,
+            heartbeatIntervalMs: 100,
+            thresholdMs: 250,
+            context: "offline",
+            frameAddresses: [0xdead],
+            backtrace: ["0  Boss  0x1 foo + 0"]
+        )
+        XCTAssertEqual(rec.symbolicatedBacktrace(), ["0  Boss  0x1 foo + 0"])
     }
 
     // MARK: - StallLog ring buffer
@@ -189,6 +224,57 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         // Image column is fixed width (30) — long names are truncated.
         XCTAssertTrue(frame.contains(String(repeating: "X", count: 30)))
         XCTAssertFalse(frame.contains(String(repeating: "X", count: 31)))
+    }
+
+    // MARK: - New-record interval floor
+
+    func testAcceptsNewRecordWhenFloorDisabled() {
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 1_000_000,
+            lastRecordNanos: 999_000,
+            minRecordIntervalMs: 0
+        ))
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 1_000_000,
+            lastRecordNanos: 999_000,
+            minRecordIntervalMs: -1
+        ))
+    }
+
+    func testAcceptsNewRecordWhenNothingRecordedYet() {
+        // lastRecordNanos == 0 is the "no prior record" sentinel.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: 50_000_000,
+            lastRecordNanos: 0,
+            minRecordIntervalMs: 100
+        ))
+    }
+
+    func testAcceptsNewRecordRejectsInsideFloor() {
+        // 50 ms elapsed, 100 ms floor → reject (must not commit recordedBeat).
+        let last: UInt64 = 1_000_000_000
+        let now = last + 50_000_000
+        XCTAssertFalse(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: now,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
+    }
+
+    func testAcceptsNewRecordAllowsAtAndAfterFloor() {
+        let last: UInt64 = 1_000_000_000
+        // Exactly at floor.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: last + 100_000_000,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
+        // Past floor.
+        XCTAssertTrue(MainThreadStallMonitor.acceptsNewRecord(
+            nowNanos: last + 250_000_000,
+            lastRecordNanos: last,
+            minRecordIntervalMs: 100
+        ))
     }
 
     // MARK: - Idle-event-loop filter (pure address + range)

@@ -89,8 +89,10 @@ struct UIStallsViewer: View {
                         StallRow(
                             record: rec,
                             isExpanded: expanded.contains(rec.id),
-                            frames: expanded.contains(rec.id) ? frames(for: rec) : nil
-                        ) { toggle(rec.id) }
+                            // Body only reads the cache — never symbolicating or
+                            // writing @State during view evaluation.
+                            frames: expanded.contains(rec.id) ? symbolicatedCache[rec.id] : nil
+                        ) { toggle(rec) }
                         Divider().padding(.leading, 14)
                     }
                 }
@@ -127,17 +129,19 @@ struct UIStallsViewer: View {
         symbolicatedCache = symbolicatedCache.filter { live.contains($0.key) }
     }
 
-    private func toggle(_ id: UUID) {
-        if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
-    }
-
-    /// Lazily symbolicate on first expand; subsequent expands hit the
-    /// view-local cache (and `MainThreadBacktrace`'s per-address memo).
-    private func frames(for rec: StallRecord) -> [String] {
-        if let cached = symbolicatedCache[rec.id] { return cached }
-        let frames = rec.symbolicatedBacktrace()
-        symbolicatedCache[rec.id] = frames
-        return frames
+    /// Expand/collapse handler. Symbolication runs here (action path),
+    /// never during `body` evaluation — mutating `@State` mid-body is
+    /// undefined in SwiftUI and can re-enter layout.
+    private func toggle(_ rec: StallRecord) {
+        let id = rec.id
+        if expanded.contains(id) {
+            expanded.remove(id)
+            return
+        }
+        expanded.insert(id)
+        if symbolicatedCache[id] == nil {
+            symbolicatedCache[id] = rec.symbolicatedBacktrace()
+        }
     }
 
     private func copyReport() {

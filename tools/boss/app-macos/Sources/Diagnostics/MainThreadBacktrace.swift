@@ -180,9 +180,10 @@ enum MainThreadBacktrace {
         slide: Int
     ) -> AppImageRange? {
         let magic = header.pointee.magic
-        // Boss is arm64/x86_64 only; 32-bit Mach-O is not a supported
-        // host. Bail cleanly rather than parsing LC_SEGMENT.
-        guard magic == MH_MAGIC_64 || magic == MH_CIGAM_64 else { return nil }
+        // Boss is arm64/x86_64 host-native only. Host-loaded images are
+        // little-endian MH_MAGIC_64; skip 32-bit and foreign-endian headers
+        // rather than parsing LC_SEGMENT / LC_SEGMENT_64 under the wrong layout.
+        guard magic == MH_MAGIC_64 else { return nil }
 
         let headerSize = MemoryLayout<mach_header_64>.size
         let ncmds = Int(header.pointee.ncmds)
