@@ -1921,6 +1921,19 @@ pub(crate) fn migrate_work_comments_revise_task_id_column(conn: &Connection) -> 
     Ok(())
 }
 
+/// Add `tasks.tags` — a JSON-encoded ordered list of free-form label
+/// strings rendered on kanban cards. Empty set is stored as `'[]'`.
+/// Caps enforced at the write path (`WORK_ITEM_TAG_MAX_LEN` /
+/// `WORK_ITEM_TAG_MAX_COUNT` in `boss_protocol`), not by SQL. Owned by
+/// the leaf row (revisions do not inherit parent tags). Idempotent —
+/// guarded by `table_has_column`.
+pub(crate) fn migrate_tasks_tags_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "tags")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'", [])?;
+    }
+    Ok(())
+}
+
 /// One-time data migration: re-homes rows still carrying the retired
 /// `directive` / `larger_change` intent values onto the single
 /// `INTENT_REVISION` ("revision") value, so they keep matching

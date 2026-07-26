@@ -4,6 +4,17 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Maximum length of a single free-form work-item tag, in Unicode scalar
+/// values (Rust `char`s). Matches the kanban chip's truncation point so a
+/// tag that survives the write path still fits the card without stretching
+/// the column. Longer values are rejected at the engine write boundary.
+pub const WORK_ITEM_TAG_MAX_LEN: usize = 24;
+
+/// Maximum number of free-form tags on a single work item. Beyond this the
+/// card would grow or overflow unboundedly; the write path rejects a final
+/// set larger than this after set/add/remove are applied.
+pub const WORK_ITEM_TAG_MAX_COUNT: usize = 5;
+
 /// Which naming strategy to use for worker branches pushed to this
 /// product's repo. The execution-id suffix is always appended for
 /// uniqueness; only the leading prefix component varies.

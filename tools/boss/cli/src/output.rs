@@ -938,6 +938,9 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
         println!("Repo: {}", format_repo_line(task.repo_remote_url.as_deref(), product),);
     }
     println!("Priority: {}", task.priority);
+    if !task.tags.is_empty() {
+        println!("Tags: {}", task.tags.join(", "));
+    }
     if let Some(level) = task.effort_level {
         println!("Effort: {level}");
     }

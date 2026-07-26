@@ -2653,6 +2653,28 @@ pub(crate) struct TaskUpdateArgs {
     /// the engine rejects a detail with no reason to attach it to.
     #[arg(long = "blocked-detail", value_name = "DETAIL", allow_hyphen_values = true)]
     pub(crate) blocked_detail: Option<String>,
+
+    /// Replace the full free-form tag set on this work item. Comma-separated
+    /// list (e.g. `--tags needs-human,ci-flake`). Empty string clears all
+    /// tags (same as `--clear-tags`). Mutually exclusive with `--clear-tags`.
+    /// Caps: 24 chars per tag, 5 tags per item (engine-enforced).
+    #[arg(long = "tags", value_name = "TAGS", conflicts_with = "clear_tags")]
+    pub(crate) tags: Option<String>,
+
+    /// Append one free-form tag (repeatable). De-duplicated against the
+    /// current set. May be combined with `--remove-tag` and/or `--tags`.
+    #[arg(long = "add-tag", value_name = "TAG", action = clap::ArgAction::Append)]
+    pub(crate) add_tags: Vec<String>,
+
+    /// Remove one free-form tag (repeatable, exact match). Unknown names
+    /// are ignored. May be combined with `--add-tag` and/or `--tags`.
+    #[arg(long = "remove-tag", value_name = "TAG", action = clap::ArgAction::Append)]
+    pub(crate) remove_tags: Vec<String>,
+
+    /// Clear every free-form tag on this work item. Mutually exclusive
+    /// with `--tags`.
+    #[arg(long = "clear-tags", conflicts_with = "tags")]
+    pub(crate) clear_tags: bool,
 }
 
 #[derive(Debug, Clone, Args)]

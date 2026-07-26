@@ -36,6 +36,72 @@ fn validate_blocked_reason_length(reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Normalize and validate a free-form tag list for a leaf work item.
+/// Trims whitespace, drops empty strings, de-duplicates (first wins),
+/// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
+/// [`boss_protocol::WORK_ITEM_TAG_MAX_COUNT`]. Length is measured in
+/// Unicode scalar values (Rust `char`s), matching the Swift UI chip
+/// truncation so a tag that survives the write path still fits the card.
+pub(crate) fn normalize_and_validate_tags(input: &[String]) -> Result<Vec<String>> {
+    use boss_protocol::{WORK_ITEM_TAG_MAX_COUNT, WORK_ITEM_TAG_MAX_LEN};
+    let mut out: Vec<String> = Vec::new();
+    for raw in input {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let len = trimmed.chars().count();
+        if len > WORK_ITEM_TAG_MAX_LEN {
+            bail!(
+                "tag is too long ({len} chars, max {WORK_ITEM_TAG_MAX_LEN}): `{trimmed}`. \
+                 Keep tags short so kanban chips stay readable."
+            );
+        }
+        if out.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        out.push(trimmed.to_owned());
+    }
+    if out.len() > WORK_ITEM_TAG_MAX_COUNT {
+        bail!(
+            "too many tags ({}, max {WORK_ITEM_TAG_MAX_COUNT}). \
+             Remove some tags before adding more.",
+            out.len()
+        );
+    }
+    Ok(out)
+}
+
+/// Apply set / add / remove tag patch fields onto the current list.
+/// Order: replace (if `set` is `Some`) → append adds → drop removes.
+/// Final list is re-validated for length/count caps.
+pub(crate) fn apply_tag_patch(
+    current: &[String],
+    set: Option<Vec<String>>,
+    add: Option<Vec<String>>,
+    remove: Option<Vec<String>>,
+) -> Result<Vec<String>> {
+    let mut tags = if let Some(set) = set {
+        normalize_and_validate_tags(&set)?
+    } else {
+        current.to_vec()
+    };
+    if let Some(add) = add {
+        let mut combined = tags;
+        combined.extend(add);
+        tags = normalize_and_validate_tags(&combined)?;
+    }
+    if let Some(remove) = remove {
+        let remove_set: Vec<String> = remove
+            .into_iter()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+        tags.retain(|t| !remove_set.iter().any(|r| r == t));
+    }
+    Ok(tags)
+}
+
 impl WorkDb {
     pub(crate) fn update_product(&self, id: &str, patch: WorkItemPatch) -> Result<WorkItem> {
         let mut conn = self.connect()?;
@@ -251,6 +317,14 @@ impl WorkDb {
         if let Some(deferred) = patch.deferred {
             task.deferred = deferred;
         }
+        if patch.tags.is_some() || patch.add_tags.is_some() || patch.remove_tags.is_some() {
+            task.tags = apply_tag_patch(
+                &task.tags,
+                patch.tags.clone(),
+                patch.add_tags.clone(),
+                patch.remove_tags.clone(),
+            )?;
+        }
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
@@ -302,6 +376,7 @@ impl WorkDb {
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
         let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
+        let tags_value = encode_task_tags(&task.tags);
 
         tx.execute(
             "UPDATE tasks
@@ -310,7 +385,7 @@ impl WorkDb {
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
-                 reasoning = ?20,
+                 reasoning = ?20, tags = ?21,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -338,6 +413,7 @@ impl WorkDb {
                 task.blocked_detail,
                 task.deferred as i64,
                 reasoning_value,
+                tags_value,
             ],
         )?;
 

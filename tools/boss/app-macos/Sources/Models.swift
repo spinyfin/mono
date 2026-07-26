@@ -224,6 +224,13 @@ struct WorkTask: Identifiable, Hashable {
     /// Mirrors `Task.dispatch_failed_at` on the wire.
     var dispatchFailedAt: String? = nil
 
+    /// Free-form operator/agent labels on this leaf work item. Empty when
+    /// none are set. Mirrors `Task.tags` on the wire. Owned by the leaf
+    /// card row — revisions do not inherit parent tags. Caps enforced by
+    /// the engine (24 chars / 5 tags); the card truncates display further
+    /// if needed and collapses entirely when empty.
+    var tags: [String] = []
+
     var isChore: Bool {
         kind == "chore" || kind == "followup"
     }

@@ -253,8 +253,21 @@ extension EngineClient {
             completedAt: payload["completed_at"] as? String,
             dispatchFailedReason: payload["dispatch_failed_reason"] as? String,
             dispatchFailedError: payload["dispatch_failed_error"] as? String,
-            dispatchFailedAt: payload["dispatch_failed_at"] as? String
+            dispatchFailedAt: payload["dispatch_failed_at"] as? String,
+            tags: parseWorkItemTags(payload["tags"])
         )
+    }
+
+    /// Decode free-form work-item tags from the wire. Absent / null / empty
+    /// → `[]` so pre-feature engines and zero-tag rows collapse the UI row.
+    /// Non-string entries are dropped rather than failing the whole task.
+    func parseWorkItemTags(_ value: Any?) -> [String] {
+        guard let raw = value as? [Any] else { return [] }
+        return raw.compactMap { entry in
+            guard let s = entry as? String else { return nil }
+            let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
     }
 
     /// Decode the per-task `doc_link_state` wire object (engine-resolved

@@ -944,6 +944,16 @@ pub struct Task {
     /// `dispatch_failed_reason`. `None` whenever that field is `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_failed_at: Option<String>,
+
+    /// Free-form operator/agent labels on this leaf work item (task, chore,
+    /// revision, design, investigation, …). Ordered, de-duplicated at write
+    /// time. Empty when none are set. Owned by the leaf row that owns the
+    /// kanban card — revisions do **not** inherit parent tags. Caps:
+    /// [`crate::WORK_ITEM_TAG_MAX_LEN`] chars per tag,
+    /// [`crate::WORK_ITEM_TAG_MAX_COUNT`] tags per item.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub tags: Vec<String>,
 }
 
 impl Task {
