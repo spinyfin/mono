@@ -6,7 +6,7 @@
 use std::fmt;
 use std::path::Path;
 
-use boss_protocol::{EffortLevel, TaskKind};
+use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
 
 use boss_engine_driver::{AgentDriver, DriverRegistry};
 
@@ -52,6 +52,15 @@ pub struct SpawnConfig {
     /// spawn came from `effort_level = small` (deliberate) or from
     /// a fall-through.
     pub effort_level: Option<EffortLevel>,
+    /// The capability signal on the row at dispatch time, independent of
+    /// [`Self::effort_level`]. `None` when the row was never classified
+    /// (created before the column existed, or by an insert path that does not
+    /// seed it) — those rows resolve their model through the legacy
+    /// kind-floor/effort-table path instead. Carried through to the dispatch
+    /// stream so an operator can tell an Opus spawn that came from
+    /// `reasoning = investigation` (deliberate) apart from one that came from
+    /// `effort_level = large` (a size proxy).
+    pub reasoning: Option<ReasoningMode>,
     /// Driver-specific effort knob value (e.g. `claude --effort`'s
     /// `"low"`/`"medium"`/…), resolved from the selected driver's
     /// [`boss_engine_driver::ModelMenu`]. `None` when the row has no
@@ -164,6 +173,13 @@ fn menu_for_driver_in(
 /// share the same floor because they share the same failure mode — a
 /// medium-or-lower effort classification on genuinely open-ended design work
 /// otherwise silently dispatches to Sonnet.
+///
+/// Since the `reasoning` column landed this floor applies only to rows that
+/// carry no [`ReasoningMode`]: new design-family rows are seeded
+/// `reasoning = investigation` at insert time
+/// ([`ReasoningMode::default_for`]), which reaches the same model through the
+/// capability lever instead of through a kind special-case. The floor stays
+/// for the rows that predate the column.
 pub fn is_design_family_kind(kind: &TaskKind) -> bool {
     matches!(
         kind,
@@ -172,53 +188,52 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 }
 
 /// Resolve dispatch knobs per design §Q3 precedence (extended for per-pool
-/// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5, and
-/// the design-family kind floor):
+/// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5, the
+/// design-family kind floor, and the `reasoning` capability signal):
 /// 1. `tasks.model_override` (when non-empty after trim).
 /// 2. `pool_model_override` — the owning pool's override (when non-empty
 ///    after trim). Both the automation pool and the review pool set this to
 ///    `"opus"` unconditionally, so reviewer agents and automation agents are
 ///    always Opus regardless of the row's effort level. Pass `None` for
 ///    main-pool executions.
-/// 3. Design-family kind floor — `kind` is `Design`, `DesignPostmortem`, or
+/// 3. `tasks.reasoning` — the capability signal, from the selected driver's
+///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]. **This is the
+///    lever that decides the model for every classified row**, and it does not
+///    consult `effort_level` in either direction: a `small` row with
+///    `reasoning = investigation` reaches Opus without inflating its effort,
+///    and a `large` row with `reasoning = standard` stays on Sonnet because it
+///    is big, not hard. Steps 4-6 below are reached only by rows where this is
+///    `None`.
+/// 4. Design-family kind floor — `kind` is `Design`, `DesignPostmortem`, or
 ///    `Investigation` ([`is_design_family_kind`]) → `"opus"`, regardless of
 ///    `effort_level`. This is a genuine model floor, not an effort bump: a
 ///    `medium`-effort design_postmortem must not fall through to the
 ///    effort-level table's Sonnet row. An explicit `tasks.model_override`
 ///    (step 1) still wins over the floor — it is the sanctioned escape
 ///    hatch, mirroring how the pool override composes.
-/// 4. Effort-level default — from the selected driver's model menu.
-/// 5. `products.default_model` (when non-empty after trim).
-/// 6. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
+/// 5. Effort-level default — from the selected driver's model menu.
+/// 6. `products.default_model` (when non-empty after trim).
+/// 7. Driver's engine-default model (from [`boss_engine_driver::ModelMenu::engine_default`]).
+///
+/// Steps 4 and 5 are the pre-`reasoning` behaviour, preserved verbatim for
+/// unclassified rows. That is deliberate: an in-flight row must not be
+/// silently re-modelled by this change landing, only by something explicitly
+/// setting its `reasoning`.
 ///
 /// The effort value and prompt addendum follow `effort_level` only via the
-/// driver's menu; neither `model_override`, `pool_model_override`, nor the
-/// kind floor changes them (design §Q3: "a user who overrides to Haiku on a
-/// `medium` row is asking 'use Haiku for this one,' not 'treat this as a
-/// trivial.'").
+/// driver's menu; none of `model_override`, `pool_model_override`,
+/// `reasoning`, or the kind floor changes them (design §Q3: "a user who
+/// overrides to Haiku on a `medium` row is asking 'use Haiku for this one,'
+/// not 'treat this as a trivial.'"). This is the same separation from the
+/// other side: `reasoning` moves the model without touching how much runway
+/// the worker gets, and `effort_level` moves the runway without touching the
+/// model.
 ///
 /// Returns [`UnknownDriverError`] when the resolved driver slug (step 0,
 /// [`resolve_driver`]) is not registered in [`DriverRegistry`], rather than
 /// silently resolving against the Claude menu.
-pub fn resolve_spawn_config(
-    effort_level: Option<EffortLevel>,
-    model_override: Option<&str>,
-    pool_model_override: Option<&str>,
-    product_default_model: Option<&str>,
-    task_driver: Option<&str>,
-    product_default_driver: Option<&str>,
-    kind: Option<&TaskKind>,
-) -> Result<SpawnConfig, UnknownDriverError> {
-    let input = SpawnResolutionInput::builder()
-        .maybe_effort_level(effort_level)
-        .maybe_model_override(model_override)
-        .maybe_pool_model_override(pool_model_override)
-        .maybe_product_default_model(product_default_model)
-        .maybe_task_driver(task_driver)
-        .maybe_product_default_driver(product_default_driver)
-        .maybe_kind(kind)
-        .build();
-    resolve_spawn_config_in(&DriverRegistry::default(), &input)
+pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig, UnknownDriverError> {
+    resolve_spawn_config_in(&DriverRegistry::default(), input)
 }
 
 /// Inputs to [`resolve_spawn_config_in`], grouped into one type per the
@@ -235,6 +250,7 @@ pub struct SpawnResolutionInput<'a> {
     pub task_driver: Option<&'a str>,
     pub product_default_driver: Option<&'a str>,
     pub kind: Option<&'a TaskKind>,
+    pub reasoning: Option<ReasoningMode>,
 }
 
 /// [`resolve_spawn_config`], resolved against a caller-supplied registry
@@ -253,6 +269,11 @@ pub fn resolve_spawn_config_in(
         m.to_owned()
     } else if let Some(m) = input.pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
+    } else if let Some(reasoning) = input.reasoning {
+        // The capability lever. Note what is NOT consulted here: `effort_level`
+        // plays no part, in either direction. That is the whole point — see
+        // this function's doc comment, step 3.
+        (menu.model_for_reasoning)(reasoning).to_owned()
     } else if input.kind.is_some_and(is_design_family_kind) {
         "opus".to_owned()
     } else if let Some(level) = effort_level {
@@ -265,6 +286,7 @@ pub fn resolve_spawn_config_in(
 
     Ok(SpawnConfig {
         effort_level,
+        reasoning: input.reasoning,
         effort_value: effort_level.and_then(|l| (menu.effort_value_for_level)(l)),
         model,
         driver,
@@ -498,6 +520,15 @@ mod tests {
         "stub-model"
     }
 
+    /// The stub's two reasoning tiers are distinguishable so tests can assert
+    /// the resolver consulted *this* driver's menu rather than Claude's.
+    fn stub_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
+        match reasoning {
+            ReasoningMode::Standard => "stub-standard",
+            ReasoningMode::Investigation => "stub-investigation",
+        }
+    }
+
     fn stub_prompt_addendum_for_level(_level: EffortLevel) -> Option<&'static str> {
         None
     }
@@ -518,6 +549,7 @@ mod tests {
                 engine_default: "stub-model",
                 effort_value_for_level: stub_effort_value_for_level,
                 default_model_for_level: stub_default_model_for_level,
+                model_for_reasoning: stub_model_for_reasoning,
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
             },
@@ -589,14 +621,19 @@ mod tests {
 
     #[test]
     fn resolve_spawn_config_errors_on_unregistered_driver_instead_of_dispatching_on_claude() {
-        let err =
-            resolve_spawn_config(Some(EffortLevel::Large), None, None, None, Some("copilot"), None, None).unwrap_err();
+        let err = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Large)
+                .task_driver("copilot")
+                .build(),
+        )
+        .unwrap_err();
         assert_eq!(err.driver_slug, "copilot");
     }
 
     #[test]
     fn null_row_falls_through_to_engine_default() {
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(cfg.effort_level, None);
         assert_eq!(cfg.effort_value, None);
         // Falls through to Claude driver's engine_default ("opus").
@@ -609,14 +646,19 @@ mod tests {
 
     #[test]
     fn null_row_with_product_default_uses_product_default() {
-        let cfg = resolve_spawn_config(None, None, None, Some("claude-sonnet-4-6"), None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .product_default_model("claude-sonnet-4-6")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.effort_value, None);
     }
 
     #[test]
     fn empty_product_default_does_not_satisfy_precedence_step_3() {
-        let cfg = resolve_spawn_config(None, None, None, Some("   "), None, None, None).unwrap();
+        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().product_default_model(" ").build()).unwrap();
         // Falls through to Claude driver's engine_default ("opus").
         assert_eq!(
             cfg.model,
@@ -628,17 +670,28 @@ mod tests {
     fn effort_level_alone_picks_level_default_model() {
         // #746: Trivial maps to Sonnet, not Haiku — only the effort
         // value stays `low`.
-        let trivial = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None).unwrap();
+        let trivial = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Trivial)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(trivial.model, "sonnet");
         assert_eq!(trivial.effort_value, Some("low"));
         assert_eq!(trivial.prompt_addendum, None);
 
-        let small = resolve_spawn_config(Some(EffortLevel::Small), None, None, None, None, None, None).unwrap();
+        let small =
+            resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(EffortLevel::Small).build()).unwrap();
         assert_eq!(small.model, "sonnet");
         assert_eq!(small.effort_value, Some("medium"));
         assert_eq!(small.prompt_addendum, None);
 
-        let medium = resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, None).unwrap();
+        let medium = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(medium.model, "sonnet");
         assert_eq!(medium.effort_value, Some("high"));
         assert!(
@@ -646,12 +699,14 @@ mod tests {
             "medium addendum should be the 'sketch a plan' nudge",
         );
 
-        let large = resolve_spawn_config(Some(EffortLevel::Large), None, None, None, None, None, None).unwrap();
+        let large =
+            resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(EffortLevel::Large).build()).unwrap();
         assert_eq!(large.model, "opus");
         assert_eq!(large.effort_value, Some("xhigh"));
         assert!(large.prompt_addendum.unwrap().starts_with("Begin with"));
 
-        let max = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None).unwrap();
+        let max =
+            resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(EffortLevel::Max).build()).unwrap();
         // The effort-level→model table tops out at Opus for every level,
         // including Max — Fable is opt-in only via an explicit
         // model_override, never a table default.
@@ -689,13 +744,11 @@ mod tests {
         // the override changes the model only; effort + addendum still
         // follow `effort_level`.
         let cfg = resolve_spawn_config(
-            Some(EffortLevel::Medium),
-            Some("opus"),
-            None,
-            Some("claude-sonnet-4-6"),
-            None,
-            None,
-            None,
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .model_override("opus")
+                .product_default_model("claude-sonnet-4-6")
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "opus");
@@ -706,13 +759,10 @@ mod tests {
     #[test]
     fn model_override_beats_product_default_when_effort_is_unset() {
         let cfg = resolve_spawn_config(
-            None,
-            Some("claude-haiku-4-5-20251001"),
-            None,
-            Some("claude-opus-4-7"),
-            None,
-            None,
-            None,
+            &SpawnResolutionInput::builder()
+                .model_override("claude-haiku-4-5-20251001")
+                .product_default_model("claude-opus-4-7")
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "claude-haiku-4-5-20251001");
@@ -727,7 +777,13 @@ mod tests {
         // canonicalises empty → NULL on insert, but the dispatcher
         // tolerates the looser shape so a hand-edited DB row doesn't
         // produce `claude --model ""`.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Large), Some("   "), None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Large)
+                .model_override(" ")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
@@ -735,7 +791,7 @@ mod tests {
     fn null_row_invocation_matches_today_plus_explicit_model() {
         // Untagged rows fall through to the driver's engine_default (Opus for Claude).
         // Must carry --permission-mode auto (Opus) and no --effort.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -748,7 +804,7 @@ mod tests {
         // `--settings '<path>'`, positioned before the trailing prompt
         // arg so claude parses it as a flag, and single-quoted so a
         // path with spaces survives the pane shell.
-        let cfg = resolve_spawn_config(None, None, None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().build()).unwrap();
         let path = Path::new("/var/folders/ab/Tmp Dir/boss-worker-settings/mono-agent-003.json");
         let inv = cfg.claude_invocation(false, Some(path));
         assert!(
@@ -767,7 +823,12 @@ mod tests {
     fn trivial_invocation_includes_both_flags() {
         // #746: Trivial spawns Sonnet (never Haiku) at --effort low.
         // Sonnet is non-Opus → --dangerously-skip-permissions (default/personal laptop).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Trivial), None, None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Trivial)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model sonnet --effort low --dangerously-skip-permissions \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -777,7 +838,13 @@ mod tests {
     #[test]
     fn medium_with_override_uses_override_model_and_medium_effort() {
         // model_override = "opus" → Opus family → --permission-mode auto.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), Some("opus"), None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .model_override("opus")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(
             cfg.claude_invocation(false, None),
             "claude --model opus --effort high --permission-mode auto \"$(cat .claude/initial-prompt.txt)\"\n",
@@ -793,6 +860,7 @@ mod tests {
             for non_opus_auto_mode in [false, true] {
                 let cfg = SpawnConfig {
                     effort_level: None,
+                    reasoning: None,
                     effort_value: None,
                     model: model.to_owned(),
                     driver: ENGINE_DEFAULT_DRIVER.to_owned(),
@@ -817,6 +885,7 @@ mod tests {
         for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
+                reasoning: None,
                 effort_value: None,
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
@@ -840,6 +909,7 @@ mod tests {
         for model in ["claude-haiku-4-5-20251001", "claude-sonnet-4-6", "claude-sonnet-4-5"] {
             let cfg = SpawnConfig {
                 effort_level: None,
+                reasoning: None,
                 effort_value: None,
                 model: model.to_owned(),
                 driver: ENGINE_DEFAULT_DRIVER.to_owned(),
@@ -897,6 +967,7 @@ mod tests {
             for non_opus_auto_mode in [false, true] {
                 let cfg = SpawnConfig {
                     effort_level: None,
+                    reasoning: None,
                     effort_value: None,
                     model: model.to_owned(),
                     driver: "claude".to_owned(),
@@ -920,7 +991,8 @@ mod tests {
         // The effort-level→model table tops out at Opus for every level,
         // including Max. Fable is still reachable, but only via an explicit
         // model_override.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), None, None, None, None, None, None).unwrap();
+        let cfg =
+            resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(EffortLevel::Max).build()).unwrap();
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.effort_value, Some("max"));
         let inv = cfg.claude_invocation(false, None);
@@ -945,7 +1017,13 @@ mod tests {
         // The hand-set, per-row opt-in: an explicit model_override is the
         // only way a spawn resolves to Fable now (precedence step 1, ahead
         // of the effort-level default).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Max), Some("fable"), None, None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Max)
+                .model_override("fable")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "fable");
         let inv = cfg.claude_invocation(false, None);
         assert!(
@@ -1058,19 +1136,23 @@ mod tests {
         // the pool override, but a task-level model_override still wins.
 
         // Pool override beats effort default (Small → Sonnet normally, Opus via pool).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("opus"), None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Small)
+                .pool_model_override("opus")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.effort_value, Some("medium"));
 
         // Task model_override beats pool override.
         let cfg = resolve_spawn_config(
-            Some(EffortLevel::Small),
-            Some("sonnet"),
-            Some("opus"),
-            None,
-            None,
-            None,
-            None,
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Small)
+                .model_override("sonnet")
+                .pool_model_override("opus")
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "sonnet");
@@ -1080,11 +1162,17 @@ mod tests {
     #[test]
     fn pool_override_beats_product_default_and_engine_default() {
         // Pool override beats product default_model.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), Some("claude-sonnet-4-6"), None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .pool_model_override("opus")
+                .product_default_model("claude-sonnet-4-6")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
 
         // Pool override beats engine default.
-        let cfg = resolve_spawn_config(None, None, Some("opus"), None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().pool_model_override("opus").build()).unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
@@ -1092,7 +1180,13 @@ mod tests {
     fn empty_pool_override_falls_through_to_effort_default() {
         // An empty/whitespace pool override is the same as no override — the
         // effort default still applies.
-        let cfg = resolve_spawn_config(Some(EffortLevel::Small), None, Some("   "), None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Small)
+                .pool_model_override(" ")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "sonnet");
     }
 
@@ -1100,7 +1194,13 @@ mod tests {
     fn pool_override_does_not_change_effort_or_addendum() {
         // Pool override changes the model only; effort + addendum still follow
         // effort_level (mirrors the task-level model_override rule in §Q3).
-        let cfg = resolve_spawn_config(Some(EffortLevel::Medium), None, Some("opus"), None, None, None, None).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .pool_model_override("opus")
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
         assert_eq!(cfg.effort_value, Some("high"));
         assert!(cfg.prompt_addendum.unwrap().starts_with("Sketch"));
@@ -1123,7 +1223,9 @@ mod tests {
                 EffortLevel::Large,
                 EffortLevel::Max,
             ] {
-                let cfg = resolve_spawn_config(Some(level), None, None, None, None, None, Some(&kind)).unwrap();
+                let cfg =
+                    resolve_spawn_config(&SpawnResolutionInput::builder().effort_level(level).kind(&kind).build())
+                        .unwrap();
                 assert_eq!(
                     cfg.model, "opus",
                     "kind {kind:?} at effort {level:?} must floor to opus, got {:?}",
@@ -1139,13 +1241,10 @@ mod tests {
         // still follow `effort_level` (same contract as model_override and
         // pool_model_override).
         let cfg = resolve_spawn_config(
-            Some(EffortLevel::Medium),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(&TaskKind::DesignPostmortem),
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .kind(&TaskKind::DesignPostmortem)
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "opus");
@@ -1159,8 +1258,13 @@ mod tests {
         // must still resolve to Sonnet from the effort table — the floor is
         // scoped to the design family only.
         for kind in [TaskKind::Chore, TaskKind::Task, TaskKind::Revision, TaskKind::Followup] {
-            let cfg =
-                resolve_spawn_config(Some(EffortLevel::Medium), None, None, None, None, None, Some(&kind)).unwrap();
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .effort_level(EffortLevel::Medium)
+                    .kind(&kind)
+                    .build(),
+            )
+            .unwrap();
             assert_eq!(
                 cfg.model, "sonnet",
                 "kind {kind:?} at medium must still resolve to sonnet"
@@ -1174,13 +1278,11 @@ mod tests {
         // is the sanctioned escape hatch and still wins over the kind floor,
         // even when it names a lower tier than Opus.
         let cfg = resolve_spawn_config(
-            Some(EffortLevel::Medium),
-            Some("sonnet"),
-            None,
-            None,
-            None,
-            None,
-            Some(&TaskKind::DesignPostmortem),
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .model_override("sonnet")
+                .kind(&TaskKind::DesignPostmortem)
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "sonnet");
@@ -1191,13 +1293,11 @@ mod tests {
         // The floor must override step 4 (products.default_model), not just
         // step 3 (the effort table).
         let cfg = resolve_spawn_config(
-            Some(EffortLevel::Trivial),
-            None,
-            None,
-            Some("claude-sonnet-4-6"),
-            None,
-            None,
-            Some(&TaskKind::Investigation),
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Trivial)
+                .product_default_model("claude-sonnet-4-6")
+                .kind(&TaskKind::Investigation)
+                .build(),
         )
         .unwrap();
         assert_eq!(cfg.model, "opus");
@@ -1213,5 +1313,198 @@ mod tests {
         assert!(!is_design_family_kind(&TaskKind::Revision));
         assert!(!is_design_family_kind(&TaskKind::Followup));
         assert!(!is_design_family_kind(&TaskKind::ProjectTask));
+    }
+
+    // --- reasoning: the capability lever, independent of effort ---
+
+    #[test]
+    fn investigation_reasoning_reaches_opus_at_every_effort_level() {
+        // The headline requirement: a `small` or `medium` row must be able to
+        // dispatch to Opus WITHOUT changing its effort level. Before the
+        // `reasoning` column, the only way to reach Opus on one of these rows
+        // was to inflate `effort_level` to `large` — which lies about the size
+        // and distorts scheduling, timeouts, and effort-based reporting.
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .effort_level(level)
+                    .kind(&TaskKind::Chore)
+                    .reasoning(ReasoningMode::Investigation)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                cfg.model, "opus",
+                "investigation reasoning at effort {level:?} must reach opus"
+            );
+        }
+    }
+
+    #[test]
+    fn standard_reasoning_stays_on_sonnet_at_every_effort_level() {
+        // The mirror requirement: a `large` row that is genuinely a big but
+        // well-specified mechanical change must be able to dispatch to Sonnet.
+        // Note `Large` and `Max` here — the legacy effort table sends both to
+        // Opus, and an explicit `standard` classification overrides that.
+        for level in [
+            EffortLevel::Trivial,
+            EffortLevel::Small,
+            EffortLevel::Medium,
+            EffortLevel::Large,
+            EffortLevel::Max,
+        ] {
+            let cfg = resolve_spawn_config(
+                &SpawnResolutionInput::builder()
+                    .effort_level(level)
+                    .kind(&TaskKind::Chore)
+                    .reasoning(ReasoningMode::Standard)
+                    .build(),
+            )
+            .unwrap();
+            assert_eq!(
+                cfg.model, "sonnet",
+                "standard reasoning at effort {level:?} must stay on sonnet"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_changes_the_model_but_not_the_effort_knob_or_addendum() {
+        // The separation cuts both ways: `reasoning` moves the model without
+        // touching how much runway the worker gets, exactly as
+        // `model_override` and the pool override already do.
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Small)
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Investigation)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "opus");
+        assert_eq!(cfg.effort_value, Some("medium"), "effort knob still follows `small`");
+        assert_eq!(
+            cfg.prompt_addendum, None,
+            "small has no addendum, reasoning must not add one"
+        );
+        assert_eq!(cfg.effort_level, Some(EffortLevel::Small), "size signal is untouched");
+        assert_eq!(cfg.reasoning, Some(ReasoningMode::Investigation));
+    }
+
+    #[test]
+    fn unclassified_row_keeps_its_pre_reasoning_behaviour() {
+        // `reasoning = None` is the "never classified" state carried by every
+        // row that predates the column. Those must resolve EXACTLY as they did
+        // before, or landing this change silently re-models work in flight.
+        let medium = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .kind(&TaskKind::Chore)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(medium.model, "sonnet", "legacy effort table still decides");
+
+        let large = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Large)
+                .kind(&TaskKind::Chore)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(large.model, "opus", "legacy effort table still decides");
+
+        // …including the design-family kind floor, which is what an
+        // unclassified design row relies on.
+        let design = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Trivial)
+                .kind(&TaskKind::Design)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(design.model, "opus", "legacy kind floor still applies");
+    }
+
+    #[test]
+    fn model_override_and_pool_override_both_beat_reasoning() {
+        // Precedence steps 1 and 2 stay above the capability lever: an
+        // operator naming a model for one row, and the reviewer/automation
+        // pools pinning their agents, are both more specific than a policy
+        // about what kind of work this is.
+        let row_override = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Small)
+                .model_override("fable")
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Standard)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(row_override.model, "fable");
+
+        let pool_override = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Large)
+                .pool_model_override("opus")
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Standard)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(pool_override.model, "opus");
+    }
+
+    #[test]
+    fn reasoning_beats_the_design_family_kind_floor_and_the_product_default() {
+        // A design-family row explicitly classified `standard` resolves to
+        // Sonnet: the kind floor is the fallback for unclassified rows, not an
+        // override of an explicit classification.
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .kind(&TaskKind::Design)
+                .reasoning(ReasoningMode::Standard)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(cfg.model, "sonnet");
+
+        // And it sits above `products.default_model` (step 6) too.
+        let with_product_default = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .product_default_model("claude-sonnet-4-6")
+                .kind(&TaskKind::Chore)
+                .reasoning(ReasoningMode::Investigation)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(with_product_default.model, "opus");
+    }
+
+    #[test]
+    fn reasoning_resolves_against_the_selected_drivers_menu_not_claudes() {
+        // The capability tiers are per-driver data, same as the effort table:
+        // resolving a non-Claude row's reasoning must not hand back Claude
+        // model slugs its CLI would reject.
+        let registry = registry_with_stub();
+        for (mode, expected) in [
+            (ReasoningMode::Standard, "stub-standard"),
+            (ReasoningMode::Investigation, "stub-investigation"),
+        ] {
+            let input = SpawnResolutionInput::builder()
+                .effort_level(EffortLevel::Medium)
+                .task_driver("stub-codex")
+                .reasoning(mode)
+                .build();
+            let cfg = resolve_spawn_config_in(&registry, &input).unwrap();
+            assert_eq!(cfg.model, expected, "{mode:?} must resolve against the stub's menu");
+        }
     }
 }

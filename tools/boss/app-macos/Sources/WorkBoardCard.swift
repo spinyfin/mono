@@ -742,6 +742,9 @@ struct WorkBoardCardView: View {
                        !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         EffortChip(effortLevel: effortLevel)
                     }
+                    if task.reasoning == "investigation" {
+                        ReasoningChip()
+                    }
                     if task.deferred {
                         FutureScopeBadge()
                     }

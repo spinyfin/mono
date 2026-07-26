@@ -248,6 +248,16 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     // anything. JSON output always carries the field; this is a
     // human-readability nicety only.
     let show_effort = tasks.iter().any(|t| t.effort_level.is_some());
+    // REASONING is rendered only when at least one row is `investigation`.
+    // A stricter predicate than `show_effort`'s `is_some()` on purpose: every
+    // newly-created row carries a reasoning mode and the overwhelming majority
+    // are `standard`, so keying off "is set" would add a column of noise to
+    // every listing. Keying off "something here is not the default" makes the
+    // column mean "these rows are the expensive ones". `boss task show` and
+    // `--json` always carry the field regardless.
+    let show_reasoning = tasks
+        .iter()
+        .any(|t| t.reasoning == Some(boss_protocol::ReasoningMode::Investigation));
     let show_short_id = tasks.iter().any(|t| t.short_id.is_some());
     // Surface the soft-delete tombstone only when a row actually carries
     // one — i.e. when the caller passed `--deleted`. Keeps the common
@@ -264,6 +274,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
     if show_effort {
         header.push("EFFORT");
     }
+    if show_reasoning {
+        header.push("REASONING");
+    }
     header.extend_from_slice(&["PROJECT", "ORDINAL", "PR URL"]);
     if show_deleted {
         header.push("DELETED");
@@ -273,6 +286,7 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         let ordinal = task.ordinal.map(|value| value.to_string()).unwrap_or_default();
         let friendly = boss_protocol::short_id_label(task.short_id).unwrap_or_default();
         let effort_str = task.effort_level.map(|l| l.as_str().to_owned()).unwrap_or_default();
+        let reasoning_str = task.reasoning.map(|r| r.as_str().to_owned()).unwrap_or_default();
         let mut row: Vec<String> = Vec::new();
         if show_short_id {
             row.push(friendly);
@@ -285,6 +299,9 @@ pub(crate) fn print_tasks_table(tasks: &[Task], with_primary_id: bool) {
         row.push(task.priority.clone());
         if show_effort {
             row.push(effort_str);
+        }
+        if show_reasoning {
+            row.push(reasoning_str);
         }
         row.push(task.project_id.clone().unwrap_or_default());
         row.push(ordinal);
@@ -909,6 +926,9 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     println!("Priority: {}", task.priority);
     if let Some(level) = task.effort_level {
         println!("Effort: {level}");
+    }
+    if let Some(reasoning) = task.reasoning {
+        println!("Reasoning: {reasoning}");
     }
     if let Some(model) = task.model_override.as_deref() {
         println!("Model override: {model}");

@@ -161,3 +161,179 @@ fn product_default_model_set_and_clear() {
 
     let _ = std::fs::remove_file(path);
 }
+
+// ── reasoning: the capability signal, seeded at create, independent of effort ──
+
+/// Every create path seeds a concrete `reasoning` rather than leaving NULL, so
+/// the signal is visible on the row from the moment it exists. Plain chores and
+/// project tasks seed `standard` — the bulk of Boss's throughput is
+/// well-articulated coding work and belongs on the cheaper tier.
+#[test]
+fn plain_chore_and_task_seed_standard_reasoning() {
+    let path = temp_db_path("reasoning-seed-standard");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+
+    let chore = create_test_chore(&db, product.id.clone(), "Rename a symbol");
+    assert_eq!(chore.reasoning, Some(ReasoningMode::Standard));
+
+    // …and stays `standard` even at `large`. This is the case the change
+    // exists to make expressible: big-but-mechanical is a size fact, not a
+    // capability one, so it must not drag the row onto the stronger model.
+    let big = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Mechanical rename across fifteen files")
+                .effort_level(EffortLevel::Large)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(big.effort_level, Some(EffortLevel::Large));
+    assert_eq!(big.reasoning, Some(ReasoningMode::Standard));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// A small chore can be classified `investigation` at create time, reaching the
+/// stronger model with its effort level left honest. The motivating shape: a
+/// modest change that first requires diagnosing why a state transition never
+/// fires.
+#[test]
+fn small_chore_can_be_created_as_investigation_without_touching_effort() {
+    let path = temp_db_path("reasoning-small-investigation");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Cards don't surface merge-conflict state")
+                .effort_level(EffortLevel::Small)
+                .reasoning(ReasoningMode::Investigation)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(chore.effort_level, Some(EffortLevel::Small), "size signal untouched");
+    assert_eq!(chore.reasoning, Some(ReasoningMode::Investigation));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Investigation-kind rows seed `investigation` without being asked, and an
+/// explicit `--reasoning` still wins over the kind-derived default.
+#[test]
+fn investigation_kind_seeds_investigation_and_explicit_choice_wins() {
+    let path = temp_db_path("reasoning-kind-default");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+
+    let derived = db
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Why does dispatch stall")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(derived.reasoning, Some(ReasoningMode::Investigation));
+
+    let overridden = db
+        .create_investigation(
+            boss_protocol::CreateInvestigationInput::builder()
+                .product_id(product.id.clone())
+                .name("Transcribe the findings we already have")
+                .reasoning(ReasoningMode::Standard)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(overridden.reasoning, Some(ReasoningMode::Standard));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// `--effort max` seeds `investigation`: `max` is documented as the human-only
+/// escape hatch for maximum reasoning depth, so its meaning was always about
+/// capability rather than size. Honouring it here keeps `--effort max` doing
+/// what operators who type it have always got.
+#[test]
+fn effort_max_seeds_investigation_reasoning() {
+    let path = temp_db_path("reasoning-max");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Hardest thing on the board")
+                .effort_level(EffortLevel::Max)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(chore.reasoning, Some(ReasoningMode::Investigation));
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// `boss task update --reasoning` sets, `--unset-reasoning` clears back to the
+/// legacy NULL, and an invalid value rejects the whole patch rather than
+/// half-applying it.
+#[test]
+fn update_sets_clears_and_validates_reasoning() {
+    let path = temp_db_path("reasoning-update");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:foo/bar.git"));
+    let chore = create_test_chore(&db, product.id.clone(), "Some work");
+    assert_eq!(chore.reasoning, Some(ReasoningMode::Standard));
+
+    let unwrap_task = |item: WorkItem| match item {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore/task item"),
+    };
+
+    let promoted = unwrap_task(
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                reasoning: Some("investigation".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert_eq!(promoted.reasoning, Some(ReasoningMode::Investigation));
+    assert_eq!(
+        promoted.effort_level, chore.effort_level,
+        "effort untouched by the update"
+    );
+
+    let cleared = unwrap_task(
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                reasoning: Some(String::new()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap(),
+    );
+    assert!(cleared.reasoning.is_none(), "empty string clears back to legacy NULL");
+
+    let err = db
+        .update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                reasoning: Some("galaxybrain".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("galaxybrain"));
+    assert!(message.contains("standard"));
+    assert!(message.contains("investigation"));
+
+    let _ = std::fs::remove_file(path);
+}

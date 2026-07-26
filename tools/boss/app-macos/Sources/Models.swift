@@ -148,6 +148,11 @@ struct WorkTask: Identifiable, Hashable {
     /// rows or items where the engine emitted `null`). Mirrors
     /// `Task.effort_level` on the wire; absent means unset, NOT medium.
     var effortLevel: String? = nil
+    /// What kind of thinking this work item needs — `standard` or
+    /// `investigation` — independent of `effortLevel`'s size. Mirrors
+    /// `Task.reasoning` on the wire. `nil` means the row was never classified
+    /// (pre-column rows); it does NOT mean `standard`.
+    var reasoning: String? = nil
     /// Non-null when this task was produced by an automation triage run.
     /// Mirrors `Task.source_automation_id` on the wire. Used to display
     /// the automation-provenance badge on the card and to route execution

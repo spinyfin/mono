@@ -1,7 +1,7 @@
 //! PR and design-doc comments: resilient anchoring, status vocabulary,
 //! resolution records, threads, and the answer-agent runs that reply to them.
 
-use super::common::{EffortLevel, default_true};
+use super::common::{EffortLevel, ReasoningMode, default_true};
 use serde::{Deserialize, Serialize};
 
 // ===========================================================================
@@ -199,6 +199,13 @@ pub struct CreateRevisionInput {
     /// precedence (same as other task kinds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// What kind of thinking this revision needs, independent of its size.
+    /// Omitted → inherited from the chain root, so a revision to an
+    /// investigation is investigation-shaped by default and a revision to a
+    /// plain chore is not. See [`CreateTaskInput::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// See [`CreateTaskInput::driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]

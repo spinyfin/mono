@@ -3,8 +3,8 @@
 
 use super::attention::BlockedSignal;
 use super::common::{
-    EffortLevel, default_human_actor, default_priority, default_true, default_unknown_created_via, is_false,
-    short_id_label,
+    EffortLevel, ReasoningMode, default_human_actor, default_priority, default_true, default_unknown_created_via,
+    is_false, short_id_label,
 };
 use super::execution::ExecutionStatus;
 use super::project::ProjectDesignDocState;
@@ -150,6 +150,10 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// See [`CreateTaskInput::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
+
     /// See [`CreateTaskInput::driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<String>,
@@ -219,6 +223,12 @@ pub struct CreateInvestigationInput {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// See [`CreateTaskInput::reasoning`]. Omitted → seeded to
+    /// `investigation` by [`ReasoningMode::default_for`], since
+    /// `kind = investigation` is investigation-shaped by definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// See [`CreateTaskInput::driver`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -307,6 +317,16 @@ pub struct CreateTaskInput {
     /// resolves per design §Q3 precedence. Stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// What kind of thinking this work needs, independent of how big it is.
+    /// Set `Investigation` when the brief requires diagnosing or designing
+    /// something before any code change — that is a *capability* request, and
+    /// inflating `effort_level` to reach a stronger model instead lies about
+    /// the size. `None` → the engine seeds one from `kind` + `effort_level`
+    /// via [`ReasoningMode::default_for`] at insert time, so the stored row
+    /// always carries an explicit value. See [`Task::reasoning`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// Explicit driver override. `None` → resolve via
     /// `product.default_driver` → `"claude"`. Stored verbatim.
@@ -418,6 +438,47 @@ task_kind_variants! {
 impl std::fmt::Display for TaskKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl ReasoningMode {
+    /// The reasoning mode to stamp on a **newly created** row whose caller did
+    /// not name one explicitly. Lives here rather than in `common.rs` because
+    /// it is keyed off [`TaskKind`].
+    ///
+    /// This is a *seed*, not a dispatch rule: it runs once at insert time and
+    /// the stored value is what the dispatcher reads afterwards, so a later
+    /// `--effort` change never silently re-models the row. Rows created before
+    /// the column existed keep `NULL` and are resolved by the dispatcher's
+    /// legacy path instead (see `boss_engine_effort::resolve_spawn_config`) —
+    /// this function is deliberately never used to fill in a `NULL` at
+    /// dispatch time.
+    ///
+    /// Two rules, in order:
+    ///
+    /// 1. **Design-family kinds** (`design`, `investigation`,
+    ///    `design_postmortem`) are investigation-shaped by definition: the
+    ///    deliverable *is* the thinking. This mirrors the model floor the
+    ///    dispatcher already applied to these kinds before the column existed.
+    /// 2. **`effort = max`** seeds `Investigation` as well. `max` is
+    ///    documented as the human-only escape hatch for "Claude's maximum
+    ///    reasoning depth regardless of what the scope markers suggest" (see
+    ///    [`EffortLevel`]) — its meaning was always about capability, not
+    ///    size, so honouring it here preserves what operators who type
+    ///    `--effort max` have always got. It is only a default: an explicit
+    ///    `--reasoning standard` on a `max` row still wins.
+    ///
+    /// Everything else — the bulk of Boss's throughput — seeds `Standard`.
+    pub fn default_for(kind: &TaskKind, effort_level: Option<EffortLevel>) -> ReasoningMode {
+        let design_family = matches!(
+            kind,
+            TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem
+        );
+        if design_family || effort_level == Some(EffortLevel::Max) {
+            ReasoningMode::Investigation
+        } else {
+            ReasoningMode::Standard
+        }
     }
 }
 
@@ -694,6 +755,18 @@ pub struct Task {
     /// Stored verbatim — the engine does not validate the slug.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
+
+    /// What *kind of thinking* this work item needs, independent of how big
+    /// it is (`effort_level`). See [`ReasoningMode`].
+    ///
+    /// `None` means the row was never classified — every row created before
+    /// this column existed, plus any insert path that does not seed it. Those
+    /// rows keep their pre-existing dispatch behaviour: the dispatcher falls
+    /// through to the design-family kind floor and then the effort-level
+    /// table, exactly as it did before. New rows are seeded at insert time by
+    /// [`ReasoningMode::default_for`] or by an explicit `--reasoning` flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<ReasoningMode>,
 
     /// Explicit agent driver override. `None` → resolve via
     /// `product.default_driver` → engine default (`"claude"`).

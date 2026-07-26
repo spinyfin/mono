@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, TaskKind, WorkerEvent};
 
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
@@ -253,7 +253,12 @@ impl CapabilitySet {
 /// [`DriverDescriptor`]. Each driver supplies its own table; `resolve_spawn_config`
 /// resolves model/effort precedence against the selected driver's menu
 /// (design §1.4 / §Mix-and-match).
-#[derive(Debug, Clone, Copy)]
+/// The `bon::Builder` derive is here for the repo's builder convention (a
+/// struct with more than five named fields must carry it, so an additive field
+/// doesn't churn every construction site). Every current construction is a
+/// struct literal inside a `static DriverDescriptor`, which a builder call
+/// cannot be — the derive is what future non-static callers use.
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
     /// Engine-default model slug for this driver (resolve-spawn precedence step 5:
     /// last resort when no override, pool override, effort level, or product default applies).
@@ -270,7 +275,24 @@ pub struct ModelMenu {
     /// map from.
     pub effort_value_for_level: fn(EffortLevel) -> Option<&'static str>,
     /// Maps a Boss [`EffortLevel`] to the default model slug for this driver.
+    ///
+    /// This is the **legacy size-derived** table, consulted only for rows that
+    /// carry no [`ReasoningMode`] (see [`Self::model_for_reasoning`]). Effort
+    /// is a size signal, so a table keyed off it can only ever approximate
+    /// what kind of thinking a job needs; it is kept because clearing a row's
+    /// reasoning must restore exactly the behaviour it had before the
+    /// capability signal existed.
     pub default_model_for_level: fn(EffortLevel) -> &'static str,
+    /// Maps a Boss [`ReasoningMode`] to the model slug for this driver.
+    ///
+    /// The capability lever, and the one that decides the model for any row
+    /// that has been classified: `Standard` names the driver's
+    /// well-articulated-coding tier, `Investigation` the tier worth paying for
+    /// when the worker has to diagnose or design before it edits. Neither
+    /// depends on [`EffortLevel`], which is what lets a `small` investigation
+    /// reach the stronger model without lying about its size and a genuinely
+    /// mechanical `large` row stay on the cheaper one.
+    pub model_for_reasoning: fn(ReasoningMode) -> &'static str,
     /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
     /// `None` for levels where no addendum is appropriate.
     pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,
@@ -1362,6 +1384,7 @@ mod tests {
                 engine_default: "stub-model",
                 effort_value_for_level: |_| None,
                 default_model_for_level: |_| "stub-model",
+                model_for_reasoning: |_| "stub-model",
                 prompt_addendum_for_level: |_| None,
                 model_requires_auto_permissions: |_| false,
             },

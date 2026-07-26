@@ -245,3 +245,155 @@ async fn model_override_passes_through_unrecognised_slug() -> Result<()> {
     );
     Ok(())
 }
+
+/// The end-to-end shape of the capability lever: `--reasoning` is settable at
+/// create, visible on `show`, updatable and clearable afterwards, and moves
+/// entirely independently of `--effort`. The `small` + `investigation`
+/// combination in this test is the one that had no expression at all before
+/// the column existed — the only way to get that row onto a stronger model was
+/// to call it `large`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_reasoning_round_trips_and_is_independent_of_effort() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product_with(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
+    )
+    .await?;
+
+    let created = run_boss(
+        engine.socket_str(),
+        &[
+            "chore",
+            "create",
+            "--product",
+            &product.id,
+            "--name",
+            "Cards don't surface merge-conflict state",
+            "--description",
+            "repro supplied; diagnose why the transition never fires",
+            "--effort",
+            "small",
+            "--reasoning",
+            "investigation",
+        ],
+    )?;
+    let chore_id = created["chore"]["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("chore create did not return an id: {created}"))?
+        .to_owned();
+    assert_eq!(created["chore"]["effort_level"].as_str(), Some("small"));
+    assert_eq!(created["chore"]["reasoning"].as_str(), Some("investigation"));
+
+    let shown = run_boss(engine.socket_str(), &["chore", "show", &chore_id])?;
+    assert_eq!(shown["effort_level"].as_str(), Some("small"));
+    assert_eq!(shown["reasoning"].as_str(), Some("investigation"));
+
+    // Demote to standard. The effort level must not move with it.
+    let updated = run_boss(
+        engine.socket_str(),
+        &["chore", "update", &chore_id, "--reasoning", "standard"],
+    )?;
+    assert_eq!(updated["chore"]["reasoning"].as_str(), Some("standard"));
+    assert_eq!(
+        updated["chore"]["effort_level"].as_str(),
+        Some("small"),
+        "changing reasoning must not touch the size signal",
+    );
+
+    // …and the converse: changing effort must not touch reasoning.
+    let re_sized = run_boss(
+        engine.socket_str(),
+        &["chore", "update", &chore_id, "--effort", "large"],
+    )?;
+    assert_eq!(re_sized["chore"]["effort_level"].as_str(), Some("large"));
+    assert_eq!(
+        re_sized["chore"]["reasoning"].as_str(),
+        Some("standard"),
+        "changing effort must not touch the capability signal",
+    );
+
+    // Clearing drops the row back to the dispatcher's legacy resolution.
+    let cleared = run_boss(
+        engine.socket_str(),
+        &["chore", "update", &chore_id, "--unset-reasoning"],
+    )?;
+    assert!(
+        cleared["chore"]["reasoning"].is_null(),
+        "--unset-reasoning must clear the column, got: {cleared}",
+    );
+    Ok(())
+}
+
+/// A plain chore created without `--reasoning` is seeded `standard`, so the
+/// signal is visible on the row from the moment it exists rather than being an
+/// invisible fall-through.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_create_seeds_standard_reasoning_by_default() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product_with(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
+    )
+    .await?;
+
+    let created = run_boss(
+        engine.socket_str(),
+        &[
+            "chore",
+            "create",
+            "--product",
+            &product.id,
+            "--name",
+            "Rename a symbol",
+            "--description",
+            "",
+            "--effort",
+            "trivial",
+        ],
+    )?;
+    assert_eq!(created["chore"]["reasoning"].as_str(), Some("standard"));
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_create_rejects_invalid_reasoning_mode() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product_with(
+        &mut client,
+        CreateProductInput::builder()
+            .name("Boss")
+            .repo_remote_url("git@github.com:test/boss.git")
+            .build(),
+    )
+    .await?;
+
+    let stderr = run_boss_expect_failure(
+        engine.socket_str(),
+        &[
+            "chore",
+            "create",
+            "--product",
+            &product.id,
+            "--name",
+            "fix it",
+            "--description",
+            "",
+            "--reasoning",
+            "galaxybrain",
+        ],
+    )?;
+    assert!(stderr.contains("galaxybrain"), "stderr: {stderr}");
+    assert!(stderr.contains("standard"), "stderr: {stderr}");
+    assert!(stderr.contains("investigation"), "stderr: {stderr}");
+    Ok(())
+}

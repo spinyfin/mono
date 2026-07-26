@@ -353,6 +353,28 @@ pub(crate) fn migrate_tasks_effort_and_model_columns(conn: &Connection) -> Resul
     Ok(())
 }
 
+/// Add `tasks.reasoning` — the capability signal (`standard` |
+/// `investigation`) that decides which model a row dispatches to, kept
+/// deliberately independent of `tasks.effort_level`'s size signal.
+///
+/// Nullable TEXT, and the NULL is load-bearing rather than incidental: it
+/// means "this row was never classified", and the dispatcher resolves those
+/// rows through exactly the path they used before this column existed (the
+/// design-family kind floor, then the effort-level table). So every row
+/// already in flight when this migration runs keeps its current model; only
+/// an explicit write changes one. There is no backfill for the same reason.
+///
+/// Constrained in code (see [`boss_protocol::ReasoningMode`]), not by a SQL
+/// `CHECK` — same rationale as [`migrate_tasks_effort_and_model_columns`]:
+/// the vocabulary lives in the engine, and extending it should never require
+/// a schema rebuild.
+pub(crate) fn migrate_tasks_reasoning_column(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "tasks", "reasoning")? {
+        conn.execute("ALTER TABLE tasks ADD COLUMN reasoning TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Add `products.default_model` per the effort-and-model-estimation
 /// design (PR #370). Nullable TEXT carrying a Claude model slug
 /// verbatim; existing product rows keep `NULL`. Lets a product owner
