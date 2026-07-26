@@ -9,7 +9,7 @@
 
 `bossctl doctor` should be a **file-scan-first, signature-matching diagnostic** over `dispatch-events/current.jsonl` (primary), `engine-trace.jsonl` (+ rotated segments), and — only where the JSONL timeline is terminal-event-blind — a read-only join to `state.db`. Reuse `boss_dispatch_reader` / `boss_log_files`; do not invent a second parser. There is **no** `bossctl doctor` today (verified against the binary's `--help`).
 
-This note specifies **14 signatures** (SIG-1…SIG-6 plus eight additional shapes found in the corpus), each with: exact predicate, artifact(s), whether a `state.db` join is required, false-positive rate against the 2026-07-24 counts, emitter file:line on current `main`, and an actionable vs. noise disposition.
+This note specifies **15 signatures** (SIG-1…SIG-6, SIG-5b/SIG-5c, plus the additional shapes found in the corpus), each with: exact predicate, artifact(s), whether a `state.db` join is required, false-positive rate against the 2026-07-24 counts, emitter file:line on current `main`, and an actionable vs. noise disposition.
 
 **Three original premises are wrong and must not be encoded:**
 
@@ -134,7 +134,7 @@ For each signature:
 
 ### SIG-1 — Persistent `worker_claimed` stall (not every `stage_stalled`)
 
-**Problem.** `stage_stalled` with `details.stalled_stage=="worker_claimed"` fires from the 30 s per-stage override. Most hits are benign chain-serialization holds that clear on the next `request_recorded` (15 s sweep). A naive match is almost entirely noise.
+**Problem.** `stage_stalled` with `details.stalled_stage=="worker_claimed"` fires from the 30 s per-stage override. Most hits are benign chain-serialization holds that clear once the timeline advances. A naive match is almost entirely noise.
 
 **Naive predicate (DO NOT SHIP ALONE):**
 
@@ -145,35 +145,60 @@ stage == "stage_stalled"
 
 Count: **2,720**. Actionable subset ≈ **~1%**.
 
-**Why "> 30 s" is vacuous.** The emitter's own threshold for `worker_claimed` is 30 s (`app/server.rs` StageThresholds override). A `stage_stalled` record **cannot exist** below that threshold. Observed `elapsed_in_stage_ms/1000`: ~80% land in 30–44 s, cliff, thin tail to 3121 s.
+**Why "> 30 s" on the record is vacuous, and why `details.elapsed_in_stage_ms > 120_000` is the wrong gate.** The emitter's threshold for `worker_claimed` is 30 s (`app/server.rs` StageThresholds override). A `stage_stalled` record **cannot exist** below that threshold. Observed corpus `elapsed_in_stage_ms/1000`: ~80% land in 30–44 s, cliff, thin tail to 3121 s. More importantly, the wire field `details.elapsed_in_stage_ms` is a **snapshot at first detection** (when the 30 s override tripped). The detector then **dedupes** further `stage_stalled` emissions for the same `(stalled_stage, stalled_at_ts)` pair (`TimelineState::already_flagged` in `dispatch-reader/src/timeline.rs`), so a multi-minute wedge often still has only one `stage_stalled` row whose frozen `elapsed_in_stage_ms` is ~30–45 s. Requiring `details.elapsed_in_stage_ms > 120_000` on that row **misses the durable stall**.
+
+**How the emitter actually measures stall (recompute this):**
+
+1. Fold the per-`execution_id` timeline in append order.
+2. Ignore `stage_stalled` for "last real event" purposes (`TimelineState::apply` treats only non-`stage_stalled` as `last_real`).
+3. `elapsed_in_stage_ms = now_ms - last_real.ts_epoch_ms` (or scan-window end if offline).
+4. Flag when `last_real` is non-terminal, `last_real.stage == "worker_claimed"`, and recompute elapsed exceeds the severity threshold.
+
+This is the same model as `pending_stalls` / `persistently_stalled` / `dispatch_stall_escalation` (`PERSISTENT_STALL_THRESHOLD` = 5 min). A prior `stage_stalled` row is optional corroboration (via `details.stalled_stage` / `stalled_at_ts_epoch_ms`), not the elapsed source of truth.
 
 **Benign pattern (chain hold):**
 
 1. `worker_claimed` / `skipped` with `details.reason ∈ {chain_serialized, chain_serialized_review_held}`
-2. `stage_stalled` / `ok` with `stalled_stage=worker_claimed`, `elapsed_in_stage_ms` typically 30–45 s
-3. Later `request_recorded` / `ok` for the same `execution_id` (clears)
+2. One or more `stage_stalled` / `ok` with `stalled_stage=worker_claimed` (first trip ~30–45 s)
+3. Later **any non-`stage_stalled` event** for the same `execution_id` (clears the stall)
+
+**Progress is not only `request_recorded`.** Clearing progress includes (non-exhaustive) a later successful `worker_claimed`, `host_selected`, `cube_*`, `run_started`, `pane_spawned`, terminal `outcome=="error"`, etc. Using "no later `request_recorded`" as the sole clear signal both false-negatives (never re-request paths) and false-positives (progressed via other stages while an earlier request still exists).
 
 **Actionable predicate (SHIP):**
 
 ```
-stage == "stage_stalled"
-  && details.stalled_stage == "worker_claimed"
-  && details.elapsed_in_stage_ms > 120_000
-  && no later request_recorded for same execution_id
-     within the scanned window (or until now)
+For each execution_id in the scan window, reduce the timeline as the
+dispatch-reader does:
+
+  last_real = last event where stage != "stage_stalled"
+  IF last_real is None OR is_terminal_event(last_real): skip
+  IF last_real.stage != "worker_claimed": skip   # this SIG's stage focus
+
+  elapsed_ms = now_ms - last_real.ts_epoch_ms     # RECOMPUTE; do not
+                                                  # trust a frozen
+                                                  # stage_stalled.details
+                                                  # .elapsed_in_stage_ms
+
+  FLAG when elapsed_ms > WARN_MS   (recommend 120_000)
+  escalate severity when elapsed_ms >= PERSISTENT_STALL_THRESHOLD_MS
+                           (300_000 — same as attention escalator)
+
+Optional corroboration (not required): a prior stage_stalled row for the
+same execution with details.stalled_stage == "worker_claimed" and
+details.stalled_at_ts_epoch_ms == last_real.ts_epoch_ms.
 ```
 
 Optional severity ladder:
 
-- **warn** if `elapsed_in_stage_ms > 120_000` and still no progress
-- **critical** if `elapsed_in_stage_ms` past `PERSISTENT_STALL_THRESHOLD` (5 min) — same threshold the attention escalator uses
+- **warn** if recomputed `elapsed_ms > 120_000` and still no non-`stage_stalled` progress
+- **critical** if recomputed `elapsed_ms` past `PERSISTENT_STALL_THRESHOLD` (5 min)
 
 **Artifacts:** `current.jsonl` only (per-exec correlation by `execution_id`).
-**state.db:** no (progress is visible as a later dispatch event).
-**False-positive rate:** naive ~99% FP; refined targets the long tail (~1% of the 2,720).
-**Emitter:** `build_stalled_event` / `spawn_stage_stalled_detector` in `engine/dispatch-reader/src/lib.rs`; thresholds `engine/core/src/app/server.rs` (~:1528–1555). Do **not** confuse the 30 s `worker_claimed` override with `CUBE_LEASE_TIMEOUT` (currently **90 s** — see SIG-6).
+**state.db:** no (progress is visible as a later non-`stage_stalled` dispatch event).
+**False-positive rate:** naive stage_stalled match ~99% FP; recomputed long-tail targets ~1% of the 2,720 first-trip stalls.
+**Emitter:** `build_stalled_event` / `spawn_stage_stalled_detector` / `TimelineState` in `engine/dispatch-reader/src/{lib,timeline}.rs`; thresholds `engine/core/src/app/server.rs` (~:1528–1555); attention escalator `engine/core/src/dispatch_stall_escalation.rs` (`PERSISTENT_STALL_THRESHOLD`). Do **not** confuse the 30 s `worker_claimed` override with `CUBE_LEASE_TIMEOUT` (currently **90 s** — see SIG-6).
 
-**Disposition:** ship refined predicate only.
+**Disposition:** ship recomputed-elapsed predicate only; never gate on `stage_stalled.details.elapsed_in_stage_ms > 120s`.
 
 ---
 
@@ -358,6 +383,33 @@ Counts: 446 unchanged / 4 moved / 3 fetch-failed. Meaning: worker didn't contrib
 
 **Disposition:** ship; document JSON-parse-only rule in bold in the implementor notes.
 
+#### SIG-5c — Trunk queue eviction (sibling of SIG-5; ship)
+
+**Not a non-goal.** Current `main` emits a second queue-side failure kind that shares the same engine-trace message and field shape as SIG-5, differing only in `failure_kind` and provenance:
+
+```
+Parse each engine-trace line as JSON.
+target == "boss_engine::ci_watch"
+  && fields.failure_kind == "trunk_queue_eviction"
+  && fields.message starts with
+       "ci_watch: queue-side failure detected; parent flipped to blocked: ci_failure"
+```
+
+| Dimension                             | SIG-5 `merge_queue_rebounce`                       | SIG-5c `trunk_queue_eviction`                                                                                                 |
+| ------------------------------------- | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Trigger                               | GitHub merge-queue FAILED_CHECKS / synthetic merge | Trunk merge queue eviction (`trunk_queue_poller::handle_trunk_queue_eviction` → `ci_watch::on_trunk_queue_eviction_detected`) |
+| `failure_kind`                        | `merge_queue_rebounce`                             | `trunk_queue_eviction`                                                                                                        |
+| Discriminator / `head_sha_at_trigger` | synthetic merge `beforeCommit.oid`                 | `trunk_eviction_discriminator(entry_id, stateChangedAt)`                                                                      |
+| `before_commit_sha` column            | set                                                | **None** (Trunk has no synthetic-merge SHA to persist)                                                                        |
+| Shared helper                         | `on_queue_side_failure_detected`                   | same                                                                                                                          |
+| `is_queue_side_failure_kind`          | true                                               | true                                                                                                                          |
+
+Both are queue-side (evidence lives off the PR's own head). Doctor should treat them as sibling SIGs (shared matcher, branch on `failure_kind`), not fold Trunk into "rebounce" wording.
+
+**Corpus note:** the 2026-07-24 window's 6 queue-side hits were all `merge_queue_rebounce`; Trunk eviction may be zero in that window but is a live emitter on current `main` (`ci_watch.rs` + `trunk_queue_poller.rs`). Ship the predicate anyway — same FP profile as SIG-5.
+
+**Disposition:** ship as SIG-5c; do not list as non-goal.
+
 ---
 
 ### SIG-6 — Cube workspace lease timeout
@@ -446,44 +498,87 @@ Count: **500**. This is **not** capacity exhaustion; it is slot desync (`occupyi
 
 ---
 
-### SIG-C — Auto-bind / deleted-row write storm
+### SIG-C — Auto-bind / deleted-row write storm (**historical forensic; demoted**)
 
-**Evidence predicate (corpus wire name):**
+**Corpus-only predicate (2026-07-24 window — DO NOT treat as current-main hard predicate):**
 
 ```
-stage == "status_transitioned"    # see naming note below
+stage == "status_transitioned"      # historical wire name only
   && outcome == "error"
   && details.source == "auto_bind_poller"
 ```
 
-Count: **2,276**. Only three error strings (~759× each):
+Count in that window: **2,276**. Only three error strings (~759× each):
 
 - `unknown task for execution: proj_…`
 - `cannot complete a deleted task: task_…` (two task-id variants)
 
-**Naming note for implementor:** current `Stage` enum wire string is `status_transition` (`Stage::StatusTransition` → `"status_transition"`). The corpus count table lists **`status_transitioned`** as a separate stage with 2,276 errors. No `auto_bind_poller` / `status_transitioned` emission site remains obvious on current `main` (deleted-task errors still originate in `engine/core/src/work/pr_flow.rs`). Doctor should:
+**Current-main status (verified against emitters):**
 
-1. Match **either** stage string if both appear in history.
-2. Also match the stable **error_message** prefixes above regardless of stage, to survive renames.
-3. Confirm against a live `current.jsonl` sample when implementing.
+| Claim                                  | Current `main`                                                                                                                                                                                                                                      |
+| -------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Stage wire `status_transitioned`       | **Gone.** Live enum is `Stage::StatusTransition` → `"status_transition"` (`dispatch-events/src/lib.rs`). Kanban / control-verb tests emit only `status_transition`.                                                                                 |
+| `details.source == "auto_bind_poller"` | **No emission site** remains on current `main`. Grep finds this string only in this investigation note.                                                                                                                                             |
+| Error text still possible              | Yes — `engine/core/src/work/pr_flow.rs` still bails with `unknown task for execution: {id}` and `cannot complete a deleted task: {id}` — but those are call-site errors, not a dedicated auto-bind storm emitter with the corpus stage/source pair. |
 
-**Severity:** P1 — unbounded retry against permanently-dead rows.
+**Disposition: demote from "ship hard fault on current main" to historical forensic.**
+
+- **Historical / `--all-history` (optional):** keep the corpus predicate + error-message prefixes for forensics on old `current.jsonl` segments.
+- **Current-main default doctor pass:** **do not ship** `stage ∈ {status_transitioned,status_transition} && details.source == "auto_bind_poller"` as a hard P1 — it cannot fire on a fleet that never wrote those records.
+- **Optional weak current-main probe (info only, not a hard fault):** `error_message` starts with `unknown task for execution:` or `cannot complete a deleted task:` on any dispatch stage — useful if a future caller reintroduces unbounded retry against deleted rows, but **zero evidence** that today's emitters still produce a storm shape.
+
+**Severity (historical):** P1 when the corpus storm shape is present. **Severity (current main default):** not a shipped hard signature.
+
+**Emitter (error text only):** `engine/core/src/work/pr_flow.rs`.
 
 ---
 
-### SIG-D — Transient-recovery exhaustion without spending retries
+### SIG-D — Transient-recovery exhaustion (wire `reason` / `class` split)
+
+**Current-main predicate (SHIP):**
 
 ```
 stage == "transient_recovery_exhausted"
-  && details.reason == "unrecognized_error"
-  && details.class == "indeterminate"
+  && outcome == "error"
+  && details.reason ∈ {"retries_exhausted", "permanent_error"}
 ```
 
-Count: **15**. All 15 were `API Error: Unable to connect to API (ConnectionRefused)` with `prior_attempts: 0`, `max_attempts: 3` — classifier never recognized the error, so **zero retries were spent**. Contrast `transient_recovery` (42) which does retry.
+These are the **only** values `EscalateReason::as_str` emits (`engine/transient-error/src/lib.rs`):
 
-**Severity:** P1 (classifier gap), not "API was down."
+| `details.reason` (why policy stopped) | Meaning                                                          |
+| ------------------------------------- | ---------------------------------------------------------------- |
+| `permanent_error`                     | `ErrorClass::Permanent` — escalate immediately, no retries spent |
+| `retries_exhausted`                   | retry cap hit for `Transient` **or** `Indeterminate`             |
 
-**Emitter:** transient recovery path + `boss_transient_error` classifier.
+`details.class` is a **separate** field (`ErrorClass::as_str`) and is **not** a substitute for `reason`:
+
+| `details.class` | Meaning                                                                             |
+| --------------- | ----------------------------------------------------------------------------------- |
+| `transient`     | confirmed retryable infrastructure error                                            |
+| `permanent`     | confirmed non-retryable                                                             |
+| `indeterminate` | unrecognized API error text — still gets the same bounded retry budget as transient |
+
+**Do not match** `details.reason == "unrecognized_error"` — that string is **not** on the wire on current `main`. An unrecognized error that exhausts its budget emits:
+
+```
+reason == "retries_exhausted" && class == "indeterminate"
+```
+
+(pinned by `unrecognized_error_at_cap_escalates_with_indeterminate_class` in `transient_recovery.rs`).
+
+**Severity ladder on the shipped predicate:**
+
+- `reason == "permanent_error"` → P1 (auth/billing/invalid; expected escalate-at-0)
+- `reason == "retries_exhausted" && class == "indeterminate"` → P1 (true classifier gap after budget spent)
+- `reason == "retries_exhausted" && class == "transient"` → P1 (infra kept failing through the budget)
+
+**Historical corpus narrative (2026-07-24 — pre-classifier fix; do not re-encode as current main):**
+
+Corpus count **15** used a now-obsolete shape (`reason`/`class` conflation around unrecognized text). All 15 were `API Error: Unable to connect to API (ConnectionRefused)` with `prior_attempts: 0`, `max_attempts: 3`. On **current `main`**, `ConnectionRefused` (and related network shapes) classifies as **`ErrorClass::Transient`** (`connection_refused_and_network_errors_are_transient` in `transient-error`), and at `prior_attempts == 0` the recovery path **resumes / nudges** rather than escalating (`connection_refused_resumes_instead_of_escalating_at_zero_attempts` in `transient_recovery.rs`). Doctor must **not** claim "ConnectionRefused ⇒ indeterminate / zero retries spent" against current emitters.
+
+Contrast: stage `transient_recovery` (non-exhausted resume events) still exists for successful retry scheduling.
+
+**Emitter:** `engine/core/src/transient_recovery.rs` (`Stage::TransientRecoveryExhausted` details: `reason`, `class`, `prior_attempts`, `max_attempts`, `error`); classifier `engine/transient-error/src/lib.rs`.
 
 ---
 
@@ -552,23 +647,25 @@ Count: **10,058 of 10,091** `dispatch_decision` records. Re-evaluates the same l
 
 ## 5. Summary table (implementor checklist)
 
-| ID     | Name                                      | Primary artifact | state.db?                   | Ship?                            | Severity    | Corpus scale                           |
-| ------ | ----------------------------------------- | ---------------- | --------------------------- | -------------------------------- | ----------- | -------------------------------------- |
-| SIG-1  | Persistent worker_claimed stall           | dispatch         | no                          | yes (elapsed>120s + no progress) | P1–P0       | 2720 naive / ~1% actionable            |
-| SIG-2  | redundant_spawn zombie                    | dispatch (+db)   | **yes** for high confidence | yes (recurrence)                 | P0          | 2625 supersedes; few multi-day zombies |
-| SIG-3  | Leaked claim                              | trace+db         | yes                         | **no hard fault**; info only     | info        | 0 leak exemplars                       |
-| SIG-4  | spawn_ack_timeout pid 0                   | dispatch         | no                          | yes                              | P1          | 292                                    |
-| SIG-4b | hook after terminal                       | trace            | optional                    | yes                              | P2          | 22                                     |
-| SIG-5  | merge_queue_rebounce                      | trace            | optional                    | yes                              | P1          | 6                                      |
-| SIG-6  | lease timeout                             | dispatch         | no                          | yes (`reason==timeout`)          | P1–P0 fleet | 115                                    |
-| SIG-A  | untracked lease heartbeat                 | dispatch         | no                          | yes (**aggregate**)              | P0/P1       | 13479                                  |
-| SIG-B  | SlotBusy                                  | dispatch         | no                          | yes                              | P1          | 500                                    |
-| SIG-C  | deleted-row auto-bind storm               | dispatch         | no                          | yes (tolerate stage rename)      | P1          | 2276                                   |
-| SIG-D  | transient_recovery_exhausted unrecognized | dispatch         | no                          | yes                              | P1          | 15                                     |
-| SIG-E  | spawn_nack / libghostty                   | dispatch         | no                          | yes                              | P2          | 4                                      |
-| SIG-F  | worker_id parse                           | dispatch         | no                          | yes                              | P2          | 7                                      |
-| SIG-G  | scheduler wakeup drop                     | trace            | no                          | yes                              | P1          | 19                                     |
-| SIG-H  | orphan_active_sweep churn                 | dispatch         | no                          | info only                        | info        | 10058                                  |
+| ID     | Name                            | Primary artifact | state.db?                   | Ship?                                              | Severity    | Corpus scale                            |
+| ------ | ------------------------------- | ---------------- | --------------------------- | -------------------------------------------------- | ----------- | --------------------------------------- |
+| SIG-1  | Persistent worker_claimed stall | dispatch         | no                          | yes (**recompute** elapsed from last real event)   | P1–P0       | 2720 naive / ~1% actionable             |
+| SIG-2  | redundant_spawn zombie          | dispatch (+db)   | **yes** for high confidence | yes (recurrence)                                   | P0          | 2625 supersedes; few multi-day zombies  |
+| SIG-3  | Leaked claim                    | trace+db         | yes                         | **no hard fault**; info only                       | info        | 0 leak exemplars                        |
+| SIG-4  | spawn_ack_timeout pid 0         | dispatch         | no                          | yes                                                | P1          | 292                                     |
+| SIG-4b | hook after terminal             | trace            | optional                    | yes                                                | P2          | 22                                      |
+| SIG-5  | merge_queue_rebounce            | trace            | optional                    | yes                                                | P1          | 6                                       |
+| SIG-5b | sha-delta gate (unchanged head) | trace            | no                          | optional info                                      | info        | 446/4/3                                 |
+| SIG-5c | trunk_queue_eviction            | trace            | optional                    | yes (sibling of SIG-5)                             | P1          | 0 in 2026-07-24 window; live emitter    |
+| SIG-6  | lease timeout                   | dispatch         | no                          | yes (`reason==timeout`)                            | P1–P0 fleet | 115                                     |
+| SIG-A  | untracked lease heartbeat       | dispatch         | no                          | yes (**aggregate**)                                | P0/P1       | 13479                                   |
+| SIG-B  | SlotBusy                        | dispatch         | no                          | yes                                                | P1          | 500                                     |
+| SIG-C  | deleted-row auto-bind storm     | dispatch         | no                          | **historical forensic only** (demoted)             | P1 hist.    | 2276 (corpus); no current-main storm    |
+| SIG-D  | transient_recovery_exhausted    | dispatch         | no                          | yes (`reason∈{retries_exhausted,permanent_error}`) | P1          | 15 historical; wire shape fixed on main |
+| SIG-E  | spawn_nack / libghostty         | dispatch         | no                          | yes                                                | P2          | 4                                       |
+| SIG-F  | worker_id parse                 | dispatch         | no                          | yes                                                | P2          | 7                                       |
+| SIG-G  | scheduler wakeup drop           | trace            | no                          | yes                                                | P1          | 19                                      |
+| SIG-H  | orphan_active_sweep churn       | dispatch         | no                          | info only                                          | info        | 10058                                   |
 
 ---
 
@@ -578,8 +675,10 @@ Count: **10,058 of 10,091** `dispatch_decision` records. Re-evaluates the same l
 2. **Never treat a stage as a failure without its outcome/reason vocabulary** (`cube_workspace_lease_failed` alone is 45× too broad; `redundant_spawn` alone is the happy supersede path; `stage_stalled` alone is mostly chain-hold telemetry).
 3. **Never treat `shell_pid == 0` without `spawn_ack_timeout` (or a proven absence of healing `update_worker_shell_pid` after the grace window).**
 4. **Never claim "execution completed" from dispatch alone** — join `state.db` or use a recurrence / heartbeat-storm proxy.
-5. **Aggregate storms** (SIG-A, SIG-2, SIG-C, SIG-H) to one finding per key; print counts and windows.
+5. **Aggregate storms** (SIG-A, SIG-2, historical SIG-C, SIG-H) to one finding per key; print counts and windows.
 6. **Default time window** so multi-week historical zombies do not dominate a fresh doctor run unless `--all-history`.
+7. **Never gate SIG-1 severity on `stage_stalled.details.elapsed_in_stage_ms`** — recompute from last non-`stage_stalled` event; progress is any later real event, not only `request_recorded`.
+8. **Never match SIG-D on `reason == "unrecognized_error"`** — wire reasons are only `retries_exhausted` / `permanent_error`; unrecognized lives in `class == "indeterminate"`.
 
 ---
 
@@ -594,9 +693,14 @@ Count: **10,058 of 10,091** `dispatch_decision` records. Re-evaluates the same l
 | `Stage` enum still 44 variants with documented wire strings    | yes (`dispatch-events/src/lib.rs`)                                                                                                                            |
 | 8 never-observed stages still have emitters                    | yes — rare, not dead                                                                                                                                          |
 | Stall thresholds                                               | default 120 s; overrides include `worker_claimed`/`host_selected`/`cube_workspace_lease_attempted` @ 30 s; detector interval 15 s; persistent attention 5 min |
+| Stall elapsed source of truth                                  | `now - last non-stage_stalled event` (`TimelineState`); `stage_stalled.details.elapsed_in_stage_ms` is first-trip snapshot only                               |
+| `EscalateReason` wire                                          | only `retries_exhausted` / `permanent_error`; `class` is independent (`transient`/`permanent`/`indeterminate`)                                                |
+| `ConnectionRefused` on current main                            | `ErrorClass::Transient`; resumes at `prior_attempts==0` (not escalate-as-indeterminate)                                                                       |
 | `CUBE_LEASE_TIMEOUT`                                           | **90 s** on current `main` (corpus showed 30 s)                                                                                                               |
 | `is_terminal_event`                                            | error outcome OR `pane_spawned`+ok — not worker completion                                                                                                    |
 | `parse_lines` tolerates bad lines                              | yes                                                                                                                                                           |
+| `failure_kind` queue-side pair                                 | `merge_queue_rebounce` (SIG-5) and `trunk_queue_eviction` (SIG-5c) both live on current main                                                                  |
+| SIG-C `auto_bind_poller` / `status_transitioned`               | **historical only** — no current-main emitter for that stage/source pair                                                                                      |
 | Wrong premises (before_commit_sha / shell_pid0 / leaked claim) | explicitly excluded                                                                                                                                           |
 
 This investigation did **not** re-read the live Application Support tree (unavailable to cube workers). Counts and exemplars are those inlined by the coordinator on 2026-07-24; emitter paths were re-verified against the mono workspace at investigation time.
@@ -618,9 +722,9 @@ P1  SIG-6  cube lease timeouts
     n=12 distinct executions in 10m  fallback_policy→none
     next: cube workspace list ; check free pool / jj fetch health
 
-P1  SIG-C  deleted-row write storm
-    n=759  error="cannot complete a deleted task: task_…"
-    next: stop auto-bind against deleted ids (engine fix) ; ignore if historical-only
+info SIG-C  (historical only; suppressed unless --all-history)
+    n=759  error="cannot complete a deleted task: task_…"  stage=status_transitioned source=auto_bind_poller
+    next: forensic only — no auto_bind_poller emitter on current main
 
 info SIG-3a pool saturation
     pool_exhausted skips=…  cap holds balanced (no claim leak detected)
@@ -633,10 +737,10 @@ Exit codes (suggestion): `0` clean / info-only; `1` any P1+; `2` scan failure (m
 ## 9. Hand-off to the implementor task
 
 1. Add `bossctl doctor` as a new top-level subcommand; file-scan-first; reuse `boss_dispatch_reader` + `boss_log_files`.
-2. Implement SIG-1,4,5,6,A,B,C,D,E,F,G as pure matchers; SIG-2 with recurrence + optional state.db; SIG-3 as info-only capacity / reconcile summary; SIG-H as info metric.
-3. Unit-test each predicate against the exemplar JSON blobs quoted in the coordinator evidence (copy into `bossctl` tests as fixtures — do not require a live store).
+2. Implement **ship** matchers: SIG-1 (recompute elapsed; any real progress clears), SIG-4, SIG-4b, SIG-5, **SIG-5c**, SIG-6, SIG-A, SIG-B, SIG-D (`reason∈{retries_exhausted,permanent_error}` + independent `class`), SIG-E, SIG-F, SIG-G. SIG-2 with recurrence + optional state.db. SIG-3 and SIG-H as info-only. **SIG-C historical-only** (optional under `--all-history`), not a default current-main hard fault.
+3. Unit-test each **shipped** predicate against the exemplar JSON blobs in Appendix B (copy into `bossctl` tests as fixtures — do not require a live store). SIG-C fixtures are forensic-only.
 4. Document `--window`, `--all-history`, `--json`, and "works when engine is wedged" next to `dispatch diagnose`.
-5. Do **not** reintroduce the three wrong premises.
+5. Do **not** reintroduce the three wrong premises, the SIG-1 frozen-elapsed gate, `reason==unrecognized_error`, or "ConnectionRefused ⇒ indeterminate at zero retries" against current main.
 
 ---
 
@@ -653,7 +757,11 @@ Key `details.reason` vocabularies:
 
 ## Appendix B — Exemplar records (for fixture tests)
 
-Benign SIG-1 chain hold + stall + clear:
+Fixtures below cover every **ship** SIG (plus historical SIG-C). Shapes match current-main emitters unless marked historical. Minimal fields only — real records also carry null cube/worker columns.
+
+### SIG-1 — Benign chain hold (stall then clear via non-request progress)
+
+Note: clear event here is `request_recorded`, but doctor must also treat any later non-`stage_stalled` event as progress. Frozen `elapsed_in_stage_ms: 42874` must **not** be the severity gate.
 
 ```json
 {"ts_epoch_ms":1784923279414,"stage":"worker_claimed","outcome":"skipped","execution_id":"exec_18c5513362ac2ed8_148","work_item_id":"task_18c5513362a6cbf0_147","details":{"reason":"chain_serialized_review_held","review_held":true,"live_sibling_execution_id":"exec_18c55030d2848c40_f6","live_sibling_work_item_id":"task_18c54f8b8399c960_b7"}}
@@ -661,14 +769,30 @@ Benign SIG-1 chain hold + stall + clear:
 {"ts_epoch_ms":1784923379833,"stage":"request_recorded","outcome":"ok","execution_id":"exec_18c5513362ac2ed8_148","details":{"preferred_workspace_id":null,"pool":"main","dispatch_class":3,"dispatch_class_label":"pr_review_revision","pool_ready_count":1,"beaten_candidates":0}}
 ```
 
-SIG-2 zombie host_selected + target heartbeat:
+### SIG-1 — Actionable durable stall (synthetic; recompute elapsed)
+
+Last real event is still `worker_claimed` at T0; a single first-trip `stage_stalled` freezes `elapsed_in_stage_ms` near the 30 s threshold. At scan time `now_ms = T0 + 400_000`, recomputed elapsed is 400 s → critical (≥ `PERSISTENT_STALL_THRESHOLD`), even though the wire field is only ~43 s.
+
+```json
+{"ts_epoch_ms":1784923279414,"stage":"worker_claimed","outcome":"skipped","execution_id":"exec_sig1_durable","work_item_id":"task_sig1_durable","details":{"reason":"chain_serialized","pool":"main","pool_capacity":12}}
+{"ts_epoch_ms":1784923322288,"stage":"stage_stalled","outcome":"ok","execution_id":"exec_sig1_durable","details":{"stalled_stage":"worker_claimed","stalled_outcome":"skipped","stalled_at_ts_epoch_ms":1784923279414,"elapsed_in_stage_ms":42874}}
+```
+
+### SIG-2 zombie host_selected + target heartbeat (also seeds SIG-A):
 
 ```json
 {"ts_epoch_ms":1781945100914,"stage":"host_selected","outcome":"error","execution_id":"exec_18babda0cc3a99b0_1164","work_item_id":"auto_18b509b3e8944fa8_5a","worker_id":"auto-worker-2","details":{"reason":"redundant_spawn","live_execution_id":"exec_18b9288b7fd1c568_3"}}
 {"ts_epoch_ms":1781515001787,"stage":"cube_lease_heartbeat","outcome":"error","execution_id":"exec_18b9288b7fd1c568_3","cube_lease_id":"a2a7ae36-0e16-4858-8e50-a8e54055e71a","error_message":"Cube command failed: {\n  \"error\": \"lease `a2a7ae36-0e16-4858-8e50-a8e54055e71a` is not tracked\"\n}","details":{"ttl_secs":1800,"cube_workspace_id":"mono-agent-035"}}
 ```
 
-SIG-4 spawn_ack_timeout:
+### SIG-A — Untracked-lease heartbeat (aggregate by lease / execution)
+
+```json
+{"ts_epoch_ms":1781515001787,"stage":"cube_lease_heartbeat","outcome":"error","execution_id":"exec_18b9288b7fd1c568_3","cube_lease_id":"a2a7ae36-0e16-4858-8e50-a8e54055e71a","error_message":"Cube command failed: {\n  \"error\": \"lease `a2a7ae36-0e16-4858-8e50-a8e54055e71a` is not tracked\"\n}","details":{"ttl_secs":1800,"cube_workspace_id":"mono-agent-035"}}
+{"ts_epoch_ms":1781515301787,"stage":"cube_lease_heartbeat","outcome":"error","execution_id":"exec_18b9288b7fd1c568_3","cube_lease_id":"a2a7ae36-0e16-4858-8e50-a8e54055e71a","error_message":"Cube command failed: {\n  \"error\": \"lease `a2a7ae36-0e16-4858-8e50-a8e54055e71a` is not tracked\"\n}","details":{"ttl_secs":1800,"cube_workspace_id":"mono-agent-035"}}
+```
+
+### SIG-4 spawn_ack_timeout:
 
 ```json
 {
@@ -680,7 +804,24 @@ SIG-4 spawn_ack_timeout:
 }
 ```
 
-SIG-5 merge_queue_rebounce (trace):
+### SIG-4b — Hook after terminal (engine-trace):
+
+```json
+{
+  "timestamp": "2026-07-24T12:00:00.000000Z",
+  "level": "WARN",
+  "fields": {
+    "message": "[engine-reconcile] live hook event arrived for a TERMINAL execution — the engine believes this run is dead but its worker is still emitting hooks. This is the ack-timeout / stale-reap contradiction (a run that should have stayed tracked was terminalized). Not resurrecting the row here; surfacing the live-liveness signal so the reconcilers and operators can act instead of silently dropping it.",
+    "run_id": "exec_18c5387f08addde0_211",
+    "kind": "session_end",
+    "status": "orphaned",
+    "work_item_id": "task_example"
+  },
+  "target": "boss_engine::app::worker_events"
+}
+```
+
+### SIG-5 merge_queue_rebounce (trace):
 
 ```json
 {
@@ -700,7 +841,29 @@ SIG-5 merge_queue_rebounce (trace):
 }
 ```
 
-SIG-6 lease timeout:
+### SIG-5c trunk_queue_eviction (trace; synthetic from current-main emitter shape):
+
+Same message as SIG-5; branch on `failure_kind`. Discriminator is `trunk_eviction_discriminator(entry_id, stateChangedAt)`, not a git SHA; no `before_commit_sha` on the attempt row.
+
+```json
+{
+  "timestamp": "2026-07-26T00:00:00.000000Z",
+  "level": "INFO",
+  "fields": {
+    "message": "ci_watch: queue-side failure detected; parent flipped to blocked: ci_failure",
+    "work_item_id": "task_trunk_example",
+    "pr_url": "https://github.com/spinyfin/mono/pull/9999",
+    "discriminator": "trunk:entry-abc@2026-07-26T00:00:00Z",
+    "head_sha_at_trigger": "trunk:entry-abc@2026-07-26T00:00:00Z",
+    "failure_kind": "trunk_queue_eviction",
+    "task_transitioned": true,
+    "task_unblocked_for_revision": true
+  },
+  "target": "boss_engine::ci_watch"
+}
+```
+
+### SIG-6 lease timeout:
 
 ```json
 {
@@ -721,9 +884,127 @@ SIG-6 lease timeout:
 }
 ```
 
-SIG-B SlotBusy → pool_claim_reconcile:
+### SIG-B SlotBusy → pool_claim_reconcile:
 
 ```json
 {"ts_epoch_ms":1784927838618,"stage":"pane_spawned","outcome":"error","execution_id":"exec_18c55660875e0648_3ad","worker_id":"review-2","error_message":"spawning worker pane for run exec_18c55660875e0648_3ad: app reported spawn error: SlotBusy { occupying_run_id: Some(\"exec_18c5565d7a4a6990_3a8\") }","details":{"released_workspace":true,"slot_id":26,"slot_busy":{"slot_id":26,"occupying_run_id":"exec_18c5565d7a4a6990_3a8"}}}
 {"ts_epoch_ms":1784928505704,"stage":"pool_claim_reconcile","outcome":"ok","execution_id":"exec_18c55660875e0648_3ad","worker_id":"review-2","details":{"pool":"review","worker_id":"review-2","execution_status":"failed"}}
+```
+
+### SIG-C — Historical auto-bind storm only (not current-main hard predicate)
+
+```json
+{"ts_epoch_ms":1784000000000,"stage":"status_transitioned","outcome":"error","execution_id":"exec_hist_autobind","work_item_id":"task_deleted_example","error_message":"cannot complete a deleted task: task_deleted_example","details":{"source":"auto_bind_poller"}}
+{"ts_epoch_ms":1784000001000,"stage":"status_transitioned","outcome":"error","execution_id":"exec_hist_autobind2","work_item_id":"proj_unknown_example","error_message":"unknown task for execution: proj_unknown_example","details":{"source":"auto_bind_poller"}}
+```
+
+### SIG-D — Current-main wire shapes (`reason` / `class` split)
+
+Retries exhausted after unrecognized error (true classifier-gap exhaustion):
+
+```json
+{
+  "ts_epoch_ms": 1784900000000,
+  "stage": "transient_recovery_exhausted",
+  "outcome": "error",
+  "execution_id": "exec_sigd_indet",
+  "work_item_id": "task_sigd_indet",
+  "details": {
+    "reason": "retries_exhausted",
+    "class": "indeterminate",
+    "prior_attempts": 3,
+    "max_attempts": 3,
+    "error": "some never-before-seen API blurb"
+  }
+}
+```
+
+Permanent error (escalate at zero retries — expected):
+
+```json
+{
+  "ts_epoch_ms": 1784900001000,
+  "stage": "transient_recovery_exhausted",
+  "outcome": "error",
+  "execution_id": "exec_sigd_perm",
+  "work_item_id": "task_sigd_perm",
+  "details": {
+    "reason": "permanent_error",
+    "class": "permanent",
+    "prior_attempts": 0,
+    "max_attempts": 3,
+    "error": "authentication_error: invalid x-api-key"
+  }
+}
+```
+
+Confirmed-transient exhausted (infra never cleared):
+
+```json
+{
+  "ts_epoch_ms": 1784900002000,
+  "stage": "transient_recovery_exhausted",
+  "outcome": "error",
+  "execution_id": "exec_sigd_trans",
+  "work_item_id": "task_sigd_trans",
+  "details": {
+    "reason": "retries_exhausted",
+    "class": "transient",
+    "prior_attempts": 3,
+    "max_attempts": 3,
+    "error": "API Error: Unable to connect to API (ConnectionRefused)"
+  }
+}
+```
+
+**Negative fixture (must NOT match historical wrong predicate):** there is no current-main emission of `details.reason == "unrecognized_error"`. ConnectionRefused at `prior_attempts==0` resumes, so no `transient_recovery_exhausted` row is written for that case on current main.
+
+### SIG-E — spawn_nack / libghostty:
+
+```json
+{
+  "ts_epoch_ms": 1784890000000,
+  "stage": "spawn_nack",
+  "outcome": "ok",
+  "execution_id": "exec_sig_e",
+  "work_item_id": "task_sig_e",
+  "details": {
+    "slot_id": 3,
+    "shell_pid": 0,
+    "recovery_patch": null,
+    "reason": "libghostty surface creation failed (ghostty_surface_new returned NULL — likely no active display after sleep/wake)"
+  }
+}
+```
+
+### SIG-F — Worker-id parse failure (historical message; regex still valid):
+
+```json
+{
+  "ts_epoch_ms": 1783000000000,
+  "stage": "pane_spawned",
+  "outcome": "error",
+  "execution_id": "exec_sig_f",
+  "worker_id": "auto-worker-2",
+  "error_message": "PaneSpawnRunner received worker_id \"auto-worker-2\" that does not parse as worker-{N}",
+  "details": { "slot_id": 2 }
+}
+```
+
+Current-main message accepts `worker-{N}`, `auto-worker-{N}`, or `review-{N}`; keep the regex `/does not parse as worker/` for regressions.
+
+### SIG-G — Scheduler wakeup drop (engine-trace):
+
+```json
+{
+  "timestamp": "2026-07-24T18:00:00.000000Z",
+  "level": "WARN",
+  "fields": {
+    "message": "scheduler heartbeat: ready execution(s) older than the heartbeat interval found — kick/drain handoff may have dropped a wakeup; re-kicking now",
+    "count": 2,
+    "oldest_age_ms": 45000,
+    "execution_ids": ["exec_stranded_1", "exec_stranded_2"]
+  },
+  "target": "boss_engine::coordinator::scheduler"
+}
 ```
