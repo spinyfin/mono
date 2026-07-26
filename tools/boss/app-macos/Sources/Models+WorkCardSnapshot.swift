@@ -105,6 +105,7 @@ struct WorkCardSnapshot: Equatable {
     let effortLevel: String?
     let reasoning: String?
     let deferred: Bool
+    let humanDriven: Bool
     let shortID: Int?
     let prURL: String?
     let revisionParentPrUrl: String?
@@ -164,6 +165,7 @@ struct WorkCardSnapshot: Equatable {
     let showsEffortChip: Bool
     let showsReasoningChip: Bool
     let showsDeferredBadge: Bool
+    let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let showsAIReviewingBadge: Bool
     let showsResolvingConflictsBadge: Bool
@@ -324,6 +326,7 @@ struct WorkCardSnapshot: Equatable {
             effortLevel: task.effortLevel,
             reasoning: task.reasoning,
             deferred: task.deferred,
+            humanDriven: task.humanDriven,
             shortID: task.shortID,
             prURL: task.prURL,
             revisionParentPrUrl: task.revisionParentPrUrl,
@@ -372,6 +375,7 @@ struct WorkCardSnapshot: Equatable {
             showsEffortChip: effortNonEmpty,
             showsReasoningChip: task.reasoning == "investigation",
             showsDeferredBadge: task.deferred,
+            showsHumanDrivenBadge: task.humanDriven,
             showsProjectBadge: projectNameNonEmpty,
             showsAIReviewingBadge: task.aiReviewing && task.status == "active",
             showsResolvingConflictsBadge: showsResolvingConflicts,
@@ -433,6 +437,12 @@ enum WorkCardLiveStatus {
         now: Date = Date()
     ) -> String? {
         guard column == .doing else { return nil }
+
+        // Human-driven rows occupy Doing without a worker — never paint
+        // them as "Waiting for a slot" / stalled agent work.
+        if task.humanDriven && task.status == "active" {
+            return "Human-driven — waiting on you"
+        }
 
         let isDispatchPending = task.status == "todo" && task.autostart
         let dispatchRetryAt = runtime?.dispatchRetryAt.flatMap(AutomationTime.parse)

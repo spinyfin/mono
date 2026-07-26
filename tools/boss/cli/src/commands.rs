@@ -419,6 +419,13 @@ pub(crate) enum TaskCommand {
     Show(TaskIdArg),
     /// Update any leaf work item (task or chore) by id.
     Update(TaskUpdateArgs),
+    /// Close a human-driven work item with a required outcome summary.
+    ///
+    /// Human-driven rows never auto-complete (no agent Stop, no PR-merge
+    /// gate). This is the only ritual that moves them to Done: the human
+    /// supplies a prose summary of what happened (e.g. acceptance-sweep
+    /// results). Agents must not invent this summary.
+    Complete(TaskCompleteArgs),
     /// Move any leaf work item (task or chore) into a different status.
     Move(TaskMoveArgs),
     /// Cancel any leaf work item (task or chore) by id. Shorthand for
@@ -2050,6 +2057,14 @@ pub(crate) struct TaskCreateArgs {
     #[arg(long = "deferred", default_value_t = false)]
     pub(crate) deferred: bool,
 
+    /// File this task as human-driven: a person performs or judges the
+    /// work. The row can move to Doing (someone is on this) but no agent
+    /// worker is spawned and nothing auto-completes it. Close only with
+    /// `boss task complete --summary "…"`. Orthogonal to kind — a
+    /// project task, chore, or investigation can all be human-driven.
+    #[arg(long = "human-driven", default_value_t = false)]
+    pub(crate) human_driven: bool,
+
     /// Mark this task as produced by an automation's triage phase. Accepts
     /// an automation selector — a canonical `auto_…` id (resolves on its
     /// own) or an `A<n>` short id (requires `--product`). The engine stamps
@@ -2229,6 +2244,10 @@ pub(crate) struct ChoreCreateArgs {
     /// the backlog but never auto-dispatched until explicitly approved.
     #[arg(long = "deferred", default_value_t = false)]
     pub(crate) deferred: bool,
+
+    /// File this chore as human-driven. See `boss task create --human-driven`.
+    #[arg(long = "human-driven", default_value_t = false)]
+    pub(crate) human_driven: bool,
 }
 
 /// Args for `boss task create-investigation`.
@@ -2276,6 +2295,11 @@ pub(crate) struct InvestigationCreateArgs {
     /// `boss task create --deferred` for the full description.
     #[arg(long = "deferred", default_value_t = false)]
     pub(crate) deferred: bool,
+
+    /// File this investigation as human-driven. See
+    /// `boss task create --human-driven`.
+    #[arg(long = "human-driven", default_value_t = false)]
+    pub(crate) human_driven: bool,
 }
 
 /// Args for `boss task create-revision`.
@@ -2532,6 +2556,26 @@ pub(crate) struct TaskIdArg {
     pub(crate) with_primary_id: bool,
 }
 
+/// Args for `boss task complete` — the human close ritual for
+/// human-driven work items.
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskCompleteArgs {
+    /// Task/chore id. Accepts primary id, friendly short id, or
+    /// cross-product form (same as `boss task show`).
+    pub(crate) id: String,
+    /// Resolve a friendly short id against this product (slug or id).
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Resolve a friendly short id against the product that owns this project.
+    #[arg(long)]
+    pub(crate) project: Option<String>,
+    /// Required prose outcome. What happened — the human judgement the
+    /// agent cannot be trusted to self-report. Stored on the row as
+    /// `completion_summary` and visible via `boss task show`.
+    #[arg(long, value_name = "TEXT")]
+    pub(crate) summary: String,
+}
+
 #[derive(Debug, Clone, Args)]
 pub(crate) struct TaskUpdateArgs {
     pub(crate) id: String,
@@ -2634,6 +2678,13 @@ pub(crate) struct TaskUpdateArgs {
     /// from `--autostart`, which is a one-shot dispatch-timing pause.
     #[arg(long, value_name = "BOOL")]
     pub(crate) deferred: Option<bool>,
+
+    /// Mark or unmark this item as human-driven. `--human-driven true`
+    /// means a person does the work (no agent worker, close only via
+    /// `boss task complete --summary`); `--human-driven false` clears the
+    /// flag so the row behaves as ordinary agent work again.
+    #[arg(long = "human-driven", value_name = "BOOL")]
+    pub(crate) human_driven: Option<bool>,
 
     /// Set or clear the blocked reason on this item. Accepts any engine
     /// reason value (`merge_conflict`, `ci_failure`, `ci_failure_exhausted`,

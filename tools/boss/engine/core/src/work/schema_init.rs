@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -163,6 +163,8 @@ impl WorkDb {
                 updated_at TEXT NOT NULL,
                 autostart INTEGER NOT NULL DEFAULT 1,
                 deferred INTEGER NOT NULL DEFAULT 0,
+                human_driven INTEGER NOT NULL DEFAULT 0,
+                completion_summary TEXT,
                 priority TEXT NOT NULL DEFAULT 'medium',
                 repo_remote_url TEXT,
                 created_via TEXT NOT NULL DEFAULT 'unknown',
@@ -285,6 +287,8 @@ impl WorkDb {
         migrate_work_executions_v3(conn)?;
         migrate_tasks_autostart(conn)?;
         migrate_tasks_deferred(conn)?;
+        migrate_tasks_human_driven(conn)?;
+        migrate_tasks_completion_summary(conn)?;
         migrate_last_status_actor(conn)?;
         migrate_tasks_priority(conn)?;
         migrate_project_design_doc_columns(conn)?;
@@ -665,7 +669,7 @@ impl WorkDb {
         // Codex retention can operate only on a recorded root.
         migrate_work_executions_driver_runtime_state(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -756,7 +760,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "29");
+        assert_eq!(schema_version, "30");
 
         let boothby_passes_exists: bool = conn
             .query_row(

@@ -427,7 +427,19 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
             && previous_task_status
                 .as_ref()
                 .is_some_and(|prev| *prev != TaskStatus::Active);
+        // Human-driven rows enter Doing without a worker — skip the repo
+        // precheck that would otherwise refuse a card that intentionally
+        // has no agent dispatch target.
+        let is_human_driven = work_db
+            .get_work_item(&id)
+            .ok()
+            .and_then(|item| match item {
+                WorkItem::Task(t) | WorkItem::Chore(t) => Some(t.human_driven),
+                _ => None,
+            })
+            .unwrap_or(false);
         if intends_active_transition
+            && !is_human_driven
             && work_item_needs_dispatch(&work_db, &id)
             && let Err(err) = work_db.precheck_dispatch_repo(&id)
         {
@@ -545,8 +557,25 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 if task_transitioned_to_active(&previous_task_status, &item) {
                     let work_item_id_for_event = work_item_id(&item);
                     let from_status = previous_task_status.clone();
-                    let needs_dispatch = work_item_needs_dispatch(&work_db, &work_item_id_for_event);
-                    let (dispatched_execution_id, did_dispatch, skip_reason) = if needs_dispatch {
+                    // Human-driven: status flip to Doing is the whole point —
+                    // mark "someone is on this" without spawning a worker.
+                    let item_is_human_driven = matches!(
+                        &item,
+                        WorkItem::Task(t) | WorkItem::Chore(t) if t.human_driven
+                    );
+                    let needs_dispatch =
+                        !item_is_human_driven && work_item_needs_dispatch(&work_db, &work_item_id_for_event);
+                    let (dispatched_execution_id, did_dispatch, skip_reason) = if item_is_human_driven {
+                        (
+                            None,
+                            false,
+                            Some(
+                                "human_driven=true (no agent worker; close with \
+                                 `boss task complete --summary`)"
+                                    .to_owned(),
+                            ),
+                        )
+                    } else if needs_dispatch {
                         let live_states = server_state.live_worker_states.clone();
                         let dispatch_input = RequestExecutionInput::builder()
                             .work_item_id(work_item_id_for_event.clone())

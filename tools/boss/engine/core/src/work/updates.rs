@@ -317,6 +317,22 @@ impl WorkDb {
         if let Some(deferred) = patch.deferred {
             task.deferred = deferred;
         }
+        if let Some(human_driven) = patch.human_driven {
+            task.human_driven = human_driven;
+            // Marking a row human-driven permanently parks auto-dispatch.
+            if human_driven {
+                task.autostart = false;
+            }
+        }
+        if let Some(summary) = patch.completion_summary {
+            // Empty string clears; non-empty stores the human close summary.
+            let trimmed = summary.trim();
+            task.completion_summary = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+        }
         if patch.tags.is_some() || patch.add_tags.is_some() || patch.remove_tags.is_some() {
             task.tags = apply_tag_patch(
                 &task.tags,
@@ -368,6 +384,24 @@ impl WorkDb {
         if status_changed {
             refuse_manual_move_off_blocked_while_gated(&tx, id, previous_status.as_str(), task.status.as_str())?;
         }
+        // Human-driven close ritual: moving to `done` requires a non-empty
+        // completion_summary (supplied by `boss task complete --summary`).
+        // Archive/cancel remain ordinary escapes and do not require a summary.
+        if status_changed && task.status == TaskStatus::Done && task.human_driven {
+            let summary_ok = task.completion_summary.as_deref().is_some_and(|s| !s.trim().is_empty());
+            if !summary_ok {
+                bail!(
+                    "human-driven work item {id} cannot move to done without a completion summary; \
+                     use `boss task complete {id} --summary \"…\"` (or pass --summary with the status \
+                     change). Agents must not close human-driven rows."
+                );
+            }
+        }
+        // Leaving a terminal status clears the close summary so a reopened
+        // human-driven row does not carry a stale outcome.
+        if status_changed && !task.status.is_terminal() {
+            task.completion_summary = None;
+        }
         let actor_stamp = if status_changed && previous_status != task.status {
             actor
         } else {
@@ -385,7 +419,7 @@ impl WorkDb {
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
-                 reasoning = ?20, tags = ?21,
+                 reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -414,6 +448,8 @@ impl WorkDb {
                 task.deferred as i64,
                 reasoning_value,
                 tags_value,
+                task.human_driven as i64,
+                task.completion_summary,
             ],
         )?;
 

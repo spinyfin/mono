@@ -170,6 +170,7 @@ impl WorkDb {
                 "SELECT t.id, t.product_id FROM tasks t
                  WHERE t.status = 'active'
                    AND t.deleted_at IS NULL
+                   AND COALESCE(t.human_driven, 0) = 0
                    AND NOT EXISTS (
                        SELECT 1 FROM work_runs wr
                        JOIN work_executions we ON wr.execution_id = we.id

@@ -124,6 +124,21 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deferred: Option<bool>,
 
+    /// Flip the `human_driven` classification. `None` → leave unchanged.
+    /// `Some(true)` marks the row as human-driven (no agent worker; close
+    /// only via `boss task complete --summary`). `Some(false)` clears the
+    /// flag so the row behaves as ordinary agent work again. See
+    /// [`crate::Task::human_driven`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_driven: Option<bool>,
+
+    /// Set the human close-out summary for a human-driven row. Required
+    /// (non-empty) when moving a human-driven row to `done` via the
+    /// complete ritual. `None` → leave unchanged. `Some("")` is rejected
+    /// on human-driven close. See [`crate::Task::completion_summary`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
+
     /// Set or clear the `blocked_reason` field. `None` → leave unchanged.
     /// `Some("")` → clear (write NULL). Any non-empty string is stored verbatim
     /// (e.g. `"merge_conflict"`, `"ci_failure"`). Manual escape hatch for

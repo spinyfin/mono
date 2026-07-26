@@ -795,6 +795,16 @@ impl WorkDb {
             tx.commit()?;
             return Ok(None);
         }
+        // Human-driven rows close only via the human complete ritual —
+        // never by merge-poller observation of a bound PR.
+        if task.human_driven {
+            tracing::info!(
+                work_item_id = %task.id,
+                %pr_url,
+                "mark_chore_pr_merged: skipping human-driven row — only `boss task complete --summary` closes it",
+            );
+            return Ok(None);
+        }
         let now = now_string();
         // Clearing blocked_reason / blocked_attempt_id is load-bearing
         // for the case where the merge poller observes a force-merge

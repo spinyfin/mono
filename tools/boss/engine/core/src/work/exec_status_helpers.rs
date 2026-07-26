@@ -173,6 +173,25 @@ pub(crate) fn work_item_is_deferred(conn: &Connection, work_item_id: &str) -> Re
     Ok(deferred.unwrap_or(0) != 0)
 }
 
+/// True when `work_item_id` is a task flagged `human_driven = 1`.
+/// Human-driven rows may sit in Doing as real in-flight work, but the
+/// engine must never mint a `ready` execution for them and never auto-
+/// complete them — only an explicit human close with a summary does.
+/// Reads the column directly (same rationale as [`work_item_is_deferred`]).
+pub(crate) fn work_item_is_human_driven(conn: &Connection, work_item_id: &str) -> Result<bool> {
+    if !work_item_id.starts_with("task_") {
+        return Ok(false);
+    }
+    let human_driven: Option<i64> = conn
+        .query_row(
+            "SELECT human_driven FROM tasks WHERE id = ?1 AND deleted_at IS NULL",
+            params![work_item_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(human_driven.unwrap_or(0) != 0)
+}
+
 pub(crate) fn product_id_for_work_item(conn: &Connection, work_item_id: &str) -> Result<String> {
     match classify_id(work_item_id)? {
         ItemKind::Product => query_product(conn, work_item_id)?

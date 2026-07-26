@@ -118,6 +118,11 @@ pub struct CreateChoreInput {
     #[builder(default)]
     pub deferred: bool,
 
+    /// See [`Task::human_driven`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub human_driven: bool,
+
     /// See [`CreateTaskInput::force_duplicate`].
     #[serde(default)]
     #[builder(default)]
@@ -207,6 +212,11 @@ pub struct CreateInvestigationInput {
     #[builder(default)]
     pub deferred: bool,
 
+    /// See [`Task::human_driven`]. Defaults to `false`.
+    #[serde(default)]
+    #[builder(default)]
+    pub human_driven: bool,
+
     #[serde(default)]
     #[builder(default)]
     pub force_duplicate: bool,
@@ -284,6 +294,13 @@ pub struct CreateTaskInput {
     #[serde(default)]
     #[builder(default)]
     pub deferred: bool,
+
+    /// See [`Task::human_driven`]. Defaults to `false`. When `true`, the
+    /// row is filed as human-driven (no agent worker; close via
+    /// `boss task complete --summary`).
+    #[serde(default)]
+    #[builder(default)]
+    pub human_driven: bool,
 
     /// Bypass the recent-duplicate guard. When `true`, the engine skips
     /// the 60-second same-name/same-product duplicate check and inserts
@@ -523,6 +540,38 @@ pub struct Task {
     #[serde(default)]
     #[builder(default)]
     pub deferred: bool,
+
+    /// When `true`, this work item is **human-driven**: a person performs
+    /// (or judges) the work, and no agent worker may close it out.
+    ///
+    /// Orthogonal to [`Task::kind`] (the deliverable axis). A human-driven
+    /// row may still be a `project_task`, `chore`, or `investigation` —
+    /// the kind describes *what* the deliverable is; this flag describes
+    /// *who* does the work.
+    ///
+    /// Semantics:
+    /// - Still schedulable: the row can sit in Doing (`status = active`)
+    ///   and occupy a lane as "someone is on this".
+    /// - Never auto-dispatched: the engine never mints a `ready` execution
+    ///   and refuses `RequestExecution` / drag-to-Doing auto-spawn.
+    /// - Never auto-completed: worker Stop, PR merge, and completion gates
+    ///   do not move the row out of Doing. Only an explicit human close
+    ///   (`boss task complete --summary …`) does.
+    /// - Idle/ghost-active detectors skip the row while it sits in Doing
+    ///   by design (often for days).
+    ///
+    /// Existing rows default to `false`. Distinct from [`autostart`]
+    /// (dispatch timing) and [`deferred`] (future-scope parking).
+    #[serde(default)]
+    #[builder(default)]
+    pub human_driven: bool,
+
+    /// Prose outcome supplied by the human at close time via
+    /// `boss task complete --summary`. `None` until the row is closed
+    /// through that ritual (or an older path that never set it). Cleared
+    /// if the row is reopened out of a terminal status.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
 
     /// Every active block reason currently in flight on this work
     /// item — the multi-signal companion to the scalar

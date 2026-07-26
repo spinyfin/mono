@@ -931,6 +931,12 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if task.deferred {
         println!("Deferred: yes (future scope — awaiting approval to dispatch)");
     }
+    if task.human_driven {
+        println!("Human-driven: yes (no agent worker; close with `boss task complete --summary \"…\"`)");
+    }
+    if let Some(summary) = task.completion_summary.as_deref() {
+        println!("Completion summary: {summary}");
+    }
     if let Some(reason) = task.archived_reason.as_deref() {
         println!("Archived reason: {reason}");
     }
