@@ -444,6 +444,11 @@ impl RuntimeConfig {
     /// [`Self::from_parts`] with an injected key resolves the same way a
     /// production one does. A failure to load `AgentConfig` is not fatal here:
     /// the provider falls back to reading the env var itself.
+    ///
+    /// Callers that must not hit the network (unit tests) should install a
+    /// keyless provider via [`Self::set_utility_model`] before the first
+    /// `utility_model()` call — `from_parts(work, None)` alone still lazy-
+    /// loads credentials from the process environment on first use.
     pub fn utility_model(&self) -> Arc<dyn UtilityModel> {
         if let Some(provider) = self.utility_cell.get() {
             return provider.clone();
@@ -460,6 +465,15 @@ impl RuntimeConfig {
                 .expect("OnceLock set after failed insert")
                 .clone(),
         }
+    }
+
+    /// Install a [`UtilityModel`] provider before the first
+    /// [`Self::utility_model`] call. Used by tests to inject a keyless
+    /// (or mock) provider so spawn / live-status / pane-summary paths never
+    /// issue real network requests when `ANTHROPIC_API_KEY` is set in the
+    /// process environment. No-op if a provider is already installed.
+    pub fn set_utility_model(&self, provider: Arc<dyn UtilityModel>) {
+        let _ = self.utility_cell.set(provider);
     }
 }
 

@@ -788,6 +788,47 @@ mod pane_spawn_tests {
         )
     }
 
+    /// Keyless utility-model provider: `resolve` fails with NoCredentials so
+    /// pane-summary / live-status paths take the offline branch. Without this,
+    /// `RuntimeConfig::utility_model()` lazy-loads `ANTHROPIC_API_KEY` from the
+    /// process environment and every `run_execution` issues a live Messages API
+    /// call (~1s each) for the pane titlebar summary — the dominant cost of
+    /// this module when the key is set on a developer machine or in CI.
+    fn keyless_utility_model() -> Arc<dyn crate::utility_model::UtilityModel> {
+        Arc::new(crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None))
+    }
+
+    /// Build a `RuntimeConfig` for pane-spawn tests with a keyless utility
+    /// model pre-installed so spawn never hits the network for titles.
+    fn test_runtime_config(work: crate::config::WorkConfig) -> Arc<crate::config::RuntimeConfig> {
+        let cfg = crate::config::RuntimeConfig::from_parts(work, None);
+        cfg.set_utility_model(keyless_utility_model());
+        Arc::new(cfg)
+    }
+
+    /// Guard: even when `ANTHROPIC_API_KEY` is set in the process environment
+    /// (common on developer machines and some CI profiles), the test
+    /// RuntimeConfig must not surface a credential for pane-summary. Without
+    /// this, every `run_execution` paid ~1s for a live Messages API call.
+    #[test]
+    fn test_runtime_config_installs_keyless_utility_model() {
+        let cfg = test_runtime_config(
+            crate::config::WorkConfig::builder()
+                .cwd(PathBuf::from("/tmp"))
+                .db_path(PathBuf::from("/tmp/state.db"))
+                .build(),
+        );
+        let err = cfg
+            .utility_model()
+            .resolve(crate::utility_model::UtilityTask::PaneSummary)
+            .expect_err("test RuntimeConfig must not resolve a credential from the environment");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NoCredentials") || msg.to_lowercase().contains("credential") || msg.contains("no "),
+            "expected a no-credentials error, got: {msg}",
+        );
+    }
+
     /// Build the standard worker-spawn test scaffolding from a workspace
     /// tempdir: a `CapturingSpawner`, a `Weak<dyn WorkerSpawner>` the
     /// runner can upgrade, a default `RuntimeConfig` pointed at the
@@ -805,13 +846,12 @@ mod pane_spawn_tests {
         let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+        let cfg = test_runtime_config(
             crate::config::WorkConfig::builder()
                 .cwd(workspace.path().to_path_buf())
                 .db_path(workspace.path().join("state.db"))
                 .build(),
-            None,
-        ));
+        );
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
         (spawner, weak, cfg, work_db)
     }
@@ -1575,14 +1615,13 @@ mod pane_spawn_tests {
         let bound = workspace.path().join("boss-test-fixture.events.sock");
 
         let (spawner, weak, _cfg, work_db) = spawn_test_env(&workspace);
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+        let cfg = test_runtime_config(
             crate::config::WorkConfig::builder()
                 .cwd(workspace.path().to_path_buf())
                 .db_path(workspace.path().join("state.db"))
                 .events_socket_path(bound.clone())
                 .build(),
-            None,
-        ));
+        );
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),
         ));
@@ -1654,15 +1693,14 @@ mod pane_spawn_tests {
         let spawner: Arc<CapturingSpawner> = Arc::new(CapturingSpawner::new());
         let weak: Weak<dyn crate::spawn_flow::WorkerSpawner> =
             Arc::downgrade(&spawner) as Weak<dyn crate::spawn_flow::WorkerSpawner>;
-        let cfg = Arc::new(crate::config::RuntimeConfig::from_parts(
+        let cfg = test_runtime_config(
             crate::config::WorkConfig::builder()
                 .cwd(workspace.path().to_path_buf())
                 .db_path(workspace.path().join("state.db"))
                 .worker_pool_size(8)
                 .automation_pool_size(3)
                 .build(),
-            None,
-        ));
+        );
         let work_db = Arc::new(WorkDb::open(workspace.path().join("state.db")).unwrap());
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),
