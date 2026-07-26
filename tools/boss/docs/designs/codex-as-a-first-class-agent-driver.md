@@ -141,7 +141,7 @@ G-4 previously read: _"3-value reasoning effort against Boss's 5-value ladder is
 
 Worth noting for the [coexistence hazard](#migration-and-coexistence): `external_config_migration_prompts` still exists, and 0.145.0 adds an `external_agent_memory_import` feature plus an `external_agent_config_imports` table in `state_5.sqlite` — a **second** Claude-import vector beyond config, pointed at agent memory. `codex doctor` now reports 0.145.0 as current (`latest version status: current version is not older`).
 
-One clarification the stdout-reader work depends on, checked explicitly because [T-05](#t-05-engine-side-stdout-jsonl-progress-reader) rests on it: **`--json` events go to stdout and the human-readable `Reading additional input from stdin...` notice goes to stderr.** The JSONL stream is uncontaminated, so the reader needs no filtering.
+One clarification for the landed stdout-reader work: **`--json` events go to stdout and the human-readable `Reading additional input from stdin...` notice goes to stderr.** The JSONL stream is uncontaminated, so the reader needs no filtering.
 
 ---
 
@@ -367,51 +367,29 @@ One gap: the trait gives no hook for **teardown**. A per-run `CODEX_HOME` accumu
 
 ### G-3 `PermissionPolicy`
 
-`ClaudeDriver::write_permission_config` is still `unimplemented!()` (`engine/driver/src/claude.rs:477-480`); the real logic remains in `engine/core/src/worker_setup.rs` emitting Claude permission grammar. T1479 moves it.
+`ClaudeDriver::write_permission_config` is still `unimplemented!()` (`engine/driver/src/claude.rs:547`), and the real rendering still lives in `engine/core/src/worker_setup.rs`. Its signature has already moved to `PermissionArtifacts` (`engine/driver/src/lib.rs:901-905`), so T1479 is now extraction-only. The remaining blocker is the one-way `core -> driver` dependency: the settings and deny-rule rendering in `worker_setup` must first be ported into the driver crate.
 
-The problem for Codex is the **signature**: `async fn write_permission_config(&self, dest_dir: &Path) -> anyhow::Result<PathBuf>` (`engine/driver/src/lib.rs:573`) hardcodes the assumption that a permission policy _is a file whose path is passed to the CLI_. For Codex the policy is `--sandbox <mode>`, `--ignore-rules` / `--strict-config`, `[sandbox_workspace_write] writable_roots`, and `CODEX_HOME` — argv and config, not a single file path. (`-a/--ask-for-approval` used to belong on that list; it was removed from `codex exec` between 0.137.0 and 0.145.0 — see [D-1](#deltas-that-change-the-design) — which does not weaken the point, since what remains is still argv plus config plus a directory.)
+The former Claude-shaped `PathBuf` signature is gone. For Codex the policy is `--sandbox <mode>`, `--ignore-rules` / `--strict-config`, `[sandbox_workspace_write] writable_roots`, and `CODEX_HOME` — argv and config as well as files. (`-a/--ask-for-approval` used to belong on that list; it was removed from `codex exec` between 0.137.0 and 0.145.0 — see [D-1](#deltas-that-change-the-design) — which does not weaken the point, since what remains is still argv plus config plus a directory.)
 
-**Fix:** the method should take Boss's _abstract_ policy (autonomous-honour-denies / reviewer-read-only / structural deny set) and return an opaque `PermissionArtifacts { config_files: Vec<PathBuf>, extra_args: Vec<String>, env: Vec<(String,String)> }`. **T1479 as currently scoped is insufficient** — it extracts Claude's logic behind a signature Codex cannot satisfy, which would force a second refactor.
+The method now takes Boss's abstract policy and returns `PermissionArtifacts { config_files: Vec<PathBuf>, extra_args: Vec<String>, env: Vec<(String,String)> }`; the remaining T1479 extraction must preserve that shape.
 
 ### G-4 `ModelAndEffortMenu`
 
-Re-verified: `menu_for_driver(_driver_slug: &str)` still discards its argument and returns Claude's menu unconditionally (`engine/effort/src/lib.rs:110-112`). `SpawnConfig.claude_effort` is still Claude-named (`engine/effort/src/lib.rs:34`, set at `:182`, consumed at `:62`).
+`menu_for_driver_in` now resolves through `DriverRegistry` (`engine/effort/src/lib.rs:158,267`), with coverage that it resolves per slug rather than hardcoding Claude (`:571-620`). Effort values are now driver-local through each descriptor's `effort_value_for_level` (for Claude, `claude.rs:34,137`).
 
 Codex fits the `ModelMenu` model cleanly, but **not as the fixed `Degrade` case this doc originally recorded**. On 0.145.0 the effort ladder is per-model and reaches six values (`low, medium, high, xhigh, max, ultra`) — meeting or exceeding Boss's 5-value ladder on the newer models, and varying between models within one catalog. So the mapping is neither a uniform degrade nor a static table: it must be resolved per selected model from `codex debug models` at runtime.
 
-**T3326 remains correctly scoped**, with two riders: it must rename `claude_effort` to a driver-neutral name (`effort_value`), otherwise the Claude-ism just moves; and the menu it builds must be **per-model**, not per-driver, or Codex's newer models will be silently capped at Boss's older assumption about their ceiling.
+The remaining Codex work is to provide its descriptor and model-aware menu; the already-landed registry and driver-local effort seam should be reused rather than duplicated.
 
 ### G-5 `ProgressObservation` — the top gap
 
 **This is the finding that most changes P1422's remaining work.**
 
-`ProgressObservationWiring` _is a Claude settings-file `hooks` map_ (`engine/driver/src/lib.rs:445-451`). The engine then does:
-
-```rust
-.get_mut("PreToolUse")
-.expect("Claude ProgressObservation wiring always includes PreToolUse")
-```
-
-at `engine/core/src/worker_setup.rs:530-532` — which would panic on the empty map the trait's own doc comment says a hookless driver returns. T3328 addresses exactly this.
-
-**But T3328 is insufficient**, and this is the co-dependency the project brief was designed to surface. Making the engine _tolerate_ an empty hook map leaves a Codex worker with **no progress signal at all**, because the only ingress is a unix socket fed by the `boss-event` shim, and `engine/core/src/events_socket.rs:248` hardcodes `ClaudeDriver.normalize_progress_event`. Codex's signal is on the worker's **stdout**, which the engine never reads.
-
-So `ProgressObservation` today abstracts _normalisation_ (`normalize_progress_event`, a `serde_json::Value` → `WorkerEvent` function — which is genuinely driver-agnostic and works fine for Codex) but not _transport_. The capability needs a third concept:
-
-```rust
-enum ProgressIngress {
-    /// Driver installs handlers that call back into Boss's socket (Claude).
-    HookCallback(ProgressObservationWiring),
-    /// Driver emits a JSONL event stream on the worker's stdout (Codex).
-    StdoutJsonl,
-}
-```
-
-with an engine-side stdout reader that feeds the same normaliser and the same activity machine. Note that `normalize_progress_event` needs no signature change — the transport split is the whole gap.
+`ProgressIngress` now distinguishes `HookCallback(ProgressObservationWiring)` and `StdoutJsonl`; `ProgressObservationWiring` is only the hook-callback payload (`engine/driver/src/lib.rs:641-653`). The spawn flow accepts the documented empty-hooks case (`worker_setup.rs:580-587`), and `events_socket.rs:238-255` accepts an injected driver rather than hardcoding `ClaudeDriver`. PR #2363 landed the engine-side stdout JSONL reader, so the transport split and reader are no longer future work.
 
 A related, smaller problem: `WorkerEvent` requires `session_id` on every variant (`protocol/src/worker_event.rs`), and `SessionStartSource` mirrors Claude's `startup|resume|compact`. Codex's identity is `thread_id`, and its `SessionStart` trigger set _(binary)_ is `startup|resume|clear|compact` — a superset. Both need widening.
 
-Finally, `progress_fidelity()` (`engine/driver/src/claude.rs:482`) still has **no callers anywhere** — re-verified. It is either dead code or an unimplemented intent; a Codex driver would declare `Rich` and nothing would consult it.
+Finally, `progress_fidelity()` is now registered per live-worker slot and consulted by the stale-worker sweep through `ProgressFidelity::stale_threshold_secs` (`live_worker_state.rs:165-177`; `stale_worker_sweep.rs:290-291`).
 
 ### G-6 `ToolUseInterception`
 
@@ -430,21 +408,21 @@ Two things the declaration does **not** wave away.
 
 The `PATH`-shim design recovers the inline case properly, since a shim can rewrite argv freely. That is one of the reasons it remains worth doing as a [follow-on project](#guardrail-integrity).
 
-Separately, and independent of Codex: the `Degrade` disposition (`engine/driver/src/lib.rs:92`) remains dangerous for whoever lands on it next, because the degrade path exists as **types only**. `PostHocInterceptionFn` and `PostHocInterceptionAction` (`engine/driver/src/lib.rs:497-525`) have **zero engine callers** — re-verified. A driver landing on `Degrade` today silently loses editorial enforcement, the path guard, the revision-PR guard, and the checkleft push guard. Codex no longer lands there, so this is not a Codex blocker; it is a latent abstraction bug, filed as [A-8](#proposed-p1422-amendments) / [T-19](#t-19-implement-the-post-hoc-interception-degrade-path-a-8) and deferred.
+Separately, and independent of Codex: the `Degrade` disposition now has an engine dispatch path on `PostToolUse` (`worker_events.rs:793-835`). It calls a driver's registered post-hoc handler when present and makes the bare-degrade loss of guards visible rather than silently dropping it. Codex still does not land on `Degrade`, but the formerly latent abstraction bug is no longer an unimplemented path.
 
 ### G-7 `TurnBoundary`
 
-Enum variant exists (`engine/driver/src/lib.rs:40`), default disposition `Synthesize` (`:92`), **no trait method** — re-verified. Completion runs directly off `WorkerEvent::Stop` (`engine/core/src/completion/stop.rs:12`, `on_stop_inner` at `:168`).
+PR #2361 is in flight with the `TurnBoundary` trait method and routes its consumers through the resolved driver. Its engine synthesizer remains deliberately unbuilt, so this document does not duplicate that in-flight revision.
 
 The brief rates this the highest-severity gap on the premise that Codex cannot signal turn end. **That premise is wrong** — `turn.completed` is native, in-band, and carries token usage. Codex's turn boundary is _better_ than Claude's.
 
-The gap is therefore not severity-of-absence but **shape**: there is no trait method, so completion is hardwired to a Claude-hook-derived event. T3325 (add a `TurnBoundary` trait method + engine synthesizer) is **correctly scoped but mis-prioritised** — for Codex the synthesizer is unnecessary; what is needed is the trait method plus the [G-5](#g-5-progressobservation--the-top-gap) stdout transport, and then `turn.completed` maps straight onto `WorkerEvent::Stop`. The synthesizer is still worth building for a hypothetical third driver with neither hooks nor turn events, but it is not on Codex's critical path and should not gate it.
+The remaining gap is the deliberately deferred synthesizer for a hypothetical driver with neither hooks nor turn events. Codex needs neither that synthesizer nor a duplicate of PR #2361's trait-method work: `turn.completed` maps directly onto `WorkerEvent::Stop` once its driver normaliser is present.
 
 One genuine subtlety: Claude's `Stop` fires per _assistant turn_ within a session; Codex's `codex exec` is **one turn per process**, exiting after `turn.completed`. Boss's probe/nudge loop assumes it can inject a follow-up prompt into a live session (`engine/core/app/pane_delivery.rs`). Under Codex that becomes `codex exec resume`, i.e. a **new process**, not a message into a running one. This is a real lifecycle difference and the main reason [T-17](#t-17-controlverbs-on-the-trait-plus-codex-probenudge-via-exec-resume-a-7) is its own task.
 
 ### G-8 `StructuredOutput`
 
-Enum variant at `engine/driver/src/lib.rs:43`, **no trait method**. Engine-side file contract exists — `STRUCTURED_OUTPUT_ENV = "BOSS_STRUCTURED_OUTPUT"` (`engine/core/src/structured_output.rs:37`) — covering review findings, task followups, postmortem followups. Still transcript-scraped: triage (`engine/core/src/automation_triage.rs:498 parse_triage_decision`) and PR URL (`engine/core/src/pr_url_capture.rs`, which reads `tool_response.stdout` from **`PostToolUse` hook events** — a Claude-hook dependency, re-verified at `pr_url_capture.rs:1-6`).
+Enum variant at `engine/driver/src/lib.rs:43`, **no trait method**. The engine-side file contract exists as `BOSS_STRUCTURED_OUTPUT` (`engine/core/src/spawn_flow.rs:59`) — covering review findings, task followups, postmortem followups. Still transcript-scraped: triage (`engine/core/src/automation_triage.rs:498 parse_triage_decision`) and PR URL (`engine/core/src/pr_url_capture.rs`, which reads `tool_response.stdout` from **`PostToolUse` hook events** — a Claude-hook dependency, re-verified at `pr_url_capture.rs:1-6`).
 
 Codex is **better** here than Claude: `--output-schema <FILE>` constrains the final response to a JSON Schema, and `--output-last-message <FILE>` writes it to a known path. That is a native, enforced structured-output contract — strictly stronger than "ask the agent to write a file and hope."
 
@@ -455,13 +433,13 @@ Two consequences:
 
 ### G-9 `TranscriptAccess`
 
-`normalize_transcript_entry` (`engine/driver/src/claude.rs:606-616`) is **never called** — re-verified. `engine/core/src/live_status.rs` passes raw JSONL straight to redaction. `engine/transcript-tail/src/lib.rs:1-8` documents itself as _"Incremental JSONL tail-watcher for claude transcript files"_ and hard-assumes that shape.
+`transcript_path_for_session()` is now on the driver trait and `live_status_loop` calls `normalize_transcript_entry` before redaction. `engine/transcript-tail` is still Claude-framed, which leaves Codex rollout-path derivation and tailer generalisation as the remaining work.
 
 Codex rollouts are also JSONL, so the tailer is reusable — but path discovery is the problem. Claude's path is discovered because Claude stamps `transcript_path` on hook payloads (`engine/core/src/events_socket.rs`, `live_status_loop.rs`). Codex's `--json` stream does **not** carry `transcript_path` (verified — no such field in any captured envelope). It is derivable as `$CODEX_HOME/sessions/<Y>/<M>/<D>/rollout-*-<thread_id>.jsonl`, and since the driver owns `CODEX_HOME` it can compute it from `thread_id` on `thread.started`.
 
 Codex's **hook** payloads _do_ carry `transcript_path` — confirmed on 0.145.0 ([D-2](#deltas-that-change-the-design)) — and the design now does wire hooks, so this is a live option rather than a hypothetical one. It is still not the right discovery route: a hook payload only arrives once the worker uses a tool, and only if hooks were trusted, whereas `thread.started` is the stream's first envelope and the driver owns `CODEX_HOME`. Derivation from `thread_id` stays the primary mechanism because it is unconditional; the hook field is a cross-check, not a dependency.
 
-**Fix:** add a `transcript_path_for_session(&self, session_id) -> Option<PathBuf>` to the trait so discovery is driver-supplied rather than hook-derived, and actually **call** `normalize_transcript_entry` in `live_status.rs` — otherwise Codex transcript lines reach Claude-shaped redaction and summarisation logic.
+**Remaining work:** derive Codex's rollout path from `thread_id` + `CODEX_HOME` and generalise `engine/transcript-tail`; retain hook-provided transcript paths only as a cross-check.
 
 ### G-10 `ControlVerbs`
 
@@ -571,7 +549,7 @@ Declare `ToolUseInterception` absent, land on `AbsenceDisposition::Degrade`, and
 
 **Rejected, and the [operator decision](#operator-decision) does not revive it.** Post-hoc detection of an _already-pushed_ commit or an _already-posted_ GitHub comment is not enforcement; the side effect is public. For editorial controls specifically the whole point is that unreviewed prose never reaches GitHub. Codex's `PreToolUse` deny is genuine **pre-execution** enforcement and is available now, so the degrade path is not what Codex lands on — it is not the second-best option here, it is the wrong shape of option.
 
-The post-hoc types should still be implemented eventually: they are the right answer for a _future_ driver that has neither hooks nor a shimmable command surface, and leaving them as uncalled types while some driver silently degrades onto them is a live trap in the abstraction. But with Codex declaring `ToolUseInterception`, that trap is **no longer Codex-adjacent** — it is a latent gap for a hypothetical third driver, and it is reclassified as deferred accordingly ([A-8](#proposed-p1422-amendments), [T-19](#t-19-implement-the-post-hoc-interception-degrade-path-a-8)).
+The post-hoc types are now dispatched on the `Degrade` path and bare degrade emits a visible loss-of-guards signal. Codex still declares `ToolUseInterception`, so it does not use that fallback; [A-8](#proposed-p1422-amendments) retains the rationale and completion record.
 
 ### Alternative 3: Drive `codex app-server` over JSON-RPC
 
@@ -689,23 +667,23 @@ The original pass paired that risk with a claim that has since been **withdrawn*
 
 Discrete, filed-work-item-sized. The original design pass could not create Boss work items; this revision materializes the new lifecycle prerequisite as T3679 and the immediate P3330 gates as T3681 through T3686. The remaining entries stay as the coordinator's handoff until they are independently scheduled.
 
-| #    | Proposed name                                                                        | Effort    | Amends / new                                                                      | Brief                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---- | ------------------------------------------------------------------------------------ | --------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| A-1  | `ProgressObservation`: abstract the ingress transport, not just normalisation        | `large`   | **Amends T3328** (materially widens it)                                           | T3328 as scoped only stops the `.expect()` panic at `worker_setup.rs:530-532`, leaving a hookless driver with no progress signal at all. `ProgressObservationWiring` must become an enum over transports — `HookCallback(wiring)` for Claude, `StdoutJsonl` for Codex — with an engine-side stdout reader feeding the same normaliser and activity machine. `normalize_progress_event` needs no signature change; `events_socket.rs:248`'s hardcoded `ClaudeDriver` does. Without this, no Codex worker reports progress or completes. |
-| A-2  | `PermissionPolicy`: return permission _artifacts_, not a single file path            | `medium`  | **Amends T1479**                                                                  | `write_permission_config(&self, dest_dir) -> Result<PathBuf>` (`lib.rs:573`) hardcodes "a permission policy is one file whose path is passed to the CLI". Codex's policy is `--sandbox`, `--ignore-rules` / `--strict-config`, `[sandbox_workspace_write]`, and `CODEX_HOME` — argv plus config. Return `PermissionArtifacts { config_files, extra_args, env }`. Landing T1479 against the current signature guarantees a second refactor.                                                                                             |
-| A-3  | `Spawn`: replace Claude-shaped parameters with a `SpawnRequest`/`SpawnPlan` pair     | `medium`  | **New**                                                                           | `spawn_invocation` (`lib.rs:553-560`) takes `settings_path`, `non_opus_auto_mode`, `permission_mode_override` — all Claude concepts — and returns a `String` the engine wraps with a hardcoded `unset ANTHROPIC_API_KEY` (`pane_spawn.rs:382`). Codex needs an exported `CODEX_HOME`. Take an opaque request struct; return `SpawnPlan { env, command }` so env mutation is driver-supplied.                                                                                                                                           |
-| A-4  | `TurnBoundary` trait method — decouple completion from `WorkerEvent::Stop`           | `medium`  | **Amends T3325** (re-scopes; drops the synthesizer from the critical path)        | T3325 pairs a trait method with an engine synthesizer. Codex needs only the method: `turn.completed` is native and maps directly to `WorkerEvent::Stop`, so `completion/stop.rs:12,168` stops being hardwired to a Claude hook. The synthesizer remains worth building for a driver with neither hooks nor turn events, but it should not gate Codex. Re-scope T3325 to the trait method; split the synthesizer out.                                                                                                                   |
-| A-5  | `StructuredOutput` trait method + driver-supplied PR-URL extraction                  | `medium`  | **Amends T1476** (adds PR-URL; T1476's own scope is sufficient as far as it goes) | `StructuredOutput` (`lib.rs:43`) has no trait method. More urgently, PR-URL capture is derived from `PostToolUse` hook events (`pr_url_capture.rs:1-6`) and is out of T1476's scope — under Codex it breaks completely, and the PR URL is the acceptance criterion for nearly every work item. Codex's `command_execution` items carry `aggregated_output`, so the same regex works against the stream. Make extraction driver-supplied. Also surface `--output-schema`, which is a stronger contract than the env-var file.           |
-| A-6  | `TranscriptAccess`: driver-supplied path discovery, and actually call the normaliser | `small`   | **New**                                                                           | `normalize_transcript_entry` (`claude.rs:606-616`) has never been called — `live_status.rs` passes raw JSONL to redaction. Path discovery depends on Claude stamping `transcript_path` on hook payloads; Codex's stream has no such field, though the path is derivable from `thread_id` + `CODEX_HOME`. Add `transcript_path_for_session()` and wire the normaliser in.                                                                                                                                                               |
-| A-7  | `ControlVerbs`: put probe/interrupt/stop/reap on the trait and call `classify_error` | `medium`  | **New**                                                                           | The trait has only `classify_error` (`lib.rs:644`) and it is never called — `transient_recovery.rs` calls `classify_claude_error` directly. probe/interrupt/stop/reap are absent entirely, yet probe is precisely where Claude and Codex diverge (live-session message vs `codex exec resume`). Error classification is provider-specific and must not route through Claude's classifier.                                                                                                                                              |
-| A-8  | Implement the post-hoc interception degrade path                                     | `medium`  | **New** — deferred                                                                | `PostHocInterceptionFn` / `PostHocInterceptionAction` (`lib.rs:497-525`) have zero engine callers, so any driver landing on `AbsenceDisposition::Degrade` for `ToolUseInterception` **silently loses every guardrail**. Codex declares the capability and does not land there, so this is **not Codex-adjacent at all** — it is a latent safety bug awaiting a hypothetical third driver with neither hooks nor a shimmable command surface. Deferred on that basis, not closed.                                                       |
-| A-9  | Widen `WorkerEvent` session identity and `SessionStartSource`                        | `small`   | **New**                                                                           | `WorkerEvent` requires `session_id` on every variant (`protocol/src/worker_event.rs`) and `SessionStartSource` mirrors Claude's `startup\|resume\|compact`. Codex's identity is `thread_id` and its trigger set is `startup\|resume\|clear\|compact` — a superset. Note the trap: Codex's _hooks_ say `session_id` while its _stream_ says `thread_id`.                                                                                                                                                                                |
-| A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New** — deferred                                                                | `worker_setup.rs:309,372` tell the worker _"A PreToolUse hook blocks these"_. The original pass rated this a correctness defect because the sentence was false for a Codex worker; under hook-based interception **it is true for both drivers**, so the defect is gone and this is hygiene. Still worth doing — the shared body hardcodes one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces. Deferred, not closed.                                                  |
-| A-11 | Resolve or delete `progress_fidelity()`                                              | `trivial` | **New**                                                                           | `claude.rs:482` — re-verified to have no callers anywhere. Either the fidelity tiers mean something and the engine should consult them, or the method should go. A Codex driver would declare `Rich` into a void.                                                                                                                                                                                                                                                                                                                      |
-| A-12 | Extend T1483's conformance harness to cover transport and turn boundaries            | `medium`  | **Amends T1483**                                                                  | T1483 (blocked on T1476 + T1479) was scoped against a Claude-shaped driver. It must also assert: stdout-JSONL ingress produces the same `WorkerEvent` sequence as hook ingress; a turn boundary drives completion identically from either source; and a pinned agent-CLI version is verified, given Codex's unversioned stream ([OQ-2](#oq-2)).                                                                                                                                                                                        |
-| A-13 | Persist driver-owned per-execution runtime state                                     | `medium`  | **New: T3679**                                                                    | Provisioning must return an opaque cleanup handle that is persisted with the execution and supplied to the resolved driver on every teardown path. This is the ownership boundary for a per-run `CODEX_HOME`, transcript archive, socket, or temporary credential state. It must survive engine restart and orphan recovery. A teardown must never infer the target from the engine environment or sweep a shared provider home.                                                                                                       |
+| #    | Proposed name                                                                        | Effort    | Amends / new                                                                      | Brief                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ---- | ------------------------------------------------------------------------------------ | --------- | --------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| A-1  | `ProgressObservation`: abstract the ingress transport, not just normalisation        | `large`   | **Amends T3328** (materially widens it)                                           | Landed: `ProgressIngress` now separates hook callbacks from stdout JSONL, the hookless empty-map case is supported, the events socket receives an injected driver, and PR #2363 added the engine-side stdout reader. This amendment records why the transport, rather than normalisation alone, had to be the boundary.                                                                                                                                                                                                      |
+| A-2  | `PermissionPolicy`: return permission _artifacts_, not a single file path            | `medium`  | **Amends T1479**                                                                  | The signature now already returns `PermissionArtifacts`; only T1479's extraction remains. It must first move the settings and deny-rule rendering from `worker_setup` across the one-way `core -> driver` boundary, retaining the existing config-files, args, and env artifact shape.                                                                                                                                                                                                                                       |
+| A-3  | `Spawn`: replace Claude-shaped parameters with a `SpawnRequest`/`SpawnPlan` pair     | `medium`  | **New**                                                                           | Landed in PR #2355: `SpawnRequest` and `SpawnPlan` replace Claude-shaped parameters and let each driver supply its command and environment directives, including Codex's `CODEX_HOME`. This row retains the architectural rationale.                                                                                                                                                                                                                                                                                         |
+| A-4  | `TurnBoundary` trait method — decouple completion from `WorkerEvent::Stop`           | `medium`  | **Amends T3325** (re-scopes; drops the synthesizer from the critical path)        | PR #2361 is in flight with the trait method and driver-routed consumers. Codex's native `turn.completed` maps directly to `WorkerEvent::Stop`; the synthesizer remains separate future work for a driver with neither hooks nor turn events.                                                                                                                                                                                                                                                                                 |
+| A-5  | `StructuredOutput` trait method + driver-supplied PR-URL extraction                  | `medium`  | **Amends T1476** (adds PR-URL; T1476's own scope is sufficient as far as it goes) | `StructuredOutput` (`lib.rs:43`) has no trait method. More urgently, PR-URL capture is derived from `PostToolUse` hook events (`pr_url_capture.rs:1-6`) and is out of T1476's scope — under Codex it breaks completely, and the PR URL is the acceptance criterion for nearly every work item. Codex's `command_execution` items carry `aggregated_output`, so the same regex works against the stream. Make extraction driver-supplied. Also surface `--output-schema`, which is a stronger contract than the env-var file. |
+| A-6  | `TranscriptAccess`: driver-supplied path discovery, and actually call the normaliser | `small`   | **New**                                                                           | The trait now has `transcript_path_for_session()`, and `live_status_loop` calls `normalize_transcript_entry`. Remaining work is Codex rollout-path derivation from `thread_id` + `CODEX_HOME` and generalising `engine/transcript-tail` beyond Claude framing.                                                                                                                                                                                                                                                               |
+| A-7  | `ControlVerbs`: put probe/interrupt/stop/reap on the trait and call `classify_error` | `medium`  | **New**                                                                           | The trait has only `classify_error` (`lib.rs:644`) and it is never called — `transient_recovery.rs` calls `classify_claude_error` directly. probe/interrupt/stop/reap are absent entirely, yet probe is precisely where Claude and Codex diverge (live-session message vs `codex exec resume`). Error classification is provider-specific and must not route through Claude's classifier.                                                                                                                                    |
+| A-8  | Implement the post-hoc interception degrade path                                     | `medium`  | **New** — deferred                                                                | Landed: `worker_events` dispatches the `Degrade` path at `PostToolUse`, invokes a registered `PostHocInterceptionFn` when present, and emits a visible loss-of-guards signal for bare degrade. Codex declares the capability and does not land there; this row remains as the rationale and record of the completed safety correction.                                                                                                                                                                                       |
+| A-9  | Widen `WorkerEvent` session identity and `SessionStartSource`                        | `small`   | **New**                                                                           | `WorkerEvent` requires `session_id` on every variant (`protocol/src/worker_event.rs`) and `SessionStartSource` mirrors Claude's `startup\|resume\|compact`. Codex's identity is `thread_id` and its trigger set is `startup\|resume\|clear\|compact` — a superset. Note the trap: Codex's _hooks_ say `session_id` while its _stream_ says `thread_id`.                                                                                                                                                                      |
+| A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New** — deferred                                                                | `worker_setup.rs:364` tells the worker _"A PreToolUse hook blocks these"_. The original pass rated this a correctness defect because the sentence was false for a Codex worker; under hook-based interception **it is true for both drivers**, so the defect is gone and this is hygiene. Still worth doing — shared prompt prose should not hardcode one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces. Deferred, not closed.                             |
+| A-11 | Resolve or delete `progress_fidelity()`                                              | `trivial` | **New**                                                                           | Landed: spawn records each driver's fidelity on the live-worker slot, and the stale-worker sweep consults `ProgressFidelity::stale_threshold_secs`. A Codex driver's declared tier now affects stale detection.                                                                                                                                                                                                                                                                                                              |
+| A-12 | Extend T1483's conformance harness to cover transport and turn boundaries            | `medium`  | **Amends T1483**                                                                  | T1483 (blocked on T1476 + T1479) was scoped against a Claude-shaped driver. It must also assert: stdout-JSONL ingress produces the same `WorkerEvent` sequence as hook ingress; a turn boundary drives completion identically from either source; and a pinned agent-CLI version is verified, given Codex's unversioned stream ([OQ-2](#oq-2)).                                                                                                                                                                              |
+| A-13 | Persist driver-owned per-execution runtime state                                     | `medium`  | **New: T3679**                                                                    | Provisioning must return an opaque cleanup handle that is persisted with the execution and supplied to the resolved driver on every teardown path. This is the ownership boundary for a per-run `CODEX_HOME`, transcript archive, socket, or temporary credential state. It must survive engine restart and orphan recovery. A teardown must never infer the target from the engine environment or sweep a shared provider home.                                                                                             |
 
-**Verdict on the existing tasks, as required by the brief:** T3324 (cut over every call site) — **sufficient and correctly scoped**; re-verified as still open, with `ClaudeDriver` hardcoded at `worker_setup.rs:66,516,536`, `spawn_flow.rs:27,238`, `events_socket.rs:19,248`, `pane_spawn.rs:307,383,943`, against a registry consulted at exactly one place (`runner/worker_spawn.rs:597-601`). T3326 — **sufficient**, if it also renames `claude_effort`. T1476 — **sufficient for what it covers**, insufficient for PR-URL (A-5). T1479 — **insufficient** (A-2). T3325 — **mis-scoped/mis-prioritised** (A-4). T3328 — **materially insufficient** (A-1). T1483 — **insufficient** (A-12).
+**Verdict on the existing tasks, as required by the brief:** T3324 (cut over every call site) remains sufficient and correctly scoped. T3326's registry-backed menu and driver-local effort work landed. T1476's shared file contract is present but its remaining prerequisite role needs verification; it still does not cover PR-URL capture (A-5). T1479 is now extraction-only (A-2). PR #2361 carries the T3325 trait-method work while leaving the synthesizer separate (A-4). T3328's transport work landed (A-1). T1483 still needs the cross-transport coverage in A-12.
 
 ---
 
@@ -807,57 +785,25 @@ Move `editorial_hook.rs` evaluation from the `PreToolUse` hook to a `gh` shim, p
 - **Depends on:** T-02
 - **Scope:** follow-on project (with T-02; Codex handles the inline-`--body` case by denying with a corrective reason in the meantime)
 
-### T-04 `ProgressObservation` transport abstraction (P1422 amendment A-1)
-
-Turn `ProgressObservationWiring` into an enum over ingress transports and remove the hardcoded `ClaudeDriver.normalize_progress_event` at `events_socket.rs:248`. Claude keeps the hook-callback arm with identical behaviour; the stdout arm is defined but has no consumer yet. Trait-and-plumbing only — the reader itself is T-05.
-
-- **Effort:** `large`
-- **Depends on:** none
-- **Scope:** in-scope
-
-### T-05 Engine-side stdout JSONL progress reader
-
-Implement the generic `StdoutJsonl` ingress: given an owned `AsyncRead`, parse JSONL envelopes, feed the driver's normaliser, and drive the existing activity machine. No Codex-specific parsing belongs here. This is deliberately only the reader; it does not solve how Boss obtains stdout from a Ghostty-pane worker. T-30 owns that attachment.
-
-- **Effort:** `large`
-- **Depends on:** T-04
-- **Scope:** in-scope
-
-### T-06 `TurnBoundary` trait method (P1422 amendment A-4, re-scopes T3325)
-
-Add the trait method and route `completion/stop.rs` through it instead of directly off `WorkerEvent::Stop`. Claude's implementation returns its existing hook-derived boundary; behaviour unchanged. Excludes the engine synthesizer, which is split to T-18.
-
-- **Effort:** `medium`
-- **Depends on:** T-04
-- **Scope:** in-scope
-
-### T-07 `Spawn` signature: `SpawnRequest` / `SpawnPlan` (P1422 amendment A-3)
-
-Replace the Claude-shaped positional parameters with an opaque request struct and a structured plan carrying driver-supplied env, moving `unset ANTHROPIC_API_KEY` out of `pane_spawn.rs:382` and behind `ClaudeDriver`. Touches `pane_spawn.rs` and its spawn-line assertions at `:868,870,942`.
-
-- **Effort:** `medium`
-- **Depends on:** none
-- **Scope:** in-scope
-
 ### T-08 `PermissionPolicy` artifacts signature (P1422 amendment A-2, amends T1479)
 
-Change `write_permission_config` to return `PermissionArtifacts { config_files, extra_args, env }` and land T1479's extraction of the Claude permission logic against that shape in one step, so the extraction is not done twice. Removes the `unimplemented!()` at `claude.rs:477-480`.
+Extract the remaining Claude permission rendering for T1479 behind the existing `PermissionArtifacts { config_files, extra_args, env }` shape. `write_permission_config` still has an `unimplemented!()` at `claude.rs:547`; port `worker_setup`'s settings and deny-rule rendering into the driver crate before completing that extraction.
 
-- **Effort:** `large`
-- **Depends on:** T-07
+- **Effort:** `medium`
+- **Depends on:** none
 - **Scope:** in-scope
 
 ### T-09 Resolve driver at every call site (existing T3324)
 
-The cutover: replace every hardcoded `ClaudeDriver` construction with a registry resolution. Confirmed still open and unchanged in scope. Listed here as an explicit dependency edge because a Codex driver cannot be exercised until it lands, and it is far easier once the signature churn (T-06, T-07, T-08) has settled.
+The cutover: replace every hardcoded `ClaudeDriver` construction with a registry resolution. Confirmed still open and unchanged in scope. Listed here as an explicit dependency edge because a Codex driver cannot be exercised until it lands, and it is easier after the remaining T-08 extraction and the in-flight PR #2361 turn-boundary routing settle.
 
 - **Effort:** `large`
-- **Depends on:** T-06, T-07, T-08
+- **Depends on:** PR #2361, PR #2355, T-08
 - **Scope:** in-scope
 
 ### T-10 `CodexDriver` skeleton: descriptor, capabilities, model menu
 
-The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet` per this design, and a `ModelMenu` sourced from `codex debug models`. Includes fixing `menu_for_driver` to honour its slug and renaming `claude_effort` (existing T3326). No spawning yet.
+The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet` per this design, and a `ModelMenu` sourced from `codex debug models`. No spawning yet.
 
 - **Effort:** `medium`
 - **Depends on:** T-09
@@ -867,7 +813,7 @@ The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet
 
 Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `AGENTS.md`, pre-stamped project trust, and `external_config_migration_prompts` disabled). Provisioning must return the execution-scoped cleanup handle defined by T3679. Authentication follows the policy and concurrency proof from T-31; an unverified symlink to the interactive `auth.json` is not an acceptable implementation. Produces a Codex worker that starts, but whose progress is not yet observed.
 
-**Includes Codex's guardrail wiring**, which the [operator decision](#operator-decision) puts here rather than in a separate shim project: emit Boss's existing guard scripts (`worker_setup.rs:918`, `:1072`) plus editorial enforcement into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML, and stamp hook trust per T-01's finding. The guard-script emission is currently hardcoded to Claude settings-file grammar and must become driver-supplied — the scripts themselves are reusable as-is, since Codex's payloads carry `tool_name: "Bash"` and Claude's `tool_input` shape ([D-2](#deltas-that-change-the-design)). Handle the inline-`--body` editorial case as a `Deny` with a corrective reason, per [the editorial case](#the-editorial-case-precisely).
+**Includes Codex's guardrail wiring**, which the [operator decision](#operator-decision) puts here rather than in a separate shim project: emit Boss's existing guard scripts (the path/checkleft scripts begin at `worker_setup.rs:972` and `:1131`, with wiring at `:580-610`) plus editorial enforcement into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML, and stamp hook trust per T-01's finding. The guard-script emission is currently hardcoded to Claude settings-file grammar and must become driver-supplied — the scripts themselves are reusable as-is, since Codex's payloads carry `tool_name: "Bash"` and Claude's `tool_input` shape ([D-2](#deltas-that-change-the-design)). Handle the inline-`--body` editorial case as a `Deny` with a corrective reason, per [the editorial case](#the-editorial-case-precisely).
 
 - **Effort:** `large`
 - **Depends on:** T-01, T-10, T-31, T3679
@@ -875,12 +821,12 @@ Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/nu
 
 ### T-12 `CodexDriver` progress normaliser
 
-Map Codex's stream envelopes onto `WorkerEvent`: `thread.started`, `turn.started`, `turn.completed`, `item.started` / `item.completed` across the `TurnItem` variants. Consumes T-05's reader and T-06's turn boundary. This makes the driver capable of decoding the stream; T-30 is the separate PTY or pipe attachment that makes a real pane worker observable end-to-end.
+Map Codex's stream envelopes onto `WorkerEvent`: `thread.started`, `turn.started`, `turn.completed`, `item.started` / `item.completed` across the `TurnItem` variants. It builds on the landed stdout reader and in-flight PR #2361 turn boundary. This makes the driver capable of decoding the stream; T-30 is the separate PTY or pipe attachment that makes a real pane worker observable end-to-end.
 
 Three constraints from the 0.145.0 delta pass, each a real trap: item IDs are **0-based** and must not be treated as ordinal or 1-based; `item.completed` with `type:"error"` carries **operational warnings as well as** turn failures, so it must not be mapped unconditionally to a failed turn; and the `TurnItem` enum grew by four variants across eight minor versions, so unknown variants must be ignored-with-logging rather than rejected.
 
 - **Effort:** `large`
-- **Depends on:** T-05, T-06, T-11
+- **Depends on:** PR #2361, T-11
 - **Scope:** in-scope
 
 ### T-13 Widen `WorkerEvent` session identity and `SessionStartSource` (A-9)
@@ -895,6 +841,8 @@ Accommodate Codex's `thread_id` and its `startup|resume|clear|compact` trigger s
 
 Make PR-URL capture driver-supplied rather than `PostToolUse`-derived (`pr_url_capture.rs`), with Codex scanning `command_execution` items' `aggregated_output`. Without this a Codex work item can never satisfy its acceptance criterion. Separate from T-12 because it changes an engine-side capture contract, not the normaliser.
 
+**Ordering note:** PR #2361 rewires the trigger onto the turn boundary; land this after #2361. This is not a duplicate: `pr_url_capture.rs:1-6` is still derived from `PostToolUse` events.
+
 - **Effort:** `medium`
 - **Depends on:** T-12
 - **Scope:** in-scope
@@ -903,13 +851,15 @@ Make PR-URL capture driver-supplied rather than `PostToolUse`-derived (`pr_url_c
 
 Put `StructuredOutput` on the trait and have the Codex driver use `--output-schema` / `--output-last-message` alongside the shared `BOSS_STRUCTURED_OUTPUT` file contract. Depends on T1476 landing the file contract first.
 
+**Verification note:** the `BOSS_STRUCTURED_OUTPUT` file contract already exists at `spawn_flow.rs:59`. Verify whether any remaining T1476 work is still a prerequisite; do not silently discard that dependency.
+
 - **Effort:** `medium`
 - **Depends on:** T-14
 - **Scope:** in-scope
 
 ### T-16 `TranscriptAccess`: driver-supplied path discovery (A-6)
 
-Add `transcript_path_for_session()`, derive Codex's rollout path from `thread_id` + `CODEX_HOME`, and actually call `normalize_transcript_entry` in `live_status.rs` — it has never been called. Generalise `engine/transcript-tail` beyond its "claude transcript files" framing.
+Derive Codex's rollout path from `thread_id` + `CODEX_HOME` and generalise `engine/transcript-tail` beyond its "claude transcript files" framing. `transcript_path_for_session()` is already on the trait, and `live_status_loop` already calls `normalize_transcript_entry`.
 
 - **Effort:** `medium`
 - **Depends on:** T-12
@@ -925,39 +875,21 @@ Put probe/interrupt/stop/reap on the trait, route `transient_recovery.rs` throug
 
 ### T-18 `TurnBoundary` engine synthesizer (remainder of T3325)
 
-The synthesize-from-a-lower-fidelity-channel path, for a future driver with neither hooks nor native turn events. Split out of T3325 because Codex does not need it and it should not gate Phase 1.
+The synthesize-from-a-lower-fidelity-channel path, for a future driver with neither hooks nor native turn events. It remains outside the turn-boundary trait-method work on PR #2361 because Codex does not need it and it should not gate Phase 1.
 
 - **Effort:** `medium`
-- **Depends on:** T-06
+- **Depends on:** PR #2361
 - **Scope:** deferred (future / not a v1 blocker) — Codex has native turn events; needed only for a third driver with neither hooks nor turn boundaries
-
-### T-19 Implement the post-hoc interception degrade path (A-8)
-
-Wire `PostHocInterceptionFn` / `PostHocInterceptionAction`, which currently have zero callers, so a driver landing on `Degrade` does not silently lose guardrails. It removes a latent safety bug from the abstraction.
-
-**Reclassified from Codex-adjacent to plain deferred.** Under the [operator decision](#operator-decision) Codex declares `ToolUseInterception` and does not land on `Degrade` at all, so this is not about Codex in any form — it is the trap waiting for a hypothetical third driver with neither hooks nor a shimmable command surface. Its dependency on T-03 is dropped along with T-03's move to the follow-on project; nothing gates it.
-
-- **Effort:** `medium`
-- **Depends on:** none
-- **Scope:** deferred (future / not a v1 blocker) — no current or planned driver lands on `Degrade`; this closes the trap for the next one
 
 ### T-20 Driver-supplied enforcement wording in prompts (A-10)
 
-Replace the hardcoded _"A PreToolUse hook blocks these"_ at `worker_setup.rs:309,372` with driver-supplied wording.
+Replace the hardcoded _"A PreToolUse hook blocks these"_ at `worker_setup.rs:364` with driver-supplied wording.
 
 **Downgraded from correctness to hygiene by the [operator decision](#operator-decision).** The original justification was that this sentence asserts a false guarantee to a Codex worker; under hook-based interception it is **true** for a Codex worker, so nothing false is being told to anyone and this no longer blocks Codex. It is still worth doing — shared prompt prose should not hardcode one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces, so re-check it then.
 
 - **Effort:** `small`
 - **Depends on:** T-10
 - **Scope:** deferred (future / not a v1 blocker) — the existing wording is accurate for both drivers as they stand
-
-### T-21 Resolve or delete `progress_fidelity()` (A-11)
-
-`claude.rs:482` has no callers. Either consult the fidelity tiers somewhere real or remove the method.
-
-- **Effort:** `trivial`
-- **Depends on:** T-12
-- **Scope:** in-scope
 
 ### T-22 Extend the reference-driver conformance harness (A-12, amends T1483)
 
@@ -1030,7 +962,7 @@ Replace or supplement `codex exec` with the persistent app-server protocol, givi
 P1422's generic stdout reader is not connected to any production worker: Boss writes commands into Ghostty panes and owns no `ChildStdout`. Implement the missing transport handoff for a Codex pane. The chosen mechanism may be a pipe, a PTY tap, or an app-to-engine stream, but it must preserve what the operator sees in the terminal while giving the engine one run-correlated, bounded stream. Verify a real Codex pane drives the existing reader through `thread.started`, tool activity, `turn.completed`, EOF, and an intentionally slow sink without deadlocking the pane.
 
 - **Effort:** `large`
-- **Depends on:** T-05, T-12
+- **Depends on:** T-12
 - **Scope:** in-scope — gates all claims of Codex progress, completion, PR capture, and Phase-1 acceptance
 
 ### T-31 Codex authentication isolation and refresh contract
@@ -1061,15 +993,13 @@ Revise the retained T3531 prototype to consume the per-execution cleanup handle 
 
 At the same depth, these may run in parallel:
 
-- **Depth 0:** T-01, T-04, T-07, T-27, T-31 — genuinely independent. **Start T-01 and T-31 first regardless of slack:** both gate safe Codex provisioning.
-- **Depth 1:** T-05/T-06 (progress transport). T-08 follows T-07.
-- **Depth 2:** T-12 supplies the Codex normaliser; T-30 attaches its stream to a real pane; T-32 then establishes resume semantics. T-13, T-14, T-16, T-17, and T-21 follow their stated edges.
+- **Depth 0:** T-01, T-08, T-27, T-31 — genuinely independent. **Start T-01 and T-31 first regardless of slack:** both gate safe Codex provisioning.
+- **Depth 1:** PR #2361 supplies the in-flight turn-boundary routing; T-12 follows T-11 and that PR.
+- **Depth 2:** T-12 supplies the Codex normaliser; T-30 attaches its stream to a real pane; T-32 then establishes resume semantics. T-13, T-14, T-16, and T-17 follow their stated edges.
 - **Not in this graph:** T-02 and T-03 belong to the follow-on `PATH`-shim project and are independent of everything above.
 
 **File-overlap cautions — order these rather than running them concurrently:**
 
-- **T-04 and T-06** both edit `engine/driver/src/lib.rs`'s trait surface and `engine/core/src/worker_setup.rs`. Land T-04 first; T-06 forward-ports its enum preservingly.
-- **T-07 and T-08** both edit `engine/core/src/runner/pane_spawn.rs` and the driver trait's spawn/permission signatures. The dependency edge already serialises them; keep it.
 - **T-12 and T-13** both edit the driver normalisers. Land T-12 first; T-13 integrates rather than replaces its mappings.
 - **T-02 and T-03** both edit `worker_setup.rs` guard-script emission and `BOSS_BIN_DIR` provisioning. The dependency edge serialises them; keep it. Both also collide with **T-11**, which makes the same guard-script emission driver-supplied — a further reason the shim work is better done as a follow-on project than concurrently.
 
