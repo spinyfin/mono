@@ -379,6 +379,82 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         ])
     }
 
+    // MARK: - Settings master switch (default off + live start/stop)
+
+    /// Isolated suite so tests never touch the process-wide standard defaults
+    /// (which AppDelegate may also observe).
+    private func makeStallDefaultsSuite() -> (UserDefaults, String) {
+        let name = "boss.test.stallMonitor.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        return (defaults, name)
+    }
+
+    func testStallMonitoringDefaultsToOffWhenKeyAbsent() {
+        let (defaults, name) = makeStallDefaultsSuite()
+        defer { defaults.removePersistentDomain(forName: name) }
+        XCTAssertNil(defaults.object(forKey: MainThreadStallMonitor.enabledKey))
+        XCTAssertFalse(MainThreadStallMonitor.isEnabled(in: defaults))
+    }
+
+    func testStallMonitoringIsEnabledReflectsBool() {
+        let (defaults, name) = makeStallDefaultsSuite()
+        defer { defaults.removePersistentDomain(forName: name) }
+        defaults.set(true, forKey: MainThreadStallMonitor.enabledKey)
+        XCTAssertTrue(MainThreadStallMonitor.isEnabled(in: defaults))
+        defaults.set(false, forKey: MainThreadStallMonitor.enabledKey)
+        XCTAssertFalse(MainThreadStallMonitor.isEnabled(in: defaults))
+    }
+
+    /// Flipping the setting via `applyEnabledFromDefaults` must start and
+    /// stop the monitor (including releasing the watchdog queue when off).
+    func testSettingFlipStartsAndStopsMonitor() {
+        let (defaults, name) = makeStallDefaultsSuite()
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        // Slow poll so a tick is unlikely mid-test; we only assert lifecycle.
+        let mon = MainThreadStallMonitor(
+            config: MainThreadStallMonitor.Config(
+                heartbeatIntervalMs: 10_000,
+                thresholdMs: 250,
+                pollIntervalMs: 10_000
+            ),
+            log: StallLog(directory: nil, capacity: 4)
+        )
+
+        // Default off → zero cost: not running, no watchdog queue.
+        mon.applyEnabledFromDefaults(defaults)
+        XCTAssertFalse(mon.isRunning)
+        XCTAssertFalse(mon.hasWatchdogQueue)
+
+        // Flip on → timers + queue exist.
+        defaults.set(true, forKey: MainThreadStallMonitor.enabledKey)
+        mon.applyEnabledFromDefaults(defaults)
+        XCTAssertTrue(mon.isRunning)
+        XCTAssertTrue(mon.hasWatchdogQueue)
+
+        // Idempotent while still enabled.
+        mon.applyEnabledFromDefaults(defaults)
+        XCTAssertTrue(mon.isRunning)
+        XCTAssertTrue(mon.hasWatchdogQueue)
+
+        // Flip off → fully torn down (zero cost).
+        defaults.set(false, forKey: MainThreadStallMonitor.enabledKey)
+        mon.applyEnabledFromDefaults(defaults)
+        XCTAssertFalse(mon.isRunning)
+        XCTAssertFalse(mon.hasWatchdogQueue)
+
+        // On again after off.
+        defaults.set(true, forKey: MainThreadStallMonitor.enabledKey)
+        mon.applyEnabledFromDefaults(defaults)
+        XCTAssertTrue(mon.isRunning)
+        XCTAssertTrue(mon.hasWatchdogQueue)
+
+        mon.stop()
+        XCTAssertFalse(mon.isRunning)
+        XCTAssertFalse(mon.hasWatchdogQueue)
+    }
+
     // MARK: - Frame-drop tally
 
     func testFrameTallyComputesDrops() {

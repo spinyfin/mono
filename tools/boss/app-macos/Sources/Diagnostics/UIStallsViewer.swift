@@ -103,15 +103,26 @@ struct UIStallsViewer: View {
 
     private var emptyState: some View {
         VStack(spacing: 10) {
-            Image(systemName: "checkmark.seal")
+            Image(systemName: MainThreadStallMonitor.shared.isRunning
+                  ? "checkmark.seal"
+                  : "pause.circle")
                 .font(.largeTitle)
-                .foregroundStyle(.green)
-            Text("No stalls in the last \(window.rawValue)")
-                .font(.headline)
-            Text("The main-thread watchdog records here whenever a heartbeat lands more than \(Int(MainThreadStallMonitor.shared.thresholdMs)) ms late. An empty list means the UI stayed responsive.")
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: 420)
+                .foregroundStyle(MainThreadStallMonitor.shared.isRunning ? .green : .secondary)
+            if MainThreadStallMonitor.shared.isRunning {
+                Text("No stalls in the last \(window.rawValue)")
+                    .font(.headline)
+                Text("The main-thread watchdog records here whenever a heartbeat lands more than \(Int(MainThreadStallMonitor.shared.thresholdMs)) ms late. An empty list means the UI stayed responsive.")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 420)
+            } else {
+                Text("Stall monitoring is off")
+                    .font(.headline)
+                Text("Enable \(MainThreadStallMonitor.enabledKey) in Settings → Feature Flags to start the main-thread watchdog. Off is the default (zero cost — no timers).")
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: 420)
+            }
         }
         .padding()
         .frame(maxWidth: .infinity, maxHeight: .infinity)

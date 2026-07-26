@@ -26,8 +26,18 @@ import os
 /// the main thread is blocked and by what (see the Ghostty pane
 /// sluggishness shake), so a regression shows up as a recorded stall
 /// instead of folklore. Surfaced in-app via [[UIStallsViewer]].
+///
+/// Master switch: [[enabledKey]] in `UserDefaults` (default **off**).
+/// When off the monitor retains no timers and no watchdog queue — zero
+/// cost. Flip via Settings → Feature Flags; [[applyEnabledFromDefaults]]
+/// starts/stops live without a relaunch. Available in release builds.
 final class MainThreadStallMonitor: @unchecked Sendable {
     static let shared = MainThreadStallMonitor()
+
+    /// `UserDefaults` key — master switch for the stall watchdog.
+    /// Default off so a normal session pays nothing for this diagnostics
+    /// path. Surfaced in Settings → Feature Flags (APP LOCAL).
+    static let enabledKey = "boss.uiStalls.monitoring"
 
     struct Config: Sendable {
         var heartbeatIntervalMs: Double = 100
@@ -49,6 +59,14 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     /// in-app [[UIStallsViewer]] copy.
     var thresholdMs: Double { config.thresholdMs }
 
+    /// Whether timers and the watchdog queue are live. Main-thread only
+    /// for a stable read (set only from `start`/`stop`).
+    var isRunning: Bool { running }
+
+    /// Zero-cost-off guarantee: when not running, no watchdog queue is
+    /// retained. Exposed for tests / introspection.
+    var hasWatchdogQueue: Bool { watchdogQueue != nil }
+
     private struct State {
         var lastBeatNanos: UInt64 = 0
         var beat: UInt64 = 0
@@ -60,11 +78,13 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     }
     private let state = OSAllocatedUnfairLock(initialState: State())
 
-    // Timer/port fields are touched only from `start()`/`stop()` on the
-    // main thread, so plain stored properties are safe under the
-    // `@unchecked Sendable` contract.
+    // Timer/port/queue fields are touched only from `start()`/`stop()` on
+    // the main thread, so plain stored properties are safe under the
+    // `@unchecked Sendable` contract. The watchdog queue is created in
+    // `start()` and released in `stop()` so an off monitor holds no queue.
     private var heartbeatTimer: DispatchSourceTimer?
     private var watchdogTimer: DispatchSourceTimer?
+    private var watchdogQueue: DispatchQueue?
     private var mainThreadPort: thread_t = 0
     private var running = false
 
@@ -75,14 +95,31 @@ final class MainThreadStallMonitor: @unchecked Sendable {
     /// Monotonic timestamp of the last *new* record, for the soft
     /// symbolication-frequency floor (`minRecordIntervalMs`).
     private var lastRecordNanos: UInt64 = 0
-    private let watchdogQueue = DispatchQueue(
-        label: "boss.diagnostics.stall-watchdog",
-        qos: .utility
-    )
 
     init(config: Config = Config(), log: StallLog = .shared) {
         self.config = config
         self.log = log
+    }
+
+    /// Whether the master switch is on in `defaults`. Absent key → off
+    /// (zero-cost default). Pure; does not start/stop.
+    static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        // `bool(forKey:)` returns false when unset — matches default-off.
+        // Prefer explicit object check only if we ever need a tri-state;
+        // here false is both the default and the off value.
+        defaults.bool(forKey: enabledKey)
+    }
+
+    /// Start or stop to match [[isEnabled]] in `defaults`. Idempotent.
+    /// Must be called on the main thread. Live toggles from Settings go
+    /// through this so no relaunch is required.
+    func applyEnabledFromDefaults(_ defaults: UserDefaults = .standard) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        if Self.isEnabled(in: defaults) {
+            start()
+        } else {
+            stop()
+        }
     }
 
     /// App executable image `[start, end)`, resolved once at first use
@@ -96,6 +133,8 @@ final class MainThreadStallMonitor: @unchecked Sendable {
 
     /// Begin monitoring. Must be called on the main thread (it captures
     /// the main thread's Mach port via `mach_thread_self()`). Idempotent.
+    /// Prefer [[applyEnabledFromDefaults]] so the UserDefaults master
+    /// switch remains the single source of truth.
     func start() {
         dispatchPrecondition(condition: .onQueue(.main))
         guard !running else { return }
@@ -123,20 +162,33 @@ final class MainThreadStallMonitor: @unchecked Sendable {
         hb.resume()
         heartbeatTimer = hb
 
+        // Create the queue only while monitoring — off means no queue.
+        let queue = DispatchQueue(
+            label: "boss.diagnostics.stall-watchdog",
+            qos: .utility
+        )
+        watchdogQueue = queue
+
         let poll = DispatchTimeInterval.milliseconds(Int(config.pollIntervalMs))
-        let wd = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        let wd = DispatchSource.makeTimerSource(queue: queue)
         wd.schedule(deadline: .now() + poll, repeating: poll, leeway: .milliseconds(10))
         wd.setEventHandler { [weak self] in self?.tick() }
         wd.resume()
         watchdogTimer = wd
     }
 
+    /// Tear down timers and the watchdog queue. Idempotent. After this
+    /// returns, no timer is scheduled and `hasWatchdogQueue` is false.
     func stop() {
         dispatchPrecondition(condition: .onQueue(.main))
         heartbeatTimer?.cancel()
         watchdogTimer?.cancel()
         heartbeatTimer = nil
         watchdogTimer = nil
+        // Drop the queue so an off monitor retains nothing from this path.
+        // In-flight `tick()` blocks keep the queue alive until they finish;
+        // no new work is scheduled after cancel.
+        watchdogQueue = nil
         running = false
     }
 
