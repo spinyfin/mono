@@ -197,6 +197,38 @@ fn mark_chore_pr_merged_skips_human_driven() {
 }
 
 #[test]
+fn mark_chore_pr_closed_unmerged_skips_human_driven() {
+    let db = WorkDb::open(temp_db_path("hd-closed-unmerged")).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_human_driven_chore(&db, &product.id, "Bound PR then abandoned");
+    let pr_url = "https://github.com/spinyfin/mono/pull/99998";
+    db.update_work_item_as_actor(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("in_review".to_owned()),
+            pr_url: Some(pr_url.to_owned()),
+            ..WorkItemPatch::default()
+        },
+        "human",
+    )
+    .unwrap();
+    let result = db.mark_chore_pr_closed_unmerged(&chore.id, pr_url).unwrap();
+    assert!(
+        result.is_none(),
+        "closed-unmerged poller must not auto-done human-driven rows"
+    );
+    let still = match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected leaf, got {other:?}"),
+    };
+    assert_eq!(still.status, TaskStatus::InReview);
+    assert!(
+        still.completion_summary.is_none(),
+        "closed-unmerged skip must not invent a completion summary"
+    );
+}
+
+#[test]
 fn work_item_is_human_driven_reads_column() {
     let db = WorkDb::open(temp_db_path("hd-column")).unwrap();
     let product = create_test_product(&db);

@@ -902,6 +902,17 @@ impl WorkDb {
         if task.status == TaskStatus::Done || task.status == TaskStatus::Archived {
             return Ok(None);
         }
+        // Human-driven rows close only via the human complete ritual —
+        // never by merge-poller observation of a closed-unmerged PR.
+        // Same early-return contract as `mark_chore_pr_merged`.
+        if task.human_driven {
+            tracing::info!(
+                work_item_id = %task.id,
+                %pr_url,
+                "mark_chore_pr_closed_unmerged: skipping human-driven row — only `boss task complete --summary` closes it",
+            );
+            return Ok(None);
+        }
         let now = now_string();
         tx.execute(
             "UPDATE tasks

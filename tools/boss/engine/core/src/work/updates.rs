@@ -392,8 +392,8 @@ impl WorkDb {
             if !summary_ok {
                 bail!(
                     "human-driven work item {id} cannot move to done without a completion summary; \
-                     use `boss task complete {id} --summary \"…\"` (or pass --summary with the status \
-                     change). Agents must not close human-driven rows."
+                     use `boss task complete {id} --summary \"…\"`. \
+                     Agents must not close human-driven rows."
                 );
             }
         }

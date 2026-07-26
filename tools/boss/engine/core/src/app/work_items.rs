@@ -429,8 +429,11 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 .is_some_and(|prev| *prev != TaskStatus::Active);
         // Human-driven rows enter Doing without a worker — skip the repo
         // precheck that would otherwise refuse a card that intentionally
-        // has no agent dispatch target.
-        let is_human_driven = work_db
+        // has no agent dispatch target. Treat the *effective* flag as the
+        // DB value OR an in-patch flip to true so a single
+        // `--human-driven true --status active` update does not reject
+        // on missing-repo before the row is reclassified.
+        let db_human_driven = work_db
             .get_work_item(&id)
             .ok()
             .and_then(|item| match item {
@@ -438,6 +441,7 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 _ => None,
             })
             .unwrap_or(false);
+        let is_human_driven = db_human_driven || patch.human_driven == Some(true);
         if intends_active_transition
             && !is_human_driven
             && work_item_needs_dispatch(&work_db, &id)
