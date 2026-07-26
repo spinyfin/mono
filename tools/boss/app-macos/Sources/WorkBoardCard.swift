@@ -98,9 +98,10 @@ struct WorkBoardSectionItemsView: View {
 /// without the "any of 77 `@Published` properties invalidates every
 /// visible card" fan-out (design entry 6).
 ///
-/// Secondary UI (selection popover, delete confirmation) is attached
-/// only while its presentation flag is true so idle cards do not carry
-/// `WorkCardPopoverView` / dialog graph nodes (design entry 10).
+/// Selection popover content (`WorkCardPopoverView`) is attached only
+/// while the card is selected so idle cards do not hold that tree
+/// (design entry 10). Confirmation dialogs stay always-attached — they
+/// are cheap, and mount-with-true is an intermittent presentation failure.
 struct WorkBoardCardItem: View {
     let task: WorkTask
     /// Board column for action routing / debug logs only (value, not observed).
@@ -216,9 +217,18 @@ struct WorkBoardCardItem: View {
             }
             // Selection popover: attach only while selected so the ~700-line
             // `WorkCardPopoverView` tree is not in every idle card's graph.
+            // isPresented reads live model selection (not a constant true) so
+            // dismiss set(false) and subsequent get stay consistent.
             .lazyWorkCardSelectionPopover(
                 isSelected: snapshot.isSelected,
-                onDismiss: { model.selectWorkCard(nil) }
+                isPresented: Binding(
+                    get: { model.selectedTask?.id == task.id },
+                    set: { presented in
+                        if !presented {
+                            model.selectWorkCard(nil)
+                        }
+                    }
+                )
             ) {
                 WorkCardPopoverView(model: model, task: task)
             }
@@ -241,8 +251,9 @@ struct WorkBoardCardItem: View {
         }
         .onAppear { logDocLinkState("appeared") }
         .onChange(of: task.prURL) { _, _ in logDocLinkState("prURL-changed") }
-        // Delete confirmation: same lazy rule — dialog nodes only while open.
-        .lazyConfirmationDialog(
+        // Always-attached: confirmationDialog needs false→true while
+        // installed; mount-with-true is a known intermittent failure.
+        .confirmationDialog(
             "Delete \"\(task.name)\"?",
             isPresented: $showingDeleteConfirmation,
             titleVisibility: .visible
@@ -482,55 +493,30 @@ struct WorkBoardCardView: View, @MainActor Equatable {
 
 // MARK: - Lazy secondary UI (design entry 10)
 
-/// Presentation modifiers that only enter AttributeGraph while their
-/// flag is true. Idle cards therefore do not carry popover content
-/// (`WorkCardPopoverView`) or confirmation-dialog nodes.
 extension View {
     /// Attaches a trailing selection popover only while `isSelected` is
-    /// true. When selection flips on, the modifier mounts with
-    /// `isPresented == true` and presents; dismiss clears selection via
-    /// `onDismiss`, which drops the modifier on the next body pass.
+    /// true so idle cards do not hold `WorkCardPopoverView`.
+    ///
+    /// `isPresented` must read **live** selection (e.g. model
+    /// `selectedTask?.id == task.id`), not a constant `true`. Constant
+    /// get fights SwiftUI after dismiss (`set(false)` then `get` still
+    /// true). User dismiss → `set(false)` clears selection → get is
+    /// false → next body pass drops this modifier. Selecting another
+    /// card updates the model first; this card rebuilds with
+    /// `isSelected == false` and removes the presenter after selection
+    /// has already moved (reselect mounts cleanly on the new card with
+    /// a live true binding).
     @ViewBuilder
     func lazyWorkCardSelectionPopover<Content: View>(
         isSelected: Bool,
-        onDismiss: @escaping () -> Void,
+        isPresented: Binding<Bool>,
         @ViewBuilder content: @escaping () -> Content
     ) -> some View {
         if isSelected {
             self.popover(
-                isPresented: Binding(
-                    get: { true },
-                    set: { presented in
-                        if !presented {
-                            onDismiss()
-                        }
-                    }
-                ),
+                isPresented: isPresented,
                 arrowEdge: .trailing,
                 content: content
-            )
-        } else {
-            self
-        }
-    }
-
-    /// Attaches a confirmation dialog only while `isPresented` is true
-    /// so idle cards do not retain dialog actions/message view nodes.
-    @ViewBuilder
-    func lazyConfirmationDialog<A: View, M: View>(
-        _ title: String,
-        isPresented: Binding<Bool>,
-        titleVisibility: Visibility = .automatic,
-        @ViewBuilder actions: () -> A,
-        @ViewBuilder message: () -> M
-    ) -> some View {
-        if isPresented.wrappedValue {
-            self.confirmationDialog(
-                title,
-                isPresented: isPresented,
-                titleVisibility: titleVisibility,
-                actions: actions,
-                message: message
             )
         } else {
             self

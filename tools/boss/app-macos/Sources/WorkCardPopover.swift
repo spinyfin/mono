@@ -10,8 +10,12 @@ import UpdateCore
 /// while `snapshot.isSelected` is true via
 /// `lazyWorkCardSelectionPopover`, so the ~700 lines of view code below
 /// are evaluated for the one presented card — not for every visible card
-/// on an idle board. Nested sheets (repo picker) follow the same rule
-/// and mount only while their own presentation flag is true.
+/// on an idle board.
+///
+/// Nested sheets stay **always attached** on this popover content so the
+/// sheet inherits the popover window context and SwiftUI sees a normal
+/// false→true `isPresented` transition (conditional mount-with-true
+/// fights macOS popover windowing and can dismiss/re-anchor the host).
 struct WorkCardPopoverView: View {
     @ObservedObject var model: ChatViewModel
     let task: WorkTask
@@ -39,21 +43,24 @@ struct WorkCardPopoverView: View {
             .onAppear {
                 model.loadExecutions(taskId: task.id)
             }
-            // Repo-picker sheet: same lazy rule as the card popover —
-            // mount only while the picker is actually open.
-            .lazyWorkCardRepoPickerSheet(
-                isPresented: $presentingRepoPicker,
-                presentation: model.repoOverridePresentation(for: task),
-                recentURLs: model.recentRepoURLs(forProduct: task.productID),
-                onSelect: { url in
-                    model.setRepoOverride(for: task.id, to: url)
-                    presentingRepoPicker = false
-                },
-                onClear: {
-                    model.setRepoOverride(for: task.id, to: nil)
-                    presentingRepoPicker = false
-                }
-            )
+            // Always-attached sheet: idle cost is one unpresented sheet on
+            // the single selected popover; conditional insert broke the
+            // popover window-context contract and remounted with true.
+            .sheet(isPresented: $presentingRepoPicker) {
+                RepoOverridePicker(
+                    presentation: model.repoOverridePresentation(for: task),
+                    recentURLs: model.recentRepoURLs(forProduct: task.productID),
+                    onCancel: { presentingRepoPicker = false },
+                    onSelect: { url in
+                        model.setRepoOverride(for: task.id, to: url)
+                        presentingRepoPicker = false
+                    },
+                    onClear: {
+                        model.setRepoOverride(for: task.id, to: nil)
+                        presentingRepoPicker = false
+                    }
+                )
+            }
     }
 
     @ViewBuilder
@@ -431,33 +438,6 @@ struct WorkCardPopoverView: View {
                 Text("Not set")
                     .font(.body)
             }
-        }
-    }
-}
-
-/// Nested sheet attachment for the repo override picker: only enters
-/// the graph while `isPresented` is true (design entry 10).
-private extension View {
-    @ViewBuilder
-    func lazyWorkCardRepoPickerSheet(
-        isPresented: Binding<Bool>,
-        presentation: RepoOverridePresentation,
-        recentURLs: [String],
-        onSelect: @escaping (String) -> Void,
-        onClear: @escaping () -> Void
-    ) -> some View {
-        if isPresented.wrappedValue {
-            self.sheet(isPresented: isPresented) {
-                RepoOverridePicker(
-                    presentation: presentation,
-                    recentURLs: recentURLs,
-                    onCancel: { isPresented.wrappedValue = false },
-                    onSelect: onSelect,
-                    onClear: onClear
-                )
-            }
-        } else {
-            self
         }
     }
 }

@@ -223,8 +223,9 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
                 }
                 .buttonStyle(.plain)
                 .help("Merge When Ready: enqueue this PR for merging once all required checks pass")
-                // Dialog nodes only while confirming (design entry 10).
-                .lazyConfirmationDialog(
+                // Always-attached: confirmationDialog needs false→true while
+                // installed; mount-with-true is a known intermittent failure.
+                .confirmationDialog(
                     "Merge When Ready",
                     isPresented: $showMergeConfirmation,
                     titleVisibility: .visible
