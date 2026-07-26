@@ -160,16 +160,15 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 
     // Fire the first Stop boundary. This dispatches the probe to
     // the (fake) app session and records the in-flight entry.
-    let first_stop = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::Stop {
+    let first_stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
             session_id: "claude-sess-1".into(),
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-    };
+        Some(execution.id.clone()),
+        None,
+    );
     dispatch_probe_reply_on_stop(&server_state, &first_stop).await;
     dispatch_probe_on_stop(&server_state, &first_stop).await;
     app_responder.await.expect("app responder task");
@@ -185,16 +184,15 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     // Second Stop: the engine should see the in-flight probe,
     // read the new transcript bytes, and publish ProbeReplied on
     // the per-run probe topic.
-    let second_stop = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::Stop {
+    let second_stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
             session_id: "claude-sess-1".into(),
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-    };
+        Some(execution.id.clone()),
+        None,
+    );
     dispatch_probe_reply_on_stop(&server_state, &second_stop).await;
 
     let envelope = sink.next().await.expect("ProbeReplied envelope should be published");
@@ -261,17 +259,16 @@ async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit(
 
     server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
 
-    let post_tool_use = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(run_id.to_owned()),
-        transcript_path: None,
-        event: WorkerEvent::PostToolUse {
+    let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-    };
+        Some(run_id.to_owned()),
+        None,
+    );
     let dispatch = tokio::spawn({
         let server_state = server_state.clone();
         async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
@@ -283,15 +280,14 @@ async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit(
     // "[coordinator-nudge] ..." text arrives as a UserPromptSubmit.
     dispatch_live_worker_state(
         &server_state,
-        &crate::events_socket::IncomingHookEvent {
-            peer_pid: None,
-            run_id: Some(run_id.to_owned()),
-            transcript_path: None,
-            event: WorkerEvent::UserPromptSubmit {
+        &crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::UserPromptSubmit {
                 session_id: "claude-sess-1".into(),
                 prompt: "[coordinator-nudge] what now?".into(),
             },
-        },
+            Some(run_id.to_owned()),
+            None,
+        ),
     )
     .await;
 
@@ -366,17 +362,16 @@ async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_rede
 
     let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
 
-    let post_tool_use = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(run_id.to_owned()),
-        transcript_path: None,
-        event: WorkerEvent::PostToolUse {
+    let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::json!({}),
             tool_response: serde_json::json!({}),
         },
-    };
+        Some(run_id.to_owned()),
+        None,
+    );
     let dispatch = tokio::spawn({
         let server_state = server_state.clone();
         async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
@@ -699,16 +694,15 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
 
     // Fire the Stop event. With the new ordering, dispatch_probe_on_stop
     // runs after dispatch_completion_on_stop and sees the queued probe.
-    let stop = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(run.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::Stop {
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
             session_id: "sess-1".into(),
             stop_hook_active: false,
             stop_reason: crate::protocol::StopReason::Completed,
         },
-    };
+        Some(run.id.clone()),
+        None,
+    );
     dispatch_probe_on_stop(&server_state, &stop).await;
     tokio::time::timeout(Duration::from_secs(2), app_responder)
         .await
@@ -719,4 +713,47 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         server_state.pop_pending_probe(&run.id).is_none(),
         "probe must be consumed by dispatch_probe_on_stop",
     );
+}
+
+/// The on-turn-boundary dispatchers follow the **driver's** answer, not the
+/// shape of the event.
+///
+/// A `WorkerEvent::Stop` resolved through a driver that declares no
+/// `Capability::TurnBoundary` is not a turn boundary, so probe dispatch must
+/// leave the queued probe alone. Before the boundary moved behind
+/// `AgentDriver::turn_boundary`, the dispatchers matched the `Stop` variant
+/// directly and this event would have fired them regardless of what the
+/// driver had to say.
+#[tokio::test]
+async fn probe_dispatch_ignores_a_stop_from_a_driver_with_no_turn_boundary() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-boundaryless";
+    server_state.worker_registry.register_run_slot(run_id, 5);
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "are you stuck?".into(), false);
+
+    let boundaryless = crate::driver::test_support::StubDriver::new(
+        crate::driver::test_support::stub_descriptor(),
+        crate::driver::CapabilitySet::new([]),
+    );
+    let stop = crate::events_socket::IncomingHookEvent::resolve(
+        &boundaryless,
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+        None,
+    );
+    assert!(!stop.is_turn_boundary(), "precondition: the driver reports no boundary");
+
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    let still_queued = server_state
+        .pop_pending_probe(run_id)
+        .expect("probe must survive an event the driver does not call a turn boundary");
+    assert_eq!(still_queued.probe_id, probe_id);
 }

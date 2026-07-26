@@ -17,7 +17,7 @@ use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::AgentDriver;
+use crate::driver::{AgentDriver, TurnEnd};
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -50,12 +50,71 @@ const LOCAL_PEERPID: libc::c_int = 0x002;
 /// the live-status summarizer loop reads that row to know which file to
 /// tail. Without this, `transcript_path` stays NULL forever and the
 /// summarizer never gets past its "no transcript path yet" early-out.
+///
+/// The turn boundary (`Capability::TurnBoundary`) is resolved here too, once,
+/// by asking the run's driver whether the decoded event ends a turn — see
+/// [`Self::resolve`]. Every downstream turn-boundary consumer reads
+/// [`Self::turn_boundary`] instead of matching [`WorkerEvent::Stop`], so
+/// "what counts as a turn ending" is the driver's answer rather than a
+/// Claude-shaped assumption baked into the dispatchers.
 #[derive(Debug, Clone)]
 pub struct IncomingHookEvent {
     pub peer_pid: Option<libc::pid_t>,
     pub run_id: Option<String>,
     pub transcript_path: Option<String>,
     pub event: WorkerEvent,
+    /// Deliberately private: the only way to populate it is [`Self::resolve`],
+    /// which derives it from a driver. A boundary that could be hand-set at a
+    /// construction site is a boundary the driver seam does not actually own.
+    turn_boundary: Option<TurnEnd>,
+}
+
+impl IncomingHookEvent {
+    /// Build an ingress event, resolving `event`'s turn boundary through
+    /// `driver`.
+    ///
+    /// This is the single point where a turn boundary enters the engine. The
+    /// hook-callback ingress ([`handle_connection`]) calls it with the
+    /// resolved hook-callback driver; a future stdout-JSONL reader (Codex,
+    /// whose boundary is a native `turn.completed` event) calls it with its
+    /// own driver and reaches the same consumers with no further plumbing.
+    pub fn resolve(
+        driver: &dyn AgentDriver,
+        event: WorkerEvent,
+        run_id: Option<String>,
+        transcript_path: Option<String>,
+        peer_pid: Option<libc::pid_t>,
+    ) -> Self {
+        let turn_boundary = driver.turn_boundary(&event);
+        Self {
+            peer_pid,
+            run_id,
+            transcript_path,
+            event,
+            turn_boundary,
+        }
+    }
+
+    /// The driver-supplied turn-ended signal for this event, or `None` when
+    /// the driver does not consider it a turn boundary.
+    pub fn turn_boundary(&self) -> Option<&TurnEnd> {
+        self.turn_boundary.as_ref()
+    }
+
+    /// Whether this event ends a worker turn, per its driver. The gate every
+    /// on-turn-boundary dispatcher opens with.
+    pub fn is_turn_boundary(&self) -> bool {
+        self.turn_boundary.is_some()
+    }
+
+    /// Test-only shorthand for [`Self::resolve`] against the engine's default
+    /// hook-callback driver — the same one the production accept loop
+    /// resolves — with no peer pid. Tests that need a *different* driver's
+    /// boundary (or its absence) call `resolve` directly.
+    #[cfg(test)]
+    pub(crate) fn for_test(event: WorkerEvent, run_id: Option<String>, transcript_path: Option<String>) -> Self {
+        Self::resolve(&crate::driver::ClaudeDriver, event, run_id, transcript_path, None)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -250,15 +309,18 @@ pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> 
     };
     // Decode through the driver's ProgressObservation and TranscriptAccess
     // capabilities. The decoded event drives the (driver-agnostic) activity
-    // machine downstream, unchanged.
+    // machine downstream, unchanged. `resolve` additionally asks the driver's
+    // TurnBoundary capability whether this event ends a turn, so the
+    // dispatchers never have to re-derive that from the event's shape.
     let transcript_path = driver.transcript_path_for_session(&raw);
     let event = driver.normalize_progress_event(&raw)?;
-    Ok(IncomingHookEvent {
-        peer_pid: peer_pid_value,
+    Ok(IncomingHookEvent::resolve(
+        driver,
+        event,
         run_id,
         transcript_path,
-        event,
-    })
+        peer_pid_value,
+    ))
 }
 
 /// Publish the two event-bus transitions this hook-ingress path can
@@ -274,38 +336,38 @@ pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> 
 /// so publishing on a run this ingress can't fully classify is harmless
 /// — the eventual subscriber's own check no-ops on a false positive.
 ///
-/// - [`Event::TransientErrorIdle`]: published on a `Stop` hook whose
-///   transcript's last meaningful entry is a trailing Claude API error —
-///   the same ground truth [`crate::transient_recovery`]'s sweep already
-///   trusts, just checked immediately instead of waiting for the next
-///   60s pass.
+/// - [`Event::TransientErrorIdle`]: published on the driver's turn
+///   boundary when the transcript's last meaningful entry is a trailing
+///   API error — the same ground truth [`crate::transient_recovery`]'s
+///   sweep already trusts, just checked immediately instead of waiting
+///   for the next 60s pass.
 /// - [`Event::AnswerAgentDied`]: published on `SessionEnd`, the only
 ///   hook that fires when a worker's session terminates. This does not
 ///   cover a hard pane kill (no hook fires at all in that case) — that
 ///   case has no in-process event and stays reliant on
 ///   `stranded_answering_sweep`'s DB-driven backstop, unchanged.
+///   `SessionEnd` is a process boundary, not a turn boundary, so it stays
+///   an event-shape match.
 pub async fn publish_hook_derived_events(bus: &EventBus, incoming: &IncomingHookEvent) {
     let Some(execution_id) = incoming.run_id.clone() else {
         return;
     };
-    match &incoming.event {
-        WorkerEvent::Stop { .. } => {
-            let Some(transcript_path) = incoming.transcript_path.as_deref() else {
-                return;
-            };
-            let lines = crate::transient_recovery::read_transcript_tail(
-                transcript_path,
-                crate::transient_recovery::TRANSCRIPT_TAIL_MAX_BYTES,
-            )
-            .await;
-            if crate::transient_error::extract_worker_error(&lines).is_some() {
-                bus.publish(Event::TransientErrorIdle { execution_id });
-            }
+    if incoming.is_turn_boundary() {
+        let Some(transcript_path) = incoming.transcript_path.as_deref() else {
+            return;
+        };
+        let lines = crate::transient_recovery::read_transcript_tail(
+            transcript_path,
+            crate::transient_recovery::TRANSCRIPT_TAIL_MAX_BYTES,
+        )
+        .await;
+        if crate::transient_error::extract_worker_error(&lines).is_some() {
+            bus.publish(Event::TransientErrorIdle { execution_id });
         }
-        WorkerEvent::SessionEnd { .. } => {
-            bus.publish(Event::AnswerAgentDied { execution_id });
-        }
-        _ => {}
+        return;
+    }
+    if let WorkerEvent::SessionEnd { .. } = &incoming.event {
+        bus.publish(Event::AnswerAgentDied { execution_id });
     }
 }
 
@@ -740,16 +802,15 @@ mod tests {
     // ─── publish_hook_derived_events ───────────────────────────────────
 
     fn incoming_stop(run_id: &str, transcript_path: Option<&str>) -> IncomingHookEvent {
-        IncomingHookEvent {
-            peer_pid: None,
-            run_id: Some(run_id.to_owned()),
-            transcript_path: transcript_path.map(str::to_owned),
-            event: WorkerEvent::Stop {
+        IncomingHookEvent::for_test(
+            WorkerEvent::Stop {
                 session_id: "s".to_owned(),
                 stop_hook_active: false,
                 stop_reason: boss_protocol::StopReason::Completed,
             },
-        }
+            Some(run_id.to_owned()),
+            transcript_path.map(str::to_owned),
+        )
     }
 
     fn write_transcript(dir: &TempDir, name: &str, lines: &[&str]) -> String {
@@ -820,15 +881,14 @@ mod tests {
     async fn session_end_publishes_answer_agent_died() {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
-        let incoming = IncomingHookEvent {
-            peer_pid: None,
-            run_id: Some("exec-2".to_owned()),
-            transcript_path: None,
-            event: WorkerEvent::SessionEnd {
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::SessionEnd {
                 session_id: "s".to_owned(),
                 reason: "exit".to_owned(),
             },
-        };
+            Some("exec-2".to_owned()),
+            None,
+        );
 
         publish_hook_derived_events(&bus, &incoming).await;
 
@@ -845,15 +905,77 @@ mod tests {
     async fn missing_run_id_publishes_nothing() {
         let bus = EventBus::new();
         let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
-        let incoming = IncomingHookEvent {
-            peer_pid: None,
-            run_id: None,
-            transcript_path: None,
-            event: WorkerEvent::SessionEnd {
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::SessionEnd {
                 session_id: "s".to_owned(),
                 reason: "exit".to_owned(),
             },
-        };
+            None,
+            None,
+        );
+
+        publish_hook_derived_events(&bus, &incoming).await;
+
+        bus.publish(Event::DispatchReady);
+        let event = sub.recv().await.expect("the sentinel event should still arrive");
+        assert_eq!(event, Event::DispatchReady);
+    }
+
+    // ─── turn boundary (Capability::TurnBoundary) ──────────────────────
+
+    #[tokio::test]
+    async fn ingress_resolves_the_turn_boundary_through_the_driver() {
+        // The whole point of the seam: the boundary on the ingress event is
+        // whatever the driver said, carried alongside the decoded event.
+        let stop = incoming_stop("exec-1", None);
+        let end = stop.turn_boundary().expect("Claude's Stop is a turn boundary");
+        assert_eq!(end.session_id, "s");
+        assert!(!end.continuation);
+        assert!(stop.is_turn_boundary());
+    }
+
+    #[tokio::test]
+    async fn ingress_reports_no_boundary_for_a_mid_turn_event() {
+        let incoming = IncomingHookEvent::for_test(
+            WorkerEvent::PostToolUse {
+                session_id: "s".to_owned(),
+                tool_name: "Bash".to_owned(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            Some("exec-1".to_owned()),
+            None,
+        );
+        assert!(!incoming.is_turn_boundary());
+        assert!(incoming.turn_boundary().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_driver_that_declares_no_boundary_suppresses_the_transient_error_publish() {
+        // A `Stop`-shaped event from a driver that does not call it a turn
+        // boundary must not open the on-turn-boundary path. This is the
+        // behaviour a hardcoded `WorkerEvent::Stop` match could not express.
+        let dir = TempDir::new().unwrap();
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, API_ERROR_LINE]);
+        let bus = EventBus::new();
+        let mut sub = bus.subscribe(boss_event_bus::TopicFilter::all());
+
+        let boundaryless = crate::driver::test_support::StubDriver::new(
+            crate::driver::test_support::stub_descriptor(),
+            crate::driver::CapabilitySet::new([]),
+        );
+        let incoming = IncomingHookEvent::resolve(
+            &boundaryless,
+            WorkerEvent::Stop {
+                session_id: "s".to_owned(),
+                stop_hook_active: false,
+                stop_reason: boss_protocol::StopReason::Completed,
+            },
+            Some("exec-1".to_owned()),
+            Some(transcript),
+            None,
+        );
+        assert!(!incoming.is_turn_boundary());
 
         publish_hook_derived_events(&bus, &incoming).await;
 

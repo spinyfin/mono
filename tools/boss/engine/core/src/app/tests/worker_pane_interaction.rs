@@ -153,15 +153,14 @@ async fn send_input_to_worker_round_trips_to_app() {
     // `send_input_to_worker_falls_back_to_probe_when_unverified`.
     dispatch_live_worker_state(
         &server_state,
-        &crate::events_socket::IncomingHookEvent {
-            peer_pid: None,
-            run_id: Some("run-send".to_owned()),
-            transcript_path: None,
-            event: crate::protocol::WorkerEvent::UserPromptSubmit {
+        &crate::events_socket::IncomingHookEvent::for_test(
+            crate::protocol::WorkerEvent::UserPromptSubmit {
                 session_id: "claude-sess-1".into(),
                 prompt: "/help\n".into(),
             },
-        },
+            Some("run-send".to_owned()),
+            None,
+        ),
     )
     .await;
 

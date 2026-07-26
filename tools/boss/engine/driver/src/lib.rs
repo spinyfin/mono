@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, TaskKind, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, StopReason, TaskKind, WorkerEvent};
 
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
@@ -644,6 +644,45 @@ pub enum ProgressIngress {
     StdoutJsonl,
 }
 
+/// A turn-ended signal for [`Capability::TurnBoundary`]: the driver-agnostic
+/// form of "the worker finished a turn and is now idle".
+///
+/// This is what the engine's turn-boundary consumers key off — completion
+/// detection, PR-URL capture, probe injection/delivery, the live-status
+/// summariser's `Stop` trigger. None of them matches [`WorkerEvent::Stop`]
+/// itself any more; each reads the boundary the driver produced from
+/// whatever channel it actually has:
+///
+/// - **Claude** fires a `Stop` hook into the `boss-event` shim, which the
+///   engine decodes into [`WorkerEvent::Stop`] — that variant is the
+///   boundary.
+/// - **Codex** emits a native, typed `turn.completed` on its `--json` stdout
+///   stream (verified against codex-cli 0.145.0; see
+///   `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`).
+///   Its driver decodes that to [`WorkerEvent::Stop`] in
+///   [`AgentDriver::normalize_progress_event`] and reports the boundary
+///   here. Routing a native turn event through this method is the
+///   first-class path; what a driver must *not* do is manufacture a
+///   Claude-shaped hook payload to satisfy Claude-shaped plumbing behind
+///   the engine's back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnEnd {
+    /// Session identity of the turn that ended, as the driver reports it.
+    /// Same value the originating [`WorkerEvent`] carries.
+    pub session_id: String,
+    /// Why the turn ended. Boss's own sequencer refines this beyond what a
+    /// single payload can say (a `Notification` immediately before the
+    /// boundary implies [`StopReason::AwaitingInput`]), so a driver that
+    /// cannot distinguish reasons reports [`StopReason::Completed`] and
+    /// loses nothing it had.
+    pub reason: StopReason,
+    /// The boundary is a re-entrant continuation rather than a fresh idle:
+    /// the agent was already stopping and something (Claude's
+    /// `stop_hook_active`) pulled it back into another turn. Drivers with no
+    /// such concept report `false`.
+    pub continuation: bool,
+}
+
 /// Inputs the [`Capability::ToolUseInterception`] wiring needs to build the
 /// per-session PreToolUse guard hooks.
 ///
@@ -845,6 +884,33 @@ pub trait AgentDriver: Send + Sync {
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
+    // ── TurnBoundary capability ─────────────────────────────────────────────
+
+    /// Report whether `event` — one already-decoded
+    /// [`Self::normalize_progress_event`] output — is this driver's
+    /// turn-ended signal, and if so describe it.
+    ///
+    /// This is the engine's *only* route to a turn boundary. Completion
+    /// detection, probe injection/delivery, and the live-status `Stop`
+    /// trigger all gate on the [`TurnEnd`] this returns instead of matching
+    /// [`WorkerEvent::Stop`] themselves, so a driver whose boundary does not
+    /// coincide with that variant — or which emits the variant for something
+    /// that is *not* a turn boundary — decides for itself rather than
+    /// inheriting Claude's hook semantics.
+    ///
+    /// `ClaudeDriver` reports every [`WorkerEvent::Stop`] (its `Stop` hook)
+    /// and nothing else. A Codex driver reports the same variant, reached
+    /// from its native `turn.completed` stdout event — see [`TurnEnd`] for
+    /// why that mapping belongs here and not in a fake hook payload.
+    ///
+    /// Returning `None` for every event is the honest answer for a driver
+    /// that declares no [`Capability::TurnBoundary`]; its
+    /// [`AbsenceDisposition::Synthesize`] default then applies, and the
+    /// engine-side synthesiser that would infer a boundary from a
+    /// lower-fidelity channel is deliberately not built yet — no driver
+    /// Boss ships or plans needs it.
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd>;
+
     // ── ToolUseInterception capability ──────────────────────────────────────
 
     /// Build the PreToolUse hook entries for the `ToolUseInterception`
@@ -974,10 +1040,32 @@ pub mod test_support {
     use boss_protocol::{NormalizeError, WorkerEvent};
 
     use super::{
-        AgentDriver, CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, PostHocInterceptionFn,
-        ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
-        ToolUseInterceptionWiring, WorkerErrorClass,
+        AgentDriver, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
+        PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
+        ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
     };
+
+    /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
+    /// resolves everything to one `"stub-model"` slug, which is enough for
+    /// tests that only exercise capability declaration or the seams a stub
+    /// stands in for.
+    pub fn stub_descriptor() -> DriverDescriptor {
+        DriverDescriptor {
+            name: "stub",
+            label: "Stub Driver",
+            binary: "stub",
+            config_dir: ".stub",
+            agent_rules_filename: "AGENTS.md",
+            initial_prompt_filename: "initial-prompt.txt",
+            model_menu: ModelMenu {
+                engine_default: "stub-model",
+                effort_value_for_level: |_| None,
+                default_model_for_level: |_| "stub-model",
+                prompt_addendum_for_level: |_| None,
+                model_requires_auto_permissions: |_| false,
+            },
+        }
+    }
 
     /// Configurable [`AgentDriver`] stub. Every method beyond
     /// `descriptor`/`capabilities` is unimplemented (or a harmless no-op for
@@ -1043,6 +1131,13 @@ pub mod test_support {
         }
         fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
             unimplemented!()
+        }
+        fn turn_boundary(&self, _: &WorkerEvent) -> Option<TurnEnd> {
+            // Declares no turn boundary. Like `transcript_path_for_session`
+            // this sits on an ingress hot path, so it answers instead of
+            // panicking — and "this driver has no boundary to report" is the
+            // answer a stub can honestly give.
+            None
         }
         fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
             unimplemented!()
@@ -1348,23 +1443,22 @@ mod tests {
     // Shared with other crates' tests via `crate::test_support::StubDriver`;
     // see that module's doc comment.
 
-    use crate::test_support::StubDriver;
+    use crate::test_support::{StubDriver, stub_descriptor};
 
-    fn stub_descriptor() -> DriverDescriptor {
-        DriverDescriptor {
-            name: "stub",
-            label: "Stub Driver",
-            binary: "stub",
-            config_dir: ".stub",
-            agent_rules_filename: "AGENTS.md",
-            initial_prompt_filename: "initial-prompt.txt",
-            model_menu: ModelMenu {
-                engine_default: "stub-model",
-                effort_value_for_level: |_| None,
-                default_model_for_level: |_| "stub-model",
-                prompt_addendum_for_level: |_| None,
-                model_requires_auto_permissions: |_| false,
-            },
-        }
+    #[test]
+    fn a_driver_declaring_no_turn_boundary_reports_none() {
+        // The absence case the (deliberately unbuilt) engine-side synthesizer
+        // would cover: no boundary from the driver, for any event.
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([]));
+        assert!(
+            driver
+                .turn_boundary(&WorkerEvent::Stop {
+                    session_id: "sess-1".to_owned(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Completed,
+                })
+                .is_none(),
+            "a driver without Capability::TurnBoundary must not claim a boundary",
+        );
     }
 }

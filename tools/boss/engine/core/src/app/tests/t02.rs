@@ -57,17 +57,16 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
         "precondition: slot mapping must be absent for this regression",
     );
 
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::PostToolUse {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     let reread = server_state.work_db.get_run(&run.id).unwrap();
@@ -119,17 +118,16 @@ async fn dispatch_assigns_virtual_slot_to_remote_worker() {
         "precondition: a remote run never gets a slot from the spawn flow",
     );
 
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::PostToolUse {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     // A virtual slot from the reserved remote range was allocated …
@@ -194,16 +192,15 @@ async fn dispatch_skips_virtual_slot_for_settled_remote_execution() {
         .mark_execution_orphaned(&execution.id, "test: settled before late hook")
         .unwrap();
 
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::Stop {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
             session_id: "claude-sess-1".into(),
             stop_hook_active: false,
             stop_reason: boss_protocol::StopReason::Completed,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     assert_eq!(
@@ -285,17 +282,16 @@ async fn dispatch_persists_transcript_path_when_payload_carries_execution_id() {
     // exactly — the entire point of the regression is that the
     // dispatcher must successfully persist when handed this
     // shape.
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::PostToolUse {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     let reread = server_state.work_db.get_run(&run.id).unwrap();
@@ -348,15 +344,14 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
     // exists but has no `work_runs` row yet, mirroring the
     // race where a hook arrives before the run is inserted.
 
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::SessionStart {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     let stats = server_state.dispatcher_stats.snapshot();
@@ -435,15 +430,14 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
     server_state.worker_registry.register_run_slot(execution.id.clone(), 5);
 
     // Step 1: SessionStart populates the cache AND the row.
-    let session_start = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::SessionStart {
+    let session_start = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: SessionStartSource::Startup,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &session_start).await;
     assert_eq!(
         server_state
@@ -473,17 +467,16 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
     // Step 3: PostToolUse with NO transcript_path on the
     // payload. Pre-fix this was a silent drop; post-fix the
     // cached path is persisted.
-    let post_tool_use = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::PostToolUse {
+    let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        None,
+    );
     dispatch_live_worker_state(&server_state, &post_tool_use).await;
     assert_eq!(
         server_state
@@ -597,17 +590,16 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
         resolver,
     );
 
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
-        event: WorkerEvent::PostToolUse {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     // Yield to let the slot task service the queued triggers.
@@ -700,17 +692,16 @@ async fn live_status_debug_slot_transcript_path_resolves_after_hook_event() {
         .register_spawn(slot_id, execution.id.clone(), "claude-opus-4-7", 0, None);
 
     let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some(path.into()),
-        event: WorkerEvent::PostToolUse {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "claude-sess-1".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        Some(path.into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     // Sanity: the write path stored the column on the right row.
@@ -788,15 +779,14 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
     );
 
     let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some(path.into()),
-        event: WorkerEvent::SessionStart {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
         },
-    };
+        Some(execution.id.clone()),
+        Some(path.into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     let resolved = <ServerState as TranscriptPathResolver>::transcript_path(&server_state, &execution.id).await;
@@ -921,15 +911,14 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
         .unwrap();
 
     let path = "/home/u/.claude/projects/foo/sess-1.jsonl";
-    let event = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: Some(path.into()),
-        event: WorkerEvent::SessionStart {
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
         },
-    };
+        Some(execution.id.clone()),
+        Some(path.into()),
+    );
     dispatch_live_worker_state(&server_state, &event).await;
 
     // Both reference shapes resolve to the same path. This is what
@@ -1785,15 +1774,14 @@ async fn chore_update_notify_sends_message_to_live_worker() {
     // the confirming hook the way the worker's CLI would.
     dispatch_live_worker_state(
         &server_state,
-        &crate::events_socket::IncomingHookEvent {
-            peer_pid: None,
-            run_id: Some(resolved_run.clone()),
-            transcript_path: None,
-            event: crate::protocol::WorkerEvent::UserPromptSubmit {
+        &crate::events_socket::IncomingHookEvent::for_test(
+            crate::protocol::WorkerEvent::UserPromptSubmit {
                 session_id: "claude-sess-1".into(),
                 prompt: msg.clone(),
             },
-        },
+            Some(resolved_run.clone()),
+            None,
+        ),
     )
     .await;
 
@@ -2376,17 +2364,16 @@ async fn hook_for_terminal_execution_is_counted_not_silently_dropped() {
         .hook_events_for_terminal_execution;
 
     // The (supposedly-dead) worker is still emitting hooks.
-    let late_hook = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::PostToolUse {
+    let late_hook = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "sess-late".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        None,
+    );
     dispatch_live_worker_state(&server_state, &late_hook).await;
 
     let after = server_state
@@ -2431,17 +2418,16 @@ async fn hook_for_live_execution_without_slot_is_not_counted_as_reconcile() {
         .snapshot()
         .hook_events_for_terminal_execution;
 
-    let early_hook = crate::events_socket::IncomingHookEvent {
-        peer_pid: None,
-        run_id: Some(execution.id.clone()),
-        transcript_path: None,
-        event: WorkerEvent::PostToolUse {
+    let early_hook = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
             session_id: "sess-early".into(),
             tool_name: "Bash".into(),
             tool_input: serde_json::Value::Null,
             tool_response: serde_json::Value::Null,
         },
-    };
+        Some(execution.id.clone()),
+        None,
+    );
     dispatch_live_worker_state(&server_state, &early_hook).await;
 
     let after = server_state

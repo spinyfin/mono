@@ -6,9 +6,20 @@
 use super::*;
 
 impl WorkerCompletionHandler {
-    /// Wire an externally-owned [`StagedResolutionSignalCache`] into this
-    /// Handle a `Stop` event for `execution_id`. Returns the outcome
+    /// Handle a worker turn ending for `execution_id`. Returns the outcome
     /// classification so callers can log/test what happened.
+    ///
+    /// The trigger is the **driver-supplied** turn boundary: the sole caller,
+    /// `app::worker_events::dispatch_completion_on_stop`, gates on
+    /// [`crate::driver::AgentDriver::turn_boundary`] rather than on the
+    /// `WorkerEvent::Stop` variant that exists only because Claude Code fires
+    /// a `Stop` hook into the `boss-event` shim. A driver whose turn ends via
+    /// some other channel (Codex's native `turn.completed`) reaches this
+    /// handler through that seam, unchanged.
+    ///
+    /// The `on_stop` / [`StopOutcome`] naming is deliberately kept: it is the
+    /// vocabulary of the whole completion subsystem and its call sites, and
+    /// renaming it would churn far more than it clarifies.
     pub async fn on_stop(&self, execution_id: &str) -> StopOutcome {
         let outcome = self.on_stop_inner(execution_id).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
