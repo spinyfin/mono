@@ -2066,6 +2066,13 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                             // decision in `editorial_actions`. Fire-and-
                             // forget; never blocks the event dispatch.
                             dispatch_editorial_on_pretooluse(&server_state, &incoming).await;
+                            // Post-hoc interception fallback: for any driver
+                            // that lacks real-time PreToolUse hooks (the
+                            // ToolUseInterception Degrade path), this is the
+                            // only place editorial/path/revision-PR/
+                            // checkleft loss ever gets surfaced. No-op for
+                            // Claude, which already ran those guards above.
+                            dispatch_post_hoc_interception_on_post_tool_use(&server_state, &incoming).await;
                             // Urgent probes fire on PostToolUse so
                             // the coordinator can redirect a worker
                             // mid-task without waiting for Stop. The
