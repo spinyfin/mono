@@ -17,7 +17,8 @@ use boss_ssh_transport::shell_quote;
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
     PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
-    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
 };
 
 pub mod structured_output;
@@ -724,6 +725,19 @@ impl AgentDriver for ClaudeDriver {
             ErrorClass::Permanent => WorkerErrorClass::Permanent,
             ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
+    }
+
+    fn structured_output_wiring(
+        &self,
+        request: &StructuredOutputRequest<'_>,
+    ) -> anyhow::Result<StructuredOutputArtifacts> {
+        // Env-file contract: export the designated path via the BOSS_* env
+        // vars, point the engine's reader at the same path. Claude has no
+        // native schema-enforcement flag (`--output-schema` is a Codex
+        // mechanism), so `request.schema` is ignored — the prompt carries
+        // the shape and the worker Write-tools to `result_path`. Behaviour
+        // is identical to the pre-trait env-var export in the spawn flow.
+        Ok(default_structured_output_wiring(request))
     }
 
     fn structured_output_fallback(&self, kind: StructuredOutputKind, text: &str) -> Vec<FallbackCandidate> {
