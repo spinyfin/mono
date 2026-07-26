@@ -139,12 +139,42 @@ impl LiveWorkerStateRegistry {
 
     /// Drop the entry for `slot_id`. Called when the engine releases
     /// a pane (slot is recycled).
+    ///
+    /// Removal is traced. Dropping an entry is not merely bookkeeping: a
+    /// slot with no live-tracked run becomes a husk candidate, and
+    /// `husk_pane_sweep` kills that pane's process one pass later. There
+    /// was previously no trace event on removal, so when live workers were
+    /// killed the clearing call site was invisible in the logs and the
+    /// mechanism could not be identified from a production incident.
+    /// `#[track_caller]` records which caller cleared it without requiring
+    /// every call site to thread a reason through.
+    #[track_caller]
     pub fn release_slot(&self, slot_id: u8) {
+        let caller = std::panic::Location::caller();
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.by_slot.remove(&slot_id);
+        let removed = guard.by_slot.remove(&slot_id);
         guard.notification_pending.remove(&slot_id);
         guard.spawned_at.remove(&slot_id);
         guard.progress_fidelity.remove(&slot_id);
+        drop(guard);
+
+        match removed {
+            Some(state) => tracing::info!(
+                slot_id,
+                run_id = %state.run_id,
+                activity = state.activity.as_str(),
+                last_event_at = ?state.last_event_at,
+                current_tool = ?state.current_tool,
+                shell_pid = state.shell_pid,
+                cleared_by = %caller,
+                "live-state registry: slot entry cleared; slot is now a husk candidate",
+            ),
+            None => tracing::debug!(
+                slot_id,
+                cleared_by = %caller,
+                "live-state registry: release_slot on a slot with no entry (no-op)",
+            ),
+        }
     }
 
     /// Snapshot of every entry. Used by the frontend RPC handler and

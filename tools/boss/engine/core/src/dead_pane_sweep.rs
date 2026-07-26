@@ -247,9 +247,17 @@ pub async fn reconcile_if_pane_dead(
     // call mirroring the other reap paths.
     let recovery_patch = boss_engine_recovery::recovery_backup::backup_dead_execution(execution);
 
+    // State only what was observed. This previously asserted "pane died with
+    // its host app", which is a hardcoded causal claim this code never
+    // verifies — it does not check whether the app is running. When five live
+    // workers were killed by `husk_pane_sweep` while the app stayed up
+    // throughout, this line appeared in the record for each of them and
+    // pointed diagnosis squarely at an app crash that never happened. The pid
+    // being gone is the observation; why it is gone is not known here.
     let reason = format!(
         "pane-death reconcile: worker shell pid {shell_pid} no longer exists (kill(0)=ESRCH); \
-         pane died with its host app (prior status `{prior_status}`)"
+         cause not determined by this probe — the process may have exited on its own, or been \
+         killed by another engine path such as a husk-pane retirement (prior status `{prior_status}`)"
     );
 
     // Funnel the orphan → triage-bookkeeping → dispatch-event flow through the
