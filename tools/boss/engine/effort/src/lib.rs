@@ -8,7 +8,7 @@ use std::path::Path;
 
 use boss_protocol::{EffortLevel, ReasoningMode, TaskKind};
 
-use boss_engine_driver::{AgentDriver, DriverRegistry};
+use boss_engine_driver::DriverRegistry;
 
 /// Engine default driver used when neither `tasks.driver` nor
 /// `products.default_driver` is set (agent-driver design §Mix-and-match).
@@ -83,17 +83,53 @@ pub struct SpawnConfig {
 
 impl SpawnConfig {
     /// Worker spawn line written into the libghostty pane via the
-    /// spawn RPC's `initial_input`. Delegates to
-    /// [`boss_engine_driver::ClaudeDriver::spawn_invocation`], which owns the
-    /// Claude-specific command-line logic (Spawn capability).
+    /// spawn RPC's `initial_input`. Resolves [`Self::driver`] against the
+    /// default [`DriverRegistry`] and delegates to that driver's
+    /// [`AgentDriver::spawn_invocation`] (Spawn capability) — never a
+    /// hardcoded concrete driver type.
     ///
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
-    /// need to construct a driver instance directly.
+    /// need to construct a driver instance directly. Production spawn paths
+    /// that already hold a registry reuse [`Self::spawn_command_in`] so the
+    /// same resolved driver instance is shared with the capability gate.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `self.driver` is not registered. `resolve_spawn_config`
+    /// already refuses unregistered slugs, so a config produced by that
+    /// path cannot hit this; hand-built configs in tests must use a
+    /// registered slug (or call [`Self::spawn_command_in`] with an extended
+    /// registry).
     pub fn claude_invocation(&self, non_opus_auto_mode: bool, settings_path: Option<&Path>) -> String {
+        self.spawn_command_in(&DriverRegistry::default(), non_opus_auto_mode, settings_path)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "SpawnConfig::claude_invocation: {err} (slug came from SpawnConfig.driver; \
+                     use resolve_spawn_config / spawn_command_in with a registry that has it)"
+                )
+            })
+    }
+
+    /// [`Self::claude_invocation`] against a caller-supplied registry.
+    ///
+    /// The registry-injection seam (`*_in`) lets a test register a second
+    /// driver and prove the spawn command comes from that driver's
+    /// `spawn_invocation`, not Claude's — and lets a production caller that
+    /// already built a registry for the capability gate reuse it.
+    pub fn spawn_command_in(
+        &self,
+        registry: &DriverRegistry,
+        non_opus_auto_mode: bool,
+        settings_path: Option<&Path>,
+    ) -> Result<String, UnknownDriverError> {
         // No permission-mode override on this convenience wrapper: the
         // capability-restricted answer-agent path spawns via
-        // `ClaudeDriver::spawn_invocation` directly (see `runner.rs`).
-        boss_engine_driver::ClaudeDriver
+        // `AgentDriver::spawn_invocation` on the resolved driver directly
+        // (see `runner/pane_spawn.rs`).
+        let driver = registry.get(&self.driver).ok_or_else(|| UnknownDriverError {
+            driver_slug: self.driver.clone(),
+        })?;
+        Ok(driver
             .spawn_invocation(boss_engine_driver::SpawnRequest {
                 model: &self.model,
                 effort: self.effort_value,
@@ -101,7 +137,7 @@ impl SpawnConfig {
                 non_opus_auto_mode,
                 permission_mode_override: None,
             })
-            .command
+            .command)
     }
 }
 
@@ -500,7 +536,7 @@ mod tests {
     use std::sync::Arc;
 
     use boss_engine_driver::test_support::StubDriver;
-    use boss_engine_driver::{Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu};
+    use boss_engine_driver::{AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu as DriverModelMenu};
 
     /// Effort vocabulary for the stub driver below. Deliberately distinct
     /// from Claude's `low/medium/high/xhigh/max` at every level, and its
@@ -565,6 +601,55 @@ mod tests {
     fn registry_with_stub() -> DriverRegistry {
         let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]));
         DriverRegistry::default().with_driver("stub-codex", Arc::new(driver))
+    }
+
+    /// Call-site cutover acceptance: constructing a second registered driver
+    /// and dispatching a work item with `--driver <slug>` must route
+    /// spawn-command construction through that driver's trait methods,
+    /// not Claude's. Uses the same registry-injection path production
+    /// spawn sites use (`spawn_command_in` / `DriverRegistry::require`).
+    #[test]
+    fn spawn_command_routes_through_registered_non_claude_driver() {
+        // StubDriver::spawn_invocation emits `{descriptor.binary} --model …`,
+        // deliberately distinct from Claude's command line so this assertion
+        // fails closed if the call site ever hardcodes ClaudeDriver again.
+        let mut descriptor = stub_descriptor();
+        descriptor.name = "stub-codex";
+        descriptor.binary = "stub-codex-cli";
+        let registry = DriverRegistry::default().with_driver(
+            "stub-codex",
+            Arc::new(StubDriver::new(descriptor, CapabilitySet::new([Capability::Spawn]))),
+        );
+
+        // Resolve as production would when `tasks.driver = "stub-codex"`.
+        let cfg = resolve_spawn_config_in(
+            &registry,
+            &SpawnResolutionInput::builder().task_driver("stub-codex").build(),
+        )
+        .expect("stub-codex is registered");
+        assert_eq!(cfg.driver, "stub-codex");
+        assert_eq!(cfg.model, "stub-model");
+
+        let command = cfg
+            .spawn_command_in(&registry, false, None)
+            .expect("stub-codex is registered");
+        assert_eq!(command, "stub-codex-cli --model stub-model\n");
+        assert!(
+            !command.starts_with("claude"),
+            "non-Claude driver must not emit a Claude command line, got {command:?}",
+        );
+
+        // Claude still works on the same registry for a different slug.
+        let claude_cfg = resolve_spawn_config_in(
+            &registry,
+            &SpawnResolutionInput::builder().task_driver("claude").build(),
+        )
+        .unwrap();
+        let claude_cmd = claude_cfg.spawn_command_in(&registry, false, None).unwrap();
+        assert!(
+            claude_cmd.starts_with("claude"),
+            "claude slug still routes to ClaudeDriver, got {claude_cmd:?}",
+        );
     }
 
     #[test]

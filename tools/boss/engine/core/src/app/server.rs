@@ -2050,9 +2050,8 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
     // per-run resolution (once the dispatch gate selects a driver per run)
     // only requires changing this lookup.
     let hook_callback_driver: std::sync::Arc<dyn crate::driver::AgentDriver> = crate::driver::DriverRegistry::default()
-        .get(crate::effort::ENGINE_DEFAULT_DRIVER)
-        .expect("engine default driver is always registered")
-        .clone();
+        .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+        .expect("engine default driver is always registered");
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {

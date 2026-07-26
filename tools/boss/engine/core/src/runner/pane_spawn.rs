@@ -11,7 +11,6 @@ use async_trait::async_trait;
 
 use crate::config::RuntimeConfig;
 use crate::coordinator::slot_id_from_worker_id;
-use crate::driver::AgentDriver;
 use crate::pane_summary;
 use crate::spawn_flow::{StartWorkerInput, start_worker};
 use crate::work::{WorkDb, WorkExecution, WorkItem};
@@ -360,11 +359,20 @@ impl ExecutionRunner for PaneSpawnRunner {
         )
         .await?;
 
+        // Resolve the driver once via the registry on the slug
+        // `compose_worker_spawn` already validated. Every subsequent trait
+        // call on this run (provision, spawn, settings wiring, live-state
+        // capabilities) goes through this Arc — never a hardcoded concrete
+        // driver type. A second registered driver therefore actually runs.
+        let driver = crate::driver::DriverRegistry::default()
+            .require(&spawn_config.driver)
+            .map_err(|err| anyhow!("spawn: {err}"))?;
+
         // Write the initial prompt (and gitignore + pre-trust) via the driver's
         // WorkspaceProvisioning capability. The driver's config_dir and
         // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
         // the exact path the spawn_invocation `$(cat ...)` reads from.
-        crate::driver::ClaudeDriver
+        driver
             .provision_workspace(workspace_path, &prompt_text, &execution.id)
             .await
             .with_context(|| {
@@ -399,8 +407,9 @@ impl ExecutionRunner for PaneSpawnRunner {
         };
 
         // The worker's session settings (boss-event hooks, deny rules)
-        // live outside the workspace tree; point claude at them with
-        // `--settings`. `write_workspace_files` writes the same path.
+        // live outside the workspace tree; point the agent at them with
+        // `--settings` (or the driver-equivalent flag). `write_workspace_files`
+        // writes the same path.
         let worker_settings_path = crate::worker_setup::worker_settings_path(workspace_path);
         // Re-prepend BOSS_BIN_DIR to PATH in the worker's first shell line,
         // mirroring the Boss/coordinator pane (see BossPaneModel.swift and
@@ -415,10 +424,10 @@ impl ExecutionRunner for PaneSpawnRunner {
         // shim instead of the bundled binary silently breaks. BOSS_BIN_DIR
         // itself survives init (init scripts don't unset custom env vars),
         // so we re-prepend it here: this line runs *after* init completes
-        // and *before* claude launches, so claude — and every tool-issued
-        // `cube`/`boss` subshell it spawns — inherits the bundled-first
-        // PATH. The `[ -n "$BOSS_BIN_DIR" ]` guard is a no-op in dev /
-        // bazel-run mode where BOSS_BIN_DIR is unset.
+        // and *before* the agent launches, so the agent — and every
+        // tool-issued `cube`/`boss` subshell it spawns — inherits the
+        // bundled-first PATH. The `[ -n "$BOSS_BIN_DIR" ]` guard is a no-op
+        // in dev / bazel-run mode where BOSS_BIN_DIR is unset.
         // The answer agent is capability-restricted: force deny-by-default
         // `dontAsk` so its `permissions.allow` allowlist is authoritative and
         // cannot be downgraded to `auto` / `--dangerously-skip-permissions`
@@ -437,7 +446,7 @@ impl ExecutionRunner for PaneSpawnRunner {
         // own concern, carried on the `SpawnPlan.env` built here — the engine
         // renders those directives generically without knowing which driver
         // or which vars they name.
-        let spawn_plan = crate::driver::ClaudeDriver.spawn_invocation(crate::driver::SpawnRequest {
+        let spawn_plan = driver.spawn_invocation(crate::driver::SpawnRequest {
             model: &spawn_config.model,
             effort: spawn_config.effort_value,
             settings_path: Some(&worker_settings_path),
@@ -496,6 +505,9 @@ impl ExecutionRunner for PaneSpawnRunner {
                 // so the settings posture and the forced CLI permission mode
                 // are driven by one value and cannot diverge.
                 worker_kind,
+                // Same Arc resolved above for provision/spawn — settings
+                // wiring and live-state capability flags use it too.
+                driver: driver.clone(),
             },
             StdDuration::from_secs(30),
         )
@@ -658,6 +670,7 @@ mod pane_spawn_tests {
     use super::super::engine_events_socket_path;
     use super::*;
     use crate::app::SendToAppError;
+    use crate::driver::AgentDriver;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::protocol::{
         EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,

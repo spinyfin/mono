@@ -19,7 +19,7 @@ fn standard_worker_gets_checkleft_push_guard() {
     // A standard (implementation) worker must carry the deterministic
     // pre-push checkleft gate as a Bash-matched PreToolUse hook.
     let input = sample_input(); // Standard chore worker
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let cmd = checkleft_push_guard_command(&parsed)
         .expect("standard worker PreToolUse must include the checkleft push guard");
     assert!(cmd.contains("python3"), "guard must run via python3: {cmd}");
@@ -50,7 +50,7 @@ fn reviewer_and_triage_workers_omit_checkleft_push_guard() {
     for kind in [WorkerKind::Reviewer, WorkerKind::Triage] {
         let mut input = sample_input();
         input.worker_kind = kind.clone();
-        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
         assert!(
             checkleft_push_guard_command(&parsed).is_none(),
             "{kind:?} worker must not carry the checkleft push guard",
@@ -63,7 +63,7 @@ fn remote_workers_omit_checkleft_push_guard() {
     // Remote SSH workers skip the push guard: the gate script is never
     // shipped to the remote host (same reason the path guard is dropped).
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_remote_settings_json(&input, &ClaudeDriver)).unwrap();
     assert!(
         checkleft_push_guard_command(&parsed).is_none(),
         "remote workers must not carry the checkleft push guard",

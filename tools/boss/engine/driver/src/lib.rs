@@ -1110,7 +1110,7 @@ pub mod claude;
 pub mod registry;
 
 pub use claude::ClaudeDriver;
-pub use registry::DriverRegistry;
+pub use registry::{DriverRegistry, UnknownDriverSlug};
 
 /// Shared test fixture for crates that need an [`AgentDriver`] stand-in
 /// without a second real driver implementation. Unconditionally compiled
@@ -1197,8 +1197,15 @@ pub mod test_support {
         fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
             self.post_hoc_interception_fn
         }
-        fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
-            unimplemented!()
+        fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
+            // Distinctive, non-Claude command line so call-site cutover tests
+            // can prove a registered stub (not ClaudeDriver) produced the
+            // spawn plan. Uses the descriptor's binary so each stub is
+            // recognisable by slug without a custom impl.
+            SpawnPlan {
+                command: format!("{} --model {}\n", self.descriptor.binary, request.model),
+                env: vec![],
+            }
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
@@ -1210,10 +1217,14 @@ pub mod test_support {
             unimplemented!()
         }
         fn progress_fidelity(&self) -> ProgressFidelity {
-            unimplemented!()
+            // Minimal tier: call-site cutover tests that seed live state
+            // from a stub don't need a Claude-shaped cadence.
+            ProgressFidelity::Minimal
         }
         fn progress_observation_wiring(&self, _: &ProgressObservationConfig) -> ProgressIngress {
-            unimplemented!()
+            // No hooks: a StdoutJsonl-shaped ingress. `write_workspace_files`
+            // / settings rendering tolerate an empty hooks map.
+            ProgressIngress::StdoutJsonl
         }
         fn normalize_progress_event(&self, _: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
             unimplemented!()
@@ -1226,10 +1237,14 @@ pub mod test_support {
             None
         }
         fn tool_use_interception_wiring(&self, _: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
-            unimplemented!()
+            ToolUseInterceptionWiring {
+                pre_tool_use_hooks: Vec::new(),
+            }
         }
         fn agent_rules_preamble(&self) -> &'static str {
-            unimplemented!()
+            // Distinctive marker so write_workspace_files tests can prove
+            // the rendered agent-rules file came from this stub, not Claude.
+            "# stub-driver preamble\n"
         }
         fn transcript_path_for_session(&self, _: &serde_json::Value) -> Option<String> {
             None
