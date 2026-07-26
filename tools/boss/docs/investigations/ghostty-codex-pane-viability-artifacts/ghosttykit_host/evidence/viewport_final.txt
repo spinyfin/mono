@@ -1,0 +1,15 @@
+zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh
+Last login: Sun Jul 26 04:14:48 on ttys004
+brianduff@brians-laptop run_out % zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/pane_script.sh
+{"type":"thread.started","thread_id":"019f9e22-a1d8-7660-8657-7c39f7a6e43e"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Running the requested command."}}
+echo GKIT_INJECT_VIA_SURFACE_TEXT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/injected_side_effect.txt
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 18'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc 'sleep 18'","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"gkit-embed-done"}}
+{"type":"turn.completed","usage":{"input_tokens":51221,"cached_input_tokens":38656,"cache_write_input_tokens":0,"output_tokens":157,"reasoning_output_tokens":58}}
+SCRIPT_DONE
+brianduff@brians-laptop run_out % echo GKIT_INJECT_VIA_SURFACE_TEXT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/injected_side_effect.txt
+brianduff@brians-laptop run_out % echo GKIT_POST_EXIT_INJECT > /Users/brianduff/.local/share/cube/workspaces/mono-agent-003/tools/boss/docs/investigations/ghostty-codex-pane-viability-artifacts/ghosttykit_host/run_out/post_exit_side_effect.txt
+brianduff@brians-laptop run_out % 

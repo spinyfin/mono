@@ -1,0 +1,6 @@
+host: ghosttykit_spike (throwaway)
+codex_bin: /Users/brianduff/.local/bin/codex
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+date: 2026-07-26T11:14:55Z
