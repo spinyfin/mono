@@ -97,3 +97,7 @@ cp ~/.codex/auth.json "$CH/auth.json"   # then expire access_token in the COPY o
 ```
 
 Automated coverage lives in `//tools/boss/codex_auth:codex_auth_test` (synthetic auth JSON only; no live Codex, no real credentials).
+
+## Follow-up hardening (credential write / adopt)
+
+The crate later hardened private-file writes (`O_EXCL` temp + mode `0o600` at open), RFC3339 `last_refresh` ordering, per-run symlink refusal under lock, and pure path resolution for tests. PR description text must not include internal tracker short-ids; describe changes by content.
