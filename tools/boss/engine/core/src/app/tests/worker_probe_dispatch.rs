@@ -106,8 +106,9 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 
     // Map the execution (via its exec_* id) to slot 1 so dispatch_probe_on_stop
     // has a target for `SendToPane`. In production BOSS_RUN_ID carries
-    // execution.id (exec_*), not run.id (run_*).
-    server_state.worker_registry.register_run_slot(execution.id.clone(), 1);
+    // execution.id (exec_*), not run.id (run_*). Park activity at Idle so
+    // the Stop-path activity guard (fail closed) allows the write.
+    register_idle_worker(&server_state, &execution.id, 1);
 
     // Subscribe a session to the per-run probe topic and pin the
     // ServerState so probe pushes have somewhere to land.
@@ -223,10 +224,12 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
 /// mid-turn (`Working`) must **not** write to the pane. Injecting into
 /// a non-accepting foreground process is a safety issue
 /// (ghostty-codex-pane-viability Q2 Layer D), not hygiene. The probe is
-/// re-queued for the next Stop boundary and a `ProbeDeliveryEscalated`
-/// push surfaces the refusal.
+/// left queued for the next Stop boundary (no pop), and Working-on-
+/// PostToolUse is treated as *expected* deferral — no
+/// `ProbeDeliveryEscalated` (multi-tool turns must not spam once per
+/// tool).
 #[tokio::test]
-async fn dispatch_urgent_probe_refuses_when_worker_not_accepting_input() {
+async fn dispatch_urgent_probe_defers_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
@@ -267,37 +270,26 @@ async fn dispatch_urgent_probe_refuses_when_worker_not_accepting_input() {
     assert_eq!(
         app_sink.queue_stats().depth,
         0,
-        "refused urgent probe must not enqueue SendToPane"
+        "deferred urgent probe must not enqueue SendToPane"
     );
-    // Probe is re-queued for Stop-boundary delivery (not silently dropped).
-    assert!(
-        server_state.pop_pending_probe(run_id).is_some(),
-        "refused urgent probe must be re-queued for Stop boundary",
-    );
+    // Probe remains queued (never popped) for Stop-boundary delivery.
+    let still = server_state
+        .pop_pending_probe(run_id)
+        .expect("deferred urgent probe must remain queued for Stop boundary");
+    assert_eq!(still.probe_id, probe_id);
+    assert!(still.urgent);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeLifecycleState::Queued),
     );
 
-    let envelope = watch_sink
-        .next()
-        .await
-        .expect("ProbeDeliveryEscalated should surface the refusal");
-    match envelope.payload {
-        FrontendEvent::ProbeDeliveryEscalated {
-            run_id: emitted_run,
-            probe_id: emitted_probe,
-            reason,
-        } => {
-            assert_eq!(emitted_run, run_id);
-            assert_eq!(emitted_probe, probe_id);
-            assert!(
-                reason.contains("not accepting typed input"),
-                "escalation reason must name the activity guard; got {reason:?}"
-            );
-        }
-        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
-    }
+    // Expected Working deferral must not publish ProbeDeliveryEscalated.
+    let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
+    assert!(
+        drain.is_err(),
+        "Working-on-PostToolUse deferral must not escalate; got {:?}",
+        drain.map(|e| e.map(|env| format!("{:?}", env.payload))),
+    );
 }
 
 /// When the activity guard passes (worker Idle) but the CLI never
@@ -506,9 +498,9 @@ async fn probe_queued_for_idle_worker_dispatches_immediately() {
 /// queued against such a session stalled forever: it has already
 /// produced its terminal `Stop` for this turn, so `dispatch_probe_on_stop`
 /// never fires again on its own, and `dispatch_probe_if_idle` only
-/// recognized `WorkerActivity::Idle`. Meanwhile `bossctl agents send`
-/// (raw pane input, no activity check) reached the same session
-/// immediately — this test locks in that probe delivery now matches.
+/// recognized `WorkerActivity::Idle`. `send_input_to_worker` /
+/// `bossctl agents send` use the same activity guard (Idle /
+/// WaitingForInput accept typed input), so probe delivery matches.
 #[tokio::test]
 async fn probe_queued_for_waiting_for_input_worker_dispatches_immediately() {
     use boss_protocol::{RequestExecutionInput, WorkerActivity, WorkerEvent};
@@ -637,7 +629,8 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
         })
         .unwrap();
 
-    server_state.worker_registry.register_run_slot(run.id.clone(), 1);
+    // Idle live state so the Stop-path fail-closed activity guard allows delivery.
+    register_idle_worker(&server_state, &run.id, 1);
 
     // Queue a probe manually (simulating what the completion handler does)
     // BEFORE dispatch_probe_on_stop fires, to verify the dispatch picks it up.
@@ -733,4 +726,198 @@ async fn probe_dispatch_ignores_a_stop_from_a_driver_with_no_turn_boundary() {
         .pop_pending_probe(run_id)
         .expect("probe must survive an event the driver does not call a turn boundary");
     assert_eq!(still_queued.probe_id, probe_id);
+}
+
+/// Multi-tool mid-turn: each `PostToolUse` forces activity to `Working`
+/// before urgent dispatch. The urgent path must short-circuit without
+/// popping and must not publish `ProbeDeliveryEscalated` once per tool.
+#[tokio::test]
+async fn urgent_probe_multi_tool_post_tool_use_does_not_escalate_spam() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-urgent-multi-tool";
+    register_working_worker(&server_state, run_id, 9);
+
+    let watch_session_id = "session-probe-watch-multi".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "redirect now".into(), true);
+
+    for tool in ["Bash", "Edit", "Read"] {
+        let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
+            WorkerEvent::PostToolUse {
+                session_id: "claude-sess-1".into(),
+                tool_name: tool.into(),
+                tool_input: serde_json::json!({}),
+                tool_response: serde_json::json!({}),
+            },
+            Some(run_id.to_owned()),
+            None,
+        );
+        // Production fan-out order: live-state apply first (forces Working),
+        // then urgent probe dispatch.
+        dispatch_live_worker_state(&server_state, &post_tool_use).await;
+        dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await;
+    }
+
+    let still = server_state
+        .pop_pending_probe(run_id)
+        .expect("urgent probe must remain queued across multi-tool deferrals");
+    assert_eq!(still.probe_id, probe_id);
+    assert!(still.urgent);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeLifecycleState::Queued),
+    );
+
+    let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
+    assert!(
+        drain.is_err(),
+        "multi-tool PostToolUse deferrals must not publish ProbeDeliveryEscalated; got {:?}",
+        drain.map(|e| e.map(|env| format!("{:?}", env.payload))),
+    );
+}
+
+/// Production-shaped ordering: `dispatch_worker_event_fanout` applies
+/// PostToolUse → Working before urgent dispatch, so Confirmed inject
+/// arms are not reachable mid-turn. The probe stays queued, then
+/// delivers on the subsequent Stop when activity becomes Idle.
+#[tokio::test]
+async fn urgent_probe_defers_through_fanout_then_delivers_on_stop() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-urgent-fanout-stop";
+    // Start mid-turn so the first PostToolUse keeps Working.
+    register_working_worker(&server_state, run_id, 3);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "please pivot".into(), true);
+
+    // Mid-turn tool boundary via full fan-out (production shape).
+    let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "claude-sess-1".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::json!({}),
+            tool_response: serde_json::json!({}),
+        },
+        Some(run_id.to_owned()),
+        None,
+    );
+    dispatch_worker_event_fanout(&server_state, &post_tool_use).await;
+
+    assert_eq!(
+        app_sink.queue_stats().depth,
+        0,
+        "fan-out PostToolUse while Working must not SendToPane"
+    );
+    // Peek without consuming for the Stop step: re-queue after assert.
+    let still = server_state
+        .pop_pending_probe(run_id)
+        .expect("probe must still be queued after mid-turn fan-out");
+    assert_eq!(still.probe_id, probe_id);
+    server_state.requeue_probe_front(run_id.to_owned(), still);
+
+    // Turn ends: Stop flips activity to Idle, then probe dispatches.
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink
+            .next()
+            .await
+            .expect("SendToPane must arrive on Stop after urgent deferral");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+    );
+    // Production order: live-state (Idle) then probe dispatch.
+    dispatch_live_worker_state(&server_state, &stop).await;
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    tokio::time::timeout(Duration::from_secs(2), app_responder)
+        .await
+        .expect("timed out waiting for Stop-boundary SendToPane")
+        .expect("app_responder panicked");
+
+    assert!(
+        server_state.pop_pending_probe(run_id).is_none(),
+        "probe must be consumed on Stop after mid-turn deferral",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeLifecycleState::Consumed),
+    );
+}
+
+/// Stop-path activity guard is fail-closed: missing live state must not
+/// write to the pane (ghostty-codex-pane-viability Q2 Layer D). The
+/// probe stays queued for a later attempt once live state is known.
+#[tokio::test]
+async fn dispatch_probe_on_stop_refuses_when_live_state_missing() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-stop-no-live";
+    server_state.worker_registry.register_run_slot(run_id, 2);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "hello?".into(), false);
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+    );
+    dispatch_probe_on_stop(&server_state, &stop).await;
+
+    assert_eq!(
+        app_sink.queue_stats().depth,
+        0,
+        "missing live state must fail closed — no SendToPane"
+    );
+    let still = server_state
+        .pop_pending_probe(run_id)
+        .expect("probe must remain queued when Stop refuses");
+    assert_eq!(still.probe_id, probe_id);
 }

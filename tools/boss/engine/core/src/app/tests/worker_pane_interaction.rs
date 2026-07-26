@@ -274,6 +274,48 @@ async fn send_input_to_worker_refuses_when_worker_not_accepting_input() {
     );
 }
 
+/// Chore-update notify path: when `send_input_to_worker` refuses mid-turn
+/// (`NotAcceptingInput`), the notice must be re-queued as a non-urgent
+/// probe for Stop/idle delivery — never silently discarded.
+#[tokio::test]
+async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
+    use boss_protocol::WorkerActivity;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-chore-mid-turn";
+    register_working_worker(&server_state, run_id, 5);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let msg = build_chore_update_message("old", "new", "old desc", "new desc").expect("message");
+
+    // Mirror work_items chore-update notify: attempt immediate inject,
+    // requeue on NotAcceptingInput.
+    match server_state.send_input_to_worker(run_id, msg.clone()).await {
+        Err(SendInputError::NotAcceptingInput {
+            activity: Some(WorkerActivity::Working),
+        }) => {
+            let probe_id = server_state.queue_probe(run_id.to_owned(), msg.clone(), /*urgent=*/ false);
+            assert_eq!(
+                server_state.probe_lifecycle_state(&probe_id),
+                Some(ProbeLifecycleState::Queued),
+            );
+        }
+        other => panic!("expected NotAcceptingInput(Working), got {other:?}"),
+    }
+
+    assert_eq!(sink.queue_stats().depth, 0, "mid-turn must not SendToPane");
+
+    let queued = server_state
+        .pop_pending_probe(run_id)
+        .expect("chore-update notice must be re-queued for Stop delivery");
+    assert!(!queued.urgent, "chore-update requeue must be non-urgent (Stop path)");
+    assert_eq!(queued.text, msg);
+}
+
 /// Fail closed when the slot has no live-worker-state entry: unknown
 /// is not "accepting typed input".
 #[tokio::test]
