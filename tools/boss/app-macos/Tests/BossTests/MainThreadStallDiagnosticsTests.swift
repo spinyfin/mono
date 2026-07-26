@@ -83,9 +83,9 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(decoded.backtrace).isEmpty)
     }
 
-    func testStallRecordDecodeAcceptsAddressOnlyLegacyLines() throws {
-        // Older JSONL lines may lack `backtrace`; decode must not fail, and
-        // live symbolication still works from frame_addresses.
+    func testStallRecordDecodeAcceptsAddressOnlyWithoutBacktrace() throws {
+        // Intermediate JSONL lines may lack `backtrace`; decode must not
+        // fail, and live symbolication still works from frame_addresses.
         let json = """
         {"context":"Data","duration_ms":300,"frame_addresses":["0x1","0x2"],\
         "heartbeat_interval_ms":100,"id":"00000000-0000-0000-0000-000000000002",\
@@ -95,6 +95,28 @@ final class MainThreadStallDiagnosticsTests: XCTestCase {
         XCTAssertEqual(decoded.frameAddresses, [1, 2])
         XCTAssertNil(decoded.backtrace)
         XCTAssertFalse(decoded.symbolicatedBacktrace().isEmpty)
+    }
+
+    func testStallRecordDecodeAcceptsLegacyBacktraceWithoutFrameAddresses() throws {
+        // True pre-address-storage JSONL wrote only symbolicated `backtrace`
+        // strings — no `frame_addresses` key. Decode must default addresses
+        // to [] and prefer the durable backtrace for display/export.
+        let json = """
+        {"backtrace":["0  Boss  0x1 foo + 0","1  Boss  0x2 bar + 4"],\
+        "context":"Legacy","duration_ms":400,"heartbeat_interval_ms":100,\
+        "id":"00000000-0000-0000-0000-000000000003","threshold_ms":250,\
+        "ts_epoch_ms":1700000000000}
+        """
+        let decoded = try JSONDecoder().decode(StallRecord.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.frameAddresses, [])
+        XCTAssertEqual(
+            decoded.backtrace,
+            ["0  Boss  0x1 foo + 0", "1  Boss  0x2 bar + 4"]
+        )
+        XCTAssertEqual(
+            decoded.symbolicatedBacktrace(),
+            ["0  Boss  0x1 foo + 0", "1  Boss  0x2 bar + 4"]
+        )
     }
 
     func testDurableBacktracePreferredOverLiveAddresses() {

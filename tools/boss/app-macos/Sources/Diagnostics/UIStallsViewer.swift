@@ -124,9 +124,18 @@ struct UIStallsViewer: View {
         } else {
             records = log.snapshot()
         }
-        // Drop cache entries for stalls that have aged out of the ring.
+        // Drop cache/expansion for stalls that left the window (age-out or
+        // since-filter tighten). Leaving `expanded` set while clearing the
+        // cache produces a false "No backtrace captured" for still-expanded
+        // rows after a widen, because body only *reads* the cache.
         let live = Set(records.map(\.id))
         symbolicatedCache = symbolicatedCache.filter { live.contains($0.key) }
+        expanded = expanded.intersection(live)
+        // Defensive re-seed: any still-expanded live row missing a cache
+        // entry is filled on the refresh/action path (never in `body`).
+        for rec in records where expanded.contains(rec.id) && symbolicatedCache[rec.id] == nil {
+            symbolicatedCache[rec.id] = rec.symbolicatedBacktrace()
+        }
     }
 
     /// Expand/collapse handler. Symbolication runs here (action path),

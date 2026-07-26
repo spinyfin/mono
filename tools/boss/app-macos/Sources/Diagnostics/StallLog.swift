@@ -86,7 +86,11 @@ struct StallRecord: Codable, Identifiable, Sendable, Equatable {
         heartbeatIntervalMs = try c.decode(Double.self, forKey: .heartbeatIntervalMs)
         thresholdMs = try c.decode(Double.self, forKey: .thresholdMs)
         context = try c.decode(String.self, forKey: .context)
-        let hexes = try c.decode([String].self, forKey: .frameAddresses)
+        // True legacy JSONL (pre-address storage) wrote only symbolicated
+        // `backtrace` strings — accept missing `frame_addresses` as [].
+        // Address-only lines (post-defer, pre-durable-backtrace) still
+        // decode with `backtrace` absent and live symbolication from addresses.
+        let hexes = try c.decodeIfPresent([String].self, forKey: .frameAddresses) ?? []
         frameAddresses = try hexes.map { hex in
             let trimmed = hex.hasPrefix("0x") || hex.hasPrefix("0X")
                 ? String(hex.dropFirst(2))
@@ -222,9 +226,9 @@ final class StallLog: @unchecked Sendable {
     /// Append a stall to the ring (synchronous, lock-guarded) and queue
     /// the JSONL line for the on-disk mirror (asynchronous).
     ///
-    /// The ring keeps the capture-path record (raw addresses). Encode runs
-    /// on the private queue and fills durable `backtrace` strings so the
-    /// JSONL mirror remains useful after process death / ASLR change.
+    /// The ring keeps the capture-path record (raw addresses). Encode and
+    /// durable symbolication run on the private queue so the watchdog /
+    /// capture caller never pays for `dladdr` or JSON serialization.
     func record(_ rec: StallRecord) {
         ring.withLock { buf in
             buf.append(rec)
@@ -233,11 +237,13 @@ final class StallLog: @unchecked Sendable {
             }
         }
 
-        guard directory != nil,
-              let json = try? Self.encoder.encode(rec) else { return }
-        let lineData = json + Data([0x0A])
-        let when = Date(timeIntervalSince1970: Double(rec.tsEpochMs) / 1000.0)
+        guard directory != nil else { return }
+        // Encode (incl. symbolicate-on-write for durable `backtrace`) on the
+        // private queue — never on the capture/watchdog path.
         queue.async { [self] in
+            guard let json = try? Self.encoder.encode(rec) else { return }
+            let lineData = json + Data([0x0A])
+            let when = Date(timeIntervalSince1970: Double(rec.tsEpochMs) / 1000.0)
             let dateStr = dateFormatter.string(from: when)
             if dateStr != currentDate || fileHandle == nil {
                 if dateStr != currentDate {
