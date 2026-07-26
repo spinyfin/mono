@@ -4,6 +4,7 @@
 //! hook events live here. Pure structural move — no behavioural change.
 
 use super::*;
+use crate::driver::{AgentDriver, Capability, ClaudeDriver};
 
 impl ServerState {
     /// First call for a given `execution_id` returns `true` (and remembers
@@ -37,6 +38,89 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
         WorkerEvent::Notification { .. } => "notification",
         WorkerEvent::SessionEnd { .. } => "session_end",
     }
+}
+
+/// The engine's [`crate::stdout_progress::WorkerEventSink`]: a
+/// `ProgressIngress::StdoutJsonl` driver's progress lands here and takes the
+/// identical fan-out the events-socket accept loop takes for a
+/// `ProgressIngress::HookCallback` driver. This impl is the whole of the
+/// stdout arm's engine-side behaviour — everything downstream of it is shared
+/// with the hook path, by construction.
+/// Implemented on `Arc<ServerState>` rather than `ServerState` because the
+/// fan-out's handlers clone the `Arc` into spawned work; `&self` is then
+/// already the `&Arc<ServerState>` they need.
+#[async_trait::async_trait]
+impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
+    async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
+        dispatch_worker_event_fanout(self, &incoming).await;
+    }
+}
+
+/// Fan one normalised worker event out to every engine subsystem that reacts
+/// to worker progress, in the order those subsystems require.
+///
+/// Transport-agnostic on purpose. Both progress ingresses converge here:
+/// [`crate::events_socket`] (a `ProgressIngress::HookCallback` driver's
+/// `boss-event` shim over the unix socket) and
+/// [`crate::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
+/// stdout stream). By the time an event reaches this function the driver has
+/// already normalised it, so which transport carried it is no longer
+/// observable — which is exactly the property that makes live-status, the
+/// staleness sweeps, and the kanban see the same shapes from either one.
+///
+/// Ordering here is load-bearing; see the per-call comments.
+pub(super) async fn dispatch_worker_event_fanout(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    // Audit *before* the live-state fan-out
+    // so an engine-side mismatch in the
+    // dispatch path can't drop the audit line
+    // — the deny is enforced harness-side by
+    // claude already, this is the independent
+    // forensic record. See
+    // [`worker_sandbox_audit`] for why.
+    crate::worker_sandbox_audit::record_if_sandbox_attempt(
+        &server_state.dispatch_event_root,
+        incoming.run_id.as_deref(),
+        &incoming.event,
+    );
+    crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
+    dispatch_live_worker_state(server_state, incoming).await;
+    // Editorial PreToolUse audit: evaluate every
+    // `gh pr|issue` Bash invocation against the
+    // product's editorial rules and record the
+    // decision in `editorial_actions`. Fire-and-
+    // forget; never blocks the event dispatch.
+    dispatch_editorial_on_pretooluse(server_state, incoming).await;
+    // Post-hoc interception fallback: for any driver
+    // that lacks real-time PreToolUse hooks (the
+    // ToolUseInterception Degrade path), this is the
+    // only place editorial/path/revision-PR/
+    // checkleft loss ever gets surfaced. No-op for
+    // Claude, which already ran those guards above.
+    dispatch_post_hoc_interception_on_post_tool_use(server_state, incoming).await;
+    // Urgent probes fire on PostToolUse so
+    // the coordinator can redirect a worker
+    // mid-task without waiting for Stop. The
+    // tool call has already returned at this
+    // point, so no in-flight work is lost.
+    dispatch_urgent_probe_on_post_tool_use(server_state, incoming).await;
+    // ProbeReplied runs first: emit the reply for the
+    // prior probe before dispatching the next one so
+    // a single Stop never fires both reply and dispatch
+    // for the same probe (the reply text hasn't been
+    // written yet at dispatch time).
+    //
+    // Completion runs before probe dispatch: probes
+    // queued by the completion handler (e.g.
+    // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
+    // so they are delivered on the *same* Stop that
+    // triggered them rather than stalling until the
+    // next Stop (which never comes for an idle worker).
+    dispatch_probe_reply_on_stop(server_state, incoming).await;
+    dispatch_completion_on_stop(server_state, incoming).await;
+    dispatch_probe_on_stop(server_state, incoming).await;
 }
 
 pub(super) async fn dispatch_live_worker_state(
@@ -185,10 +269,10 @@ pub(super) async fn dispatch_live_worker_state(
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
-                    // the T267-class contradiction where a run we think is
-                    // dead is demonstrably alive (its worker is still
-                    // emitting hooks). If so, make it LOUD and countable
-                    // instead of swallowing it silently.
+                    // the contradiction where a run we think is dead is
+                    // demonstrably alive (its worker is still emitting
+                    // hooks). If so, make it LOUD and countable instead
+                    // of swallowing it silently.
                     if !note_hook_for_terminal_execution(server_state, run_id, event_kind) {
                         tracing::warn!(
                             run_id,
@@ -434,9 +518,19 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         // local pid, so 0 (the live state stores it but the value is
         // only meaningful for the local ancestor-walk correlation that
         // remote runs bypass via the `_boss_run_id` token).
-        server_state
-            .live_worker_states
-            .register_spawn(slot_id, run_id, model, 0, binding);
+        // Remote workers are Claude-only today (the `model` fallback above
+        // is the literal label `"claude"` — see the driver-abstraction
+        // design doc's "Remote/SSH driver-awareness" future task), so this
+        // mirrors the local spawn path's derivation, passing the capability
+        // straight into registration rather than a follow-up setter call.
+        server_state.live_worker_states.register_spawn_with_capabilities(
+            slot_id,
+            run_id,
+            model,
+            0,
+            binding,
+            ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
+        );
         tracing::info!(
             run_id,
             slot_id,
@@ -451,9 +545,9 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
 /// When a hook event arrives for a run with no live slot mapping,
 /// determine whether the engine already considers that execution
 /// terminal. A terminal execution that is *still emitting worker hook
-/// events* is the T267-class contradiction: the engine believed the run
-/// dead — because an ack-timeout was once mis-handled as a spawn failure,
-/// or a sweep reaped it — yet its worker is demonstrably alive. Emit a
+/// events* is a contradiction: the engine believed the run dead — because
+/// an ack-timeout was once mis-handled as a spawn failure, or a sweep
+/// reaped it — yet its worker is demonstrably alive. Emit a
 /// loud `[engine-reconcile]` diagnostic and bump the
 /// `dispatcher.hook_events.for_terminal_execution` counter so the
 /// mismatch is observable rather than silently swallowed (the "engine has
@@ -1463,6 +1557,7 @@ mod post_hoc_interception_decision_tests {
                 engine_default: "stub-model",
                 effort_value_for_level: |_| None,
                 default_model_for_level: |_| "stub-model",
+                model_for_reasoning: |_| "stub-model",
                 prompt_addendum_for_level: |_| None,
                 model_requires_auto_permissions: |_| false,
             },

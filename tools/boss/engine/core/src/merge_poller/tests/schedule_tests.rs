@@ -72,36 +72,49 @@ fn poll_tier_classifies_open_pr_signals() {
     );
 }
 
-/// [`PrPollSchedule`]: `seed_defaults` must not clobber an entry
-/// already scheduled by a real probe outcome, `drain_due` must
-/// return exactly (and only) the entries due by the given instant,
-/// and rescheduling with `None` must stop tracking a PR entirely.
+/// [`PrPollSchedule`]: a sweep's observations must not clobber a due time
+/// already set by a real probe outcome, `drain_due_within` must return
+/// exactly (and only) the entries due by the given instant, and
+/// rescheduling with `None` must stop tracking a PR entirely.
+///
+/// A 600 s sweep interval here so both tiers still poll faster than the
+/// sweep and hold slots — the tier-vs-sweep predicate has its own tests in
+/// `adaptive_tests.rs`.
 #[test]
-fn pr_poll_schedule_seed_drain_and_reschedule() {
+fn pr_poll_schedule_observe_drain_and_reschedule() {
     let mut schedule = PrPollSchedule::default();
     let now = Instant::now();
+    let sweep = Duration::from_secs(600);
 
     // A real probe already scheduled pr1 as Cold (long interval).
-    schedule.reschedule("pr1", Some(PollTier::Cold), now);
-    // Seeding defaults must not override that — pr1 stays Cold-scheduled,
-    // far in the future — while pr2 (never seen) gets a fresh Hot slot.
-    schedule.seed_defaults(["pr1".to_owned(), "pr2".to_owned()], now);
+    schedule.reschedule("pr1", Some(PollTier::Cold), now, sweep);
+    // A sweep observing both must not override that — pr1 stays
+    // Cold-scheduled, far in the future — while pr2 (never seen) gets a
+    // fresh Hot slot.
+    schedule.apply_sweep_observations(
+        &[
+            ("pr1".to_owned(), Some(PollTier::Cold)),
+            ("pr2".to_owned(), Some(PollTier::Hot)),
+        ],
+        now,
+        sweep,
+    );
 
     // Only pr2's Hot (40 s) slot should be due at now + 45s; pr1's Cold
     // (180 s) slot is not.
-    let due = schedule.drain_due(now + Duration::from_secs(45));
+    let due = schedule.drain_due_within(now + Duration::from_secs(45), Duration::ZERO);
     assert_eq!(due, vec!["pr2".to_owned()]);
 
     // pr1 is still tracked (its Cold slot hasn't arrived yet).
     assert!(schedule.next_due().is_some());
-    let due_later = schedule.drain_due(now + Duration::from_secs(200));
+    let due_later = schedule.drain_due_within(now + Duration::from_secs(200), Duration::ZERO);
     assert_eq!(due_later, vec!["pr1".to_owned()]);
     assert!(schedule.next_due().is_none());
 
     // Rescheduling with `None` stops tracking immediately.
-    schedule.reschedule("pr3", Some(PollTier::Hot), now);
+    schedule.reschedule("pr3", Some(PollTier::Hot), now, sweep);
     assert!(schedule.next_due().is_some());
-    schedule.reschedule("pr3", None, now);
+    schedule.reschedule("pr3", None, now, sweep);
     assert!(schedule.next_due().is_none());
 }
 
@@ -414,13 +427,14 @@ async fn a_pass_slower_than_its_cadence_is_counted_even_when_it_completes() {
 async fn an_overrunning_targeted_reconcile_is_abandoned() {
     let metrics = Registry::new();
     crate::merge_poller::init(&metrics);
-    let out = reconcile_one_within_budget(
+    let urls = vec!["https://github.com/foo/bar/pull/1".to_owned()];
+    let out = reconcile_batch_within_budget(
         &metrics,
         async {
             tokio::time::sleep(RECONCILE_ONE_TIMEOUT * 4).await;
-            (SweepOutcome::default(), None)
+            (SweepOutcome::default(), Vec::new())
         },
-        "https://github.com/foo/bar/pull/1",
+        &urls,
     )
     .await;
     assert!(
@@ -428,4 +442,26 @@ async fn an_overrunning_targeted_reconcile_is_abandoned() {
         "a targeted reconcile must not hold the wait loop past its budget",
     );
     assert_eq!(metrics.counter_value("merge_poller.pass_timed_out"), Some(1));
+}
+
+/// A batch's budget grows with the local per-candidate work it carries but
+/// never reaches a full pass's: its GitHub cost is two round trips whether
+/// it holds 1 PR or 40.
+#[test]
+fn reconcile_batch_budget_grows_with_size_and_is_capped() {
+    assert_eq!(reconcile_batch_budget(1), RECONCILE_ONE_TIMEOUT);
+    assert_eq!(
+        reconcile_batch_budget(0),
+        RECONCILE_ONE_TIMEOUT,
+        "an empty batch must not underflow the per-PR term",
+    );
+    assert_eq!(
+        reconcile_batch_budget(4),
+        RECONCILE_ONE_TIMEOUT + RECONCILE_BATCH_TIMEOUT_PER_PR * 3,
+    );
+    assert_eq!(
+        reconcile_batch_budget(500),
+        MIN_PASS_TIMEOUT,
+        "a large due set must not hold the wait loop as long as a full pass may",
+    );
 }

@@ -1181,14 +1181,17 @@ pub async fn serve_with_merge_probe(
     // (the process is alive), so this reaps the execution and releases
     // the slot for redispatch. Runs every 60s and fires on boot.
     let _stale_worker_sweep_handle = crate::stale_worker_sweep::spawn_loop(
-        server_state.work_db.clone(),
-        server_state.live_worker_states.clone(),
-        server_state.execution_coordinator.clone(),
-        server_state.dispatch_events.clone(),
-        // Reap via the same `release_worker_pane` teardown as `bossctl
-        // agents stop` so a reconcile-cancel kills the worker's process
-        // tree before its slot/lease is freed.
-        server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+        crate::stale_worker_sweep::StaleWorkerSweepDeps {
+            work_db: server_state.work_db.clone(),
+            live_states: server_state.live_worker_states.clone(),
+            coordinator: server_state.execution_coordinator.clone(),
+            dispatch_events: server_state.dispatch_events.clone(),
+            // Reap via the same `release_worker_pane` teardown as `bossctl
+            // agents stop` so a reconcile-cancel kills the worker's
+            // process tree before its slot/lease is freed.
+            reaper: server_state.clone() as Arc<dyn crate::stale_worker_sweep::StaleWorkerReaper>,
+            hold_registry: server_state.hold_registry.clone(),
+        },
         Duration::from_secs(60),
         crate::stale_worker_sweep::DEFAULT_STALE_THRESHOLD_SECS,
     );
@@ -2064,54 +2067,7 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
                                 event = ?incoming.event,
                                 "events socket: hook event received",
                             );
-                            // Audit *before* the live-state fan-out
-                            // so an engine-side mismatch in the
-                            // dispatch path can't drop the audit line
-                            // — the deny is enforced harness-side by
-                            // claude already, this is the independent
-                            // forensic record. See
-                            // [`worker_sandbox_audit`] for why.
-                            crate::worker_sandbox_audit::record_if_sandbox_attempt(
-                                &server_state.dispatch_event_root,
-                                incoming.run_id.as_deref(),
-                                &incoming.event,
-                            );
-                            crate::events_socket::publish_hook_derived_events(&server_state.event_bus, &incoming).await;
-                            dispatch_live_worker_state(&server_state, &incoming).await;
-                            // Editorial PreToolUse audit: evaluate every
-                            // `gh pr|issue` Bash invocation against the
-                            // product's editorial rules and record the
-                            // decision in `editorial_actions`. Fire-and-
-                            // forget; never blocks the event dispatch.
-                            dispatch_editorial_on_pretooluse(&server_state, &incoming).await;
-                            // Post-hoc interception fallback: for any driver
-                            // that lacks real-time PreToolUse hooks (the
-                            // ToolUseInterception Degrade path), this is the
-                            // only place editorial/path/revision-PR/
-                            // checkleft loss ever gets surfaced. No-op for
-                            // Claude, which already ran those guards above.
-                            dispatch_post_hoc_interception_on_post_tool_use(&server_state, &incoming).await;
-                            // Urgent probes fire on PostToolUse so
-                            // the coordinator can redirect a worker
-                            // mid-task without waiting for Stop. The
-                            // tool call has already returned at this
-                            // point, so no in-flight work is lost.
-                            dispatch_urgent_probe_on_post_tool_use(&server_state, &incoming).await;
-                            // ProbeReplied runs first: emit the reply for the
-                            // prior probe before dispatching the next one so
-                            // a single Stop never fires both reply and dispatch
-                            // for the same probe (the reply text hasn't been
-                            // written yet at dispatch time).
-                            //
-                            // Completion runs before probe dispatch: probes
-                            // queued by the completion handler (e.g.
-                            // PROBE_NO_PR) must be visible to `dispatch_probe_on_stop`
-                            // so they are delivered on the *same* Stop that
-                            // triggered them rather than stalling until the
-                            // next Stop (which never comes for an idle worker).
-                            dispatch_probe_reply_on_stop(&server_state, &incoming).await;
-                            dispatch_completion_on_stop(&server_state, &incoming).await;
-                            dispatch_probe_on_stop(&server_state, &incoming).await;
+                            dispatch_worker_event_fanout(&server_state, &incoming).await;
                         }
                         Err(err) => {
                             tracing::warn!(?err, "events socket: failed to handle connection");

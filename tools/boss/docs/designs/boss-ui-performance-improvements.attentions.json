@@ -1,21 +1,10 @@
 [
   {
     "question_type": "multiple_choice",
-    "prompt": "The main-thread stall watchdog burns ~7% of a core symbolicating 64 frames through dladdr on every detection, including the captures it then discards as idle-loop false positives. The design recommends keeping it always-on in release and deferring symbolication until a record is actually read. Confirm the disposition before task 1 lands.",
+    "prompt": "The project goal says main-thread CPU, but the process sits at 25-90% CPU overall. The design's `consumeLines` receive-buffer-scan finding (278 top-of-stack samples) and its engine JSON-decode finding (~2114 samples on the EngineClient queue) are both real but both run off the main thread, so entries 12 and 13 are currently tagged deferred. Which is the actual target?",
     "choices": [
-      "Keep always-on in release with deferred symbolication (recommended)",
-      "Dev/debug builds only",
-      "Always-on but opt-in behind a setting, default off",
-      "Keep as-is; the overhead is acceptable"
-    ],
-    "anchor": "risks--open-questions"
-  },
-  {
-    "question_type": "multiple_choice",
-    "prompt": "The project goal says main-thread CPU, but the process sits at 25-90% CPU overall. Findings 3 and 6 (the EngineClient receive-buffer scan at 278 top-of-stack samples, and JSON decode at ~2114 samples) are real but run off the main thread, so they are currently tagged deferred. Which is the actual target?",
-    "choices": [
-      "Main-thread CPU only — keep tasks 12 and 13 deferred (recommended)",
-      "Total process CPU — promote tasks 12 and 13 to in-scope",
+      "Main-thread CPU only — keep entries 12 and 13 deferred (recommended)",
+      "Total process CPU — promote entries 12 and 13 to in-scope",
       "Main-thread first, then reassess off-main after the verification sweep"
     ],
     "anchor": "risks--open-questions"

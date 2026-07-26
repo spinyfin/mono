@@ -345,6 +345,7 @@ pub(crate) async fn compose_worker_spawn(
         product_dispatch_preamble,
         row_driver,
         product_default_driver,
+        row_reasoning,
     ) = match work_item {
         WorkItem::Task(task) | WorkItem::Chore(task) => {
             let product = work_db.get_product(&task.product_id).ok().flatten();
@@ -360,9 +361,10 @@ pub(crate) async fn compose_worker_spawn(
                 dispatch_preamble,
                 task.driver.clone(),
                 product_default_driver,
+                task.reasoning,
             )
         }
-        _ => (None, None, None, None, None, None, None),
+        _ => (None, None, None, None, None, None, None, None),
     };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
@@ -615,7 +617,9 @@ pub(crate) async fn compose_worker_spawn(
     // Products and projects do not have a TaskKind; only Task/Chore rows
     // carry one. Threaded into `resolve_spawn_config` so design-family kinds
     // (`Design` / `DesignPostmortem` / `Investigation`) floor to Opus
-    // regardless of effort level, and reused below for the capability gate.
+    // regardless of effort level *on rows that predate the `reasoning`
+    // column* — newer rows reach the same place through `row_reasoning`,
+    // which the resolver consults first. Reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
     let spawn_input = SpawnResolutionInput::builder()
@@ -626,6 +630,7 @@ pub(crate) async fn compose_worker_spawn(
         .maybe_task_driver(row_driver.as_deref())
         .maybe_product_default_driver(product_default_driver.as_deref())
         .maybe_kind(work_item_kind)
+        .maybe_reasoning(row_reasoning)
         .build();
     let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
         .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;

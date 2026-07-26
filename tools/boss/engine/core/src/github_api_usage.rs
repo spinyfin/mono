@@ -521,35 +521,38 @@ mod tests {
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 
-        // Fill a whole batch so the writer commits on the size trigger
-        // rather than on the timer — deterministic, and it exercises the
-        // path that actually carries volume in production.
+        // Fill a whole batch, so the size trigger is the commit path under
+        // test — the one that actually carries volume in production.
+        //
+        // Stamp the samples with a live timestamp rather than taking the
+        // fixture's epoch-1970 one: the writer's prune tick is ready on its
+        // very first `select!` pass (a tokio `interval` yields its first
+        // tick immediately), and prune deletes everything older than
+        // RETENTION. A 1970 `started_at_ms` is committed and then deleted
+        // out from under the assertions below.
+        let started_at_ms = boss_gh_telemetry::now_ms();
         for _ in 0..WRITE_BATCH_MAX {
-            tx.send(sample(
-                "merge_poller.adaptive",
-                GhApi::Graphql,
-                GhOutcome::Ok,
-                rl(2, 4972),
-            ))
-            .expect("writer task is alive");
+            let mut s = sample("merge_poller.adaptive", GhApi::Graphql, GhOutcome::Ok, rl(2, 4972));
+            s.started_at_ms = started_at_ms;
+            tx.send(s).expect("writer task is alive");
         }
 
-        // Let the writer drain. Bounded so a wiring failure ends as an
-        // assertion, not a hang.
-        let mut buckets = Vec::new();
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-            buckets = db.github_api_usage_by_caller(0).expect("query");
-            if !buckets.is_empty() {
-                break;
-            }
-        }
+        // Close the channel and await the writer's own completion signal:
+        // on `None` it commits whatever it still holds and returns, so the
+        // join is the point at which every sample is durably in the table.
+        //
+        // Polling the table instead races the 2s flush timer, which is free
+        // to fire mid-drain and commit a *partial* batch; the remainder then
+        // sits in `pending` until the next tick, and a reader that stops at
+        // the first non-empty result sees a short count.
+        drop(tx);
+        handle.await.expect("writer task exits cleanly once its senders drop");
 
+        let buckets = db.github_api_usage_by_caller(0).expect("query");
         assert_eq!(buckets.len(), 1, "the recorded calls must reach state.db");
         assert_eq!(buckets[0].caller, "merge_poller.adaptive");
         assert_eq!(buckets[0].calls, WRITE_BATCH_MAX as i64);
         assert_eq!(buckets[0].points, 2 * WRITE_BATCH_MAX as i64);
-        handle.abort();
     }
 
     #[tokio::test]
@@ -560,8 +563,12 @@ mod tests {
         let (tx, rx) = unbounded_channel::<GhCallSample>();
         let handle = spawn_writer(db.clone(), rx);
 
-        tx.send(sample("ci_watch", GhApi::Rest, GhOutcome::Ok, rl(1, 4000)))
-            .expect("writer task is alive");
+        // Live timestamp for the same reason as the test above: a row
+        // stamped in 1970 is outside RETENTION, and the writer's prune tick
+        // is entitled to delete it the moment it is committed.
+        let mut s = sample("ci_watch", GhApi::Rest, GhOutcome::Ok, rl(1, 4000));
+        s.started_at_ms = boss_gh_telemetry::now_ms();
+        tx.send(s).expect("writer task is alive");
         drop(tx);
         handle.await.expect("writer task exits cleanly when its senders drop");
 

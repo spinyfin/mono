@@ -239,6 +239,34 @@ pub async fn run_one_pass(
     completion_handler: Option<&WorkerCompletionHandler>,
     remediation: Option<&ConflictRemediationQueue>,
 ) -> SweepOutcome {
+    run_one_pass_observed(work_db, probe, publisher, cube_client, completion_handler, remediation)
+        .await
+        .0
+}
+
+/// [`run_one_pass`], plus the per-PR [`PollTier`] its probe implies for
+/// every candidate the pass considered.
+///
+/// The tiers are free: the pass already probed every one of these PRs, and
+/// throwing the classification away is what forced the adaptive layer to
+/// spend a probe of its own just to *discover* that a PR is cold. Handing
+/// them to [`PrPollSchedule::apply_sweep_observations`] lets the schedule be
+/// derived from the sweep rather than guessed and corrected.
+///
+/// The observation list covers every URL the pass *listed*, not only the
+/// ones it walked: the batched probe is taken up front for the whole set, so
+/// a pass abandoned mid-walk still classified them all. An entry the
+/// snapshot no longer holds (a mid-pass re-probe replaces the results map
+/// with just the unprocessed remainder) is reported as `None` — no adaptive
+/// slot, and the next sweep re-observes it.
+pub async fn run_one_pass_observed(
+    work_db: &WorkDb,
+    probe: &dyn MergeProbe,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    remediation: Option<&ConflictRemediationQueue>,
+) -> (SweepOutcome, Vec<PollObservation>) {
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
         Err(err) => {
@@ -309,7 +337,9 @@ pub async fn run_one_pass(
         + stranded_blocked.len()
         + late_pr_candidates.len();
     if total == 0 {
-        return SweepOutcome::default();
+        // No candidates at all: an empty observation set, which retires every
+        // remaining adaptive slot rather than leaving orphans behind.
+        return (SweepOutcome::default(), Vec::new());
     }
     tracing::debug!(
         in_review = in_review.len(),
@@ -480,7 +510,29 @@ pub async fn run_one_pass(
         .await;
     }
 
-    outcome
+    let observations = poll_observations(&probe_urls, &snapshot.results);
+    (outcome, observations)
+}
+
+/// Classify each probed URL into the tier that should drive its adaptive
+/// polling. Shared by the full sweep and the batched adaptive reconcile so
+/// both feed [`PrPollSchedule`] through identical rules: a URL whose probe
+/// failed, or which the snapshot no longer holds, yields `None` (no adaptive
+/// slot — the full sweep re-probes it).
+pub(crate) fn poll_observations(
+    pr_urls: &[String],
+    results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+) -> Vec<PollObservation> {
+    pr_urls
+        .iter()
+        .map(|url| {
+            let tier = results
+                .get(url)
+                .and_then(|r| r.as_ref().ok())
+                .and_then(poll_tier_for_probe);
+            (url.clone(), tier)
+        })
+        .collect()
 }
 
 /// Reconcile exactly one PR instead of sweeping every candidate (doc
@@ -508,6 +560,10 @@ pub async fn run_one_pass(
 /// tier is `None` when `pr_url` is no longer a live candidate (merged,
 /// closed, or otherwise dropped out of every list) — callers should stop
 /// tracking it until the next full sweep re-discovers it.
+///
+/// A thin wrapper over [`reconcile_batch`]: the adaptive timer reconciles a
+/// coalesced due set rather than one PR at a time, and a single-PR reconcile
+/// is just that batch with one member.
 pub async fn reconcile_one(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
@@ -517,22 +573,82 @@ pub async fn reconcile_one(
     remediation: Option<&ConflictRemediationQueue>,
     pr_url: &str,
 ) -> (SweepOutcome, Option<PollTier>) {
+    let urls = [pr_url.to_owned()];
+    let (outcome, observations) = reconcile_batch(
+        work_db,
+        probe,
+        publisher,
+        cube_client,
+        completion_handler,
+        remediation,
+        &urls,
+    )
+    .await;
+    let tier = observations
+        .into_iter()
+        .find(|(url, _)| url == pr_url)
+        .and_then(|(_, t)| t);
+    (outcome, tier)
+}
+
+/// [`reconcile_one`] for a whole due set at once: the same scoped detection
+/// paths, but **one** batched lifecycle probe and **one** batched
+/// merge-queue dequeue query covering every PR in `pr_urls`.
+///
+/// This is the shape the cost argument turns on. GitHub bills a GraphQL
+/// query `max(1, nodes/100)` points, so a query for one PR costs the same
+/// single point as a query for the ~100 nodes' worth of PRs that fit
+/// alongside it. Reconciling `N` due PRs one at a time therefore cost
+/// `2N` points (a probe and a dequeue query each, both floored to 1),
+/// against `ceil(51N/100) + ceil(20N/100)` for the batch — at N=25, 50
+/// points collapse to 18. The per-PR path also re-ran all four candidate
+/// list queries and the stalled-reviewer query once per PR; batching runs
+/// each exactly once.
+///
+/// Returns the aggregate outcome plus one [`PollObservation`] per requested
+/// URL, in the order requested. A URL with no live candidate on any list
+/// yields `None` (it is not probed at all), exactly as the single-PR path
+/// did.
+pub async fn reconcile_batch(
+    work_db: &WorkDb,
+    probe: &dyn MergeProbe,
+    publisher: &dyn ExecutionPublisher,
+    cube_client: Option<&dyn CubeClient>,
+    completion_handler: Option<&WorkerCompletionHandler>,
+    remediation: Option<&ConflictRemediationQueue>,
+    pr_urls: &[String],
+) -> (SweepOutcome, Vec<PollObservation>) {
     let mut outcome = SweepOutcome::default();
-
-    let in_review = candidates_for_pr_url(work_db.list_chores_pending_merge_check(), pr_url);
-    let blocked_conflict = candidates_for_pr_url(work_db.list_chores_blocked_on_merge_conflict(), pr_url);
-    let blocked_ci = candidates_for_pr_url(work_db.list_chores_blocked_on_ci_failure(), pr_url);
-    let stranded_blocked = candidates_for_pr_url(work_db.list_chores_stranded_blocked_remediation(), pr_url);
-
-    if in_review.is_empty() && blocked_conflict.is_empty() && blocked_ci.is_empty() && stranded_blocked.is_empty() {
-        tracing::debug!(
-            pr_url,
-            "merge poller: reconcile_one found no live candidate for this PR; skipping until next full sweep",
-        );
-        return (outcome, None);
+    let wanted: std::collections::HashSet<&str> = pr_urls.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return (outcome, Vec::new());
     }
 
-    let probe_urls = vec![pr_url.to_owned()];
+    let in_review = candidates_for_pr_urls(work_db.list_chores_pending_merge_check(), &wanted);
+    let blocked_conflict = candidates_for_pr_urls(work_db.list_chores_blocked_on_merge_conflict(), &wanted);
+    let blocked_ci = candidates_for_pr_urls(work_db.list_chores_blocked_on_ci_failure(), &wanted);
+    let stranded_blocked = candidates_for_pr_urls(work_db.list_chores_stranded_blocked_remediation(), &wanted);
+
+    // Probe only the requested URLs that still have a live candidate row.
+    // A URL that has dropped off every list costs nothing here and is
+    // reported as "no tier", which retires its adaptive slot.
+    let mut probe_seen = std::collections::HashSet::new();
+    let probe_urls: Vec<String> = in_review
+        .iter()
+        .chain(blocked_conflict.iter())
+        .chain(blocked_ci.iter())
+        .chain(stranded_blocked.iter())
+        .map(|candidate| candidate.pr_url.clone())
+        .filter(|url| probe_seen.insert(url.clone()))
+        .collect();
+    if probe_urls.is_empty() {
+        tracing::debug!(
+            pr_count = pr_urls.len(),
+            "merge poller: reconcile found no live candidate for any requested PR; \
+             skipping until the next full sweep",
+        );
+        return (outcome, pr_urls.iter().map(|url| (url.clone(), None)).collect());
+    }
     let probe_results = probe.probe_batch(&probe_urls).await;
 
     let mut seen = std::collections::HashSet::new();
@@ -555,13 +671,16 @@ pub async fn reconcile_one(
     }
     // See the matching gate in `run_one_pass`: a `trunk_queue` product's
     // dequeue/eviction signal is owned by the Trunk queue poller, not
-    // GitHub's merge-queue timeline.
+    // GitHub's merge-queue timeline. One batched dequeue query for the whole
+    // due set, exactly like the full sweep's.
     run_merge_queue_rebounce_pass(work_db, publisher, &in_review, &blocked_ci, &mut outcome).await;
 
     let reviewer_stale_secs: u64 = 10 * 60;
     match work_db.list_tasks_with_stalled_reviewer(reviewer_stale_secs) {
         Ok(stalled) => {
-            for (task_id, product_id, stalled_pr_url) in stalled.iter().filter(|(_, _, u)| u == pr_url) {
+            for (task_id, product_id, stalled_pr_url) in
+                stalled.iter().filter(|(_, _, url)| wanted.contains(url.as_str()))
+            {
                 sweep_stalled_reviewer(
                     work_db,
                     publisher,
@@ -577,21 +696,26 @@ pub async fn reconcile_one(
         Err(err) => tracing::warn!(?err, "merge poller: failed to list stalled reviewer tasks"),
     }
 
-    let tier = probe_results
-        .get(pr_url)
-        .and_then(|r| r.as_ref().ok())
-        .and_then(poll_tier_for_probe);
-    (outcome, tier)
+    // Observe every *requested* URL, not just the probed ones, so a URL that
+    // has left every candidate list reports `None` and loses its slot rather
+    // than silently keeping one.
+    (outcome, poll_observations(pr_urls, &probe_results))
 }
 
-/// Filter a candidate-list query result down to rows matching `pr_url`,
-/// logging (not propagating) a query failure — [`reconcile_one`] is
-/// best-effort per list, matching [`run_one_pass`]'s own error handling.
-pub(crate) fn candidates_for_pr_url(result: Result<Vec<PendingMergeCheck>>, pr_url: &str) -> Vec<PendingMergeCheck> {
+/// Filter a candidate-list query result down to rows whose PR is in
+/// `wanted`, logging (not propagating) a query failure — [`reconcile_batch`]
+/// is best-effort per list, matching [`run_one_pass`]'s own error handling.
+pub(crate) fn candidates_for_pr_urls(
+    result: Result<Vec<PendingMergeCheck>>,
+    wanted: &std::collections::HashSet<&str>,
+) -> Vec<PendingMergeCheck> {
     match result {
-        Ok(items) => items.into_iter().filter(|c| c.pr_url == pr_url).collect(),
+        Ok(items) => items
+            .into_iter()
+            .filter(|c| wanted.contains(c.pr_url.as_str()))
+            .collect(),
         Err(err) => {
-            tracing::warn!(?err, pr_url, "merge poller: reconcile_one candidate list query failed");
+            tracing::warn!(?err, "merge poller: targeted reconcile candidate list query failed");
             Vec::new()
         }
     }
@@ -825,6 +949,14 @@ pub(crate) async fn sweep_pending_pr(
         // on-Stop path (it reads the worker's Stop-boundary transcript for
         // the build-wait heuristic), never from a PR-detection recheck.
         | StopOutcome::BuildWaitPending { .. }
+        // BackgroundChildrenPending is only reachable via `nudge_or_park`
+        // on the on-Stop path (it probes the worker's live process tree),
+        // never from a PR-detection recheck.
+        | StopOutcome::BackgroundChildrenPending { .. }
+        // Held is only reachable via `nudge_or_park` on the on-Stop path
+        // (it checks the operator hold registry), never from a
+        // PR-detection recheck.
+        | StopOutcome::Held { .. }
         | StopOutcome::DbError => {}
     }
 }
@@ -900,6 +1032,12 @@ pub(crate) async fn sweep_late_pr(
         // BuildWaitPending is only reachable via `nudge_or_park` on the
         // on-Stop path, never from a late-PR recheck.
         | StopOutcome::BuildWaitPending { .. }
+        // BackgroundChildrenPending is only reachable via `nudge_or_park`
+        // on the on-Stop path, never from a late-PR recheck.
+        | StopOutcome::BackgroundChildrenPending { .. }
+        // Held is only reachable via `nudge_or_park` on the on-Stop path,
+        // never from a late-PR recheck.
+        | StopOutcome::Held { .. }
         | StopOutcome::DbError => {}
     }
 }

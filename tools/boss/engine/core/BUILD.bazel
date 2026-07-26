@@ -74,6 +74,7 @@ rust_library(
         "//tools/boss/engine/proposal-validation",
         "//tools/boss/engine/recovery",
         "//tools/boss/engine/ssh-transport",
+        "//tools/boss/engine/stdout-progress",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transcript-markdown:transcript_markdown",
         "//tools/boss/engine/transcript-tail",

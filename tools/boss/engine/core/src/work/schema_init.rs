@@ -168,6 +168,7 @@ impl WorkDb {
                 created_via TEXT NOT NULL DEFAULT 'unknown',
                 effort_level TEXT,
                 model_override TEXT,
+                reasoning TEXT,
                 driver TEXT,
                 ci_attempt_budget INTEGER,
                 ci_attempts_used INTEGER NOT NULL DEFAULT 0,
@@ -642,6 +643,12 @@ impl WorkDb {
         // subsystem, API bucket, rateLimit reading). Independent of every
         // other table and additive-only. Rides the current schema marker.
         migrate_github_api_calls_table(conn)?;
+        // `tasks.reasoning`: the capability signal (standard | investigation),
+        // independent of `effort_level`'s size signal. Nullable, and NULL is
+        // load-bearing — it means "never classified" and keeps the row on the
+        // dispatcher's pre-existing kind-floor/effort-table path, so landing
+        // this migration re-models nothing already in flight.
+        migrate_tasks_reasoning_column(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

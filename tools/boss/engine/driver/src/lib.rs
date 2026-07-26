@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, StopReason, TaskKind, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, StopReason, TaskKind, WorkerEvent};
 
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
@@ -133,7 +133,7 @@ pub enum Capability {
     /// A "turn ended" signal triggering completion detection and probe injection.
     TurnBoundary,
     /// Receive the worker's structured results (PR URL, ReviewResult, triage,
-    /// FOLLOWUPS) via file-based primary contract (T1414).
+    /// FOLLOWUPS) via a file-based primary contract.
     StructuredOutput,
     /// A redactable, role-structured view of the run for summarisation and
     /// post-hoc extraction.
@@ -146,6 +146,22 @@ pub enum Capability {
     /// Driver supplies the agent-rules filename, hook-enforcement wording, and
     /// the final-output convention; the body is shared.
     PromptComposition,
+    /// The driver's [`Capability::ProgressObservation`] stream can positively
+    /// signal that the worker is blocked awaiting human input (as distinct
+    /// from busy/idle) — for Claude, a `WorkerEvent::Notification` preceding
+    /// `Stop`. This is a narrower claim than `ProgressObservation` itself:
+    /// a driver can produce a perfectly good event stream while having no
+    /// channel that ever means "I am specifically waiting on a human."
+    ///
+    /// Absence is **Degrade**, never Synthesize: Boss must not guess this
+    /// state from a lower-fidelity channel (e.g. "no events for N minutes").
+    /// A wedged autonomous worker on such a driver shows `Working`
+    /// indefinitely rather than a fabricated `WaitingForInput` — see the
+    /// agent-driver design doc's "Stop-reason richness loss" risk and the
+    /// `codex-progress-channel-decision` investigation, which found
+    /// `codex exec`'s one-turn-per-process model has no live "awaiting
+    /// input" state for this signal to attach to at all.
+    AwaitingInputSignal,
 }
 
 impl Capability {
@@ -168,6 +184,7 @@ impl Capability {
             Self::ControlVerbs,
             Self::ToolProvisioning,
             Self::PromptComposition,
+            Self::AwaitingInputSignal,
         ]
         .into_iter()
     }
@@ -189,6 +206,7 @@ impl Capability {
             Self::ControlVerbs => AbsenceDisposition::Degrade,
             Self::ToolProvisioning => AbsenceDisposition::Degrade,
             Self::PromptComposition => AbsenceDisposition::Refuse,
+            Self::AwaitingInputSignal => AbsenceDisposition::Degrade,
         }
     }
 }
@@ -253,7 +271,12 @@ impl CapabilitySet {
 /// [`DriverDescriptor`]. Each driver supplies its own table; `resolve_spawn_config`
 /// resolves model/effort precedence against the selected driver's menu
 /// (design §1.4 / §Mix-and-match).
-#[derive(Debug, Clone, Copy)]
+/// The `bon::Builder` derive is here for the repo's builder convention (a
+/// struct with more than five named fields must carry it, so an additive field
+/// doesn't churn every construction site). Every current construction is a
+/// struct literal inside a `static DriverDescriptor`, which a builder call
+/// cannot be — the derive is what future non-static callers use.
+#[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
     /// Engine-default model slug for this driver (resolve-spawn precedence step 5:
     /// last resort when no override, pool override, effort level, or product default applies).
@@ -270,7 +293,24 @@ pub struct ModelMenu {
     /// map from.
     pub effort_value_for_level: fn(EffortLevel) -> Option<&'static str>,
     /// Maps a Boss [`EffortLevel`] to the default model slug for this driver.
+    ///
+    /// This is the **legacy size-derived** table, consulted only for rows that
+    /// carry no [`ReasoningMode`] (see [`Self::model_for_reasoning`]). Effort
+    /// is a size signal, so a table keyed off it can only ever approximate
+    /// what kind of thinking a job needs; it is kept because clearing a row's
+    /// reasoning must restore exactly the behaviour it had before the
+    /// capability signal existed.
     pub default_model_for_level: fn(EffortLevel) -> &'static str,
+    /// Maps a Boss [`ReasoningMode`] to the model slug for this driver.
+    ///
+    /// The capability lever, and the one that decides the model for any row
+    /// that has been classified: `Standard` names the driver's
+    /// well-articulated-coding tier, `Investigation` the tier worth paying for
+    /// when the worker has to diagnose or design before it edits. Neither
+    /// depends on [`EffortLevel`], which is what lets a `small` investigation
+    /// reach the stronger model without lying about its size and a genuinely
+    /// mechanical `large` row stay on the cheaper one.
+    pub model_for_reasoning: fn(ReasoningMode) -> &'static str,
     /// Optional per-level worker-prompt addendum to prepend to the initial-prompt body.
     /// `None` for levels where no addendum is appropriate.
     pub prompt_addendum_for_level: fn(EffortLevel) -> Option<&'static str>,
@@ -625,12 +665,11 @@ pub struct ProgressObservationWiring {
 ///   error, no log line — reproduction 2 in the decision doc), which is
 ///   disqualifying for a liveness signal specifically. Its worker process
 ///   instead emits a `stdout` JSONL stream (`thread.started` → `turn.started`
-///   → `item.started`/`item.completed` → `turn.completed`) that a
-///   driver-owned reader parses and feeds to
-///   [`AgentDriver::normalize_progress_event`]. That reader is separate
-///   plumbing, built in a later task; this variant is the documented seam it
-///   plugs into — a driver that selects it has no settings-file hook wiring
-///   to merge.
+///   → `item.started`/`item.completed` → `turn.completed`) that a reader
+///   parses and feeds to [`AgentDriver::normalize_progress_event`]. That
+///   reader is `boss_engine_stdout_progress`, attached to the engine's
+///   activity machine by `boss_engine::stdout_progress`; a driver that
+///   selects this variant has no settings-file hook wiring to merge.
 ///
 /// A driver without hook-callback wiring returns [`Self::StdoutJsonl`] here
 /// rather than an empty [`ProgressObservationWiring`] — the absence of hooks
@@ -771,6 +810,60 @@ pub enum PostHocInterceptionAction {
 pub type PostHocInterceptionFn =
     fn(tool_name: &str, tool_input: &serde_json::Value, tool_output: &serde_json::Value) -> PostHocInterceptionAction;
 
+/// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
+/// field is a concept that holds across backends: the resolved model/effort,
+/// an optional rendered settings/config path, the corp-laptop
+/// auto-permissions override, and an optional forced permission mode.
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnRequest<'a> {
+    /// Resolved model slug (e.g. `"opus"`, `"sonnet"`).
+    pub model: &'a str,
+    /// Driver-specific effort knob value, resolved from the driver's
+    /// [`ModelMenu`]. `None` when the row carries no effort level.
+    pub effort: Option<&'a str>,
+    /// Absolute path to the driver's rendered settings/config file, when the
+    /// spawn flow has one to pass (e.g. Claude's `--settings`). `None` for
+    /// spawns that carry no settings path.
+    pub settings_path: Option<&'a Path>,
+    /// Corp-laptop override: force `--permission-mode auto` for non-Opus
+    /// models too, instead of the default `--dangerously-skip-permissions`.
+    pub non_opus_auto_mode: bool,
+    /// Forces a specific permission mode (e.g. `"dontAsk"` for the
+    /// capability-restricted answer agent), suppressing the model-derived
+    /// choice. `None` keeps the default per-model behaviour.
+    pub permission_mode_override: Option<&'a str>,
+}
+
+/// One environment adjustment a [`SpawnPlan`] applies to the worker pane
+/// shell before its `command` runs.
+///
+/// A plain `Vec<(String, String)>` of sets cannot express Claude's
+/// requirement to *unset* `ANTHROPIC_API_KEY` (so the worker authenticates
+/// via OAuth credentials instead of a stray API key inherited from the
+/// user's shell profile) — hence the two-variant shape instead of bare pairs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvDirective {
+    /// `export <0>=<1>` in the pane shell before `command` runs.
+    Set(String, String),
+    /// `unset <0>` in the pane shell before `command` runs.
+    Unset(String),
+}
+
+/// What [`AgentDriver::spawn_invocation`] produces for [`Capability::Spawn`]:
+/// the environment adjustments and command line the spawn flow applies to
+/// the worker pane, verbatim and in order. A driver owns both its command
+/// line and its environment requirements (e.g. Claude's unset
+/// `ANTHROPIC_API_KEY`, a Codex driver's exported `CODEX_HOME`).
+#[derive(Debug, Clone, Default)]
+pub struct SpawnPlan {
+    /// Environment adjustments to apply in the pane shell, in order, before
+    /// `command` runs.
+    pub env: Vec<EnvDirective>,
+    /// The command line to run after `env` has been applied (e.g.
+    /// `claude --model … "$(cat …)"\n`).
+    pub command: String,
+}
+
 /// An agent driver: the abstraction layer between Boss and a coding-agent CLI.
 ///
 /// A driver declares its [`CapabilitySet`] and implements the behavioural
@@ -788,23 +881,15 @@ pub trait AgentDriver: Send + Sync {
 
     // ── Spawn capability ────────────────────────────────────────────────────
 
-    /// Build the worker invocation string written into the pane as the
-    /// spawn command. Replaces `boss_engine::effort::SpawnConfig::claude_invocation`
-    /// for the Claude driver.
+    /// Build the [`SpawnPlan`] — environment adjustments plus the command
+    /// line — written into the pane as the spawn command.
     ///
-    /// `permission_mode_override`, when `Some`, forces `--permission-mode
-    /// <mode>` and suppresses the model-derived `auto` /
+    /// `request.permission_mode_override`, when `Some`, forces
+    /// `--permission-mode <mode>` and suppresses the model-derived `auto` /
     /// `--dangerously-skip-permissions` choice. Used by the capability-restricted
     /// answer agent to guarantee `dontAsk` (deny-by-default allowlist), which
     /// must not be downgradable. `None` keeps the default per-model behaviour.
-    fn spawn_invocation(
-        &self,
-        model: &str,
-        effort: Option<&str>,
-        settings_path: Option<&Path>,
-        non_opus_auto_mode: bool,
-        permission_mode_override: Option<&str>,
-    ) -> String;
+    fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan;
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
@@ -1041,8 +1126,8 @@ pub mod test_support {
 
     use super::{
         AgentDriver, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
-        PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
-        ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+        PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest,
+        ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
     };
 
     /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
@@ -1061,6 +1146,7 @@ pub mod test_support {
                 engine_default: "stub-model",
                 effort_value_for_level: |_| None,
                 default_model_for_level: |_| "stub-model",
+                model_for_reasoning: |_| "stub-model",
                 prompt_addendum_for_level: |_| None,
                 model_requires_auto_permissions: |_| false,
             },
@@ -1111,7 +1197,7 @@ pub mod test_support {
         fn post_hoc_interception(&self) -> Option<PostHocInterceptionFn> {
             self.post_hoc_interception_fn
         }
-        fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+        fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
             unimplemented!()
         }
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
@@ -1271,6 +1357,16 @@ mod tests {
     }
 
     #[test]
+    fn awaiting_input_signal_degrades_when_absent_not_synthesizes() {
+        // Must never be Synthesize: Boss must not guess WaitingForInput
+        // from a lower-fidelity signal when the driver can't back it.
+        assert_eq!(
+            Capability::AwaitingInputSignal.default_absence_disposition(),
+            AbsenceDisposition::Degrade,
+        );
+    }
+
+    #[test]
     fn post_hoc_interception_action_variants_are_distinct() {
         assert_eq!(PostHocInterceptionAction::Accept, PostHocInterceptionAction::Accept);
         let edit = PostHocInterceptionAction::RequestEdit {
@@ -1351,7 +1447,7 @@ mod tests {
     fn all_capabilities_covers_every_variant() {
         let all: Vec<_> = Capability::all().collect();
         // Every variant must appear exactly once.
-        assert_eq!(all.len(), 12, "Capability::all() must cover all 12 variants");
+        assert_eq!(all.len(), 13, "Capability::all() must cover all 13 variants");
         // Spot-check a few to ensure the enum and all() stay in sync.
         assert!(all.contains(&Capability::Spawn));
         assert!(all.contains(&Capability::StructuredOutput));

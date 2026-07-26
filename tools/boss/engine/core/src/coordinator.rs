@@ -6714,6 +6714,13 @@ impl ExecutionCoordinator {
                     details["spawn_config"] = serde_json::json!({
                         "effort_level": spawn.effort_level.map(|level| level.as_str()),
                         "effort_value": spawn.effort_value,
+                        // The capability signal is what actually picked the
+                        // model for any classified row, so the dispatch stream
+                        // has to carry it to answer *why* this model — without
+                        // it, an Opus spawn on a `small` row looks like a bug.
+                        // `null` here means the row was unclassified and the
+                        // legacy kind-floor / effort-table path chose instead.
+                        "reasoning": spawn.reasoning.map(|mode| mode.as_str()),
                         "model": spawn.model,
                         "prompt_addendum_applied": spawn.prompt_addendum.is_some(),
                     });
@@ -9987,6 +9994,7 @@ mod tests {
             slot_id: Some(1),
             spawn_config: Some(crate::effort::SpawnConfig {
                 effort_level: Some(crate::work::EffortLevel::Trivial),
+                reasoning: Some(crate::work::ReasoningMode::Standard),
                 effort_value: Some("low"),
                 model: "sonnet".to_owned(),
                 driver: crate::effort::ENGINE_DEFAULT_DRIVER.to_owned(),

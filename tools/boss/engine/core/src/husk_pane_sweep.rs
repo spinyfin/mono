@@ -113,7 +113,14 @@ pub struct HuskPaneSweepOutcome {
 
 impl crate::sweep_loop::SweepOutcome for HuskPaneSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.retired > 0
+        // Observation passes count as activity, not just retirements. A
+        // husk candidate seen on pass N is killed on pass N+1, so a pass
+        // that only *observes* is the sole record of what the engine
+        // believed one interval before an irreversible kill. Logging only
+        // when `retired > 0` left that first pass invisible: five live
+        // workers were retired with no trace of which slots were flagged
+        // or what the live set held when they were flagged.
+        self.retired > 0 || self.pending_confirmation > 0
     }
 
     fn log(&self) {
@@ -182,11 +189,17 @@ pub async fn run_one_pass(
 
     outcome.pending_confirmation = pending.len();
     for pane in pending {
-        tracing::debug!(
+        // `warn`, not `debug`: this line is the last record written before
+        // the next pass kills the pane's process, and it is the only place
+        // the flagging decision is visible. At `debug` it was filtered out
+        // in practice, which is why a five-worker retirement could not be
+        // traced back to what the engine believed one pass earlier.
+        tracing::warn!(
             slot_id = pane.slot_id,
             run_id = %pane.run_id,
+            task_title = ?pane.task_title,
             "husk-pane sweep: app-hosted pane with no engine-tracked run observed; \
-             awaiting next-pass confirmation before retiring",
+             awaiting next-pass confirmation before retiring (next pass WILL kill this pane's process)",
         );
     }
 

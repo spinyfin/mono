@@ -189,6 +189,15 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
 
+    /// Reasoning mode to apply on this update. `None` → leave the existing
+    /// column value alone. `Some("")` → clear the column (write NULL, so the
+    /// row falls back to the dispatcher's legacy effort-table path). Any
+    /// other string is validated against the
+    /// [`ReasoningMode`](crate::ReasoningMode) enum at the engine boundary;
+    /// invalid values reject the entire patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+
     /// Driver override. `None` → leave unchanged. `Some("")` → clear.
     /// Any other string is stored verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]

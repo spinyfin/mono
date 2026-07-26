@@ -20,25 +20,64 @@ pub enum PollTier {
 }
 
 impl PollTier {
-    /// How long to wait before reconciling this PR again. Stretched by
-    /// [`rate_limit_throttle_factor`] when the hourly GitHub quota is
-    /// running low, so hot PRs back off from their normal 40s cadence
-    /// right alongside the full sweep instead of being the adaptive
-    /// layer that keeps draining an already-low budget.
+    /// This tier's unthrottled cadence — the cadence the tier *means*,
+    /// independent of the current quota pressure.
     ///
     /// Hot was 15s; at ~47 open PRs each hot cycle re-probes the whole set,
     /// so a 15s cadence was a structural driver of the personal-token
     /// GraphQL exhaustion. 40s still catches CI/merge-queue transitions
     /// promptly (those settle over minutes, not seconds) while cutting the
     /// hot re-probe rate by ~2.7x.
-    pub fn interval(self) -> Duration {
-        let base = match self {
+    ///
+    /// Separate from [`Self::interval`] because [`adaptive_poll_adds_freshness`]
+    /// compares a tier against the configured full-sweep cadence, and that
+    /// comparison must not depend on the throttle multiplier: the multiplier
+    /// stretches both sides equally (see the `'wait` loop in [`spawn_loop`]),
+    /// so folding it in would cancel out at best and make the predicate
+    /// flap with quota pressure at worst.
+    pub fn base_interval(self) -> Duration {
+        match self {
             PollTier::Hot => Duration::from_secs(40),
             PollTier::Cold => Duration::from_secs(180),
-        };
+        }
+    }
+
+    /// How long to wait before reconciling this PR again. Stretched by
+    /// [`rate_limit_throttle_factor`] when the hourly GitHub quota is
+    /// running low, so hot PRs back off from their normal 40s cadence
+    /// right alongside the full sweep instead of being the adaptive
+    /// layer that keeps draining an already-low budget.
+    pub fn interval(self) -> Duration {
+        let base = self.base_interval();
         let throttle = rate_limit_throttle_factor();
         if throttle > 1.0 { base.mul_f64(throttle) } else { base }
     }
+}
+
+/// Whether polling `tier` adaptively buys anything the periodic full sweep
+/// at `sweep_interval` does not already provide.
+///
+/// The adaptive layer and the full sweep probe **the same set of PRs**:
+/// [`spawn_loop`] seeds the schedule from the sweep's own candidate walk, so
+/// every tracked PR is re-probed once per `sweep_interval` no matter what its
+/// adaptive timer does. An adaptive poll therefore only adds freshness when
+/// its tier fires *sooner* than the next sweep would have.
+///
+/// At today's cadences (Hot 40s, Cold 180s, sweep 60s) that makes every Cold
+/// adaptive poll pure duplicate spend: the sweep already probed that PR up to
+/// three times while its own 180s timer was still counting down, and the poll
+/// costs 2 GraphQL points (one probe + one dequeue-events query, each floored
+/// to a 1-point minimum regardless of how few nodes a single-PR query asks
+/// for). That redundancy — not terminal PRs, which
+/// [`poll_tier_for_probe`] already drops — is where the adaptive path's share
+/// of the measured 65–115 points/minute burn was going.
+///
+/// Dropping a Cold PR from the adaptive schedule cannot lengthen detection:
+/// its worst case moves from `min(60s sweep, 180s adaptive)` = 60s to
+/// `60s sweep` = 60s. If the sweep cadence is ever raised past 180s the
+/// predicate flips on its own and Cold PRs start polling adaptively again.
+pub(crate) fn adaptive_poll_adds_freshness(tier: PollTier, sweep_interval: Duration) -> bool {
+    tier.base_interval() < sweep_interval
 }
 
 /// Classify a probed PR's [`PollTier`] from its lifecycle state, or `None`
@@ -95,17 +134,76 @@ pub(crate) fn is_pass_conclusion(c: &str) -> bool {
 /// under `tokio::time::sleep`'s max duration.
 pub(crate) const NO_PR_DUE_WAIT: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 
+/// How far past "due now" [`PrPollSchedule::drain_due_within`] reaches when
+/// collecting a batch — the coalescing window that makes batching the
+/// adaptive path actually pay.
+///
+/// Without it, batching is a no-op in practice. Per-PR timers are staggered
+/// by whenever each PR was last reconciled, so the due set at any instant is
+/// almost always exactly one PR, and a one-PR batch costs the same 2 points
+/// as the unbatched call it replaced (GraphQL bills `max(1, nodes/100)`, so a
+/// small query saves nothing). The window is what turns "one PR is due" into
+/// "these k PRs are due within the next few seconds", and `k` PRs cost
+/// `ceil(51k/100) + ceil(20k/100)` points instead of `2k`.
+///
+/// It can only pull a poll **earlier** than scheduled, never later, so it
+/// cannot lengthen detection latency for any PR. Sized at a quarter of the
+/// Hot cadence: large enough that a PR pulled forward drags a useful number
+/// of neighbours with it, small enough that a Hot PR's effective cadence
+/// never drops below 30s. Pulling PRs forward also *self-synchronises* the
+/// schedule — every PR in a drained batch is rescheduled to the same instant,
+/// so batches accrete members over time rather than dispersing.
+pub(crate) const ADAPTIVE_COALESCE_WINDOW: Duration = Duration::from_secs(10);
+
+/// Why a PR holds no adaptive poll slot. Carried into the trace on every
+/// exclusion: a PR that quietly stops being polled because of a predicate
+/// bug is invisible by construction, so the predicate must say what it
+/// dropped and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveExclusion {
+    /// The probe reported a terminal (merged / closed) PR, or the PR is no
+    /// longer a live candidate on any list — [`poll_tier_for_probe`]
+    /// returned `None`. Nothing further can change; re-probing spends quota
+    /// to re-confirm a fact.
+    Terminal,
+    /// The PR is still live, but its tier polls no faster than the periodic
+    /// full sweep, which re-probes it anyway — see
+    /// [`adaptive_poll_adds_freshness`]. Still polled, just by the sweep.
+    CoveredByFullSweep,
+}
+
+impl AdaptiveExclusion {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            AdaptiveExclusion::Terminal => "terminal_or_no_live_candidate",
+            AdaptiveExclusion::CoveredByFullSweep => "covered_by_full_sweep",
+        }
+    }
+}
+
+/// What one PR's probe said about how it should be polled next: its URL and
+/// the tier [`poll_tier_for_probe`] derived, or `None` for a terminal PR.
+/// Produced by both the full sweep ([`run_one_pass_observed`]) and the
+/// batched adaptive reconcile ([`reconcile_batch`]) so the two feed the
+/// schedule through one shape.
+pub(crate) type PollObservation = (String, Option<PollTier>);
+
 /// In-memory next-poll-time tracker driving the per-PR adaptive interval
 /// (doc `github-event-detection-webhooks-vs-polling-2026-07-08.md` §9
 /// item 3), replacing the single global tick with a per-PR schedule:
 /// hot PRs (CI running, merge-queued) get reconciled on a short cadence
 /// while cold ones (steady-state, awaiting a human) back off.
 ///
-/// Purely in-memory and best-effort — it is reseeded from the DB's own
-/// candidate lists after every periodic full sweep (see [`spawn_loop`]),
-/// which remains the correctness backstop, so a dropped, evicted, or
-/// (after a restart) forgotten entry only means the PR is picked up on
-/// the next full sweep — never lost.
+/// Purely in-memory and best-effort — it is reconciled against the full
+/// sweep's own probe observations after every periodic sweep (see
+/// [`PrPollSchedule::apply_sweep_observations`]), and that sweep remains the
+/// correctness backstop, so a dropped, evicted, or (after a restart)
+/// forgotten entry only means the PR is picked up on the next full sweep —
+/// never lost.
+///
+/// Only PRs whose tier polls *faster* than the sweep hold a slot at all
+/// ([`adaptive_poll_adds_freshness`]); for the rest an adaptive poll would
+/// re-fetch state the sweep had already fetched more recently.
 #[derive(Default)]
 pub(crate) struct PrPollSchedule {
     next_poll_at: HashMap<String, Instant>,
@@ -117,70 +215,145 @@ impl PrPollSchedule {
         self.next_poll_at.values().min().copied()
     }
 
-    /// Remove and return every PR whose scheduled poll has arrived.
-    pub(crate) fn drain_due(&mut self, now: Instant) -> Vec<String> {
-        let due: Vec<String> = self
+    /// How many PRs currently hold an adaptive poll slot.
+    pub(crate) fn tracked(&self) -> usize {
+        self.next_poll_at.len()
+    }
+
+    /// Remove and return every PR due by `now + window`, earliest first —
+    /// the coalescing drain the batched adaptive path runs on (see
+    /// [`ADAPTIVE_COALESCE_WINDOW`]).
+    ///
+    /// Reaching *forward* is what makes the batch non-trivial: with per-PR
+    /// timers staggered across the tier interval, "due exactly now" is
+    /// almost always a set of one. Everything returned is polled up to
+    /// `window` early and never late, so no PR's detection latency grows.
+    ///
+    /// Ordered by due time (URL breaking ties) so the batch a given schedule
+    /// state produces is deterministic — an arbitrary `HashMap` order would
+    /// make both the trace and the tests non-reproducible.
+    pub(crate) fn drain_due_within(&mut self, now: Instant, window: Duration) -> Vec<String> {
+        let cutoff = now + window;
+        let mut due: Vec<(Instant, String)> = self
             .next_poll_at
             .iter()
-            .filter(|&(_, &at)| at <= now)
-            .map(|(url, _)| url.clone())
+            .filter(|&(_, &at)| at <= cutoff)
+            .map(|(url, at)| (*at, url.clone()))
             .collect();
+        due.sort();
+        let due: Vec<String> = due.into_iter().map(|(_, url)| url).collect();
         for url in &due {
             self.next_poll_at.remove(url);
         }
         due
     }
 
-    /// Record the tier observed for `pr_url`, scheduling its next poll.
-    /// `None` (the PR dropped out of every candidate list) stops tracking
-    /// it until a full sweep rediscovers it.
-    pub(crate) fn reschedule(&mut self, pr_url: &str, tier: Option<PollTier>, now: Instant) {
+    /// Record the tier observed for `pr_url`, scheduling its next adaptive
+    /// poll — or dropping its slot when an adaptive poll would buy nothing.
+    ///
+    /// A slot is kept only when the tier polls faster than the full sweep at
+    /// `sweep_interval` ([`adaptive_poll_adds_freshness`]). `None` (terminal
+    /// PR, or no live candidate on any list) always drops it. Either way the
+    /// periodic full sweep keeps probing the PR for as long as it remains a
+    /// candidate, so a dropped slot is a dropped *duplicate*, not a dropped
+    /// PR — and the drop is logged with its reason so a predicate bug shows
+    /// up in the trace rather than as a PR that silently stops progressing.
+    pub(crate) fn reschedule(&mut self, pr_url: &str, tier: Option<PollTier>, now: Instant, sweep_interval: Duration) {
         match tier {
-            Some(tier) => {
+            Some(tier) if adaptive_poll_adds_freshness(tier, sweep_interval) => {
                 self.next_poll_at.insert(pr_url.to_owned(), now + tier.interval());
             }
-            None => {
-                self.next_poll_at.remove(pr_url);
+            other => {
+                let reason = match other {
+                    Some(_) => AdaptiveExclusion::CoveredByFullSweep,
+                    None => AdaptiveExclusion::Terminal,
+                };
+                if self.next_poll_at.remove(pr_url).is_some() || reason == AdaptiveExclusion::CoveredByFullSweep {
+                    tracing::debug!(
+                        pr_url,
+                        reason = reason.as_str(),
+                        sweep_interval_secs = sweep_interval.as_secs(),
+                        "merge poller: PR excluded from the adaptive poll schedule",
+                    );
+                }
             }
         }
     }
 
-    /// Seed a default (hot) entry for every PR in `pr_urls` that isn't
-    /// already tracked — called after a full sweep so newly-discovered
-    /// PRs get an adaptive slot immediately instead of waiting for
-    /// another full-sweep interval. Existing entries are left alone: a
-    /// fresh default must not clobber a tier already learned from a real
-    /// probe via [`reconcile_one`].
-    pub(crate) fn seed_defaults(&mut self, pr_urls: impl IntoIterator<Item = String>, now: Instant) {
-        for url in pr_urls {
-            self.next_poll_at
-                .entry(url)
-                .or_insert_with(|| now + PollTier::Hot.interval());
+    /// Reconcile the whole schedule against what a full sweep just observed.
+    ///
+    /// `observations` is every PR the sweep considered, with the tier its
+    /// probe implies — so this both *adds* slots for newly-discovered hot PRs
+    /// and *retires* slots for PRs that are no longer candidates at all
+    /// (absent from `observations` entirely). Replaces the older
+    /// "seed a hot default for every candidate URL" pass, which needed a
+    /// second read of all four candidate lists and could only ever learn a
+    /// PR's real tier by spending an adaptive probe to discover it.
+    ///
+    /// Existing due times are preserved (`or_insert`): re-stamping every hot
+    /// PR's timer on each sweep would let the 60s sweep permanently outrun
+    /// the 40s timer it is supposed to be independent of.
+    ///
+    /// Returns the count of PRs excluded per reason, for the summary log.
+    pub(crate) fn apply_sweep_observations(
+        &mut self,
+        observations: &[PollObservation],
+        now: Instant,
+        sweep_interval: Duration,
+    ) -> AdaptiveExclusionCounts {
+        let mut counts = AdaptiveExclusionCounts::default();
+        let mut keep: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (pr_url, tier) in observations {
+            match tier {
+                Some(tier) if adaptive_poll_adds_freshness(*tier, sweep_interval) => {
+                    keep.insert(pr_url.as_str());
+                    self.next_poll_at
+                        .entry(pr_url.clone())
+                        .or_insert_with(|| now + tier.interval());
+                }
+                other => {
+                    let reason = match other {
+                        Some(_) => AdaptiveExclusion::CoveredByFullSweep,
+                        None => AdaptiveExclusion::Terminal,
+                    };
+                    counts.record(reason);
+                    tracing::debug!(
+                        pr_url,
+                        reason = reason.as_str(),
+                        "merge poller: PR excluded from the adaptive poll schedule",
+                    );
+                }
+            }
         }
+        // Retire slots for PRs this sweep no longer considers at all (merged,
+        // closed, or otherwise gone from every candidate list). Their next
+        // rediscovery, if any, comes from a later sweep's observations.
+        self.next_poll_at.retain(|url, _| keep.contains(url.as_str()));
+        counts
     }
 }
 
-/// Distinct PR urls across every per-PR candidate list [`run_one_pass`]
-/// considers — a cheap, GitHub-call-free local DB read used only to seed
-/// [`PrPollSchedule`] after a full sweep.
-pub(crate) fn current_pr_candidate_urls(work_db: &WorkDb) -> Vec<String> {
-    let mut urls = std::collections::HashSet::new();
-    let lists = [
-        work_db.list_chores_pending_merge_check(),
-        work_db.list_chores_blocked_on_merge_conflict(),
-        work_db.list_chores_blocked_on_ci_failure(),
-        work_db.list_chores_stranded_blocked_remediation(),
-    ];
-    for list in lists {
-        match list {
-            Ok(items) => urls.extend(items.into_iter().map(|c| c.pr_url)),
-            Err(err) => tracing::warn!(
-                ?err,
-                "merge poller: failed to list candidates while seeding poll schedule"
-            ),
+/// Per-reason tally of PRs a sweep's observations excluded from the adaptive
+/// schedule. Logged as one line per sweep so "how much is the predicate
+/// dropping, and why" is answerable from the trace without reading a
+/// debug line per PR.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdaptiveExclusionCounts {
+    pub(crate) terminal: usize,
+    pub(crate) covered_by_full_sweep: usize,
+}
+
+impl AdaptiveExclusionCounts {
+    fn record(&mut self, reason: AdaptiveExclusion) {
+        match reason {
+            AdaptiveExclusion::Terminal => self.terminal += 1,
+            AdaptiveExclusion::CoveredByFullSweep => self.covered_by_full_sweep += 1,
         }
     }
-    urls.into_iter().collect()
+
+    pub(crate) fn total(self) -> usize {
+        self.terminal + self.covered_by_full_sweep
+    }
 }
 
 /// Multiple of the configured sweep interval after which a detection pass
@@ -201,11 +374,27 @@ pub(crate) const PASS_TIMEOUT_MULTIPLIER: u32 = 3;
 /// tuned-down cadence) can't produce a budget a normal pass would trip.
 pub(crate) const MIN_PASS_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Budget for a single targeted [`reconcile_one`]. Much tighter than a full
-/// pass: it probes exactly one PR. It runs inside the wait `select!`, so
-/// time spent here is also time the trunk observer, the activation kick,
-/// and every other PR's adaptive timer are not being serviced.
+/// Budget for a targeted [`reconcile_one`] — one PR. Much tighter than a
+/// full pass. It runs inside the wait `select!`, so time spent here is also
+/// time the trunk observer, the activation kick, and every other PR's
+/// adaptive timer are not being serviced.
 pub(crate) const RECONCILE_ONE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Extra budget a batched reconcile gets per PR beyond the first.
+///
+/// A batch's GitHub cost is flat in the batch size — two round trips
+/// whether it carries 1 PR or 25 — but its *local* work is not: every
+/// candidate walks the same DB-writing detection paths [`sweep_one`] runs.
+/// So the budget grows with the batch while staying far below a full pass's.
+pub(crate) const RECONCILE_BATCH_TIMEOUT_PER_PR: Duration = Duration::from_secs(10);
+
+/// Time budget for one batched adaptive reconcile of `pr_count` PRs, capped
+/// at [`MIN_PASS_TIMEOUT`] so a large due set can never hold the wait loop
+/// as long as a full detection pass may.
+pub(crate) fn reconcile_batch_budget(pr_count: usize) -> Duration {
+    let extra = RECONCILE_BATCH_TIMEOUT_PER_PR * (pr_count.saturating_sub(1)).min(u32::MAX as usize) as u32;
+    (RECONCILE_ONE_TIMEOUT + extra).min(MIN_PASS_TIMEOUT)
+}
 
 /// Hard time budget for one full detection pass at `interval` cadence.
 pub(crate) fn pass_budget(interval: Duration) -> Duration {
@@ -225,15 +414,15 @@ pub(crate) fn pass_budget(interval: Duration) -> Duration {
 /// minutes over its 60-second cadence produced no log line at all, so the
 /// only evidence of the blackout was the *absence* of `merge_poller` output
 /// in the trace. A pass that exceeds its own cadence must be loud.
-pub(crate) async fn run_pass_within_budget<F>(
+pub(crate) async fn run_pass_within_budget<T, F>(
     label: &'static str,
     budget: Duration,
     cadence: Duration,
     metrics: &Registry,
     pass: F,
-) -> Option<SweepOutcome>
+) -> Option<T>
 where
-    F: std::future::Future<Output = SweepOutcome>,
+    F: std::future::Future<Output = T>,
 {
     // `tokio::time::Instant` rather than `std::time::Instant`: identical in
     // production, but it tracks the same clock as the `timeout` below, so
@@ -270,27 +459,34 @@ where
     }
 }
 
-/// [`run_pass_within_budget`]'s counterpart for the targeted per-PR
-/// reconcile, which returns a tier alongside its outcome. `None` means the
-/// reconcile blew [`RECONCILE_ONE_TIMEOUT`] and was dropped.
-pub(crate) async fn reconcile_one_within_budget<F>(
+/// [`run_pass_within_budget`]'s counterpart for the targeted reconcile,
+/// which returns per-PR tiers alongside its outcome. `None` means the
+/// reconcile blew [`reconcile_batch_budget`] and was dropped.
+///
+/// An abandoned batch leaves its PRs with no adaptive slot (they were
+/// already drained out of the schedule) until the next full sweep's
+/// observations re-add them — the same backstop a timed-out single-PR
+/// reconcile has always relied on.
+pub(crate) async fn reconcile_batch_within_budget<F>(
     metrics: &Registry,
     reconcile: F,
-    pr_url: &str,
-) -> Option<(SweepOutcome, Option<PollTier>)>
+    pr_urls: &[String],
+) -> Option<(SweepOutcome, Vec<PollObservation>)>
 where
-    F: std::future::Future<Output = (SweepOutcome, Option<PollTier>)>,
+    F: std::future::Future<Output = (SweepOutcome, Vec<PollObservation>)>,
 {
-    match tokio::time::timeout(RECONCILE_ONE_TIMEOUT, reconcile).await {
+    let budget = reconcile_batch_budget(pr_urls.len());
+    match tokio::time::timeout(budget, reconcile).await {
         Ok(result) => Some(result),
         Err(_) => {
             PASS_TIMED_OUT.inc_by(metrics, 1);
             PASS_OVERRUN.inc_by(metrics, 1);
             tracing::warn!(
-                pr_url,
-                budget_ms = RECONCILE_ONE_TIMEOUT.as_millis(),
-                "merge poller: targeted per-PR reconcile exceeded its time budget and was abandoned; \
-                 the periodic full sweep remains the backstop for this PR",
+                pr_count = pr_urls.len(),
+                pr_urls = ?pr_urls,
+                budget_ms = budget.as_millis(),
+                "merge poller: targeted reconcile exceeded its time budget and was abandoned; \
+                 the periodic full sweep remains the backstop for these PRs",
             );
             None
         }
@@ -322,12 +518,21 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
 /// it re-discovers any PR the adaptive/targeted paths below missed.
 ///
 /// Between full sweeps, an in-memory [`PrPollSchedule`] drives a
-/// per-PR adaptive timer (doc §9 item 3) that calls [`reconcile_one`]
-/// on just the PR that's due, instead of every PR sharing the single
-/// `interval` tick — hot PRs (CI running, merge-queued) get reconciled
-/// on a short cadence, cold ones back off. The schedule is reseeded
-/// with a default entry for every newly-discovered PR after each full
-/// sweep.
+/// per-PR adaptive timer (doc §9 item 3) that calls [`reconcile_batch`]
+/// on just the PRs that are due, instead of every PR sharing the single
+/// `interval` tick. Two properties keep that layer from costing more than
+/// it is worth:
+///
+///   - only PRs whose tier fires sooner than the next full sweep hold a
+///     slot ([`adaptive_poll_adds_freshness`]) — the rest are already being
+///     probed by the sweep at least as often;
+///   - everything due within [`ADAPTIVE_COALESCE_WINDOW`] goes out as one
+///     batched pair of GraphQL queries, because GitHub's 1-point floor
+///     makes N single-PR queries cost N times an N-PR query.
+///
+/// The schedule is reconciled against the sweep's own probe observations
+/// after each full sweep, so a newly-hot PR gets a slot without a discovery
+/// probe and a PR that has gone cold or terminal loses one.
 ///
 /// `kick` is a shared [`Notify`] the caller can fire (via
 /// [`Notify::notify_one`]) to request an immediate out-of-band full
@@ -399,14 +604,14 @@ pub fn spawn_loop(
             // with the per-PR path below. The two have very different
             // per-point efficiency, and a single "merge_poller" bucket
             // would confirm whichever culprit you already suspected.
-            let outcome = run_pass_within_budget(
+            let (outcome, observations) = run_pass_within_budget(
                 "full_sweep",
                 budget,
                 interval,
                 &metrics,
                 gh_scope(
                     callers::MERGE_POLLER_SWEEP,
-                    run_one_pass(
+                    run_one_pass_observed(
                         work_db.as_ref(),
                         probe.as_ref(),
                         publisher.as_ref(),
@@ -438,12 +643,28 @@ pub fn spawn_loop(
                 );
             }
 
-            // Seed a default adaptive slot for every PR this full sweep
-            // just considered. Existing entries (already scheduled by a
-            // prior `reconcile_one` call below) are left alone — a fresh
-            // default must not clobber a tier already learned from a
-            // real probe.
-            schedule.seed_defaults(current_pr_candidate_urls(work_db.as_ref()), last_run_at);
+            // Reconcile the adaptive schedule against what this sweep just
+            // probed. The sweep already knows every candidate's tier — it
+            // took the probe — so the schedule is driven from that instead
+            // of re-reading all four candidate lists and seeding a Hot
+            // guess that costs an adaptive probe to correct.
+            //
+            // PRs the sweep covers at least as promptly as their own tier
+            // would (every Cold PR, at today's 60s sweep vs 180s Cold) hold
+            // no slot at all: an adaptive poll for them is a duplicate of a
+            // probe the sweep just made. They are still polled — by the
+            // sweep, sooner — and every exclusion is logged with its reason.
+            let exclusions = schedule.apply_sweep_observations(&observations, last_run_at, interval);
+            ADAPTIVE_TRACKED.set(&metrics, schedule.tracked() as i64);
+            if exclusions.total() > 0 || schedule.tracked() > 0 {
+                tracing::debug!(
+                    adaptive_tracked = schedule.tracked(),
+                    observed = observations.len(),
+                    excluded_terminal = exclusions.terminal,
+                    excluded_covered_by_full_sweep = exclusions.covered_by_full_sweep,
+                    "merge poller: adaptive poll schedule reconciled against sweep observations",
+                );
+            }
 
             // Layer 4: piggyback the speculative conflict-prediction
             // sweep on this same full-sweep cadence. Gated by its own
@@ -571,54 +792,71 @@ pub fn spawn_loop(
                         // continue listening; a Trunk pass is not a full sweep
                     }
                     _ = tokio::time::sleep(pr_wait) => {
-                        for pr_url in schedule.drain_due(Instant::now()) {
-                            // Bounded like the full sweep: this runs inside
-                            // the wait `select!`, so an unbounded reconcile
-                            // stalls the trunk observer, the activation kick,
-                            // and every other PR's adaptive timer with it.
-                            //
-                            // The un-batched per-PR path: one reconcile
-                            // probes a single PR, so its cost per PR is
-                            // far higher than the batched sweep's. Its
-                            // own scope is what makes that comparable
-                            // from data instead of arguable from code.
-                            let Some((outcome, tier)) = reconcile_one_within_budget(
-                                &metrics,
-                                gh_scope(
-                                    callers::MERGE_POLLER_ADAPTIVE,
-                                    reconcile_one(
-                                        work_db.as_ref(),
-                                        probe.as_ref(),
-                                        publisher.as_ref(),
-                                        Some(cube_client.as_ref()),
-                                        Some(completion_handler.as_ref()),
-                                        Some(&remediation),
-                                        &pr_url,
-                                    ),
-                                ),
-                                &pr_url,
-                            )
-                            .await
-                            else {
-                                // Timed out: drop this PR's adaptive slot for
-                                // now; the periodic full sweep re-seeds it.
-                                continue;
-                            };
-                            record_sweep_metrics(&metrics, &outcome);
-                            if outcome.total_transitions() > 0 {
-                                tracing::info!(
-                                    pr_url,
-                                    merged = outcome.merged,
-                                    conflict_flagged = outcome.conflict_flagged,
-                                    conflict_cleared = outcome.conflict_cleared,
-                                    ci_flagged = outcome.ci_flagged,
-                                    ci_cleared = outcome.ci_cleared,
-                                    merge_queue_rebounced = outcome.merge_queue_rebounced,
-                                    "merge poller: adaptive per-PR reconcile transitions",
-                                );
-                            }
-                            schedule.reschedule(&pr_url, tier, Instant::now());
+                        // Everything due within the coalescing window goes
+                        // out as ONE batch. The un-batched predecessor
+                        // reconciled the due set one PR at a time, and a
+                        // single-PR GraphQL query costs the same 1-point
+                        // minimum as a 25-PR one — so per-PR reconciling
+                        // spent 2 points per PR while the batched sweep
+                        // spent ~1 point per *hundred nodes* across all of
+                        // them. Reaching forward by the window is what makes
+                        // the due set bigger than one; see
+                        // `ADAPTIVE_COALESCE_WINDOW`.
+                        let due = schedule.drain_due_within(Instant::now(), ADAPTIVE_COALESCE_WINDOW);
+                        if due.is_empty() {
+                            continue;
                         }
+                        record_adaptive_batch(&metrics, due.len());
+                        // Bounded like the full sweep: this runs inside
+                        // the wait `select!`, so an unbounded reconcile
+                        // stalls the trunk observer, the activation kick,
+                        // and every other PR's adaptive timer with it.
+                        //
+                        // Its own gh scope, kept distinct from the sweep's:
+                        // the two paths have very different per-point
+                        // efficiency, and one blended bucket would confirm
+                        // whichever culprit you already suspected.
+                        let Some((outcome, observations)) = reconcile_batch_within_budget(
+                            &metrics,
+                            gh_scope(
+                                callers::MERGE_POLLER_ADAPTIVE,
+                                reconcile_batch(
+                                    work_db.as_ref(),
+                                    probe.as_ref(),
+                                    publisher.as_ref(),
+                                    Some(cube_client.as_ref()),
+                                    Some(completion_handler.as_ref()),
+                                    Some(&remediation),
+                                    &due,
+                                ),
+                            ),
+                            &due,
+                        )
+                        .await
+                        else {
+                            // Timed out: these PRs hold no adaptive slot for
+                            // now; the next full sweep's observations re-add
+                            // the ones that still warrant one.
+                            continue;
+                        };
+                        record_sweep_metrics(&metrics, &outcome);
+                        if outcome.total_transitions() > 0 {
+                            tracing::info!(
+                                pr_count = due.len(),
+                                merged = outcome.merged,
+                                conflict_flagged = outcome.conflict_flagged,
+                                conflict_cleared = outcome.conflict_cleared,
+                                ci_flagged = outcome.ci_flagged,
+                                ci_cleared = outcome.ci_cleared,
+                                merge_queue_rebounced = outcome.merge_queue_rebounced,
+                                "merge poller: batched adaptive reconcile transitions",
+                            );
+                        }
+                        let now = Instant::now();
+                        for (pr_url, tier) in &observations {
+                            schedule.reschedule(pr_url, *tier, now, interval);
+                        }
+                        ADAPTIVE_TRACKED.set(&metrics, schedule.tracked() as i64);
                         // continue listening in this same wait loop
                     }
                     _ = kick.notified() => {
@@ -654,21 +892,33 @@ pub fn spawn_loop(
                                         since_last_ms = since_last.as_millis(),
                                         "merge poller: PrReconcileRequested → reconciling named PR",
                                     );
-                                    let Some((outcome, tier)) = reconcile_one_within_budget(
+                                    // A keyed request names one PR, but anything
+                                    // already due rides along for free: the batch
+                                    // costs the same two round trips either way,
+                                    // and the passengers would otherwise each have
+                                    // cost their own pair moments later.
+                                    let mut requested = vec![pr_url.clone()];
+                                    requested.extend(
+                                        schedule
+                                            .drain_due_within(Instant::now(), ADAPTIVE_COALESCE_WINDOW)
+                                            .into_iter()
+                                            .filter(|url| url != &pr_url),
+                                    );
+                                    let Some((outcome, observations)) = reconcile_batch_within_budget(
                                         &metrics,
                                         gh_scope(
                                             callers::MERGE_POLLER_REQUESTED,
-                                            reconcile_one(
+                                            reconcile_batch(
                                                 work_db.as_ref(),
                                                 probe.as_ref(),
                                                 publisher.as_ref(),
                                                 Some(cube_client.as_ref()),
                                                 Some(completion_handler.as_ref()),
                                                 Some(&remediation),
-                                                &pr_url,
+                                                &requested,
                                             ),
                                         ),
-                                        &pr_url,
+                                        &requested,
                                     )
                                     .await
                                     else {
@@ -678,6 +928,7 @@ pub fn spawn_loop(
                                     if outcome.total_transitions() > 0 {
                                         tracing::info!(
                                             pr_url,
+                                            pr_count = requested.len(),
                                             merged = outcome.merged,
                                             conflict_flagged = outcome.conflict_flagged,
                                             conflict_cleared = outcome.conflict_cleared,
@@ -687,7 +938,11 @@ pub fn spawn_loop(
                                             "merge poller: PrReconcileRequested reconcile transitions",
                                         );
                                     }
-                                    schedule.reschedule(&pr_url, tier, Instant::now());
+                                    let now = Instant::now();
+                                    for (url, tier) in &observations {
+                                        schedule.reschedule(url, *tier, now, interval);
+                                    }
+                                    ADAPTIVE_TRACKED.set(&metrics, schedule.tracked() as i64);
                                 }
                             }
                             Some(_) => {

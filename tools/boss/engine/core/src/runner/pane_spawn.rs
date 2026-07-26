@@ -22,6 +22,53 @@ use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
+/// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
+/// statement to prepend to the worker pane's spawn command. Generic over
+/// every driver: the engine knows how to turn a `Set`/`Unset` directive into
+/// shell syntax, but never which vars a given driver names (that knowledge
+/// stays in the driver's [`crate::driver::SpawnPlan`]).
+fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
+    match directive {
+        crate::driver::EnvDirective::Set(key, value) => {
+            format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
+        }
+        crate::driver::EnvDirective::Unset(key) => format!("unset {key}; "),
+    }
+}
+
+#[cfg(test)]
+mod render_env_directive_tests {
+    use super::render_env_directive;
+    use crate::driver::EnvDirective;
+
+    #[test]
+    fn renders_unset() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Unset("ANTHROPIC_API_KEY".to_string())),
+            "unset ANTHROPIC_API_KEY; "
+        );
+    }
+
+    #[test]
+    fn renders_set_with_plain_value() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Set("CODEX_HOME".to_string(), "/opt/codex".to_string())),
+            "export CODEX_HOME='/opt/codex'; "
+        );
+    }
+
+    #[test]
+    fn renders_set_quoting_a_value_with_a_single_quote() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Set(
+                "CODEX_HOME".to_string(),
+                "/Users/a b/it's".to_string()
+            )),
+            "export CODEX_HOME='/Users/a b/it'\\''s'; "
+        );
+    }
+}
+
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
 /// per-lease worker config files, asks the macOS app to host a
 /// worker pane, and registers the returned shell pid against the
@@ -351,14 +398,6 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         };
 
-        // Scrub ANTHROPIC_API_KEY from the worker shell's environment before
-        // invoking claude. The engine needs the var in its own process for
-        // pane-summary LLM calls; workers must authenticate via OAuth
-        // credentials (~/.claude/.credentials.json) and inherit nothing.
-        // Without this unset, a user who sets ANTHROPIC_API_KEY in their
-        // shell profile (or via `launchctl setenv`) causes every worker
-        // spawn to show: "Auth conflict: Using ANTHROPIC_API_KEY instead of
-        // Anthropic Console key."
         // The worker's session settings (boss-event hooks, deny rules)
         // live outside the workspace tree; point claude at them with
         // `--settings`. `write_workspace_files` writes the same path.
@@ -392,15 +431,23 @@ impl ExecutionRunner for PaneSpawnRunner {
         // force a new restricted kind to decide both.
         let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
         let permission_mode_override = worker_kind.forced_permission_mode();
+        // Any environment scrubbing/exporting a driver's spawn needs (e.g.
+        // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
+        // credentials instead of a stray shell-profile key) is the driver's
+        // own concern, carried on the `SpawnPlan.env` built here — the engine
+        // renders those directives generically without knowing which driver
+        // or which vars they name.
+        let spawn_plan = crate::driver::ClaudeDriver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(&worker_settings_path),
+            non_opus_auto_mode: spawner.non_opus_auto_mode(),
+            permission_mode_override,
+        });
+        let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
-            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
-            crate::driver::ClaudeDriver.spawn_invocation(
-                &spawn_config.model,
-                spawn_config.effort_value,
-                Some(&worker_settings_path),
-                spawner.non_opus_auto_mode(),
-                permission_mode_override,
-            ),
+            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",
+            spawn_plan.command,
         );
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
@@ -896,6 +943,31 @@ mod pane_spawn_tests {
         chore_input: CreateChoreInput,
         product_default_model: Option<&str>,
     ) -> Result<(Arc<CapturingSpawner>, Task)> {
+        run_once_with_chore_inner(workspace, chore_input, product_default_model, false).await
+    }
+
+    /// [`run_once_with_chore`], but with the row's `reasoning` cleared back to
+    /// NULL after creation — i.e. a row that predates the `reasoning` column.
+    ///
+    /// Every create path seeds a reasoning mode, so this is the only way to
+    /// exercise the dispatcher's legacy resolution path (design-family kind
+    /// floor, then the effort-level table) from a real SQLite row. The tests
+    /// that use it are the requirement-6 guarantee in test form: landing the
+    /// capability signal must not re-model rows that were already in flight.
+    async fn run_once_with_unclassified_chore(
+        workspace: &TempDir,
+        chore_input: CreateChoreInput,
+        product_default_model: Option<&str>,
+    ) -> Result<(Arc<CapturingSpawner>, Task)> {
+        run_once_with_chore_inner(workspace, chore_input, product_default_model, true).await
+    }
+
+    async fn run_once_with_chore_inner(
+        workspace: &TempDir,
+        chore_input: CreateChoreInput,
+        product_default_model: Option<&str>,
+        unclassify_reasoning: bool,
+    ) -> Result<(Arc<CapturingSpawner>, Task)> {
         let (spawner, weak, cfg, work_db) = spawn_test_env(workspace);
 
         let product = create_test_product_with_repo(&work_db, "Boss", Some("git@example.com:foo.git"));
@@ -905,6 +977,29 @@ mod pane_spawn_tests {
         let mut chore_input = chore_input;
         chore_input.product_id = product.id.clone();
         let chore = work_db.create_chore(chore_input).unwrap();
+        let chore = if unclassify_reasoning {
+            let cleared = work_db
+                .update_work_item(
+                    &chore.id,
+                    boss_protocol::WorkItemPatch {
+                        reasoning: Some(String::new()),
+                        ..boss_protocol::WorkItemPatch::default()
+                    },
+                )
+                .unwrap();
+            match cleared {
+                WorkItem::Chore(t) | WorkItem::Task(t) => {
+                    assert!(
+                        t.reasoning.is_none(),
+                        "helper must produce a genuinely unclassified row"
+                    );
+                    t
+                }
+                other => panic!("expected chore/task item, got {other:?}"),
+            }
+        } else {
+            chore
+        };
 
         let flags = std::sync::Arc::new(crate::feature_flags::FeatureFlagsStore::new(
             workspace.path().join("feature-flags.toml"),
@@ -928,14 +1023,19 @@ mod pane_spawn_tests {
         Ok((spawner, chore))
     }
 
-    /// Untagged row (NULL effort_level, NULL model_override, no
-    /// product default) must produce the same spawn line today's
+    /// Untagged row (NULL effort_level, NULL model_override, NULL reasoning,
+    /// no product default) must produce the same spawn line today's
     /// engine produces — minus the implicit `claude` model selection,
     /// plus an explicit `--model <engine-default-slug>`. No
     /// `--effort` flag, no prompt addendum. Design §Q2 / task spec
     /// regression test: "byte-equivalent to today's `claude
     /// "$(cat .claude/initial-prompt.txt)"` plus the explicit
     /// `--model <engine-default-slug>`."
+    ///
+    /// Goes through [`run_once_with_unclassified_chore`] because "untagged" now
+    /// has to mean untagged on *both* axes: every create path seeds a reasoning
+    /// mode, so only a row predating that column reaches the engine-default
+    /// fall-through. That is exactly the population this assertion protects.
     #[tokio::test]
     async fn untagged_row_spawn_matches_engine_default() {
         let workspace = TempDir::new().unwrap();
@@ -944,7 +1044,9 @@ mod pane_spawn_tests {
             .name("Untagged chore")
             .description("plain row, no effort/model")
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         // The worker settings file lives outside the workspace; the
@@ -975,6 +1077,91 @@ mod pane_spawn_tests {
         assert!(
             !prompt.starts_with("Begin with a written plan"),
             "untagged-row prompt must not carry the large/max addendum",
+        );
+    }
+
+    /// A `large` row explicitly classified `standard` spawns Sonnet — but keeps
+    /// `--effort xhigh` and the planning addendum, because it is still a big
+    /// job. This is the mirror of the requirement that a small investigation
+    /// can reach Opus: the two axes move independently, and "big" is not the
+    /// same claim as "hard".
+    #[tokio::test]
+    async fn large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Mechanical rename across fifteen files")
+            .description("well-specified, just large")
+            .effort_level(EffortLevel::Large)
+            .reasoning(boss_protocol::ReasoningMode::Standard)
+            .build();
+        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let input = spawner.spawn_input();
+
+        assert!(
+            input.initial_input.contains("--model sonnet"),
+            "large + standard must spawn Sonnet, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--effort xhigh"),
+            "the size signal is untouched — still --effort xhigh, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--dangerously-skip-permissions"),
+            "Sonnet takes the non-auto permission branch, got: {:?}",
+            input.initial_input,
+        );
+
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+        assert!(
+            prompt.starts_with("Begin with a written plan."),
+            "large addendum still applies — it follows effort, not reasoning; got: {prompt:?}",
+        );
+    }
+
+    /// A `small` row classified `investigation` spawns Opus with its effort
+    /// level left honest. The whole point of the capability signal: before it
+    /// existed, the only way to get this row onto Opus was to call it `large`.
+    #[tokio::test]
+    async fn small_investigation_row_spawns_opus_without_inflating_effort() {
+        let workspace = TempDir::new().unwrap();
+        let chore_input = CreateChoreInput::builder()
+            .product_id(String::new())
+            .name("Review cards don't surface merge-conflict state")
+            .description("repro and evidence supplied; diagnose why the transition never fires")
+            .effort_level(EffortLevel::Small)
+            .reasoning(boss_protocol::ReasoningMode::Investigation)
+            .build();
+        let (spawner, chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let input = spawner.spawn_input();
+
+        assert_eq!(
+            chore.effort_level,
+            Some(EffortLevel::Small),
+            "the row still says what it is: a small job",
+        );
+        assert!(
+            input.initial_input.contains("--model opus"),
+            "small + investigation must spawn Opus, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--effort medium"),
+            "the effort knob still follows `small`, got: {:?}",
+            input.initial_input,
+        );
+        assert!(
+            input.initial_input.contains("--permission-mode auto"),
+            "Opus takes the auto-permission branch, got: {:?}",
+            input.initial_input,
+        );
+
+        let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
+        assert!(
+            !prompt.starts_with("Begin with a written plan"),
+            "reasoning must not smuggle in the large-effort addendum, got: {prompt:?}",
         );
     }
 
@@ -1087,7 +1274,14 @@ mod pane_spawn_tests {
             .description("multi-subsystem investigation")
             .effort_level(EffortLevel::Large)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        // Unclassified on purpose: this pins the *legacy* effort-table path,
+        // the one every row created before the `reasoning` column takes. A
+        // `large` row that has since been classified `standard` resolves to
+        // Sonnet instead — see
+        // `large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum`.
+        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
+            .await
+            .unwrap();
         let input = spawner.spawn_input();
 
         assert!(
@@ -1118,11 +1312,11 @@ mod pane_spawn_tests {
         );
     }
 
-    /// `products.default_model` only kicks in when both
-    /// `model_override` and `effort_level` are unset (design §Q3
-    /// step 3). With a product default in place but no effort tag,
-    /// the dispatch should pick the product slug rather than the
-    /// engine default — and still omit `--effort`.
+    /// `products.default_model` only kicks in when `model_override`,
+    /// `effort_level`, and `reasoning` are all unset (design §Q3
+    /// step 3, now step 6). With a product default in place but no effort tag
+    /// and no classification, the dispatch should pick the product slug rather
+    /// than the engine default — and still omit `--effort`.
     #[tokio::test]
     async fn product_default_model_fills_in_when_row_is_untagged() {
         let workspace = TempDir::new().unwrap();
@@ -1130,7 +1324,7 @@ mod pane_spawn_tests {
             .product_id(String::new())
             .name("Untagged on Sonnet-defaulted product")
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
             .await
             .unwrap();
         let input = spawner.spawn_input();

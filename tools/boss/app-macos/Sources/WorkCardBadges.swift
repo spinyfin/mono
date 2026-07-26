@@ -178,16 +178,41 @@ struct CIFailureChip: View {
     }
 }
 
+/// The single definition of "GitHub says this PR does not merge cleanly",
+/// over the raw `WorkTask.prMergeableState` wire value.
+///
+/// Every badge that renders PR state must consult this *before* deciding on
+/// any mergeable-looking rendering (green check, "checks passed"). CI state
+/// and merge-queue readiness both say nothing about whether the head merges
+/// cleanly, so a passing signal there must never be promoted to "ready" on
+/// a PR known to conflict. Keeping the comparison in one place is what stops
+/// the two call sites — `PrCiIndicator` and `MergeQueueBadge` — from drifting
+/// to different spellings of the same state.
+enum PrMergeability {
+    static func isConflicting(_ rawState: String?) -> Bool {
+        rawState == "conflicting"
+    }
+}
+
 /// CI status indicator shown on Review-lane cards. Four visual states:
 /// in-progress (yellow clock), success (green checkmark), fail (red X),
 /// and unknown / nil (also rendered as in-progress). The unknown state
 /// means the first poll is still pending — showing in-progress is truthful
 /// ("we haven't checked yet") and keeps the icon slot occupied so it
 /// doesn't pop in later.
+///
+/// A known conflict pre-empts all four: see `prMergeableState`.
 
 struct PrCiIndicator: View {
     let state: String
     var detail: String? = nil
+    /// Raw GitHub mergeability (`WorkTask.prMergeableState`). CI alone
+    /// (`state`) says nothing about whether the PR's head actually merges
+    /// cleanly — a PR can have `state == "success"` while GitHub reports it
+    /// `CONFLICTING` (mono#2366, Review-lane counterpart of mono#2303's
+    /// `MergeQueueBadge` fix), so this must be checked ahead of the
+    /// CI-only rendering rather than inferred from CI passing.
+    var prMergeableState: String? = nil
 
     var body: some View {
         if let icon = systemImage {
@@ -199,7 +224,17 @@ struct PrCiIndicator: View {
         }
     }
 
-    private var systemImage: String? {
+    // `isConflicting` and the three rendering properties below are
+    // deliberately not `private`: `PrCiIndicatorConflictTests` pins the
+    // conflict-pre-emption behavior by reading them directly, which asserts
+    // on what actually gets rendered (icon, tint, tooltip) rather than on a
+    // predicate that a future edit could leave correct while reordering the
+    // switches underneath it. `@testable import` reaches `internal`, not
+    // `private`.
+    var isConflicting: Bool { PrMergeability.isConflicting(prMergeableState) }
+
+    var systemImage: String? {
+        if isConflicting { return "xmark.circle.fill" }
         switch state {
         case "success": return "checkmark.circle.fill"
         case "fail":    return "xmark.circle.fill"
@@ -207,7 +242,8 @@ struct PrCiIndicator: View {
         }
     }
 
-    private var tint: Color {
+    var tint: Color {
+        if isConflicting { return .red }
         switch state {
         case "success": return .green
         case "fail":    return .red
@@ -215,7 +251,10 @@ struct PrCiIndicator: View {
         }
     }
 
-    private var tooltipText: String {
+    var tooltipText: String {
+        if isConflicting {
+            return "PR has merge conflicts"
+        }
         switch state {
         case "success":
             return "All required CI checks passed"
@@ -445,7 +484,7 @@ struct MergeQueueBadge: View {
         // on GitHub while a conflict blocks it (mono#2023 "merge when
         // ready" semantics), so CI alone must never render as mergeable
         // when the PR is known to conflict (T3271 / mono#2303).
-        if prMergeableState == "conflicting" {
+        if PrMergeability.isConflicting(prMergeableState) {
             return .unmergeable
         }
         switch ciRequiredState {
@@ -901,6 +940,26 @@ struct PriorityChip: View {
         case .medium: return Color(nsColor: .secondaryLabelColor)
         case .low: return .blue
         }
+    }
+}
+
+/// Reasoning-mode chip rendered on kanban cards, and ONLY for
+/// `investigation`. `standard` is the overwhelming majority and gets no chip:
+/// a badge on nearly every card carries no information and just crowds the
+/// footer. This chip means "this row is on the expensive tier", which is the
+/// only thing worth a glance. Mirrors the CLI's `REASONING` column, which
+/// renders on the same condition.
+struct ReasoningChip: View {
+    var body: some View {
+        Text("INV")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(Color.purple)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.14))
+            .clipShape(Capsule())
+            .help("Reasoning: Investigation — dispatches to the higher-capability model regardless of effort")
+            .accessibilityLabel("Reasoning Investigation")
     }
 }
 

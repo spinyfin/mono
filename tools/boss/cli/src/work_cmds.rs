@@ -685,6 +685,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
                     .maybe_model_override(model_override)
+                    .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
                     .force_duplicate(args.force_duplicate)
                     .build(),
@@ -806,6 +807,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
                     .maybe_model_override(model_override)
+                    .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
                     .force_duplicate(args.force_duplicate)
                     .build(),
@@ -1066,6 +1068,11 @@ pub(crate) async fn run_update_leaf(
     } else {
         args.model
     };
+    let reasoning = if args.unset_reasoning {
+        Some(String::new())
+    } else {
+        args.reasoning.map(|r| r.as_str().to_owned())
+    };
     let driver = if args.unset_driver {
         Some(String::new())
     } else {
@@ -1088,6 +1095,7 @@ pub(crate) async fn run_update_leaf(
         repo_remote_url: args.repo_remote_url,
         effort_level,
         model_override,
+        reasoning,
         driver,
         autostart: args.autostart,
         // `--deferred false` approves a future-scope item; `--deferred true`
@@ -1105,7 +1113,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --model, --driver, --autostart, --deferred, --blocked-reason, or --blocked-detail",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --blocked-reason, or --blocked-detail",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {

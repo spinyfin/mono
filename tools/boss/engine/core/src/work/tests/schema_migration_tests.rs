@@ -479,3 +479,59 @@ fn migration_collapses_directive_and_larger_change_intent_to_revision() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// Upgrading a database that predates the `reasoning` column re-adds it and
+/// leaves every existing row NULL. No backfill is correct, not an omission:
+/// NULL is the "never classified" state the dispatcher resolves through its
+/// legacy kind-floor / effort-table path, so an in-flight row keeps the exact
+/// model it had before the upgrade. Backfilling `standard` here would silently
+/// re-model every `large` row on the board from Opus to Sonnet.
+#[test]
+fn migration_re_adds_reasoning_column_and_leaves_existing_rows_null() {
+    // disk_db_path required: drops a column and re-opens the DB to migrate.
+    let (_dir, path) = disk_db_path("reasoning-upgrade");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let chore = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Legacy large chore")
+                .effort_level(EffortLevel::Large)
+                .build(),
+        )
+        .unwrap();
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute("ALTER TABLE tasks DROP COLUMN reasoning", []).unwrap();
+        assert!(!table_has_column(&conn, "tasks", "reasoning").unwrap());
+    }
+    drop(db);
+
+    let db = WorkDb::open(path.clone()).unwrap();
+    {
+        let conn = db.connect().unwrap();
+        assert!(table_has_column(&conn, "tasks", "reasoning").unwrap());
+        let stored: Option<String> = conn
+            .query_row("SELECT reasoning FROM tasks WHERE id = ?1", [&chore.id], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(stored.is_none(), "the migration must not backfill a value");
+    }
+
+    // And the row reads back as unclassified through the mapper, so the
+    // dispatcher takes the legacy path for it.
+    let reread = db.get_work_item(&chore.id).unwrap();
+    let task = match reread {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected chore/task item, got {other:?}"),
+    };
+    assert!(task.reasoning.is_none());
+    assert_eq!(
+        task.effort_level,
+        Some(EffortLevel::Large),
+        "size signal survives intact"
+    );
+}

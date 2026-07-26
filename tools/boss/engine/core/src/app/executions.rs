@@ -430,6 +430,92 @@ pub(super) async fn handle_stop_run(ctx: Dispatch, req: FrontendRequest) {
     }
 }
 
+/// Place an explicit operator hold on a live run, exempting it from the
+/// idle-park ([`crate::completion::WorkerCompletionHandler::nudge_or_park`])
+/// and auto-reap ([`crate::stale_worker_sweep::run_one_pass`]) sweeps
+/// until released ([`handle_release_hold_run`]) or the run ends. Backs
+/// `bossctl agents hold`. Errors if `run_id` is not a currently-live run —
+/// a hold on a run that has already ended (or never existed) would sit in
+/// the registry forever with nothing left to protect.
+pub(super) async fn handle_hold_run(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::HoldRun { run_id, reason } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "hold_run rejected: caller not in app/Boss subtree",
+        );
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: "hold_run requires app or Boss authority".to_owned(),
+            },
+        );
+        return;
+    }
+    if !server_state.live_worker_states.is_run_live(&run_id) {
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: format!("hold_run: no live run matches `{run_id}`"),
+            },
+        );
+        return;
+    }
+    let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    tracing::info!(run_id = %run_id, reason = reason.as_deref().unwrap_or("(none given)"), "hold_run requested");
+    server_state.hold_registry.hold(&run_id, reason.clone(), now_epoch_secs);
+    server_state.live_worker_states.set_held(&run_id, true);
+    send_response(&sink, &request_id, FrontendEvent::RunHeld { run_id, reason });
+}
+
+/// Release a previously-placed hold on `run_id`, restoring the normal
+/// idle-park/auto-reap sweep behavior. Idempotent — releasing a run with
+/// no hold in place still replies `RunHoldReleased`. Backs `bossctl
+/// agents release-hold`.
+pub(super) async fn handle_release_hold_run(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::ReleaseHoldRun { run_id } = req else {
+        unreachable!()
+    };
+    if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+        tracing::warn!(
+            peer_pid = ?peer_pid,
+            run_id = %run_id,
+            "release_hold_run rejected: caller not in app/Boss subtree",
+        );
+        send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::Error {
+                message: "release_hold_run requires app or Boss authority".to_owned(),
+            },
+        );
+        return;
+    }
+    tracing::info!(run_id = %run_id, "release_hold_run requested");
+    server_state.hold_registry.release(&run_id);
+    server_state.live_worker_states.set_held(&run_id, false);
+    send_response(&sink, &request_id, FrontendEvent::RunHoldReleased { run_id });
+}
+
 pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

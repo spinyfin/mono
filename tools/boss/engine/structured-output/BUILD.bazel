@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/driver:__pkg__",
         "//tools/boss/engine/effort:__pkg__",
         "//tools/boss/engine/pr-review:__pkg__",
+        "//tools/boss/engine/stdout-progress:__pkg__",
     ],
     deps = [
         "//tools/boss/engine/utils",

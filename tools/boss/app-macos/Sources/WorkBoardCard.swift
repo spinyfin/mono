@@ -234,7 +234,7 @@ struct WorkBoardCardItem: View {
                     reviewRequiredDetail: column == .review ? task.reviewRequiredDetail : nil,
                     mergeQueueState: task.isInMergingSection ? task.mergeQueueState : nil,
                     mergeQueueDetail: task.isInMergingSection ? task.mergeQueueDetail : nil,
-                    prMergeableState: task.isInMergingSection ? task.prMergeableState : nil,
+                    prMergeableState: task.prMergeableState,
                     externalRefLink: externalRefLink,
                     ambiguousRepoNames: model.ambiguousVisibleRepoNames,
                     inReviewRevisions: inReviewRevisions,
@@ -572,11 +572,20 @@ struct WorkBoardCardView: View {
     /// `nil` unless `mergeQueueState` is non-nil. Parsed by `MergeQueueBadge`
     /// to render the queue position and readiness icon.
     var mergeQueueDetail: String? = nil
-    /// Raw GitHub mergeability for the Merging-section badge — mirrors
-    /// `WorkTask.prMergeableState`; supplied by the parent under the same
-    /// `task.isInMergingSection` condition as `mergeQueueState`. Lets
-    /// `MergeQueueBadge` render `unmergeable` on a conflicting PR even
-    /// when required CI has passed (T3271 / mono#2303).
+    /// Raw GitHub mergeability — an unconditional mirror of
+    /// `WorkTask.prMergeableState`, deliberately NOT gated on lane or
+    /// section. Whichever badge ends up rendering PR state is responsible
+    /// for pre-empting a mergeable-looking rendering when this says
+    /// `"conflicting"`; the card's job is only to make the fact available.
+    ///
+    /// Gating this to the lanes that happen to render a badge today would
+    /// re-create the bug it fixes: the value was previously supplied under
+    /// the same condition as `mergeQueueState`, so `MergeQueueBadge` — the
+    /// only reader — could apply its conflict check, but a Review-lane card
+    /// (never in the Merging section) fell through to `PrCiIndicator` with
+    /// `nil` here and rendered a green check on a PR GitHub reported as
+    /// `CONFLICTING` (mono#2366). Both readers now check it (mono#2303 for
+    /// `MergeQueueBadge`, mono#2366 for `PrCiIndicator`).
     var prMergeableState: String? = nil
     /// Upstream-link affordance derived from `task.externalRef`. `nil`
     /// when the task has no external binding — the affordance is hidden
@@ -742,6 +751,9 @@ struct WorkBoardCardView: View {
                        !effortLevel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         EffortChip(effortLevel: effortLevel)
                     }
+                    if task.reasoning == "investigation" {
+                        ReasoningChip()
+                    }
                     if task.deferred {
                         FutureScopeBadge()
                     }
@@ -886,7 +898,7 @@ struct WorkBoardCardView: View {
                         )
                         .layoutPriority(-1)
                     } else if let ciState = ciRequiredState {
-                        PrCiIndicator(state: ciState, detail: ciRequiredDetail)
+                        PrCiIndicator(state: ciState, detail: ciRequiredDetail, prMergeableState: prMergeableState)
                     }
                     PRURLLink(
                         urlString: prURL,

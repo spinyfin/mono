@@ -462,6 +462,7 @@ pub(crate) async fn run_create_investigation(
             .maybe_repo_remote_url(args.repo_remote_url)
             .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
             .maybe_model_override(model_override)
+            .maybe_reasoning(args.reasoning.map(boss_protocol::ReasoningMode::from))
             .maybe_driver(driver)
             .force_duplicate(args.force_duplicate)
             .build(),
@@ -585,6 +586,7 @@ pub(crate) async fn run_create_revision(
             .maybe_priority(args.priority.map(|p| p.as_str().to_owned()))
             .maybe_effort_level(args.effort.map(boss_protocol::EffortLevel::from))
             .maybe_model_override(model_override)
+            .maybe_reasoning(args.reasoning.map(boss_protocol::ReasoningMode::from))
             .maybe_driver(driver)
             .force_duplicate(args.force_duplicate)
             .depends_on(depends_on)
@@ -2235,6 +2237,7 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.pr_url.is_some()
         || patch.ordinal.is_some()
         || patch.effort_level.is_some()
+        || patch.reasoning.is_some()
         || patch.model_override.is_some()
         || patch.driver.is_some()
         || patch.default_model.is_some()

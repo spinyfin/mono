@@ -397,7 +397,7 @@ private let bossFilingGuidanceDirect = """
     1. Find the Boss product: `boss product list --json` — identify the product named "Boss" (or equivalent).
     2. Create the chore with the `[effort-classification]` tag baked into the `--description` (one atomic write — do NOT do a separate update after create, as that races with autostart and produces a spurious worker re-read probe). Example:
        ```sh
-       boss chore create --product <id> --name "…" --effort <level> \
+       boss chore create --product <id> --name "…" --effort <level> --reasoning <mode> \
          --description "$(cat <<'EOF'
        <brief>
 
@@ -509,8 +509,35 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - Use current product and project context before choosing task/chore/project shape.
     - Ask only when you cannot reasonably infer the destination product.
     - Keep status and structure accurate as workers finish.
-    - Pass `--effort <level>` on every `boss chore create` / `boss task create`. Do NOT pass `--model`.
+    - Pass `--effort <level>` AND `--reasoning <mode>` on every `boss chore create` / `boss task create`. Do NOT pass `--model` — model selection is policy, not something you hand-pick per row.
     - Prefer subagents for pre-work. When filing a chore/task/project requires nontrivial preparation — gathering logs or stats, reading design docs or PRs, sweeping code to scope a problem — spin off a coordinator subagent (Agent tool) to do it rather than doing it inline or filing a thin brief. Fold the subagent's findings (verbatim evidence, file paths, stats) into the work item's description so the dispatched worker starts from concrete context instead of rediscovering it. This matters doubly when the evidence lives in coordinator-only state (engine logs, runtime db) that cube workers are forbidden to read: the brief is the only channel that context can cross. Inline work is fine only for a single trivial lookup (one CLI call or one file peek). Hard tripwire: any diagnosis or scoping that needs a third tool call of the same investigation — regardless of whether the calls hit repo files, engine trace, logs, GitHub, or external APIs — moves to a background agent with the full question. Inline is reserved for: boss/bossctl CRUD and status, a single lookup of any kind, and interactive ops the user is actively steering in real time (e.g. an auth handshake or a confirmed destructive command).
+
+    ## Reasoning classification
+
+    Modes: `standard | investigation`. Pass `--reasoning <mode>` on every create.
+
+    **This is a separate axis from effort, and mixing them up is the mistake this flag exists to prevent.** Effort is *how big* the job is (how long, how many files, how many subsystems). Reasoning is *what kind of thinking* it needs. They move independently: a one-file chore can need investigation, and a fifteen-file mechanical rename does not.
+
+    Reasoning is what picks the worker's model. Effort picks its runway (the `--effort` knob, the planning addendum, scheduling and timeouts). **Never inflate `--effort` to get a stronger model** — that lies about the size of the work and distorts scheduling and every effort-based report. Reach for `--reasoning investigation` instead.
+
+    ### Rules (top-to-bottom, first match wins)
+
+    1. **Design-kind or investigation-kind row → `investigation`** (confidence high). The deliverable is the thinking.
+    2. **The brief hands over a symptom rather than a change → `investigation`** (confidence high). Tells: it supplies a repro, logs, or evidence and asks *why*; it says diagnose / root cause / figure out / work out why / find out what's causing; the worker must locate the fault before it can know what to edit. A brief that says "X doesn't happen and here is the trace" is this rule even when the eventual fix is one line.
+    3. **The change is architectural or open-ended → `investigation`** (confidence medium). Tells: redesign, rearchitect, decide between approaches, introduce a new abstraction, choose a schema or protocol shape. The work is deciding *what* to build, not building it.
+    4. **The brief says exactly what to change → `standard`** (confidence high). Named files, named symbols, a stated target state, a described diff. Size is irrelevant here: a large well-specified mechanical change is still `standard`.
+    5. **Otherwise → `standard`** (confidence low). Reason: "fallback." This is deliberately the default — well-articulated coding work is the bulk of Boss's throughput and belongs on the cheaper, faster tier.
+
+    ### Edge cases
+
+    - **Investigate-family markers in the effort heuristic (rule 2 there) do NOT decide this.** That rule bumps *size* because investigate-shaped work tends to be long. Classify reasoning from the brief's own shape, using the rules above, not from whether that marker fired.
+    - **A `large` row may be `standard`** and **a `small` or `medium` row may be `investigation`**. Both combinations are correct and expected; neither is a signal that you misclassified the other axis.
+    - **Bug fixes split both ways:** "fix this null deref at foo.rs:42" is `standard`; "this panics intermittently under load, find out why" is `investigation`.
+    - **Revisions** inherit their chain root's mode automatically. Do not pass `--reasoning` on `boss task create-revision` unless the ask genuinely changed shape.
+
+    ### Updating later
+
+    `boss task update <row-id> --reasoning <mode>` sets it; `--unset-reasoning` clears it back to legacy resolution. Re-dispatch reads the current value, exactly as it does for `effort_level`. Existing rows are not re-modelled by anything except an explicit update.
 
     ## Effort estimation
 
@@ -521,7 +548,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     ### Rules (top-to-bottom, first match wins)
 
     1. **Design-kind or investigation-kind row → `large`** (confidence high). Reason: "design or investigation kind."
-    2. **Title or description matches investigate-family marker → `large`** (confidence high). Markers: `investigate`, `audit`, `instrument`, `diagnose`, `end-to-end`, `root cause`, `architect`, `redesign`, `migrate`, `rearchitect`. **Size only, not kind** — these markers bump effort to `large` but must not bias the kind decision. An investigate-shaped prompt may still be an investigation task (see "Investigation tasks" section); do not let this rule push you toward a plain chore when the user wants a writeup.
+    2. **Title or description matches investigate-family marker → `large`** (confidence high). Markers: `investigate`, `audit`, `instrument`, `diagnose`, `end-to-end`, `root cause`, `architect`, `redesign`, `migrate`, `rearchitect`. **Size only** — these markers bump effort to `large` but must not bias either the *kind* decision or the *reasoning* decision. An investigate-shaped prompt may still be an investigation task (see "Investigation tasks" section); do not let this rule push you toward a plain chore when the user wants a writeup. And do not treat this rule firing as the reason to pass `--reasoning investigation` — classify that from the brief's own shape (see "Reasoning classification"), and note the converse too: a row this rule did NOT fire on can still be `investigation`.
     3. **Description ≥ 4 KB → `large`** (confidence medium). Reason: "description size N KB."
     4. **Title or description has multi-file/multi-subsystem hint → `medium`** (confidence medium). Hints: `+` between subsystems, "across", "spans", multiple module names (`engine`, `cli`, `protocol`, `app-macos`, `cube`, `bossctl`).
     5. **Title matches mechanical-edit marker → `trivial`** (confidence high). Markers: `rename`, `apply`, `revert`, `bump`, `move`, `delete`, `remove`, `hide`, `show`, `pad`, `align`, `re-export`, `gap`, `cursor`, `badge`, `tooltip`.
@@ -546,7 +573,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     Compose the tag into the `--description` you pass to `boss chore create` / `boss task create`:
 
     ```sh
-    boss chore create --product <id> --name "…" --effort small \
+    boss chore create --product <id> --name "…" --effort small --reasoning standard \
       --description "$(cat <<'EOF'
     <the chore brief>
 

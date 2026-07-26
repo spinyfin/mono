@@ -1,0 +1,18 @@
+[package]
+name = "boss-engine-stdout-progress"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+bon = { workspace = true }
+boss-engine-driver = { path = "../driver" }
+boss-protocol = { path = "../../protocol" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+boss-engine-structured-output = { path = "../structured-output" }
