@@ -81,7 +81,7 @@ mod apply_permission_extra_args_tests {
 
     #[test]
     fn reviewer_sandbox_replaces_workspace_write_default() {
-        let plan = CodexDriver.spawn_invocation(SpawnRequest {
+        let plan = CodexDriver::default().spawn_invocation(SpawnRequest {
             model: "gpt-5.6-terra",
             effort: None,
             settings_path: None,

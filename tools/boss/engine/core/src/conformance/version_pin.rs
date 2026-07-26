@@ -192,7 +192,7 @@ fn codex_exec_spawn_satisfies_shared_flag_contract() {
     assert_codex_exec_spawn_contract(&plan);
 
     // Production CodexDriver must satisfy the same required/forbidden flags.
-    let production = crate::driver::CodexDriver.spawn_invocation(crate::driver::SpawnRequest {
+    let production = crate::driver::CodexDriver::default().spawn_invocation(crate::driver::SpawnRequest {
         model: "gpt-5.6-terra",
         effort: Some("high"),
         settings_path: None,
