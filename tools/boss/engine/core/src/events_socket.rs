@@ -109,11 +109,15 @@ impl IncomingHookEvent {
 
     /// Test-only shorthand for [`Self::resolve`] against the engine's default
     /// hook-callback driver — the same one the production accept loop
-    /// resolves — with no peer pid. Tests that need a *different* driver's
-    /// boundary (or its absence) call `resolve` directly.
+    /// resolves via [`crate::driver::DriverRegistry`] — with no peer pid.
+    /// Tests that need a *different* driver's boundary (or its absence)
+    /// call `resolve` directly.
     #[cfg(test)]
     pub(crate) fn for_test(event: WorkerEvent, run_id: Option<String>, transcript_path: Option<String>) -> Self {
-        Self::resolve(&crate::driver::ClaudeDriver, event, run_id, transcript_path, None)
+        let driver = crate::driver::DriverRegistry::default()
+            .require(crate::effort::ENGINE_DEFAULT_DRIVER)
+            .expect("engine default driver is always registered");
+        Self::resolve(driver.as_ref(), event, run_id, transcript_path, None)
     }
 }
 

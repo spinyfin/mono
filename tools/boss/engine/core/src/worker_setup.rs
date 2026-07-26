@@ -63,7 +63,7 @@ use serde_json;
 use boss_protocol::ExecutionKind;
 
 use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
-use crate::driver::{AgentDriver, ClaudeDriver, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig};
+use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig};
 use crate::ssh_transport::shell_quote;
 
 // Re-export guard command constants so the test module (which uses `use
@@ -538,8 +538,12 @@ enum EngineDataDirSandbox {
 /// the `boss-event` shim with absolute paths so the hook fires
 /// regardless of `PATH`. The engine points the session at this via
 /// `claude --settings`; it is written outside the workspace tree.
-pub fn render_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Enabled);
+///
+/// `driver` supplies ProgressObservation + ToolUseInterception wiring —
+/// resolved by the caller via [`crate::driver::DriverRegistry::require`],
+/// never constructed as a concrete type here.
+pub fn render_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Enabled, driver);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
@@ -552,23 +556,28 @@ pub fn render_settings_json(input: &WorkerSetupInput) -> String {
 /// the worker-visible *forwarded* socket path on the remote (e.g.
 /// `/tmp/boss-events-<run>.sock`) and `boss_event_path` with the remote
 /// shim (typically the bare `boss-event` resolved on the remote PATH).
-pub fn render_remote_settings_json(input: &WorkerSetupInput) -> String {
-    let value = settings_value(input, EngineDataDirSandbox::Disabled);
+pub fn render_remote_settings_json(input: &WorkerSetupInput, driver: &dyn AgentDriver) -> String {
+    let value = settings_value(input, EngineDataDirSandbox::Disabled, driver);
     serde_json::to_string_pretty(&value).expect("settings JSON value is always serializable")
 }
 
-fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> serde_json::Value {
-    // Rich-tier ProgressObservation (design §1.5): the Claude driver wires
-    // every hook event to the `boss-event` forwarder, producing the
-    // `WorkerEvent` stream that drives the activity machine. The env-prefix
-    // rationale (`BOSS_RUN_ID` correlation, `BOSS_WORKSPACE` buffering) and
-    // the shim command live in `ClaudeDriver::progress_observation_wiring`.
+fn settings_value(
+    input: &WorkerSetupInput,
+    sandbox: EngineDataDirSandbox,
+    driver: &dyn AgentDriver,
+) -> serde_json::Value {
+    // Rich-tier ProgressObservation (design §1.5): the resolved driver wires
+    // every hook event to the `boss-event` forwarder (or declares a
+    // StdoutJsonl ingress with no hooks), producing the `WorkerEvent` stream
+    // that drives the activity machine. The env-prefix rationale
+    // (`BOSS_RUN_ID` correlation, `BOSS_WORKSPACE` buffering) and the shim
+    // command live in the driver's `progress_observation_wiring`.
     //
     // The settings file is still assembled here because the permission rules
     // (PermissionPolicy) and the PreToolUse interception guards
-    // (ToolUseInterception) share this JSON and are extracted in later tasks;
-    // for now they layer on top of the driver-produced hooks.
-    let ingress = ClaudeDriver.progress_observation_wiring(&ProgressObservationConfig {
+    // (ToolUseInterception) share this JSON; they layer on top of the
+    // driver-produced hooks.
+    let ingress = driver.progress_observation_wiring(&ProgressObservationConfig {
         events_socket_path: input.events_socket_path.clone(),
         lease_id: input.lease_id.clone(),
         run_id: input.run_id.clone(),
@@ -589,7 +598,7 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
 
     let is_revision =
         input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
-    let interception_wiring = ClaudeDriver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+    let interception_wiring = driver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
         data_dir: if sandbox == EngineDataDirSandbox::Enabled {
             input.events_socket_path.parent().map(|p| p.to_path_buf())
         } else {
@@ -1648,9 +1657,11 @@ fn hook_group_is_leaked(group: &serde_json::Value) -> bool {
 /// module docs for why dropping session config into a VCS-visible path
 /// (`settings.json` or `settings.local.json`) is the bug this avoids.
 ///
-/// `driver` supplies the config-dir name, the agent-rules filename, and
-/// the hook-enforcement preamble (WorkspaceProvisioning + PromptComposition
-/// capabilities). Pass [`crate::driver::ClaudeDriver`] for the standard case.
+/// `driver` supplies the config-dir name, the agent-rules filename, the
+/// hook-enforcement preamble, and ProgressObservation / ToolUseInterception
+/// wiring (WorkspaceProvisioning + PromptComposition + those capabilities).
+/// Callers resolve it via [`crate::driver::DriverRegistry::require`] rather
+/// than constructing a concrete driver type.
 pub fn write_workspace_files(
     input: &WorkerSetupInput,
     driver: &dyn crate::driver::AgentDriver,
@@ -1693,7 +1704,7 @@ pub fn write_workspace_files(
         ensure_path_guard_script_in(parent)?;
         ensure_checkleft_push_guard_script_in(parent)?;
     }
-    std::fs::write(&settings_path, render_settings_json(input))?;
+    std::fs::write(&settings_path, render_settings_json(input, driver))?;
 
     Ok(WrittenFiles {
         claude_md_path: agent_rules_path,

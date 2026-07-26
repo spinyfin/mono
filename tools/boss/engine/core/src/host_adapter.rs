@@ -729,7 +729,14 @@ impl HostAdapter for SshHostAdapter {
             // its reduced surface instead of silently becoming Standard.
             worker_kind: crate::worker_setup::worker_kind_for_execution(&execution.kind),
         };
-        let settings_json = render_remote_settings_json(&settings_input);
+        // Resolve the same driver `compose_worker_spawn` already validated
+        // against the registry — settings wiring (ProgressObservation +
+        // ToolUseInterception) must come from that driver, not a hardcoded
+        // Claude reference.
+        let driver = crate::driver::DriverRegistry::default()
+            .require(&spawn_config.driver)
+            .map_err(|err| anyhow::anyhow!("remote spawn: {err}"))?;
+        let settings_json = render_remote_settings_json(&settings_input, driver.as_ref());
 
         // 5. Ship the prompt + settings to the remote. The prompt lives
         //    under `<workspace>/.boss/` (read by the wrapper via

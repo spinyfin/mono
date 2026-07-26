@@ -4,7 +4,7 @@ use super::helpers::*;
 #[test]
 fn settings_json_is_valid_json_with_all_seven_hooks() {
     let input = sample_input();
-    let rendered = render_settings_json(&input);
+    let rendered = render_settings_json(&input, &ClaudeDriver);
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     let hooks = parsed.get("hooks").unwrap().as_object().unwrap();
     for name in [
@@ -34,7 +34,7 @@ fn settings_json_is_valid_json_with_all_seven_hooks() {
 #[test]
 fn settings_json_threads_socket_lease_and_shim_into_command() {
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
     assert!(command.contains("events.sock"));
     assert!(command.contains("lease-uuid-abc"));
@@ -49,7 +49,7 @@ fn settings_json_inlines_workspace_into_every_hook_command() {
     // hook command must inline-prefix this env var so the buffer
     // lives in the lease's workspace regardless of cwd.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let workspace_str = input.workspace_path.display().to_string();
     for hook_name in [
         "SessionStart",
@@ -79,7 +79,7 @@ fn settings_json_inlines_run_id_into_every_hook_command() {
     // can't correlate hook events to runs and the live worker
     // state stays pinned at `Spawning` for the worker's lifetime.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     for hook_name in [
         "SessionStart",
         "UserPromptSubmit",
@@ -111,7 +111,7 @@ fn settings_json_pins_permissions_default_mode_to_auto() {
     // autonomously while still honoring the user's permission
     // allow/deny rules, which the environment policy requires.
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     assert_eq!(
         parsed["permissions"]["defaultMode"],
         serde_json::Value::String("auto".into()),
@@ -122,7 +122,7 @@ fn settings_json_pins_permissions_default_mode_to_auto() {
 #[test]
 fn shell_escape_quotes_paths_with_spaces() {
     let input = sample_input();
-    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input)).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&render_settings_json(&input, &ClaudeDriver)).unwrap();
     let command = parsed["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
     // Application Support has a space — must round-trip through
     // single-quote escaping.
