@@ -129,7 +129,8 @@ impl std::fmt::Display for AuthFingerprint {
 /// Result of provisioning auth into a per-run `CODEX_HOME`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSnapshot {
-    /// Absolute path of the per-run `auth.json` written.
+    /// Path of the per-run `auth.json` written (`codex_home/auth.json`).
+    /// Not necessarily absolute — mirrors the `codex_home` argument shape.
     pub auth_path: PathBuf,
     /// Fingerprint of the bytes installed at provision time.
     pub fingerprint: AuthFingerprint,
@@ -164,13 +165,25 @@ pub enum AdoptOutcome {
 /// [`snapshot_auth_into_codex_home`]. Prefer a Boss-managed regular-file
 /// source over pointing concurrent workers at the interactive home.
 pub fn resolve_operator_auth_path() -> PathBuf {
-    if let Ok(home) = std::env::var("CODEX_HOME") {
-        let home = home.trim();
-        if !home.is_empty() {
-            return PathBuf::from(home).join(AUTH_JSON_NAME);
+    resolve_operator_auth_path_from(
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+}
+
+/// Pure path resolution for operator auth (no env access). Prefer this in
+/// tests; production code uses [`resolve_operator_auth_path`].
+///
+/// Precedence: non-empty trimmed `codex_home` → `$codex_home/auth.json`;
+/// else `home` → `$home/.codex/auth.json`; else relative `.codex/auth.json`.
+pub fn resolve_operator_auth_path_from(codex_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    if let Some(codex_home) = codex_home {
+        let codex_home = codex_home.trim();
+        if !codex_home.is_empty() {
+            return PathBuf::from(codex_home).join(AUTH_JSON_NAME);
         }
     }
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = home {
         return PathBuf::from(home).join(".codex").join(AUTH_JSON_NAME);
     }
     PathBuf::from(".codex").join(AUTH_JSON_NAME)
@@ -179,12 +192,16 @@ pub fn resolve_operator_auth_path() -> PathBuf {
 /// Snapshot source `auth.json` into `codex_home/auth.json` under an exclusive
 /// lock on the source. Refuses symlink sources. Never logs credential bytes.
 pub fn snapshot_auth_into_codex_home(source_auth: &Path, codex_home: &Path) -> Result<AuthSnapshot, CodexAuthError> {
-    let source_auth = canonicalize_existing(source_auth)?;
+    let source_auth = ensure_path_exists(source_auth)?;
+    // Early reject before contending for the lock (best-effort).
     ensure_regular_file_not_symlink(&source_auth)?;
 
     let lock_path = source_lock_path(&source_auth);
     let _lock = SourceLock::acquire(&lock_path)?;
 
+    // Re-check under the exclusive lock to close the TOCTOU window between
+    // the pre-lock probe and the content read.
+    ensure_regular_file_not_symlink(&source_auth)?;
     let bytes = read_file_bytes(&source_auth)?;
     validate_auth_json_shape(&bytes, &source_auth)?;
     let fingerprint = AuthFingerprint::from_bytes(&bytes);
@@ -231,12 +248,23 @@ pub fn snapshot_auth_into_codex_home(source_auth: &Path, codex_home: &Path) -> R
 /// [`snapshot_auth_into_codex_home`]. Callers must pass the same source path.
 pub fn adopt_refresh_if_newer(snapshot: &AuthSnapshot, codex_home: &Path) -> Result<AdoptOutcome, CodexAuthError> {
     let run_auth = codex_home.join(AUTH_JSON_NAME);
-    if !run_auth.exists() {
-        tracing::info!(
-            codex_home = %codex_home.display(),
-            "codex auth: adopt skipped — per-run auth.json missing"
-        );
-        return Ok(AdoptOutcome::RunAuthMissing);
+    // Use symlink_metadata so a dangling symlink is not treated as missing
+    // (Path::exists follows links and would report false).
+    match fs::symlink_metadata(&run_auth) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::info!(
+                codex_home = %codex_home.display(),
+                "codex auth: adopt skipped — per-run auth.json missing"
+            );
+            return Ok(AdoptOutcome::RunAuthMissing);
+        }
+        Err(source) => {
+            return Err(CodexAuthError::Io { path: run_auth, source });
+        }
+        Ok(_) => {
+            // Refuse to follow a per-run auth.json symlink into another tree.
+            ensure_regular_file_not_symlink(&run_auth)?;
+        }
     }
 
     let run_bytes = read_file_bytes(&run_auth)?;
@@ -252,11 +280,13 @@ pub fn adopt_refresh_if_newer(snapshot: &AuthSnapshot, codex_home: &Path) -> Res
     }
 
     let source_auth = &snapshot.source_path;
+    // Early reject before contending for the lock (best-effort).
     ensure_regular_file_not_symlink(source_auth)?;
     let lock_path = source_lock_path(source_auth);
     let _lock = SourceLock::acquire(&lock_path)?;
 
-    // Re-read source under the lock.
+    // Re-check + re-read source under the exclusive lock (TOCTOU).
+    ensure_regular_file_not_symlink(source_auth)?;
     let source_bytes = read_file_bytes(source_auth)?;
     validate_auth_json_shape(&source_bytes, source_auth)?;
     let source_fp = AuthFingerprint::from_bytes(&source_bytes);
@@ -264,16 +294,12 @@ pub fn adopt_refresh_if_newer(snapshot: &AuthSnapshot, codex_home: &Path) -> Res
     let run_meta = auth_refresh_meta(&run_bytes);
     let source_meta = auth_refresh_meta(&source_bytes);
 
-    let run_newer = match (&run_meta.last_refresh, &source_meta.last_refresh) {
-        (Some(r), Some(s)) => r.as_str() > s.as_str(),
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => {
-            // No timestamps: adopt only when content differs and source still
-            // matches the provision-time fingerprint (no concurrent adoption).
-            source_fp == snapshot.fingerprint
-        }
-    };
+    let run_newer = decide_run_is_newer(
+        run_meta.last_refresh.as_deref(),
+        source_meta.last_refresh.as_deref(),
+        &source_fp,
+        &snapshot.fingerprint,
+    );
 
     if !run_newer {
         tracing::info!(
@@ -345,16 +371,19 @@ fn source_lock_path(source_auth: &Path) -> PathBuf {
     }
 }
 
-fn canonicalize_existing(path: &Path) -> Result<PathBuf, CodexAuthError> {
-    if !path.exists() {
-        return Err(CodexAuthError::SourceMissing {
+/// Confirm `path` exists without resolving symlinks (`fs::canonicalize`
+/// would follow links and hide a symlink source we must refuse).
+fn ensure_path_exists(path: &Path) -> Result<PathBuf, CodexAuthError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(CodexAuthError::SourceMissing {
             path: path.to_path_buf(),
-        });
+        }),
+        Err(source) => Err(CodexAuthError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
     }
-    // Do not use fs::canonicalize here for the symlink check — that resolves
-    // the link. We want the caller's path identity for the symlink refusal,
-    // then work on that path's openable target only after the check.
-    Ok(path.to_path_buf())
 }
 
 fn ensure_regular_file_not_symlink(path: &Path) -> Result<(), CodexAuthError> {
@@ -388,47 +417,140 @@ fn read_file_bytes(path: &Path) -> Result<Vec<u8>, CodexAuthError> {
     Ok(buf)
 }
 
+/// Atomically write `bytes` to `path` as a regular file with mode `0o600`.
+///
+/// Creates an exclusive temp in the parent (`O_EXCL` / `create_new` + random
+/// suffix) with mode set at open time (no umask-readable window), writes +
+/// syncs, then renames into place. On any failure the temp is removed so
+/// credential material is not left behind.
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), CodexAuthError> {
-    // Atomic-ish: write to sibling temp then rename.
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = parent.join(format!(
-        ".{}.boss-tmp-{}",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("auth"),
-        std::process::id()
-    ));
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)
-            .map_err(|source| CodexAuthError::Io {
-                path: tmp.clone(),
-                source,
-            })?;
-        f.write_all(bytes).map_err(|source| CodexAuthError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
-        f.sync_all().map_err(|source| CodexAuthError::Io {
-            path: tmp.clone(),
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent).map_err(|source| CodexAuthError::Io {
+            path: parent.to_path_buf(),
             source,
         })?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&tmp, perms).map_err(|source| CodexAuthError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
+
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("auth");
+    let (tmp, mut file) = create_exclusive_private_temp(parent, stem)?;
+
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    // Drop the handle before rename (required on some platforms).
+    drop(file);
+
+    if let Err(source) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(CodexAuthError::Io { path: tmp, source });
     }
-    fs::rename(&tmp, path).map_err(|source| CodexAuthError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+
+    if let Err(source) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(CodexAuthError::Io {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
     Ok(())
+}
+
+/// Open a new exclusive temp file under `parent` with mode `0o600` (unix).
+fn create_exclusive_private_temp(parent: &Path, stem: &str) -> Result<(PathBuf, File), CodexAuthError> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+
+    for attempt in 0u32..32 {
+        let name = format!(".{stem}.boss-tmp-{pid:x}-{nanos:x}-{attempt:x}");
+        let candidate = parent.join(&name);
+
+        let open_result = {
+            let mut opts = OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Mode at open — never write secrets under umask defaults.
+                opts.mode(0o600);
+            }
+            opts.open(&candidate)
+        };
+
+        match open_result {
+            Ok(f) => return Ok((candidate, f)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(CodexAuthError::Io {
+                    path: candidate,
+                    source,
+                });
+            }
+        }
+    }
+
+    Err(CodexAuthError::Io {
+        path: parent.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "exhausted exclusive private temp name attempts",
+        ),
+    })
+}
+
+/// Decide whether run-local credentials should replace the source.
+///
+/// When both sides carry `last_refresh`, compare parsed RFC3339 instants
+/// (not raw strings). Unparseable timestamps fall back to the no-timestamp
+/// rule and log without credential body bytes.
+fn decide_run_is_newer(
+    run_last_refresh: Option<&str>,
+    source_last_refresh: Option<&str>,
+    source_fp: &AuthFingerprint,
+    provisioned_fp: &AuthFingerprint,
+) -> bool {
+    match (run_last_refresh, source_last_refresh) {
+        (Some(r), Some(s)) => match last_refresh_instant_is_newer(r, s) {
+            Some(newer) => newer,
+            None => {
+                // Do not log the raw timestamp strings in case of surprise
+                // content; fingerprints already identify the bodies.
+                tracing::warn!(
+                    source_fingerprint = %source_fp,
+                    provisioned_fingerprint = %provisioned_fp,
+                    "codex auth: last_refresh not RFC3339-parseable; falling back to no-timestamp adopt rule"
+                );
+                source_fp == provisioned_fp
+            }
+        },
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => {
+            // No timestamps: adopt only when content differs and source still
+            // matches the provision-time fingerprint (no concurrent adoption).
+            source_fp == provisioned_fp
+        }
+    }
+}
+
+/// Parse a Codex `last_refresh` value as an RFC3339 instant.
+fn parse_last_refresh_instant(s: &str) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(s).ok()
+}
+
+/// Compare two `last_refresh` strings as instants.
+/// Returns `None` if either side fails to parse.
+fn last_refresh_instant_is_newer(run: &str, source: &str) -> Option<bool> {
+    let ri = parse_last_refresh_instant(run)?;
+    let si = parse_last_refresh_instant(source)?;
+    Some(ri > si)
 }
 
 /// Structural validation only — never inspects token *values*.
@@ -688,21 +810,136 @@ mod tests {
     }
 
     #[test]
-    fn resolve_operator_auth_path_prefers_codex_home_env() {
-        // SAFETY: test process; we restore after.
-        let prev = std::env::var_os("CODEX_HOME");
-        // use a unique value
-        // (env mutation is process-global; keep the critical section short)
-        // For hermeticity we only check the pure path join logic via a direct call
-        // when env is set — if another test races, still a PathBuf shape check.
-        unsafe {
-            std::env::set_var("CODEX_HOME", "/tmp/boss-codex-auth-test-home");
-        }
-        let p = resolve_operator_auth_path();
-        match prev {
-            Some(v) => unsafe { std::env::set_var("CODEX_HOME", v) },
-            None => unsafe { std::env::remove_var("CODEX_HOME") },
-        }
-        assert_eq!(p, PathBuf::from("/tmp/boss-codex-auth-test-home/auth.json"));
+    fn resolve_operator_auth_path_from_precedence() {
+        assert_eq!(
+            resolve_operator_auth_path_from(Some("/tmp/boss-codex-auth-test-home"), Some("/home/u")),
+            PathBuf::from("/tmp/boss-codex-auth-test-home/auth.json")
+        );
+        // Whitespace-only CODEX_HOME falls through to HOME.
+        assert_eq!(
+            resolve_operator_auth_path_from(Some("   "), Some("/home/u")),
+            PathBuf::from("/home/u/.codex/auth.json")
+        );
+        assert_eq!(
+            resolve_operator_auth_path_from(None, Some("/home/u")),
+            PathBuf::from("/home/u/.codex/auth.json")
+        );
+        assert_eq!(
+            resolve_operator_auth_path_from(None, None),
+            PathBuf::from(".codex/auth.json")
+        );
+        assert_eq!(
+            resolve_operator_auth_path_from(Some(""), None),
+            PathBuf::from(".codex/auth.json")
+        );
+    }
+
+    #[test]
+    fn last_refresh_same_instant_different_string_forms_not_newer() {
+        // Z vs explicit +00:00 — same instant, lexicographic would disagree.
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-01-01T00:00:00Z", "2026-01-01T00:00:00+00:00"),
+            Some(false)
+        );
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00.000Z"),
+            Some(false)
+        );
+        // Equal forms are not strictly newer.
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-07-26T12:00:00Z", "2026-07-26T12:00:00Z"),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn last_refresh_true_ordering() {
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-07-26T12:00:00Z", "2026-01-01T00:00:00Z"),
+            Some(true)
+        );
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-01-01T00:00:00Z", "2026-07-26T12:00:00Z"),
+            Some(false)
+        );
+        // Offset form that is actually later in absolute time.
+        assert_eq!(
+            last_refresh_instant_is_newer("2026-07-26T13:00:00+01:00", "2026-07-26T11:00:00Z"),
+            Some(true)
+        );
+        assert_eq!(
+            last_refresh_instant_is_newer("not-a-timestamp", "2026-01-01T00:00:00Z"),
+            None
+        );
+        assert_eq!(last_refresh_instant_is_newer("2026-01-01T00:00:00Z", "bogus"), None);
+    }
+
+    #[test]
+    fn decide_run_is_newer_falls_back_when_unparseable() {
+        let provisioned = AuthFingerprint::from_bytes(b"provisioned");
+        let source_same = AuthFingerprint::from_bytes(b"provisioned");
+        let source_other = AuthFingerprint::from_bytes(b"other");
+
+        // Unparseable + source still at provision fingerprint → adopt.
+        assert!(decide_run_is_newer(
+            Some("not-rfc3339"),
+            Some("also-bad"),
+            &source_same,
+            &provisioned
+        ));
+        // Unparseable + source already changed → do not clobber.
+        assert!(!decide_run_is_newer(
+            Some("not-rfc3339"),
+            Some("also-bad"),
+            &source_other,
+            &provisioned
+        ));
+    }
+
+    #[test]
+    fn adopt_refuses_run_auth_symlink() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.json");
+        let body = sample_auth("2026-01-01T00:00:00Z", "access-sym", "refresh-sym");
+        fs::write(&source, &body).unwrap();
+        let home = dir.path().join("run");
+        let snap = snapshot_auth_into_codex_home(&source, &home).unwrap();
+
+        // Replace per-run auth.json with a symlink pointing at a rotated body
+        // elsewhere — adopt must refuse rather than follow and write into source.
+        let elsewhere = dir.path().join("elsewhere.json");
+        let rotated = sample_auth("2026-07-26T12:00:00Z", "access-via-link", "refresh-via-link");
+        fs::write(&elsewhere, &rotated).unwrap();
+        let run_auth = home.join(AUTH_JSON_NAME);
+        fs::remove_file(&run_auth).unwrap();
+        symlink(&elsewhere, &run_auth).unwrap();
+
+        let err = adopt_refresh_if_newer(&snap, &home).unwrap_err();
+        assert!(matches!(err, CodexAuthError::SourceIsSymlink { .. }));
+        // Source must be untouched; error display must not leak token shapes.
+        assert_eq!(fs::read_to_string(&source).unwrap(), body);
+        let msg = err.to_string();
+        assert!(!msg.contains("access-"));
+        assert!(!msg.contains("refresh-"));
+        assert!(!msg.contains("sk-"));
+        assert!(!msg.contains("eyJ"));
+    }
+
+    #[test]
+    fn adopt_equal_last_refresh_instant_different_forms_skips() {
+        let dir = tempdir().unwrap();
+        let source = dir.path().join("source.json");
+        // Source uses +00:00; run uses Z for the same instant with different tokens.
+        let original = sample_auth("2026-07-26T12:00:00+00:00", "access-old", "refresh-old");
+        fs::write(&source, &original).unwrap();
+        let home = dir.path().join("run");
+        let snap = snapshot_auth_into_codex_home(&source, &home).unwrap();
+
+        let run_rotated = sample_auth("2026-07-26T12:00:00Z", "access-new", "refresh-new");
+        fs::write(home.join(AUTH_JSON_NAME), &run_rotated).unwrap();
+
+        let outcome = adopt_refresh_if_newer(&snap, &home).unwrap();
+        assert!(matches!(outcome, AdoptOutcome::SourceAlreadyNewer { .. }));
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
     }
 }
