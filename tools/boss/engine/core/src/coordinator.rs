@@ -322,11 +322,13 @@ const PRE_START_RETRY_DELAYS: [Duration; 3] =
     [Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(45)];
 
 /// How often `run_execution`'s [`HeartbeatGuard`] re-stamps the cube
-/// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` is 30 minutes, so a
-/// 5-minute cadence gives ~6 chances to renew within one TTL window
-/// — generous enough that a single failed beat (e.g., a transient
-/// cube subprocess failure) doesn't immediately put the lease at
-/// risk.
+/// lease expiry. Cube's `DEFAULT_LEASE_TTL_SECS` (and the engine's
+/// matching [`crate::cube_lease_heartbeat::LEASE_TTL_SECS`]) is 24 hours,
+/// so a 5-minute cadence renews far more often than needed within one
+/// TTL window — generous enough that many consecutive failed beats
+/// (e.g., a transient cube subprocess failure) don't put the lease at
+/// risk. The interval is kept short so pane-worker coverage still
+/// matches the periodic sweep's cadence.
 const LEASE_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// `work_attention_items.kind` filed when a `ready` execution has been

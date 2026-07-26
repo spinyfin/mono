@@ -6,7 +6,7 @@
 //! [`crate::ladder_lease_registry`] (clean shutdown) and
 //! [`crate::ladder_lease_reap`] (startup, after a crash) are the primary
 //! fixes for the 2026-07-18 incident: a rung-1 lease orphaned by an engine
-//! restart sat unreclaimed for cube's full default TTL (1800 s / 30 min)
+//! restart sat unreclaimed for cube's full default TTL (86400 s / 24 h)
 //! before the engine ever got a chance to notice. Those two fixes bound the
 //! *reclaim* latency; this sweep shrinks the *exposure window* itself by
 //! refreshing every currently-tracked rung-1 lease down to a much shorter
@@ -39,10 +39,10 @@ use crate::coordinator::CubeClient;
 use crate::sweep_loop::{SweepOutcome, spawn_sweep_loop};
 
 /// TTL (seconds) this sweep refreshes every tracked rung-1 lease to.
-/// Deliberately far below cube's 1800 s default: a rung-1 attempt normally
-/// completes in well under a minute (an engine-direct rebase, no agent),
-/// so 600 s / 10 min is generous headroom while still shrinking the
-/// 2026-07-18 incident's exposure window by 3×.
+/// Deliberately far below cube's 86400 s / 24 h default: a rung-1 attempt
+/// normally completes in well under a minute (an engine-direct rebase, no
+/// agent), so 600 s / 10 min is generous headroom while still shrinking
+/// the 2026-07-18 incident's exposure window by orders of magnitude.
 pub const RUNG1_LEASE_TTL_SECS: u64 = 600;
 
 /// Cadence between passes. Well below [`RUNG1_LEASE_TTL_SECS`] so a lease

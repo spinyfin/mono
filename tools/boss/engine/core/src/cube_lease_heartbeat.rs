@@ -4,7 +4,7 @@
 //! ## Why this exists
 //!
 //! Cube hands the engine a workspace via a *lease* that carries a TTL
-//! (cube's default is 1800 s / 30 min). Cube runs a TTL sweep that
+//! (cube's default is 86400 s / 24 h). Cube runs a TTL sweep that
 //! reclaims any lease whose expiry has passed — it marks the workspace
 //! `free` and clears the lease *even if a worker is still alive in it*.
 //! Cube exposes `cube workspace heartbeat <lease>` to push the expiry
@@ -24,7 +24,7 @@
 //! ## Algorithm (mirrors [`crate::dead_pid_sweep`])
 //!
 //! Every [`heartbeat_interval`] (default 300 s — deliberately ≪ the
-//! 1800 s TTL, see "TTL ownership" below):
+//! 86400 s TTL, see "TTL ownership" below):
 //!
 //! 1. Snapshot [`crate::live_worker_state::LiveWorkerStateRegistry`].
 //! 2. For each slot with a live `shell_pid` and non-terminal activity
@@ -45,8 +45,8 @@
 //! The engine owns the heartbeat-interval ↔ TTL relationship explicitly
 //! rather than relying on cube's default: it passes
 //! [`LEASE_TTL_SECS`] on every heartbeat and ticks every
-//! [`DEFAULT_HEARTBEAT_INTERVAL`]. With 300 s ≪ 1800 s the lease is
-//! refreshed ~6× per TTL window, so up to ~4 consecutive missed/failed
+//! [`DEFAULT_HEARTBEAT_INTERVAL`]. With 300 s ≪ 86400 s the lease is
+//! refreshed many times per TTL window, so many consecutive missed/failed
 //! heartbeats (a transiently busy engine, a flaky cube call) are
 //! tolerated before any lease is at risk.
 //!
@@ -220,12 +220,17 @@ pub const HEARTBEAT_INTERVAL_SECS_ENV: &str = "BOSS_CUBE_LEASE_HEARTBEAT_INTERVA
 /// before it could expire.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 
-/// TTL (seconds) the engine asks cube to set on every heartbeat. Matches
-/// cube's own default of 1800 s, but the engine passes it explicitly so
-/// the interval-≪-TTL relationship is owned here and survives a change
-/// to cube's default. With [`DEFAULT_HEARTBEAT_INTERVAL`] = 300 s this
-/// is a 6× margin.
-pub const LEASE_TTL_SECS: u64 = 1800;
+/// TTL (seconds) the engine asks cube to set on every heartbeat.
+///
+/// Matches cube's own default of 86400 s / 24 h (`tools/cube` —
+/// `DEFAULT_LEASE_TTL_SECS`). The engine still passes the value
+/// *explicitly* so the interval-≪-TTL relationship is owned here and
+/// cannot silently re-clamp every heartbeated lease if cube's default
+/// moves again. With [`DEFAULT_HEARTBEAT_INTERVAL`] = 300 s this is a
+/// ~288× margin — enormous headroom; the real reclaim paths (confirm-dead
+/// auto-reap and force-release) do not depend on this TTL at all. TTL is
+/// only the last-resort backstop for a lease nothing is watching.
+pub const LEASE_TTL_SECS: u64 = 86400;
 
 /// Per-call timeout for a single `cube workspace heartbeat` subprocess
 /// invocation. Addresses the same cube-hang failure mode that prompted
@@ -1101,6 +1106,28 @@ mod tests {
     }
 
     // ─── tests ───────────────────────────────────────────────────────────────
+
+    /// Pin the engine-owned heartbeat TTL at 24h, matching cube's
+    /// `DEFAULT_LEASE_TTL_SECS`. The engine passes this value explicitly
+    /// on every heartbeat — if it drifts below cube's default, every
+    /// heartbeated lease is silently re-clamped (the 30m clamp that made
+    /// cube's 24h backstop inert for live workers). Keep both sides at
+    /// 86400s; real reclaim does not depend on TTL (confirm-dead auto-reap
+    /// / force-release).
+    #[test]
+    fn lease_ttl_secs_is_24_hours_matching_cube_default() {
+        assert_eq!(
+            LEASE_TTL_SECS, 86400,
+            "engine LEASE_TTL_SECS must stay at 24h to match cube's \
+             DEFAULT_LEASE_TTL_SECS; drifting this re-clamps every \
+             heartbeated lease and undoes cube's long-TTL backstop"
+        );
+        // Cadence must stay ≪ TTL (the invariant this module owns).
+        assert!(
+            DEFAULT_HEARTBEAT_INTERVAL.as_secs() * 10 < LEASE_TTL_SECS,
+            "heartbeat interval must remain much smaller than LEASE_TTL_SECS"
+        );
+    }
 
     /// The core invariant: a live worker's lease is heartbeated with the
     /// engine-owned TTL every pass.
