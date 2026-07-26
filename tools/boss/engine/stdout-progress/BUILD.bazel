@@ -4,35 +4,34 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 exports_files(["Cargo.toml"])
 
 rust_library(
-    name = "structured-output",
+    name = "stdout-progress",
     srcs = glob(["src/**/*.rs"]),
-    crate_name = "boss_engine_structured_output",
+    crate_name = "boss_engine_stdout_progress",
     crate_root = "src/lib.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [
         "//tools/boss/engine/core:__pkg__",
-        "//tools/boss/engine/driver:__pkg__",
-        "//tools/boss/engine/effort:__pkg__",
-        "//tools/boss/engine/pr-review:__pkg__",
-        "//tools/boss/engine/stdout-progress:__pkg__",
     ],
     deps = [
-        "//tools/boss/engine/utils",
+        "//tools/boss/engine/driver",
+        "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
 )
 
 rust_test(
-    name = "structured-output_test",
+    name = "stdout-progress_test",
     size = "small",
-    crate = ":structured-output",
+    crate = ":stdout-progress",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,
     ),
     deps = [
-        "//tools/boss/engine/utils",
+        "//tools/boss/engine/driver",
+        "//tools/boss/engine/structured-output",
+        "//tools/boss/protocol",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,
