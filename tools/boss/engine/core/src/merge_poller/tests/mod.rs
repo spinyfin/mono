@@ -591,5 +591,6 @@ mod classify_tests;
 mod merge_queue_tests;
 mod metrics_tests;
 mod probe_tests;
+mod remediation_tests;
 mod schedule_tests;
 mod sweep_tests;

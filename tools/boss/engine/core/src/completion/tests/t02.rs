@@ -96,7 +96,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
     let probe = NoOpProbe;
 
     let outcome =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler)).await;
+        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
 
     // Pass 1 — pre-fix behaviour: the recheck reaches all three
     // candidates but the detector still returns Stale on each. The
@@ -151,7 +151,7 @@ async fn merge_poller_recheck_binds_three_stuck_workers_when_detector_recovers()
         url: "https://github.com/spinyfin/mono/pull/433".into(),
     });
     let outcome2 =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler)).await;
+        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(&handler), None).await;
     assert_eq!(
         outcome2.pr_recheck_recovered, 3,
         "all three stuck workers must transition on the recovery pass, got {outcome2:?}",

@@ -183,6 +183,120 @@ pub(crate) fn current_pr_candidate_urls(work_db: &WorkDb) -> Vec<String> {
     urls.into_iter().collect()
 }
 
+/// Multiple of the configured sweep interval after which a detection pass
+/// is abandoned mid-flight.
+///
+/// A pass is *supposed* to be bounded by GitHub round trips: one batched
+/// probe, then local DB work. Nothing in it should ever approach three
+/// whole sweep cadences. When it does, something is awaiting work that
+/// does not belong on the detection path (before this fix, a cube lease +
+/// rebase + push per conflicting PR, serially), and the right response is
+/// to cut the pass loose and let the next one re-list from the DB — every
+/// candidate list is rebuilt from scratch each pass, so nothing is lost.
+/// Three rather than one so a genuinely slow-but-progressing pass (a large
+/// candidate set behind a sluggish GitHub) still completes.
+pub(crate) const PASS_TIMEOUT_MULTIPLIER: u32 = 3;
+
+/// Floor for the pass budget, so a short configured interval (tests, a
+/// tuned-down cadence) can't produce a budget a normal pass would trip.
+pub(crate) const MIN_PASS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Budget for a single targeted [`reconcile_one`]. Much tighter than a full
+/// pass: it probes exactly one PR. It runs inside the wait `select!`, so
+/// time spent here is also time the trunk observer, the activation kick,
+/// and every other PR's adaptive timer are not being serviced.
+pub(crate) const RECONCILE_ONE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard time budget for one full detection pass at `interval` cadence.
+pub(crate) fn pass_budget(interval: Duration) -> Duration {
+    interval.saturating_mul(PASS_TIMEOUT_MULTIPLIER).max(MIN_PASS_TIMEOUT)
+}
+
+/// Run one detection pass under a hard time budget, and make an overrun
+/// loud either way.
+///
+/// Returns `None` when the budget was exceeded and the pass was dropped
+/// mid-flight. Dropping the future cancels it at its next await point; each
+/// state write inside a pass is its own synchronous DB transaction, so a
+/// cancelled pass leaves no half-written transition — just unprocessed
+/// candidates, which the next pass re-lists.
+///
+/// The silent version of this was the whole problem: a pass that ran 32
+/// minutes over its 60-second cadence produced no log line at all, so the
+/// only evidence of the blackout was the *absence* of `merge_poller` output
+/// in the trace. A pass that exceeds its own cadence must be loud.
+pub(crate) async fn run_pass_within_budget<F>(
+    label: &'static str,
+    budget: Duration,
+    cadence: Duration,
+    metrics: &Registry,
+    pass: F,
+) -> Option<SweepOutcome>
+where
+    F: std::future::Future<Output = SweepOutcome>,
+{
+    // `tokio::time::Instant` rather than `std::time::Instant`: identical in
+    // production, but it tracks the same clock as the `timeout` below, so
+    // the overrun accounting is testable under a paused runtime clock.
+    let started = tokio::time::Instant::now();
+    match tokio::time::timeout(budget, pass).await {
+        Ok(outcome) => {
+            let elapsed = started.elapsed();
+            if elapsed > cadence {
+                PASS_OVERRUN.inc_by(metrics, 1);
+                tracing::warn!(
+                    label,
+                    elapsed_ms = elapsed.as_millis(),
+                    cadence_ms = cadence.as_millis(),
+                    budget_ms = budget.as_millis(),
+                    "merge poller: detection pass took longer than its own cadence — every tracked PR's \
+                     lifecycle went unobserved for that whole window",
+                );
+            }
+            Some(outcome)
+        }
+        Err(_) => {
+            PASS_TIMED_OUT.inc_by(metrics, 1);
+            PASS_OVERRUN.inc_by(metrics, 1);
+            tracing::warn!(
+                label,
+                budget_ms = budget.as_millis(),
+                cadence_ms = cadence.as_millis(),
+                "merge poller: detection pass exceeded its time budget and was abandoned mid-flight; \
+                 remaining candidates are re-listed by the next pass",
+            );
+            None
+        }
+    }
+}
+
+/// [`run_pass_within_budget`]'s counterpart for the targeted per-PR
+/// reconcile, which returns a tier alongside its outcome. `None` means the
+/// reconcile blew [`RECONCILE_ONE_TIMEOUT`] and was dropped.
+pub(crate) async fn reconcile_one_within_budget<F>(
+    metrics: &Registry,
+    reconcile: F,
+    pr_url: &str,
+) -> Option<(SweepOutcome, Option<PollTier>)>
+where
+    F: std::future::Future<Output = (SweepOutcome, Option<PollTier>)>,
+{
+    match tokio::time::timeout(RECONCILE_ONE_TIMEOUT, reconcile).await {
+        Ok(result) => Some(result),
+        Err(_) => {
+            PASS_TIMED_OUT.inc_by(metrics, 1);
+            PASS_OVERRUN.inc_by(metrics, 1);
+            tracing::warn!(
+                pr_url,
+                budget_ms = RECONCILE_ONE_TIMEOUT.as_millis(),
+                "merge poller: targeted per-PR reconcile exceeded its time budget and was abandoned; \
+                 the periodic full sweep remains the backstop for this PR",
+            );
+            None
+        }
+    }
+}
+
 /// Increment every per-sweep metric from `outcome`. Shared by the
 /// periodic full sweep and the targeted [`reconcile_one`] paths in
 /// [`spawn_loop`] so adaptive/targeted transitions are counted exactly
@@ -261,6 +375,17 @@ pub fn spawn_loop(
         let mut spec_schedule = crate::speculative_conflict::SpeculativeCheckSchedule::default();
         let mut stacking_schedule = crate::stacked_pr_structuring::StackingSchedule::default();
         let stacking_fetcher = crate::stacked_pr_structuring::GhPrChangedFiles;
+        // Conflict remediation runs HERE — on its own bounded tasks — not on
+        // the detection path below. See `crate::conflict_remediation` for why
+        // (short version: the escalation ladder leases a cube workspace and
+        // rebases, which awaited inline turned a 60-second sweep into a
+        // 32-minute detection blackout).
+        let remediation = ConflictRemediationQueue::new(Arc::new(LadderRemediationJob::new(
+            work_db.clone(),
+            publisher.clone(),
+            cube_client.clone(),
+        )));
+        let budget = pass_budget(interval);
         loop {
             // Refresh the shared-token budget from GitHub before probing so
             // this sweep's cadence reflects spend by every consumer (siblings,
@@ -268,14 +393,22 @@ pub fn spawn_loop(
             // batch — and so the first sweep on boot isn't blind at the
             // `i64::MAX` sentinel. Free (0 GraphQL points) and best-effort.
             refresh_rate_limit_budget().await;
-            let outcome = run_one_pass(
-                work_db.as_ref(),
-                probe.as_ref(),
-                publisher.as_ref(),
-                Some(cube_client.as_ref()),
-                Some(completion_handler.as_ref()),
+            let outcome = run_pass_within_budget(
+                "full_sweep",
+                budget,
+                interval,
+                &metrics,
+                run_one_pass(
+                    work_db.as_ref(),
+                    probe.as_ref(),
+                    publisher.as_ref(),
+                    Some(cube_client.as_ref()),
+                    Some(completion_handler.as_ref()),
+                    Some(&remediation),
+                ),
             )
-            .await;
+            .await
+            .unwrap_or_default();
             let last_run_at = Instant::now();
             record_sweep_metrics(&metrics, &outcome);
             if outcome.total_transitions() > 0 || outcome.pr_recheck_unresolved > 0 {
@@ -418,15 +551,29 @@ pub fn spawn_loop(
                     }
                     _ = tokio::time::sleep(pr_wait) => {
                         for pr_url in schedule.drain_due(Instant::now()) {
-                            let (outcome, tier) = reconcile_one(
-                                work_db.as_ref(),
-                                probe.as_ref(),
-                                publisher.as_ref(),
-                                Some(cube_client.as_ref()),
-                                Some(completion_handler.as_ref()),
+                            // Bounded like the full sweep: this runs inside
+                            // the wait `select!`, so an unbounded reconcile
+                            // stalls the trunk observer, the activation kick,
+                            // and every other PR's adaptive timer with it.
+                            let Some((outcome, tier)) = reconcile_one_within_budget(
+                                &metrics,
+                                reconcile_one(
+                                    work_db.as_ref(),
+                                    probe.as_ref(),
+                                    publisher.as_ref(),
+                                    Some(cube_client.as_ref()),
+                                    Some(completion_handler.as_ref()),
+                                    Some(&remediation),
+                                    &pr_url,
+                                ),
                                 &pr_url,
                             )
-                            .await;
+                            .await
+                            else {
+                                // Timed out: drop this PR's adaptive slot for
+                                // now; the periodic full sweep re-seeds it.
+                                continue;
+                            };
                             record_sweep_metrics(&metrics, &outcome);
                             if outcome.total_transitions() > 0 {
                                 tracing::info!(
@@ -477,15 +624,23 @@ pub fn spawn_loop(
                                         since_last_ms = since_last.as_millis(),
                                         "merge poller: PrReconcileRequested → reconciling named PR",
                                     );
-                                    let (outcome, tier) = reconcile_one(
-                                        work_db.as_ref(),
-                                        probe.as_ref(),
-                                        publisher.as_ref(),
-                                        Some(cube_client.as_ref()),
-                                        Some(completion_handler.as_ref()),
+                                    let Some((outcome, tier)) = reconcile_one_within_budget(
+                                        &metrics,
+                                        reconcile_one(
+                                            work_db.as_ref(),
+                                            probe.as_ref(),
+                                            publisher.as_ref(),
+                                            Some(cube_client.as_ref()),
+                                            Some(completion_handler.as_ref()),
+                                            Some(&remediation),
+                                            &pr_url,
+                                        ),
                                         &pr_url,
                                     )
-                                    .await;
+                                    .await
+                                    else {
+                                        continue;
+                                    };
                                     record_sweep_metrics(&metrics, &outcome);
                                     if outcome.total_transitions() > 0 {
                                         tracing::info!(

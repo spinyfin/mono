@@ -482,7 +482,14 @@ impl CommandMergeProbe {
                     // `rate_limit_throttle_factor` maxes out immediately
                     // rather than waiting for a future successful call to
                     // report a low `remaining` reading.
-                    RATE_LIMIT_REMAINING.store(0, Ordering::Relaxed);
+                    //
+                    // Routed through `record_rate_limit_remaining` rather
+                    // than storing into `RATE_LIMIT_REMAINING` directly: a
+                    // bare store pins the throttle multiplier at 8.0 while
+                    // emitting no threshold-crossing line, so the trace's
+                    // `throttle_factor` readings stop being a faithful record
+                    // of the multiplier actually in force.
+                    record_rate_limit_remaining(0, "rate_limit_rejection");
                     let msg = "gh api graphql rejected: GitHub API rate limit exceeded".to_owned();
                     for url in &order {
                         out.insert(url.clone(), Err(msg.clone()));

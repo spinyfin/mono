@@ -32,6 +32,7 @@ use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, Effo
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::conflict_ladder;
+use crate::conflict_remediation::{ConflictRemediationQueue, EnqueueOutcome};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 #[cfg(test)]
@@ -115,6 +116,45 @@ pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+) -> bool {
+    let mode = match cube_client {
+        Some(cube) => ConflictRemediationMode::Inline(cube),
+        None => ConflictRemediationMode::Disabled,
+    };
+    on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe).await
+}
+
+/// How a caller of [`on_conflict_detected_with`] wants the mechanical
+/// escalation ladder run for a freshly-created attempt.
+///
+/// The distinction that matters is **who awaits the ladder**. It leases a
+/// cube workspace, rebases, and pushes — minutes of work. Awaiting that on
+/// the merge poller's detection task is what blinded merge/conflict
+/// detection for tens of minutes at a time (see [`crate::conflict_remediation`]).
+pub enum ConflictRemediationMode<'a> {
+    /// The ladder is off (no cube client / feature flag disabled): spawn the
+    /// worker revision directly, i.e. straight to rung 3. Pre-ladder
+    /// behaviour, preserved exactly.
+    Disabled,
+    /// Run the ladder inline, on the caller's task. The call does not return
+    /// until the ladder finishes. Correct for callers that are not the
+    /// detection loop (tests, one-shot tools).
+    Inline(&'a dyn CubeClient),
+    /// Hand the ladder to the bounded background remediator and return
+    /// immediately, spawning nothing on this tick. The detection path uses
+    /// this: `merge_poller::run_one_pass` must stay pure detect-and-publish.
+    Deferred(&'a ConflictRemediationQueue),
+}
+
+/// [`on_conflict_detected`] with explicit control over how the escalation
+/// ladder is run — see [`ConflictRemediationMode`].
+pub async fn on_conflict_detected_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    remediation: ConflictRemediationMode<'_>,
     pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
@@ -647,7 +687,46 @@ pub async fn on_conflict_detected(
             // agent profile instead of the default full-worker one.
             let mut use_small_agent_profile = false;
             let mut mechanical_rungs_unavailable = false;
-            if let Some(cube) = cube_client {
+            if let ConflictRemediationMode::Deferred(queue) = remediation {
+                // Detect-and-publish only. The attempt row above is the
+                // durable "conflict observed, remediation needed" record;
+                // the ladder (and the worker-revision spawn it falls
+                // through to) runs on the remediator's own tasks. Nothing
+                // is spawned on this tick, exactly as on the
+                // `MechanicalRungsUnavailable` path — and for the same
+                // reason: the attempt stays `pending` with no
+                // `revision_task_id`, so a declined enqueue is retried by a
+                // later detection tick rather than lost.
+                mechanical_rungs_unavailable = true;
+                match queue.try_enqueue(candidate, a, probe) {
+                    EnqueueOutcome::Enqueued => {
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: conflict observed; mechanical rungs handed to the background \
+                             remediator (detection path does not wait)",
+                        );
+                    }
+                    EnqueueOutcome::AlreadyInFlight => {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: remediation already in flight for this PR; not enqueuing again",
+                        );
+                    }
+                    EnqueueOutcome::Cooldown => {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: remediation for this PR completed recently; deferring re-entry \
+                             until the cooldown elapses",
+                        );
+                    }
+                }
+            } else if let ConflictRemediationMode::Inline(cube) = remediation {
                 match conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await {
                     conflict_ladder::LadderOutcome::Retired => {
                         tracing::info!(
@@ -985,6 +1064,48 @@ fn take_over_foreign_ci_block(work_db: &WorkDb, candidate: &PendingMergeCheck, f
             false
         }
     }
+}
+
+/// The fall-through half of [`on_conflict_detected_with`]'s ladder block,
+/// callable on its own so the background remediator
+/// ([`crate::conflict_remediation`]) can finish what the detection pass
+/// deliberately did not wait for: when the mechanical rungs don't resolve
+/// the conflict, spawn the worker revision and clear the parent back to
+/// Review so it stays in the Review column while the fix runs in Doing.
+///
+/// Same sequence as the inline path (`maybe_spawn_conflict_revision` →
+/// [`blocking_signal::unblock_for_revision`] → publish
+/// `conflict_revision_in_flight`), so a deferred remediation lands the
+/// parent in exactly the state an inline one would have.
+pub(crate) async fn spawn_conflict_revision_after_ladder(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    attempt: &crate::work::ConflictResolution,
+    use_small_agent_profile: bool,
+) -> bool {
+    let spawned = maybe_spawn_conflict_revision(
+        work_db,
+        publisher,
+        pr_checker,
+        candidate,
+        probe,
+        attempt,
+        use_small_agent_profile,
+    )
+    .await;
+    if spawned && blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &attempt.id) {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "conflict_revision_in_flight",
+            )
+            .await;
+    }
+    spawned
 }
 
 /// Create the engine-triggered revision that delivers the conflict fix and

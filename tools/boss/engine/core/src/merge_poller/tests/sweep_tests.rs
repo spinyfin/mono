@@ -104,7 +104,7 @@ async fn merged_pr_is_promoted_and_publishes_invalidation() {
     probe.set(pr, PrLifecycleState::Merged);
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.merged, 1);
 
     let item = db.get_work_item(&chore_id).unwrap();
@@ -135,7 +135,7 @@ async fn open_clean_pr_leaves_chore_in_review() {
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.merged, 0);
     assert_eq!(outcome.conflict_flagged, 0);
     // No `blocked: merge_conflict` row in the corpus, so the clean
@@ -192,7 +192,7 @@ async fn closed_unmerged_pr_reopens_addressed_comments() {
     probe.set(pr, PrLifecycleState::ClosedUnmerged);
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.comments_reopened, 1);
     assert_eq!(outcome.merged, 0);
     assert_eq!(outcome.closed_unmerged, 1);
@@ -234,7 +234,7 @@ async fn closed_unmerged_pr_retires_chore_to_done() {
     probe.set(pr, PrLifecycleState::ClosedUnmerged);
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.closed_unmerged, 1);
     assert_eq!(outcome.merged, 0, "closed-unmerged must not count as a merge");
 
@@ -256,7 +256,7 @@ async fn closed_unmerged_pr_retires_chore_to_done() {
 
     // Idempotency: a second pass over the same (now-done) row must not
     // double-count or error, mirroring the merge path's idempotency.
-    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome2.closed_unmerged, 0);
 }
 
@@ -275,7 +275,7 @@ async fn probe_failure_does_not_crash_or_promote() {
     let publisher = Arc::new(RecordingPublisher::default());
 
     // The error on pr_a must not prevent pr_b from being promoted.
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.merged, 1);
     match db.get_work_item(&chore_a).unwrap() {
         WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
@@ -308,7 +308,7 @@ async fn merged_pr_promotes_project_task_to_done() {
 
     // Both kinds are mergeable, so a single sweep should promote
     // both rows — the project_task one being the regression case.
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.merged, 2,
         "merge poller must sweep both chore and project_task rows",
@@ -349,7 +349,7 @@ async fn unmerged_project_task_pr_stays_in_review() {
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.total_transitions(), 0);
     match db.get_work_item(&project_task_id).unwrap() {
         WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::InReview),
@@ -365,7 +365,7 @@ async fn empty_corpus_is_skipped() {
     // No chores in review at all → no work, no errors, no events.
     let probe = StubProbe::new();
     let publisher = Arc::new(RecordingPublisher::default());
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.total_transitions(), 0);
     assert!(publisher.lifecycle_reasons().await.is_empty());
 }
@@ -387,7 +387,7 @@ async fn reconcile_one_scopes_to_named_pr_only() {
     probe.set(pr2, PrLifecycleState::Merged);
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let (outcome, tier) = reconcile_one(&db, probe.as_ref(), publisher.as_ref(), None, None, pr1).await;
+    let (outcome, tier) = reconcile_one(&db, probe.as_ref(), publisher.as_ref(), None, None, None, pr1).await;
     assert_eq!(outcome.merged, 1);
     // Merged is a terminal state: the PR has just been transitioned out
     // of every candidate list, so `poll_tier_for_probe` returns `None`
@@ -424,6 +424,7 @@ async fn reconcile_one_returns_no_tier_for_unknown_pr() {
         publisher.as_ref(),
         None,
         None,
+        None,
         "https://github.com/foo/bar/pull/999",
     )
     .await;
@@ -448,7 +449,7 @@ async fn sweep_drives_full_conflict_resolve_cycle() {
 
     // Pass 1: probe reports Conflict; revision spawned, parent stays in_review.
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.conflict_flagged, 1);
     assert_eq!(outcome.conflict_cleared, 0);
     assert_eq!(outcome.merged, 0);
@@ -463,13 +464,13 @@ async fn sweep_drives_full_conflict_resolve_cycle() {
 
     // Pass 2 with no change: idempotent — active revision already in flight,
     // pre-flight early-exit fires, zero transitions.
-    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome2.total_transitions(), 0);
 
     // Pass 3: probe flips to Clean; on_resolved retires the attempt and
     // clears the signal. Parent was already in_review — no status flip.
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-    let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome3.conflict_cleared, 1);
     assert_eq!(outcome3.conflict_flagged, 0);
     match db.get_work_item(&chore).unwrap() {
@@ -481,7 +482,7 @@ async fn sweep_drives_full_conflict_resolve_cycle() {
         other => panic!("expected chore, got {other:?}"),
     }
     // Pass 4 with no change: clear is also idempotent.
-    let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome4.total_transitions(), 0);
 
     // Event trail: conflict in flight → (no work-item event on resolve since
@@ -527,6 +528,7 @@ async fn sweep_with_attempt_runs_retire_path_end_to_end() {
         publisher.as_ref(),
         Some(cube.as_ref() as &dyn CubeClient),
         None,
+        None,
     )
     .await;
     let attempt = db
@@ -552,6 +554,7 @@ async fn sweep_with_attempt_runs_retire_path_end_to_end() {
         probe.as_ref(),
         publisher.as_ref(),
         Some(cube.as_ref() as &dyn CubeClient),
+        None,
         None,
     )
     .await;
@@ -604,7 +607,7 @@ async fn stranded_blocked_parent_with_dirty_pr_regains_signal_and_respawns_revis
 
         // --- Pass 1: the original conflict/CI failure spawns a revision. ---
         set_dirty_probe(&probe, pr, kind, "base-old", "head-old");
-        let o1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let o1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
         match kind {
             StrandKind::Conflict => assert_eq!(o1.conflict_flagged, 1, "{reason}: pass1"),
             StrandKind::Ci => assert_eq!(o1.ci_flagged, 1, "{reason}: pass1"),
@@ -690,7 +693,7 @@ async fn stranded_blocked_parent_with_dirty_pr_regains_signal_and_respawns_revis
 
         // --- Pass 2: PR is dirty/red again at a fresh base/head. ---
         set_dirty_probe(&probe, pr, kind, "base-new", "head-new");
-        let o2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+        let o2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
         assert_eq!(
             o2.stranded_blocked_recanonicalized, 1,
             "{reason}: exactly one orphan recovered",
@@ -775,7 +778,7 @@ async fn stranded_recovery_skips_dependency_gated_parent() {
 
     // Give the parent remediation ownership (a prior conflict revision).
     set_dirty_probe(&probe, pr, StrandKind::Conflict, "base-old", "head-old");
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     let crz = db
         .active_conflict_resolution_for_work_item(&chore)
         .unwrap()
@@ -809,7 +812,7 @@ async fn stranded_recovery_skips_dependency_gated_parent() {
 
     // ...so the recovery pass leaves it untouched even with a dirty PR.
     set_dirty_probe(&probe, pr, StrandKind::Conflict, "base-new", "head-new");
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.stranded_blocked_recanonicalized, 0,
         "gated parent must be skipped",
@@ -943,7 +946,7 @@ async fn sweep_drives_full_ci_failure_cycle() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.ci_flagged, 1, "first sweep must run the CI remediation flow");
     assert_eq!(outcome.conflict_flagged, 0);
     // Unified in_review model (#1007 parity): the parent STAYS in_review
@@ -965,7 +968,7 @@ async fn sweep_drives_full_ci_failure_cycle() {
     );
 
     // Pass 2: probe still reports the same failure.
-    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome2.total_transitions(), 0, "idempotent re-probe must not re-fire",);
 
     // Pass 3: CI is clean. The blocked_ci slice picks the row up.
@@ -974,7 +977,7 @@ async fn sweep_drives_full_ci_failure_cycle() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
-    let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome3.ci_cleared, 1, "next clean probe must retire");
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(t) => {
@@ -985,7 +988,7 @@ async fn sweep_drives_full_ci_failure_cycle() {
     }
 
     // Pass 4: idempotent retire.
-    let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome4 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome4.total_transitions(), 0);
 
     // Event trail: parent never enters `blocked` in the in_review model, so
@@ -1036,7 +1039,7 @@ async fn budget_exhausted_surfaces_attention_item() {
         .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-exhaust")));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.ci_flagged, 1,
         "budget-exhausted path still counts as a ci_flagged transition",
@@ -1136,7 +1139,7 @@ async fn inflight_ci_does_not_spawn_until_failure_is_terminal_then_reconciles() 
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_in_flight(pr, "head-1")));
-    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         out1.ci_flagged, 0,
         "InFlight (non-terminal) CI must NOT spawn a remediation revision",
@@ -1179,7 +1182,7 @@ async fn inflight_ci_does_not_spawn_until_failure_is_terminal_then_reconciles() 
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
-    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         out2.ci_flagged, 1,
         "a terminal failed rollup must spawn exactly one remediation",
@@ -1216,7 +1219,7 @@ async fn inflight_ci_does_not_spawn_until_failure_is_terminal_then_reconciles() 
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
-    let out3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out3.ci_cleared, 1, "a clean probe must retire the remediation");
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(t) => {
@@ -1294,7 +1297,7 @@ async fn sweep_promotes_merged_pr_even_when_row_was_in_review_with_conflict() {
 
     // First pass: conflict detected; parent stays in_review (revision spawned).
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
         other => panic!("expected chore, got {other:?}"),
@@ -1302,7 +1305,7 @@ async fn sweep_promotes_merged_pr_even_when_row_was_in_review_with_conflict() {
 
     // Second pass: GitHub reports MERGED.
     probe.set(pr, PrLifecycleState::Merged);
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.merged, 1);
     match db.get_work_item(&chore).unwrap() {
         WorkItem::Chore(t) => {
@@ -1339,7 +1342,7 @@ async fn startup_sweep_picks_up_offline_conflict_transition() {
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.conflict_flagged, 1,
         "startup sweep must pick up offline conflicts in one pass",
@@ -1371,7 +1374,7 @@ async fn startup_sweep_resolves_offline_clean_transition() {
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.conflict_cleared, 1,
         "startup sweep must retire offline-resolved conflicts in one pass",
@@ -1402,7 +1405,7 @@ async fn opt_out_label_blocks_conflict_flip_through_sweep() {
     );
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.conflict_flagged, 0);
     assert_eq!(outcome.total_transitions(), 0);
     match db.get_work_item(&chore).unwrap() {
@@ -1467,7 +1470,7 @@ async fn stale_base_succeeded_crz_rearmed_on_conflicting_pr() {
     );
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     // New-model: re-arm dispatches a fresh revision; the parent is
     // reconciled back to in_review. conflict_flagged = 1 because a state
@@ -1569,7 +1572,7 @@ async fn failed_crz_is_not_rearmed_on_conflicting_pr() {
         Some("sha-new"),
     );
     let publisher = Arc::new(RecordingPublisher::default());
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     let ready = db.list_ready_executions().unwrap();
     assert!(
@@ -1616,7 +1619,7 @@ async fn drift_guard_clears_blocked_task_when_signals_empty_but_pr_clean() {
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     // The drift guard must have fired the retire path.
     assert_eq!(
@@ -1675,7 +1678,7 @@ async fn polymorphic_clear_routes_merge_conflict_signal() {
     // on_ci_resolved (which would have been a no-op anyway, but
     // the new shape skips the unconditional call entirely).
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.conflict_cleared, 1);
     assert_eq!(outcome.ci_cleared, 0);
 
@@ -1729,7 +1732,7 @@ async fn unknown_mergeability_does_not_retire_merge_conflict() {
 
     // Probe returns mergeable=UNKNOWN — GitHub is mid-recompute.
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::unknown_mergeability()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     // The merge_conflict retire path must NOT have fired.
     assert_eq!(
@@ -1797,7 +1800,7 @@ async fn polymorphic_clear_routes_ci_failure_signal_and_resets_budget() {
     let publisher = Arc::new(RecordingPublisher::default());
 
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(outcome.ci_cleared, 1, "polymorphic dispatch fired on_ci_resolved");
     assert_eq!(
         outcome.conflict_cleared, 0,
@@ -1874,7 +1877,7 @@ async fn polymorphic_clear_each_signal_independent_when_both_active() {
             ci: OpenPrCiStatus::Clean,
         }),
     );
-    let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let _ = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     let active_after_1: Vec<String> = db
         .active_blocked_signals(&chore)
         .unwrap()
@@ -1895,7 +1898,7 @@ async fn polymorphic_clear_each_signal_independent_when_both_active() {
     // `ci_failure` row (via on_ci_resolved). Each fires
     // independently — neither hides the other.
     probe.set(pr, PrLifecycleState::Open(OpenPrStatus::clean()));
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     // The conflict retire path is no-op against the side-table row
     // because the scalar is `ci_failure`; the WHERE guard in
     // `clear_chore_blocked_merge_conflict` misses. However, the
@@ -1964,7 +1967,7 @@ async fn cross_flow_conflict_then_ci_fires_in_order() {
         .review(PrReviewState::Unknown)
         .build();
     probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
-    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         out1.conflict_flagged, 1,
         "conflict_watch must fire first on Conflict+Failing",
@@ -1993,7 +1996,7 @@ async fn cross_flow_conflict_then_ci_fires_in_order() {
     });
     p1.head_ref_oid = Some("head-2".into());
     probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
-    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         out2.conflict_cleared, 1,
         "merge_conflict retire fires in the Clean branch",
@@ -2018,7 +2021,7 @@ async fn cross_flow_conflict_then_ci_fires_in_order() {
     // the parent returns to `in_review`.
     p1.state = PrLifecycleState::Open(OpenPrStatus::clean());
     probe.states.lock().unwrap().insert(pr.into(), Ok(p1.clone()));
-    let out3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out3 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out3.ci_cleared, 1);
     assert!(db.active_blocked_signals(&chore).unwrap().is_empty());
     match db.get_work_item(&chore).unwrap() {
@@ -2121,7 +2124,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
             auto_merge_enabled_at: None,
         }),
     );
-    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(
         outcome.conflict_flagged, 1,
         "conflict_watch must fire via the normal in_review sweep dispatch",
@@ -2177,6 +2180,7 @@ async fn merge_poller_recovers_conflict_resolution_when_signal_missed() {
         publisher.as_ref(),
         Some(cube.as_ref() as &dyn CubeClient),
         None,
+        None,
     )
     .await;
     let attempt = db
@@ -2204,6 +2208,7 @@ async fn merge_poller_recovers_conflict_resolution_when_signal_missed() {
         probe.as_ref(),
         publisher.as_ref(),
         Some(cube.as_ref() as &dyn CubeClient),
+        None,
         None,
     )
     .await;
@@ -2246,7 +2251,15 @@ async fn run_one_pass_recovers_late_pr_for_abandoned_execution() {
         Arc::new(NoopProbeQueuer),
     );
 
-    let outcome = run_one_pass(db.as_ref(), probe.as_ref(), publisher.as_ref(), None, Some(&handler)).await;
+    let outcome = run_one_pass(
+        db.as_ref(),
+        probe.as_ref(),
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        None,
+    )
+    .await;
 
     assert_eq!(
         outcome.late_pr_recovered, 1,
@@ -2290,6 +2303,7 @@ async fn run_one_pass_does_not_query_late_pr_candidates_without_handler() {
         publisher.as_ref(),
         None,
         None, // no handler
+        None,
     )
     .await;
 
@@ -2325,7 +2339,15 @@ async fn ci_resolved_stops_live_worker_and_keeps_task_in_review() {
         Arc::new(NoopProbeQueuer),
     );
 
-    let outcome = run_one_pass(db.as_ref(), probe.as_ref(), publisher.as_ref(), None, Some(&handler)).await;
+    let outcome = run_one_pass(
+        db.as_ref(),
+        probe.as_ref(),
+        publisher.as_ref(),
+        None,
+        Some(&handler),
+        None,
+    )
+    .await;
 
     assert_eq!(outcome.ci_cleared, 1, "ci_failure retired to in_review");
     assert_eq!(
@@ -2366,6 +2388,7 @@ async fn ci_resolved_without_handler_does_not_stop_worker() {
         publisher.as_ref(),
         None,
         None, // no handler
+        None,
     )
     .await;
 
@@ -2401,7 +2424,7 @@ async fn ci_required_state_clears_when_rollup_recovers_to_success() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
-    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out1.ci_flagged, 1, "first sweep must detect and block on CI failure");
 
     // ci_required_state should reflect the failing rollup after detection.
@@ -2424,7 +2447,7 @@ async fn ci_required_state_clears_when_rollup_recovers_to_success() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
-    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out2.ci_cleared, 1, "clean probe must retire the ci_failure block");
 
     let t = match db.get_work_item(&chore).unwrap() {
@@ -2508,7 +2531,7 @@ async fn stale_ci_failing_badge_cleared_by_poll_without_active_signal() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-2")));
-    let out = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     // No retire path fired (there was nothing blocked to retire) — proving
     // the clear came from the poll-state safety net, not `on_ci_resolved`.
@@ -2563,8 +2586,8 @@ async fn clean_poll_without_prior_failure_does_not_emit_clear() {
         .insert(pr.to_owned(), Ok(probe_ci_clean(pr, "head-1")));
     // Two sweeps: the first writes success (prior NULL), the second is a
     // confirmed no-op. Neither saw a prior "fail" so neither may clear.
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
-    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
 
     assert_eq!(
         publisher.ci_failure_cleared_count(pr).await,
@@ -2594,7 +2617,7 @@ async fn merge_of_ci_blocked_pr_clears_badge() {
         .lock()
         .unwrap()
         .insert(pr.to_owned(), Ok(probe_ci_failing(pr, "head-1")));
-    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out1 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out1.ci_flagged, 1);
     // Unified in_review model: the parent stays in_review with a CI-fix
     // revision in flight; the pending ci_remediations row still exists and
@@ -2625,7 +2648,7 @@ async fn merge_of_ci_blocked_pr_clears_badge() {
             .review(PrReviewState::Unknown)
             .build()),
     );
-    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None).await;
+    let out2 = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
     assert_eq!(out2.merged, 1, "merge must be detected");
 
     // Task must be done.

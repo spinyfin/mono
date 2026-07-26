@@ -105,6 +105,77 @@ impl SweepOutcome {
     }
 }
 
+/// How long a batched probe snapshot may be used to write lifecycle
+/// transitions before it must be re-taken.
+///
+/// A pass takes ONE batched probe up front and then walks every candidate
+/// against it. That is fine when the pass takes a second; it is a
+/// correctness problem when it doesn't. In the incident this constant
+/// exists for, PR #2346 merged ten seconds after a pass took its snapshot,
+/// and the pass — stuck behind 32 minutes of inline conflict remediation —
+/// went on writing state from that half-hour-old snapshot. Sized to the
+/// nominal full-sweep interval: a snapshot older than one whole sweep
+/// cadence is by definition something the next sweep should have replaced.
+pub(crate) const PROBE_SNAPSHOT_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Re-probes allowed within a single pass before the pass gives up on its
+/// remaining candidates. Bounded so a pathologically slow pass can't turn
+/// into an unbounded GitHub-quota amplifier; abandoning the remainder is
+/// safe because every candidate list is rebuilt from the DB next pass.
+pub(crate) const MAX_PROBE_REFRESHES_PER_PASS: u8 = 2;
+
+/// The batched probe result for one pass, plus the age bookkeeping that
+/// keeps a long pass from transitioning work items off a stale view of
+/// GitHub. See [`PROBE_SNAPSHOT_MAX_AGE`].
+pub(crate) struct ProbeSnapshot {
+    pub(crate) results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
+    taken_at: Instant,
+    refreshes_left: u8,
+}
+
+impl ProbeSnapshot {
+    pub(crate) fn new(results: HashMap<String, std::result::Result<PrLifecycleProbe, String>>) -> Self {
+        Self {
+            results,
+            taken_at: Instant::now(),
+            refreshes_left: MAX_PROBE_REFRESHES_PER_PASS,
+        }
+    }
+
+    /// Returns `true` when it is safe to write state from `self.results`.
+    ///
+    /// Fresh snapshot → `true` immediately (the overwhelmingly common case,
+    /// and free — no clock-driven GitHub traffic). Stale snapshot → re-probe
+    /// and return `true`. Stale snapshot with the per-pass refresh budget
+    /// already spent → `false`, and the caller must stop: writing off a
+    /// snapshot that old is worse than deferring to the next pass.
+    pub(crate) async fn ensure_fresh(&mut self, probe: &dyn MergeProbe, probe_urls: &[String]) -> bool {
+        let age = self.taken_at.elapsed();
+        if age <= PROBE_SNAPSHOT_MAX_AGE {
+            return true;
+        }
+        if self.refreshes_left == 0 {
+            tracing::warn!(
+                snapshot_age_ms = age.as_millis(),
+                max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+                "merge poller: probe snapshot stale and the per-pass re-probe budget is spent; \
+                 abandoning the rest of this pass rather than transitioning off a stale snapshot",
+            );
+            return false;
+        }
+        self.refreshes_left -= 1;
+        tracing::warn!(
+            snapshot_age_ms = age.as_millis(),
+            max_age_ms = PROBE_SNAPSHOT_MAX_AGE.as_millis(),
+            pr_count = probe_urls.len(),
+            "merge poller: probe snapshot went stale mid-pass; re-probing before writing further state",
+        );
+        self.results = probe.probe_batch(probe_urls).await;
+        self.taken_at = Instant::now();
+        true
+    }
+}
+
 /// Run one full lifecycle sweep over every chore and project_task
 /// the poller cares about (in_review with a PR, plus rows currently
 /// blocked on merge_conflict so we can detect resolution, plus
@@ -122,12 +193,20 @@ impl SweepOutcome {
 /// (`record_worker_pr_completion` + cube release + pane teardown + event
 /// publish). Pass `None` for pre-`completion_handler` wiring and tests that
 /// exercise only the in-review and conflict paths.
+///
+/// `remediation` is the bounded background runner conflict remediation is
+/// handed to. It is what keeps this function a *detection* pass: with a
+/// queue wired, observing a conflict records the attempt, publishes, and
+/// enqueues — it never awaits the escalation ladder's cube lease + rebase +
+/// push. Pass `None` (tests, pre-Phase wiring) to keep the pre-existing
+/// inline-ladder behaviour.
 pub async fn run_one_pass(
     work_db: &WorkDb,
     probe: &dyn MergeProbe,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
     completion_handler: Option<&WorkerCompletionHandler>,
+    remediation: Option<&ConflictRemediationQueue>,
 ) -> SweepOutcome {
     let in_review = match work_db.list_chores_pending_merge_check() {
         Ok(items) => items,
@@ -225,7 +304,7 @@ pub async fn run_one_pass(
         .map(|candidate| candidate.pr_url.clone())
         .filter(|url| probe_url_seen.insert(url.clone()))
         .collect();
-    let probe_results = probe.probe_batch(&probe_urls).await;
+    let mut snapshot = ProbeSnapshot::new(probe.probe_batch(&probe_urls).await);
     // De-duplicate by work_item_id: a chore that's both pending and
     // blocked-on-CI (shouldn't happen but defensive) only gets one
     // probe per sweep.
@@ -234,12 +313,16 @@ pub async fn run_one_pass(
         if !seen.insert(candidate.work_item_id.clone()) {
             continue;
         }
+        // Never transition off a snapshot that has gone stale under a
+        // long-running pass — see [`ProbeSnapshot`].
+        if !snapshot.ensure_fresh(probe, &probe_urls).await {
+            break;
+        }
         sweep_one(
             work_db,
-            &probe_results,
+            &snapshot.results,
             publisher,
-            cube_client,
-            completion_handler,
+            (cube_client, completion_handler, remediation),
             candidate,
             &mut outcome,
         )
@@ -276,7 +359,10 @@ pub async fn run_one_pass(
     // merge_conflict / ci_failure loop, and let the normal detection path
     // spawn a fresh revision.
     for candidate in &stranded_blocked {
-        sweep_stranded_blocked_remediation(work_db, &probe_results, publisher, candidate, &mut outcome).await;
+        if !snapshot.ensure_fresh(probe, &probe_urls).await {
+            break;
+        }
+        sweep_stranded_blocked_remediation(work_db, &snapshot.results, publisher, candidate, &mut outcome).await;
     }
     // Late-PR sweep (Bug B): recover terminal executions whose pane
     // pushed a PR after the execution was marked abandoned.
@@ -373,6 +459,7 @@ pub async fn reconcile_one(
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
     completion_handler: Option<&WorkerCompletionHandler>,
+    remediation: Option<&ConflictRemediationQueue>,
     pr_url: &str,
 ) -> (SweepOutcome, Option<PollTier>) {
     let mut outcome = SweepOutcome::default();
@@ -402,8 +489,7 @@ pub async fn reconcile_one(
             work_db,
             &probe_results,
             publisher,
-            cube_client,
-            completion_handler,
+            (cube_client, completion_handler, remediation),
             candidate,
             &mut outcome,
         )
@@ -767,11 +853,17 @@ pub(crate) async fn sweep_one(
     work_db: &WorkDb,
     probe_results: &HashMap<String, std::result::Result<PrLifecycleProbe, String>>,
     publisher: &dyn ExecutionPublisher,
-    cube_client: Option<&dyn CubeClient>,
-    completion_handler: Option<&WorkerCompletionHandler>,
+    // (cube_client, completion_handler, remediation) — bundled to keep the
+    // parameter count under clippy::too_many_arguments.
+    handlers: (
+        Option<&dyn CubeClient>,
+        Option<&WorkerCompletionHandler>,
+        Option<&ConflictRemediationQueue>,
+    ),
     candidate: &PendingMergeCheck,
     outcome: &mut SweepOutcome,
 ) {
+    let (cube_client, completion_handler, remediation) = handlers;
     let probe_result = match probe_results.get(&candidate.pr_url) {
         Some(Ok(state)) => state.clone(),
         Some(Err(err)) => {
@@ -827,23 +919,37 @@ pub(crate) async fn sweep_one(
                     // known-open; feed that observation to the gate via a
                     // static checker rather than a redundant `gh pr view`.
                     //
-                    // Escalation ladder: hand `on_conflict_detected` a live
-                    // `CubeClient` for the rung-1 engine-direct rebase only when
-                    // the `conflict_ladder_mechanical_rebase` flag is enabled.
-                    // Off (or no completion handler) → `None` preserves the
+                    // Escalation ladder: enabled only when the
+                    // `conflict_ladder_mechanical_rebase` flag is on. Off (or
+                    // no completion handler) → `Disabled` preserves the
                     // worker-only path exactly.
-                    let rung1_cube = if completion_handler
+                    //
+                    // When it IS on, the ladder must never be awaited here.
+                    // This function is the detection path: `run_one_pass`
+                    // awaits it one candidate at a time on the poller's single
+                    // task, so a rung-1 rebase awaited inline (cube lease +
+                    // real rebase + push-gate, observed at 1.5–8.75 minutes
+                    // per PR) stops every other PR's merge/conflict state from
+                    // being observed for that entire window — the 32-minute
+                    // detection blackout `e64dda13b` (#1968) introduced.
+                    // `Deferred` hands the ladder to the bounded background
+                    // remediator and returns immediately.
+                    let ladder_enabled = completion_handler
                         .map(|h| h.mechanical_rebase_enabled())
-                        .unwrap_or(false)
-                    {
-                        cube_client
-                    } else {
-                        None
+                        .unwrap_or(false);
+                    let mode = match (ladder_enabled, remediation, cube_client) {
+                        (false, _, _) => conflict_watch::ConflictRemediationMode::Disabled,
+                        (true, Some(queue), _) => conflict_watch::ConflictRemediationMode::Deferred(queue),
+                        // No remediator wired (tests, pre-Phase wiring): fall
+                        // back to the pre-existing inline behaviour rather
+                        // than silently dropping the ladder.
+                        (true, None, Some(cube)) => conflict_watch::ConflictRemediationMode::Inline(cube),
+                        (true, None, None) => conflict_watch::ConflictRemediationMode::Disabled,
                     };
-                    if conflict_watch::on_conflict_detected(
+                    if conflict_watch::on_conflict_detected_with(
                         work_db,
                         publisher,
-                        rung1_cube,
+                        mode,
                         &crate::work::StaticPrStateChecker(crate::work::PrOpenState::Open),
                         candidate,
                         &probe_result,

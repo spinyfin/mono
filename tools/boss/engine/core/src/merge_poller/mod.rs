@@ -53,6 +53,7 @@ use boss_github::{fetch_failing_checks_for_commit, parse_provider_job_id, provid
 use crate::blocking_signal::SignalKind;
 use crate::ci_watch;
 use crate::completion::{StopOutcome, WorkerCompletionHandler};
+use crate::conflict_remediation::{ConflictRemediationQueue, LadderRemediationJob};
 use crate::conflict_watch;
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::design_detector;
