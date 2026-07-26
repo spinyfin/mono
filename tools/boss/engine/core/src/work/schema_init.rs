@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -659,8 +659,13 @@ impl WorkDb {
         // `tasks.tags`: free-form ordered label strings for kanban cards.
         // JSON array text, default `[]`. Caps enforced at write.
         migrate_tasks_tags_column(conn)?;
+        // `work_executions.driver_runtime_state`: opaque JSON from
+        // AgentDriver::provision_workspace, handed back to teardown on
+        // every termination path. Survives workspace release so future
+        // Codex retention can operate only on a recorded root.
+        migrate_work_executions_driver_runtime_state(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '28')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '29')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -751,7 +756,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "28");
+        assert_eq!(schema_version, "29");
 
         let boothby_passes_exists: bool = conn
             .query_row(

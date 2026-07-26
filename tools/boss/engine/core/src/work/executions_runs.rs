@@ -409,7 +409,7 @@ impl WorkDb {
                     we.created_at, we.started_at, we.finished_at, \
                     we.pre_start_failure_count, we.dispatch_not_before, we.pr_url, we.pr_head_before, \
                     we.prefer_is_soft, we.worker_branch_prefix, we.transient_failure_count, we.allow_dirty, we.branch_naming, \
-                    we.dispatch_wait_reason, we.dispatch_wait_since \
+                    we.dispatch_wait_reason, we.dispatch_wait_since, we.driver_runtime_state \
              FROM work_executions we \
              LEFT JOIN tasks t ON t.id = we.work_item_id \
              WHERE we.status = 'ready' \
@@ -437,7 +437,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND cube_lease_id IS NOT NULL
@@ -467,7 +467,7 @@ impl WorkDb {
             "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                     cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                     created_at, started_at, finished_at,
-                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
              FROM work_executions
              WHERE status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
                AND workspace_path IS NOT NULL
@@ -502,7 +502,7 @@ impl WorkDb {
                 "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
                         cube_workspace_id, workspace_path, priority, preferred_workspace_id,
                         created_at, started_at, finished_at,
-                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since
+                        pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
                  FROM work_executions
                  WHERE work_item_id = ?1
                    AND kind = 'revision_implementation'
@@ -840,6 +840,50 @@ impl WorkDb {
             params![execution_id],
         )?;
         Ok(())
+    }
+
+    /// Persist the opaque [`boss_protocol::DriverRuntimeState`] returned by
+    /// [`boss_engine_driver::AgentDriver::provision_workspace`] onto the
+    /// execution row. Survives engine restart, orphan recovery, and
+    /// workspace release (`clear_execution_workspace` deliberately leaves
+    /// this column alone). Pass `None` to clear a previously recorded
+    /// value (idempotent teardown of Claude-shaped drivers that return
+    /// no state typically never calls this).
+    pub fn set_driver_runtime_state(
+        &self,
+        execution_id: &str,
+        state: Option<&boss_protocol::DriverRuntimeState>,
+    ) -> Result<()> {
+        let conn = self.connect()?;
+        let json = match state {
+            Some(s) => Some(serde_json::to_string(s).context("serialize driver_runtime_state")?),
+            None => None,
+        };
+        let affected = conn.execute(
+            "UPDATE work_executions SET driver_runtime_state = ?2 WHERE id = ?1",
+            params![execution_id, json],
+        )?;
+        if affected == 0 {
+            bail!("unknown execution: {execution_id}");
+        }
+        Ok(())
+    }
+
+    /// Load the opaque driver-owned runtime state for `execution_id`.
+    /// `None` when the row is missing, the column is NULL (Claude /
+    /// pre-migration), or the stored JSON fails to parse (treated as
+    /// absent so a corrupt blob cannot block teardown).
+    pub fn get_driver_runtime_state(&self, execution_id: &str) -> Result<Option<boss_protocol::DriverRuntimeState>> {
+        let conn = self.connect()?;
+        let raw: Option<String> = conn
+            .query_row(
+                "SELECT driver_runtime_state FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(raw.and_then(|s| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&s).ok()))
     }
 
     /// Return `true` if `on_stop_inner` has been called at least once for

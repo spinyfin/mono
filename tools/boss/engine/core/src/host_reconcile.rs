@@ -185,6 +185,7 @@ async fn drain_execution(
     // preserves `workspace_path`, so the pre-call `execution` snapshot is
     // still current.
     crate::driver_teardown::teardown_driver_workspace(
+        work_db,
         &execution.id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
     )

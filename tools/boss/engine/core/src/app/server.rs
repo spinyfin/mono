@@ -821,6 +821,7 @@ pub async fn serve_with_merge_probe(
                 // startup reaper): tear down any driver-owned state
                 // outside the workspace.
                 crate::driver_teardown::teardown_driver_workspace(
+                    &server_state.work_db,
                     &execution.id,
                     execution.workspace_path.as_deref().map(std::path::Path::new),
                 )

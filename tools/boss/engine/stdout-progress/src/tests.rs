@@ -105,11 +105,21 @@ impl AgentDriver for CodexShapedDriver {
         unimplemented!()
     }
 
-    async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+    async fn provision_workspace(
+        &self,
+        _: &Path,
+        _: &str,
+        _: &str,
+    ) -> anyhow::Result<Option<boss_engine_driver::DriverRuntimeState>> {
         unimplemented!()
     }
 
-    async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
+    async fn teardown_workspace(
+        &self,
+        _: Option<&Path>,
+        _: &str,
+        _: Option<&boss_engine_driver::DriverRuntimeState>,
+    ) -> anyhow::Result<()> {
         unimplemented!()
     }
 

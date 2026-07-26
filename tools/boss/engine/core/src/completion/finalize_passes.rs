@@ -258,6 +258,7 @@ impl WorkerCompletionHandler {
                 // driver-owned state outside the workspace, captured before
                 // `complete_pane_parked_execution` nulls `workspace_path`.
                 crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
                     &execution.id,
                     workspace_path.as_deref().map(std::path::Path::new),
                 )
@@ -372,6 +373,7 @@ impl WorkerCompletionHandler {
                 // driver-owned state outside the workspace, captured before
                 // `complete_pane_parked_execution` nulls `workspace_path`.
                 crate::driver_teardown::teardown_driver_workspace(
+                    &self.work_db,
                     &execution.id,
                     workspace_path.as_deref().map(std::path::Path::new),
                 )

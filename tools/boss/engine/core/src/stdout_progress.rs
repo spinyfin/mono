@@ -461,10 +461,20 @@ mod tests {
         fn spawn_invocation(&self, _: crate::driver::SpawnRequest<'_>) -> crate::driver::SpawnPlan {
             unimplemented!()
         }
-        async fn provision_workspace(&self, _: &std::path::Path, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn provision_workspace(
+            &self,
+            _: &std::path::Path,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<Option<crate::driver::DriverRuntimeState>> {
             unimplemented!()
         }
-        async fn teardown_workspace(&self, _: Option<&std::path::Path>, _: &str) -> anyhow::Result<()> {
+        async fn teardown_workspace(
+            &self,
+            _: Option<&std::path::Path>,
+            _: &str,
+            _: Option<&crate::driver::DriverRuntimeState>,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
         async fn write_permission_config(

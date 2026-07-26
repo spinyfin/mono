@@ -354,6 +354,7 @@ pub(crate) async fn reap_never_started_spawn(
     // `provision_workspace` ran but `teardown_workspace` still gets its
     // chance regardless.
     crate::driver_teardown::teardown_driver_workspace(
+        ctx.work_db,
         execution_id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
     )

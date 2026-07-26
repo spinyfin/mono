@@ -68,6 +68,7 @@ impl WorkerCompletionHandler {
         // driver-owned state outside the workspace, using the path captured
         // before `clear_execution_workspace` nulled it.
         crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
             execution_id,
             cleared.workspace_path.as_deref().map(std::path::Path::new),
         )

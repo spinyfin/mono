@@ -372,7 +372,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         // WorkspaceProvisioning capability. The driver's config_dir and
         // initial_prompt_filename (e.g. `.claude/initial-prompt.txt`) determine
         // the exact path the spawn_invocation `$(cat ...)` reads from.
-        driver
+        // Any opaque out-of-workspace runtime state the driver returns
+        // (future Codex: Boss-owned CODEX_HOME / archive root) is persisted
+        // on the execution so every teardown path can hand it back after
+        // engine restart / orphan recovery / workspace release without
+        // inferring a home from the engine environment.
+        let runtime_state = driver
             .provision_workspace(workspace_path, &prompt_text, &execution.id)
             .await
             .with_context(|| {
@@ -382,6 +387,20 @@ impl ExecutionRunner for PaneSpawnRunner {
                     execution.id,
                 )
             })?;
+        if let Err(err) = self
+            .work_db
+            .set_driver_runtime_state(&execution.id, runtime_state.as_ref())
+        {
+            // Persistence failure is non-fatal for Claude (no state) but
+            // would strand a future Codex home. Log loudly so an operator
+            // can see it; spawn continues so a flaky DB write does not
+            // strand a successfully provisioned workspace.
+            tracing::error!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "failed to persist driver_runtime_state after provision (non-fatal)",
+            );
+        }
 
         // Structured-output artifacts (PR URL / review findings / triage
         // decision / followups): create the engine-owned scratch dir and clear

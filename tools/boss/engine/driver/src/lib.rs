@@ -1089,7 +1089,22 @@ pub trait AgentDriver: Send + Sync {
 
     /// Write per-session workspace files (prompt file, agent-rules, gitignore)
     /// and suppress the backend's first-run trust prompt.
-    async fn provision_workspace(&self, workspace: &Path, prompt_text: &str, run_id: &str) -> anyhow::Result<()>;
+    ///
+    /// Returns optional [`DriverRuntimeState`] describing any per-run state
+    /// the driver created *outside* the cube workspace (e.g. a future Codex
+    /// driver's Boss-owned per-run `CODEX_HOME` or archive root). The engine
+    /// persists that opaque payload on the execution and hands it back to
+    /// [`AgentDriver::teardown_workspace`] on every termination path. Claude
+    /// returns `None` — it creates no state outside the workspace. Drivers
+    /// **must not** expect the engine to infer a home from the process
+    /// environment or by scanning a shared provider directory; if cleanup
+    /// needs a path, return it here.
+    async fn provision_workspace(
+        &self,
+        workspace: &Path,
+        prompt_text: &str,
+        run_id: &str,
+    ) -> anyhow::Result<Option<DriverRuntimeState>>;
 
     /// Tear down whatever per-run state the driver created *outside* the cube
     /// workspace — a per-worker config/cache dir, a socket, a temp credential
@@ -1098,12 +1113,16 @@ pub trait AgentDriver: Send + Sync {
     /// cube owns that checkout's lifecycle.
     ///
     /// `workspace` is informational only (some implementations may use it to
-    /// namespace their own state) — `run_id` is the actual key for the state
-    /// being cleaned up, since drivers that key their out-of-workspace state
-    /// by run id (e.g. a per-worker `CODEX_HOME`) must still be torn down
-    /// when the workspace path is unknown (never recorded, or already
-    /// cleared by a racing teardown). Callers pass `None` rather than
-    /// skipping the call in that case.
+    /// namespace their own state). `run_id` identifies the execution. The
+    /// authoritative cleanup handle is `runtime_state` — the opaque payload
+    /// this driver returned from a prior [`Self::provision_workspace`] call
+    /// for the same execution, reloaded from the execution row. When
+    /// `runtime_state` is `None` (Claude, pre-migration rows, or a provision
+    /// that returned no state), the driver must no-op rather than invent a
+    /// cleanup target by scanning a shared provider home or reading the
+    /// engine environment. Callers pass `workspace = None` when the path is
+    /// unknown (never recorded, or already cleared by a racing teardown)
+    /// rather than skipping the call.
     ///
     /// Called on every run-termination path (normal completion, stop, reap,
     /// orphaned/husk recovery, app-crash reconciliation) — not just the happy
@@ -1116,7 +1135,12 @@ pub trait AgentDriver: Send + Sync {
     /// Must not perform real work — it can run while the process is shutting
     /// down. `ClaudeDriver` implements this as a no-op: Claude creates no
     /// state outside the workspace.
-    async fn teardown_workspace(&self, workspace: Option<&Path>, run_id: &str) -> anyhow::Result<()>;
+    async fn teardown_workspace(
+        &self,
+        workspace: Option<&Path>,
+        run_id: &str,
+        runtime_state: Option<&DriverRuntimeState>,
+    ) -> anyhow::Result<()>;
 
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
@@ -1365,6 +1389,8 @@ pub trait AgentDriver: Send + Sync {
 pub mod claude;
 pub mod registry;
 
+// Also available in-module for trait signatures (pub use is an import + re-export).
+pub use boss_protocol::DriverRuntimeState;
 pub use claude::ClaudeDriver;
 pub use registry::{DriverRegistry, UnknownDriverSlug};
 
@@ -1381,9 +1407,9 @@ pub mod test_support {
     use boss_protocol::{NormalizeError, WorkerEvent};
 
     use super::{
-        AgentDriver, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
-        PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest,
-        ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+        AgentDriver, CapabilitySet, DriverDescriptor, DriverRuntimeState, ModelMenu, PermissionArtifacts,
+        PermissionInput, PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+        SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
     };
 
     /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
@@ -1463,10 +1489,15 @@ pub mod test_support {
                 env: vec![],
             }
         }
-        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<Option<DriverRuntimeState>> {
             unimplemented!()
         }
-        async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
+        async fn teardown_workspace(
+            &self,
+            _: Option<&Path>,
+            _: &str,
+            _: Option<&DriverRuntimeState>,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
         async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {

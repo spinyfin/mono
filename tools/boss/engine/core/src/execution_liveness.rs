@@ -255,6 +255,7 @@ pub async fn finalize_gone_execution(
             // `mark_execution_orphaned` preserves `workspace_path` on the
             // row, so the pre-call value on `execution` is still current.
             crate::driver_teardown::teardown_driver_workspace(
+                work_db,
                 &execution.id,
                 execution.workspace_path.as_deref().map(Path::new),
             )

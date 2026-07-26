@@ -392,6 +392,21 @@ pub(crate) fn migrate_work_executions_revision_stop_contributed_head(conn: &Conn
     Ok(())
 }
 
+/// `driver_runtime_state`: opaque JSON blob returned by
+/// [`boss_engine_driver::AgentDriver::provision_workspace`] and later
+/// handed to [`boss_engine_driver::AgentDriver::teardown_workspace`].
+/// Survives engine restart, orphan recovery, and workspace release —
+/// deliberately *not* cleared when `workspace_path` is nulled, so a
+/// future Codex retention sweep can still find the recorded
+/// Boss-owned root without scanning a shared provider home. Claude
+/// returns no state, so most rows stay NULL. Idempotent.
+pub(crate) fn migrate_work_executions_driver_runtime_state(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "driver_runtime_state")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN driver_runtime_state TEXT", [])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
     table_has_column(conn, "work_executions", column)
 }
