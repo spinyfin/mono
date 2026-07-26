@@ -349,28 +349,42 @@ impl MergeProbe for CommandMergeProbe {
 /// already hand-building the query).
 ///
 /// GraphQL bills by node count (~cost = nodes / 100), so the connection
-/// `first`/`last` caps here are the dominant per-PR lever on quota spend.
-/// They are deliberately tight rather than blanket `first: 100`:
+/// `first`/`last` caps here are the dominant per-PR lever on quota spend for
+/// the *batched* sweep — a batch of `N` PRs costs `ceil(51N/100)` points at
+/// the caps below, against `ceil(81N/100)` before them. (It is not a lever
+/// for a single-PR query, where the 1-point floor dominates whatever the
+/// node count; the fix for that path is to stop issuing single-PR queries —
+/// see [`reconcile_batch`].)
 ///
-/// - `labels(first: 30)` — boss's own label vocabulary (`blocked:*`,
-///   priority, opt-out flags) is a handful of names; 30 is comfortable
-///   headroom and only the label *set* is consumed ([`parse_probe_json`]).
-/// - `reviews(last: 20)` — the merge-gating decision is read from the
+/// The caps were re-cut against the 60 most recent PRs in the repo this
+/// poller actually watches: **max 0 labels, max 12 reviews, exactly 3 rollup
+/// contexts** across all of them. They are deliberately tight rather than
+/// blanket `first: 100`:
+///
+/// - `labels(first: 10)` — boss's own label vocabulary (`blocked:*`,
+///   priority, opt-out flags) is a handful of names, no sampled PR carried
+///   any, and only the label *set* is consumed ([`parse_probe_json`]).
+/// - `reviews(last: 10)` — the merge-gating decision is read from the
 ///   authoritative `reviewDecision` field, not this array; the array only
-///   supplies the tooltip's reviewer login list ([`classify_review`]), for
-///   which the 20 most-recent reviews cover every realistic PR.
-/// - `contexts(first: 30)` — the CI rollup on the head commit. Required
-///   checks are few (this repo gates on three Buildkite contexts); 30 is
-///   several times the real fan-out while still cutting the worst-case
-///   node count by ~3x versus `first: 100`.
+///   supplies the tooltip's reviewer login list ([`classify_review`]), which
+///   takes the latest state *per author*. Truncating from the oldest end is
+///   therefore the harmless direction: the only casualty is an author whose
+///   sole review is older than the 10 most recent, on a PR busy enough to
+///   have more than 10 (1 of 60 sampled).
+/// - `contexts(first: 30)` — the CI rollup on the head commit, and
+///   deliberately **not** trimmed further even though the sampled PRs all
+///   carry 3. This connection is the only one whose truncation is not
+///   cosmetic: a dropped failing context reads as a *green* rollup, which
+///   would move a task to Review on a red PR. The asymmetry (a wasted node
+///   budget versus a false green) is worth ~20 nodes.
 ///
-/// Together these cut a typical probe from ~300 requested nodes to ~80 —
-/// roughly a 3x GraphQL-cost reduction with no behavioural loss for any
+/// Together these cut a typical probe from ~300 requested nodes to ~51 —
+/// roughly a 6x GraphQL-cost reduction with no behavioural loss for any
 /// realistically-shaped PR.
 pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "state mergedAt closedAt mergeable mergeStateStatus baseRefOid headRefOid headRefName baseRefName ",
-    "labels(first: 30) { nodes { name } } ",
-    "reviewDecision reviews(last: 20) { nodes { author { login } state } } ",
+    "labels(first: 10) { nodes { name } } ",
+    "reviewDecision reviews(last: 10) { nodes { author { login } state } } ",
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",

@@ -110,6 +110,62 @@ crate::register_counter!(
     "merge_poller.pass_timed_out",
     "Detection passes abandoned mid-flight after exceeding the pass timeout."
 );
+crate::register_counter!(
+    ADAPTIVE_BATCHES,
+    "merge_poller.adaptive_batches",
+    "Batched adaptive reconciles issued — the GraphQL round-trip pair count of the adaptive path."
+);
+crate::register_counter!(
+    ADAPTIVE_PRS_RECONCILED,
+    "merge_poller.adaptive_prs_reconciled",
+    "PRs covered by batched adaptive reconciles."
+);
+crate::register_gauge!(
+    ADAPTIVE_TRACKED,
+    "merge_poller.adaptive_tracked",
+    "PRs currently holding an adaptive poll slot (those whose tier polls faster than the full sweep)."
+);
+
+/// Record one batched adaptive reconcile of `size` PRs.
+///
+/// The ratio of [`ADAPTIVE_PRS_RECONCILED`] to [`ADAPTIVE_BATCHES`] is the
+/// number this whole change turns on: it is the average due-set size, and
+/// GraphQL's 1-point-per-query floor means the adaptive path's cost is
+/// proportional to the *batch* count, not the PR count. A ratio pinned at
+/// 1.0 would mean the coalescing window is buying nothing and the batching
+/// is decorative.
+///
+/// The mean alone can hide a bimodal distribution (many 1s plus a few large
+/// batches average out to a healthy-looking number), so the size histogram
+/// goes out as its own dynamically-registered counter family. Bucketed
+/// rather than one counter per exact size, to keep the registry's entry
+/// count bounded by a fleet that can legitimately reach dozens of open PRs.
+pub fn record_adaptive_batch(registry: &Registry, size: usize) {
+    if size == 0 {
+        return;
+    }
+    ADAPTIVE_BATCHES.inc(registry);
+    ADAPTIVE_PRS_RECONCILED.inc_by(registry, size as u64);
+    registry.counter_inc_by_dynamic(
+        &format!("merge_poller.adaptive_batch_size.{}", adaptive_batch_size_bucket(size)),
+        "Batched adaptive reconciles whose due set fell in this size bucket.",
+        1,
+    );
+}
+
+/// Bucket label for a due-set size. Exact for the sizes where the batching
+/// question is actually decided (1 vs 2), coarser above.
+pub(crate) fn adaptive_batch_size_bucket(size: usize) -> &'static str {
+    match size {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        3..=5 => "3_5",
+        6..=10 => "6_10",
+        11..=25 => "11_25",
+        _ => "26_plus",
+    }
+}
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics_init::init_all`] at engine startup.
@@ -126,6 +182,9 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&COMMENTS_REOPENED);
     registry.register_counter(&PASS_OVERRUN);
     registry.register_counter(&PASS_TIMED_OUT);
+    registry.register_counter(&ADAPTIVE_BATCHES);
+    registry.register_counter(&ADAPTIVE_PRS_RECONCILED);
+    registry.register_gauge(&ADAPTIVE_TRACKED);
 }
 
 // ── GitHub API quota budget ─────────────────────────────────────────────
