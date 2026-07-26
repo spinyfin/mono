@@ -29,8 +29,10 @@
 //! not touch.
 //!
 //! Pull-style rather than a channel or a callback on purpose: the consumer
-//! paces the reader, so events reach the activity machine in stream order with
-//! no intermediate queue to bound, drop from, or reorder.
+//! paces the reader, so events reach the activity machine in stream order.
+//! A tiny internal queue preserves the ordered batch when one provider
+//! envelope maps to multiple worker events (for example, fatal diagnostic
+//! then `Stop`); there is no independently paced background producer.
 //!
 //! # Robustness
 //!
@@ -56,6 +58,7 @@
 //! - **Invalid UTF-8** — decoded lossily, which turns into a JSON parse failure
 //!   and is skipped like any other non-JSON line.
 
+use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::sync::Arc;
 
@@ -169,10 +172,12 @@ enum RawLine {
 /// normalises each through the driver that produced it.
 ///
 /// See the crate docs for the transport split and the tolerated-anomaly list.
+#[derive(bon::Builder)]
 pub struct StdoutJsonlProgressReader<R> {
     reader: BufReader<R>,
     driver: Arc<dyn AgentDriver>,
     progress_session: Option<Box<dyn ProgressSessionNormalizer>>,
+    pending_events: VecDeque<ProgressEnvelope>,
     config: ReaderConfig,
     stats: ReaderStats,
 }
@@ -231,6 +236,7 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
             reader: BufReader::new(stream),
             driver,
             progress_session,
+            pending_events: VecDeque::new(),
             config,
             stats: ReaderStats::default(),
         }
@@ -251,6 +257,11 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// loop normally instead of unwinding.
     pub async fn next_event(&mut self) -> Option<ProgressEnvelope> {
         loop {
+            if let Some(envelope) = self.pending_events.pop_front() {
+                self.stats.events_emitted += 1;
+                return Some(envelope);
+            }
+
             let bytes = match self.next_raw_line().await {
                 RawLine::Complete(bytes) => {
                     self.stats.lines_read += 1;
@@ -301,17 +312,21 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
             };
 
             let normalized = match self.progress_session.as_mut() {
-                Some(session) => session.normalize_progress_event(&raw),
-                None => self.driver.normalize_progress_event(&raw),
+                Some(session) => session.normalize_progress_events(&raw),
+                None => self.driver.normalize_progress_event(&raw).map(|event| vec![event]),
             };
             match normalized {
-                Ok(event) => {
-                    self.stats.events_emitted += 1;
+                Ok(events) => {
                     let transcript_path = match self.progress_session.as_mut() {
                         Some(session) => session.transcript_path_for_session(&raw),
                         None => self.driver.transcript_path_for_session(&raw),
                     };
-                    return Some(ProgressEnvelope { event, transcript_path });
+                    self.pending_events
+                        .extend(events.into_iter().map(|event| ProgressEnvelope {
+                            event,
+                            transcript_path: transcript_path.clone(),
+                        }));
+                    continue;
                 }
                 Err(err) => {
                     // The expected steady state for a stream that mixes

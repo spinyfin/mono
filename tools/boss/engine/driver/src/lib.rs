@@ -818,6 +818,16 @@ pub trait ProgressIdentityStore: Send + Sync {
 pub trait ProgressSessionNormalizer: Send {
     fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
+    /// Normalize one provider envelope into its ordered worker-event fanout.
+    ///
+    /// Most envelopes map one-to-one and use this default. A provider may
+    /// override the batch form when one wire event carries two distinct parts
+    /// of the shared contract—for example, a fatal error message followed by
+    /// the authoritative turn-ending [`WorkerEvent::Stop`].
+    fn normalize_progress_events(&mut self, raw: &serde_json::Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
+        self.normalize_progress_event(raw).map(|event| vec![event])
+    }
+
     fn transcript_path_for_session(&mut self, raw: &serde_json::Value) -> Option<String>;
 }
 
@@ -842,15 +852,16 @@ pub trait TranscriptSessionNormalizer: Send {
 /// - **Claude** fires a `Stop` hook into the `boss-event` shim, which the
 ///   engine decodes into [`WorkerEvent::Stop`] — that variant is the
 ///   boundary.
-/// - **Codex** emits a native, typed `turn.completed` on its `--json` stdout
-///   stream (verified against codex-cli 0.145.0; see
+/// - **Codex** emits native, typed terminal envelopes on its `--json` stdout
+///   stream (`turn.completed`, `turn.failed`, and unrecoverable `error`;
+///   verified against codex-cli 0.145.0; see
 ///   `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`).
 ///   Its driver decodes that to [`WorkerEvent::Stop`] in
 ///   [`AgentDriver::normalize_progress_event`] and reports the boundary
-///   here. Routing a native turn event through this method is the
-///   first-class path; what a driver must *not* do is manufacture a
-///   Claude-shaped hook payload to satisfy Claude-shaped plumbing behind
-///   the engine's back.
+///   here, preserving a fatal diagnostic immediately before the `Stop`.
+///   Routing a native turn event through this method is the first-class path;
+///   what a driver must *not* do is manufacture a Claude-shaped hook payload
+///   to satisfy Claude-shaped plumbing behind the engine's back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEnd {
     /// Session identity of the turn that ended, as the driver reports it.

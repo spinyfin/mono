@@ -19,7 +19,7 @@ use boss_engine_driver::{
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, SessionStartSource, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, SessionStartSource, StopReason, WorkerEvent};
 use tokio::io::AsyncWriteExt;
 
 use super::*;
@@ -352,6 +352,126 @@ async fn production_codex_normalizer_runs_through_generic_reader() {
         | WorkerEvent::Notification { session_id, .. }
         | WorkerEvent::SessionEnd { session_id, .. } => session_id == "reader-production-thread",
     }));
+    assert_eq!(reader.stats().unrecognised_envelopes, 1);
+}
+
+async fn assert_production_fatal_envelope(fatal_line: &str, expected_message: &str) {
+    let stream = format!(
+        "{}\n{}\n{fatal_line}\n",
+        r#"{"type":"thread.started","thread_id":"reader-fatal-thread"}"#, r#"{"type":"turn.started"}"#,
+    );
+    let mut reader = StdoutJsonlProgressReader::new(stream.as_bytes(), Arc::new(CodexDriver::default()));
+    let mut events = Vec::new();
+    while let Some(envelope) = reader.next_event().await {
+        events.push(envelope.event);
+    }
+
+    assert_eq!(
+        kinds(&events),
+        vec!["session_start", "user_prompt_submit", "notification", "stop"]
+    );
+    assert_eq!(
+        events[2],
+        WorkerEvent::Notification {
+            session_id: "reader-fatal-thread".to_owned(),
+            message: expected_message.to_owned(),
+        }
+    );
+    assert_eq!(
+        events[3],
+        WorkerEvent::Stop {
+            session_id: "reader-fatal-thread".to_owned(),
+            stop_hook_active: false,
+            stop_reason: StopReason::Other,
+        }
+    );
+    assert_eq!(
+        CodexDriver::default().turn_boundary(&events[3]),
+        Some(TurnEnd {
+            session_id: "reader-fatal-thread".to_owned(),
+            reason: StopReason::Other,
+            continuation: false,
+        })
+    );
+    assert_eq!(reader.stats().lines_read, 3);
+    assert_eq!(reader.stats().events_emitted, 4);
+    assert_eq!(reader.stats().unrecognised_envelopes, 0);
+}
+
+#[tokio::test]
+async fn production_reader_turn_failed_emits_message_and_stop_without_completed() {
+    assert_production_fatal_envelope(
+        r#"{"type":"turn.failed","error":{"message":"model quota exhausted"}}"#,
+        "model quota exhausted",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_reader_top_level_error_emits_message_and_stop_without_completed() {
+    assert_production_fatal_envelope(
+        r#"{"type":"error","message":"response stream disconnected"}"#,
+        "response stream disconnected",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn production_reader_deduplicates_error_followed_by_turn_failed() {
+    let stream = concat!(
+        r#"{"type":"thread.started","thread_id":"reader-dedup-thread"}"#,
+        "\n",
+        r#"{"type":"turn.started"}"#,
+        "\n",
+        r#"{"type":"error","message":"upstream failed"}"#,
+        "\n",
+        r#"{"type":"turn.failed","error":{"message":"upstream failed"}}"#,
+        "\n",
+    );
+    let mut reader = StdoutJsonlProgressReader::new(stream.as_bytes(), Arc::new(CodexDriver::default()));
+    let mut events = Vec::new();
+    while let Some(envelope) = reader.next_event().await {
+        events.push(envelope.event);
+    }
+
+    assert_eq!(
+        kinds(&events),
+        vec!["session_start", "user_prompt_submit", "notification", "stop"]
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, WorkerEvent::Stop { .. }))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn production_reader_keeps_item_error_non_terminal_and_unknown_additive() {
+    let stream = concat!(
+        r#"{"type":"thread.started","thread_id":"reader-warning-thread"}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"item_1","type":"error","message":"stream lag warning"}}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"item_2","type":"future_item","future":true}}"#,
+        "\n",
+    );
+    let mut reader = StdoutJsonlProgressReader::new(stream.as_bytes(), Arc::new(CodexDriver::default()));
+    let mut events = Vec::new();
+    while let Some(envelope) = reader.next_event().await {
+        events.push(envelope.event);
+    }
+
+    assert_eq!(kinds(&events), vec!["session_start", "notification"]);
+    assert_eq!(
+        events[1],
+        WorkerEvent::Notification {
+            session_id: "reader-warning-thread".to_owned(),
+            message: "stream lag warning".to_owned(),
+        }
+    );
+    assert!(!events.iter().any(|event| matches!(event, WorkerEvent::Stop { .. })));
     assert_eq!(reader.stats().unrecognised_envelopes, 1);
 }
 

@@ -37,6 +37,8 @@ pub(super) struct CodexProgressSession {
     run_id: Option<String>,
     identity_store: Option<Arc<dyn ProgressIdentityStore>>,
     transcript_path_cache: Option<(String, String)>,
+    turn_terminal: bool,
+    terminal_message: Option<String>,
 }
 
 impl CodexProgressSession {
@@ -53,6 +55,8 @@ impl CodexProgressSession {
             run_id,
             identity_store,
             transcript_path_cache: None,
+            turn_terminal: false,
+            terminal_message: None,
         }
     }
 
@@ -82,6 +86,12 @@ impl CodexProgressSession {
     }
 
     fn normalize_stdout(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
+        self.normalize_stdout_events(raw)?
+            .pop()
+            .ok_or_else(|| NormalizeError::UnknownEvent("duplicate terminal Codex event".to_owned()))
+    }
+
+    fn normalize_stdout_events(&mut self, raw: &Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
         let obj = raw
             .as_object()
             .ok_or_else(|| NormalizeError::Malformed("expected Codex stdout JSON object".into()))?;
@@ -96,10 +106,12 @@ impl CodexProgressSession {
                 // A repeated thread.started from `exec resume` makes the same
                 // thread current again without clearing any per-stream state.
                 self.current_thread_id = Some(thread_id.to_owned());
-                Ok(WorkerEvent::SessionStart {
+                self.turn_terminal = false;
+                self.terminal_message = None;
+                Ok(vec![WorkerEvent::SessionStart {
                     session_id: thread_id.to_owned(),
                     source,
-                })
+                }])
             }
             StdoutEnvelope::Unknown {
                 envelope_type,
@@ -121,32 +133,71 @@ impl CodexProgressSession {
                     .clone()
                     .ok_or(NormalizeError::MissingField("thread_id"))?;
                 Ok(match other {
-                    StdoutEnvelope::TurnStarted => WorkerEvent::UserPromptSubmit {
-                        session_id,
-                        prompt: String::new(),
-                    },
-                    StdoutEnvelope::TurnCompleted => WorkerEvent::Stop {
-                        session_id,
-                        stop_hook_active: false,
-                        stop_reason: StopReason::Completed,
-                    },
-                    StdoutEnvelope::CommandStarted { command } => WorkerEvent::PreToolUse {
+                    StdoutEnvelope::TurnStarted => {
+                        self.turn_terminal = false;
+                        self.terminal_message = None;
+                        vec![WorkerEvent::UserPromptSubmit {
+                            session_id,
+                            prompt: String::new(),
+                        }]
+                    }
+                    StdoutEnvelope::TurnCompleted => {
+                        if self.turn_terminal {
+                            tracing::debug!("codex stdout: suppressing a duplicate terminal turn.completed");
+                            Vec::new()
+                        } else {
+                            self.turn_terminal = true;
+                            vec![WorkerEvent::Stop {
+                                session_id,
+                                stop_hook_active: false,
+                                stop_reason: StopReason::Completed,
+                            }]
+                        }
+                    }
+                    StdoutEnvelope::FatalError { message } => {
+                        let duplicate_message = self.terminal_message.as_deref() == Some(message);
+                        if !self.turn_terminal {
+                            self.turn_terminal = true;
+                            self.terminal_message = Some(message.to_owned());
+                            vec![
+                                WorkerEvent::Notification {
+                                    session_id: session_id.clone(),
+                                    message: message.to_owned(),
+                                },
+                                WorkerEvent::Stop {
+                                    session_id,
+                                    stop_hook_active: false,
+                                    stop_reason: StopReason::Other,
+                                },
+                            ]
+                        } else if duplicate_message {
+                            tracing::debug!(message, "codex stdout: suppressing duplicate terminal error message");
+                            Vec::new()
+                        } else {
+                            self.terminal_message = Some(message.to_owned());
+                            vec![WorkerEvent::Notification {
+                                session_id,
+                                message: message.to_owned(),
+                            }]
+                        }
+                    }
+                    StdoutEnvelope::CommandStarted { command } => vec![WorkerEvent::PreToolUse {
                         session_id,
                         tool_name: "Bash".to_owned(),
                         tool_input: json!({ "command": command }),
-                    },
-                    StdoutEnvelope::CommandCompleted { command, output } => WorkerEvent::PostToolUse {
+                    }],
+                    StdoutEnvelope::CommandCompleted { command, output } => vec![WorkerEvent::PostToolUse {
                         session_id,
                         tool_name: "Bash".to_owned(),
                         tool_input: json!({ "command": command }),
                         // Keep aggregated_output as a bare string. The shared
                         // PR-URL capture seam explicitly supports this shape.
                         tool_response: Value::String(output.to_owned()),
-                    },
-                    StdoutEnvelope::OperationalWarning { message } => WorkerEvent::Notification {
+                    }],
+                    StdoutEnvelope::OperationalWarning { message } => vec![WorkerEvent::Notification {
                         session_id,
                         message: message.to_owned(),
-                    },
+                    }],
                     StdoutEnvelope::ThreadStarted { .. } | StdoutEnvelope::Unknown { .. } => {
                         unreachable!("handled above")
                     }
@@ -179,6 +230,10 @@ impl ProgressSessionNormalizer for CodexProgressSession {
         self.normalize_stdout(raw)
     }
 
+    fn normalize_progress_events(&mut self, raw: &Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
+        self.normalize_stdout_events(raw)
+    }
+
     fn transcript_path_for_session(&mut self, raw: &Value) -> Option<String> {
         self.transcript_path(raw)
     }
@@ -191,6 +246,9 @@ enum StdoutEnvelope<'a> {
     },
     TurnStarted,
     TurnCompleted,
+    FatalError {
+        message: &'a str,
+    },
     CommandStarted {
         command: &'a str,
     },
@@ -223,6 +281,22 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
         }
         "turn.started" => Ok(StdoutEnvelope::TurnStarted),
         "turn.completed" => Ok(StdoutEnvelope::TurnCompleted),
+        "turn.failed" => {
+            let message = obj
+                .get("error")
+                .and_then(Value::as_object)
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .ok_or(NormalizeError::MissingField("error.message"))?;
+            Ok(StdoutEnvelope::FatalError { message })
+        }
+        "error" => {
+            let message = obj
+                .get("message")
+                .and_then(Value::as_str)
+                .ok_or(NormalizeError::MissingField("message"))?;
+            Ok(StdoutEnvelope::FatalError { message })
+        }
         "item.started" | "item.completed" => {
             let item = obj
                 .get("item")
@@ -758,6 +832,79 @@ mod tests {
     }
 
     #[test]
+    fn fatal_stdout_envelopes_preserve_message_and_end_the_turn() {
+        for (raw, expected_message) in [
+            (
+                json!({
+                    "type":"turn.failed",
+                    "error":{"message":"upstream quota exhausted"}
+                }),
+                "upstream quota exhausted",
+            ),
+            (
+                json!({
+                    "type":"error",
+                    "message":"unrecoverable response stream failure"
+                }),
+                "unrecoverable response stream failure",
+            ),
+        ] {
+            let mut session = session();
+            session
+                .normalize_stdout(&json!({"type":"thread.started","thread_id":"fatal-thread"}))
+                .unwrap();
+            session.normalize_stdout(&json!({"type":"turn.started"})).unwrap();
+
+            let events = session.normalize_stdout_events(&raw).unwrap();
+            assert_eq!(
+                events,
+                vec![
+                    WorkerEvent::Notification {
+                        session_id: "fatal-thread".into(),
+                        message: expected_message.into(),
+                    },
+                    WorkerEvent::Stop {
+                        session_id: "fatal-thread".into(),
+                        stop_hook_active: false,
+                        stop_reason: StopReason::Other,
+                    },
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_error_and_turn_failed_emit_only_one_terminal_boundary() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"fatal-thread"}))
+            .unwrap();
+        session.normalize_stdout(&json!({"type":"turn.started"})).unwrap();
+
+        let first = session
+            .normalize_stdout_events(&json!({"type":"error","message":"same upstream failure"}))
+            .unwrap();
+        let duplicate = session
+            .normalize_stdout_events(&json!({
+                "type":"turn.failed",
+                "error":{"message":"same upstream failure"}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Stop { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            duplicate.is_empty(),
+            "the upstream terminal summary must not emit a second Stop"
+        );
+    }
+
+    #[test]
     fn additive_variants_are_tolerated_without_session_state() {
         let mut session = session();
         for raw in [
@@ -786,6 +933,8 @@ mod tests {
                 "item":{"type":"command_execution","command":"echo hi","aggregated_output":{"text":"hi"}}
             }),
             json!({"type":"item.completed","item":{"type":"error","message":["warning"]}}),
+            json!({"type":"turn.failed","error":{"message":["fatal"]}}),
+            json!({"type":"error","message":{"text":"fatal"}}),
         ] {
             assert!(matches!(
                 session.normalize_stdout(&raw),

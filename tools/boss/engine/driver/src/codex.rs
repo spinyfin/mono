@@ -1021,12 +1021,11 @@ impl AgentDriver for CodexDriver {
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
-        // The progress normaliser maps `turn.completed` →
-        // `WorkerEvent::Stop`, so the boundary is the same shape as Claude's:
-        // Stop means the turn ended. `codex exec` does not re-enter via
-        // stop-hooks, so continuation is always false. Implementing this now
-        // is correct and trivial; it simply never fires until the normaliser
-        // lands.
+        // The progress normaliser maps every terminal stdout envelope
+        // (`turn.completed`, `turn.failed`, and unrecoverable top-level
+        // `error`) to `WorkerEvent::Stop`, so the boundary is the same shape
+        // as Claude's: Stop means the turn ended. `codex exec` does not
+        // re-enter via stop-hooks, so continuation is always false.
         match event {
             WorkerEvent::Stop {
                 session_id,
