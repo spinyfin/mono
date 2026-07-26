@@ -47,11 +47,14 @@
 //! * `"files"` — scan the content of changed, non-deleted files (the
 //!   long-standing behaviour). This is the default when `surfaces` is
 //!   omitted, so existing configs are unaffected.
-//! * `"changeset"` — additionally scan the PR description and the
-//!   joined-range commit-description string carried on
+//! * `"changeset"` — additionally scan the PR description and the tip
+//!   commit-description string carried on
 //!   [`checkleft_check_sdk::ChangeSet`]. Either, both, or neither may be
-//!   present on a given run: `commit_description` is set whenever the VCS can
-//!   supply one, while `pr_description` depends on the host having resolved
+//!   present on a given run: `commit_description` is the **tip** commit
+//!   message only (not the full `base..HEAD` range — the host keeps that
+//!   range for BYPASS parsing on a separate field so intermediate historical
+//!   commit messages cannot false-fail leakage checks when GitHub MQ/squash
+//!   re-embeds them). `pr_description` depends on the host having resolved
 //!   the PR (it is reliably absent, for example, when running from a jj
 //!   workspace with no `.git` at its root — see
 //!   `tools/checkleft/docs/investigations/locationless-and-virtual-path-finding-rendering.md`).
@@ -630,6 +633,51 @@ mod tests {
             r#"{"surfaces":["changeset"],"patterns":[{"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"nope"}]}"#,
         ));
         assert!(findings.is_empty());
+    }
+
+    /// Host responsibility: only the tip commit message is placed on
+    /// `commit_description`. Historical intermediate messages stay on the
+    /// host-only bypass range and must not reach this check. If the tip + PR
+    /// body are clean, this check must not fail even when intermediate
+    /// messages would have matched.
+    #[test]
+    fn changeset_scope_does_not_see_historical_messages_absent_from_tip_field() {
+        // Simulates host attach: tip clean; historical "the operator" / ZZ id
+        // never put on commit_description.
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("Clean PR body describing the design change."),
+            Some("docs: clean tip message for the design PR"),
+            r#"{"surfaces":["changeset"],"patterns":[
+                {"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"id leak","severity":"error"},
+                {"name":"operator-ref","pattern":"(?i)\\bthe operator\\b","message":"operator leak","severity":"error"}
+            ]}"#,
+        ));
+        assert!(
+            findings.is_empty(),
+            "tip + PR body clean must not fail; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn changeset_scope_still_flags_tip_commit_message_leaks() {
+        let findings = forbidden_pattern_check(make_changeset_input(
+            Some("Clean PR body."),
+            Some("docs: fold ZZ3718 into the design\n\nAs the operator requested."),
+            r#"{"surfaces":["changeset"],"patterns":[
+                {"name":"work-item-id","pattern":"\\bZZ\\d{4,}\\b","message":"id leak","severity":"error"},
+                {"name":"operator-ref","pattern":"(?i)\\bthe operator\\b","message":"operator leak","severity":"error"}
+            ]}"#,
+        ));
+        assert_eq!(
+            findings.len(),
+            2,
+            "tip message leaks must still be flagged; got: {findings:?}"
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|f| f.surface == Some(FindingSurface::CommitMessage))
+        );
     }
 
     #[test]

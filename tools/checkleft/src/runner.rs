@@ -1288,6 +1288,7 @@ impl Runner {
                 file_line_deltas: HashMap::new(),
                 file_diffs: HashMap::new(),
                 commit_description: changeset.commit_description.clone(),
+                bypass_commit_descriptions: changeset.bypass_commit_descriptions.clone(),
                 pr_description: changeset.pr_description.clone(),
                 change_id: changeset.change_id.clone(),
                 repository: changeset.repository.clone(),

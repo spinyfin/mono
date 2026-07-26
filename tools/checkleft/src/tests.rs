@@ -1693,3 +1693,126 @@ fn json_output_serializes_fixable_field_per_finding() {
     assert_eq!(findings[0]["fixable"], serde_json::Value::Bool(true));
     assert_eq!(findings[1]["fixable"], serde_json::Value::Bool(false));
 }
+
+/// Scoped attach must put only the tip message on the leakage surface
+/// (`commit_description`) while keeping the full `base..HEAD` range on the
+/// BYPASS surface (`bypass_commit_descriptions`). Intermediate historical
+/// messages that mention boss-isms or carry BYPASS must not pollute the tip.
+#[tokio::test]
+async fn attach_description_context_splits_tip_leakage_from_range_bypass() {
+    use std::fs;
+    use std::process::Command;
+
+    use checkleft::change_detection::ChangePlan;
+    use checkleft::change_detection::scenario::Scenario;
+    use checkleft::input::ChangeSet;
+    use checkleft::vcs::Vcs;
+    use tempfile::tempdir;
+
+    fn run_git(root: &std::path::Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_output(root: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).expect("utf-8").trim().to_owned()
+    }
+
+    let temp = tempdir().expect("temp dir");
+    run_git(temp.path(), &["init", "-b", "main"]);
+    run_git(temp.path(), &["config", "user.email", "test@checkleft.example"]);
+    run_git(temp.path(), &["config", "user.name", "Checkleft Test"]);
+
+    fs::write(temp.path().join("base.txt"), "base\n").expect("write base");
+    run_git(temp.path(), &["add", "base.txt"]);
+    run_git(temp.path(), &["commit", "-m", "initial"]);
+    let base_sha = git_output(temp.path(), &["rev-parse", "HEAD"]);
+
+    run_git(temp.path(), &["checkout", "-b", "pr-branch"]);
+
+    // Intermediate content commit: boss-ism leakage + a BYPASS directive.
+    fs::write(temp.path().join("design.md"), "design\n").expect("write design");
+    run_git(temp.path(), &["add", "design.md"]);
+    run_git(
+        temp.path(),
+        &[
+            "commit",
+            "-m",
+            "docs: record the operator refutation of PATH shims\n\nFold ZZ3718 into the design.\n\nBYPASS_FILE_SIZE=Intentionally large fixture for the spike.",
+        ],
+    );
+
+    // Clean tip (simulates a later amend / empty jj WC commit with a clean message).
+    run_git(
+        temp.path(),
+        &[
+            "commit",
+            "--allow-empty",
+            "-m",
+            "docs: design Codex as a first-class agent driver",
+        ],
+    );
+
+    let vcs = Vcs::detect(temp.path()).expect("detect vcs");
+    let plan = ChangePlan::Scoped {
+        base_sha,
+        scenario: Scenario::PullRequest {
+            base_branch: "main".to_owned(),
+        },
+    };
+    let env = CiEnvironment::default();
+
+    let attached = super::attach_description_context(ChangeSet::default(), &vcs, &env, &plan).await;
+
+    assert_eq!(
+        attached.commit_description.as_deref(),
+        Some("docs: design Codex as a first-class agent driver"),
+        "leakage surface must be tip-only; got {:?}",
+        attached.commit_description
+    );
+    assert!(
+        !attached
+            .commit_description
+            .as_deref()
+            .unwrap_or("")
+            .contains("the operator"),
+        "tip leakage surface must not include historical 'the operator'"
+    );
+    assert!(
+        !attached.commit_description.as_deref().unwrap_or("").contains("ZZ3718"),
+        "tip leakage surface must not include historical work-item id"
+    );
+
+    let range = attached
+        .bypass_commit_descriptions
+        .as_deref()
+        .expect("scoped plan must populate bypass range");
+    assert!(
+        range.contains("BYPASS_FILE_SIZE="),
+        "BYPASS in a non-tip content commit must remain visible on the bypass surface; got: {range:?}"
+    );
+    assert!(
+        range.contains("the operator") && range.contains("ZZ3718"),
+        "full range should still include historical messages for BYPASS context; got: {range:?}"
+    );
+    assert_eq!(
+        attached.bypass_reason("BYPASS_FILE_SIZE").as_deref(),
+        Some("Intentionally large fixture for the spike."),
+        "bypass_reason must resolve directives from the full-range surface"
+    );
+}

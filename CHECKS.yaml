@@ -96,19 +96,23 @@ checks:
   # See the rubric this mirrors: the `agent_isms` dimension, sub-rules
   # (2)/(3), in `engine/pr-review/src/render.rs`.
   #
-  # Scoped to `surfaces: [changeset]` only (PR description + commit message),
-  # deliberately NOT `files`. Every one of these phrases — `T<n>`/`P<n>` ids,
-  # "the operator", "chore", "revision" — is also this codebase's own
-  # correct, long-standing internal vocabulary for describing Boss itself
-  # (e.g. `boss_construct_scan.rs`'s own doc comments, or the hundreds of
-  # pre-existing `// T<n>: ...` provenance comments across engine/core).
-  # Scanning file content would flag that legitimate usage everywhere it
-  # already exists rather than newly-introduced leaks, and the check has no
-  # per-line grandfather mechanism — only a file-level `exclude`, which
-  # would have to list most of `engine/core` to stay quiet, defeating the
-  # point of a narrow exclusion list. The PR description and commit message
-  # of a real changeset carry none of that legacy noise, and are exactly the
-  # surface the motivating incident was about, so that is where this starts.
+  # Scoped to `surfaces: [changeset]` only (PR description + tip commit
+  # message), deliberately NOT `files`. Every one of these phrases —
+  # `T<n>`/`P<n>` ids, "the operator", "chore", "revision" — is also this
+  # codebase's own correct, long-standing internal vocabulary for describing
+  # Boss itself (e.g. `boss_construct_scan.rs`'s own doc comments, or the
+  # hundreds of pre-existing `// T<n>: ...` provenance comments across
+  # engine/core). Scanning file content would flag that legitimate usage
+  # everywhere it already exists rather than newly-introduced leaks, and the
+  # check has no per-line grandfather mechanism — only a file-level
+  # `exclude`, which would have to list most of `engine/core` to stay quiet,
+  # defeating the point of a narrow exclusion list. The PR description and
+  # tip commit message of a real changeset carry none of that legacy noise,
+  # and are exactly the surface the motivating incident was about, so that is
+  # where this starts. Intermediate historical commit messages on the branch
+  # are intentionally not scanned (checkleft keeps the full range only for
+  # BYPASS parsing) so MQ/squash re-embedding of old messages cannot
+  # false-fail a PR whose tip + PR body are clean.
   #
   # Declared at the repo root (not under tools/boss/) and with an explicit
   # `scope: changeset` because `scope = changeset` is only honoured in the
