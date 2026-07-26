@@ -310,6 +310,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-codex-auth"
+version = "0.1.0"
+dependencies = [
+ "fs4",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "boss-comment-anchor"
 version = "0.1.0"
 dependencies = [
