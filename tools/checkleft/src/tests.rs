@@ -11,9 +11,10 @@ use checkleft::external::FixInvocationOutcome;
 use super::{
     ColorLevel, ExternalProviderMode, FixCheckPlan, FixPlan, OutputStyle, TRUNCATE_HEAD_LINES, TRUNCATE_MAX_LINE_LEN,
     TRUNCATE_TAIL_LINES, ci_from_env, compute_fix_plan, distinct_applied_files, github_auth_unavailable_warning,
-    normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number, render_fix_results,
-    render_human_footer, render_human_results, resolve_github_token_from_sources, should_show_progress,
-    sort_results_for_output, still_failing_from_verify, truncate_tool_output,
+    invocation_root_from, normalize_optional_description, parse_external_provider_mode, parse_github_ref_pr_number,
+    render_fix_results, render_human_footer, render_human_results, render_no_checks_ran,
+    resolve_github_token_from_sources, should_show_progress, sort_results_for_output, still_failing_from_verify,
+    truncate_tool_output,
 };
 
 #[test]
@@ -810,6 +811,53 @@ fn footer_matches_disabled_output_for_no_findings_and_no_checks() {
         render_human_footer(&[], style, Duration::from_secs(0)),
         render_human_results(&[], style, Duration::from_secs(0)),
     );
+}
+
+// --- invocation_root_from (bazel run cwd / scope consistency) ---
+
+#[test]
+fn invocation_root_prefers_build_working_directory_when_it_is_a_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let bwd = tmp.path().to_path_buf();
+    let cwd = PathBuf::from("/some/bazel/runfiles/_main");
+    let root = invocation_root_from(Some(bwd.as_os_str().to_owned()), cwd);
+    assert_eq!(root, bwd, "BUILD_WORKING_DIRECTORY must win over process cwd");
+}
+
+#[test]
+fn invocation_root_falls_back_to_cwd_when_build_working_directory_absent() {
+    let cwd = PathBuf::from("/real/workspace");
+    let root = invocation_root_from(None, cwd.clone());
+    assert_eq!(root, cwd);
+}
+
+#[test]
+fn invocation_root_falls_back_to_cwd_when_build_working_directory_is_not_a_dir() {
+    let cwd = PathBuf::from("/real/workspace");
+    let root = invocation_root_from(Some(std::ffi::OsString::from("/no/such/path/at/all")), cwd.clone());
+    assert_eq!(root, cwd, "stale BUILD_WORKING_DIRECTORY must not hard-fail the run");
+}
+
+// --- render_no_checks_ran (non-empty scope, zero checks) ---
+
+#[test]
+fn no_checks_ran_with_nonempty_scope_is_not_a_silent_pass() {
+    let style = OutputStyle {
+        level: ColorLevel::None,
+    };
+    let msg = render_no_checks_ran(style, 1872);
+    assert!(msg.contains("1872"), "must report the resolved file count: {msg}");
+    assert!(msg.contains("not a clean pass"), "must not read as a clean pass: {msg}");
+    assert!(
+        msg.contains("show-plan"),
+        "must point the developer at show-plan: {msg}"
+    );
+    assert!(
+        msg.contains("BUILD_WORKING_DIRECTORY"),
+        "must name the bazel-run cwd fix: {msg}"
+    );
+    // Must not be the terse silent-pass line alone.
+    assert_ne!(msg, "No checks ran.\n");
 }
 
 // --- github_auth_unavailable_warning ---

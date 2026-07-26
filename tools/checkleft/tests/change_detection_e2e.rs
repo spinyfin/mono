@@ -996,6 +996,157 @@ fn jj_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Run a jj command in `root`, asserting it succeeds. Used by the
+/// secondary-workspace regression below.
+fn jj(root: &Path, args: &[&str]) {
+    let out = Command::new("jj")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("spawn jj");
+    assert!(
+        out.status.success(),
+        "jj {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn jj_out(root: &Path, args: &[&str]) -> String {
+    let out = Command::new("jj")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("spawn jj");
+    assert!(
+        out.status.success(),
+        "jj {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).expect("utf-8").trim().to_owned()
+}
+
+/// Regression: a jj working copy with a known small diff against
+/// `main@origin` must resolve the *same* small scope from the shared
+/// `resolve_change_plan` + `changeset_since` path that all three entry points
+/// (`checkleft run`, `checkleft fix`, and the cube push gate) use.
+///
+/// Topology (mirrors a cube secondary workspace):
+///
+/// ```text
+///   remote main ── A (base.txt)
+///   local @      ── B on top of A, with AGENTS.md + tools/checkleft/README.md
+/// ```
+///
+/// `origin/main` is registered so `select_base_local` prefers it (the cube
+/// case where the local `main` bookmark may be stale/at-HEAD). Expected
+/// scope is exactly the two files on B.
+///
+/// Skipped when `jj` is not on PATH.
+#[test]
+fn jj_working_copy_small_diff_scopes_identically_for_run_fix_and_push_gate() {
+    if !jj_available() {
+        eprintln!("skipping jj secondary-workspace e2e: `jj` is not on PATH");
+        return;
+    }
+
+    // 1. Bare git remote that will become origin.
+    let remote_dir = tempdir().expect("remote tempdir");
+    let remote = remote_dir.path();
+    git(remote, &["init", "--bare", "-b", "main"]);
+
+    // 2. Clone into a working dir, seed main, push, then colocate jj.
+    let work_dir = tempdir().expect("work tempdir");
+    let root = work_dir.path();
+    git(root, &["clone", remote.to_str().unwrap(), "."]);
+    git(root, &["config", "user.email", "test@checkleft.example"]);
+    git(root, &["config", "user.name", "Checkleft Test"]);
+    git(root, &["config", "commit.gpgsign", "false"]);
+    let main_sha = commit(root, "base.txt", "base\n", "A: base on main");
+    git(root, &["push", "-u", "origin", "main"]);
+
+    let colocate = Command::new("jj")
+        .args(["git", "init", "--colocate"])
+        .current_dir(root)
+        .output()
+        .expect("spawn jj");
+    if !colocate.status.success() {
+        eprintln!(
+            "skipping jj secondary-workspace e2e: `jj git init --colocate` failed: {}",
+            String::from_utf8_lossy(&colocate.stderr)
+        );
+        return;
+    }
+    // Import origin so `main@origin` / `origin/main` resolve for JjHeadProber.
+    jj(root, &["git", "fetch"]);
+
+    // 3. New change off main with exactly two modified files.
+    jj(root, &["new", "main@origin"]);
+    std::fs::create_dir_all(root.join("tools/checkleft")).expect("mkdir");
+    std::fs::write(root.join("AGENTS.md"), "# agents\n").expect("write AGENTS.md");
+    std::fs::write(root.join("tools/checkleft/README.md"), "# readme\n").expect("write README");
+    // Snapshot the working copy into a real commit so the change is on `@-`
+    // with an empty WC on top — matching how cube workers leave the tree
+    // (content commit + empty working-copy commit).
+    jj(root, &["commit", "-m", "B: two-file change off main"]);
+
+    let vcs = detect(root);
+    assert_eq!(vcs.kind(), checkleft::vcs::VcsKind::Jujutsu, "must detect as jj");
+
+    // All three entry points construct the same inputs and call the same
+    // `resolve_change_plan` → `changeset_from_plan` path. Pin the plan once
+    // and assert the scoped paths — that is the shared contract.
+    let env = CiEnvironment::default(); // Local / pre-push (developer + push gate)
+    let plan = resolve(&env, &vcs, auto());
+
+    assert!(
+        matches!(
+            plan,
+            ChangePlan::Scoped {
+                scenario: Scenario::Local,
+                ..
+            }
+        ),
+        "local jj working copy must classify as Local, got {plan:?}"
+    );
+    assert_eq!(
+        base_sha(&plan),
+        Some(main_sha.as_str()),
+        "base must be main@origin (the two-file fork point), got {:?}",
+        base_sha(&plan)
+    );
+
+    let paths = scoped_paths(&vcs, &plan);
+    assert_eq!(
+        paths,
+        vec!["AGENTS.md".to_owned(), "tools/checkleft/README.md".to_owned(),],
+        "scope must be exactly the two files on the branch — not empty and not \
+         an inflated execroot/runfiles diff. got {paths:?}"
+    );
+
+    // Sanity: the jj-side base prober agrees with the plan (guards a silent
+    // drift if select_base_local stops preferring origin/main).
+    let origin_main = jj_out(
+        root,
+        &[
+            "log",
+            "-r",
+            "main@origin",
+            "--no-graph",
+            "--ignore-working-copy",
+            "-T",
+            "commit_id",
+        ],
+    );
+    assert_eq!(
+        origin_main, main_sha,
+        "fixture origin/main must still be the seed commit"
+    );
+
+    // Drop guards against the tempdirs being cleaned mid-assert.
+    drop(work_dir);
+    drop(remote_dir);
+}
+
 /// jj-colocated repo. Base selection runs through the colocated git repo (per
 /// design: CI topology *is* git), while the diff uses jj. The PR drift exclusion
 /// (T843/#948) must hold for jj too.

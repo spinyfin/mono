@@ -276,7 +276,7 @@ async fn main() -> ExitCode {
 async fn run_cli() -> Result<ExitCode> {
     let cli = Cli::parse();
     init_tracing(cli.verbose, cli.log_level, cli.log_file.clone())?;
-    let root = std::env::current_dir()?;
+    let root = resolve_invocation_root()?;
     info!(root = %root.display(), "starting checkleft");
 
     let vcs = Vcs::detect(&root)?;
@@ -451,6 +451,55 @@ fn current_checkleft_bin() -> String {
         .unwrap_or_else(|| "checkleft".to_owned())
 }
 
+/// Resolve the directory that should anchor VCS detection and CHECKS.yaml
+/// discovery for this invocation.
+///
+/// Under `bazel run`, Bazel chdirs into the target's runfiles tree before
+/// exec'ing the binary. That tree is a sparse materialization of the package
+/// (often just `tools/`), and walking up from it can land on bazel's
+/// execroot — a different git/jj workspace with a completely different file
+/// set. Diffing that workspace against `main` produces thousands of
+/// spurious paths that no check matches, so `checkleft run` reports a huge
+/// scope and then "No checks ran" (a false pass), while `cube pr create`'s
+/// push gate — which spawns checkleft with the real workspace as cwd —
+/// scopes correctly.
+///
+/// Bazel exports `BUILD_WORKING_DIRECTORY` as the absolute path of the
+/// directory from which `bazel run` was invoked. Prefer it when present and
+/// a real directory; otherwise fall back to process cwd (direct binary
+/// invocations, hooks, the push gate, CI).
+///
+/// Pure core is [`invocation_root_from`]; this wrapper only reads env + cwd.
+fn resolve_invocation_root() -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("failed to read process current directory")?;
+    Ok(invocation_root_from(std::env::var_os("BUILD_WORKING_DIRECTORY"), cwd))
+}
+
+/// Pure selection of the invocation root given an optional
+/// `BUILD_WORKING_DIRECTORY` value and the process cwd. Extracted so unit
+/// tests can cover the bazel-run case without mutating process environment.
+fn invocation_root_from(build_working_directory: Option<std::ffi::OsString>, cwd: PathBuf) -> PathBuf {
+    if let Some(raw) = build_working_directory {
+        let candidate = PathBuf::from(raw);
+        if candidate.is_dir() {
+            info!(
+                build_working_directory = %candidate.display(),
+                cwd = %cwd.display(),
+                "using BUILD_WORKING_DIRECTORY as invocation root (bazel run)"
+            );
+            return candidate;
+        }
+        // Present but not a directory (stale/broken env): fall through to cwd
+        // rather than fail — same fail-open posture as a missing var.
+        info!(
+            build_working_directory = %candidate.display(),
+            cwd = %cwd.display(),
+            "BUILD_WORKING_DIRECTORY is set but not a directory; falling back to cwd"
+        );
+    }
+    cwd
+}
+
 /// Run `git` in `root` and return trimmed stdout, or `None` if the command
 /// fails or produces no output.
 fn git_output(root: &Path, args: &[&str]) -> Option<String> {
@@ -567,7 +616,16 @@ async fn dispatch_run(
                     // screen; the findings already streamed into the log area above it,
                     // so only the summary footer remains to print.
                     progress.finalize();
-                    print!("{}", render_human_footer(&results, style, elapsed));
+                    // When the scope was non-empty but every path was ineligible,
+                    // emit the unambiguous warning (scope-consistency) instead of the terse
+                    // "No checks ran." that reads as a clean pass.
+                    if results.is_empty() && file_count > 0 {
+                        print!("{}", render_no_checks_ran(style, file_count));
+                    } else {
+                        print!("{}", render_human_footer(&results, style, elapsed));
+                    }
+                } else if results.is_empty() && file_count > 0 {
+                    print!("{}", render_no_checks_ran(style, file_count));
                 } else {
                     print_human_results(&results, elapsed);
                 }
@@ -2096,6 +2154,10 @@ fn render_run_scope_line(plan: &ChangePlan, file_count: usize, style: OutputStyl
 /// block. The per-finding bodies already streamed into the log area, so for the
 /// has-findings case this is only the summary line; the no-findings and
 /// no-checks cases match [`render_human_results`] exactly.
+///
+/// Callers that know the change-set size and observe zero results with a
+/// non-empty scope should prefer [`render_no_checks_ran`] so the developer
+/// cannot mistake an empty schedule for a clean pass.
 fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Duration) -> String {
     if results.is_empty() {
         return "No checks ran.\n".to_owned();
@@ -2132,6 +2194,23 @@ fn render_human_footer(results: &[CheckResult], style: OutputStyle, elapsed: Dur
         out.push_str(&hint);
     }
     out
+}
+
+/// Message when the runner produced zero check results against a non-empty
+/// change set. This is anomalous (every changed path was ineligible, or the
+/// scope itself was wrong — historically `bazel run` using the runfiles cwd)
+/// and must not read as a clean pass.
+fn render_no_checks_ran(style: OutputStyle, file_count: usize) -> String {
+    let noun = if file_count == 1 { "file" } else { "files" };
+    format!(
+        "{summary}: no checks applied to any of the {file_count} modified {noun}.\n\
+         {warning}: this is not a clean pass — the resolved change set did not match \
+         any configured check. Inspect the scope with `checkleft show-plan`. If you \
+         invoked via `bazel run` and the file count looks far larger than your diff, \
+         the working directory was wrong (checkleft should honour BUILD_WORKING_DIRECTORY).\n",
+        summary = style.paint_bold("summary"),
+        warning = style.paint_info("warning"),
+    )
 }
 
 /// Terse, copy-pasteable line advertising `checkleft fix` when at least one

@@ -115,6 +115,14 @@ to the commit message or PR description (see the bypass docs).
 > jj-based workflow, run `checkleft run` before pushing (or wire it into your
 > push tooling) rather than relying on the git hook.
 
+> **`bazel run` note.** Under `bazel run`, Bazel chdirs into the target's
+> runfiles tree. checkleft therefore honours `BUILD_WORKING_DIRECTORY` (the
+> directory from which `bazel run` was invoked) so change detection still
+> scopes against your real working copy — the same scope `cube pr create`'s
+> push gate sees when it spawns checkleft with the workspace as cwd. Without
+> that, a monorepo `bazel run //tools/checkleft -- run` can resolve thousands
+> of spurious paths against bazel's execroot and report a false pass.
+
 The root config can also set `settings.external_checks_url` to merge an
 externally hosted root config before applying local root and child overrides.
 The CLI flag `--external-checks-url` provides the same behavior for repos that
