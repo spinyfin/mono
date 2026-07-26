@@ -355,6 +355,66 @@ async fn production_codex_normalizer_runs_through_generic_reader() {
     assert_eq!(reader.stats().unrecognised_envelopes, 1);
 }
 
+#[tokio::test]
+async fn shared_codex_driver_keeps_interleaved_reader_sessions_isolated() {
+    let driver: Arc<dyn AgentDriver> = Arc::new(CodexDriver::default());
+    let stream_a = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-a"}"#,
+        "\n",
+        r#"{"type":"turn.completed"}"#,
+        "\n",
+    );
+    let stream_b = concat!(
+        r#"{"type":"thread.started","thread_id":"thread-b"}"#,
+        "\n",
+        r#"{"type":"turn.completed"}"#,
+        "\n",
+    );
+    let mut reader_a = StdoutJsonlProgressReader::new(stream_a.as_bytes(), driver.clone());
+    let mut reader_b = StdoutJsonlProgressReader::new(stream_b.as_bytes(), driver);
+
+    assert!(matches!(
+        reader_a.next_event().await.unwrap().event,
+        WorkerEvent::SessionStart { ref session_id, .. } if session_id == "thread-a"
+    ));
+    assert!(matches!(
+        reader_b.next_event().await.unwrap().event,
+        WorkerEvent::SessionStart { ref session_id, .. } if session_id == "thread-b"
+    ));
+    assert!(matches!(
+        reader_a.next_event().await.unwrap().event,
+        WorkerEvent::Stop { ref session_id, .. } if session_id == "thread-a"
+    ));
+    assert!(matches!(
+        reader_b.next_event().await.unwrap().event,
+        WorkerEvent::Stop { ref session_id, .. } if session_id == "thread-b"
+    ));
+}
+
+#[tokio::test]
+async fn production_reader_skips_malformed_known_codex_fields() {
+    let stream = concat!(
+        r#"{"type":"thread.started","thread_id":"strict-fields"}"#,
+        "\n",
+        r#"{"type":"item.started","item":{"type":"command_execution","command":42}}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"type":"command_execution","command":"echo ok","aggregated_output":{"stdout":"ok"}}}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"type":"error","message":["warning"]}}"#,
+        "\n",
+        r#"{"type":"turn.completed"}"#,
+        "\n",
+    );
+    let mut reader = StdoutJsonlProgressReader::new(stream.as_bytes(), Arc::new(CodexDriver::default()));
+    let mut events = Vec::new();
+    while let Some(envelope) = reader.next_event().await {
+        events.push(envelope.event);
+    }
+
+    assert_eq!(kinds(&events), vec!["session_start", "stop"]);
+    assert_eq!(reader.stats().unrecognised_envelopes, 3);
+}
+
 #[test]
 fn codex_turn_completed_is_a_non_continuation_turn_boundary() {
     let driver = CodexShapedDriver::new();

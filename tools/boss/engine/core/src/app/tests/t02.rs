@@ -583,7 +583,10 @@ async fn dispatch_real_post_tool_use_updates_real_trigger_fields() {
     let resolver: std::sync::Arc<dyn TranscriptPathResolver> = std::sync::Arc::new(NopResolver);
     server_state.live_status_manager.start_slot(
         slot_id,
-        execution.id.clone(),
+        crate::live_status_loop::LiveStatusRun::new(
+            execution.id.clone(),
+            std::sync::Arc::new(crate::driver::ClaudeDriver),
+        ),
         server_state.utility_model.clone(),
         server_state.live_worker_states.clone(),
         broadcaster,

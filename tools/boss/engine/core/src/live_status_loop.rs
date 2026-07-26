@@ -44,7 +44,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::AgentDriver;
 use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::metrics::Registry;
@@ -488,12 +488,31 @@ struct SlotHandle {
     join: Option<JoinHandle<()>>,
 }
 
+/// The execution-specific half of a live-status slot.
+///
+/// Keeping the run id and its resolved driver together prevents callers from
+/// accidentally pairing a transcript with the engine's default driver.
+pub struct LiveStatusRun {
+    pub run_id: String,
+    pub driver: Arc<dyn AgentDriver>,
+}
+
+impl LiveStatusRun {
+    pub fn new(run_id: impl Into<String>, driver: Arc<dyn AgentDriver>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            driver,
+        }
+    }
+}
+
 /// Configuration captured at slot start. Carried by value into the
 /// task so the manager can drop the entry on `stop_slot` without
 /// waiting for the task.
 struct SlotConfig {
     slot_id: u8,
     run_id: String,
+    driver: Arc<dyn AgentDriver>,
     /// Where this slot's summarizer calls go. Held instead of a bare API key:
     /// the provider owns endpoint, model *and* credential together, and is
     /// chosen independently of the work item's driver.
@@ -637,16 +656,18 @@ impl LiveStatusManager {
     pub fn start_slot(
         &self,
         slot_id: u8,
-        run_id: String,
+        run: LiveStatusRun,
         utility: Arc<dyn UtilityModel>,
         registry: Arc<LiveWorkerStateRegistry>,
         broadcaster: Arc<dyn LiveStatusBroadcaster>,
         resolver: Arc<dyn TranscriptPathResolver>,
     ) {
         self.stop_slot(slot_id);
+        let LiveStatusRun { run_id, driver } = run;
         tracing::info!(
             slot_id,
             run_id = %run_id,
+            driver = driver.descriptor().name,
             utility_provider = utility.provider_id(),
             "live_status: start_slot — spawning per-slot summarizer task",
         );
@@ -664,6 +685,7 @@ impl LiveStatusManager {
         let cfg = SlotConfig {
             slot_id,
             run_id,
+            driver,
             utility,
             registry,
             broadcaster,
@@ -752,7 +774,7 @@ impl LiveStatusManager {
 /// `run_slot_loop` so the wiring itself — not just
 /// `AgentDriver::normalize_transcript_entry` in isolation — has test
 /// coverage.
-fn normalize_lines<D: AgentDriver>(driver: &D, lines: Vec<Value>) -> Vec<Value> {
+fn normalize_lines(driver: &dyn AgentDriver, lines: Vec<Value>) -> Vec<Value> {
     lines
         .into_iter()
         .map(|raw| driver.normalize_transcript_entry(raw))
@@ -776,6 +798,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
     let SlotConfig {
         slot_id,
         run_id,
+        driver,
         utility,
         registry,
         broadcaster,
@@ -967,12 +990,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     new_lines_count = new_lines.len();
                     // Normalise through the run's driver before anything
                     // downstream (redaction, summarisation) sees the entry.
-                    // The engine is Claude-default today; once the dispatch
-                    // gate selects a driver per run, this picks the run's
-                    // driver instead of hardcoding `ClaudeDriver`. For Claude
-                    // this is a no-op passthrough — see
-                    // `ClaudeDriver::normalize_transcript_entry`.
-                    transcript_buffer.extend(normalize_lines(&ClaudeDriver, new_lines));
+                    transcript_buffer.extend(normalize_lines(driver.as_ref(), new_lines));
                 }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");
@@ -1122,6 +1140,14 @@ mod tests {
         Arc::new(crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None))
     }
 
+    fn claude_driver() -> Arc<dyn AgentDriver> {
+        Arc::new(crate::driver::ClaudeDriver)
+    }
+
+    fn live_run(run_id: &str) -> LiveStatusRun {
+        LiveStatusRun::new(run_id, claude_driver())
+    }
+
     /// Stub driver whose `normalize_transcript_entry` rewrites a marker
     /// field, so `normalize_lines` tests can assert the wiring actually
     /// routes lines through the driver rather than passing them through
@@ -1211,6 +1237,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn codex_rollout_survives_normalize_redact_and_render_pipeline() {
+        let lines = vec![
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"inspecting the split module"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"call-1",
+                    "name":"exec",
+                    "input":"cargo test -p boss-engine"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-1",
+                    "output":[{"type":"input_text","text":"all tests passed"}]
+                }
+            }),
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"turn_aborted","reason":"interrupted"}
+            }),
+        ];
+        let normalized = normalize_lines(&crate::driver::CodexDriver::default(), lines);
+        let rendered = live_status::redact_and_assemble(&normalized);
+
+        assert!(rendered.contains("inspecting the split module"), "{rendered}");
+        assert!(rendered.contains("Bash(cargo test -p boss-engine)"), "{rendered}");
+        assert!(rendered.contains("all tests passed"), "{rendered}");
+        assert!(rendered.contains("turn aborted: interrupted"), "{rendered}");
+    }
+
     #[derive(Default)]
     struct CountingBroadcaster {
         calls: AtomicUsize,
@@ -1259,14 +1323,14 @@ mod tests {
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
             mgr.start_slot(
                 3,
-                "run-a".into(),
+                live_run("run-a"),
                 keyless_utility(),
                 registry.clone(),
                 bc.clone(),
                 res.clone(),
             );
             assert!(mgr.has_slot(3));
-            mgr.start_slot(3, "run-b".into(), keyless_utility(), registry, bc, res);
+            mgr.start_slot(3, live_run("run-b"), keyless_utility(), registry, bc, res);
             assert!(mgr.has_slot(3));
             mgr.stop_slot(3);
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1287,7 +1351,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(1, "run-1".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            1,
+            live_run("run-1"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         mgr.notify(1, Trigger::ActivityChanged(WorkerActivity::Errored));
         // Let the task pick up the trigger and write the literal.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1306,7 +1377,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(2, "run-2".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            2,
+            live_run("run-2"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         // No prior status → literal lands.
         mgr.notify(2, Trigger::ActivityChanged(WorkerActivity::WaitingForInput));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1334,7 +1412,7 @@ mod tests {
         registry.register_spawn(4, "run-4", "claude-opus-4-7", 0, None);
         let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-        mgr.start_slot(4, "run-4".into(), keyless_utility(), registry, bc, res);
+        mgr.start_slot(4, live_run("run-4"), keyless_utility(), registry, bc, res);
         assert!(mgr.has_slot(4));
         mgr.stop_slot(4);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1389,7 +1467,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(6, "run-6".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            6,
+            live_run("run-6"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         // Mark Working so the disable arm is the only barrier.
         mgr.notify(6, Trigger::ActivityChanged(WorkerActivity::Working));
         mgr.set_enabled(6, false);
@@ -1442,7 +1527,7 @@ mod tests {
         registry.register_spawn(7, "run-7", "claude-opus-4-7", 0, None);
         let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-        mgr.start_slot(7, "run-7".into(), keyless_utility(), registry, bc, res);
+        mgr.start_slot(7, live_run("run-7"), keyless_utility(), registry, bc, res);
         mgr.notify(7, Trigger::Stop);
         tokio::time::sleep(Duration::from_millis(40)).await;
         let snap = mgr.debug_store().snapshot_for(7);
@@ -1465,7 +1550,7 @@ mod tests {
             registry.register_spawn(8, "run-8", "claude-opus-4-7", 0, None);
             let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-            mgr.start_slot(8, "run-8".into(), keyless_utility(), registry, bc, res);
+            mgr.start_slot(8, live_run("run-8"), keyless_utility(), registry, bc, res);
             mgr.notify(8, Trigger::Stop);
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(mgr.debug_store().snapshot_for(8).last_trigger_kind.is_some());
@@ -1492,7 +1577,7 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(5, "run-5".into(), keyless_utility(), registry, bc_dyn, res_dyn);
+        mgr.start_slot(5, live_run("run-5"), keyless_utility(), registry, bc_dyn, res_dyn);
         // Drive the slot into Working so the post-tool-use trigger
         // doesn't hit the quiet-state guard.
         mgr.notify(5, Trigger::ActivityChanged(WorkerActivity::Working));

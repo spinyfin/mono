@@ -202,7 +202,7 @@ pub trait WorkerSpawner: Send + Sync {
     /// for tests; production `ServerState` starts the task via its
     /// `LiveStatusManager`. The task tears itself down when
     /// `release_worker_pane` runs.
-    fn start_live_status_slot(&self, _slot_id: u8, _run_id: &str) {}
+    fn start_live_status_slot(&self, _slot_id: u8, _run_id: &str, _driver: Arc<dyn AgentDriver>) {}
 
     /// Whether the `default_pr_draft_mode` setting is enabled. When
     /// `true`, the worker's CLAUDE.md gets a directive to pass
@@ -469,7 +469,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         // 5. Spin up the live-status summarizer for this slot. The
         //    manager owns the task lifecycle and will be torn down
         //    on `release_worker_pane`.
-        spawner.start_live_status_slot(slot_id, &input.run_id);
+        spawner.start_live_status_slot(slot_id, &input.run_id, input.driver.clone());
     }
 
     Ok(StartedWorker {

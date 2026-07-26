@@ -3,82 +3,72 @@
 //! Codex exposes two JSONL dialects which are deliberately parsed separately:
 //!
 //! - `codex exec --json` stdout uses `thread.*`, `turn.*`, and `item.*`
-//!   envelopes. Those records drive [`WorkerEvent`].
+//!   envelopes. One [`CodexProgressSession`] owns correlation for one reader.
 //! - rollout transcripts use `session_meta`, `event_msg`, and
-//!   `response_item`. Those records are only reshaped for transcript
-//!   redaction/status today; they are not a second progress ingress.
+//!   `response_item`. Those records are reshaped into the canonical
+//!   user/assistant/tool records consumed by live-status rendering.
 //!
 //! Keeping the parsers distinct prevents rollout-only events such as
 //! `event_msg.turn_aborted` from being invented on the stdout channel.
 
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
 
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
 
-/// Per-driver progress state.
-///
-/// A `DriverRegistry` is constructed for each stdout-ingress run, so this
-/// state belongs to one stream in production. Codex puts `thread_id` only on
-/// `thread.started`; every later stdout envelope inherits the current id.
-#[derive(Default)]
-pub(super) struct CodexProgressNormalizer {
-    state: Mutex<CodexProgressState>,
-}
+use crate::ProgressSessionNormalizer;
 
-#[derive(Default)]
-struct CodexProgressState {
+const THREAD_ID_MARKER: &str = ".boss-thread-id";
+
+/// Mutable state owned by one stdout reader.
+///
+/// `current_thread_id` never lives on the registry's shared driver.
+/// `codex_home` is the exact run home derived from the reader's run id;
+/// transcript discovery cannot escape into a sibling run.
+pub(super) struct CodexProgressSession {
     current_thread_id: Option<String>,
-    transcript_paths: HashMap<String, String>,
-    rollout_exec_calls: HashMap<String, Value>,
+    codex_home: Option<PathBuf>,
 }
 
-/// Threads observed by any stdout-ingress process in this engine.
-///
-/// `codex exec resume` is a new process, and production creates a fresh
-/// registry/driver for that new stdout stream. Known-thread identity therefore
-/// has to outlive one [`CodexProgressNormalizer`] instance even though the
-/// current-thread pointer remains stream-local.
-static KNOWN_THREAD_IDS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+impl CodexProgressSession {
+    pub(super) fn new(codex_home: Option<PathBuf>) -> Self {
+        Self {
+            current_thread_id: None,
+            codex_home,
+        }
+    }
 
-/// Parsed stdout dialect. This is intentionally not reused for rollout lines.
-enum StdoutEnvelope<'a> {
-    ThreadStarted {
-        thread_id: &'a str,
-    },
-    TurnStarted,
-    TurnCompleted,
-    CommandStarted {
-        command: &'a Value,
-    },
-    CommandCompleted {
-        command: &'a Value,
-        output: &'a Value,
-    },
-    OperationalWarning {
-        message: &'a str,
-    },
-    Unknown {
-        envelope_type: &'a str,
-        item_type: Option<&'a str>,
-    },
-}
+    fn classify_thread_start(&mut self, thread_id: &str) -> SessionStartSource {
+        // Keep only the current identity in memory. The durable marker below
+        // restores that one lifecycle identity after an engine restart
+        // without an unbounded process-global set of every thread ever seen.
+        if self.current_thread_id.as_deref() == Some(thread_id) {
+            return SessionStartSource::Resume;
+        }
 
-/// Parsed rollout dialect. This is intentionally not reused for stdout.
-enum RolloutEnvelope {
-    SessionMeta,
-    EventMessage { event_type: String },
-    ExecCall { call_id: String, input: Value },
-    ToolCallOutput { call_id: String, output: Value },
-    OtherResponseItem { item_type: String },
-    Unknown { record_type: String },
-}
+        let Some(codex_home) = self.codex_home.as_deref() else {
+            return SessionStartSource::Startup;
+        };
+        match claim_persisted_thread_id(codex_home, thread_id) {
+            Ok(true) => SessionStartSource::Resume,
+            Ok(false) => SessionStartSource::Startup,
+            Err(err) => {
+                // Progress remains usable if the marker cannot be written.
+                // The warning makes the resulting loss of restart-aware
+                // resume classification explicit.
+                tracing::warn!(
+                    codex_home = %codex_home.display(),
+                    %err,
+                    "codex stdout: could not persist thread identity"
+                );
+                SessionStartSource::Startup
+            }
+        }
+    }
 
-impl CodexProgressNormalizer {
-    pub(super) fn normalize_stdout(&self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
+    fn normalize_stdout(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
         let obj = raw
             .as_object()
             .ok_or_else(|| NormalizeError::Malformed("expected Codex stdout JSON object".into()))?;
@@ -86,22 +76,13 @@ impl CodexProgressNormalizer {
 
         match envelope {
             StdoutEnvelope::ThreadStarted { thread_id } => {
-                let mut state = self.lock_state()?;
-                let continuation = !known_thread_ids()
-                    .lock()
-                    .map_err(|_| NormalizeError::Malformed("Codex known-thread lock poisoned".into()))?
-                    .insert(thread_id.to_owned());
-                // `exec resume` re-emits thread.started with the same id. Keep
-                // all known-thread/transcript state and merely make that
-                // existing thread current again.
-                state.current_thread_id = Some(thread_id.to_owned());
+                let source = self.classify_thread_start(thread_id);
+                // A repeated thread.started from `exec resume` makes the same
+                // thread current again without clearing any per-stream state.
+                self.current_thread_id = Some(thread_id.to_owned());
                 Ok(WorkerEvent::SessionStart {
                     session_id: thread_id.to_owned(),
-                    source: if continuation {
-                        SessionStartSource::Resume
-                    } else {
-                        SessionStartSource::Startup
-                    },
+                    source,
                 })
             }
             StdoutEnvelope::Unknown {
@@ -119,7 +100,10 @@ impl CodexProgressNormalizer {
                 }))
             }
             other => {
-                let session_id = self.current_thread_id()?;
+                let session_id = self
+                    .current_thread_id
+                    .clone()
+                    .ok_or(NormalizeError::MissingField("thread_id"))?;
                 Ok(match other {
                     StdoutEnvelope::TurnStarted => WorkerEvent::UserPromptSubmit {
                         session_id,
@@ -133,15 +117,15 @@ impl CodexProgressNormalizer {
                     StdoutEnvelope::CommandStarted { command } => WorkerEvent::PreToolUse {
                         session_id,
                         tool_name: "Bash".to_owned(),
-                        tool_input: command_input(command),
+                        tool_input: json!({ "command": command }),
                     },
                     StdoutEnvelope::CommandCompleted { command, output } => WorkerEvent::PostToolUse {
                         session_id,
                         tool_name: "Bash".to_owned(),
-                        tool_input: command_input(command),
+                        tool_input: json!({ "command": command }),
                         // Keep aggregated_output as a bare string. The shared
                         // PR-URL capture seam explicitly supports this shape.
-                        tool_response: output.clone(),
+                        tool_response: Value::String(output.to_owned()),
                     },
                     StdoutEnvelope::OperationalWarning { message } => WorkerEvent::Notification {
                         session_id,
@@ -155,98 +139,47 @@ impl CodexProgressNormalizer {
         }
     }
 
-    /// Discover the rollout for the thread named by `raw`, or by the current
-    /// sticky thread when this envelope omits `thread_id`.
-    pub(super) fn transcript_path(&self, raw: &Value, homes_root: &Path) -> Option<String> {
-        let raw_thread_id = raw.get("thread_id").and_then(Value::as_str).map(str::to_owned);
-        let thread_id = {
-            let state = self.state.lock().ok()?;
-            raw_thread_id.or_else(|| state.current_thread_id.clone())?
-        };
-
-        if let Some(cached) = self.state.lock().ok()?.transcript_paths.get(&thread_id).cloned() {
-            return Some(cached);
-        }
-
-        let path = discover_rollout_path(homes_root, &thread_id)?;
-        let path = path.to_string_lossy().into_owned();
-        self.state.lock().ok()?.transcript_paths.insert(thread_id, path.clone());
-        Some(path)
-    }
-
-    /// Reshape one rollout transcript record for the shared live-status
-    /// redactor. Rollout parsing remains separate from stdout progress
-    /// parsing; this method never emits a [`WorkerEvent`].
-    pub(super) fn normalize_rollout(&self, mut raw: Value) -> Value {
-        let parsed = match raw.as_object().and_then(parse_rollout_envelope) {
-            Some(parsed) => parsed,
-            None => {
-                tracing::debug!("codex rollout: ignoring malformed/non-object transcript record");
-                return raw;
-            }
-        };
-
-        match parsed {
-            RolloutEnvelope::SessionMeta => raw,
-            RolloutEnvelope::EventMessage { event_type } => {
-                // Keep the original rollout shape, but expose the nested event
-                // type to the transcript status/redaction layer. In
-                // particular, turn_aborted remains rollout-only.
-                insert_top_level(&mut raw, "codex_rollout_event", Value::String(event_type));
-                raw
-            }
-            RolloutEnvelope::ExecCall { call_id, input } => {
-                if let Ok(mut state) = self.state.lock() {
-                    state.rollout_exec_calls.insert(call_id, input.clone());
-                }
-                insert_top_level(&mut raw, "tool_name", Value::String("Bash".to_owned()));
-                insert_top_level(&mut raw, "tool_input", command_input(&input));
-                raw
-            }
-            RolloutEnvelope::ToolCallOutput { call_id, output } => {
-                let known_exec = self
-                    .state
-                    .lock()
-                    .ok()
-                    .and_then(|state| state.rollout_exec_calls.get(&call_id).cloned());
-                if known_exec.is_some() {
-                    insert_top_level(&mut raw, "tool_name", Value::String("Bash".to_owned()));
-                    insert_top_level(&mut raw, "tool_response", output);
-                } else {
-                    tracing::debug!(
-                        call_id,
-                        "codex rollout: leaving unmatched custom_tool_call_output unchanged"
-                    );
-                }
-                raw
-            }
-            RolloutEnvelope::OtherResponseItem { item_type } => {
-                tracing::debug!(item_type, "codex rollout: leaving non-exec response item unchanged");
-                raw
-            }
-            RolloutEnvelope::Unknown { record_type } => {
-                tracing::debug!(record_type, "codex rollout: ignoring additive record variant");
-                raw
-            }
-        }
-    }
-
-    fn current_thread_id(&self) -> Result<String, NormalizeError> {
-        self.lock_state()?
-            .current_thread_id
-            .clone()
-            .ok_or(NormalizeError::MissingField("thread_id"))
-    }
-
-    fn lock_state(&self) -> Result<std::sync::MutexGuard<'_, CodexProgressState>, NormalizeError> {
-        self.state
-            .lock()
-            .map_err(|_| NormalizeError::Malformed("Codex progress state lock poisoned".into()))
+    fn transcript_path(&self, raw: &Value) -> Option<String> {
+        let thread_id = raw
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .or(self.current_thread_id.as_deref())?;
+        let codex_home = self.codex_home.as_deref()?;
+        discover_rollout_path(codex_home, thread_id).map(|path| path.to_string_lossy().into_owned())
     }
 }
 
-fn known_thread_ids() -> &'static Mutex<HashSet<String>> {
-    KNOWN_THREAD_IDS.get_or_init(|| Mutex::new(HashSet::new()))
+impl ProgressSessionNormalizer for CodexProgressSession {
+    fn normalize_progress_event(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
+        self.normalize_stdout(raw)
+    }
+
+    fn transcript_path_for_session(&mut self, raw: &Value) -> Option<String> {
+        self.transcript_path(raw)
+    }
+}
+
+/// Parsed stdout dialect. This is intentionally not reused for rollout lines.
+enum StdoutEnvelope<'a> {
+    ThreadStarted {
+        thread_id: &'a str,
+    },
+    TurnStarted,
+    TurnCompleted,
+    CommandStarted {
+        command: &'a str,
+    },
+    CommandCompleted {
+        command: &'a str,
+        output: &'a str,
+    },
+    OperationalWarning {
+        message: &'a str,
+    },
+    Unknown {
+        envelope_type: &'a str,
+        item_type: Option<&'a str>,
+    },
 }
 
 fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>, NormalizeError> {
@@ -278,24 +211,28 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                 ("item.started", "command_execution") => {
                     let command = item
                         .get("command")
+                        .and_then(Value::as_str)
                         .ok_or(NormalizeError::MissingField("item.command"))?;
                     Ok(StdoutEnvelope::CommandStarted { command })
                 }
                 ("item.completed", "command_execution") => {
                     let command = item
                         .get("command")
+                        .and_then(Value::as_str)
                         .ok_or(NormalizeError::MissingField("item.command"))?;
                     let output = item
                         .get("aggregated_output")
+                        .and_then(Value::as_str)
                         .ok_or(NormalizeError::MissingField("item.aggregated_output"))?;
                     Ok(StdoutEnvelope::CommandCompleted { command, output })
                 }
-                ("item.completed", "error") => Ok(StdoutEnvelope::OperationalWarning {
-                    message: item
+                ("item.completed", "error") => {
+                    let message = item
                         .get("message")
                         .and_then(Value::as_str)
-                        .unwrap_or("Codex reported an operational warning"),
-                }),
+                        .ok_or(NormalizeError::MissingField("item.message"))?;
+                    Ok(StdoutEnvelope::OperationalWarning { message })
+                }
                 _ => Ok(StdoutEnvelope::Unknown {
                     envelope_type,
                     item_type: Some(item_type),
@@ -311,59 +248,59 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
     }
 }
 
-fn parse_rollout_envelope(obj: &Map<String, Value>) -> Option<RolloutEnvelope> {
-    let record_type = obj.get("type")?.as_str()?;
-    let payload = obj.get("payload")?.as_object()?;
-    match record_type {
-        "session_meta" => Some(RolloutEnvelope::SessionMeta),
-        "event_msg" => Some(RolloutEnvelope::EventMessage {
-            event_type: payload.get("type")?.as_str()?.to_owned(),
-        }),
-        "response_item" => {
-            let item_type = payload.get("type")?.as_str()?;
-            match item_type {
-                "custom_tool_call" if payload.get("name").and_then(Value::as_str) == Some("exec") => {
-                    Some(RolloutEnvelope::ExecCall {
-                        call_id: payload.get("call_id")?.as_str()?.to_owned(),
-                        input: payload.get("input").cloned().unwrap_or(Value::Null),
-                    })
-                }
-                "custom_tool_call_output" => Some(RolloutEnvelope::ToolCallOutput {
-                    call_id: payload.get("call_id")?.as_str()?.to_owned(),
-                    output: payload.get("output").cloned().unwrap_or(Value::Null),
-                }),
-                _ => Some(RolloutEnvelope::OtherResponseItem {
-                    item_type: item_type.to_owned(),
-                }),
-            }
-        }
-        _ => Some(RolloutEnvelope::Unknown {
-            record_type: record_type.to_owned(),
-        }),
-    }
-}
-
-fn command_input(command: &Value) -> Value {
-    match command {
-        Value::String(command) => json!({ "command": command }),
-        other => other.clone(),
-    }
-}
-
-fn insert_top_level(raw: &mut Value, key: &str, value: Value) {
-    if let Some(obj) = raw.as_object_mut() {
-        obj.insert(key.to_owned(), value);
-    }
-}
-
-/// Find the newest rollout whose filename ends in this thread id.
+/// Claim the one persisted thread identity for this run.
 ///
-/// Codex embeds a local timestamp before the id, so pure construction is not
-/// possible. Symlinked directories are skipped to keep discovery contained
-/// under the Boss-owned homes root.
-fn discover_rollout_path(homes_root: &Path, thread_id: &str) -> Option<PathBuf> {
+/// Returns `true` when the marker already named `thread_id` (resume) and
+/// `false` when this call created/replaced it (startup). The file is bounded
+/// to one id per run, survives engine restarts, and is deleted with the
+/// Boss-owned CODEX_HOME during normal teardown.
+fn claim_persisted_thread_id(codex_home: &Path, thread_id: &str) -> std::io::Result<bool> {
+    let marker = codex_home.join(THREAD_ID_MARKER);
+    match OpenOptions::new().write(true).create_new(true).open(&marker) {
+        Ok(mut file) => {
+            file.write_all(thread_id.as_bytes())?;
+            file.sync_all()?;
+            Ok(false)
+        }
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            let persisted = fs::read_to_string(&marker)?;
+            if persisted == thread_id {
+                return Ok(true);
+            }
+            // A new thread under the same run is a startup and replaces the
+            // bounded marker. This is not the resume case.
+            let mut file = OpenOptions::new().write(true).truncate(true).open(marker)?;
+            file.write_all(thread_id.as_bytes())?;
+            file.sync_all()?;
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// Find a rollout only within this run's canonical `sessions` subtree.
+///
+/// Codex embeds a local timestamp before the thread id, so pure construction
+/// is impossible. Symlinked entries are skipped, and both the sessions root
+/// and candidate are canonicalized and containment-checked again immediately
+/// before return to catch path replacement during traversal.
+fn discover_rollout_path(codex_home: &Path, thread_id: &str) -> Option<PathBuf> {
+    discover_rollout_path_after_scan(codex_home, thread_id, || {})
+}
+
+fn discover_rollout_path_after_scan(codex_home: &Path, thread_id: &str, after_scan: impl FnOnce()) -> Option<PathBuf> {
+    let canonical_home = fs::canonicalize(codex_home).ok()?;
+    let sessions_path = codex_home.join("sessions");
+    if fs::symlink_metadata(&sessions_path).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    let canonical_sessions = fs::canonicalize(&sessions_path).ok()?;
+    if canonical_sessions == canonical_home || !canonical_sessions.starts_with(&canonical_home) {
+        return None;
+    }
+
     let expected_suffix = format!("-{thread_id}.jsonl");
-    let mut stack = vec![homes_root.to_path_buf()];
+    let mut stack = vec![canonical_sessions.clone()];
     let mut matches = Vec::new();
 
     while let Some(dir) = stack.pop() {
@@ -372,6 +309,7 @@ fn discover_rollout_path(homes_root: &Path, thread_id: &str) -> Option<PathBuf> 
             Err(_) => continue,
         };
         for entry in entries.flatten() {
+            let path = entry.path();
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(_) => continue,
@@ -380,7 +318,11 @@ fn discover_rollout_path(homes_root: &Path, thread_id: &str) -> Option<PathBuf> 
                 continue;
             }
             if file_type.is_dir() {
-                stack.push(entry.path());
+                let canonical_dir = match fs::canonicalize(&path) {
+                    Ok(path) if path.starts_with(&canonical_sessions) => path,
+                    _ => continue,
+                };
+                stack.push(canonical_dir);
                 continue;
             }
             if !file_type.is_file() {
@@ -388,16 +330,173 @@ fn discover_rollout_path(homes_root: &Path, thread_id: &str) -> Option<PathBuf> 
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("rollout-") && name.ends_with(&expected_suffix) {
-                matches.push((name.into_owned(), entry.path()));
+            if !name.starts_with("rollout-") || !name.ends_with(&expected_suffix) {
+                continue;
             }
+            let canonical_candidate = match fs::canonicalize(&path) {
+                Ok(path) if path.starts_with(&canonical_sessions) => path,
+                _ => continue,
+            };
+            matches.push((name.into_owned(), canonical_candidate));
         }
     }
 
-    // Lexical ordering includes the ISO timestamp in the filename and gives a
-    // deterministic newest result if an interrupted resume left duplicates.
-    matches.sort_by(|left, right| left.0.cmp(&right.0));
-    matches.pop().map(|(_, path)| path)
+    matches.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let (_, candidate) = matches.pop()?;
+
+    // Re-check both identities after traversal. A directory/file swapped to a
+    // symlink between the first check and now is rejected.
+    after_scan();
+    let sessions_now = fs::canonicalize(&sessions_path).ok()?;
+    let candidate_now = fs::canonicalize(&candidate).ok()?;
+    if sessions_now != canonical_sessions
+        || candidate_now != candidate
+        || !candidate_now.starts_with(&canonical_sessions)
+        || fs::symlink_metadata(&candidate).ok()?.file_type().is_symlink()
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+/// Parsed rollout dialect. This is intentionally not reused for stdout.
+enum RolloutEnvelope {
+    SessionMeta,
+    EventMessage {
+        event_type: String,
+        payload: Map<String, Value>,
+    },
+    ResponseItem {
+        item_type: String,
+        payload: Map<String, Value>,
+    },
+    Unknown {
+        record_type: String,
+    },
+}
+
+fn parse_rollout_envelope(obj: &Map<String, Value>) -> Option<RolloutEnvelope> {
+    let record_type = obj.get("type")?.as_str()?.to_owned();
+    let payload = obj.get("payload")?.as_object()?.clone();
+    match record_type.as_str() {
+        "session_meta" => Some(RolloutEnvelope::SessionMeta),
+        "event_msg" => Some(RolloutEnvelope::EventMessage {
+            event_type: payload.get("type")?.as_str()?.to_owned(),
+            payload,
+        }),
+        "response_item" => Some(RolloutEnvelope::ResponseItem {
+            item_type: payload.get("type")?.as_str()?.to_owned(),
+            payload,
+        }),
+        _ => Some(RolloutEnvelope::Unknown { record_type }),
+    }
+}
+
+/// Reshape one rollout transcript record for the shared live-status pipeline.
+///
+/// This is stateless: output records are renderable on their own, so
+/// concurrent transcript tails can share a driver without call-id maps.
+pub(super) fn normalize_rollout(raw: Value) -> Value {
+    let parsed = match raw.as_object().and_then(parse_rollout_envelope) {
+        Some(parsed) => parsed,
+        None => {
+            tracing::debug!("codex rollout: ignoring malformed/non-object transcript record");
+            return raw;
+        }
+    };
+
+    match parsed {
+        RolloutEnvelope::SessionMeta => json!({"type":"system"}),
+        RolloutEnvelope::EventMessage { event_type, payload } => normalize_rollout_event_message(&event_type, &payload)
+            .unwrap_or_else(|| {
+                tracing::debug!(event_type, "codex rollout: ignoring additive event_msg variant");
+                raw
+            }),
+        RolloutEnvelope::ResponseItem { item_type, payload } => normalize_rollout_response_item(&item_type, &payload)
+            .unwrap_or_else(|| {
+                tracing::debug!(item_type, "codex rollout: ignoring additive response_item variant");
+                raw
+            }),
+        RolloutEnvelope::Unknown { record_type } => {
+            tracing::debug!(record_type, "codex rollout: ignoring additive record variant");
+            raw
+        }
+    }
+}
+
+fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value>) -> Option<Value> {
+    match event_type {
+        "agent_message" => Some(assistant_text(payload.get("message")?.as_str()?)),
+        "user_message" => Some(json!({
+            "type":"user",
+            "text": payload.get("message")?.as_str()?,
+        })),
+        "turn_aborted" => {
+            let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
+            Some(assistant_text(&format!("turn aborted: {reason}")))
+        }
+        "task_started" => Some(assistant_text("turn started")),
+        "task_complete" => {
+            let message = payload
+                .get("last_agent_message")
+                .and_then(Value::as_str)
+                .unwrap_or("turn completed");
+            Some(assistant_text(message))
+        }
+        _ => None,
+    }
+}
+
+fn normalize_rollout_response_item(item_type: &str, payload: &Map<String, Value>) -> Option<Value> {
+    match item_type {
+        "custom_tool_call" if payload.get("name").and_then(Value::as_str) == Some("exec") => Some(json!({
+            "type":"assistant",
+            "message":{
+                "content":[{
+                    "type":"tool_use",
+                    "name":"Bash",
+                    "input":{"command": payload.get("input")?.as_str()?},
+                }]
+            }
+        })),
+        "custom_tool_call_output" => Some(json!({
+            "type":"user",
+            "tool_name":"Bash",
+            "tool_response":payload.get("output").cloned().unwrap_or(Value::Null),
+        })),
+        "message" => normalize_rollout_message(payload),
+        _ => None,
+    }
+}
+
+fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
+    let role = payload.get("role")?.as_str()?;
+    let content = payload.get("content")?.as_array()?;
+    let text = content
+        .iter()
+        .filter_map(|block| {
+            let block_type = block.get("type").and_then(Value::as_str)?;
+            if matches!(block_type, "output_text" | "input_text" | "text") {
+                block.get("text").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    match role {
+        "assistant" => Some(assistant_text(&text)),
+        "user" => Some(json!({"type":"user","text":text})),
+        "developer" | "system" => Some(json!({"type":"system"})),
+        _ => None,
+    }
+}
+
+fn assistant_text(text: &str) -> Value {
+    json!({
+        "type":"assistant",
+        "message":{"content":[{"type":"text","text":text}]}
+    })
 }
 
 #[cfg(test)]
@@ -405,15 +504,15 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    fn normalizer() -> CodexProgressNormalizer {
-        CodexProgressNormalizer::default()
+    fn session() -> CodexProgressSession {
+        CodexProgressSession::new(None)
     }
 
     #[test]
     fn stdout_turn_and_command_execution_map_to_worker_events() {
-        let normalizer = normalizer();
+        let mut session = session();
         assert_eq!(
-            normalizer
+            session
                 .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-1"}))
                 .unwrap(),
             WorkerEvent::SessionStart {
@@ -422,11 +521,11 @@ mod tests {
             }
         );
         assert!(matches!(
-            normalizer.normalize_stdout(&json!({"type":"turn.started"})).unwrap(),
+            session.normalize_stdout(&json!({"type":"turn.started"})).unwrap(),
             WorkerEvent::UserPromptSubmit { session_id, .. } if session_id == "thread-1"
         ));
         assert_eq!(
-            normalizer
+            session
                 .normalize_stdout(&json!({
                     "type":"item.started",
                     "item":{"id":"item_0","type":"command_execution","command":"echo hi"}
@@ -439,7 +538,7 @@ mod tests {
             }
         );
         assert_eq!(
-            normalizer
+            session
                 .normalize_stdout(&json!({
                     "type":"item.completed",
                     "item":{
@@ -460,7 +559,7 @@ mod tests {
             }
         );
         assert_eq!(
-            normalizer
+            session
                 .normalize_stdout(&json!({"type":"turn.completed","usage":{"future_counter":7}}))
                 .unwrap(),
             WorkerEvent::Stop {
@@ -473,11 +572,11 @@ mod tests {
 
     #[test]
     fn repeated_thread_started_for_known_id_is_resume_without_state_reset() {
-        let normalizer = normalizer();
-        normalizer
+        let mut session = session();
+        session
             .normalize_stdout(&json!({"type":"thread.started","thread_id":"same-thread"}))
             .unwrap();
-        let repeated = normalizer
+        let repeated = session
             .normalize_stdout(&json!({"type":"thread.started","thread_id":"same-thread"}))
             .unwrap();
         assert_eq!(
@@ -488,50 +587,67 @@ mod tests {
             }
         );
         assert!(matches!(
-            normalizer.normalize_stdout(&json!({"type":"turn.started"})).unwrap(),
+            session.normalize_stdout(&json!({"type":"turn.started"})).unwrap(),
             WorkerEvent::UserPromptSubmit { session_id, .. } if session_id == "same-thread"
         ));
     }
 
     #[test]
-    fn resumed_process_recognizes_thread_seen_by_prior_normalizer_instance() {
-        let first_process = normalizer();
-        first_process
-            .normalize_stdout(&json!({
-                "type":"thread.started",
-                "thread_id":"cross-process-resume-thread"
-            }))
-            .unwrap();
+    fn persisted_identity_survives_restart_and_is_removed_with_run_home() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("run-home");
+        fs::create_dir_all(&home).unwrap();
 
-        let resumed_process = normalizer();
-        assert_eq!(
-            resumed_process
-                .normalize_stdout(&json!({
-                    "type":"thread.started",
-                    "thread_id":"cross-process-resume-thread"
-                }))
-                .unwrap(),
-            WorkerEvent::SessionStart {
-                session_id: "cross-process-resume-thread".into(),
-                source: SessionStartSource::Resume,
-            }
-        );
+        let mut first_process = CodexProgressSession::new(Some(home.clone()));
+        let first = first_process
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"restart-thread"}))
+            .unwrap();
         assert!(matches!(
-            resumed_process
-                .normalize_stdout(&json!({"type":"turn.started"}))
-                .unwrap(),
-            WorkerEvent::UserPromptSubmit { session_id, .. }
-                if session_id == "cross-process-resume-thread"
+            first,
+            WorkerEvent::SessionStart {
+                source: SessionStartSource::Startup,
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(home.join(THREAD_ID_MARKER)).unwrap(),
+            "restart-thread"
+        );
+
+        let mut after_restart = CodexProgressSession::new(Some(home.clone()));
+        let resumed = after_restart
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"restart-thread"}))
+            .unwrap();
+        assert!(matches!(
+            resumed,
+            WorkerEvent::SessionStart {
+                source: SessionStartSource::Resume,
+                ..
+            }
+        ));
+
+        fs::remove_dir_all(&home).unwrap();
+        fs::create_dir_all(&home).unwrap();
+        let mut after_cleanup = CodexProgressSession::new(Some(home));
+        let fresh = after_cleanup
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"restart-thread"}))
+            .unwrap();
+        assert!(matches!(
+            fresh,
+            WorkerEvent::SessionStart {
+                source: SessionStartSource::Startup,
+                ..
+            }
         ));
     }
 
     #[test]
     fn operational_error_item_is_non_terminal_notification() {
-        let normalizer = normalizer();
-        normalizer
+        let mut session = session();
+        session
             .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-warning"}))
             .unwrap();
-        let event = normalizer
+        let event = session
             .normalize_stdout(&json!({
                 "type":"item.completed",
                 "item":{"id":"item_0","type":"error","message":"hook trust bypassed"}
@@ -548,8 +664,8 @@ mod tests {
     }
 
     #[test]
-    fn additive_variants_are_tolerated_and_do_not_require_session_state() {
-        let normalizer = normalizer();
+    fn additive_variants_are_tolerated_without_session_state() {
+        let mut session = session();
         for raw in [
             json!({"type":"thread.future","new_field":true}),
             json!({"type":"item.completed","item":{"id":"item_0","type":"extension","payload":{}}}),
@@ -557,17 +673,38 @@ mod tests {
             json!({"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"done"}}),
         ] {
             assert!(matches!(
-                normalizer.normalize_stdout(&raw),
+                session.normalize_stdout(&raw),
                 Err(NormalizeError::UnknownEvent(_))
             ));
         }
     }
 
     #[test]
+    fn known_stdout_records_require_string_fields() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"malformed-thread"}))
+            .unwrap();
+        for raw in [
+            json!({"type":"item.started","item":{"type":"command_execution","command":42}}),
+            json!({
+                "type":"item.completed",
+                "item":{"type":"command_execution","command":"echo hi","aggregated_output":{"text":"hi"}}
+            }),
+            json!({"type":"item.completed","item":{"type":"error","message":["warning"]}}),
+        ] {
+            assert!(matches!(
+                session.normalize_stdout(&raw),
+                Err(NormalizeError::MissingField(_))
+            ));
+        }
+    }
+
+    #[test]
     fn stdout_turn_aborted_is_not_synthesized() {
-        let normalizer = normalizer();
+        let mut session = session();
         assert!(matches!(
-            normalizer.normalize_stdout(&json!({
+            session.normalize_stdout(&json!({
                 "type":"turn_aborted",
                 "turn_id":"turn-1",
                 "reason":"interrupted"
@@ -577,22 +714,15 @@ mod tests {
     }
 
     #[test]
-    fn rollout_parser_is_distinct_and_marks_turn_aborted_only_there() {
-        let normalizer = normalizer();
-        let normalized = normalizer.normalize_rollout(json!({
-            "timestamp":"2026-07-26T00:00:00Z",
+    fn rollout_records_become_canonical_renderable_records() {
+        let aborted = normalize_rollout(json!({
             "type":"event_msg",
             "payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}
         }));
-        assert_eq!(normalized["type"], "event_msg");
-        assert_eq!(normalized["codex_rollout_event"], "turn_aborted");
-        assert_eq!(normalized["payload"]["reason"], "interrupted");
-    }
+        assert_eq!(aborted["type"], "assistant");
+        assert_eq!(aborted["message"]["content"][0]["text"], "turn aborted: interrupted");
 
-    #[test]
-    fn rollout_exec_call_and_output_get_canonical_tool_fields() {
-        let normalizer = normalizer();
-        let call = normalizer.normalize_rollout(json!({
+        let call = normalize_rollout(json!({
             "type":"response_item",
             "payload":{
                 "type":"custom_tool_call",
@@ -601,10 +731,14 @@ mod tests {
                 "input":"echo rollout"
             }
         }));
-        assert_eq!(call["tool_name"], "Bash");
-        assert_eq!(call["tool_input"], json!({"command":"echo rollout"}));
+        assert_eq!(call["type"], "assistant");
+        assert_eq!(call["message"]["content"][0]["name"], "Bash");
+        assert_eq!(
+            call["message"]["content"][0]["input"],
+            json!({"command":"echo rollout"})
+        );
 
-        let output = normalizer.normalize_rollout(json!({
+        let output = normalize_rollout(json!({
             "type":"response_item",
             "payload":{
                 "type":"custom_tool_call_output",
@@ -612,6 +746,7 @@ mod tests {
                 "output":[{"type":"input_text","text":"rollout\n"}]
             }
         }));
+        assert_eq!(output["type"], "user");
         assert_eq!(output["tool_name"], "Bash");
         assert_eq!(
             output["tool_response"],
@@ -620,21 +755,94 @@ mod tests {
     }
 
     #[test]
-    fn transcript_discovery_globs_timestamped_rollout_by_thread_id() {
+    fn transcript_discovery_is_scoped_to_exact_run_home() {
         let tmp = TempDir::new().unwrap();
-        let sessions = tmp.path().join("run-1/sessions/2026/07/26");
-        fs::create_dir_all(&sessions).unwrap();
-        let expected = sessions.join("rollout-2026-07-26T03-48-52-thread-lookup.jsonl");
+        let run_a = tmp.path().join("run-a");
+        let run_b = tmp.path().join("run-b");
+        let sessions_a = run_a.join("sessions/2026/07/26");
+        let sessions_b = run_b.join("sessions/2026/07/26");
+        fs::create_dir_all(&sessions_a).unwrap();
+        fs::create_dir_all(&sessions_b).unwrap();
+        let expected = sessions_a.join("rollout-2026-07-26T03-48-52-duplicate-thread.jsonl");
         fs::write(&expected, "{}\n").unwrap();
-        fs::write(sessions.join("rollout-2026-07-26T03-48-53-other-thread.jsonl"), "{}\n").unwrap();
+        fs::write(
+            sessions_b.join("rollout-2026-07-26T03-48-53-duplicate-thread.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
 
-        let normalizer = normalizer();
-        normalizer
-            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-lookup"}))
+        let mut session = CodexProgressSession::new(Some(run_a));
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"duplicate-thread"}))
             .unwrap();
         assert_eq!(
-            normalizer.transcript_path(&json!({"type":"turn.started"}), tmp.path()),
-            Some(expected.to_string_lossy().into_owned())
+            session.transcript_path(&json!({"type":"turn.started"})),
+            Some(fs::canonicalize(expected).unwrap().to_string_lossy().into_owned())
         );
+    }
+
+    #[test]
+    fn transcript_discovery_chooses_newest_duplicate_within_run() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("run-home");
+        let day = home.join("sessions/2026/07/26");
+        fs::create_dir_all(&day).unwrap();
+        let older = day.join("rollout-2026-07-26T03-48-52-duplicate-thread.jsonl");
+        let newer = day.join("rollout-2026-07-26T03-48-53-duplicate-thread.jsonl");
+        fs::write(older, "{}\n").unwrap();
+        fs::write(&newer, "{}\n").unwrap();
+
+        assert_eq!(
+            discover_rollout_path(&home, "duplicate-thread"),
+            Some(fs::canonicalize(newer).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_discovery_rejects_symlinked_sessions_and_candidates() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_rollout = outside.join("rollout-2026-07-26T00-00-00-race-thread.jsonl");
+        fs::write(&outside_rollout, "{}\n").unwrap();
+
+        let linked_sessions_home = tmp.path().join("linked-sessions-home");
+        fs::create_dir_all(&linked_sessions_home).unwrap();
+        symlink(&outside, linked_sessions_home.join("sessions")).unwrap();
+        assert!(discover_rollout_path(&linked_sessions_home, "race-thread").is_none());
+
+        let linked_file_home = tmp.path().join("linked-file-home");
+        let day = linked_file_home.join("sessions/2026/07/26");
+        fs::create_dir_all(&day).unwrap();
+        symlink(
+            &outside_rollout,
+            day.join("rollout-2026-07-26T00-00-00-race-thread.jsonl"),
+        )
+        .unwrap();
+        assert!(discover_rollout_path(&linked_file_home, "race-thread").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transcript_discovery_rejects_candidate_replaced_after_scan() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("run-home");
+        let day = home.join("sessions/2026/07/26");
+        fs::create_dir_all(&day).unwrap();
+        let candidate = day.join("rollout-2026-07-26T00-00-00-race-thread.jsonl");
+        fs::write(&candidate, "{}\n").unwrap();
+        let outside = tmp.path().join("outside.jsonl");
+        fs::write(&outside, "{}\n").unwrap();
+
+        let found = discover_rollout_path_after_scan(&home, "race-thread", || {
+            fs::remove_file(&candidate).unwrap();
+            symlink(&outside, &candidate).unwrap();
+        });
+        assert!(found.is_none());
     }
 }

@@ -19,13 +19,16 @@ use crate::completion::{
 };
 use crate::config::RuntimeConfig;
 use crate::coordinator::{CommandCubeClient, CubeClient, ExecutionCoordinator, ExecutionPublisher, WorkerPool};
+use crate::driver::AgentDriver;
 use crate::events_socket::{bind_events_socket, handle_connection, peer_pid};
 use crate::external_tracker::WorkDbOrgStateSink;
 use crate::external_tracker::github_oauth::{
     DeviceFlow, GitHubAuthController, GitHubAuthState, KeychainTokenStore, probe_and_record_org_state,
 };
 use crate::ipc_log::IpcLogger;
-use crate::live_status_loop::{LiveStatusBroadcaster, LiveStatusManager, TranscriptPathResolver, Trigger};
+use crate::live_status_loop::{
+    LiveStatusBroadcaster, LiveStatusManager, LiveStatusRun, TranscriptPathResolver, Trigger,
+};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::merge_poller::{CommandMergeProbe, MergeProbe, spawn_loop as spawn_merge_poller};
 use crate::merge_when_ready;
@@ -282,7 +285,7 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         self.broadcast_live_worker_states().await;
     }
 
-    fn start_live_status_slot(&self, slot_id: u8, run_id: &str) {
+    fn start_live_status_slot(&self, slot_id: u8, run_id: &str, driver: Arc<dyn AgentDriver>) {
         let Some(arc_self) = self._self_weak.upgrade() else {
             tracing::debug!(slot_id, "start_live_status_slot: ServerState already dropped",);
             return;
@@ -296,7 +299,7 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         let resolver: Arc<dyn TranscriptPathResolver> = arc_self.clone();
         self.live_status_manager.start_slot(
             slot_id,
-            run_id.to_owned(),
+            LiveStatusRun::new(run_id, driver),
             utility,
             self.live_worker_states.clone(),
             broadcaster,

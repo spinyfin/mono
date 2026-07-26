@@ -779,6 +779,28 @@ pub enum ProgressIngress {
     StdoutJsonl,
 }
 
+/// Run-scoped context supplied when a stdout progress reader starts.
+///
+/// Stream protocols commonly omit session identity after their first
+/// envelope. Mutable correlation therefore belongs to the reader session,
+/// not the registry's shared [`AgentDriver`] instance. `run_id` also lets a
+/// driver resolve run-owned artifacts without scanning another run's state.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressSessionConfig {
+    pub run_id: Option<String>,
+}
+
+/// Mutable normalizer owned by one progress ingress.
+///
+/// A registry driver may be shared by concurrent readers; implementations of
+/// this trait are not shared. The reader invokes both methods in stream order,
+/// so sticky session identity and transcript discovery cannot cross streams.
+pub trait ProgressSessionNormalizer: Send {
+    fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
+
+    fn transcript_path_for_session(&mut self, raw: &serde_json::Value) -> Option<String>;
+}
+
 /// A turn-ended signal for [`Capability::TurnBoundary`]: the driver-agnostic
 /// form of "the worker finished a turn and is now idle".
 ///
@@ -1293,6 +1315,16 @@ pub trait AgentDriver: Send + Sync {
     /// the raw payload is a hook JSON object; this delegates to
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
+
+    /// Create mutable correlation state for one stdout ingress.
+    ///
+    /// Hook-callback drivers return `None` and keep using the stateless
+    /// methods above. A stdout driver whose wire omits session identity after
+    /// its first record returns a fresh normalizer here; the generic reader
+    /// owns it for exactly one stream.
+    fn progress_session(&self, _config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        None
+    }
 
     // ── TurnBoundary capability ─────────────────────────────────────────────
 

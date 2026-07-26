@@ -26,14 +26,15 @@ use serde::{Deserialize, Serialize};
 
 mod progress;
 
-use progress::CodexProgressNormalizer;
+use progress::{CodexProgressSession, normalize_rollout};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
-    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan,
-    SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressSessionConfig, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, StructuredOutputArtifacts,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -721,7 +722,9 @@ fn which_codex() -> Option<PathBuf> {
 /// implemented here.
 #[derive(Default)]
 pub struct CodexDriver {
-    progress: CodexProgressNormalizer,
+    // Keep this type non-unit so callers can use `Default` uniformly with
+    // stateful drivers without tripping clippy's unit-default lint.
+    _private: (),
 }
 
 #[async_trait]
@@ -992,7 +995,23 @@ impl AgentDriver for CodexDriver {
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        self.progress.normalize_stdout(raw)
+        // Stateless compatibility path for direct callers. Stdout ingestion
+        // owns a durable per-reader session via `progress_session` below.
+        CodexProgressSession::new(None).normalize_progress_event(raw)
+    }
+
+    fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        let codex_home = config
+            .run_id
+            .as_deref()
+            .and_then(|run_id| match codex_home_for_run(run_id) {
+                Ok(home) => Some(home),
+                Err(err) => {
+                    tracing::warn!(run_id, %err, "codex stdout: invalid run id for progress session");
+                    None
+                }
+            });
+        Some(Box::new(CodexProgressSession::new(codex_home)))
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
@@ -1037,13 +1056,14 @@ impl AgentDriver for CodexDriver {
     }
 
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
-        // The timestamped filename cannot be constructed from thread_id.
-        // Search only below Boss-owned homes and cache the match per thread.
-        self.progress.transcript_path(raw, &codex_homes_root())
+        // Transcript lookup requires the exact run home supplied when the
+        // stdout reader creates its per-ingress progress session.
+        let _ = raw;
+        None
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-        self.progress.normalize_rollout(raw)
+        normalize_rollout(raw)
     }
 
     fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {

@@ -59,7 +59,7 @@
 use std::io::ErrorKind;
 use std::sync::Arc;
 
-use boss_engine_driver::AgentDriver;
+use boss_engine_driver::{AgentDriver, ProgressSessionConfig, ProgressSessionNormalizer};
 use boss_protocol::WorkerEvent;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
@@ -172,6 +172,7 @@ enum RawLine {
 pub struct StdoutJsonlProgressReader<R> {
     reader: BufReader<R>,
     driver: Arc<dyn AgentDriver>,
+    progress_session: Option<Box<dyn ProgressSessionNormalizer>>,
     config: ReaderConfig,
     stats: ReaderStats,
 }
@@ -184,14 +185,46 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// run — this crate never names a concrete driver, so the same reader
     /// serves every `StdoutJsonl` backend.
     pub fn new(stream: R, driver: Arc<dyn AgentDriver>) -> Self {
-        Self::with_config(stream, driver, ReaderConfig::default())
+        Self::with_config_and_session(
+            stream,
+            driver,
+            ReaderConfig::default(),
+            ProgressSessionConfig::default(),
+        )
+    }
+
+    /// Wrap a stream whose owning execution is `run_id`.
+    ///
+    /// The run context is passed only to the driver's per-ingress normalizer;
+    /// the generic reader remains unaware of driver-specific workspace or
+    /// transcript layouts.
+    pub fn for_run(stream: R, driver: Arc<dyn AgentDriver>, run_id: impl Into<String>) -> Self {
+        Self::with_config_and_session(
+            stream,
+            driver,
+            ReaderConfig::default(),
+            ProgressSessionConfig {
+                run_id: Some(run_id.into()),
+            },
+        )
     }
 
     /// [`Self::new`] with an explicit config.
     pub fn with_config(stream: R, driver: Arc<dyn AgentDriver>, config: ReaderConfig) -> Self {
+        Self::with_config_and_session(stream, driver, config, ProgressSessionConfig::default())
+    }
+
+    fn with_config_and_session(
+        stream: R,
+        driver: Arc<dyn AgentDriver>,
+        config: ReaderConfig,
+        session_config: ProgressSessionConfig,
+    ) -> Self {
+        let progress_session = driver.progress_session(&session_config);
         Self {
             reader: BufReader::new(stream),
             driver,
+            progress_session,
             config,
             stats: ReaderStats::default(),
         }
@@ -261,10 +294,17 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
                 }
             };
 
-            match self.driver.normalize_progress_event(&raw) {
+            let normalized = match self.progress_session.as_mut() {
+                Some(session) => session.normalize_progress_event(&raw),
+                None => self.driver.normalize_progress_event(&raw),
+            };
+            match normalized {
                 Ok(event) => {
                     self.stats.events_emitted += 1;
-                    let transcript_path = self.driver.transcript_path_for_session(&raw);
+                    let transcript_path = match self.progress_session.as_mut() {
+                        Some(session) => session.transcript_path_for_session(&raw),
+                        None => self.driver.transcript_path_for_session(&raw),
+                    };
                     return Some(ProgressEnvelope { event, transcript_path });
                 }
                 Err(err) => {

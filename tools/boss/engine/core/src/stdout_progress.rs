@@ -147,7 +147,7 @@ where
         .clone();
     tracing::info!(run_id, driver = driver_slug, "stdout progress: ingress started");
 
-    let mut reader = StdoutJsonlProgressReader::new(stream, driver.clone());
+    let mut reader = StdoutJsonlProgressReader::for_run(stream, driver.clone(), run_id);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {
