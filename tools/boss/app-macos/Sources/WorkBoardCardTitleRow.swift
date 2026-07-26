@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 // ===========================================================================
@@ -16,7 +17,10 @@ struct WorkBoardCardTitleRowSlice: Equatable {
     let name: String
     /// Used only for the revision 2-line name cap.
     let kind: String
-    let status: String
+    /// "Blocked by" / "Waiting on:" when a blocked-by line is painted; nil
+    /// otherwise. Derived at init so raw `status` is not compared when the
+    /// line is absent (status only selects this prefix for paint).
+    let blockedByPrefix: String?
     let blockedBy: String?
     let hasTagChips: Bool
     let tags: [String]
@@ -27,8 +31,14 @@ struct WorkBoardCardTitleRowSlice: Equatable {
         self.showsBlockedLock = snapshot.showsBlockedLock
         self.name = snapshot.name
         self.kind = snapshot.kind
-        self.status = snapshot.status
-        self.blockedBy = snapshot.blockedBy
+        if let blockedBy = snapshot.blockedBy, !blockedBy.isEmpty {
+            self.blockedBy = blockedBy
+            self.blockedByPrefix = snapshot.status == "blocked"
+                ? "Blocked by" : "Waiting on:"
+        } else {
+            self.blockedBy = nil
+            self.blockedByPrefix = nil
+        }
         self.hasTagChips = snapshot.hasTagChips
         self.tags = snapshot.tags
     }
@@ -78,8 +88,7 @@ struct WorkBoardCardTitleRow: View, @MainActor Equatable {
                             .lineLimit(slice.kind == "revision" ? 2 : nil)
                             .truncationMode(.tail)
                     }
-                    if let blockedBy = slice.blockedBy, !blockedBy.isEmpty {
-                        let prefix = slice.status == "blocked" ? "Blocked by" : "Waiting on:"
+                    if let blockedBy = slice.blockedBy, let prefix = slice.blockedByPrefix {
                         Text("\(prefix) \(blockedBy)")
                             .font(.caption)
                             .foregroundStyle(.secondary)

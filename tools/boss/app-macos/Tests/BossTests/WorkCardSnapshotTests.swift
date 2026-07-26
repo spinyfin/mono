@@ -1423,6 +1423,118 @@ final class WorkCardSnapshotTests: XCTestCase {
         XCTAssertFalse(WorkBoardCardFooterSlice(snapshot: withID).isEmpty)
     }
 
+    /// Footer view equality ignores hover-handler identity (same rule as
+    /// the badge strip and card shell).
+    func testFooterEquatableIgnoresClosures() {
+        var task = Self.makeTask(name: "Ship")
+        task.shortID = 7
+        let snap = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(column: .review)
+        )
+        let slice = WorkBoardCardFooterSlice(snapshot: snap)
+        let a = WorkBoardCardFooter(
+            slice: slice,
+            onRevisionBadgeHover: { _ in /* a */ }
+        )
+        let b = WorkBoardCardFooter(
+            slice: slice,
+            onRevisionBadgeHover: { _ in /* b */ }
+        )
+        XCTAssertEqual(a, b)
+    }
+
+    /// Selection / board-style chrome lives on the card shell only — content
+    /// subview slices must not re-equate when those fields flip.
+    func testChromeOnlyFieldsIsolateFromContentSlices() {
+        let task = Self.makeTask(name: "Ship")
+        let base = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .backlog,
+                isSelected: false,
+                boardStyle: .classic
+            )
+        )
+        let selected = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .backlog,
+                isSelected: true,
+                boardStyle: .classic
+            )
+        )
+        let elevated = WorkCardSnapshot.build(
+            task: task,
+            context: WorkCardSnapshotContext(
+                column: .backlog,
+                isSelected: false,
+                boardStyle: .elevated
+            )
+        )
+
+        XCTAssertNotEqual(base, selected)
+        XCTAssertNotEqual(base, elevated)
+
+        for chrome in [selected, elevated] {
+            XCTAssertEqual(
+                WorkBoardCardTitleRowSlice(snapshot: base),
+                WorkBoardCardTitleRowSlice(snapshot: chrome)
+            )
+            XCTAssertEqual(
+                WorkBoardCardLiveStatusRowSlice(snapshot: base),
+                WorkBoardCardLiveStatusRowSlice(snapshot: chrome)
+            )
+            XCTAssertEqual(
+                WorkBoardCardBadgeStripSlice(snapshot: base),
+                WorkBoardCardBadgeStripSlice(snapshot: chrome)
+            )
+            XCTAssertEqual(
+                WorkBoardCardFooterSlice(snapshot: base),
+                WorkBoardCardFooterSlice(snapshot: chrome)
+            )
+            XCTAssertNil(WorkBoardCardRevisionHeaderSlice(snapshot: base))
+            XCTAssertNil(WorkBoardCardRevisionHeaderSlice(snapshot: chrome))
+        }
+    }
+
+    /// Without a blocked-by line, non-lock status flips must not re-equate
+    /// the title slice (prefix is paint-only when the line is present).
+    func testTitleSliceIgnoresStatusWhenBlockedByEmpty() {
+        let active = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_status", name: "Ship", status: "active"),
+            context: WorkCardSnapshotContext(column: .doing)
+        )
+        let done = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_status", name: "Ship", status: "done"),
+            context: WorkCardSnapshotContext(column: .doing)
+        )
+        XCTAssertEqual(
+            WorkBoardCardTitleRowSlice(snapshot: active),
+            WorkBoardCardTitleRowSlice(snapshot: done)
+        )
+
+        // When blockedBy is painted, prefix selection still participates.
+        let waiting = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_wait", name: "Ship", status: "active"),
+            context: WorkCardSnapshotContext(
+                column: .doing,
+                blockedBy: "T1 Ship prep"
+            )
+        )
+        let blocked = WorkCardSnapshot.build(
+            task: Self.makeTask(id: "task_wait", name: "Ship", status: "blocked"),
+            context: WorkCardSnapshotContext(
+                column: .doing,
+                blockedBy: "T1 Ship prep"
+            )
+        )
+        XCTAssertNotEqual(
+            WorkBoardCardTitleRowSlice(snapshot: waiting),
+            WorkBoardCardTitleRowSlice(snapshot: blocked)
+        )
+    }
+
     // MARK: - WorkCardLiveStatus (entry 6 observation detach)
 
     /// Live-status resolution is pure and lives outside the card so the
