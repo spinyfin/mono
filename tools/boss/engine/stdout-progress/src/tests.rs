@@ -14,12 +14,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use boss_engine_driver::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-    WorkerErrorClass,
+    ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, WorkerErrorClass,
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, SessionStartSource, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, SessionStartSource, WorkerEvent};
 use tokio::io::AsyncWriteExt;
 
 use super::*;
@@ -46,6 +46,10 @@ fn only_model(_level: EffortLevel) -> &'static str {
     "gpt-5.5"
 }
 
+fn only_model_for_reasoning(_mode: ReasoningMode) -> &'static str {
+    "gpt-5.5"
+}
+
 fn no_addendum(_level: EffortLevel) -> Option<&'static str> {
     None
 }
@@ -68,6 +72,7 @@ impl CodexShapedDriver {
                     engine_default: "gpt-5.5",
                     effort_value_for_level: no_effort_value,
                     default_model_for_level: only_model,
+                    model_for_reasoning: only_model_for_reasoning,
                     prompt_addendum_for_level: no_addendum,
                     model_requires_auto_permissions: never_auto_permissions,
                 },
@@ -96,11 +101,15 @@ impl AgentDriver for CodexShapedDriver {
         CapabilitySet::new([Capability::ProgressObservation])
     }
 
-    fn spawn_invocation(&self, _: &str, _: Option<&str>, _: Option<&Path>, _: bool, _: Option<&str>) -> String {
+    fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
         unimplemented!()
     }
 
     async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+
+    async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
         unimplemented!()
     }
 
@@ -589,4 +598,117 @@ async fn default_config_allows_a_realistically_large_envelope() {
     let (events, stats) = drain_bytes(stream.into_bytes()).await;
     assert_eq!(kinds(&events), vec!["post_tool_use"]);
     assert_eq!(stats.oversized_lines, 0);
+}
+
+// ─── Tolerance: I/O errors ───────────────────────────────────────────────────
+
+/// An `AsyncRead` that hands back a fixed prefix and then fails every
+/// subsequent `poll_read` with a caller-chosen error kind. Models a worker
+/// whose pipe breaks mid-stream (a killed process, a closed SSH channel).
+struct FailAfterPrefix {
+    prefix: Vec<u8>,
+    pos: usize,
+    kind: std::io::ErrorKind,
+}
+
+impl FailAfterPrefix {
+    fn new(prefix: &str, kind: std::io::ErrorKind) -> Self {
+        Self {
+            prefix: prefix.as_bytes().to_vec(),
+            pos: 0,
+            kind,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for FailAfterPrefix {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if self.pos < self.prefix.len() {
+            let remaining = &self.prefix[self.pos..];
+            let n = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            return std::task::Poll::Ready(Ok(()));
+        }
+        std::task::Poll::Ready(Err(std::io::Error::from(self.kind)))
+    }
+}
+
+/// A broken pipe must end the stream cleanly rather than hang or panic: the
+/// envelopes read before the break are delivered, `ended_with_io_error` is
+/// set, and `next_event` returns `None` instead of looping forever.
+#[tokio::test]
+async fn io_error_ends_the_stream_cleanly_and_is_recorded() {
+    let stream = FailAfterPrefix::new(
+        concat!(r#"{"type":"turn.started"}"#, "\n"),
+        std::io::ErrorKind::BrokenPipe,
+    );
+    let mut reader = StdoutJsonlProgressReader::new(stream, CodexShapedDriver::arc());
+
+    let mut events = Vec::new();
+    while let Some(envelope) = reader.next_event().await {
+        events.push(envelope.event);
+    }
+
+    assert_eq!(kinds(&events), vec!["user_prompt_submit"]);
+    assert!(reader.stats().ended_with_io_error);
+    assert!(reader.next_event().await.is_none(), "must stay ended, not loop");
+}
+
+/// An `AsyncRead` whose first `poll_read` fails with `Interrupted` once, then
+/// serves real bytes. `Interrupted` must be retried transparently — it is not
+/// a stream-ending error — so the envelope after it still decodes.
+struct InterruptedOnce {
+    fired: bool,
+    rest: Vec<u8>,
+    pos: usize,
+}
+
+impl InterruptedOnce {
+    fn new(bytes: &str) -> Self {
+        Self {
+            fired: false,
+            rest: bytes.as_bytes().to_vec(),
+            pos: 0,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for InterruptedOnce {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if !self.fired {
+            self.fired = true;
+            return std::task::Poll::Ready(Err(std::io::Error::from(std::io::ErrorKind::Interrupted)));
+        }
+        let remaining = &self.rest[self.pos..];
+        let n = remaining.len().min(buf.remaining());
+        buf.put_slice(&remaining[..n]);
+        self.pos += n;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// If the `Interrupted` retry in `next_raw_line` ever regressed to falling
+/// through to the fatal-error branch, this would drop the entire stream and
+/// silently emit nothing — the assertion on the emitted event is what would
+/// catch that.
+#[tokio::test]
+async fn interrupted_read_is_retried_not_treated_as_fatal() {
+    let stream = InterruptedOnce::new(concat!(r#"{"type":"turn.completed","usage":{}}"#, "\n"));
+    let mut reader = StdoutJsonlProgressReader::new(stream, CodexShapedDriver::arc());
+
+    let envelope = reader
+        .next_event()
+        .await
+        .expect("interrupted read must be retried, not fatal");
+    assert_eq!(kinds(&[envelope.event]), vec!["stop"]);
+    assert!(!reader.stats().ended_with_io_error);
 }

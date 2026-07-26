@@ -650,7 +650,7 @@ pub struct ProgressObservationWiring {
 ///   → `item.started`/`item.completed` → `turn.completed`) that a reader
 ///   parses and feeds to [`AgentDriver::normalize_progress_event`]. That
 ///   reader is `boss_engine_stdout_progress`, attached to the engine's
-///   activity machine by `boss_engine::app::stdout_progress`; a driver that
+///   activity machine by `boss_engine::stdout_progress`; a driver that
 ///   selects this variant has no settings-file hook wiring to merge.
 ///
 /// A driver without hook-callback wiring returns [`Self::StdoutJsonl`] here

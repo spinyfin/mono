@@ -61,7 +61,7 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
 /// Transport-agnostic on purpose. Both progress ingresses converge here:
 /// [`crate::events_socket`] (a `ProgressIngress::HookCallback` driver's
 /// `boss-event` shim over the unix socket) and
-/// [`crate::app::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
+/// [`crate::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
 /// stdout stream). By the time an event reaches this function the driver has
 /// already normalised it, so which transport carried it is no longer
 /// observable — which is exactly the property that makes live-status, the

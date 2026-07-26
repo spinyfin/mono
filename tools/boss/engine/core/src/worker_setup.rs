@@ -632,7 +632,7 @@ fn settings_value(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> se
 /// Resolve a driver's [`ProgressIngress`] into the settings-file `hooks`
 /// map. [`ProgressIngress::StdoutJsonl`] drivers (Codex) have no
 /// hook-callback wiring at all — their progress is read from the worker's
-/// stdout by [`crate::app::stdout_progress`], not this Claude-style hooks map
+/// stdout by [`crate::stdout_progress`], not this Claude-style hooks map
 /// — so this returns an empty map for that arm instead of assuming a
 /// `HookCallback` that was never produced.
 fn hooks_map_for_ingress(ingress: ProgressIngress) -> serde_json::Map<String, serde_json::Value> {
