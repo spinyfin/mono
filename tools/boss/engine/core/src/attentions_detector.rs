@@ -41,26 +41,22 @@ use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
 use crate::design_detector;
 use crate::driver::AgentDriver;
 use crate::structured_output::StructuredOutputKind;
+use crate::utility_model::{self, UtilityTask};
 use crate::work::WorkDb;
 
-// ── Backstop: Anthropic API constants ────────────────────────────────────────
+// ── Backstop: utility-model constants ────────────────────────────────────────
+//
+// The model and endpoint are no longer pinned here — they come from the
+// engine's UtilityModel provider (`UtilityTask::AttentionsBackstop`),
+// which still honours the per-feature `BOSS_BACKSTOP_API_KEY` billing bucket.
+// What remains below is the shape of the call, which is this feature's own.
 
-/// Per-feature key env var; routes billing to a separate spend bucket. Falls
-/// back to `ANTHROPIC_API_KEY` via [`claude_client::resolve_api_key`].
-const BACKSTOP_API_KEY_ENV: &str = "BOSS_BACKSTOP_API_KEY";
-const BACKSTOP_MODEL: &str = "claude-haiku-4-5-20251001";
 const BACKSTOP_MAX_TOKENS: u32 = 2048;
 const BACKSTOP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum number of transcript characters fed to the supervisor pass.
 const BACKSTOP_TRANSCRIPT_TAIL_CHARS: usize = 8_000;
 /// Maximum number of questions the backstop will emit from one doc.
 const BACKSTOP_MAX_QUESTIONS: usize = 20;
-
-/// Resolve the backstop key: `BOSS_BACKSTOP_API_KEY` then `ANTHROPIC_API_KEY`,
-/// via the shared pipeline's resolver.
-fn resolve_backstop_api_key() -> Option<String> {
-    claude_client::resolve_api_key(Some(BACKSTOP_API_KEY_ENV))
-}
 
 /// One entry of a `<slug>.attentions.json` questions manifest.
 #[derive(Debug, Clone, Deserialize)]
@@ -755,9 +751,15 @@ fn strip_markdown_bold(s: &str) -> String {
 /// `confidence_source = extracted`. Only called when the primary
 /// [`reconcile_task_followups`] returned `None`.
 ///
-/// Requires `BOSS_BACKSTOP_API_KEY` or `ANTHROPIC_API_KEY` to be set; logs a
-/// warning and returns `None` when the key is absent. All other failures are
-/// also logged and swallowed.
+/// Requires the engine's [`UtilityModel`](crate::utility_model::UtilityModel)
+/// provider to resolve a credential for [`UtilityTask::AttentionsBackstop`]
+/// (`BOSS_BACKSTOP_API_KEY`, then the provider's base credential); logs a
+/// warning and returns `None` when it cannot. All other failures are also
+/// logged and swallowed.
+///
+/// Reaches the provider through the process-wide handle rather than a
+/// parameter: this is called from the completion handler, several layers deep,
+/// with no config in hand — the same reason `populator::install` exists.
 pub async fn extract_followups_backstop(
     work_db: &WorkDb,
     work_item_id: &str,
@@ -790,13 +792,13 @@ pub async fn extract_followups_backstop(
         &assistant_text
     };
 
-    let api_key = match resolve_backstop_api_key() {
-        Some(k) => k,
-        None => {
+    let call = match utility_model::provider().resolve(UtilityTask::AttentionsBackstop) {
+        Ok(call) => call,
+        Err(err) => {
             tracing::warn!(
                 execution_id,
-                "attentions backstop (followups): no API key configured \
-                 (set BOSS_BACKSTOP_API_KEY or ANTHROPIC_API_KEY); skipping"
+                %err,
+                "attentions backstop (followups): no utility-model credential; skipping"
             );
             return None;
         }
@@ -804,13 +806,13 @@ pub async fn extract_followups_backstop(
 
     let prompt = build_followups_supervisor_prompt(tail);
     let request = MessagesRequest::builder()
-        .model(BACKSTOP_MODEL)
+        .model(call.model.clone())
         .max_tokens(BACKSTOP_MAX_TOKENS)
         .messages(vec![Message::user(prompt)])
         .build();
-    let config = CallConfig::new(BACKSTOP_TIMEOUT);
+    let config = CallConfig::new(BACKSTOP_TIMEOUT).with_endpoint(call.endpoint.clone());
 
-    let response = match claude_client::send_messages(&api_key, &request, &config).await {
+    let response = match claude_client::send_messages(&call.api_key, &request, &config).await {
         Ok(response) => response,
         Err(err) => {
             tracing::warn!(

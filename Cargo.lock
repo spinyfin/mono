@@ -421,6 +421,7 @@ dependencies = [
  "boss-engine-recovery",
  "boss-engine-structured-output",
  "boss-engine-transient-error",
+ "boss-engine-utility-model",
  "boss-engine-utils",
  "boss-engine-worker-policy",
  "boss-event-bus",
@@ -477,6 +478,7 @@ name = "boss-engine-comment-classifier"
 version = "0.1.0"
 dependencies = [
  "boss-claude-client",
+ "boss-engine-utility-model",
  "boss-engine-utils",
  "boss-protocol",
  "serde",
@@ -608,6 +610,15 @@ name = "boss-engine-transient-error"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+]
+
+[[package]]
+name = "boss-engine-utility-model"
+version = "0.1.0"
+dependencies = [
+ "boss-claude-client",
+ "thiserror 1.0.69",
+ "tracing",
 ]
 
 [[package]]

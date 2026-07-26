@@ -406,17 +406,17 @@ impl ExecutionRunner for PaneSpawnRunner {
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and
         // every other identifier — this label is purely visual. We
-        // resolve the API key lazily and let the helper handle every
-        // failure mode (missing key, API error, cache miss) so a
-        // slow or unreachable Anthropic never blocks the spawn.
-        let api_key = self.cfg.agent().ok().and_then(|agent| agent.anthropic_api_key.clone());
+        // resolve the utility-model provider lazily and let the helper handle
+        // every failure mode (no credential, API error, cache miss) so a slow
+        // or unreachable provider never blocks the spawn.
+        let utility = self.cfg.utility_model();
         // `derived_title_summary` exhaustively matches `ExecutionKind` (its doc
         // comment demands this — see `execution.rs`) to decide whether this kind
         // needs a pure derived phrase or can use the cached/LLM path; see its
         // doc comment for why some kinds can't share `get_or_generate`.
         let title_summary = match pane_summary::derived_title_summary(&execution.kind, work_item_name(work_item)) {
             Some(summary) => summary,
-            None => pane_summary::get_or_generate(&self.work_db, api_key.as_deref(), work_item).await,
+            None => pane_summary::get_or_generate(&self.work_db, utility.as_ref(), work_item).await,
         };
 
         let work_item_binding = Some(WorkItemBinding {

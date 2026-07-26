@@ -1028,7 +1028,7 @@ async fn planner_prompt_embeds_real_doc_and_context() {
     assert!(prompt.contains("Alpha"), "prompt carries the project name");
 
     // The request body forces the structured-output tool call and pins model.
-    let body = build_request_body(&input);
+    let body = build_request_body(&input, PLANNER_MODEL);
     assert_eq!(body["model"], PLANNER_MODEL);
     assert_eq!(body["tool_choice"]["type"], "tool");
     assert_eq!(body["tool_choice"]["name"], "emit_task_graph");
