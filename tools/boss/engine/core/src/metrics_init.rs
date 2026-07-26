@@ -220,9 +220,9 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            81,
+            83,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
-             10 dispatcher + 12 merge_poller + 18 external_tracker + 2 speculative_conflict + \
+             10 dispatcher + 14 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api counters"
@@ -242,9 +242,10 @@ mod tests {
                 "dispatch.queue_oldest_wait_seconds.review",
                 "github_api.graphql.remaining",
                 "github_api.rest.remaining",
+                "merge_poller.adaptive_tracked",
             ],
             "init_all must register the dep_unblock gauge, the queue-level dispatch gauges, \
-             and the GitHub remaining-quota gauges",
+             the GitHub remaining-quota gauges, and the adaptive-schedule size gauge",
         );
     }
 }
