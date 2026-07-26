@@ -1179,8 +1179,9 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
     assert_eq!(prereqs_listed.len(), 2, "got {listed_ids:?}");
     assert!(listed_ids.contains(&prereq1.id) && listed_ids.contains(&prereq2.id));
 
-    // `boss task list --dependents-of <target>` → no project_tasks
-    // (the only dependent is a chore).
+    // `boss task list --dependents-of <target>` is flavor-complete: the
+    // only dependent is a chore, and it must appear here (not only under
+    // `boss chore list`).
     let dep_tasks = list_tasks_filtered(
         &mut client,
         &product.id,
@@ -1188,13 +1189,17 @@ async fn dependency_show_detail_and_list_filters() -> Result<()> {
         Some(DependencyFilter::DependentsOf { id: target.id.clone() }),
     )
     .await?;
-    assert!(
-        dep_tasks.is_empty(),
-        "no project_task dependents in fixture, got {:?}",
+    assert_eq!(
+        dep_tasks.len(),
+        1,
+        "expected the chore dependent on task list, got {:?}",
         dep_tasks.iter().map(|t| &t.id).collect::<Vec<_>>()
     );
+    assert_eq!(dep_tasks[0].id, dependent_chore.id);
+    assert_eq!(dep_tasks[0].kind, TaskKind::Chore);
 
-    // `boss chore list --dependents-of <target>` → the chore.
+    // `boss chore list --dependents-of <target>` → the same chore
+    // (kind-narrowed view still works).
     let dep_chores = list_chores_filtered(
         &mut client,
         &product.id,

@@ -3,8 +3,9 @@ use super::*;
 // ── find_work_items_by_pr (boss task by-pr) ─────────────────────────────────
 
 /// The original miss: a chore-backed PR must be findable by PR number.
-/// `list_tasks` omits `kind = chore` rows entirely, so this is the case
-/// the by-pr lookup exists to fix.
+/// `list_tasks` used to omit `kind = chore` rows entirely; `by-pr`
+/// remains the O(1) PR-number path (and surfaces revision children
+/// under the owner) even after `list_tasks` became flavor-complete.
 #[test]
 fn find_by_pr_finds_chore_backed_pr() {
     let db = WorkDb::open(temp_db_path("by-pr-chore")).unwrap();

@@ -1609,10 +1609,11 @@ mod tests {
             "expected populate to proceed despite the design revision, got {outcome:?}"
         );
         // The revision and the newly staged planner task both remain,
-        // alongside the design task itself (3 rows total on the project;
-        // `list_project_task_briefs` — the source of the pre-seed count —
-        // isn't restricted to the `project_task`/`design`/`investigation`
-        // kinds that `list_tasks` narrows to).
+        // alongside the design task itself (3 rows total on the project).
+        // `list_project_task_briefs` is the source of the pre-seed count
+        // and is not kind-filtered; `list_tasks` is flavor-complete too
+        // (including revisions), but pre-seed counting uses the brief
+        // query + `is_pre_seed_kind` filter rather than list_tasks.
         let briefs = db.list_project_task_briefs(&project_id).unwrap();
         assert_eq!(briefs.len(), 3);
         assert!(briefs.iter().any(|(_, _, kind)| kind == "revision"));

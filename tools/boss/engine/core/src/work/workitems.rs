@@ -28,16 +28,20 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 /// `followup` were invisible on every listing surface because of exactly
 /// that).
 ///
-/// A kind is excluded only when it has a compensating listing surface of
-/// its own (`Chore` → `list_chores`) or is deliberately non-listed by
-/// design (`Revision` → rolls up onto its parent's card, never a
-/// standalone row — see `project_postmortem_sweep.rs`'s "rule 2" and the
-/// kanban design doc). Every other kind belongs here by default.
+/// Default is inclusion for every kind. `boss task list` is the
+/// flavor-complete leaf listing surface: chore and revision rows must
+/// appear here rather than being silently dropped (which forced
+/// operators onto `boss chore list` / `boss task list-revisions` and
+/// made PR→work-item lookup via `task list` impossible). Narrow listing
+/// surfaces (`list_chores`, `list_revisions`) remain available for
+/// callers that want one kind only. The kanban board still uses
+/// [`WorkDb::get_work_tree`], which partitions chores and projects
+/// separately and is unaffected by this filter.
 fn kind_returned_by_list_tasks(kind: &TaskKind) -> bool {
     match kind {
-        TaskKind::Chore => false,
-        TaskKind::Revision => false,
-        TaskKind::Design
+        TaskKind::Chore
+        | TaskKind::Revision
+        | TaskKind::Design
         | TaskKind::Followup
         | TaskKind::Investigation
         | TaskKind::DesignPostmortem
@@ -1232,10 +1236,11 @@ impl WorkDb {
         Ok(())
     }
 
-    /// List `kind = 'revision'` rows for a product. Revisions are excluded
-    /// from `list_tasks` and `list_chores` by design; this is the only bulk
-    /// enumeration path. Optionally restrict to a single parent via
-    /// `parent_id`.
+    /// List `kind = 'revision'` rows for a product. Revisions are also
+    /// returned by [`Self::list_tasks`]; this path remains the dedicated
+    /// bulk enumeration that can scope to a single parent via `parent_id`
+    /// and maps `parent_task_id` / provenance columns that the general
+    /// list surface does not need.
     ///
     /// When `parent_id` is supplied, it is resolved to the chain root first:
     /// revisions always store `parent_task_id` as the original non-revision
