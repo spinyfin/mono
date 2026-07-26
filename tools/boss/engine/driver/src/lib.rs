@@ -541,9 +541,9 @@ impl ProgressFidelity {
     /// no empirically-grounded per-tier threshold to substitute — picking
     /// one would be guessing a number that either still false-positives on
     /// a slow-but-healthy turn or is so generous it stops backstopping
-    /// anything. Given the task's own ordering ("erring toward 'too lax' is
-    /// recoverable by a human; erring toward 'too eager' destroys work"),
-    /// `Coarse` is exempted rather than assigned a guessed threshold.
+    /// anything. Erring toward "too lax" is recoverable by a human; erring
+    /// toward "too eager" destroys work — so `Coarse` is exempted rather
+    /// than assigned a guessed threshold.
     /// `Minimal` (process-alive-only) has no event stream to key cadence
     /// off at all, so it is exempted for the same reason the design doc's
     /// risk register already named: "hold `Working` while alive, and exempt
@@ -565,10 +565,10 @@ impl ProgressFidelity {
     /// declaring `Rich` gets the exact same protection Claude gets today.
     /// Exempting it wholesale because its transport is stdout rather than
     /// hooks would blind the sweep to a genuinely hung Codex worker for no
-    /// reason tied to the actual signal it emits — the row's own brief
-    /// names that failure mode ("a genuinely hung Codex worker is never
-    /// swept, holds its slot, and wedges dispatch") as a live risk this
-    /// exemption would reintroduce. The fidelity tier — not the transport —
+    /// reason tied to the actual signal it emits, reintroducing the failure
+    /// mode this guard exists to prevent: a genuinely hung Codex worker is
+    /// never swept, holds its slot, and wedges dispatch. The fidelity tier —
+    /// not the transport —
     /// is what determines whether cadence-based judgement is valid.
     pub fn stale_threshold_secs(self, default_stale_threshold_secs: i64) -> Option<i64> {
         match self {

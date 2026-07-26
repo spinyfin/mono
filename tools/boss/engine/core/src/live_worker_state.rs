@@ -66,6 +66,16 @@ struct Inner {
     /// behaviour unchanged. Deliberately kept out of [`LiveWorkerState`]
     /// itself: that struct is the wire format the app/bossctl consume, and
     /// this value has no UI consumer, only the sweep's.
+    ///
+    /// In-memory only, and not persisted or rehydrated anywhere: if the
+    /// engine restarts while a worker is alive, this map starts empty and
+    /// the slot re-defaults to `Rich` until the driver re-declares (which
+    /// today only happens at spawn, not on rehydrate). For a `Coarse`- or
+    /// `Minimal`-tier driver this silently re-enables cadence-based
+    /// staleness judgement for a slot the exemption was meant to protect —
+    /// a live worker mid-turn with no per-tool event can then be swept as
+    /// stale. No-op today (Claude is `Rich`), but a real gap for the first
+    /// non-`Rich` driver.
     progress_fidelity: HashMap<u8, ProgressFidelity>,
 }
 
