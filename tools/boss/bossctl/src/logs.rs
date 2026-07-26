@@ -57,13 +57,15 @@ impl LogsQuery {
         let since_ms = self
             .since
             .as_deref()
-            .map(|s| parse_time_spec(s, now, true))
+            // date-only → start of that UTC day
+            .map(|s| parse_time_spec(s, now, true, false))
             .transpose()
             .context("parsing --since")?;
         let until_ms = self
             .until
             .as_deref()
-            .map(|s| parse_time_spec(s, now, true))
+            // date-only → inclusive end of that UTC day
+            .map(|s| parse_time_spec(s, now, true, true))
             .transpose()
             .context("parsing --until")?;
         if let (Some(s), Some(u)) = (since_ms, until_ms)

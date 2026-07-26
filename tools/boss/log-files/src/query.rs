@@ -300,13 +300,15 @@ fn json_number_u128(v: &Value) -> Option<u128> {
 /// Accepts:
 /// - relative offsets: `30s`, `15m`, `6h`, `2d` (measured back/forward from `now_ms`)
 /// - absolute RFC3339: `2026-07-26T06:20:00Z`, `2026-07-26T06:20:00+00:00`
-/// - absolute date (UTC midnight): `2026-07-26`
+/// - absolute date `YYYY-MM-DD`:
+///   - for `--since` (`date_end_of_day = false`): UTC start of that day (`T00:00:00Z`)
+///   - for `--until` (`date_end_of_day = true`): inclusive end of that UTC day
+///     (exclusive next midnight − 1 ms), so the whole calendar day is included
 /// - bare integer epoch: seconds if `< 10^12`, else milliseconds
 ///
-/// For relative forms, `since` style uses subtraction from `now_ms` (both
-/// `--since` and `--until` call this the same way — pass the intended
-/// direction via `relative_is_past`).
-pub fn parse_time_spec(value: &str, now_ms: u128, relative_is_past: bool) -> Result<u128> {
+/// For relative forms, pass the intended direction via `relative_is_past`
+/// (true = subtract from `now_ms`).
+pub fn parse_time_spec(value: &str, now_ms: u128, relative_is_past: bool, date_end_of_day: bool) -> Result<u128> {
     let value = value.trim();
     if value.is_empty() {
         bail!("empty time value");
@@ -349,10 +351,15 @@ pub fn parse_time_spec(value: &str, now_ms: u128, relative_is_past: bool) -> Res
         });
     }
 
-    // Date-only YYYY-MM-DD → UTC midnight.
+    // Date-only YYYY-MM-DD.
     if value.len() == 10 && value.as_bytes().get(4) == Some(&b'-') && value.as_bytes().get(7) == Some(&b'-') {
-        let full = format!("{value}T00:00:00Z");
-        return parse_rfc3339_to_epoch_ms(&full).with_context(|| format!("invalid date `{value}`"));
+        let start = parse_rfc3339_to_epoch_ms(&format!("{value}T00:00:00Z"))
+            .with_context(|| format!("invalid date `{value}`"))?;
+        if date_end_of_day {
+            // Inclusive end-of-day == exclusive next midnight − 1 ms (UTC days are 86_400_000 ms).
+            return Ok(start.saturating_add(86_400_000).saturating_sub(1));
+        }
+        return Ok(start);
     }
 
     // RFC3339 / ISO-8601.
@@ -405,11 +412,6 @@ pub fn follow_line_matches(line: &str, filter: &LogFilter) -> bool {
     live.since_ms = None;
     live.until_ms = None;
     line_matches(line, &live)
-}
-
-/// Convenience: resolve paths and run a query in one call.
-pub fn query_source_files(paths: &[PathBuf], filter: &LogFilter, limit: usize) -> Result<QueryResult> {
-    query_log_files(paths, filter, limit)
 }
 
 #[cfg(test)]
@@ -525,39 +527,64 @@ mod tests {
     #[test]
     fn time_window_filters_by_timestamp_and_ts_epoch_ms() {
         let a = r#"{"timestamp":"2026-07-26T01:00:00Z","level":"INFO","fields":{"message":"a"},"target":"t"}"#;
-        let b = r#"{"ts_epoch_ms":1785027600000,"stage":"x"}"#; // 2026-07-26T02:00:00Z roughly — use parsed
-        // Use known RFC3339 bounds.
+        // 2026-07-26T02:00:00Z as epoch ms.
+        let in_window_ms = parse_rfc3339_to_epoch_ms("2026-07-26T02:00:00Z").unwrap();
+        let b = format!(r#"{{"ts_epoch_ms":{in_window_ms},"stage":"x"}}"#);
+        let outside_ms = parse_rfc3339_to_epoch_ms("2026-07-26T03:00:00Z").unwrap();
+        let c = format!(r#"{{"ts_epoch_ms":{outside_ms},"stage":"y"}}"#);
         let since = parse_rfc3339_to_epoch_ms("2026-07-26T00:30:00Z").unwrap();
-        let until = parse_rfc3339_to_epoch_ms("2026-07-26T01:30:00Z").unwrap();
+        let until = parse_rfc3339_to_epoch_ms("2026-07-26T02:30:00Z").unwrap();
         let filter = LogFilter {
             since_ms: Some(since),
             until_ms: Some(until),
             ..Default::default()
         };
         assert!(line_matches(a, &filter));
-        // b is far in the future relative to that window if ts is huge; just
-        // check undated non-json is rejected.
+        assert!(line_matches(&b, &filter), "ts_epoch_ms inside window must match");
+        assert!(!line_matches(&c, &filter), "ts_epoch_ms outside window must not match");
+        // Undated non-json cannot be placed in a time window.
         assert!(!line_matches("not json at all", &filter));
-        let _ = b; // silence
     }
 
     #[test]
     fn parse_time_spec_relative_and_epoch() {
         let now = 10_000_000_000_u128;
-        assert_eq!(parse_time_spec("30m", now, true).unwrap(), now - 30 * 60_000);
-        assert_eq!(parse_time_spec("2h", now, true).unwrap(), now - 2 * 3_600_000);
-        assert_eq!(parse_time_spec("15s", now, false).unwrap(), now + 15_000);
-        assert_eq!(parse_time_spec("1700000000", now, true).unwrap(), 1_700_000_000_000);
-        assert_eq!(parse_time_spec("1700000000000", now, true).unwrap(), 1_700_000_000_000);
+        assert_eq!(parse_time_spec("30m", now, true, false).unwrap(), now - 30 * 60_000);
+        assert_eq!(parse_time_spec("2h", now, true, false).unwrap(), now - 2 * 3_600_000);
+        assert_eq!(parse_time_spec("15s", now, false, false).unwrap(), now + 15_000);
+        assert_eq!(
+            parse_time_spec("1700000000", now, true, false).unwrap(),
+            1_700_000_000_000
+        );
+        assert_eq!(
+            parse_time_spec("1700000000000", now, true, false).unwrap(),
+            1_700_000_000_000
+        );
     }
 
     #[test]
     fn parse_time_spec_rfc3339_and_date() {
         let now = 0u128;
-        let ms = parse_time_spec("2026-07-26T06:20:00Z", now, true).unwrap();
+        let ms = parse_time_spec("2026-07-26T06:20:00Z", now, true, false).unwrap();
         assert_eq!(ms, parse_rfc3339_to_epoch_ms("2026-07-26T06:20:00Z").unwrap());
-        let day = parse_time_spec("2026-07-26", now, true).unwrap();
-        assert_eq!(day, parse_rfc3339_to_epoch_ms("2026-07-26T00:00:00Z").unwrap());
+        // --since style: start of day.
+        let day_start = parse_time_spec("2026-07-26", now, true, false).unwrap();
+        assert_eq!(day_start, parse_rfc3339_to_epoch_ms("2026-07-26T00:00:00Z").unwrap());
+        // --until style: inclusive end of day (next midnight exclusive − 1 ms).
+        let day_end = parse_time_spec("2026-07-26", now, true, true).unwrap();
+        let next_midnight = parse_rfc3339_to_epoch_ms("2026-07-27T00:00:00Z").unwrap();
+        assert_eq!(day_end, next_midnight - 1);
+        // End-of-day includes a late timestamp that start-of-day alone would exclude.
+        let late = r#"{"timestamp":"2026-07-26T23:59:59Z","level":"INFO","fields":{"message":"late"},"target":"t"}"#;
+        let until_filter = LogFilter {
+            since_ms: Some(day_start),
+            until_ms: Some(day_end),
+            ..Default::default()
+        };
+        assert!(line_matches(late, &until_filter));
+        let too_late =
+            r#"{"timestamp":"2026-07-27T00:00:00Z","level":"INFO","fields":{"message":"next"},"target":"t"}"#;
+        assert!(!line_matches(too_late, &until_filter));
     }
 
     #[test]

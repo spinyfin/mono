@@ -233,13 +233,16 @@ enum Command {
     /// field filters / a larger `--tail` (or `--tail 0` for unlimited) for
     /// incident queries. When the result is capped, a truncation notice is
     /// printed to stderr so a short answer is never mistaken for absence.
+    /// Global `--json` emits original JSONL records one per line (no wrapper)
+    /// so `jq` pipelines keep working; notices stay on stderr.
     ///
     /// Sources:
     /// - `engine` (default) — `engine-trace.jsonl` + rotated segments
     /// - `audit` — `engine-audit.log` (+ rotated, if any)
     /// - `dispatch` — `dispatch-events/current.jsonl`
     /// - `spawn` — `diagnostics/spawn-YYYY-MM-DD.jsonl`
-    /// - `population-timing` — `diagnostics/engine-population-timing-*.jsonl`
+    /// - `population-timing` — `diagnostics/population-timing-*.jsonl` (app)
+    ///   and `diagnostics/engine-population-timing-*.jsonl` (engine)
     Logs {
         /// Which log / diagnostic stream to read.
         #[arg(value_enum, default_value_t = LogSource::Engine)]
@@ -261,10 +264,13 @@ enum Command {
         grep: Option<String>,
         /// Only records at or after this time. Accepts relative offsets
         /// (`30m`, `6h`, `2d`, `90s`), RFC3339 (`2026-07-26T06:20:00Z`),
-        /// a date (`2026-07-26`), or an epoch integer (seconds or ms).
+        /// a date (`2026-07-26` = start of that UTC day), or an epoch integer
+        /// (seconds or ms).
         #[arg(long)]
         since: Option<String>,
         /// Only records at or before this time. Same formats as `--since`.
+        /// A bare date (`2026-07-26`) is end-of-day UTC so that whole calendar
+        /// day is included (exclusive next midnight).
         #[arg(long)]
         until: Option<String>,
         /// Match the JSON `target` field (tracing module path). Exact match
@@ -534,7 +540,8 @@ pub(crate) enum LogSource {
     Dispatch,
     /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
     Spawn,
-    /// `diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`.
+    /// App + engine population-timing day files under `diagnostics/`
+    /// (`population-timing-*.jsonl` and `engine-population-timing-*.jsonl`).
     #[value(name = "population-timing")]
     PopulationTiming,
 }

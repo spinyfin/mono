@@ -41,6 +41,14 @@ pub const SPAWN_DIAGNOSTICS_PREFIX: &str = "spawn-";
 /// (`engine-population-timing-YYYY-MM-DD.jsonl`).
 pub const POPULATION_TIMING_PREFIX: &str = "engine-population-timing-";
 
+/// Day-rotated filename prefix for app-side population-timing diagnostics
+/// (`population-timing-YYYY-MM-DD.jsonl` under the same `diagnostics/` dir).
+///
+/// The macOS app writes the primary client-side stream under this prefix; the
+/// engine writes under [`POPULATION_TIMING_PREFIX`]. Both belong to the
+/// `population-timing` log source.
+pub const APP_POPULATION_TIMING_PREFIX: &str = "population-timing-";
+
 /// Which engine log / diagnostic stream a reader is targeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogSource {
@@ -52,7 +60,9 @@ pub enum LogSource {
     Dispatch,
     /// `diagnostics/spawn-YYYY-MM-DD.jsonl` — worker-spawn diagnostics.
     Spawn,
-    /// `diagnostics/engine-population-timing-YYYY-MM-DD.jsonl`.
+    /// App + engine population-timing day files under `diagnostics/`:
+    /// `population-timing-YYYY-MM-DD.jsonl` and
+    /// `engine-population-timing-YYYY-MM-DD.jsonl`.
     PopulationTiming,
 }
 
@@ -156,8 +166,9 @@ pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf 
 /// - Trace / audit: rotated segments (oldest first) then the live file.
 /// - Dispatch: the single `current.jsonl` (and any `<name>.<unix_s>` siblings
 ///   if present, for forward-compat with future rotation).
-/// - Spawn / population-timing: day-dated files under `diagnostics/`, sorted
-///   by the date embedded in the filename.
+/// - Spawn: day-dated files under `diagnostics/`, sorted by date in the name.
+/// - Population-timing: both engine (`engine-population-timing-*`) and app
+///   (`population-timing-*`) day files, merged and sorted by date.
 pub fn resolve_log_source_files(source: LogSource, state_root: &Path) -> Vec<PathBuf> {
     match source {
         LogSource::EngineTrace | LogSource::Audit => {
@@ -169,7 +180,10 @@ pub fn resolve_log_source_files(source: LogSource, state_root: &Path) -> Vec<Pat
             crate::segments::segments_with_live(&base)
         }
         LogSource::Spawn => day_rotated_files(&state_root.join(DIAGNOSTICS_DIR), SPAWN_DIAGNOSTICS_PREFIX),
-        LogSource::PopulationTiming => day_rotated_files(&state_root.join(DIAGNOSTICS_DIR), POPULATION_TIMING_PREFIX),
+        LogSource::PopulationTiming => merge_day_rotated_files(
+            &state_root.join(DIAGNOSTICS_DIR),
+            &[POPULATION_TIMING_PREFIX, APP_POPULATION_TIMING_PREFIX],
+        ),
     }
 }
 
@@ -193,17 +207,47 @@ pub fn day_rotated_files(dir: &Path, prefix: &str) -> Vec<PathBuf> {
                     let Some(date) = rest.strip_suffix(suffix) else {
                         return false;
                     };
-                    // YYYY-MM-DD
-                    date.len() == 10
-                        && date.as_bytes().get(4) == Some(&b'-')
-                        && date.as_bytes().get(7) == Some(&b'-')
-                        && date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+                    is_yyyy_mm_dd(date)
                 })
                 .unwrap_or(false)
         })
         .collect();
     files.sort();
     files
+}
+
+/// Merge day-rotated files for multiple prefixes, sorted by the YYYY-MM-DD
+/// embedded in each filename (then by full filename for same-day stability).
+pub fn merge_day_rotated_files(dir: &Path, prefixes: &[&str]) -> Vec<PathBuf> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for prefix in prefixes {
+        files.extend(day_rotated_files(dir, prefix));
+    }
+    files.sort_by(|a, b| {
+        day_file_date_key(a)
+            .cmp(&day_file_date_key(b))
+            .then_with(|| a.file_name().cmp(&b.file_name()))
+    });
+    files
+}
+
+fn is_yyyy_mm_dd(date: &str) -> bool {
+    date.len() == 10
+        && date.as_bytes().get(4) == Some(&b'-')
+        && date.as_bytes().get(7) == Some(&b'-')
+        && date.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+}
+
+/// Extract the trailing `YYYY-MM-DD` from a day-rotated filename
+/// (`<prefix>YYYY-MM-DD.jsonl`). Returns `None` when the shape does not match.
+fn day_file_date_key(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".jsonl")?;
+    if stem.len() < 10 {
+        return None;
+    }
+    let date = &stem[stem.len() - 10..];
+    if is_yyyy_mm_dd(date) { Some(date) } else { None }
 }
 
 /// Resolve the default audit-log path: [`AUDIT_PATH_ENV`] if set, otherwise
@@ -329,5 +373,34 @@ mod tests {
         std::fs::write(diag.join("spawn-2026-07-26.jsonl"), b"{}\n").unwrap();
         let files = resolve_log_source_files(LogSource::Spawn, dir.path());
         assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn population_timing_merges_app_and_engine_day_files_by_date() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let diag = dir.path().join(DIAGNOSTICS_DIR);
+        std::fs::create_dir_all(&diag).unwrap();
+        // Intentionally write out of order and interleave prefixes.
+        std::fs::write(diag.join("population-timing-2026-07-26.jsonl"), b"app26\n").unwrap();
+        std::fs::write(diag.join("engine-population-timing-2026-07-25.jsonl"), b"eng25\n").unwrap();
+        std::fs::write(diag.join("population-timing-2026-07-25.jsonl"), b"app25\n").unwrap();
+        std::fs::write(diag.join("engine-population-timing-2026-07-26.jsonl"), b"eng26\n").unwrap();
+        // Noise: spawn diagnostics must not appear.
+        std::fs::write(diag.join("spawn-2026-07-25.jsonl"), b"spawn\n").unwrap();
+
+        let files = resolve_log_source_files(LogSource::PopulationTiming, dir.path());
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "engine-population-timing-2026-07-25.jsonl",
+                "population-timing-2026-07-25.jsonl",
+                "engine-population-timing-2026-07-26.jsonl",
+                "population-timing-2026-07-26.jsonl",
+            ]
+        );
     }
 }
