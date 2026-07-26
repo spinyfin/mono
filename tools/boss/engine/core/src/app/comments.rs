@@ -8,8 +8,8 @@
 use super::*;
 
 use boss_protocol::{
-    COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, INTENT_REVISION, THREAD_ENTRY_KIND_NUDGE,
-    THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+    AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, CommentThreadEntry, INTENT_REVISION,
+    THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
 use crate::utility_model::UtilityTask;
@@ -800,6 +800,20 @@ pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
     else {
         unreachable!()
     };
+    // Fold the bossctl `comments list` pr_doc slug resolution into the
+    // engine so CLI and app callers can pass `owner/repo` in the
+    // composite key the same way humans write it.
+    let artifact_id = if artifact_kind == "pr_doc" {
+        match work_db.resolve_pr_doc_artifact_id(&artifact_id) {
+            Ok(resolved) => resolved,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        }
+    } else {
+        artifact_id
+    };
     match work_db.list_comments_with_thread(&artifact_kind, &artifact_id, include_resolved) {
         Ok(comments) => send_response_with_revision(
             &sink,
@@ -813,6 +827,86 @@ pub(super) async fn handle_comments_list(ctx: Dispatch, req: FrontendRequest) {
         ),
         Err(err) => send_work_error(&sink, &request_id, &err),
     }
+}
+
+/// Read-only: one comment + thread + answer-agent-run history. Backs
+/// `boss comment show` (folds the bossctl direct-DB path onto the engine
+/// RPC surface so the coordinator never needs raw sqlite3).
+pub(super) async fn handle_comments_get(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::CommentsGet { comment_id } = req else {
+        unreachable!()
+    };
+    match load_comment_detail(&work_db, &comment_id) {
+        Ok(Some((comment, thread_entries, answer_agent_runs))) => {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::CommentsGetResult {
+                    comment,
+                    thread_entries,
+                    answer_agent_runs,
+                },
+            );
+        }
+        Ok(None) => send_work_error(&sink, &request_id, anyhow::anyhow!("unknown comment: {comment_id}")),
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
+/// Read-only: every `answer_agent_runs` row for a comment. Backs
+/// `boss comment runs`.
+pub(super) async fn handle_list_answer_agent_runs(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::ListAnswerAgentRuns { comment_id } = req else {
+        unreachable!()
+    };
+    match work_db.get_comment(&comment_id) {
+        Ok(None) => {
+            send_work_error(&sink, &request_id, anyhow::anyhow!("unknown comment: {comment_id}"));
+            return;
+        }
+        Ok(Some(_)) => {}
+        Err(err) => {
+            send_work_error(&sink, &request_id, &err);
+            return;
+        }
+    }
+    match work_db.list_answer_agent_runs_for_comment(&comment_id) {
+        Ok(answer_agent_runs) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::AnswerAgentRunsList {
+                comment_id,
+                answer_agent_runs,
+            },
+        ),
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}
+
+/// Comment + thread + answer-agent-run history loaded for [`handle_comments_get`].
+type CommentDetail = (WorkComment, Vec<CommentThreadEntry>, Vec<AnswerAgentRun>);
+
+/// Shared load path for [`handle_comments_get`]: comment row + thread +
+/// answer-agent runs. Returns `Ok(None)` when the comment id is unknown.
+fn load_comment_detail(work_db: &WorkDb, comment_id: &str) -> Result<Option<CommentDetail>> {
+    let Some(comment) = work_db.get_comment(comment_id)? else {
+        return Ok(None);
+    };
+    let thread_entries = work_db.list_comment_thread_entries(comment_id)?;
+    let answer_agent_runs = work_db.list_answer_agent_runs_for_comment(comment_id)?;
+    Ok(Some((comment, thread_entries, answer_agent_runs)))
 }
 
 /// Reply to `comments_banner_state` — a read-only `[Revise]`-banner summary,

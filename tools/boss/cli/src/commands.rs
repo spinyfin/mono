@@ -83,9 +83,9 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: ChoreCommand,
     },
-    /// Manage markdown-viewer comment threads. Currently just the one
-    /// write action a read-only answer-agent worker is permitted: posting
-    /// its reply.
+    /// Manage markdown-viewer comment threads: read-only list/show/runs
+    /// inspection for operators and the coordinator, plus the one write
+    /// action a read-only answer-agent worker is permitted (`reply`).
     Comment {
         #[command(subcommand)]
         command: CommentCommand,
@@ -415,6 +415,12 @@ pub(crate) enum TaskCommand {
     /// the right inspection verb instead of a work-item lookup.
     #[command(name = "by-exec")]
     ByExec(ByExecArgs),
+    /// Full execution history for a work item — every `work_executions`
+    /// row, oldest first. `boss task show` only surfaces the most recent
+    /// 20; this is the untruncated ledger (and the engine-RPC half of
+    /// `bossctl work executions`).
+    #[command(name = "executions")]
+    Executions(TaskExecutionsArgs),
     /// Show any leaf work item (task or chore) by id.
     Show(TaskIdArg),
     /// Update any leaf work item (task or chore) by id.
@@ -573,6 +579,20 @@ pub(crate) struct PrStatusArgs {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum CommentCommand {
+    /// List comments on an artifact. `--task` is shorthand for a work-item
+    /// comment thread; pass `--artifact` + `--artifact-kind` for a
+    /// `pr_doc:<owner>/<repo>:<branch>:<path>` composite key. Excludes
+    /// `resolved`/`dismissed` unless `--include-resolved` — `orphaned`
+    /// comments are always included. Engine-RPC half of
+    /// `bossctl comments list`.
+    List(CommentListArgs),
+    /// Show one comment: anchor, status, intent classification, thread
+    /// entries, and full answer-agent-run history. Engine-RPC half of
+    /// `bossctl comments show`.
+    Show(CommentShowArgs),
+    /// List every `answer_agent_runs` row for a comment, oldest first.
+    /// Engine-RPC half of `bossctl comments runs`.
+    Runs(CommentRunsArgs),
     /// Post the answer agent's reply to the comment thread this run was
     /// spawned for. The target thread is derived from the caller's own
     /// `BOSS_RUN_ID` — there is no `--comment-id` (or similar) flag, by
@@ -584,6 +604,37 @@ pub(crate) enum CommentCommand {
 }
 
 #[derive(Debug, Args)]
+pub(crate) struct CommentListArgs {
+    /// Work item (task/chore) id whose comments to list — shorthand
+    /// for `--artifact-kind work_item --artifact <id>`.
+    #[arg(long)]
+    pub(crate) task: Option<String>,
+    /// Raw artifact id (e.g. a `pr_doc:<owner>/<repo>:<branch>:<path>`
+    /// composite key — an SSH or HTTPS remote URL also works for
+    /// `<owner>/<repo>`). Pairs with `--artifact-kind`.
+    #[arg(long)]
+    pub(crate) artifact: Option<String>,
+    /// Artifact kind for `--artifact` (`work_item` or `pr_doc`).
+    #[arg(long, default_value = "pr_doc")]
+    pub(crate) artifact_kind: String,
+    /// Include `resolved`/`dismissed` comments (excluded by default).
+    #[arg(long)]
+    pub(crate) include_resolved: bool,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CommentShowArgs {
+    /// Comment id (`cmt_…`).
+    pub(crate) comment_id: String,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct CommentRunsArgs {
+    /// Comment id (`cmt_…`) whose answer-agent runs to list.
+    pub(crate) comment_id: String,
+}
+
+#[derive(Debug, Args)]
 pub(crate) struct CommentReplyArgs {
     /// The comprehensive answer to post. Pass the full text inline —
     /// there is deliberately no `--body-file` (a file-reading flag on this
@@ -591,6 +642,18 @@ pub(crate) struct CommentReplyArgs {
     /// contents into the thread).
     #[arg(long)]
     pub(crate) body: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskExecutionsArgs {
+    /// Work item id whose execution history to list (task/chore/project
+    /// id, or a friendly short id like `T42` resolved against `--product`).
+    pub(crate) id: String,
+    /// Product slug/id used to resolve a friendly short id (`T42`).
+    /// Optional when `id` is already a canonical `task_…` id, or when
+    /// the product can be inferred from the working tree.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
 }
 
 /// Shared subcommands for dependency CRUD. The engine doesn't care

@@ -1783,6 +1783,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::CommentsBannerState { .. } => comments::handle_comments_banner_state(ctx, r).await,
             r @ FrontendRequest::CommentsCreate { .. } => comments::handle_comments_create(ctx, r).await,
             r @ FrontendRequest::CommentsDismiss { .. } => comments::handle_comments_dismiss(ctx, r).await,
+            r @ FrontendRequest::CommentsGet { .. } => comments::handle_comments_get(ctx, r).await,
             r @ FrontendRequest::CommentsList { .. } => comments::handle_comments_list(ctx, r).await,
             r @ FrontendRequest::CommentsPostAnswer { .. } => comments::handle_comments_post_answer(ctx, r).await,
             r @ FrontendRequest::CommentsPostFollowup { .. } => comments::handle_comments_post_followup(ctx, r).await,
@@ -1865,6 +1866,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::LinkWorkItemExternalRef { .. } => {
                 external_tracker::handle_link_work_item_external_ref(ctx, r).await
             }
+            r @ FrontendRequest::ListAnswerAgentRuns { .. } => comments::handle_list_answer_agent_runs(ctx, r).await,
             r @ FrontendRequest::ListAttentionGroups { .. } => attentions::handle_list_attention_groups(ctx, r).await,
             r @ FrontendRequest::ListAttentionItems { .. } => attentions::handle_list_attention_items(ctx, r).await,
             r @ FrontendRequest::ListAttentionItemsForWorkItem { .. } => {

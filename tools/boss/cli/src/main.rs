@@ -8,18 +8,18 @@ pub(crate) use boss_client::{
     BossClient, Discovery, engine_socket_reachable, ensure_engine_running, running_engine_pid, stop_engine,
 };
 pub(crate) use boss_protocol::{
-    AddDependencyInput, Attention, AttentionGroup, Automation, AutomationDedupSuppression, AutomationPatch,
-    AutomationRun, AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, ConflictHotspotReport,
-    ConflictResolution, CreateAttentionInput, CreateAutomationInput, CreateChoreInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
-    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent,
-    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
-    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
-    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationDedupSuppression,
+    AutomationPatch, AutomationRun, AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation,
+    ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAutomationInput, CreateChoreInput,
+    CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
+    CreateRevisionInput, CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction,
+    EditorialRules, EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride,
+    FrontendEvent, FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState,
+    PlannerOutput, PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode,
+    RemoveDependencyInput, ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
-    WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch,
+    WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail,
+    WorkItemDependencyView, WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};

@@ -8,19 +8,20 @@ use crate::host_registry_wire::HostSnapshot;
 use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
-    AddDependencyInput, Attention, AttentionGroup, AttentionMerge, Automation, AutomationDedupSuppression,
-    AutomationPatch, AutomationRun, CiBudgetSnapshot, CiRemediation, CommentAnchor, CommentWithThread,
-    CommentsBannerState, ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAttentionItemInput,
-    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateExecutionInput, CreateInvestigationInput,
-    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
-    CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState,
-    EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
-    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState,
-    ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
-    ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput,
-    SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
-    WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
+    AutomationDedupSuppression, AutomationPatch, AutomationRun, CiBudgetSnapshot, CiRemediation, CommentAnchor,
+    CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport, ConflictResolution,
+    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
+    CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter,
+    DesignDocContent, DesignDocTreeState, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
+    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch,
+    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -298,6 +299,15 @@ pub enum FrontendRequest {
         comment_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<String>,
+    },
+
+    /// Read-only: fetch one comment by id together with its thread entries
+    /// and full answer-agent-run history. Backs `boss comment show` so the
+    /// coordinator never needs raw `sqlite3` against `state.db` for a stuck
+    /// thread. Replies with [`FrontendEvent::CommentsGetResult`], or
+    /// [`FrontendEvent::WorkError`] when the id is unknown.
+    CommentsGet {
+        comment_id: String,
     },
 
     /// List comments for an artifact. Excludes `resolved` / `dismissed`
@@ -926,6 +936,15 @@ pub enum FrontendRequest {
     LinkWorkItemExternalRef {
         #[serde(flatten)]
         input: LinkExternalRefInput,
+    },
+
+    /// Read-only: every `answer_agent_runs` row for a comment, oldest
+    /// first. Backs `boss comment runs` (and is the answer-agent half of
+    /// `boss comment show`). Replies with
+    /// [`FrontendEvent::AnswerAgentRunsList`], or
+    /// [`FrontendEvent::WorkError`] when the comment id is unknown.
+    ListAnswerAgentRuns {
+        comment_id: String,
     },
 
     /// List attention groups for a product, with optional filters.

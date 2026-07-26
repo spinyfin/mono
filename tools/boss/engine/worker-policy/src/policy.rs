@@ -175,8 +175,13 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // ── Allowed: comment reads ───────────────────────────────────────
         //
         // A revision worker addressing PR review comments has to be able to
-        // read the thread it is answering.
-        FrontendRequest::CommentsBannerState { .. } | FrontendRequest::CommentsList { .. } => Allow,
+        // read the thread it is answering. `CommentsGet` /
+        // `ListAnswerAgentRuns` are the single-comment detail half of the
+        // same surface (`CommentsList` is the bulk half).
+        FrontendRequest::CommentsBannerState { .. }
+        | FrontendRequest::CommentsGet { .. }
+        | FrontendRequest::CommentsList { .. }
+        | FrontendRequest::ListAnswerAgentRuns { .. } => Allow,
 
         // ── Allowed: execution / run reads (sanitized on the way out) ────
         //

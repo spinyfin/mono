@@ -213,3 +213,93 @@ async fn comment_topic_invalidation_reaches_subscriber() -> Result<()> {
 
     Ok(())
 }
+
+/// Read-only detail RPCs: `CommentsGet` returns the comment + empty
+/// thread/runs for a freshly created comment; `ListAnswerAgentRuns`
+/// returns the same empty runs vector. An unknown id is a WorkError.
+#[tokio::test]
+async fn comments_get_and_list_answer_agent_runs() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let created = create_comment(
+        &mut client,
+        CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: "task_readonly".to_owned(),
+            doc_version: "v0".to_owned(),
+            anchor: anchor("span", "", ""),
+            body: "why does this fail?".to_owned(),
+            author: "user:test@example.com".to_owned(),
+            plain_text_projection_version: 1,
+        },
+    )
+    .await?;
+
+    match client
+        .send_request(&FrontendRequest::CommentsGet {
+            comment_id: created.id.clone(),
+        })
+        .await?
+    {
+        FrontendEvent::CommentsGetResult {
+            comment,
+            thread_entries,
+            answer_agent_runs,
+        } => {
+            assert_eq!(comment.id, created.id);
+            assert_eq!(comment.body, "why does this fail?");
+            assert!(thread_entries.is_empty(), "fresh comment has no thread entries");
+            assert!(answer_agent_runs.is_empty(), "fresh comment has no answer-agent runs");
+        }
+        other => return Err(unexpected("comments_get", other)),
+    }
+
+    match client
+        .send_request(&FrontendRequest::ListAnswerAgentRuns {
+            comment_id: created.id.clone(),
+        })
+        .await?
+    {
+        FrontendEvent::AnswerAgentRunsList {
+            comment_id,
+            answer_agent_runs,
+        } => {
+            assert_eq!(comment_id, created.id);
+            assert!(answer_agent_runs.is_empty());
+        }
+        other => return Err(unexpected("list_answer_agent_runs", other)),
+    }
+
+    match client
+        .send_request(&FrontendRequest::CommentsGet {
+            comment_id: "cmt_does_not_exist".to_owned(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unknown comment"),
+                "expected unknown-comment WorkError, got: {message}"
+            );
+        }
+        other => return Err(unexpected("comments_get unknown", other)),
+    }
+
+    match client
+        .send_request(&FrontendRequest::ListAnswerAgentRuns {
+            comment_id: "cmt_does_not_exist".to_owned(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unknown comment"),
+                "expected unknown-comment WorkError, got: {message}"
+            );
+        }
+        other => return Err(unexpected("list_answer_agent_runs unknown", other)),
+    }
+
+    Ok(())
+}

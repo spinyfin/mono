@@ -847,7 +847,7 @@ pub(crate) async fn run_by_exec(client: &mut BossClient, ctx: &RunContext, args:
         ExecutionKind::AnswerAgent => {
             return Err(CliError::application(format!(
                 "execution {} is an answer-agent run bound to comment {} (not a task/chore) — inspect it with \
-                 `bossctl comments show {}`",
+                 `boss comment show {}`",
                 execution.id, execution.work_item_id, execution.work_item_id
             )));
         }
@@ -1462,6 +1462,65 @@ pub(crate) async fn list_executions_for_item(
     work_item_id: &str,
 ) -> Result<Vec<WorkExecution>, CliError> {
     list_executions_for_item_impl(client, work_item_id, false).await
+}
+
+/// `boss task executions <id>` — untruncated execution history for a work
+/// item (engine-RPC half of `bossctl work executions`). Unlike the
+/// `Executions` section on `boss task show`, this does not truncate to 20
+/// and sorts oldest-first so the full ledger reads chronologically.
+pub(crate) async fn run_task_executions(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskExecutionsArgs,
+) -> Result<(), CliError> {
+    let work_item_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    match client
+        .send_request(&FrontendRequest::ListExecutions {
+            work_item_id: Some(work_item_id.clone()),
+            include_revision_chain: false,
+        })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::ExecutionsList { mut executions, .. } => {
+            // Oldest first — matches bossctl work executions and is what
+            // "history" means for a coordinator scrolling for a prior run.
+            executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+            print_entity(
+                ctx,
+                &serde_json::json!({
+                    "work_item_id": work_item_id,
+                    "executions": executions,
+                }),
+                || {
+                    if executions.is_empty() {
+                        println!("no executions for {work_item_id}");
+                        return;
+                    }
+                    for exec in &executions {
+                        print_execution_history_row(exec);
+                    }
+                },
+            )
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("task executions", &other)),
+    }
+}
+
+fn print_execution_history_row(exec: &WorkExecution) {
+    let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
+    let started = exec.started_at.as_deref().unwrap_or("-");
+    let finished = exec.finished_at.as_deref().unwrap_or("-");
+    println!(
+        "{}  [{}]  kind={}  workspace={}  created={}  started={}  finished={}",
+        exec.id, exec.status, exec.kind, workspace, exec.created_at, started, finished,
+    );
+    if let Some(pr_url) = &exec.pr_url {
+        println!("  pr_url: {pr_url}");
+    }
 }
 
 /// Like [`list_executions_for_item`] but also pulls in every revision task's

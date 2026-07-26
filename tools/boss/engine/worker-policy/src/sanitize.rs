@@ -256,10 +256,12 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::GitHubAuthState { .. }
         | FrontendEvent::TrunkStatus { .. }
         | FrontendEvent::CommentResult { .. }
+        | FrontendEvent::CommentsGetResult { .. }
         | FrontendEvent::CommentsList { .. }
         | FrontendEvent::CommentsBannerState { .. }
         | FrontendEvent::CommentsResolved { .. }
         | FrontendEvent::CommentsReviseDocResult { .. }
+        | FrontendEvent::AnswerAgentRunsList { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }
