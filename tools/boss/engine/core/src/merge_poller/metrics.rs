@@ -100,6 +100,16 @@ crate::register_counter!(
     "merge_poller.comments_reopened",
     "in_revision comments reopened because their task's PR closed without merging in one sweep."
 );
+crate::register_counter!(
+    PASS_OVERRUN,
+    "merge_poller.pass_overrun",
+    "Detection passes that took longer than their own sweep cadence."
+);
+crate::register_counter!(
+    PASS_TIMED_OUT,
+    "merge_poller.pass_timed_out",
+    "Detection passes abandoned mid-flight after exceeding the pass timeout."
+);
 
 /// Register all merge-poller counter handles with `registry`. Called
 /// from [`crate::metrics_init::init_all`] at engine startup.
@@ -114,6 +124,8 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&REVISION_INVALIDATED);
     registry.register_counter(&WORKER_STOPPED_ON_REVIEW);
     registry.register_counter(&COMMENTS_REOPENED);
+    registry.register_counter(&PASS_OVERRUN);
+    registry.register_counter(&PASS_TIMED_OUT);
 }
 
 // ── GitHub API quota budget ─────────────────────────────────────────────
@@ -204,10 +216,31 @@ pub(crate) fn record_rate_limit(body: &serde_json::Value) {
     let Some(remaining) = parse_rate_limit_remaining(body) else {
         return;
     };
+    record_rate_limit_remaining(remaining, "graphql_response");
+}
+
+/// Fold an already-extracted `remaining` reading into the process-wide
+/// budget, logging on a threshold crossing exactly like
+/// [`record_rate_limit`] does for a parsed response body.
+///
+/// **Every** write to [`RATE_LIMIT_REMAINING`] must go through here.
+/// A direct `RATE_LIMIT_REMAINING.store(...)` silently moves the
+/// multiplier that [`rate_limit_throttle_factor`] hands to every poll
+/// interval without leaving a line in the trace, which makes the
+/// `throttle_factor` values recorded elsewhere an unfaithful record of
+/// the multiplier actually in force — the batched-probe rate-limit
+/// rejection path used to do exactly that, forcing the factor to 8.0
+/// while emitting no "quota running low" line at all.
+///
+/// `source` names the observation ("graphql_response", the synthetic
+/// "rate_limit_rejection", …) so a threshold crossing is attributable to
+/// the call that caused it rather than just "something set it".
+pub(crate) fn record_rate_limit_remaining(remaining: i64, source: &str) {
     let previous = RATE_LIMIT_REMAINING.swap(remaining, Ordering::Relaxed);
     if remaining < RATE_LIMIT_LOW_WATER && previous >= RATE_LIMIT_LOW_WATER {
         tracing::warn!(
             remaining,
+            source,
             low_water = RATE_LIMIT_LOW_WATER,
             throttle_factor = throttle_factor_for(remaining, RATE_LIMIT_LOW_WATER),
             "merge poller: GitHub API quota running low — stretching poll cadence",
@@ -215,6 +248,7 @@ pub(crate) fn record_rate_limit(body: &serde_json::Value) {
     } else if remaining >= RATE_LIMIT_LOW_WATER && previous < RATE_LIMIT_LOW_WATER {
         tracing::info!(
             remaining,
+            source,
             "merge poller: GitHub API quota recovered — resuming normal poll cadence",
         );
     }

@@ -2279,8 +2279,15 @@ async fn merge_poller_recovers_missed_pr_open_for_waiting_human_execution() {
     }
     let probe = NoOpProbe;
 
-    let outcome =
-        crate::merge_poller::run_one_pass(db.as_ref(), &probe, publisher.as_ref(), None, Some(handler.as_ref())).await;
+    let outcome = crate::merge_poller::run_one_pass(
+        db.as_ref(),
+        &probe,
+        publisher.as_ref(),
+        None,
+        Some(handler.as_ref()),
+        None,
+    )
+    .await;
 
     assert_eq!(
         outcome.pr_recheck_recovered, 1,

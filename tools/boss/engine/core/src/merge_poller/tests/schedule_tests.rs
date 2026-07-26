@@ -319,3 +319,113 @@ fn conclusion_predicates_partition_closed_sets() {
         assert!(!super::is_pass_conclusion(unknown), "{unknown:?} must not be a pass",);
     }
 }
+
+// ── Pass budget ────────────────────────────────────────────────────────
+//
+// A detection pass that runs past its own cadence used to be completely
+// silent: the only evidence of the 32-minute blackout was the *absence* of
+// `merge_poller` lines in the trace. These guard both halves of the fix —
+// the pass is bounded, and an overrun is loud.
+
+#[tokio::test]
+async fn pass_budget_is_sized_off_the_interval_with_a_floor() {
+    // Well above the floor: three cadences.
+    assert_eq!(pass_budget(Duration::from_secs(60)), Duration::from_secs(180));
+    // Below the floor: a short configured interval must not produce a
+    // budget a normal pass would trip.
+    assert_eq!(pass_budget(Duration::from_secs(5)), MIN_PASS_TIMEOUT);
+}
+
+#[tokio::test]
+async fn a_pass_within_budget_returns_its_outcome_unchanged() {
+    let metrics = Registry::new();
+    crate::merge_poller::init(&metrics);
+    let expected = SweepOutcome {
+        merged: 3,
+        ..SweepOutcome::default()
+    };
+    let out = run_pass_within_budget(
+        "test",
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+        &metrics,
+        async move { expected },
+    )
+    .await;
+    assert_eq!(out, Some(expected));
+    assert_eq!(metrics.counter_value("merge_poller.pass_timed_out"), Some(0));
+    assert_eq!(metrics.counter_value("merge_poller.pass_overrun"), Some(0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_overrunning_pass_is_abandoned_and_counted() {
+    let metrics = Registry::new();
+    crate::merge_poller::init(&metrics);
+    let out = run_pass_within_budget(
+        "test",
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+        &metrics,
+        async {
+            // The 32-minute inline-remediation pass, in miniature.
+            tokio::time::sleep(Duration::from_secs(32 * 60)).await;
+            SweepOutcome::default()
+        },
+    )
+    .await;
+    assert_eq!(out, None, "a pass past its budget must be dropped, not awaited");
+    assert_eq!(
+        metrics.counter_value("merge_poller.pass_timed_out"),
+        Some(1),
+        "the abandoned pass must be counted",
+    );
+    assert_eq!(
+        metrics.counter_value("merge_poller.pass_overrun"),
+        Some(1),
+        "an abandoned pass is also an overrun",
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_pass_slower_than_its_cadence_is_counted_even_when_it_completes() {
+    let metrics = Registry::new();
+    crate::merge_poller::init(&metrics);
+    let out = run_pass_within_budget(
+        "test",
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+        &metrics,
+        async {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            SweepOutcome::default()
+        },
+    )
+    .await;
+    assert!(out.is_some(), "still under the budget, so the outcome is kept");
+    assert_eq!(
+        metrics.counter_value("merge_poller.pass_overrun"),
+        Some(1),
+        "exceeding its own cadence must be loud even when the pass finishes",
+    );
+    assert_eq!(metrics.counter_value("merge_poller.pass_timed_out"), Some(0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_overrunning_targeted_reconcile_is_abandoned() {
+    let metrics = Registry::new();
+    crate::merge_poller::init(&metrics);
+    let out = reconcile_one_within_budget(
+        &metrics,
+        async {
+            tokio::time::sleep(RECONCILE_ONE_TIMEOUT * 4).await;
+            (SweepOutcome::default(), None)
+        },
+        "https://github.com/foo/bar/pull/1",
+    )
+    .await;
+    assert!(
+        out.is_none(),
+        "a targeted reconcile must not hold the wait loop past its budget",
+    );
+    assert_eq!(metrics.counter_value("merge_poller.pass_timed_out"), Some(1));
+}

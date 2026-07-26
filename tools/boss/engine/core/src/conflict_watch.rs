@@ -32,6 +32,7 @@ use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, Effo
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::conflict_ladder;
+use crate::conflict_remediation::{ConflictRemediationQueue, EnqueueOutcome};
 use crate::coordinator::{CubeClient, ExecutionPublisher};
 use crate::merge_poller::{PrLifecycleProbe, parse_pr_number, pr_labels_opt_out};
 #[cfg(test)]
@@ -115,6 +116,45 @@ pub async fn on_conflict_detected(
     work_db: &WorkDb,
     publisher: &dyn ExecutionPublisher,
     cube_client: Option<&dyn CubeClient>,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+) -> bool {
+    let mode = match cube_client {
+        Some(cube) => ConflictRemediationMode::Inline(cube),
+        None => ConflictRemediationMode::Disabled,
+    };
+    on_conflict_detected_with(work_db, publisher, mode, pr_checker, candidate, probe).await
+}
+
+/// How a caller of [`on_conflict_detected_with`] wants the mechanical
+/// escalation ladder run for a freshly-created attempt.
+///
+/// The distinction that matters is **who awaits the ladder**. It leases a
+/// cube workspace, rebases, and pushes — minutes of work. Awaiting that on
+/// the merge poller's detection task is what blinded merge/conflict
+/// detection for tens of minutes at a time (see [`crate::conflict_remediation`]).
+pub enum ConflictRemediationMode<'a> {
+    /// The ladder is off (no cube client / feature flag disabled): spawn the
+    /// worker revision directly, i.e. straight to rung 3. Pre-ladder
+    /// behaviour, preserved exactly.
+    Disabled,
+    /// Run the ladder inline, on the caller's task. The call does not return
+    /// until the ladder finishes. Correct for callers that are not the
+    /// detection loop (tests, one-shot tools).
+    Inline(&'a dyn CubeClient),
+    /// Hand the ladder to the bounded background remediator and return
+    /// immediately, spawning nothing on this tick. The detection path uses
+    /// this: `merge_poller::run_one_pass` must stay pure detect-and-publish.
+    Deferred(&'a ConflictRemediationQueue),
+}
+
+/// [`on_conflict_detected`] with explicit control over how the escalation
+/// ladder is run — see [`ConflictRemediationMode`].
+pub async fn on_conflict_detected_with(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    remediation: ConflictRemediationMode<'_>,
     pr_checker: &dyn PrStateChecker,
     candidate: &PendingMergeCheck,
     probe: &PrLifecycleProbe,
@@ -392,12 +432,55 @@ pub async fn on_conflict_detected(
                             );
                             return reconciled;
                         }
-                    } else {
-                        // Old-style crz (no revision), still in flight.
+                    } else if active_crz.status == "pending" {
+                        // A `pending` attempt with no revision is the shape
+                        // the ladder path deliberately leaves behind when it
+                        // declines to spawn a worker this tick:
+                        // `MechanicalRungsUnavailable` (rung-1 lease failure)
+                        // and, under `ConflictRemediationMode::Deferred`,
+                        // every tick where the background remediator declined
+                        // the enqueue. That is explicitly a **retry** state —
+                        // "the attempt stays pending with no revision_task_id
+                        // so the next tick re-enters the ladder" is the whole
+                        // contract — so fall through to the shared
+                        // insert/lookup + ladder block below.
+                        //
+                        // Returning `false` here (as this branch used to)
+                        // made that contract a lie and stranded the row: once
+                        // the parent is `blocked: merge_conflict` with a
+                        // pending attempt, the `in_review` pre-flight above
+                        // no longer applies and the flip's WHERE guard always
+                        // misses, so every subsequent sweep landed here and
+                        // no-opped. Nothing was in flight, nothing was
+                        // scheduled, and the only automatic recovery was the
+                        // startup-only
+                        // `reconcile_orphaned_conflict_ladder_attempts`.
+                        //
+                        // Falling through creates nothing duplicate: the
+                        // INSERT below UNIQUE-collides with this very row and
+                        // falls back to it, and the remediation queue's own
+                        // dedup declines a second ladder run while one is
+                        // genuinely in flight.
                         tracing::debug!(
                             work_item_id = %candidate.work_item_id,
                             pr_url = %candidate.pr_url,
-                            "conflict_watch: blocked signal re-armed; active crz still in flight; no new dispatch",
+                            attempt_id = %active_crz.id,
+                            "conflict_watch: blocked signal re-armed; attempt pending with no fix vehicle; \
+                             re-entering the ladder for it",
+                        );
+                    } else {
+                        // `running` with no revision: the legacy bespoke
+                        // dispatch (`mark_conflict_resolution_running`, which
+                        // stamps a real lease/workspace/worker onto the row)
+                        // genuinely has an actor holding a cube workspace
+                        // against this PR. Re-entering would race a mechanical
+                        // rebase against it, so this one really is "leave it
+                        // alone" rather than "stranded".
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %active_crz.id,
+                            "conflict_watch: blocked signal re-armed; old-style crz still running; no new dispatch",
                         );
                         return false;
                     }
@@ -589,18 +672,37 @@ pub async fn on_conflict_detected(
                 .latest_conflict_resolution_for_work_item(&candidate.work_item_id)
                 .ok()
                 .flatten();
-            tracing::warn!(
-                work_item_id = %candidate.work_item_id,
-                pr_url = %candidate.pr_url,
-                base_sha_at_trigger = ?probe.base_ref_oid,
-                head_sha_before = ?probe.head_ref_oid,
-                colliding_attempt_id = ?colliding.as_ref().map(|c| c.id.as_str()),
-                colliding_status = ?colliding.as_ref().map(|c| c.status.as_str()),
-                "conflict_watch: insert_conflict_resolution UNIQUE collision; no fresh attempt created for this key",
-            );
-            work_db
+            let active = work_db
                 .active_conflict_resolution_for_work_item(&candidate.work_item_id)
-                .unwrap_or(None)
+                .unwrap_or(None);
+            // A `pending` attempt with no revision is the row the blocked
+            // re-arm path above deliberately falls through on so the ladder
+            // can be retried for it. That collision is the *expected*
+            // outcome of a retry tick, not an anomaly — warning on it every
+            // sweep for the life of a stuck conflict would bury the genuine
+            // "an attempt was silently eaten" signal this line exists for.
+            let expected_ladder_reentry = active
+                .as_ref()
+                .is_some_and(|a| a.status == "pending" && a.revision_task_id.is_none());
+            if expected_ladder_reentry {
+                tracing::debug!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    attempt_id = ?active.as_ref().map(|a| a.id.as_str()),
+                    "conflict_watch: no fresh attempt for this key; re-entering the existing pending attempt",
+                );
+            } else {
+                tracing::warn!(
+                    work_item_id = %candidate.work_item_id,
+                    pr_url = %candidate.pr_url,
+                    base_sha_at_trigger = ?probe.base_ref_oid,
+                    head_sha_before = ?probe.head_ref_oid,
+                    colliding_attempt_id = ?colliding.as_ref().map(|c| c.id.as_str()),
+                    colliding_status = ?colliding.as_ref().map(|c| c.status.as_str()),
+                    "conflict_watch: insert_conflict_resolution UNIQUE collision; no fresh attempt created for this key",
+                );
+            }
+            active
         }
         Err(err) => {
             tracing::warn!(
@@ -647,7 +749,56 @@ pub async fn on_conflict_detected(
             // agent profile instead of the default full-worker one.
             let mut use_small_agent_profile = false;
             let mut mechanical_rungs_unavailable = false;
-            if let Some(cube) = cube_client {
+            if let ConflictRemediationMode::Deferred(queue) = remediation {
+                // Detect-and-publish only. The attempt row above is the
+                // durable "conflict observed, remediation needed" record;
+                // the ladder (and the worker-revision spawn it falls
+                // through to) runs on the remediator's own tasks. Nothing
+                // is spawned on this tick, exactly as on the
+                // `MechanicalRungsUnavailable` path — and for the same
+                // reason: the attempt stays `pending` with no
+                // `revision_task_id`, so a declined enqueue is retried by a
+                // later detection tick rather than lost.
+                //
+                // That retry is not hypothetical: the blocked re-arm path
+                // above (`active_crz.status == "pending"` with no revision)
+                // exists precisely to route the next tick back here. Both
+                // declines below are therefore recoverable —
+                // `AlreadyInFlight` resolves when the running ladder reports
+                // its outcome, and `Cooldown` can now only be owed by an
+                // outcome that genuinely asked to be retried
+                // (`RemediationDisposition::RetryAfterCooldown`), so it
+                // lapses within one cooldown window.
+                mechanical_rungs_unavailable = true;
+                match queue.try_enqueue(candidate, a, probe) {
+                    EnqueueOutcome::Enqueued => {
+                        tracing::info!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: conflict observed; mechanical rungs handed to the background \
+                             remediator (detection path does not wait)",
+                        );
+                    }
+                    EnqueueOutcome::AlreadyInFlight => {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: remediation already in flight for this PR; not enqueuing again",
+                        );
+                    }
+                    EnqueueOutcome::Cooldown => {
+                        tracing::debug!(
+                            work_item_id = %candidate.work_item_id,
+                            pr_url = %candidate.pr_url,
+                            attempt_id = %a.id,
+                            "conflict_watch: remediation for this PR completed recently; deferring re-entry \
+                             until the cooldown elapses",
+                        );
+                    }
+                }
+            } else if let ConflictRemediationMode::Inline(cube) = remediation {
                 match conflict_ladder::try_mechanical_rungs(work_db, publisher, cube, candidate, a).await {
                     conflict_ladder::LadderOutcome::Retired => {
                         tracing::info!(
@@ -985,6 +1136,48 @@ fn take_over_foreign_ci_block(work_db: &WorkDb, candidate: &PendingMergeCheck, f
             false
         }
     }
+}
+
+/// The fall-through half of [`on_conflict_detected_with`]'s ladder block,
+/// callable on its own so the background remediator
+/// ([`crate::conflict_remediation`]) can finish what the detection pass
+/// deliberately did not wait for: when the mechanical rungs don't resolve
+/// the conflict, spawn the worker revision and clear the parent back to
+/// Review so it stays in the Review column while the fix runs in Doing.
+///
+/// Same sequence as the inline path (`maybe_spawn_conflict_revision` →
+/// [`blocking_signal::unblock_for_revision`] → publish
+/// `conflict_revision_in_flight`), so a deferred remediation lands the
+/// parent in exactly the state an inline one would have.
+pub(crate) async fn spawn_conflict_revision_after_ladder(
+    work_db: &WorkDb,
+    publisher: &dyn ExecutionPublisher,
+    pr_checker: &dyn PrStateChecker,
+    candidate: &PendingMergeCheck,
+    probe: &PrLifecycleProbe,
+    attempt: &crate::work::ConflictResolution,
+    use_small_agent_profile: bool,
+) -> bool {
+    let spawned = maybe_spawn_conflict_revision(
+        work_db,
+        publisher,
+        pr_checker,
+        candidate,
+        probe,
+        attempt,
+        use_small_agent_profile,
+    )
+    .await;
+    if spawned && blocking_signal::unblock_for_revision(work_db, SignalKind::MergeConflict, candidate, &attempt.id) {
+        publisher
+            .publish_work_item_changed(
+                &candidate.product_id,
+                &candidate.work_item_id,
+                "conflict_revision_in_flight",
+            )
+            .await;
+    }
+    spawned
 }
 
 /// Create the engine-triggered revision that delivers the conflict fix and
