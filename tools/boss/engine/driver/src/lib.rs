@@ -903,6 +903,107 @@ pub fn default_pr_url_capture_feed(
     Some(PrUrlCaptureFeed { output_text, command })
 }
 
+/// Inputs for [`AgentDriver::structured_output_wiring`]
+/// ([`Capability::StructuredOutput`]).
+///
+/// The engine designates one absolute [`Self::result_path`] per
+/// `(execution, kind)` (see [`boss_engine_structured_output`]) and, when it
+/// has one, an opaque JSON Schema the agent should honour. The driver turns
+/// those into the backend-specific spawn artifacts: env-file contract for
+/// Claude, or CLI flags such as Codex's `--output-schema` /
+/// `--output-last-message` for a driver with native schema enforcement.
+///
+/// The schema's *format* is not defined here — the seam carries whatever the
+/// caller supplies. Drivers that cannot enforce a schema ignore it.
+#[derive(Debug, Clone, Copy)]
+pub struct StructuredOutputRequest<'a> {
+    /// Which payload this wiring is for. Selects the env-var name under the
+    /// file contract (`BOSS_PR_URL_OUTPUT` vs `BOSS_STRUCTURED_OUTPUT`).
+    pub kind: StructuredOutputKind,
+    /// Absolute path the engine will read after the run. For the env-file
+    /// contract this is also the path the worker is told to write (prompt +
+    /// env). A driver that redirects output (e.g. via `--output-last-message`)
+    /// should still point that flag at this path so the engine's reader
+    /// needs no per-driver knowledge.
+    pub result_path: &'a Path,
+    /// Optional JSON Schema the caller wants the agent to honour. Opaque —
+    /// this seam does not define a schema format. A driver with native
+    /// schema enforcement materialises it (typically next to
+    /// [`Self::result_path`]) and passes it to the CLI; Claude ignores it
+    /// and relies on the prompt + file contract. `None` when the caller has
+    /// no schema to enforce.
+    pub schema: Option<&'a serde_json::Value>,
+}
+
+/// What [`AgentDriver::structured_output_wiring`] produces for
+/// [`Capability::StructuredOutput`]: the spawn-time env / CLI-arg
+/// adjustments plus the path the engine should read after the run.
+///
+/// Mirrors [`PermissionArtifacts`]: broken out by how the spawn flow must
+/// apply them, so a single returned path is not forced to express every
+/// backend's shape. Claude fills only `env` (the `BOSS_*` file-contract
+/// vars); a Codex driver fills `extra_args` with `--output-schema` /
+/// `--output-last-message` and may still set `env` so the file contract
+/// remains a working fallback.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StructuredOutputArtifacts {
+    /// Extra CLI arguments the spawn flow must append to the worker
+    /// invocation (e.g. Codex's `--output-schema <file>` and
+    /// `--output-last-message <path>`). Empty for the env-file contract.
+    pub extra_args: Vec<String>,
+    /// Extra environment variables the spawn flow must set on the worker
+    /// process (e.g. `BOSS_STRUCTURED_OUTPUT=<path>` /
+    /// `BOSS_PR_URL_OUTPUT=<path>`).
+    pub env: Vec<(String, String)>,
+    /// Absolute path the engine should read the result from after the run.
+    /// Equal to the request's `result_path` for the env-file contract and
+    /// for a native flag pointed at the same path; a driver that redirects
+    /// output names the redirected path here.
+    pub result_path: PathBuf,
+}
+
+/// Env-var name the file contract exports for `kind`.
+///
+/// [`StructuredOutputKind::PrUrl`] is a separate var because an implementer
+/// produces both a PR URL and (optionally) a designated payload, so the two
+/// cannot share one path. Every other kind reuses
+/// [`boss_engine_structured_output::STRUCTURED_OUTPUT_ENV`].
+pub fn structured_output_env_name(kind: StructuredOutputKind) -> &'static str {
+    match kind {
+        StructuredOutputKind::PrUrl => boss_engine_structured_output::PR_URL_OUTPUT_ENV,
+        _ => boss_engine_structured_output::STRUCTURED_OUTPUT_ENV,
+    }
+}
+
+/// Default [`AgentDriver::structured_output_wiring`] body: the driver-agnostic
+/// **env-file contract**.
+///
+/// Sets the appropriate `BOSS_*` env var to `request.result_path`, returns
+/// that path as the engine's read target, and produces no extra CLI args.
+/// Ignores `request.schema` — the common-denominator contract has no native
+/// schema enforcement; the prompt carries the shape and the worker writes
+/// the file.
+///
+/// This is the fallback every driver inherits. A driver with a stronger
+/// native mechanism (Codex `--output-schema`) overrides the trait method,
+/// typically by starting from this default and appending CLI flags so the
+/// file path keeps working even when the native path is used.
+///
+/// The file contract is **not** conditional on the capability being
+/// declared: the engine always prepares the path and may always export
+/// these env vars. Absence of the capability only drops the driver's
+/// prose-scrape fallback ([`AgentDriver::structured_output_fallback`]).
+pub fn default_structured_output_wiring(request: &StructuredOutputRequest<'_>) -> StructuredOutputArtifacts {
+    StructuredOutputArtifacts {
+        extra_args: Vec::new(),
+        env: vec![(
+            structured_output_env_name(request.kind).to_owned(),
+            request.result_path.display().to_string(),
+        )],
+        result_path: request.result_path.to_path_buf(),
+    }
+}
+
 /// Driver-neutral inputs for the [`Capability::Spawn`] capability. Every
 /// field is a concept that holds across backends: the resolved model/effort,
 /// an optional rendered settings/config path, the corp-laptop
@@ -1208,6 +1309,37 @@ pub trait AgentDriver: Send + Sync {
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass;
 
     // ── StructuredOutput capability ─────────────────────────────────────────
+
+    /// Primary-channel wiring for [`Capability::StructuredOutput`]: turn a
+    /// designated result path (and optional opaque schema) into the
+    /// spawn-time env / CLI-arg artifacts the worker needs, plus the path
+    /// the engine should read after the run.
+    ///
+    /// The default is the driver-agnostic **env-file contract**
+    /// ([`default_structured_output_wiring`]): export
+    /// `BOSS_STRUCTURED_OUTPUT` / `BOSS_PR_URL_OUTPUT` pointing at
+    /// `request.result_path`, produce no extra CLI args, ignore
+    /// `request.schema`. That contract is the common denominator that works
+    /// for every driver and is **not** conditional on this capability being
+    /// declared — absence only drops the prose-scrape fallback below.
+    ///
+    /// A driver with a stronger native mechanism overrides this method. The
+    /// seam carries an optional schema so a Codex driver can materialise it
+    /// and pass `--output-schema <file>` / `--output-last-message <path>`
+    /// without any engine change beyond applying the returned
+    /// [`StructuredOutputArtifacts`]. Prefer starting from
+    /// [`default_structured_output_wiring`] and *adding* flags, so the
+    /// file-contract env vars remain a working fallback.
+    ///
+    /// Returns `Err` only when a driver that materialises helper files (e.g.
+    /// a schema file for the CLI) fails to write them. The env-file default
+    /// is infallible.
+    fn structured_output_wiring(
+        &self,
+        request: &StructuredOutputRequest<'_>,
+    ) -> anyhow::Result<StructuredOutputArtifacts> {
+        Ok(default_structured_output_wiring(request))
+    }
 
     /// Fallback producer for [`Capability::StructuredOutput`]: recover
     /// `kind`'s payload from the worker's prose when the **primary** channel
@@ -1772,6 +1904,207 @@ mod tests {
         assert_eq!(
             driver.pr_url_capture_feed("Bash", &input, &response),
             default_pr_url_capture_feed("Bash", &input, &response),
+        );
+    }
+
+    // ── structured_output_wiring / default_structured_output_wiring ────────
+
+    fn so_request<'a>(
+        kind: StructuredOutputKind,
+        result_path: &'a Path,
+        schema: Option<&'a serde_json::Value>,
+    ) -> StructuredOutputRequest<'a> {
+        StructuredOutputRequest {
+            kind,
+            result_path,
+            schema,
+        }
+    }
+
+    #[test]
+    fn default_wiring_exports_pr_url_env_and_echoes_result_path() {
+        let path = PathBuf::from("/tmp/boss-worker-output/exec_1.pr-url.json");
+        let arts = default_structured_output_wiring(&so_request(StructuredOutputKind::PrUrl, &path, None));
+        assert_eq!(
+            arts.env,
+            vec![(
+                boss_engine_structured_output::PR_URL_OUTPUT_ENV.to_owned(),
+                path.display().to_string(),
+            )],
+        );
+        assert!(arts.extra_args.is_empty(), "env-file contract has no CLI flags");
+        assert_eq!(arts.result_path, path);
+    }
+
+    #[test]
+    fn default_wiring_exports_structured_output_env_for_non_pr_kinds() {
+        let path = PathBuf::from("/tmp/boss-worker-output/exec_1.review-result.json");
+        for kind in [
+            StructuredOutputKind::ReviewResult,
+            StructuredOutputKind::TriageDecision,
+            StructuredOutputKind::Followups,
+            StructuredOutputKind::PostmortemFollowups,
+        ] {
+            let arts = default_structured_output_wiring(&so_request(kind, &path, None));
+            assert_eq!(
+                arts.env,
+                vec![(
+                    boss_engine_structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
+                    path.display().to_string(),
+                )],
+                "{kind:?} must export BOSS_STRUCTURED_OUTPUT",
+            );
+            assert!(arts.extra_args.is_empty());
+            assert_eq!(arts.result_path, path);
+        }
+    }
+
+    #[test]
+    fn default_wiring_ignores_schema() {
+        // The common-denominator contract has no native schema enforcement;
+        // schema is carried for richer drivers only.
+        let path = PathBuf::from("/tmp/out.json");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "pr_url": { "type": "string" } },
+            "required": ["pr_url"],
+        });
+        let arts = default_structured_output_wiring(&so_request(StructuredOutputKind::PrUrl, &path, Some(&schema)));
+        assert!(
+            arts.extra_args.is_empty(),
+            "default must not materialise schema into CLI flags: {:?}",
+            arts.extra_args,
+        );
+        assert_eq!(arts.env.len(), 1);
+        assert_eq!(arts.result_path, path);
+    }
+
+    #[test]
+    fn claude_wiring_matches_env_file_contract_with_no_behavioural_change() {
+        // Claude expresses the existing BOSS_* env-file contract through the
+        // trait method. Schema is ignored; no CLI flags; result path echoes.
+        let path = PathBuf::from("/tmp/boss-worker-output/exec_x.followups.json");
+        let schema = serde_json::json!({ "type": "array" });
+        let request = so_request(StructuredOutputKind::Followups, &path, Some(&schema));
+
+        let via_claude = ClaudeDriver
+            .structured_output_wiring(&request)
+            .expect("claude wiring is infallible");
+        let via_default = default_structured_output_wiring(&request);
+
+        assert_eq!(via_claude, via_default, "Claude must be the env-file contract");
+        assert_eq!(
+            via_claude.env,
+            vec![(
+                boss_engine_structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
+                path.display().to_string(),
+            )],
+        );
+        assert!(via_claude.extra_args.is_empty());
+        assert_eq!(via_claude.result_path, path);
+    }
+
+    #[test]
+    fn trait_default_wiring_matches_free_function() {
+        // StubDriver uses the trait default; un-overridden drivers still get
+        // the env-file contract without implementing the richer method.
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([]));
+        let path = PathBuf::from("/tmp/out.triage.json");
+        let request = so_request(StructuredOutputKind::TriageDecision, &path, None);
+        assert_eq!(
+            driver.structured_output_wiring(&request).unwrap(),
+            default_structured_output_wiring(&request),
+        );
+    }
+
+    #[test]
+    fn schema_capable_driver_passes_schema_and_result_path_to_cli() {
+        // Shape a richer driver (Codex `--output-schema` /
+        // `--output-last-message`) would produce: start from the env-file
+        // fallback, materialise the opaque schema next to the result path,
+        // and append the native CLI flags. Engine applies
+        // `StructuredOutputArtifacts` generically — no further trait change
+        // needed when a real Codex driver lands.
+        struct SchemaCapableDriver;
+
+        impl SchemaCapableDriver {
+            fn wiring(request: &StructuredOutputRequest<'_>) -> anyhow::Result<StructuredOutputArtifacts> {
+                let mut arts = default_structured_output_wiring(request);
+                if let Some(schema) = request.schema {
+                    // `foo.json` → `foo.schema.json` so the schema sits next
+                    // to the result without colliding with it.
+                    let schema_path = request.result_path.with_extension("schema.json");
+                    if let Some(parent) = schema_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&schema_path, serde_json::to_vec_pretty(schema)?)?;
+                    arts.extra_args.push("--output-schema".to_owned());
+                    arts.extra_args.push(schema_path.display().to_string());
+                    arts.extra_args.push("--output-last-message".to_owned());
+                    arts.extra_args.push(request.result_path.display().to_string());
+                }
+                Ok(arts)
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "boss-so-schema-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let result_path = dir.join("exec_1.review-result.json");
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "findings": { "type": "array" }
+            },
+            "required": ["findings"],
+        });
+        let request = so_request(StructuredOutputKind::ReviewResult, &result_path, Some(&schema));
+
+        let arts = SchemaCapableDriver::wiring(&request).expect("schema wiring");
+
+        // File-contract fallback still present.
+        assert_eq!(
+            arts.env,
+            vec![(
+                boss_engine_structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
+                result_path.display().to_string(),
+            )],
+        );
+        assert_eq!(arts.result_path, result_path, "engine still reads the designated path");
+
+        // Native flags carry schema path + result path.
+        let schema_path = result_path.with_extension("schema.json");
+        assert_eq!(
+            arts.extra_args,
+            vec![
+                "--output-schema".to_owned(),
+                schema_path.display().to_string(),
+                "--output-last-message".to_owned(),
+                result_path.display().to_string(),
+            ],
+        );
+        // Schema was materialised as whatever the caller supplied.
+        let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&schema_path).unwrap()).unwrap();
+        assert_eq!(written, schema);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_name_helper_splits_pr_url_from_designated_payload() {
+        assert_eq!(
+            structured_output_env_name(StructuredOutputKind::PrUrl),
+            boss_engine_structured_output::PR_URL_OUTPUT_ENV,
+        );
+        assert_eq!(
+            structured_output_env_name(StructuredOutputKind::Followups),
+            boss_engine_structured_output::STRUCTURED_OUTPUT_ENV,
         );
     }
 }

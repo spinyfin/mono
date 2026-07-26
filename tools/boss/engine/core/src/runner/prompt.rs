@@ -280,29 +280,40 @@ pub(super) fn designated_output_kind(execution: &WorkExecution, work_item: &Work
 /// payload's path as `$BOSS_STRUCTURED_OUTPUT` (when the kind has one) and the
 /// PR-URL artifact's path as `$BOSS_PR_URL_OUTPUT`.
 ///
-/// The operative instruction is always the literal path embedded in the
-/// prompt — a model writes with the `Write` tool, not by expanding env vars —
-/// but exporting them keeps the convention self-documenting in the pane and
-/// lets a script resolve it.
+/// Built through [`crate::driver::default_structured_output_wiring`] so the
+/// env-file contract has a single source of truth with the driver's
+/// [`crate::driver::AgentDriver::structured_output_wiring`] default. The
+/// operative instruction is always the literal path embedded in the prompt —
+/// a model writes with the `Write` tool, not by expanding env vars — but
+/// exporting them keeps the convention self-documenting in the pane and lets
+/// a script resolve it.
 pub(super) fn structured_output_env_vars(
     dir: &Path,
     execution: &WorkExecution,
     work_item: &WorkItem,
 ) -> Vec<(String, String)> {
-    let path_of = |kind| {
-        crate::structured_output::path_for(dir, &execution.id, kind)
-            .display()
-            .to_string()
-    };
-    let mut env = vec![(
-        crate::structured_output::PR_URL_OUTPUT_ENV.to_owned(),
-        path_of(StructuredOutputKind::PrUrl),
-    )];
+    use crate::driver::{StructuredOutputRequest, default_structured_output_wiring};
+
+    let mut env = Vec::new();
+    let pr_path = crate::structured_output::path_for(dir, &execution.id, StructuredOutputKind::PrUrl);
+    env.extend(
+        default_structured_output_wiring(&StructuredOutputRequest {
+            kind: StructuredOutputKind::PrUrl,
+            result_path: &pr_path,
+            schema: None,
+        })
+        .env,
+    );
     if let Some(kind) = designated_output_kind(execution, work_item) {
-        env.push((
-            crate::structured_output::STRUCTURED_OUTPUT_ENV.to_owned(),
-            path_of(kind),
-        ));
+        let path = crate::structured_output::path_for(dir, &execution.id, kind);
+        env.extend(
+            default_structured_output_wiring(&StructuredOutputRequest {
+                kind,
+                result_path: &path,
+                schema: None,
+            })
+            .env,
+        );
     }
     env
 }
