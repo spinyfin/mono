@@ -12,11 +12,20 @@
 //!
 //! Tolerance: additive fields and unknown enum variants must not crash the
 //! reader. Fail loudly on removals and on semantic changes to existing fields.
+//!
+//! ## Live CLI check
+//!
+//! [`installed_codex_matches_pinned_version_when_present`] is a soft skip when
+//! `codex` is not on PATH (CI images without the CLI). Set
+//! `BOSS_REQUIRE_CODEX_CLI=1` to require the binary and fail instead of
+//! skipping — use this on hosts that claim the live pin (dev machines that
+//! re-capture fixtures).
 
 use std::process::Command;
 
 use crate::conformance::fixtures::{
-    CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, codex_shaped_driver, decode_jsonl,
+    CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_exec_spawn_contract,
+    codex_shaped_driver, decode_jsonl,
 };
 use crate::driver::AgentDriver;
 
@@ -32,6 +41,16 @@ fn parse_codex_version(stdout: &str) -> Option<String> {
     }
 }
 
+fn require_codex_cli() -> bool {
+    match std::env::var("BOSS_REQUIRE_CODEX_CLI") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
 #[test]
 fn pinned_version_constant_is_semver_shaped() {
     let parts: Vec<_> = PINNED_CODEX_CLI_VERSION.split('.').collect();
@@ -43,20 +62,34 @@ fn pinned_version_constant_is_semver_shaped() {
 
 #[test]
 fn installed_codex_matches_pinned_version_when_present() {
-    // When `codex` is on PATH the harness must be running against the pin.
-    // When it is absent (CI images without the CLI) the fixture-side pins
-    // below still defend the stream contract; this test is a soft skip.
+    // Soft skip when `codex` is absent (CI images without the CLI); fixture-side
+    // pins below still defend the stream contract. Set BOSS_REQUIRE_CODEX_CLI=1
+    // to require the binary and fail instead of skipping.
+    let require = require_codex_cli();
     let output = match Command::new("codex").arg("--version").output() {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
+            if require {
+                panic!(
+                    "BOSS_REQUIRE_CODEX_CLI is set but `codex --version` failed (status {})",
+                    o.status
+                );
+            }
             eprintln!(
-                "codex --version failed (status {}); skipping live version check",
+                "codex --version failed (status {}); skipping live version check \
+                 (set BOSS_REQUIRE_CODEX_CLI=1 to require it)",
                 o.status
             );
             return;
         }
         Err(err) => {
-            eprintln!("codex not on PATH ({err}); skipping live version check");
+            if require {
+                panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH: {err}");
+            }
+            eprintln!(
+                "codex not on PATH ({err}); skipping live version check \
+                 (set BOSS_REQUIRE_CODEX_CLI=1 to require it)"
+            );
             return;
         }
     };
@@ -145,10 +178,10 @@ fn fixture_carries_required_envelope_types_for_pinned_version() {
 }
 
 #[test]
-fn codex_shaped_spawn_does_not_use_removed_ask_for_approval_flag() {
-    // `-a` / `--ask-for-approval` was removed from `codex exec` on 0.145.0 and
-    // produces a hard argument error. The harness's reference spawn plan must
-    // never reintroduce it.
+fn codex_exec_spawn_satisfies_shared_flag_contract() {
+    // Pin against the shared spawn contract, not only the test double's
+    // hardcoded command string. When a production CodexDriver lands, feed its
+    // SpawnPlan into the same assert_codex_exec_spawn_contract.
     let plan = codex_shaped_driver().spawn_invocation(crate::driver::SpawnRequest {
         model: "gpt-5.5",
         effort: None,
@@ -156,21 +189,7 @@ fn codex_shaped_spawn_does_not_use_removed_ask_for_approval_flag() {
         non_opus_auto_mode: false,
         permission_mode_override: None,
     });
-    assert!(
-        !plan.command.contains("ask-for-approval") && !plan.command.split_whitespace().any(|t| t == "-a"),
-        "spawn must not use the removed -a/--ask-for-approval flag; got {}",
-        plan.command,
-    );
-    assert!(
-        plan.command.contains("--json"),
-        "spawn must request the JSONL progress stream; got {}",
-        plan.command,
-    );
-    assert!(
-        plan.command.contains("--strict-config"),
-        "spawn must pass --strict-config so config-schema drift fails at startup; got {}",
-        plan.command,
-    );
+    assert_codex_exec_spawn_contract(&plan);
 }
 
 #[test]
@@ -192,17 +211,26 @@ fn unknown_turn_item_variants_are_tolerated_not_fatal() {
     assert_eq!(events.len(), 2, "unknown items skipped; start + completed remain");
     assert!(matches!(&events[0], boss_protocol::WorkerEvent::SessionStart { .. }));
     assert!(matches!(&events[1], boss_protocol::WorkerEvent::Stop { .. }));
+    // Sticky: turn.completed inherited thread_id from thread.started.
+    match &events[1] {
+        boss_protocol::WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "t1"),
+        other => panic!("expected Stop, got {other:?}"),
+    }
 }
 
 #[test]
 fn additive_usage_fields_do_not_break_turn_completed_normalisation() {
     // A future CLI adding another usage counter must not break decoding.
-    let line = r#"{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"future_counter":99}}"#;
-    let raw: serde_json::Value = serde_json::from_str(line).unwrap();
-    let event = codex_shaped_driver()
-        .normalize_progress_event(&raw)
-        .expect("additive usage fields must be tolerated");
-    assert!(matches!(event, boss_protocol::WorkerEvent::Stop { .. }));
+    // Seed sticky session via thread.started (real streams always start that way).
+    let stream = concat!(
+        r#"{"type":"thread.started","thread_id":"t-add"}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":1,"cached_input_tokens":0,"cache_write_input_tokens":0,"output_tokens":1,"reasoning_output_tokens":0,"future_counter":99}}"#,
+        "\n",
+    );
+    let events = decode_jsonl(&codex_shaped_driver(), stream);
+    assert_eq!(events.len(), 2);
+    assert!(matches!(&events[1], boss_protocol::WorkerEvent::Stop { .. }));
 }
 
 #[test]

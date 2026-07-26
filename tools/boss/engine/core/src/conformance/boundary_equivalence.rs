@@ -1,10 +1,23 @@
-//! Boundary equivalence: a turn boundary drives completion identically
-//! whether it arrived as a hook-fired `Stop` or a native `turn.completed`.
+//! Boundary equivalence across hook vs stdout-JSONL transports.
 //!
-//! Both paths go through [`AgentDriver::normalize_progress_event`] then
-//! [`AgentDriver::turn_boundary`], and the resulting [`TurnEnd`] is what the
-//! engine uses for completion detection — never a raw `WorkerEvent::Stop`
-//! match.
+//! Two separate claims, deliberately not collapsed:
+//!
+//! 1. **TurnEnd parity** — both transports produce equal [`TurnEnd`] values
+//!    via [`AgentDriver::turn_boundary`] (hook-fired `Stop` and native
+//!    `turn.completed` → same `TurnEnd` after
+//!    [`AgentDriver::normalize_progress_event`]).
+//! 2. **Activity-machine completion** — the decoded [`WorkerEvent`] sequence
+//!    from either transport, applied through
+//!    [`LiveWorkerStateRegistry::apply_event`], leaves the slot
+//!    [`WorkerActivity::Idle`]. The registry is driven by `WorkerEvent`s
+//!    (including `WorkerEvent::Stop`); it is **not** fed `TurnEnd` values.
+//!    `turn_boundary` is checked alongside as the driver-level completion
+//!    signal the engine uses for turn-boundary detection.
+//!
+//! These tests do not claim that completion detection is implemented solely
+//! as `turn_boundary → TurnEnd` with no raw `WorkerEvent::Stop` match
+//! elsewhere in the engine — only that both transports agree on `TurnEnd`
+//! and that the activity machine reaches Idle from the decoded event stream.
 
 use boss_protocol::{StopReason, WorkerEvent};
 
@@ -29,6 +42,7 @@ fn last_turn_end(driver: &dyn AgentDriver, jsonl: &str) -> TurnEnd {
 
 #[test]
 fn hook_stop_and_native_turn_completed_produce_identical_turn_end() {
+    // Claim 1: turn_boundary yields the same TurnEnd from either transport.
     let from_hooks = last_turn_end(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL);
     let from_stdout = last_turn_end(&codex_shaped_driver(), CODEX_STDOUT_SESSION_JSONL);
 
@@ -47,11 +61,9 @@ fn hook_stop_and_native_turn_completed_produce_identical_turn_end() {
 }
 
 #[test]
-fn turn_boundary_drives_identical_activity_machine_completion_from_either_source() {
-    // Apply each transport's full event sequence to a fresh live-worker
-    // registry and assert both leave the slot Idle (completed turn, no
-    // awaiting-input pending). This is the engine-visible "completion"
-    // outcome completion detection and the kanban feed on.
+fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
+    // Claim 2: apply_event is fed WorkerEvents (not TurnEnd). Both transports'
+    // decoded sequences leave the live-worker slot Idle after the turn.
     let codex = codex_shaped_driver();
     let cases: [(&str, &dyn AgentDriver, &str); 2] = [
         ("hook", &ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL),
@@ -65,10 +77,11 @@ fn turn_boundary_drives_identical_activity_machine_completion_from_either_source
         for event in &events {
             assert!(
                 reg.apply_event(1, event),
-                "{label}: apply_event must accept every decoded event",
+                "{label}: apply_event must accept every decoded WorkerEvent",
             );
-            // Only a turn boundary (via the driver) is the completion signal;
-            // mid-turn events must not report one.
+            // Driver-level turn_boundary is the completion signal for claim 1;
+            // assert it only fires on Stop-shaped events, independent of the
+            // registry path (which sees raw WorkerEvents).
             let is_boundary = driver.turn_boundary(event).is_some();
             match event {
                 WorkerEvent::Stop { .. } => assert!(is_boundary, "{label}: Stop must be a turn boundary"),

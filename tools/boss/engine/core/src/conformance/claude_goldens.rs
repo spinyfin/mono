@@ -4,6 +4,13 @@
 //! `worker_setup` renderers that take `&dyn AgentDriver`), never by reaching
 //! past the trait into Claude-only helpers. A regression here means an
 //! extraction changed the worker-visible contract.
+//!
+//! ## v1 scope
+//!
+//! Goldens pin **standard** worker kind only (`WorkerKind::Standard`). Other
+//! worker kinds (e.g. answer-agent / automation-specific setups) are
+//! intentionally unpinned in this harness revision; extend deliberately when
+//! those surfaces gain a driver-extraction gate.
 
 use std::path::PathBuf;
 

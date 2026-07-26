@@ -10,6 +10,7 @@
 //! (boundary equivalence).
 
 use std::path::Path;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
@@ -72,8 +73,14 @@ pub const CLAUDE_HOOK_SESSION_JSONL: &str = concat!(
 
 /// Codex stdout-JSONL ingress for the same logical session.
 ///
-/// Verbatim envelope types from the 0.145.0 investigation, with `thread_id`
-/// and command text aligned to [`CANONICAL_SESSION_ID`] / [`FIXTURE_BASH_COMMAND`].
+/// **Shape-aligned and identity-rewritten**, not wire-identical to a live
+/// capture: envelope types and item shapes come from the 0.145.0 investigation,
+/// with `thread_id` and command text rewritten to [`CANONICAL_SESSION_ID`] /
+/// [`FIXTURE_BASH_COMMAND`] so the two fixture sides compare under
+/// [`PartialEq`]. Only `thread.started` carries `thread_id` on the wire;
+/// later envelopes inherit session identity from sticky state in
+/// [`CodexShapedDriver`] (as a production normaliser must).
+///
 /// The `agent_message` item has no activity-machine analog and must be
 /// skipped by the normaliser (tolerance for unmappable variants).
 ///
@@ -142,6 +149,68 @@ pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerE
     event
 }
 
+// ─── Codex exec spawn contract ───────────────────────────────────────────────
+
+/// Flags every Codex `exec` spawn plan must include.
+///
+/// Shared between the conformance test double and (when it lands) production
+/// `CodexDriver::spawn_invocation`. Pin tests call
+/// [`assert_codex_exec_spawn_contract`] so a future production path that
+/// regresses these flags fails the same pin without rewriting the double.
+pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--json", "--strict-config"];
+
+/// Long-form flags that must never appear on a Codex `exec` spawn line.
+///
+/// `-a` / `--ask-for-approval` was removed from `codex exec` on 0.145.0 and
+/// produces a hard argument error.
+pub const CODEX_EXEC_FORBIDDEN_LONG_FLAGS: &[&str] = &["--ask-for-approval"];
+
+/// Build the reference `codex exec …` command line that satisfies
+/// [`CODEX_EXEC_REQUIRED_FLAGS`] and omits every forbidden token.
+///
+/// Production `CodexDriver` may add model / sandbox tokens around these
+/// required flags, but must still pass [`assert_codex_exec_spawn_contract`].
+pub fn codex_exec_reference_command() -> String {
+    // Required flags come from the shared constants so the double cannot
+    // drift from the contract the pin tests enforce.
+    let mut cmd = String::from("codex exec");
+    for flag in CODEX_EXEC_REQUIRED_FLAGS {
+        cmd.push(' ');
+        cmd.push_str(flag);
+    }
+    cmd.push_str(" --dangerously-bypass-approvals-and-sandbox \"$(cat .codex/initial-prompt.txt)\"\n");
+    cmd
+}
+
+/// Assert a [`SpawnPlan`] satisfies the Codex exec spawn contract.
+///
+/// Intended for version-pin tests and, later, for production-driver tests that
+/// feed a real `CodexDriver` plan into the same checker.
+pub fn assert_codex_exec_spawn_contract(plan: &SpawnPlan) {
+    let tokens: Vec<&str> = plan.command.split_whitespace().collect();
+    for flag in CODEX_EXEC_REQUIRED_FLAGS {
+        assert!(
+            plan.command.contains(flag),
+            "Codex exec spawn contract requires `{flag}`; got {}",
+            plan.command,
+        );
+    }
+    for flag in CODEX_EXEC_FORBIDDEN_LONG_FLAGS {
+        assert!(
+            !plan.command.contains(flag),
+            "Codex exec spawn contract forbids `{flag}` (removed on pinned CLI); got {}",
+            plan.command,
+        );
+    }
+    // Short `-a` is the removed ask-for-approval alias; match as a whole token
+    // so we do not false-positive on longer flags that happen to contain "a".
+    assert!(
+        !tokens.contains(&"-a"),
+        "Codex exec spawn contract forbids bare `-a` (removed ask-for-approval alias); got {}",
+        plan.command,
+    );
+}
+
 // ─── Codex-shaped reference normaliser (test double for a future CodexDriver) ─
 
 fn no_effort_value(_level: EffortLevel) -> Option<&'static str> {
@@ -163,6 +232,11 @@ fn never_auto_permissions(_model: &str) -> bool {
 /// Maps `codex exec --json` envelopes onto [`WorkerEvent`]s with shapes that
 /// match Claude's hook normaliser for an equivalent session.
 ///
+/// Session identity is sticky: `thread.started` records `thread_id`, and later
+/// envelopes that omit `thread_id` (the real Codex wire shape) inherit it.
+/// Envelopes that need a session before any `thread.started` fail with
+/// [`NormalizeError::MissingField`] rather than falling back to a hardcoded id.
+///
 /// Deliberately rejects unmappable variants (`agent_message`, unknown types)
 /// so the tolerance tests exercise the skip path. Tool inputs are lifted into
 /// Claude's `{"command":…}` object form so cross-transport sequences compare
@@ -170,6 +244,10 @@ fn never_auto_permissions(_model: &str) -> bool {
 /// for PreToolUse, but the harness asserts field-level parity too.
 pub struct CodexShapedDriver {
     descriptor: DriverDescriptor,
+    /// Last `thread_id` observed on `thread.started` (and any later envelope
+    /// that carries one). Interior mutability because [`AgentDriver`] methods
+    /// take `&self` and the trait is `Send + Sync`.
+    last_thread_id: Mutex<Option<String>>,
 }
 
 impl CodexShapedDriver {
@@ -191,7 +269,25 @@ impl CodexShapedDriver {
                     model_requires_auto_permissions: never_auto_permissions,
                 },
             },
+            last_thread_id: Mutex::new(None),
         }
+    }
+
+    /// Resolve session identity for a mappable envelope.
+    ///
+    /// Preference order: `thread_id` on this envelope (and sticky-update), else
+    /// the last seen sticky id. Fails if neither is known.
+    fn resolve_session_id(&self, obj: &serde_json::Map<String, serde_json::Value>) -> Result<String, NormalizeError> {
+        if let Some(id) = obj.get("thread_id").and_then(|v| v.as_str()) {
+            let id = id.to_owned();
+            *self.last_thread_id.lock().expect("codex-shaped last_thread_id lock") = Some(id.clone());
+            return Ok(id);
+        }
+        self.last_thread_id
+            .lock()
+            .expect("codex-shaped last_thread_id lock")
+            .clone()
+            .ok_or(NormalizeError::MissingField("thread_id"))
     }
 }
 
@@ -216,14 +312,12 @@ impl AgentDriver for CodexShapedDriver {
     }
 
     fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
-        // Pin the flags a real CodexDriver must keep. `-a`/`--ask-for-approval`
-        // was removed in 0.145.0 and must not reappear; `--json` is required
-        // for the stdout progress channel; `--strict-config` catches config
-        // schema drift at startup.
+        // Build from the shared spawn contract so the double and the pin tests
+        // share one source of truth. A production CodexDriver must pass the
+        // same [`assert_codex_exec_spawn_contract`] check.
         SpawnPlan {
             env: vec![EnvDirective::Set("CODEX_HOME".into(), "/tmp/boss-codex-home".into())],
-            command: "codex exec --json --strict-config --dangerously-bypass-approvals-and-sandbox \"$(cat .codex/initial-prompt.txt)\"\n"
-                .to_owned(),
+            command: codex_exec_reference_command(),
         }
     }
 
@@ -255,13 +349,35 @@ impl AgentDriver for CodexShapedDriver {
             .get("type")
             .and_then(|v| v.as_str())
             .ok_or(NormalizeError::MissingField("type"))?;
-        let session_id = obj
-            .get("thread_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(CANONICAL_SESSION_ID)
-            .to_owned();
         let item = obj.get("item");
         let item_type = item.and_then(|i| i.get("type")).and_then(|v| v.as_str());
+
+        // Unmappable variants are rejected before session resolution so a
+        // bare error/agent_message/unknown item does not require sticky state.
+        let is_mappable = matches!(
+            (kind, item_type),
+            ("thread.started", _)
+                | ("turn.started", _)
+                | ("item.started", Some("command_execution"))
+                | ("item.completed", Some("command_execution"))
+                | ("turn.completed", _)
+        );
+        if !is_mappable {
+            return Err(NormalizeError::UnknownEvent(kind.to_owned()));
+        }
+
+        let session_id = if kind == "thread.started" {
+            // thread.started must carry thread_id on the wire — do not inherit.
+            let id = obj
+                .get("thread_id")
+                .and_then(|v| v.as_str())
+                .ok_or(NormalizeError::MissingField("thread_id"))?
+                .to_owned();
+            *self.last_thread_id.lock().expect("codex-shaped last_thread_id lock") = Some(id.clone());
+            id
+        } else {
+            self.resolve_session_id(obj)?
+        };
 
         Ok(match (kind, item_type) {
             ("thread.started", _) => WorkerEvent::SessionStart {
@@ -312,9 +428,7 @@ impl AgentDriver for CodexShapedDriver {
                 stop_hook_active: false,
                 stop_reason: StopReason::Completed,
             },
-            // Unmappable: agent_message, error-as-warning, unknown TurnItem
-            // variants. Returning UnknownEvent lets the reader skip them —
-            // the harness separately asserts that skip is non-fatal.
+            // is_mappable already filtered unknowns; keep the arm exhaustive.
             (other, _) => return Err(NormalizeError::UnknownEvent(other.to_owned())),
         })
     }
@@ -367,9 +481,13 @@ impl AgentDriver for CodexShapedDriver {
     }
 }
 
-/// Decode every JSONL line through `driver`, skipping envelopes the driver
-/// rejects (unknown variants, non-JSON). Returns the recognised events in
-/// stream order.
+/// Decode every JSONL line through `driver`.
+///
+/// - [`NormalizeError::UnknownEvent`] is skipped (tolerance for unmappable
+///   variants such as `agent_message` / unknown TurnItem types).
+/// - [`NormalizeError::Malformed`] / [`NormalizeError::MissingField`] panic:
+///   fixture streams and well-formed sessions must not produce them.
+/// - Non-JSON lines also panic — fixtures are authored, not scraped live.
 pub fn decode_jsonl(driver: &dyn AgentDriver, jsonl: &str) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
     for line in jsonl.lines() {
@@ -377,12 +495,87 @@ pub fn decode_jsonl(driver: &dyn AgentDriver, jsonl: &str) -> Vec<WorkerEvent> {
         if line.is_empty() {
             continue;
         }
-        let Ok(raw) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if let Ok(event) = driver.normalize_progress_event(&raw) {
-            events.push(event);
+        let raw: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("fixture JSONL line is not valid JSON ({e}): {line}"));
+        match driver.normalize_progress_event(&raw) {
+            Ok(event) => events.push(event),
+            Err(NormalizeError::UnknownEvent(_)) => {
+                // Skip path: unmappable / additive variants.
+            }
+            Err(err) => {
+                panic!("unexpected normalize error for line {line}: {err}");
+            }
         }
     }
     events
+}
+
+#[cfg(test)]
+mod sticky_session_tests {
+    use super::*;
+
+    fn event_session_id(event: &WorkerEvent) -> &str {
+        match event {
+            WorkerEvent::SessionStart { session_id, .. }
+            | WorkerEvent::UserPromptSubmit { session_id, .. }
+            | WorkerEvent::PreToolUse { session_id, .. }
+            | WorkerEvent::PostToolUse { session_id, .. }
+            | WorkerEvent::Stop { session_id, .. }
+            | WorkerEvent::Notification { session_id, .. }
+            | WorkerEvent::SessionEnd { session_id, .. } => session_id,
+        }
+    }
+
+    #[test]
+    fn later_envelopes_inherit_thread_id_from_thread_started() {
+        // Rewrite only thread.started's id. Later fixture lines already omit
+        // thread_id (the real Codex wire shape); they must inherit the sticky
+        // id rather than a hardcoded CANONICAL_SESSION_ID fallback.
+        let custom_id = "session-from-thread-started-only";
+        assert!(
+            CODEX_STDOUT_SESSION_JSONL.contains(CANONICAL_SESSION_ID),
+            "fixture must embed the canonical id on thread.started so rewrite is meaningful",
+        );
+        // Only one occurrence of the canonical id (on thread.started).
+        assert_eq!(
+            CODEX_STDOUT_SESSION_JSONL.matches(CANONICAL_SESSION_ID).count(),
+            1,
+            "fixture must carry thread_id only on thread.started",
+        );
+        let stream = CODEX_STDOUT_SESSION_JSONL.replace(CANONICAL_SESSION_ID, custom_id);
+        let driver = codex_shaped_driver();
+        let events = decode_jsonl(&driver, &stream);
+        assert_eq!(
+            events.len(),
+            expected_session_events().len(),
+            "full session must still decode after id rewrite",
+        );
+        for event in &events {
+            assert_eq!(
+                event_session_id(event),
+                custom_id,
+                "every event must inherit the rewritten thread.started id; got {event:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn mappable_envelope_without_known_session_fails() {
+        let driver = codex_shaped_driver();
+        let raw: serde_json::Value = serde_json::from_str(r#"{"type":"turn.started"}"#).unwrap();
+        let err = driver
+            .normalize_progress_event(&raw)
+            .expect_err("turn.started with no prior thread.started must fail");
+        assert!(matches!(err, NormalizeError::MissingField("thread_id")), "got {err:?}",);
+    }
+
+    #[test]
+    fn thread_started_without_thread_id_fails() {
+        let driver = codex_shaped_driver();
+        let raw: serde_json::Value = serde_json::from_str(r#"{"type":"thread.started"}"#).unwrap();
+        let err = driver
+            .normalize_progress_event(&raw)
+            .expect_err("thread.started must carry thread_id");
+        assert!(matches!(err, NormalizeError::MissingField("thread_id")), "got {err:?}",);
+    }
 }
