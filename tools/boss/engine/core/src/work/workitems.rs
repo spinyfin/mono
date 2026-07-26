@@ -846,6 +846,11 @@ impl WorkDb {
         // Compute has_in_progress_revision for every chain-root task that
         // has at least one todo/active descendant revision.
         attach_in_progress_revision_flag(&mut tasks, &mut chores);
+        // Compute ready_for_review for every Review-lane task that is
+        // waiting on the operator and nothing else (no block, no
+        // in-progress revision, CI green, no merge conflict). Must run
+        // after attach_in_progress_revision_flag, which it reads.
+        attach_ready_for_review_flag(&mut tasks, &mut chores);
         trace.record_plain(segment::ASSEMBLE, elapsed_ms(t));
 
         // Compute ai_reviewing for tasks held in Doing while a pr_review

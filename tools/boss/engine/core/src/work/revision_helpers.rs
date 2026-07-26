@@ -380,6 +380,40 @@ pub(crate) fn attach_in_progress_revision_flag(tasks: &mut [Task], chores: &mut 
     }
 }
 
+// ── Ready-for-review flag ────────────────────────────────────────────────────
+
+/// Set `ready_for_review = true` on every Review-lane task that is waiting
+/// on the operator and nothing else: an open PR (`status = "in_review"`,
+/// `pr_url` set) with no active block, no in-progress descendant revision,
+/// every required CI check green, and no merge conflict with the base
+/// branch.
+///
+/// Called by `get_work_tree` after [`attach_in_progress_revision_flag`], so
+/// `has_in_progress_revision` is already populated. Reads only fields
+/// already loaded onto `Task` by the `get_work_tree` SQL — no extra query.
+///
+/// Deliberately keyed on the *raw* polled facts (`ci_required_state`,
+/// `pr_mergeable_state`) rather than only on `blocked_reason`/`status`,
+/// which reflect the last reconciliation pass over those facts and can lag
+/// a fresher merge-poller sweep — a task can still read `status =
+/// "in_review"` with `blocked_reason = None` while `pr_mergeable_state`
+/// already reads `"conflicting"` from the most recent poll. Reading the
+/// raw fact directly means this flag doesn't have to wait for the
+/// reconciliation step to catch up before it stops calling a conflicted PR
+/// ready. A still-running (`"in_progress"`) or not-yet-polled (`None`/
+/// `"unknown"`) CI state is treated as NOT ready — there's nothing to
+/// merge yet.
+pub(crate) fn attach_ready_for_review_flag(tasks: &mut [Task], chores: &mut [Task]) {
+    for task in tasks.iter_mut().chain(chores.iter_mut()) {
+        task.ready_for_review = task.status == TaskStatus::InReview
+            && task.pr_url.is_some()
+            && task.blocked_reason.is_none()
+            && !task.has_in_progress_revision
+            && task.ci_required_state.as_deref() == Some("success")
+            && task.pr_mergeable_state.as_deref() == Some("mergeable");
+    }
+}
+
 // ── AI reviewing flag ────────────────────────────────────────────────────────
 
 /// Set `ai_reviewing = true` on every task (and chore) that is currently held
@@ -891,5 +925,169 @@ mod tests {
             canonicalize_created_via(Some("  some-future-source  "), "task_x", "revision"),
             "some-future-source"
         );
+    }
+
+    // ── attach_ready_for_review_flag ─────────────────────────────────────────
+
+    fn review_task(id: &str) -> Task {
+        Task::builder()
+            .id(id)
+            .product_id("prod_1")
+            .kind(TaskKind::Chore)
+            .name("n")
+            .description("")
+            .status(TaskStatus::InReview)
+            .created_at("")
+            .updated_at("")
+            .pr_url("https://github.com/org/repo/pull/1")
+            .build()
+    }
+
+    #[test]
+    fn ready_when_open_unblocked_ci_green_and_mergeable() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_blocked() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        t.blocked_reason = Some("merge_conflict".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_in_progress_revision() {
+        let mut t = review_task("t1");
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        t.has_in_progress_revision = true;
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_ci_failing_pending_unknown_or_missing() {
+        for ci_state in [Some("fail"), Some("in_progress"), Some("unknown"), None] {
+            let mut t = review_task("t1");
+            t.ci_required_state = ci_state.map(str::to_owned);
+            t.pr_mergeable_state = Some("mergeable".to_owned());
+            let mut tasks = vec![t];
+            attach_ready_for_review_flag(&mut tasks, &mut []);
+            assert!(
+                !tasks[0].ready_for_review,
+                "ci_required_state={ci_state:?} should not be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_when_pr_mergeable_state_conflicting_unknown_or_missing() {
+        // mono#2357/mono#2356 regression: a card can show a clean CI check
+        // and no badges while GitHub already reports the PR CONFLICTING
+        // because the status/blocked_reason reconciliation pass hasn't
+        // caught up with the latest merge-poller sweep yet. The flag must
+        // read pr_mergeable_state directly rather than trusting the absence
+        // of blocked_reason.
+        for mergeable_state in [Some("conflicting"), Some("unknown"), None] {
+            let mut t = review_task("t1");
+            t.ci_required_state = Some("success".to_owned());
+            t.pr_mergeable_state = mergeable_state.map(str::to_owned);
+            let mut tasks = vec![t];
+            attach_ready_for_review_flag(&mut tasks, &mut []);
+            assert!(
+                !tasks[0].ready_for_review,
+                "pr_mergeable_state={mergeable_state:?} should not be ready"
+            );
+        }
+    }
+
+    #[test]
+    fn not_ready_when_no_pr_url() {
+        let mut t = review_task("t1");
+        t.pr_url = None;
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    #[test]
+    fn not_ready_when_not_in_review() {
+        let mut t = review_task("t1");
+        t.status = TaskStatus::Active;
+        t.ci_required_state = Some("success".to_owned());
+        t.pr_mergeable_state = Some("mergeable".to_owned());
+        let mut tasks = vec![t];
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+        assert!(!tasks[0].ready_for_review);
+    }
+
+    /// Regression fixture: the operator's worked example from a live Review
+    /// column (2026-07-25), with the underlying PR facts as GitHub actually
+    /// reported them once the state was checked directly (the companion
+    /// staleness chore, see `attach_ready_for_review_flag`'s doc comment).
+    /// Two of the eight cards rendered clean — green CI, no badge, no pill —
+    /// while GitHub reported `CONFLICTING`; a naive "no badge, no lock"
+    /// implementation would have called three of these ready. With correct
+    /// facts, `ready_for_review` must be `false` for every row here.
+    #[test]
+    fn worked_example_zero_of_eight_are_ready() {
+        // mono#2357 — looked clean, PR actually CONFLICTING.
+        let mut t3529 = review_task("t3529");
+        t3529.ci_required_state = Some("success".to_owned());
+        t3529.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // mono#2356 — looked clean, PR actually CONFLICTING.
+        let mut t3528 = review_task("t3528");
+        t3528.ci_required_state = Some("success".to_owned());
+        t3528.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // `in revision` badge (descendant revision still todo/active).
+        let in_revision_ids = ["t3519", "t3513", "t3540", "t3537"];
+        let mut in_revision_tasks: Vec<Task> = in_revision_ids
+            .iter()
+            .map(|id| {
+                let mut t = review_task(id);
+                t.ci_required_state = Some("success".to_owned());
+                t.pr_mergeable_state = Some("mergeable".to_owned());
+                t.has_in_progress_revision = true;
+                t
+            })
+            .collect();
+
+        // mono#2261 — `Merge Conflict` pill correctly shown.
+        let mut t3231 = review_task("t3231");
+        t3231.blocked_reason = Some("merge_conflict".to_owned());
+        t3231.status = TaskStatus::Blocked;
+        t3231.ci_required_state = Some("success".to_owned());
+        t3231.pr_mergeable_state = Some("conflicting".to_owned());
+
+        // "Idle detection..." — no badge, no pill, but CI is broken.
+        let mut idle_detection = review_task("t_idle_detection");
+        idle_detection.ci_required_state = Some("fail".to_owned());
+        idle_detection.pr_mergeable_state = Some("mergeable".to_owned());
+
+        let mut tasks = vec![t3529, t3528, t3231, idle_detection];
+        tasks.append(&mut in_revision_tasks);
+        attach_ready_for_review_flag(&mut tasks, &mut []);
+
+        for task in &tasks {
+            assert!(
+                !task.ready_for_review,
+                "expected {} to be NOT ready, got ready_for_review=true",
+                task.id
+            );
+        }
     }
 }

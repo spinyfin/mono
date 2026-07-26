@@ -917,6 +917,9 @@ struct ContentView: View {
             HStack {
                 Text(column.title)
                     .font(.headline)
+                if column == .review {
+                    reviewReadyOnlyToggle
+                }
                 Spacer()
                 Text("\(itemCount)")
                     .font(.caption.weight(.semibold))
@@ -970,6 +973,26 @@ struct ContentView: View {
             guard let taskID = items.first else { return false }
             return model.attemptMoveTask(taskID, to: column)
         }
+    }
+
+    /// Review-column-only affordance: narrows the column to cards that are
+    /// waiting on the operator and nothing else (no blocked pill, no `in
+    /// revision` badge, CI green, no merge conflict). Sticky across app
+    /// restarts (persisted via `ChatViewModel.setReviewReadyOnly`).
+    private var reviewReadyOnlyToggle: some View {
+        Button {
+            model.setReviewReadyOnly(!model.reviewReadyOnly)
+        } label: {
+            Label("Ready", systemImage: model.reviewReadyOnly ? "checkmark.circle.fill" : "checkmark.circle")
+                .font(.caption.weight(.semibold))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(model.reviewReadyOnly ? Color.accentColor : .secondary)
+        .help(
+            "Show only Review cards ready for you to act on now: no blocked pill, "
+                + "no in-progress revision, CI checks green, and no merge conflict."
+        )
+        .accessibilityIdentifier("review-ready-only-toggle")
     }
 
     private var columnBackground: Color {
