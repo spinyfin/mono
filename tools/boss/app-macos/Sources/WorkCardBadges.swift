@@ -904,6 +904,26 @@ struct PriorityChip: View {
     }
 }
 
+/// Reasoning-mode chip rendered on kanban cards, and ONLY for
+/// `investigation`. `standard` is the overwhelming majority and gets no chip:
+/// a badge on nearly every card carries no information and just crowds the
+/// footer. This chip means "this row is on the expensive tier", which is the
+/// only thing worth a glance. Mirrors the CLI's `REASONING` column, which
+/// renders on the same condition.
+struct ReasoningChip: View {
+    var body: some View {
+        Text("INV")
+            .font(.caption.weight(.bold))
+            .foregroundStyle(Color.purple)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.14))
+            .clipShape(Capsule())
+            .help("Reasoning: Investigation — dispatches to the higher-capability model regardless of effort")
+            .accessibilityLabel("Reasoning Investigation")
+    }
+}
+
 /// Effort-level chip rendered on kanban cards. Only shown when the
 /// task carries a non-nil effort_level — unset rows must not masquerade
 /// as medium.

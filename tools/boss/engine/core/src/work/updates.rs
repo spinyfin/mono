@@ -224,6 +224,18 @@ impl WorkDb {
                 Some(trimmed.parse::<EffortLevel>().map_err(|e| anyhow::anyhow!(e))?)
             };
         }
+        if let Some(reasoning_patch) = patch.reasoning {
+            // Same contract as `effort_level` above: empty string clears the
+            // column (back to the dispatcher's legacy path), anything else
+            // must parse, and an invalid value rejects the whole patch rather
+            // than half-applying it.
+            let trimmed = reasoning_patch.trim();
+            task.reasoning = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.parse::<ReasoningMode>().map_err(|e| anyhow::anyhow!(e))?)
+            };
+        }
         apply_optional_string_patch(&mut task.model_override, patch.model_override);
         apply_optional_string_patch(&mut task.driver, patch.driver);
         apply_optional_string_patch(&mut task.blocked_reason, patch.blocked_reason);
@@ -289,6 +301,7 @@ impl WorkDb {
         };
 
         let effort_level_value = task.effort_level.map(|level| level.as_str().to_owned());
+        let reasoning_value = task.reasoning.map(|mode| mode.as_str().to_owned());
 
         tx.execute(
             "UPDATE tasks
@@ -297,6 +310,7 @@ impl WorkDb {
                  effort_level = ?11, model_override = ?12, autostart = ?13,
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
+                 reasoning = ?20,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -323,6 +337,7 @@ impl WorkDb {
                 task.archived_reason,
                 task.blocked_detail,
                 task.deferred as i64,
+                reasoning_value,
             ],
         )?;
 

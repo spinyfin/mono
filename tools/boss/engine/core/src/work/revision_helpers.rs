@@ -565,6 +565,12 @@ pub(crate) fn insert_revision_in_tx(
             .unwrap_or_else(|| default_revision_effort_level(&root.kind).to_owned()),
     );
     let model_override = normalize_model_override(input.model_override);
+    // Inherit the chain root's capability signal when the caller did not name
+    // one: a revision to an investigation is investigation-shaped, a revision
+    // to a plain chore is not. When the root itself is unclassified (a row
+    // predating the column) the revision stays unclassified too, so it keeps
+    // resolving the legacy way rather than being silently re-modelled.
+    let reasoning = input.reasoning.or(root.reasoning).map(|mode| mode.as_str().to_owned());
     let driver = normalize_model_override(input.driver);
     let created_via = canonicalize_created_via(input.created_via.as_deref(), &id, "revision");
     // Inherit product, project, and repo from the chain root. A revision
@@ -602,9 +608,9 @@ pub(crate) fn insert_revision_in_tx(
     conn.execute(
         "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, \
          pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, \
-         effort_level, model_override, driver, short_id, parent_task_id, repo_remote_url) \
+         effort_level, model_override, reasoning, driver, short_id, parent_task_id, repo_remote_url) \
          VALUES (?1, ?2, ?3, 'revision', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, \
-         ?10, ?11, ?12, ?13, ?14, ?15)",
+         ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
             id,
             product_id,
@@ -617,6 +623,7 @@ pub(crate) fn insert_revision_in_tx(
             created_via,
             effort_level,
             model_override,
+            reasoning,
             driver,
             short_id,
             parent_id,

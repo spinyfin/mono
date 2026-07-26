@@ -1453,6 +1453,7 @@ mod post_hoc_interception_decision_tests {
                 engine_default: "stub-model",
                 effort_value_for_level: |_| None,
                 default_model_for_level: |_| "stub-model",
+                model_for_reasoning: |_| "stub-model",
                 prompt_addendum_for_level: |_| None,
                 model_requires_auto_permissions: |_| false,
             },

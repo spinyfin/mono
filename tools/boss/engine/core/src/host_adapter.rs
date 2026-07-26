@@ -798,6 +798,7 @@ impl HostAdapter for SshHostAdapter {
             run_id = %run_id,
             remote_pid = ?outcome.remote_pid,
             model = %spawn_config.model,
+            reasoning = spawn_config.reasoning.map(|mode| mode.as_str()).unwrap_or("unclassified"),
             "remote worker launched; awaiting Stop over the forwarded events socket",
         );
 

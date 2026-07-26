@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
-use boss_protocol::{EffortLevel, NormalizeError, WorkerEvent, normalize_hook_event};
+use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, normalize_hook_event};
 use boss_ssh_transport::shell_quote;
 
 use super::{
@@ -41,7 +41,36 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
     })
 }
 
+/// Model slug for a given [`ReasoningMode`] — the capability lever.
+///
+/// This is the table the operator's policy actually lives in: *"sonnet is best
+/// for well articulated coding tasks (these should be the bulk of what boss
+/// does, but when some investigation is required, opus is usually better)."*
+/// Neither arm consults [`EffortLevel`], which is the entire point — a small
+/// investigate-and-fix chore gets Opus without its effort level being inflated
+/// to `large`, and a big-but-mechanical `large` row gets Sonnet.
+///
+/// Family aliases, not pinned snapshots, for the same reason as
+/// [`claude_default_model_for_level`]. Fable is deliberately absent: it is the
+/// most expensive model in the menu and is only ever reachable through an
+/// explicit per-row `--model fable`, never as a table default.
+fn claude_model_for_reasoning(reasoning: ReasoningMode) -> &'static str {
+    match reasoning {
+        ReasoningMode::Standard => "sonnet",
+        ReasoningMode::Investigation => "opus",
+    }
+}
+
 /// Default model slug for a given effort level.
+///
+/// **Legacy fall-through only.** Since the `reasoning` column landed, this
+/// table is consulted exclusively for rows that carry no [`ReasoningMode`] —
+/// rows created before the column existed, and insert paths that do not seed
+/// it. Classified rows resolve through [`claude_model_for_reasoning`] instead.
+/// Do not extend this table to express capability: effort is a size signal,
+/// and deriving the model from it is precisely the conflation the reasoning
+/// column exists to undo. It stays because clearing a row's reasoning must
+/// restore exactly the dispatch behaviour that row had before.
 ///
 /// Family aliases (`"sonnet"`, `"opus"`, `"fable"`) are used so the engine
 /// auto-tracks the latest snapshot per family without requiring a code
@@ -107,6 +136,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         engine_default: "opus",
         effort_value_for_level: claude_effort_value_for_level,
         default_model_for_level: claude_default_model_for_level,
+        model_for_reasoning: claude_model_for_reasoning,
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
     },

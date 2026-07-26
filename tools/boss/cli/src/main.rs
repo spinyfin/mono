@@ -15,7 +15,7 @@ pub(crate) use boss_protocol::{
     CreateTaskInput, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
     EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent,
     FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
-    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, RemoveDependencyInput,
+    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
     ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
     SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, UnpopulatePreservedTask,
     WorkAttentionItem, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
@@ -96,6 +96,7 @@ mod commands;
 mod data;
 mod engine_cmds;
 mod output;
+mod status_args;
 mod work_cmds;
 
 pub(crate) use automation_cmds::*;
@@ -103,6 +104,7 @@ pub(crate) use commands::*;
 pub(crate) use data::*;
 pub(crate) use engine_cmds::*;
 pub(crate) use output::*;
+pub(crate) use status_args::*;
 pub(crate) use work_cmds::*;
 
 #[cfg(test)]
