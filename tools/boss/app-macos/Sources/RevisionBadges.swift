@@ -25,7 +25,7 @@ struct RevisionBadge: View {
 /// `created_via` field. `nil` when the revision is operator- or comment-driven.
 /// Design: `tools/boss/docs/designs/unify-pr-remediation-on-revisions.md` Q2.
 
-enum EngineRevisionOrigin {
+enum EngineRevisionOrigin: Equatable {
     case mergeConflict
     case ciFix
 

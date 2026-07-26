@@ -10,7 +10,8 @@ import Foundation
 // repo's file-size check: Models+Automations.swift, Models+Editorial.swift,
 // Models+Products.swift, Models+WorkBoard.swift, Models+Transcript.swift,
 // Models+WorkerActivity.swift, Models+CI.swift, Models+Engine.swift,
-// Models+AttentionItems.swift, Models+GitHubAuth.swift.
+// Models+AttentionItems.swift, Models+GitHubAuth.swift,
+// Models+WorkCardSnapshot.swift.
 // ===========================================================================
 
 struct WorkTask: Identifiable, Hashable {
