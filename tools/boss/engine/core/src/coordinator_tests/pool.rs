@@ -1671,7 +1671,8 @@ async fn spawn_dispatch_ready_subscriber_delivers_kick_without_hand_call() {
 /// incident (`mono-agent-001`, Worf's report). Pre-fix, the engine
 /// never called `cube_client.heartbeat_lease` from anywhere — the
 /// trait method had only stub implementations in test mocks. Any
-/// worker that ran longer than `DEFAULT_LEASE_TTL_SECS = 1800` had
+/// worker that ran longer than the lease TTL (today 24h on both cube
+/// and the engine heartbeat path) had
 /// its lease silently age out, after which the next
 /// `cube workspace lease` call from another execution reclaimed
 /// the workspace and ran `jj new <main>` on the still-active

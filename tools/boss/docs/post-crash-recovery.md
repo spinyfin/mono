@@ -62,8 +62,10 @@ status no longer matches a live execution.
 
 ### Manual escape hatch: `bossctl agents reap <run-id>`
 
-The automatic probe is bounded by cube's lease TTL (30 minutes by
-default — see `tools/cube/src/app.rs::DEFAULT_LEASE_TTL_SECS`). If the
+The automatic probe is bounded by cube's lease TTL (24 hours by
+default — see `tools/cube/src/app/workspace.rs::DEFAULT_LEASE_TTL_SECS`,
+and the engine's matching `LEASE_TTL_SECS` in
+`tools/boss/engine/core/src/cube_lease_heartbeat.rs`). If the
 app crash was recent, cube still reports the lease as `leased` and the
 probe verdict is `Live`, even though the worker pane is gone.
 
@@ -208,7 +210,7 @@ bossctl agents reap <run-id>
 bossctl work start <work-item-id>   # picks up the orphan's workspace_id
 
 # If the workspace itself is stuck (rare — cube usually self-heals
-# via TTL after 30 min), see tools/cube/docs/remaining-work.md for
+# via TTL after 24h), see tools/cube/docs/remaining-work.md for
 # `cube workspace force-release`.
 ```
 
@@ -223,7 +225,7 @@ deliberately doesn't, because:
   lease lets cube hand the workspace to someone else (or auto-clean
   it), which makes the in-flight state harder to recover.
 - Cube's lease TTL provides a safety net: orphaned leases that no
-  worker is heartbeating expire on their own within 30 minutes.
+  worker is heartbeating expire on their own within 24 hours.
 - A human who _does_ want a clean slate can invoke `bossctl agents
 stop <run-id>` first, then `agents reap` — the stop path is the
   documented way to release the lease deliberately.

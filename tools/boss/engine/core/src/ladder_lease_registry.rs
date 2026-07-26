@@ -13,7 +13,8 @@
 //! [`crate::run_reconcile`]) knows it exists. If the engine process exits
 //! (crash, restart, shutdown) between acquiring the lease and running its
 //! release, the lease is orphaned to the dead engine and sits until cube's
-//! TTL sweep reclaims it — up to 30 minutes later. See the 2026-07-18
+//! TTL sweep reclaims it — up to the full cube default TTL later
+//! (24 hours). See the 2026-07-18
 //! incident: workspace `flunge-agent-035`, lease held by conflict-ladder
 //! attempt `crz_18c35db426d18878_7d9`, orphaned across an engine restart
 //! that landed 31 seconds after the lease was acquired.

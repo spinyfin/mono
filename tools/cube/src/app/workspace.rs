@@ -64,7 +64,9 @@ use crate::app::workspace_ops::{workspace_goto, workspace_push, workspace_rebase
 /// heartbeat-failure-streak + confirm-dead auto-reap (also calls
 /// force-release directly, see `cube_lease_heartbeat.rs`). This TTL is only
 /// the last-resort backstop for leases nothing else is watching.
-const DEFAULT_LEASE_TTL_SECS: i64 = 24 * 60 * 60;
+// `pub(super)` so unit tests can pin the value (and keep it in lockstep
+// with the Boss engine's `LEASE_TTL_SECS` heartbeat backstop).
+pub(super) const DEFAULT_LEASE_TTL_SECS: i64 = 24 * 60 * 60;
 
 /// `last_release_reason` recorded when the dirty-reclaim guard in
 /// `reset_workspace_guarded` refuses a destructive reset and the workspace
@@ -1002,7 +1004,7 @@ pub(super) fn run_workspace(
             // The workspace is claimed (state=leased) and exclusively ours.
             // Release the per-repo lock before the network-bound reset/resume
             // and setup below: those operate only on this one workspace, and
-            // the bounded lease TTL (30m) far exceeds the bounded reset, so no
+            // the bounded lease TTL (24h) far exceeds the bounded reset, so no
             // concurrent lease can expire-and-reclaim it mid-reset. Holding
             // the lock across `jj git fetch` is exactly what let one stalled
             // workspace wedge every other lease/release for the repo.
@@ -1255,7 +1257,7 @@ pub(super) fn run_workspace(
 
             // Reset the workspace OUTSIDE the per-repo lock. This is the
             // root-cause fix: the workspace is still `leased` (so no concurrent
-            // lease can claim it) and its TTL (30m) far exceeds the now-bounded
+            // lease can claim it) and its TTL (24h) far exceeds the now-bounded
             // reset, so running `jj git fetch && jj new <main>` here cannot be
             // raced — and a stalled remote can no longer hold the lock and
             // wedge every other lease/release for the repo. A failed or

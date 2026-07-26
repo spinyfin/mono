@@ -12,6 +12,25 @@ use crate::store::Store;
 use crate::app::dispatch::{run_with_context, run_with_dependencies};
 use crate::app::errors::CubeError;
 use crate::app::repo::RepoEnsureDefaults;
+use crate::app::workspace::DEFAULT_LEASE_TTL_SECS;
+
+/// Pin cube's default lease TTL at 24h.
+///
+/// Raised from 30m by the 2026-07-23 crash-and-restart incident fix.
+/// The Boss engine's `LEASE_TTL_SECS` (see `cube_lease_heartbeat.rs`)
+/// must stay in lockstep — the engine passes that value explicitly on
+/// every heartbeat, so a drift silently re-clamps every live lease
+/// back to the engine figure. Both sides assert the same 86400s value.
+#[test]
+fn default_lease_ttl_is_24_hours() {
+    assert_eq!(
+        DEFAULT_LEASE_TTL_SECS,
+        24 * 60 * 60,
+        "cube DEFAULT_LEASE_TTL_SECS must stay at 24h; if you change it, also \
+         update boss_engine_core::cube_lease_heartbeat::LEASE_TTL_SECS so the \
+         engine does not re-clamp every heartbeated lease to a different value"
+    );
+}
 
 #[test]
 fn workspace_lease_claims_first_free_workspace_and_records_head_commit() {
