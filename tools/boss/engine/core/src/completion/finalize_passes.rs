@@ -247,12 +247,22 @@ impl WorkerCompletionHandler {
         // sweep re-finalize an already-finalized triage run later with a
         // misleading pane-died detail.
         let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
             Some(&format!("automation triage: {outcome}")),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Stop-driven completion termination path: tear down any
+                // driver-owned state outside the workspace, captured before
+                // `complete_pane_parked_execution` nulls `workspace_path`.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
+            }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "automation triage finalise: execution already terminal; nothing to do",
@@ -347,6 +357,7 @@ impl WorkerCompletionHandler {
         // `complete_pane_parked_execution` (see that finalizer's comment for
         // why this does not depend on there being a still-`active` run).
         let lease_id = execution.cube_lease_id.clone();
+        let workspace_path = execution.workspace_path.clone();
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
@@ -356,7 +367,16 @@ impl WorkerCompletionHandler {
                 "answer agent: no reply posted"
             }),
         ) {
-            Ok(Some(_)) => {}
+            Ok(Some(_)) => {
+                // Stop-driven completion termination path: tear down any
+                // driver-owned state outside the workspace, captured before
+                // `complete_pane_parked_execution` nulls `workspace_path`.
+                crate::driver_teardown::teardown_driver_workspace(
+                    &execution.id,
+                    workspace_path.as_deref().map(std::path::Path::new),
+                )
+                .await;
+            }
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "answer-agent finalise: execution already terminal; nothing to do",

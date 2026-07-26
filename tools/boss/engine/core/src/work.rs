@@ -498,6 +498,7 @@ pub use audit_misc::canonicalize_repo_remote_url;
 pub use audit_misc::canonicalize_worker_branch_prefix;
 pub use automations::AutomationFireRecord;
 pub use boothby::{BoothbyActionContext, BoothbyActionGuard};
+pub use exec_tail::ClearedExecutionWorkspace;
 pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,

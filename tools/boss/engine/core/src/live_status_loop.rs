@@ -1141,6 +1141,9 @@ mod tests {
         async fn provision_workspace(&self, _: &Path, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn teardown_workspace(&self, _: Option<&Path>, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
         async fn write_permission_config(&self, _: &PermissionInput, _: &Path) -> anyhow::Result<PermissionArtifacts> {
             unimplemented!()
         }

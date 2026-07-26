@@ -691,6 +691,16 @@ async fn reap_dead_execution(
         return false;
     }
 
+    // Reap termination path (dead-pid reconcile): tear down any
+    // driver-owned state outside the workspace. `mark_execution_orphaned`
+    // preserves `workspace_path`, so the pre-call `execution` snapshot is
+    // still current.
+    crate::driver_teardown::teardown_driver_workspace(
+        execution_id,
+        execution.workspace_path.as_deref().map(std::path::Path::new),
+    )
+    .await;
+
     // Snapshot the dead worker's uncommitted workspace work to a
     // durable patch before the slot is released and the workspace
     // becomes eligible for re-lease/reset. Best-effort: a failed or

@@ -508,15 +508,26 @@ pub async fn run_one_pass(
                 let class_label = class.as_str();
                 // Settle the execution so it isn't re-inspected; ignore a
                 // race where another reconciler already marked it terminal.
-                if let Err(err) = work_db.mark_execution_orphaned(
+                match work_db.mark_execution_orphaned(
                     &execution_id,
                     &format!("transient-recovery escalation ({}): {clipped}", reason.as_str()),
                 ) {
-                    tracing::debug!(
-                        execution_id,
-                        ?err,
-                        "transient-recovery: execution already terminal at escalation (benign)",
-                    );
+                    Ok(orphaned) => {
+                        // Reap termination path: tear down any driver-owned
+                        // state outside the workspace.
+                        crate::driver_teardown::teardown_driver_workspace(
+                            &execution_id,
+                            orphaned.workspace_path.as_deref().map(std::path::Path::new),
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            execution_id,
+                            ?err,
+                            "transient-recovery: execution already terminal at escalation (benign)",
+                        );
+                    }
                 }
                 let title = match reason {
                     EscalateReason::RetriesExhausted => "Worker auto-recovery exhausted retries".to_owned(),
