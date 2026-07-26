@@ -216,9 +216,10 @@ extension ChatViewModel {
     }
 
     /// Rebuild the gating/dependency prereq caches from current edge and
-    /// task/project data. Called synchronously from `invalidateWorkCache()`
-    /// and `dependenciesByProductID.didSet` so the caches are always current
-    /// before the next SwiftUI render pass. O(total edges) per call.
+    /// task/project data. Invoked lazily on first read after
+    /// `invalidateWorkCache(.dependencies)` (or full invalidation) so a
+    /// burst of engine events coalesces into one rebuild at the next render
+    /// rather than one full graph walk per event. O(total edges) per call.
     func rebuildPrereqCache() {
         var gating: [String: [WorkDependencyRow]] = [:]
         var prereqs: [String: [WorkDependencyRow]] = [:]
