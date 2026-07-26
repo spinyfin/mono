@@ -1452,8 +1452,24 @@ if __name__ == "__main__":
 /// Rooted at the per-user system temp dir (`$TMPDIR` on macOS, a
 /// private per-user location), so the files are user-private and never
 /// inside a workspace tree.
+///
+/// Under Bazel tests, prefers `$TEST_TMPDIR` when set. That directory is
+/// unique per test action (including each shard of a `shard_count > 1`
+/// `rust_test` and each `runs_per_test` copy), so concurrent processes
+/// do not race on the shared gate-script paths
+/// (`boss-path-guard.py`, `boss-checkleft-push-guard.py`) that live
+/// here. Production never sets `TEST_TMPDIR`, so the stable per-user
+/// location that heal relies on is unchanged.
 pub fn worker_settings_dir() -> PathBuf {
-    std::env::temp_dir().join(WORKER_SETTINGS_SUBDIR)
+    worker_settings_root().join(WORKER_SETTINGS_SUBDIR)
+}
+
+/// Root directory under which [`worker_settings_dir`] places its subdir.
+fn worker_settings_root() -> PathBuf {
+    match std::env::var_os("TEST_TMPDIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => std::env::temp_dir(),
+    }
 }
 
 /// Absolute path to the worker settings file for `workspace_path`. The

@@ -22,13 +22,18 @@ pub(crate) fn claude_md_for(input: &WorkerSetupInput) -> String {
     )
 }
 
-/// Serializes tests that touch the *shared* worker-settings dir
-/// (`worker_settings_dir()`, a fixed `$TMPDIR` path). `write_workspace_files`
-/// truncate-writes the global `boss-path-guard.py` there; a concurrent
-/// reader of that same file otherwise observes a half-written (empty)
-/// script. The path isn't per-test overridable, so a lock is the
-/// minimal isolation. Recovers from poisoning so one failing test
-/// doesn't cascade.
+/// Serializes tests that touch the worker-settings dir within one
+/// process. `write_workspace_files` truncate-writes the shared gate
+/// scripts (`boss-path-guard.py`, `boss-checkleft-push-guard.py`) under
+/// [`worker_settings_dir`]; a concurrent reader of that same file
+/// otherwise observes a half-written (empty) script.
+///
+/// Cross-process isolation (Bazel shards / `runs_per_test` copies) is
+/// handled by [`worker_settings_dir`] preferring `$TEST_TMPDIR` when
+/// set — unique per test action. This mutex only covers in-process
+/// parallelism (Rust's default multi-threaded test runner), where every
+/// thread shares one `TEST_TMPDIR`. Recovers from poisoning so one
+/// failing test doesn't cascade.
 static SHARED_SETTINGS_DIR_LOCK: Mutex<()> = Mutex::new(());
 
 pub(crate) fn lock_shared_settings_dir() -> std::sync::MutexGuard<'static, ()> {
