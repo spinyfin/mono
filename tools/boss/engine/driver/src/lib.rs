@@ -133,7 +133,7 @@ pub enum Capability {
     /// A "turn ended" signal triggering completion detection and probe injection.
     TurnBoundary,
     /// Receive the worker's structured results (PR URL, ReviewResult, triage,
-    /// FOLLOWUPS) via file-based primary contract (T1414).
+    /// FOLLOWUPS) via a file-based primary contract.
     StructuredOutput,
     /// A redactable, role-structured view of the run for summarisation and
     /// post-hoc extraction.

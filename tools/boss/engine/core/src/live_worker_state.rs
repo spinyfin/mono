@@ -82,13 +82,14 @@ struct Inner {
     /// trusts a `WorkerEvent::Notification` as a genuine "worker is
     /// blocked on human input" signal.
     ///
-    /// Defaults to `true` for every slot at `register_spawn` (Claude is
-    /// the only driver in production today, and it provides the
-    /// capability), so every existing caller's behaviour is unchanged
-    /// without having to thread this through. A caller that resolves a
-    /// driver lacking the capability calls `set_awaiting_input_capable`
-    /// to override it — see that method's doc for why the honest default
-    /// on absence is "never fake it", not a lower-fidelity guess.
+    /// Defaults to `true` via `register_spawn` (Claude is the only driver
+    /// in production today, and it provides the capability), so the ~30
+    /// existing test call sites keep working unchanged. Production spawn
+    /// sites that resolve a real driver call
+    /// `register_spawn_with_capabilities` instead, passing the resolved
+    /// value directly so it can never be left at the default by a
+    /// forgotten follow-up call — see that method's doc for why the honest
+    /// default on absence is "never fake it", not a lower-fidelity guess.
     awaiting_input_capable: HashMap<u8, bool>,
 }
 
@@ -106,6 +107,13 @@ impl LiveWorkerStateRegistry {
     /// dispatch always passes `Some`; in-process tests and any
     /// future direct-launch path that bypasses the work tables may
     /// pass `None`.
+    ///
+    /// Seeds `awaiting_input_capable` `true` (Claude's historical
+    /// behaviour) — the ~30 existing test call sites in this crate rely on
+    /// that default. Production spawn paths that resolve an actual driver
+    /// must call [`Self::register_spawn_with_capabilities`] instead, so the
+    /// capability travels with registration rather than depending on a
+    /// second call that a future call site could forget.
     pub fn register_spawn(
         &self,
         slot_id: u8,
@@ -114,11 +122,31 @@ impl LiveWorkerStateRegistry {
         shell_pid: i32,
         binding: Option<WorkItemBinding>,
     ) {
+        self.register_spawn_with_capabilities(slot_id, run_id, model, shell_pid, binding, true);
+    }
+
+    /// Same as [`Self::register_spawn`], but takes `awaiting_input_capable`
+    /// directly instead of seeding `true` and relying on a follow-up
+    /// [`Self::set_awaiting_input_capable`] call. Production spawn sites
+    /// that resolve a real driver should call this: it closes the
+    /// fail-open gap where a spawn site that registers a slot but forgets
+    /// the setter would silently default to "trust `Notification`", and it
+    /// removes the window between the two calls where a concurrently
+    /// delivered hook event would be evaluated against that stale default.
+    pub fn register_spawn_with_capabilities(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        awaiting_input_capable: bool,
+    ) {
         let state = LiveWorkerState::new_spawning(slot_id, run_id, model, shell_pid, binding);
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
-        guard.awaiting_input_capable.insert(slot_id, true);
+        guard.awaiting_input_capable.insert(slot_id, awaiting_input_capable);
         guard
             .spawned_at
             .insert(slot_id, boss_engine_utils::epoch_time::now_epoch_secs());
@@ -350,8 +378,9 @@ impl LiveWorkerStateRegistry {
                 // (see `set_awaiting_input_capable`). Absent that — a
                 // driver that doesn't back the signal, or emitted one it
                 // shouldn't have — leave activity untouched rather than
-                // guess: the "don't fake WaitingForInput" contract lives
-                // here, at the one place this event is interpreted.
+                // guess: this is one of two places the "don't fake
+                // WaitingForInput" contract is enforced, the other being
+                // `mark_stalled_spawns`'s own `awaiting_input_capable` check.
                 if awaiting_input_capable.get(&slot_id).copied().unwrap_or(true) {
                     state.activity = WorkerActivity::WaitingForInput;
                     state.current_tool = None;
@@ -502,6 +531,12 @@ impl LiveWorkerStateRegistry {
     /// `crate::spawn_ack_sweep::run_one_pass`, which terminal-fails and
     /// redispatches it after a longer grace window.
     ///
+    /// **Also gated on `awaiting_input_capable`.** A slot whose driver
+    /// doesn't declare `Capability::AwaitingInputSignal` is left in
+    /// `Spawning` here too — promoting it would be exactly the same kind
+    /// of "no events for N seconds ⇒ assume the worker awaits a human"
+    /// guess `apply_event` refuses to make for an untrusted `Notification`.
+    ///
     /// Returns the slot IDs that were changed so callers can broadcast
     /// the updated snapshot. Normal-running workers (whose `SessionStart`
     /// hook fires within seconds of spawn) always have `last_event_at`
@@ -509,7 +544,10 @@ impl LiveWorkerStateRegistry {
     pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let Inner {
-            by_slot, spawned_at, ..
+            by_slot,
+            spawned_at,
+            awaiting_input_capable,
+            ..
         } = &mut *guard;
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
         let mut changed = Vec::new();
@@ -520,6 +558,17 @@ impl LiveWorkerStateRegistry {
             if state.shell_pid <= 0 {
                 // No process has reported in at all — `spawn_ack_sweep`
                 // owns this slot, not the directory-trust-prompt path.
+                continue;
+            }
+            if !awaiting_input_capable.get(slot_id).copied().unwrap_or(true) {
+                // This driver never declared `Capability::AwaitingInputSignal`,
+                // so — same "don't fake it" contract `apply_event` enforces on
+                // `Notification` — this sweep must not promote the slot either.
+                // Leave it in `Spawning` rather than guess, mirroring the
+                // zero-pid case just above; `dead_pid_sweep`'s process-liveness
+                // backstop is the honest fallback for this driver class (see
+                // the design doc's "ProgressObservation minimum-fidelity tier"
+                // decision).
                 continue;
             }
             if state.last_event_at.is_some() {
@@ -816,6 +865,26 @@ mod tests {
             reg.get(1).unwrap().activity,
             WorkerActivity::WaitingForInput,
             "a fresh spawn into a recycled slot must not inherit the prior run's flag"
+        );
+    }
+
+    #[test]
+    fn register_spawn_with_capabilities_seeds_flag_at_registration() {
+        // The capability travels with registration in one call, so there is
+        // no window where a hook event could race a follow-up setter call.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn_with_capabilities(1, "run-1", "claude-opus-4-7", 1, None, false);
+        reg.apply_event(
+            1,
+            &WorkerEvent::Notification {
+                session_id: "s".into(),
+                message: "claude needs permission".into(),
+            },
+        );
+        assert_eq!(
+            reg.get(1).unwrap().activity,
+            WorkerActivity::Spawning,
+            "an untrusted Notification must not change activity"
         );
     }
 
@@ -1183,6 +1252,37 @@ mod tests {
             "must remain Spawning — spawn_ack_sweep owns the pid-less timeout path"
         );
         assert_eq!(state.shell_pid, 0);
+    }
+
+    /// Mirrors `awaiting_input_incapable_driver_never_shows_waiting_for_input`
+    /// for the stalled-spawn path: a slot whose driver doesn't declare
+    /// `Capability::AwaitingInputSignal` must never be promoted to
+    /// `WaitingForInput` by `mark_stalled_spawns`, even after the threshold
+    /// elapses with `shell_pid > 0` and no hook event — exactly the shape
+    /// that promotes a capable slot. It must be left in `Spawning` instead
+    /// of the fabricated state.
+    #[test]
+    fn awaiting_input_incapable_driver_never_marked_stalled() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.set_awaiting_input_capable(1, false);
+
+        let old_spawn = 1_700_000_000_i64;
+        reg.set_spawn_time_for_test(1, old_spawn);
+
+        let now = old_spawn + STALLED_SPAWN_THRESHOLD_SECS + 1;
+        let changed = reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS);
+
+        assert!(
+            changed.is_empty(),
+            "an awaiting-input-incapable driver's slot must never be marked stalled"
+        );
+        let state = reg.get(1).unwrap();
+        assert_eq!(
+            state.activity,
+            WorkerActivity::Spawning,
+            "must remain Spawning — no lower-fidelity fallback exists yet for this driver"
+        );
     }
 
     /// Workers in non-Spawning states are never touched by `mark_stalled_spawns`.

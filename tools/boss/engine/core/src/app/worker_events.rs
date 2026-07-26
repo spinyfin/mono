@@ -4,6 +4,7 @@
 //! hook events live here. Pure structural move — no behavioural change.
 
 use super::*;
+use crate::driver::{AgentDriver, Capability, ClaudeDriver};
 
 impl ServerState {
     /// First call for a given `execution_id` returns `true` (and remembers
@@ -185,10 +186,10 @@ pub(super) async fn dispatch_live_worker_state(
                     // No slot, and not a live remote worker. Before we
                     // drop the event, check whether it belongs to an
                     // execution the engine already believes is terminal —
-                    // the T267-class contradiction where a run we think is
-                    // dead is demonstrably alive (its worker is still
-                    // emitting hooks). If so, make it LOUD and countable
-                    // instead of swallowing it silently.
+                    // the contradiction where a run we think is dead is
+                    // demonstrably alive (its worker is still emitting
+                    // hooks). If so, make it LOUD and countable instead
+                    // of swallowing it silently.
                     if !note_hook_for_terminal_execution(server_state, run_id, event_kind) {
                         tracing::warn!(
                             run_id,
@@ -434,20 +435,18 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
         // local pid, so 0 (the live state stores it but the value is
         // only meaningful for the local ancestor-walk correlation that
         // remote runs bypass via the `_boss_run_id` token).
-        server_state
-            .live_worker_states
-            .register_spawn(slot_id, run_id, model, 0, binding);
         // Remote workers are Claude-only today (the `model` fallback above
         // is the literal label `"claude"` — see the driver-abstraction
         // design doc's "Remote/SSH driver-awareness" future task), so this
-        // mirrors the local spawn path's derivation rather than relying on
-        // `register_spawn`'s capable-by-default seed.
-        use crate::driver::AgentDriver as _;
-        server_state.live_worker_states.set_awaiting_input_capable(
+        // mirrors the local spawn path's derivation, passing the capability
+        // straight into registration rather than a follow-up setter call.
+        server_state.live_worker_states.register_spawn_with_capabilities(
             slot_id,
-            crate::driver::ClaudeDriver
-                .capabilities()
-                .provides(crate::driver::Capability::AwaitingInputSignal),
+            run_id,
+            model,
+            0,
+            binding,
+            ClaudeDriver.capabilities().provides(Capability::AwaitingInputSignal),
         );
         tracing::info!(
             run_id,
@@ -463,9 +462,9 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
 /// When a hook event arrives for a run with no live slot mapping,
 /// determine whether the engine already considers that execution
 /// terminal. A terminal execution that is *still emitting worker hook
-/// events* is the T267-class contradiction: the engine believed the run
-/// dead — because an ack-timeout was once mis-handled as a spawn failure,
-/// or a sweep reaped it — yet its worker is demonstrably alive. Emit a
+/// events* is a contradiction: the engine believed the run dead — because
+/// an ack-timeout was once mis-handled as a spawn failure, or a sweep
+/// reaped it — yet its worker is demonstrably alive. Emit a
 /// loud `[engine-reconcile]` diagnostic and bump the
 /// `dispatcher.hook_events.for_terminal_execution` counter so the
 /// mismatch is observable rather than silently swallowed (the "engine has
