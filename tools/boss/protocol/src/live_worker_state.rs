@@ -69,6 +69,25 @@ impl WorkerActivity {
         matches!(self, WorkerActivity::Terminated | WorkerActivity::Errored)
     }
 
+    /// True iff the pane's foreground worker is in a posture where
+    /// typed / `SendToPane` input is expected to be consumed as agent
+    /// (or interactive-shell) input rather than buffered against a
+    /// non-consuming process.
+    ///
+    /// Only [`Self::Idle`] (between turns at the prompt) and
+    /// [`Self::WaitingForInput`] (parked on a permission / human
+    /// redirect) qualify. Mid-turn [`Self::Working`], pre-session
+    /// [`Self::Spawning`], and terminal states do **not**: injecting
+    /// there races the foreground process and — when that process
+    /// does not consume stdin (e.g. `codex exec`) — leaves bytes in
+    /// the tty input buffer that the interactive shell later
+    /// executes (see the ghostty-codex-pane-viability investigation,
+    /// Q2 Layer D). This is a property of live pane activity, not of
+    /// which agent driver owns the run.
+    pub fn accepts_typed_input(self) -> bool {
+        matches!(self, WorkerActivity::Idle | WorkerActivity::WaitingForInput)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             WorkerActivity::Spawning => "spawning",
@@ -259,6 +278,16 @@ mod tests {
     fn worker_activity_serializes_as_snake_case() {
         let json = serde_json::to_string(&WorkerActivity::WaitingForInput).unwrap();
         assert_eq!(json, "\"waiting_for_input\"");
+    }
+
+    #[test]
+    fn accepts_typed_input_only_when_parked_at_prompt() {
+        assert!(WorkerActivity::Idle.accepts_typed_input());
+        assert!(WorkerActivity::WaitingForInput.accepts_typed_input());
+        assert!(!WorkerActivity::Spawning.accepts_typed_input());
+        assert!(!WorkerActivity::Working.accepts_typed_input());
+        assert!(!WorkerActivity::Errored.accepts_typed_input());
+        assert!(!WorkerActivity::Terminated.accepts_typed_input());
     }
 
     #[test]

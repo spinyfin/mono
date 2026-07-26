@@ -219,45 +219,37 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
 }
 
-/// Happy path for the verified urgent-probe delivery: `SendToPane`
-/// succeeds and the worker's CLI confirms it by firing a
-/// `UserPromptSubmit` hook carrying the injected `[coordinator-nudge]`
-/// text, all within the verification window. The probe must be
-/// consumed (not left requeued) exactly as before this fix.
+/// Safety guard: an urgent probe on PostToolUse while the worker is
+/// mid-turn (`Working`) must **not** write to the pane. Injecting into
+/// a non-accepting foreground process is a safety issue
+/// (ghostty-codex-pane-viability Q2 Layer D), not hygiene. The probe is
+/// re-queued for the next Stop boundary and a `ProbeDeliveryEscalated`
+/// push surfaces the refusal.
 #[tokio::test]
-async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit() {
+async fn dispatch_urgent_probe_refuses_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-confirmed";
-    server_state.worker_registry.register_run_slot(run_id, 5);
+    let run_id = "run-urgent-refused";
+    register_working_worker(&server_state, run_id, 5);
 
     let app_sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), app_sink.clone())
         .await;
-    let server_for_app = server_state.clone();
-    let app_responder = tokio::spawn(async move {
-        let envelope = app_sink
-            .next()
-            .await
-            .expect("SendToPane must be enqueued for urgent probe");
-        let request_id = match &envelope.payload {
-            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
-            other => panic!("expected EngineRequest, got {other:?}"),
-        };
-        server_for_app
-            .deliver_app_response(
-                "session-app",
-                &request_id,
-                EngineToAppResponse::SendToPane {
-                    result: Ok(crate::protocol::SendToPaneResult {}),
-                },
-            )
-            .await;
-    });
 
-    server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
+    let watch_session_id = "session-probe-watch-refuse".to_owned();
+    let watch_sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&watch_session_id, watch_sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&watch_session_id, &[probe_topic(run_id)])
+        .await;
+
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "what now?".into(), true);
 
     let post_tool_use = crate::events_socket::IncomingHookEvent::for_test(
         WorkerEvent::PostToolUse {
@@ -269,65 +261,63 @@ async fn dispatch_urgent_probe_on_post_tool_use_confirms_via_user_prompt_submit(
         Some(run_id.to_owned()),
         None,
     );
-    let dispatch = tokio::spawn({
-        let server_state = server_state.clone();
-        async move { dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await }
-    });
+    dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use).await;
 
-    app_responder.await.expect("app responder task");
-
-    // Confirm delivery the way the worker's CLI would: the marked
-    // "[coordinator-nudge] ..." text arrives as a UserPromptSubmit.
-    dispatch_live_worker_state(
-        &server_state,
-        &crate::events_socket::IncomingHookEvent::for_test(
-            WorkerEvent::UserPromptSubmit {
-                session_id: "claude-sess-1".into(),
-                prompt: "[coordinator-nudge] what now?".into(),
-            },
-            Some(run_id.to_owned()),
-            None,
-        ),
-    )
-    .await;
-
-    dispatch.await.expect("dispatch task");
-
-    assert!(
-        server_state.pop_pending_probe(run_id).is_none(),
-        "confirmed urgent probe must be consumed, not left queued",
+    // Pre-write guard: no SendToPane was issued.
+    assert_eq!(
+        app_sink.queue_stats().depth,
+        0,
+        "refused urgent probe must not enqueue SendToPane"
     );
+    // Probe is re-queued for Stop-boundary delivery (not silently dropped).
+    assert!(
+        server_state.pop_pending_probe(run_id).is_some(),
+        "refused urgent probe must be re-queued for Stop boundary",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeLifecycleState::Queued),
+    );
+
+    let envelope = watch_sink
+        .next()
+        .await
+        .expect("ProbeDeliveryEscalated should surface the refusal");
+    match envelope.payload {
+        FrontendEvent::ProbeDeliveryEscalated {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            reason,
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+            assert!(
+                reason.contains("not accepting typed input"),
+                "escalation reason must name the activity guard; got {reason:?}"
+            );
+        }
+        other => panic!("expected ProbeDeliveryEscalated, got {other:?}"),
+    }
 }
 
-/// Regression test for the probe-6 incident, corrected understanding
-/// (2026-07-13): an urgent probe's pane write lands while the worker
-/// is mid-turn, `SendToPane` reports success, but neither a
-/// `UserPromptSubmit` hook nor a transcript scan confirms it within
-/// the verification window. The original fix treated that as proof of
-/// loss and auto-redelivered the text at the next Stop boundary — but
-/// the corrected incident record shows the text likely *was* consumed
-/// (the worker acted on it), so auto-redelivery would have handed the
-/// worker a duplicate instruction. This asserts the corrected
-/// behavior: the probe is NOT re-queued, its lifecycle state is
-/// recorded as `Unconfirmed` (queryable rather than assumed), it is
-/// still tracked in-flight so a reply that does arrive is captured,
-/// and a `ProbeDeliveryEscalated` push tells observers delivery is
-/// unverified without implying a duplicate was sent.
+/// When the activity guard passes (worker Idle) but the CLI never
+/// confirms the write, the corrected probe-6 understanding still
+/// applies: do **not** auto-redeliver. Lifecycle is Unconfirmed and a
+/// ProbeDeliveryEscalated push is emitted. This is the post-guard
+/// observability path; mid-turn refusal is covered separately.
 #[tokio::test(start_paused = true)]
-async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_redelivery() {
+async fn dispatch_urgent_probe_on_idle_records_unconfirmed_without_redelivery() {
     use crate::protocol::WorkerEvent;
 
     let (server_state, _dir) = test_server_state();
-    let run_id = "run-urgent-midturn";
-    server_state.worker_registry.register_run_slot(run_id, 6);
+    let run_id = "run-urgent-idle-unconfirmed";
+    register_idle_worker(&server_state, run_id, 6);
 
     let app_sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), app_sink.clone())
         .await;
 
-    // Observe the probe topic so we can assert the visibility push
-    // lands alongside the escalation.
     let watch_session_id = "session-probe-watch".to_owned();
     let watch_sink = make_session_sink();
     server_state
@@ -344,7 +334,7 @@ async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_rede
         let envelope = app_sink
             .next()
             .await
-            .expect("SendToPane must be enqueued for urgent probe");
+            .expect("SendToPane must be enqueued for idle urgent probe");
         let request_id = match &envelope.payload {
             FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
             other => panic!("expected EngineRequest, got {other:?}"),
@@ -378,31 +368,18 @@ async fn dispatch_urgent_probe_on_post_tool_use_records_unconfirmed_without_rede
     });
 
     app_responder.await.expect("app responder task");
-
-    // Simulate the incident: the worker is mid-turn and never fires a
-    // UserPromptSubmit for the injected text. Drive virtual time past
-    // the verification window so the dispatch task's wait times out
-    // deterministically instead of the test blocking on real time.
     tokio::time::advance(Duration::from_secs(10)).await;
-
     dispatch.await.expect("dispatch task");
 
-    // The probe must NOT be re-queued — that would duplicate delivery
-    // in exactly the scenario the corrected incident record
-    // establishes actually happened.
     assert!(
         server_state.pop_pending_probe(run_id).is_none(),
         "unconfirmed urgent probe must not be auto-redelivered",
     );
-    // Its lifecycle must be observably Unconfirmed rather than silently
-    // assumed either way.
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
         Some(ProbeLifecycleState::Unconfirmed),
         "unconfirmed delivery must be recorded, not left unknown",
     );
-    // Still tracked as in-flight so a reply that does arrive (because
-    // the text really was consumed) is captured rather than dropped.
     assert!(
         server_state.take_in_flight_probe(run_id).is_some(),
         "unconfirmed probe must still be tracked in-flight for reply capture",

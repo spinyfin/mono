@@ -1073,19 +1073,24 @@ pub(super) async fn dispatch_probe_on_stop(
 const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// On the `PostToolUse` boundary, check whether the front probe in the
-/// per-run queue is urgent. If so, pop it and dispatch it immediately
-/// via `SendToPane`, prefixing the text with `[coordinator-nudge]` so
-/// the worker and human readers can identify coordinator-injected
-/// urgent text. The tool call has already completed at this point, so
-/// no in-flight Bash is cancelled.
+/// per-run queue is urgent. If so, pop it and attempt an immediate
+/// verified pane write (prefixed with `[coordinator-nudge]`). The tool
+/// call has already completed at this point, so no in-flight Bash is
+/// cancelled.
 ///
-/// The write is not trusted just because `SendToPane` returned Ok: it
-/// lands while the worker is actively mid-turn, which races the CLI's
-/// TUI input handling (the probe-6 incident). This waits for
-/// confirmation — a matching `UserPromptSubmit` hook, or a transcript
-/// scan — before declaring success. On a transport/app-level failure
-/// the probe is pushed back to the front so the next `PostToolUse`
-/// retries with the same id.
+/// **Activity guard:** `inject_pane_text_verified` refuses when the
+/// live worker is not accepting typed input (typically `Working` on
+/// this boundary). That is intentional and driver-agnostic — mid-turn
+/// inject into a non-consuming foreground process is a safety issue
+/// (ghostty-codex-pane-viability Q2 Layer D). On refusal the probe is
+/// re-queued for the next Stop-boundary dispatch and
+/// `ProbeDeliveryEscalated` surfaces the reason.
+///
+/// When the guard passes, the write is not trusted just because
+/// `SendToPane` returned Ok: confirmation still requires a matching
+/// `UserPromptSubmit` hook or a transcript scan (probe-6). On a
+/// transport/app-level failure the probe is pushed back to the front
+/// so a later retry keeps the same id.
 ///
 /// On an *unconfirmed* write, the corrected understanding of the
 /// probe-6 incident (2026-07-13) is that the text likely still reached
@@ -1189,6 +1194,36 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 )
                 .await;
         }
+        PaneInjectOutcome::NotAcceptingInput { activity } => {
+            // Mid-turn / non-consuming foreground: do not write bytes
+            // into the pty (safety). Leave the probe queued for the
+            // next Stop-boundary dispatch, which runs when activity
+            // is Idle/WaitingForInput. Surface via lifecycle + topic
+            // so observers see the refusal rather than a silent drop.
+            tracing::warn!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                activity = activity.map(boss_protocol::WorkerActivity::as_str),
+                "urgent probe refused: worker is not accepting typed input; re-queuing for Stop boundary",
+            );
+            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.requeue_probe_front(run_id.to_owned(), probe);
+            server_state
+                .topic_broker
+                .publish(
+                    &probe_topic(run_id),
+                    FrontendEventEnvelope::push(FrontendEvent::ProbeDeliveryEscalated {
+                        run_id: run_id.to_owned(),
+                        probe_id,
+                        reason: format!(
+                            "refused urgent pane injection: worker not accepting typed input (activity={})",
+                            activity.map(boss_protocol::WorkerActivity::as_str).unwrap_or("unknown")
+                        ),
+                    }),
+                )
+                .await;
+        }
         PaneInjectOutcome::SendFailed(failure) => {
             tracing::warn!(
                 ?failure,
@@ -1228,23 +1263,23 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
 /// emit `ProbeReplied` when the worker responds.
 pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_id: &str) {
     use crate::protocol::{EngineToAppRequest, SendToPaneInput};
-    use boss_protocol::WorkerActivity;
 
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         // Worker not yet mapped to a slot (spawning) — probe stays queued.
         tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
         return;
     };
-    let is_parked = server_state
-        .live_worker_states
-        .get(slot_id)
-        .map(|s| matches!(s.activity, WorkerActivity::Idle | WorkerActivity::WaitingForInput))
-        .unwrap_or(false);
-    if !is_parked {
+    // Same activity predicate as `inject_pane_text_verified`: only
+    // Idle / WaitingForInput accept typed input. Working / Spawning /
+    // terminal / missing live state leave the probe queued for Stop.
+    if !server_state.pane_accepts_typed_input(slot_id) {
         tracing::debug!(
             run_id,
             slot_id,
-            "probe-if-idle: worker not parked; probe will fire at next Stop",
+            activity = server_state
+                .pane_typed_input_activity(slot_id)
+                .map(boss_protocol::WorkerActivity::as_str),
+            "probe-if-idle: worker not accepting typed input; probe will fire at next Stop",
         );
         return;
     }

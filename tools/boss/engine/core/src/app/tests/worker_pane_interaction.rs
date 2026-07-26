@@ -110,9 +110,10 @@ async fn send_input_to_worker_round_trips_to_app() {
     // the text payload to the registered app session, waits for a
     // `UserPromptSubmit` hook confirming the CLI actually enqueued
     // it (not just that the app accepted the pty write), and
-    // surfaces the slot id once both land.
+    // surfaces the slot id once both land. Worker must be Idle so
+    // the typed-input activity guard allows the write.
     let (server_state, _dir) = test_server_state();
-    server_state.worker_registry.register_run_slot("run-send", 7);
+    register_idle_worker(&server_state, "run-send", 7);
 
     let sink = make_session_sink();
     server_state
@@ -181,8 +182,13 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     // time at its next Stop boundary. This locks in the corrected
     // behavior: an unconfirmed write returns Ok (the pane write did
     // succeed) without being queued again.
+    //
+    // Activity is Idle so the typed-input guard allows the write; the
+    // gap under test is verification after a successful pty write, not
+    // the mid-turn refusal path (see
+    // `send_input_to_worker_refuses_when_worker_not_accepting_input`).
     let (server_state, _dir) = test_server_state();
-    server_state.worker_registry.register_run_slot("run-unverified", 3);
+    register_idle_worker(&server_state, "run-unverified", 3);
 
     let sink = make_session_sink();
     server_state
@@ -202,9 +208,8 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
         other => panic!("expected EngineRequest, got {other:?}"),
     };
 
-    // The app accepts the pty write (this is exactly what happened in
-    // production) — but no `UserPromptSubmit` hook ever follows,
-    // simulating the worker being mid-turn when the write landed.
+    // The app accepts the pty write — but no `UserPromptSubmit` hook
+    // ever follows (observability gap after a successful write).
     server_state
         .deliver_app_response(
             "session-app",
@@ -233,10 +238,66 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
     );
 }
 
+/// Safety guard (ghostty-codex-pane-viability Q2 Layer D):
+/// `send_input_to_worker` must refuse when the live worker is mid-turn
+/// (`Working`) so bytes are never written into a pane whose foreground
+/// process may not consume stdin. The refusal is a typed error — not a
+/// silent drop and not a successful "unconfirmed" write.
+#[tokio::test]
+async fn send_input_to_worker_refuses_when_worker_not_accepting_input() {
+    use boss_protocol::WorkerActivity;
+
+    let (server_state, _dir) = test_server_state();
+    register_working_worker(&server_state, "run-working", 4);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let err = server_state
+        .send_input_to_worker("run-working", "dangerous inject\n".into())
+        .await
+        .expect_err("mid-turn inject must be refused");
+    match err {
+        SendInputError::NotAcceptingInput {
+            activity: Some(WorkerActivity::Working),
+        } => {}
+        other => panic!("expected NotAcceptingInput(Working), got {other:?}"),
+    }
+
+    // No SendToPane must have been enqueued — the guard is pre-write.
+    assert_eq!(
+        sink.queue_stats().depth,
+        0,
+        "refused inject must not enqueue SendToPane"
+    );
+}
+
+/// Fail closed when the slot has no live-worker-state entry: unknown
+/// is not "accepting typed input".
+#[tokio::test]
+async fn send_input_to_worker_refuses_when_live_state_missing() {
+    let (server_state, _dir) = test_server_state();
+    server_state.worker_registry.register_run_slot("run-no-live", 8);
+
+    let sink = make_session_sink();
+    server_state.register_app_session("session-app".into(), sink).await;
+
+    let err = server_state
+        .send_input_to_worker("run-no-live", "hi\n".into())
+        .await
+        .expect_err("missing live state must refuse");
+    match err {
+        SendInputError::NotAcceptingInput { activity: None } => {}
+        other => panic!("expected NotAcceptingInput(None), got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn send_input_to_worker_surfaces_app_error() {
     let (server_state, _dir) = test_server_state();
-    server_state.worker_registry.register_run_slot("run-send", 2);
+    register_idle_worker(&server_state, "run-send", 2);
 
     let sink = make_session_sink();
     server_state

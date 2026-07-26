@@ -32,6 +32,16 @@ pub enum FocusPaneError {
 pub enum SendInputError {
     #[error("no worker pane mapped for that run id")]
     UnknownRun,
+    /// Live worker activity does not accept typed input (or is
+    /// unknown). No bytes were written to the pane — see
+    /// [`boss_protocol::WorkerActivity::accepts_typed_input`].
+    #[error(
+        "worker is not accepting typed input (activity={})",
+        activity.map(boss_protocol::WorkerActivity::as_str).unwrap_or("unknown")
+    )]
+    NotAcceptingInput {
+        activity: Option<boss_protocol::WorkerActivity>,
+    },
     #[error("app reported error: {0:?}")]
     App(EngineToAppError),
     #[error(transparent)]
@@ -161,12 +171,13 @@ impl ServerState {
     /// into that worker pane as if the user had typed it. Returns the
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
-    /// crew name). Mirrors [`focus_worker_pane`] in shape, but this
-    /// call can land at any point in the worker's turn — including
-    /// mid-tool-call — so unlike a plain `SendToPane` it verifies the
-    /// write actually became a queued prompt (see
-    /// `inject_pane_text_verified`). This is the chore-update
-    /// auto-notice path implicated in the probe-6 incident.
+    /// crew name). Mirrors [`focus_worker_pane`] in shape, but refuses
+    /// when the live worker is not accepting typed input (see
+    /// [`SendInputError::NotAcceptingInput`] /
+    /// `inject_pane_text_verified`'s activity guard). When the guard
+    /// passes it also verifies the write actually became a queued
+    /// prompt. This is the chore-update auto-notice path implicated
+    /// in the probe-6 incident.
     ///
     /// The corrected understanding of that incident (2026-07-13) is
     /// that an unconfirmed write is *not* proof of loss — the text may
@@ -207,6 +218,7 @@ impl ServerState {
                 );
                 Ok(slot_id)
             }
+            PaneInjectOutcome::NotAcceptingInput { activity } => Err(SendInputError::NotAcceptingInput { activity }),
             PaneInjectOutcome::SendFailed(PaneSendFailure::App(err)) => Err(SendInputError::App(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::Send(err)) => Err(SendInputError::Send(err)),
             PaneInjectOutcome::SendFailed(PaneSendFailure::ResponseKindMismatch(msg)) => {
