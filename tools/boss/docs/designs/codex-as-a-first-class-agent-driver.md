@@ -328,20 +328,20 @@ Every Boss workspace contains a `.claude/` directory (gitignored by the engine, 
 
 Classification per the brief: **(a)** implementable against the current trait, **(b)** needs a trait signature change, **(c)** needs new engine machinery, **(d)** genuinely absent.
 
-| #    | Capability              | What Codex offers natively                     | Class    | Verdict                                    |
-| ---- | ----------------------- | ---------------------------------------------- | -------- | ------------------------------------------ |
-| G-1  | `Spawn`                 | `codex exec` + flags                           | **(b)**  | Signature is Claude-shaped                 |
-| G-2  | `WorkspaceProvisioning` | `AGENTS.md`, `CODEX_HOME`, trust registry      | **(a)**  | Fits; needs `CODEX_HOME` lifecycle         |
-| G-3  | `PermissionPolicy`      | 3 sandbox modes, `writable_roots`, `.rules`    | **(b)**  | Trait is a file path; Codex needs argv+env |
+| #    | Capability              | What Codex offers natively                     | Class    | Verdict                                                   |
+| ---- | ----------------------- | ---------------------------------------------- | -------- | --------------------------------------------------------- |
+| G-1  | `Spawn`                 | `codex exec` + flags                           | **(b)**  | Signature is Claude-shaped                                |
+| G-2  | `WorkspaceProvisioning` | `AGENTS.md`, `CODEX_HOME`, trust registry      | **(a)**  | Fits; needs `CODEX_HOME` lifecycle                        |
+| G-3  | `PermissionPolicy`      | 3 sandbox modes, `writable_roots`, `.rules`    | **(b)**  | Trait is a file path; Codex needs argv+env                |
 | G-4  | `ModelAndEffortMenu`    | `-m`, `model_reasoning_effort`, `debug models` | **(a)**  | Needs Codex descriptor + model-aware runtime menu adapter |
-| G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)**  | **Transport is not abstracted** — top gap  |
-| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(a)**† | Declared deny-only; gated on T-01          |
-| G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)**  | Native, but no trait method                |
-| G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)**  | Better than Claude's; no trait method      |
-| G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)**  | Trait method exists but is dead code       |
-| G-10 | `ControlVerbs`          | process signals; `codex exec resume`           | **(b)**  | Trait has one method, never called         |
-| G-11 | `ToolProvisioning`      | MCP, plugins, skills                           | **(a)**  | Unused in v1, as designed                  |
-| G-12 | `PromptComposition`     | `AGENTS.md` + preamble                         | **(b)**  | Shared body asserts Claude mechanics       |
+| G-5  | `ProgressObservation`   | `--json` stdout JSONL                          | **(c)**  | **Transport is not abstracted** — top gap                 |
+| G-6  | `ToolUseInterception`   | deny-only `PreToolUse`, works but fails open   | **(a)**† | Declared deny-only; gated on T-01                         |
+| G-7  | `TurnBoundary`          | `turn.started` / `turn.completed`              | **(c)**  | Native, but no trait method                               |
+| G-8  | `StructuredOutput`      | `--output-schema`, `--output-last-message`     | **(b)**  | Better than Claude's; no trait method                     |
+| G-9  | `TranscriptAccess`      | rollout JSONL, Codex line schema               | **(b)**  | Trait method exists but is dead code                      |
+| G-10 | `ControlVerbs`          | process signals; `codex exec resume`           | **(b)**  | Trait has one method, never called                        |
+| G-11 | `ToolProvisioning`      | MCP, plugins, skills                           | **(a)**  | Unused in v1, as designed                                 |
+| G-12 | `PromptComposition`     | `AGENTS.md` + preamble                         | **(b)**  | Shared body asserts Claude mechanics                      |
 
 † **G-6 was classified (d) in the original pass; the [operator decision](#operator-decision) reclassifies it (a).** Codex's `PreToolUse` exists, fires, and blocks pre-execution on 0.145.0, and it is implementable against the current trait — the earlier (d) recorded Boss _declining_ to declare a working mechanism, which the legend has no code for. Two qualifications survive the reclassification: the capability is **deny-only** (tool-input rewriting is unreachable), and it is **gated on [T-01](#t-01-codex-hook-trust-provisioning)** because hooks fail open when untrusted. See [G-6](#g-6-tooluseinterception).
 
