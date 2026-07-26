@@ -22,6 +22,53 @@ use super::work_item::{work_item_id, work_item_name, work_item_task_kind};
 use super::worker_spawn::{ComposedWorkerSpawn, WorkerSpawnOpts, compose_worker_spawn};
 use super::{ExecutionRunner, RunOutcome, RunWaitState, bound_events_socket_path};
 
+/// Render one driver-supplied [`crate::driver::EnvDirective`] as a shell
+/// statement to prepend to the worker pane's spawn command. Generic over
+/// every driver: the engine knows how to turn a `Set`/`Unset` directive into
+/// shell syntax, but never which vars a given driver names (that knowledge
+/// stays in the driver's [`crate::driver::SpawnPlan`]).
+fn render_env_directive(directive: &crate::driver::EnvDirective) -> String {
+    match directive {
+        crate::driver::EnvDirective::Set(key, value) => {
+            format!("export {key}={}; ", crate::ssh_transport::shell_quote(value))
+        }
+        crate::driver::EnvDirective::Unset(key) => format!("unset {key}; "),
+    }
+}
+
+#[cfg(test)]
+mod render_env_directive_tests {
+    use super::render_env_directive;
+    use crate::driver::EnvDirective;
+
+    #[test]
+    fn renders_unset() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Unset("ANTHROPIC_API_KEY".to_string())),
+            "unset ANTHROPIC_API_KEY; "
+        );
+    }
+
+    #[test]
+    fn renders_set_with_plain_value() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Set("CODEX_HOME".to_string(), "/opt/codex".to_string())),
+            "export CODEX_HOME='/opt/codex'; "
+        );
+    }
+
+    #[test]
+    fn renders_set_quoting_a_value_with_a_single_quote() {
+        assert_eq!(
+            render_env_directive(&EnvDirective::Set(
+                "CODEX_HOME".to_string(),
+                "/Users/a b/it's".to_string()
+            )),
+            "export CODEX_HOME='/Users/a b/it'\\''s'; "
+        );
+    }
+}
+
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
 /// per-lease worker config files, asks the macOS app to host a
 /// worker pane, and registers the returned shell pid against the
@@ -351,14 +398,6 @@ impl ExecutionRunner for PaneSpawnRunner {
             }
         };
 
-        // Scrub ANTHROPIC_API_KEY from the worker shell's environment before
-        // invoking claude. The engine needs the var in its own process for
-        // pane-summary LLM calls; workers must authenticate via OAuth
-        // credentials (~/.claude/.credentials.json) and inherit nothing.
-        // Without this unset, a user who sets ANTHROPIC_API_KEY in their
-        // shell profile (or via `launchctl setenv`) causes every worker
-        // spawn to show: "Auth conflict: Using ANTHROPIC_API_KEY instead of
-        // Anthropic Console key."
         // The worker's session settings (boss-event hooks, deny rules)
         // live outside the workspace tree; point claude at them with
         // `--settings`. `write_workspace_files` writes the same path.
@@ -392,15 +431,23 @@ impl ExecutionRunner for PaneSpawnRunner {
         // force a new restricted kind to decide both.
         let worker_kind = crate::worker_setup::worker_kind_for_execution(&execution.kind);
         let permission_mode_override = worker_kind.forced_permission_mode();
+        // Any environment scrubbing/exporting a driver's spawn needs (e.g.
+        // Claude unsetting ANTHROPIC_API_KEY so it authenticates via OAuth
+        // credentials instead of a stray shell-profile key) is the driver's
+        // own concern, carried on the `SpawnPlan.env` built here — the engine
+        // renders those directives generically without knowing which driver
+        // or which vars they name.
+        let spawn_plan = crate::driver::ClaudeDriver.spawn_invocation(crate::driver::SpawnRequest {
+            model: &spawn_config.model,
+            effort: spawn_config.effort_value,
+            settings_path: Some(&worker_settings_path),
+            non_opus_auto_mode: spawner.non_opus_auto_mode(),
+            permission_mode_override,
+        });
+        let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
-            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; {}",
-            crate::driver::ClaudeDriver.spawn_invocation(
-                &spawn_config.model,
-                spawn_config.effort_value,
-                Some(&worker_settings_path),
-                spawner.non_opus_auto_mode(),
-                permission_mode_override,
-            ),
+            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",
+            spawn_plan.command,
         );
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for

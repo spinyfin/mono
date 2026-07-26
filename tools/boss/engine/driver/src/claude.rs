@@ -15,9 +15,9 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, nor
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, ModelMenu, PermissionArtifacts, PermissionInput,
-    ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, WorkerErrorClass,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
+    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
+    SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, WorkerErrorClass,
 };
 
 pub mod structured_output;
@@ -439,14 +439,14 @@ impl AgentDriver for ClaudeDriver {
         ])
     }
 
-    fn spawn_invocation(
-        &self,
-        model: &str,
-        effort: Option<&str>,
-        settings_path: Option<&Path>,
-        non_opus_auto_mode: bool,
-        permission_mode_override: Option<&str>,
-    ) -> String {
+    fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
+        let SpawnRequest {
+            model,
+            effort,
+            settings_path,
+            non_opus_auto_mode,
+            permission_mode_override,
+        } = request;
         let mut cmd = format!("claude --model {model}");
         if let Some(e) = effort {
             cmd.push_str(" --effort ");
@@ -477,7 +477,17 @@ impl AgentDriver for ClaudeDriver {
             " \"$(cat {}/{})\"\n",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         ));
-        cmd
+        SpawnPlan {
+            // Claude must authenticate via OAuth credentials
+            // (~/.claude/.credentials.json), not a stray ANTHROPIC_API_KEY
+            // inherited from the user's shell profile (or `launchctl
+            // setenv`) — that produces "Auth conflict: Using
+            // ANTHROPIC_API_KEY instead of Anthropic Console key." The
+            // engine needs the var in its own process for pane-summary LLM
+            // calls, so this unset is scoped to the worker pane shell only.
+            env: vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
+            command: cmd,
+        }
     }
 
     /// Write per-session workspace files and suppress the first-run trust
@@ -1347,16 +1357,40 @@ mod tests {
         ClaudeDriver.teardown_workspace(None, "run-1").await.unwrap();
     }
 
+    fn spawn_request(model: &str) -> SpawnRequest<'_> {
+        SpawnRequest {
+            model,
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+        }
+    }
+
     #[test]
     fn spawn_invocation_uses_descriptor_paths() {
-        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
+        let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
         let expected_cat = format!(
             "\"$(cat {}/{})\"\n",
             CLAUDE_DESCRIPTOR.config_dir, CLAUDE_DESCRIPTOR.initial_prompt_filename,
         );
         assert!(
-            cmd.contains(&expected_cat),
-            "spawn invocation must read from descriptor paths; got: {cmd}",
+            plan.command.contains(&expected_cat),
+            "spawn invocation must read from descriptor paths; got: {}",
+            plan.command,
+        );
+    }
+
+    #[test]
+    fn spawn_invocation_unsets_anthropic_api_key() {
+        // Claude must authenticate via OAuth credentials, not a stray
+        // ANTHROPIC_API_KEY inherited from the worker pane's shell profile.
+        let plan = ClaudeDriver.spawn_invocation(spawn_request("sonnet"));
+        assert_eq!(
+            plan.env,
+            vec![EnvDirective::Unset("ANTHROPIC_API_KEY".to_owned())],
+            "spawn plan must unset ANTHROPIC_API_KEY; got: {:?}",
+            plan.env,
         );
     }
 
@@ -1366,7 +1400,11 @@ mod tests {
         // `--dangerously-skip-permissions` (which bypasses the settings
         // allow/deny rules). The override must win and suppress that entirely,
         // so the capability-restricted answer agent always runs deny-by-default.
-        let cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, Some("dontAsk"));
+        let plan = ClaudeDriver.spawn_invocation(SpawnRequest {
+            permission_mode_override: Some("dontAsk"),
+            ..spawn_request("sonnet")
+        });
+        let cmd = plan.command;
         assert!(
             cmd.contains("--permission-mode dontAsk"),
             "expected forced dontAsk; got: {cmd}"
@@ -1381,7 +1419,7 @@ mod tests {
         );
 
         // Without an override, the default per-model behaviour is unchanged.
-        let default_cmd = ClaudeDriver.spawn_invocation("sonnet", None, None, false, None);
+        let default_cmd = ClaudeDriver.spawn_invocation(spawn_request("sonnet")).command;
         assert!(
             default_cmd.contains("--dangerously-skip-permissions"),
             "got: {default_cmd}"

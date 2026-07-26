@@ -85,7 +85,7 @@ impl SpawnConfig {
     /// Worker spawn line written into the libghostty pane via the
     /// spawn RPC's `initial_input`. Delegates to
     /// [`boss_engine_driver::ClaudeDriver::spawn_invocation`], which owns the
-    /// Claude-specific command-line logic (Spawn capability, P1422 Depth 1).
+    /// Claude-specific command-line logic (Spawn capability).
     ///
     /// Kept here so callers that hold a `SpawnConfig` (primarily tests) do not
     /// need to construct a driver instance directly.
@@ -93,13 +93,15 @@ impl SpawnConfig {
         // No permission-mode override on this convenience wrapper: the
         // capability-restricted answer-agent path spawns via
         // `ClaudeDriver::spawn_invocation` directly (see `runner.rs`).
-        boss_engine_driver::ClaudeDriver.spawn_invocation(
-            &self.model,
-            self.effort_value,
-            settings_path,
-            non_opus_auto_mode,
-            None,
-        )
+        boss_engine_driver::ClaudeDriver
+            .spawn_invocation(boss_engine_driver::SpawnRequest {
+                model: &self.model,
+                effort: self.effort_value,
+                settings_path,
+                non_opus_auto_mode,
+                permission_mode_override: None,
+            })
+            .command
     }
 }
 
