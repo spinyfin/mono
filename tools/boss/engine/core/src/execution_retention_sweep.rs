@@ -10,6 +10,14 @@
 //! cleanup of whatever backlog had already accumulated (e.g. the
 //! T2168/T2215 `redundant_spawn` storm) — there is no separate migration
 //! step. Every subsequent pass just keeps the stock bounded going forward.
+//!
+//! ## Ordering vs Codex home reclaim
+//!
+//! Each pass runs the codex-home retention reclaim **before** pruning
+//! execution rows so policy-eligible homes are reclaimed while their DB
+//! pointers still exist. Prune itself also reclaims any home that loses
+//! its last remaining pointer (see `execution_retention`), so a race
+//! cannot permanently orphan a reclaimable `CODEX_HOME`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,16 +34,18 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ExecutionRetentionSweepOutcome {
     pub deleted: u64,
+    pub codex_homes_reclaimed: u64,
 }
 
 impl crate::sweep_loop::SweepOutcome for ExecutionRetentionSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.deleted > 0
+        self.deleted > 0 || self.codex_homes_reclaimed > 0
     }
 
     fn log(&self) {
         tracing::info!(
             deleted = self.deleted,
+            codex_homes_reclaimed = self.codex_homes_reclaimed,
             "execution-retention sweep: pruned terminal work_executions rows past the retention bound",
         );
     }
@@ -51,12 +61,20 @@ pub fn spawn_loop(work_db: Arc<WorkDb>, interval: Duration) -> tokio::task::Join
 
 /// Run a single retention pass with the default policy. Returns a summary;
 /// callers may log it.
+///
+/// Order: codex-home reclaim first (while pointers exist), then row prune
+/// (which also reclaims homes that lose their last pointer).
 pub async fn run_one_pass(work_db: &WorkDb) -> ExecutionRetentionSweepOutcome {
+    // Reclaim-before-prune: policy-eligible homes for terminal executions
+    // that are about to (or may soon) leave the DB.
+    let _ = crate::codex_home_retention_sweep::run_one_pass(work_db, false).await;
+
     let now_epoch = boss_engine_utils::epoch_time::now_epoch_secs();
 
     match work_db.prune_terminal_executions(ExecutionRetentionPolicy::default(), now_epoch, false) {
         Ok(outcome) => ExecutionRetentionSweepOutcome {
             deleted: outcome.deleted,
+            codex_homes_reclaimed: outcome.codex_homes_reclaimed,
         },
         Err(err) => {
             tracing::warn!(?err, "execution-retention sweep: prune failed; skipping this pass");

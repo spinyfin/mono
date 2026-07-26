@@ -143,6 +143,11 @@ const CODEX_DIR_GITIGNORE: &str = "*\n";
 /// are created. Tests set this so homes land in a disposable temp tree.
 pub const CODEX_HOMES_ROOT_ENV: &str = "BOSS_CODEX_HOMES_DIR";
 
+/// Process-global lock for any test that mutates [`CODEX_HOMES_ROOT_ENV`].
+/// Hold across the full set/clear of the env var so parallel crate tests
+/// (engine_lib_test + driver_test) cannot race the process environment.
+pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
 const CODEX_HOMES_DIR_NAME: &str = "boss-codex-homes";
 
@@ -236,6 +241,24 @@ pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind) -> &'static str {
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
 pub fn codex_sandbox_extra_args(worker_kind: WorkerKind) -> Vec<String> {
     vec!["--sandbox".into(), codex_sandbox_for_worker_kind(worker_kind).into()]
+}
+
+/// Reclaim a Boss-owned per-run `CODEX_HOME` after retention policy says it
+/// is eligible. Refuses anything outside [`codex_homes_root`]. Idempotent
+/// when the path is already gone. Used by the engine retention sweep —
+/// **not** by interactive `~/.codex` scanning and not by cwd heuristics.
+pub fn reclaim_codex_home(codex_home: &Path) -> anyhow::Result<()> {
+    assert_codex_home_safe_to_delete(codex_home)?;
+    if !codex_home.exists() {
+        return Ok(());
+    }
+    // Re-check after exists: race with another reclaim is fine (NotFound).
+    assert_codex_home_safe_to_delete(codex_home)?;
+    match fs::remove_dir_all(codex_home) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing Boss-owned CODEX_HOME {}", codex_home.display())),
+    }
 }
 
 /// Refuse to delete a path unless it is a strict, canonicalized child of the
@@ -818,8 +841,14 @@ impl AgentDriver for CodexDriver {
         Ok(Some(runtime.to_driver_runtime_state()))
     }
 
-    /// Adopt any mid-run auth refresh back into the source, then remove the
-    /// Boss-owned `CODEX_HOME`. Never scans `~/.codex` for leftover homes.
+    /// Adopt any mid-run auth refresh back into the source.
+    ///
+    /// Leaves the Boss-owned `CODEX_HOME` on disk as terminal-run evidence
+    /// for the retention policy (`boss-engine-codex-rollout-retention` /
+    /// `codex_home_retention_sweep`). Disk reclaim happens later against
+    /// **this recorded path only** — never by scanning `~/.codex` or
+    /// inferring a home from the engine environment. Idempotent: a missing
+    /// home or missing runtime state is a pure no-op.
     async fn teardown_workspace(
         &self,
         _workspace: Option<&Path>,
@@ -833,9 +862,9 @@ impl AgentDriver for CodexDriver {
         let runtime = CodexRuntimeState::from_driver_runtime_state(state)?;
         let codex_home = &runtime.codex_home;
 
-        // Homes-root containment before any adopt / delete. An empty run_id
-        // (or a tampered runtime-state payload) must never make remove_dir_all
-        // target the shared root or an out-of-tree path.
+        // Containment check even though we do not delete here: a tampered
+        // payload must surface loudly rather than quietly becoming a
+        // retention candidate outside the Boss homes root.
         assert_codex_home_safe_to_delete(codex_home)?;
 
         // Rebuild the AuthSnapshot handle the auth crate expects for adopt.
@@ -851,26 +880,20 @@ impl AgentDriver for CodexDriver {
                 tracing::info!(
                     codex_home = %codex_home.display(),
                     ?outcome,
-                    "codex auth: teardown adopt finished"
+                    "codex auth: teardown adopt finished (home retained for policy reclaim)"
                 );
             }
             Err(err) => {
-                // Best-effort: log and continue to remove the home so a
-                // flaky adopt cannot leak CODEX_HOME trees forever.
+                // Best-effort: log and leave the home for retention rather
+                // than failing the caller's termination path.
                 tracing::warn!(
                     codex_home = %codex_home.display(),
                     error = %err,
-                    "codex auth: adopt_refresh_if_newer failed (continuing teardown)"
+                    "codex auth: adopt_refresh_if_newer failed (home retained; non-fatal)"
                 );
             }
         }
 
-        // Re-check after adopt: path identity must still be a contained child.
-        assert_codex_home_safe_to_delete(codex_home)?;
-        if codex_home.exists() {
-            fs::remove_dir_all(codex_home)
-                .with_context(|| format!("removing Boss-owned CODEX_HOME {}", codex_home.display()))?;
-        }
         Ok(())
     }
 
@@ -1345,12 +1368,21 @@ else:
             PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex")
         );
 
-        // Teardown removes the home.
+        // Teardown adopts auth but retains the home for policy-based reclaim.
         CodexDriver
             .teardown_workspace(Some(&workspace), "run-prov-1", Some(&state))
             .await
             .unwrap();
-        assert!(!runtime.codex_home.exists(), "teardown must remove CODEX_HOME");
+        assert!(
+            runtime.codex_home.exists(),
+            "teardown must retain CODEX_HOME as terminal-run evidence"
+        );
+
+        // Explicit reclaim (what the retention sweep does) removes only this root.
+        reclaim_codex_home(&runtime.codex_home).unwrap();
+        assert!(!runtime.codex_home.exists(), "reclaim must remove the recorded home");
+        // Idempotent.
+        reclaim_codex_home(&runtime.codex_home).unwrap();
 
         {
             let _guard = ENV_LOCK.lock().unwrap();

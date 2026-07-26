@@ -886,6 +886,27 @@ impl WorkDb {
         Ok(raw.and_then(|s| serde_json::from_str::<boss_protocol::DriverRuntimeState>(&s).ok()))
     }
 
+    /// Every execution that still has a non-empty `driver_runtime_state`
+    /// blob — the input set for driver-owned home retention (Codex
+    /// per-run `CODEX_HOME` reclaim). Includes both live and terminal
+    /// rows; the caller classifies liveness from `status`. Does not
+    /// invent paths by scanning a provider home.
+    pub fn list_executions_with_driver_runtime_state(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, work_item_id, kind, status, repo_remote_url, cube_repo_id, cube_lease_id,
+                    cube_workspace_id, workspace_path, priority, preferred_workspace_id,
+                    created_at, started_at, finished_at,
+                    pre_start_failure_count, dispatch_not_before, pr_url, pr_head_before, prefer_is_soft, worker_branch_prefix, transient_failure_count, allow_dirty, branch_naming, dispatch_wait_reason, dispatch_wait_since, driver_runtime_state
+             FROM work_executions
+             WHERE driver_runtime_state IS NOT NULL
+               AND driver_runtime_state != ''
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([], map_execution)?;
+        collect_rows(rows)
+    }
+
     /// Return `true` if `on_stop_inner` has been called at least once for
     /// this execution (i.e. the `stop_seen` flag is set). Returns `false`
     /// for unknown execution IDs (treat as not seen, gate stays closed).

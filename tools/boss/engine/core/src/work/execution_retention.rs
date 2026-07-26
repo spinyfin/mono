@@ -48,8 +48,22 @@
 //! this ships — the sweep fires immediately on spawn) and is available as
 //! an on-demand operator verb (`bossctl executions prune`) for manual
 //! cleanup between sweeps.
+//!
+//! ## Codex homes and prune ordering
+//!
+//! Codex per-run homes are discovered only from
+//! `work_executions.driver_runtime_state`. If a prune deleted those rows
+//! without reclaiming the on-disk trees, the homes would become permanent
+//! orphans (the hourly codex-home sweep would never see the paths again).
+//! [`WorkDb::prune_terminal_executions`] therefore collects recorded
+//! `codex_home` paths from prune candidates, deletes the rows, and
+//! best-effort reclaims any path that no remaining execution still
+//! references. Live (or otherwise surviving) owners of the same path are
+//! never reclaimed.
 
 use super::*;
+use std::collections::HashSet;
+use std::path::PathBuf;
 
 /// `work_executions.status` values eligible for pruning. `completed` is
 /// intentionally absent — see the module doc.
@@ -88,6 +102,10 @@ pub struct ExecutionPruneOutcome {
     /// Rows deleted — or, when `dry_run` was requested, rows that WOULD
     /// have been deleted.
     pub deleted: u64,
+    /// Boss-owned Codex homes reclaimed because the last DB pointer was
+    /// on a just-pruned row. Zero on `dry_run`. Best-effort; reclaim
+    /// failures are logged and do not fail the prune.
+    pub codex_homes_reclaimed: u64,
 }
 
 impl WorkDb {
@@ -95,6 +113,10 @@ impl WorkDb {
     /// rows past `policy`'s bound. `now_epoch` is UTC epoch seconds —
     /// callers pass a fixed value (rather than reading the clock inside)
     /// so pruning is deterministic in tests.
+    ///
+    /// After a real (non-dry-run) delete, any `codex_home` recorded only
+    /// on the pruned rows is reclaimed so the on-disk tree cannot become
+    /// a permanent orphan of the codex-home retention sweep.
     pub fn prune_terminal_executions(
         &self,
         policy: ExecutionRetentionPolicy,
@@ -140,16 +162,113 @@ fn prune_terminal_executions_on(
             params![cutoff, policy.keep_per_work_item],
             |row| row.get(0),
         )?;
-        return Ok(ExecutionPruneOutcome { deleted: count as u64 });
+        return Ok(ExecutionPruneOutcome {
+            deleted: count as u64,
+            codex_homes_reclaimed: 0,
+        });
     }
+
+    // Capture recorded Codex homes *before* the DELETE so a prune cannot
+    // permanently orphan reclaimable trees. Paths still referenced by any
+    // surviving execution (including a live owner of the same home) are
+    // filtered out after the delete.
+    let codex_homes_on_candidates =
+        codex_homes_for_prune_candidates(conn, &candidates_sql, cutoff, policy.keep_per_work_item)?;
 
     let deleted = conn.execute(
         &format!("DELETE FROM work_executions WHERE id IN ({candidates_sql})"),
         params![cutoff, policy.keep_per_work_item],
     )?;
+
+    let still_referenced = remaining_codex_home_paths(conn)?;
+    let mut reclaimed = 0u64;
+    for path in codex_homes_on_candidates {
+        if still_referenced.contains(&path) {
+            continue;
+        }
+        match boss_engine_driver::codex::reclaim_codex_home(&path) {
+            Ok(()) => {
+                reclaimed = reclaimed.saturating_add(1);
+                tracing::info!(
+                    codex_home = %path.display(),
+                    "execution-retention prune: reclaimed Codex home that lost its last DB pointer"
+                );
+            }
+            Err(err) => {
+                // Non-fatal: a later operator pass / disk cleanup can retry.
+                // Leaving an orphan under the homes root is preferred over
+                // failing the DB prune that already committed.
+                tracing::warn!(
+                    codex_home = %path.display(),
+                    error = %format!("{err:#}"),
+                    "execution-retention prune: failed to reclaim Codex home after row delete"
+                );
+            }
+        }
+    }
+
     Ok(ExecutionPruneOutcome {
         deleted: deleted as u64,
+        codex_homes_reclaimed: reclaimed,
     })
+}
+
+/// Unique `codex_home` paths recorded on prune-candidate execution rows.
+fn codex_homes_for_prune_candidates(
+    conn: &Connection,
+    candidates_sql: &str,
+    cutoff: i64,
+    keep_per_work_item: u32,
+) -> Result<Vec<PathBuf>> {
+    let sql = format!(
+        "SELECT driver_runtime_state FROM work_executions
+          WHERE id IN ({candidates_sql})
+            AND driver_runtime_state IS NOT NULL
+            AND driver_runtime_state != ''"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![cutoff, keep_per_work_item], |row| {
+        let raw: String = row.get(0)?;
+        Ok(raw)
+    })?;
+    let mut paths = HashSet::new();
+    for raw in rows {
+        let raw = raw?;
+        if let Some(path) = codex_home_from_runtime_state_json(&raw) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// Every `codex_home` still recorded on a remaining execution row.
+fn remaining_codex_home_paths(conn: &Connection) -> Result<HashSet<PathBuf>> {
+    let mut stmt = conn.prepare(
+        "SELECT driver_runtime_state FROM work_executions
+          WHERE driver_runtime_state IS NOT NULL
+            AND driver_runtime_state != ''",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let raw: String = row.get(0)?;
+        Ok(raw)
+    })?;
+    let mut paths = HashSet::new();
+    for raw in rows {
+        let raw = raw?;
+        if let Some(path) = codex_home_from_runtime_state_json(&raw) {
+            paths.insert(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn codex_home_from_runtime_state_json(raw: &str) -> Option<PathBuf> {
+    let state: boss_protocol::DriverRuntimeState = serde_json::from_str(raw).ok()?;
+    let runtime = boss_engine_driver::codex::CodexRuntimeState::from_driver_runtime_state(&state).ok()?;
+    if runtime.codex_home.as_os_str().is_empty() {
+        return None;
+    }
+    Some(runtime.codex_home)
 }
 
 #[cfg(test)]
@@ -363,5 +482,121 @@ mod tests {
         };
         let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
         assert_eq!(outcome.deleted, 0, "all rows are inside the age bound");
+    }
+
+    #[test]
+    fn prune_reclaims_codex_home_when_last_db_pointer_is_removed() {
+        let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-codex-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        // SAFETY: serialised by CODEX_HOMES_ENV_TEST_LOCK.
+        unsafe {
+            std::env::set_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV, &homes_root);
+        }
+
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        let work_item_id = create_chore(&db, &product_id, "c1");
+        let now = 1_800_000_000i64;
+
+        let home = homes_root.join("orphan-run");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(home.join("marker"), "evidence").unwrap();
+
+        let execution_id = insert_execution(&db, &work_item_id, "abandoned", now - 20 * DAY);
+        let state = boss_engine_driver::codex::CodexRuntimeState {
+            codex_home: home.clone(),
+            auth_source_path: PathBuf::from("/tmp/source-auth.json"),
+            auth_fingerprint: "fp".into(),
+            auth_policy: "SnapshotWithRefreshAdoption".into(),
+        }
+        .to_driver_runtime_state();
+        db.set_driver_runtime_state(&execution_id, Some(&state)).unwrap();
+
+        // Sanity: the recorded blob round-trips and is considered safe.
+        let loaded = db
+            .get_driver_runtime_state(&execution_id)
+            .unwrap()
+            .expect("state stored");
+        let runtime = boss_engine_driver::codex::CodexRuntimeState::from_driver_runtime_state(&loaded).unwrap();
+        assert_eq!(runtime.codex_home, home);
+        boss_engine_driver::codex::assert_codex_home_safe_to_delete(&home)
+            .unwrap_or_else(|e| panic!("home must be safe under test root: {e:#}"));
+
+        let policy = ExecutionRetentionPolicy {
+            max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+            keep_per_work_item: 0,
+        };
+        let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
+        assert_eq!(outcome.deleted, 1);
+        assert_eq!(
+            outcome.codex_homes_reclaimed, 1,
+            "last DB pointer gone → home must be reclaimed: {outcome:?}"
+        );
+        assert!(!home.exists(), "orphaned CODEX_HOME must not remain on disk");
+
+        unsafe {
+            std::env::remove_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV);
+        }
+    }
+
+    #[test]
+    fn prune_does_not_reclaim_codex_home_still_referenced_by_another_row() {
+        let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let homes_root = tmp.path().join("boss-codex-homes");
+        std::fs::create_dir_all(&homes_root).unwrap();
+        // SAFETY: serialised by CODEX_HOMES_ENV_TEST_LOCK.
+        unsafe {
+            std::env::set_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV, &homes_root);
+        }
+
+        let db = open_db();
+        let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
+        // Separate work items so keep-floor / supersede logic does not
+        // collapse the two executions.
+        let old_item = create_chore(&db, &product_id, "old");
+        let live_item = create_chore(&db, &product_id, "live");
+        let now = 1_800_000_000i64;
+
+        let home = homes_root.join("shared-run");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::write(home.join("marker"), "shared").unwrap();
+
+        let state = boss_engine_driver::codex::CodexRuntimeState {
+            codex_home: home.clone(),
+            auth_source_path: PathBuf::from("/tmp/source-auth.json"),
+            auth_fingerprint: "fp".into(),
+            auth_policy: "SnapshotWithRefreshAdoption".into(),
+        }
+        .to_driver_runtime_state();
+
+        let old_id = insert_execution(&db, &old_item, "abandoned", now - 20 * DAY);
+        db.set_driver_runtime_state(&old_id, Some(&state)).unwrap();
+
+        // Live (non-prunable) owner of the same path.
+        let live_id = insert_execution(&db, &live_item, "running", now - DAY);
+        db.set_driver_runtime_state(&live_id, Some(&state)).unwrap();
+
+        let policy = ExecutionRetentionPolicy {
+            max_age_secs: DEFAULT_RETENTION_MAX_AGE_SECS,
+            keep_per_work_item: 0,
+        };
+        let outcome = db.prune_terminal_executions(policy, now, false).unwrap();
+        assert_eq!(outcome.deleted, 1, "only the abandoned row is pruned");
+        assert_eq!(
+            outcome.codex_homes_reclaimed, 0,
+            "shared path still referenced by live row must not be reclaimed"
+        );
+        assert!(home.join("marker").is_file(), "live owner's home must survive");
+
+        unsafe {
+            std::env::remove_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV);
+        }
     }
 }

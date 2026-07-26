@@ -423,6 +423,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
+ "boss-engine-codex-rollout-retention",
  "boss-engine-comment-classifier",
  "boss-engine-day-rotated-log",
  "boss-engine-design-docs",
@@ -498,6 +499,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "tempfile",
+]
+
+[[package]]
+name = "boss-engine-codex-rollout-retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]
