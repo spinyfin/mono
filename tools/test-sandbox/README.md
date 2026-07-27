@@ -18,6 +18,12 @@ test:macos --strategy=TestRunner=local
 test:linux --strategy=TestRunner=linux-sandbox
 test:linux --sandbox_tmpfs_path=/tmp
 test --run_under=//tools/test-sandbox:hermetic_test_wrapper
+# Align build's analysis config with cquery (which inherits test --run_under
+# on Bazel 9.x). Empty cquery --run_under= is invalid; without this, every
+# build↔cquery flip discards the analysis cache (repobin hits this constantly).
+build --run_under=//tools/test-sandbox:hermetic_test_wrapper
+# Interactive runs cannot use the test wrapper (needs TEST_SRCDIR / test runtime).
+run --run_under=/usr/bin/env
 test --test_env=ANTHROPIC_API_KEY=          # (and six more)
 ```
 
