@@ -29,6 +29,8 @@ use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
+const CHECKPOINT_BYTES: u64 = 4096;
+
 #[derive(Debug, Error)]
 pub enum TailError {
     #[error("transcript io: {0}")]
@@ -55,6 +57,13 @@ struct FileIdentity {
     inode: u64,
 }
 
+#[derive(Debug)]
+struct FileCheckpoint {
+    prefix: Vec<u8>,
+    suffix_start: u64,
+    suffix: Vec<u8>,
+}
+
 #[derive(Debug, bon::Builder)]
 #[builder(on(String, into))]
 pub struct TranscriptTail {
@@ -63,6 +72,12 @@ pub struct TranscriptTail {
     containment: Option<TranscriptContainment>,
     #[builder(skip)]
     file_identity: Option<FileIdentity>,
+    /// Bounded byte windows at the beginning and end of the consumed prefix.
+    /// Comparing them before every incremental read detects same-inode
+    /// truncate-and-regrow rewrites whose final size is equal to or larger
+    /// than the prior cursor.
+    #[builder(skip)]
+    checkpoint: Option<FileCheckpoint>,
     #[builder(skip)]
     offset: u64,
     /// Incremented whenever the watched file is truncated or, for
@@ -82,6 +97,7 @@ impl TranscriptTail {
             path: path.into(),
             containment: None,
             file_identity: None,
+            checkpoint: None,
             offset: 0,
             generation: 0,
             partial: String::new(),
@@ -105,6 +121,7 @@ impl TranscriptTail {
                 file_identity,
             }),
             file_identity: Some(file_identity),
+            checkpoint: None,
             offset: 0,
             generation: 0,
             partial: String::new(),
@@ -138,30 +155,40 @@ impl TranscriptTail {
         let replaced = self
             .file_identity
             .is_some_and(|prior_identity| prior_identity != opened_identity);
+        let checkpoint_changed = if !replaced && size >= self.offset {
+            match self.checkpoint.as_ref() {
+                Some(checkpoint) => !checkpoint_matches(&mut file, checkpoint).await?,
+                None => self.offset > 0,
+            }
+        } else {
+            false
+        };
 
-        // Truncation / rotation: a shorter file or a new unrestricted inode
-        // means byte offsets and every cumulative consumer derived from them
-        // belong to an obsolete generation. Reset and re-read from the top.
-        // Contained tails reject replacement above instead of following it.
-        if size < self.offset || replaced {
+        // Truncation / rotation: a shorter file, a new unrestricted inode, or
+        // changed prefix/checkpoint bytes means byte offsets and every
+        // cumulative consumer derived from them belong to an obsolete
+        // generation. Reset and re-read from the top. Contained tails reject
+        // path replacement above instead of following it.
+        if size < self.offset || replaced || checkpoint_changed {
             self.offset = 0;
+            self.checkpoint = None;
             self.partial.clear();
             self.generation = self.generation.saturating_add(1);
         }
         self.file_identity = Some(opened_identity);
 
         if size == self.offset {
+            self.checkpoint = read_checkpoint(&mut file, size).await?;
             return Ok(Vec::new());
         }
 
         file.seek(SeekFrom::Start(self.offset)).await?;
-        let to_read = (size - self.offset) as usize;
-        let mut buf = Vec::with_capacity(to_read);
-        file.read_to_end(&mut buf).await?;
-        self.offset = size;
+        let to_read = size - self.offset;
+        let mut buf = Vec::with_capacity(to_read as usize);
+        (&mut file).take(to_read).read_to_end(&mut buf).await?;
 
         let chunk = String::from_utf8(buf)?;
-        let mut combined = std::mem::take(&mut self.partial);
+        let mut combined = self.partial.clone();
         combined.push_str(&chunk);
 
         let mut values = Vec::new();
@@ -186,10 +213,64 @@ impl TranscriptTail {
                 }
             }
         }
+        let checkpoint = read_checkpoint(&mut file, size).await?;
+        self.offset = size;
+        self.checkpoint = checkpoint;
         self.partial = combined[start..].to_owned();
 
         Ok(values)
     }
+}
+
+async fn checkpoint_matches(file: &mut fs::File, checkpoint: &FileCheckpoint) -> io::Result<bool> {
+    file.seek(SeekFrom::Start(0)).await?;
+    let mut current_prefix = vec![0; checkpoint.prefix.len()];
+    if let Err(error) = file.read_exact(&mut current_prefix).await {
+        return if error.kind() == io::ErrorKind::UnexpectedEof {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    if current_prefix != checkpoint.prefix {
+        return Ok(false);
+    }
+    if checkpoint.suffix_start == 0 {
+        return Ok(true);
+    }
+
+    file.seek(SeekFrom::Start(checkpoint.suffix_start)).await?;
+    let mut current_suffix = vec![0; checkpoint.suffix.len()];
+    match file.read_exact(&mut current_suffix).await {
+        Ok(_) => Ok(current_suffix == checkpoint.suffix),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+async fn read_checkpoint(file: &mut fs::File, offset: u64) -> io::Result<Option<FileCheckpoint>> {
+    if offset == 0 {
+        return Ok(None);
+    }
+    let length = offset.min(CHECKPOINT_BYTES);
+    file.seek(SeekFrom::Start(0)).await?;
+    let mut prefix = vec![0; length as usize];
+    file.read_exact(&mut prefix).await?;
+
+    let suffix_start = offset - length;
+    let suffix = if suffix_start == 0 {
+        prefix.clone()
+    } else {
+        file.seek(SeekFrom::Start(suffix_start)).await?;
+        let mut suffix = vec![0; length as usize];
+        file.read_exact(&mut suffix).await?;
+        suffix
+    };
+    Ok(Some(FileCheckpoint {
+        prefix,
+        suffix_start,
+        suffix,
+    }))
 }
 
 fn verify_initial_containment(path: &Path, root: &Path) -> Result<(PathBuf, FileIdentity, FileIdentity), TailError> {
@@ -400,6 +481,45 @@ mod tests {
         let second = tail.poll().await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0]["b"], 3);
+        assert_eq!(tail.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn equal_size_same_inode_rewrite_resets_cursor_and_reemits() {
+        let dir = TempDir::new().unwrap();
+        let path = sample_path(&dir, "log.jsonl");
+        std::fs::write(&path, "{\"old\":1}\n").unwrap();
+        let identity = file_identity(&std::fs::metadata(&path).unwrap());
+
+        let mut tail = TranscriptTail::new(path.clone());
+        let first = tail.poll().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["old"], 1);
+
+        std::fs::write(&path, "{\"new\":2}\n").unwrap();
+        assert_eq!(file_identity(&std::fs::metadata(&path).unwrap()), identity);
+        let second = tail.poll().await.unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["new"], 2);
+        assert_eq!(tail.generation(), 1);
+    }
+
+    #[tokio::test]
+    async fn larger_same_inode_rewrite_resets_cursor_and_reemits_prefix() {
+        let dir = TempDir::new().unwrap();
+        let path = sample_path(&dir, "log.jsonl");
+        std::fs::write(&path, "{\"old\":1}\n").unwrap();
+        let identity = file_identity(&std::fs::metadata(&path).unwrap());
+
+        let mut tail = TranscriptTail::new(path.clone());
+        assert_eq!(tail.poll().await.unwrap().len(), 1);
+
+        std::fs::write(&path, "{\"new\":2}\n{\"extra\":3}\n").unwrap();
+        assert_eq!(file_identity(&std::fs::metadata(&path).unwrap()), identity);
+        let second = tail.poll().await.unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0]["new"], 2);
+        assert_eq!(second[1]["extra"], 3);
         assert_eq!(tail.generation(), 1);
     }
 

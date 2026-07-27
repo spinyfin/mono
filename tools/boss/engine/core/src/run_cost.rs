@@ -20,6 +20,11 @@ use crate::transcript_tail::TranscriptTail;
 #[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
 #[builder(on(String, into))]
 pub(crate) struct RunCostSnapshot {
+    /// Assign every persisted cost field verbatim, including NULL. Set when a
+    /// transcript generation is replaced so values absent from the replay do
+    /// not survive from the obsolete generation.
+    #[builder(default)]
+    pub full_replacement: bool,
     pub model: Option<String>,
     pub output_tokens: Option<i64>,
     pub input_tokens: Option<i64>,
@@ -214,6 +219,7 @@ impl CostAccumulator {
             });
 
         Some(RunCostSnapshot {
+            full_replacement: false,
             model: self.model.clone(),
             output_tokens: saw_usage.then(|| sum(|usage| usage.output_tokens)),
             input_tokens: saw_usage.then(|| sum(|usage| usage.input_tokens)),
@@ -269,6 +275,7 @@ struct TranscriptCostTail {
     tail: TranscriptTail,
     containment_root: Option<PathBuf>,
     accumulator: CostAccumulator,
+    accumulator_generation: u64,
 }
 
 impl TranscriptCostTail {
@@ -282,6 +289,7 @@ impl TranscriptCostTail {
             tail,
             containment_root: containment_root.map(Path::to_owned),
             accumulator: CostAccumulator::default(),
+            accumulator_generation: 0,
         })
     }
 }
@@ -292,7 +300,7 @@ struct RunCostTail {
 }
 
 impl RunCostTail {
-    async fn poll(&mut self, transcript_path: &Path, containment_root: Option<&Path>) -> Result<(), String> {
+    async fn poll(&mut self, transcript_path: &Path, containment_root: Option<&Path>) -> Result<bool, String> {
         let replace = match self.tails.get(transcript_path) {
             Some(state)
                 if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
@@ -305,10 +313,7 @@ impl RunCostTail {
             Some(state) => state.containment_root.as_deref() != containment_root,
             None => false,
         };
-        if replace {
-            self.tails.remove(transcript_path);
-        }
-        if !self.tails.contains_key(transcript_path) {
+        if replace || !self.tails.contains_key(transcript_path) {
             let tail = TranscriptCostTail::new(transcript_path, containment_root)?;
             self.tails.insert(transcript_path.to_owned(), tail);
         }
@@ -316,15 +321,17 @@ impl RunCostTail {
             .tails
             .get_mut(transcript_path)
             .expect("transcript cost tail was just inserted");
-        let generation = state.tail.generation();
         let values = state.tail.poll().await.map_err(|error| error.to_string())?;
-        if state.tail.generation() != generation {
+        let mut full_replacement = replace;
+        if state.tail.generation() != state.accumulator_generation {
             state.accumulator = CostAccumulator::default();
+            state.accumulator_generation = state.tail.generation();
+            full_replacement = true;
         }
         for value in values {
             state.accumulator.ingest(transcript_path, &value);
         }
-        Ok(())
+        Ok(full_replacement)
     }
 
     fn snapshot(&self) -> Option<RunCostSnapshot> {
@@ -362,10 +369,13 @@ impl RunCostCapture {
                 .clone()
         };
         let mut state = state.lock().await;
-        state.poll(transcript_path, containment_root).await?;
-        let Some(snapshot) = state.snapshot() else {
-            return Ok(false);
+        let full_replacement = state.poll(transcript_path, containment_root).await?;
+        let mut snapshot = match state.snapshot() {
+            Some(snapshot) => snapshot,
+            None if full_replacement => RunCostSnapshot::default(),
+            None => return Ok(false),
         };
+        snapshot.full_replacement = full_replacement;
         // Keep the per-execution lock through the DB assignment so two hooks
         // cannot persist cumulative snapshots out of order.
         work_db
@@ -485,7 +495,7 @@ mod tests {
         )
         .unwrap();
         let mut tail = RunCostTail::default();
-        tail.poll(&path, None).await.unwrap();
+        assert!(!tail.poll(&path, None).await.unwrap());
         let before = tail.snapshot().unwrap();
         assert_eq!(before.input_tokens, Some(150));
         assert_eq!(before.rounds, Some(2));
@@ -501,7 +511,7 @@ mod tests {
             ),
         )
         .unwrap();
-        tail.poll(&path, None).await.unwrap();
+        assert!(tail.poll(&path, None).await.unwrap());
         let after = tail.snapshot().unwrap();
         assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
         assert_eq!(after.input_tokens, Some(7));

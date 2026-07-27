@@ -1586,12 +1586,14 @@ impl WorkDb {
     /// The dispatcher derives this snapshot by incrementally tailing the
     /// transcript on every hook. Values are assignments, not SQL increments:
     /// retrying a hook or rebuilding the in-memory tail after an engine
-    /// restart is therefore idempotent. Optional scalar values use `COALESCE`
-    /// so a transcript that has not emitted (for example) a turn-duration
-    /// record cannot erase a value captured by an earlier hook. Cache-write
-    /// TTL splits carry a separate observed/known signal because NULL also
-    /// means "usage observed but the provider omitted its TTL breakdown"; that
-    /// state must explicitly clear a formerly-known split.
+    /// restart is therefore idempotent. Incremental snapshots use `COALESCE`
+    /// so a transcript that has not yet emitted (for example) a turn-duration
+    /// record cannot erase a value captured by an earlier hook. A snapshot
+    /// rebuilt after transcript replacement assigns every field verbatim,
+    /// including NULL, so values removed from the new generation cannot
+    /// survive. Cache-write TTL splits additionally carry an observed/known
+    /// signal because NULL also means "usage observed but the provider omitted
+    /// its TTL breakdown".
     pub(crate) fn set_run_cost_snapshot(
         &self,
         execution_id: &str,
@@ -1613,23 +1615,34 @@ impl WorkDb {
         };
         let updated = conn.execute(
             "UPDATE work_runs
-             SET model = COALESCE(?2, model),
-                 output_tokens = COALESCE(?3, output_tokens),
-                 input_tokens = COALESCE(?4, input_tokens),
-                 cache_creation_tokens = COALESCE(?5, cache_creation_tokens),
-                 cache_read_tokens = COALESCE(?6, cache_read_tokens),
+             SET model = CASE WHEN ?12 = 1 THEN ?2 ELSE COALESCE(?2, model) END,
+                 output_tokens = CASE WHEN ?12 = 1 THEN ?3 ELSE COALESCE(?3, output_tokens) END,
+                 input_tokens = CASE WHEN ?12 = 1 THEN ?4 ELSE COALESCE(?4, input_tokens) END,
+                 cache_creation_tokens = CASE
+                     WHEN ?12 = 1 THEN ?5
+                     ELSE COALESCE(?5, cache_creation_tokens)
+                 END,
+                 cache_read_tokens = CASE
+                     WHEN ?12 = 1 THEN ?6
+                     ELSE COALESCE(?6, cache_read_tokens)
+                 END,
                  cache_creation_5m_tokens = CASE
+                     WHEN ?12 = 1 THEN ?7
                      WHEN ?9 IS NULL THEN cache_creation_5m_tokens
                      WHEN ?9 = 0 THEN NULL
                      ELSE ?7
                  END,
                  cache_creation_1h_tokens = CASE
+                     WHEN ?12 = 1 THEN ?8
                      WHEN ?9 IS NULL THEN cache_creation_1h_tokens
                      WHEN ?9 = 0 THEN NULL
                      ELSE ?8
                  END,
-                 rounds = COALESCE(?10, rounds),
-                 agent_active_ms = COALESCE(?11, agent_active_ms)
+                 rounds = CASE WHEN ?12 = 1 THEN ?10 ELSE COALESCE(?10, rounds) END,
+                 agent_active_ms = CASE
+                     WHEN ?12 = 1 THEN ?11
+                     ELSE COALESCE(?11, agent_active_ms)
+                 END
              WHERE id = ?1",
             params![
                 run_id,
@@ -1643,6 +1656,7 @@ impl WorkDb {
                 snapshot.cache_creation_ttl_split_known,
                 snapshot.rounds,
                 snapshot.agent_active_ms,
+                snapshot.full_replacement,
             ],
         )?;
         Ok(updated > 0)

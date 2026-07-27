@@ -359,6 +359,124 @@ async fn dispatch_clears_known_cache_ttl_split_when_later_usage_is_unsplit() {
 }
 
 #[tokio::test]
+async fn transcript_replacement_clears_cost_fields_missing_from_the_new_generation() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    type PersistedCost = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "rewrite-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "rewrite cost");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-rewrite".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("rewrite.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"old","model":"claude-opus","usage":{"input_tokens":3,"output_tokens":2,"cache_creation_input_tokens":4,"cache_read_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":1}}}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","uuid":"duration-old","durationMs":20}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "rewrite-session".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    let read_cost = || -> PersistedCost {
+        let conn = server_state.work_db.connect().unwrap();
+        conn.query_row(
+            "SELECT model, output_tokens, input_tokens, cache_creation_tokens,
+                    cache_read_tokens, cache_creation_5m_tokens,
+                    cache_creation_1h_tokens, rounds, agent_active_ms
+             FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        read_cost(),
+        (
+            Some("claude-opus".into()),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(3),
+            Some(1),
+            Some(1),
+            Some(20),
+        )
+    );
+
+    // The replacement still contains a round, but deliberately omits model,
+    // usage, and duration. Full-replacement persistence must clear all fields
+    // absent from the recomputed snapshot rather than COALESCEing old values.
+    std::fs::write(
+        &transcript,
+        concat!(r#"{"type":"assistant","message":{"id":"replacement"}}"#, "\n"),
+    )
+    .unwrap();
+    dispatch_live_worker_state(&server_state, &event).await;
+    assert_eq!(read_cost(), (None, None, None, None, None, None, None, Some(1), None));
+
+    // An empty generation produces no accumulator snapshot at all. The
+    // generation-reset signal must still issue a full NULL assignment.
+    std::fs::write(&transcript, "").unwrap();
+    dispatch_live_worker_state(&server_state, &event).await;
+    assert_eq!(read_cost(), (None, None, None, None, None, None, None, None, None));
+}
+
+#[tokio::test]
 async fn stop_settle_captures_usage_and_duration_appended_after_boundary() {
     use crate::protocol::WorkerEvent;
     use boss_protocol::RequestExecutionInput;
