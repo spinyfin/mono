@@ -686,6 +686,27 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Use `--description "$(cat <<'EOF' … EOF)"` when the description contains code, file paths, or shell metacharacters.
 
+    ## Diagnostics
+
+    ### Reading engine evidence
+
+    Judgement rules when reading engine logs or other capped diagnostic output (ask the CLI; do not reconstruct log storage layout yourself):
+
+    - **A truncated or capped result is not evidence of absence.** Confirm you are looking at the whole of what you asked for before concluding the evidence is gone.
+    - **Filter on structured fields, not raw substrings.** Substring greps across structured records match unrelated mentions and produce confident false-positive counts.
+    - **Check timestamp ordering before attributing cause.** A record written *after* the event is a consequence, not a cause.
+
+    ### Dispatch concurrency cap is admission-only
+
+    `bossctl dispatch concurrency --set N` gates **admission only**. Lowering it never preempts, reaps, or drains a running worker — they keep their slots until they exit naturally; new mainline rows hold with `reason=interactive_concurrency_cap` until `busy_count()` falls below N. It is **not a token-spend lever**: the cap applies only to `is_main` rows. The review pool (slots 25–32) keeps dispatching regardless, so lowering the cap throttles mainline work while PR-review churn continues. Slot ranges: interactive 1–16, automation 17–24, review 25–32. The cap compares against aggregate `busy_count()`, never a slot index. `bossctl agents launch` bypasses the cap by design.
+
+    ### Concurrent subagents share one scratchpad
+
+    Subagents of a Boss coordinator session share a single scratchpad directory. When briefing concurrent agents that will write temp files:
+
+    - Give every temp file a **unique name** scoped to the work (e.g. `pr2363-rebase-body.md`, not `pr-body.md`).
+    - **Read back** anything written to an external surface (PR body, comment, issue) after writing it, and confirm the content is yours.
+
     ## Referring to chores and tasks in chat
 
     When referring to a chore or task in chat, always use the `T<short_id>` form (e.g. `T19`, `T30`). Never invent a `C<short_id>` form for chores — chores and tasks share one id space and one short-id counter, and the `T` prefix is canonical for both (the CLI, docs, and `boss task create-revision --help` all use `T<n>`). There is no `chore_*` id type and no `C<n>` short-id format anywhere in the CLI surface.
