@@ -24,6 +24,7 @@ use boss_client::{BossClient, Discovery};
 mod agents;
 mod comments;
 mod dispatch_stats;
+mod doctor;
 mod hosts;
 mod logs;
 mod review;
@@ -338,14 +339,24 @@ enum DispatchAction {
         #[arg(long)]
         outcome: Option<String>,
     },
-    /// Print the full per-execution timeline for one execution id,
-    /// with stage durations and the full `error_message` on any
-    /// failure event.
+    /// Print the dispatch timeline for one execution or work item and
+    /// match known failure signatures (stall, zombie redundant_spawn,
+    /// spawn_ack_timeout, lease timeout, untracked-lease storm, SlotBusy,
+    /// queue-side CI, …) with evidence lines and known recovery.
+    ///
+    /// Accepts an execution id (`exec_…`) or a work-item id (`task_…`,
+    /// `chore_…`, …). File-scan only over dispatch JSONL + engine-trace —
+    /// works when the engine is wedged. Signature catalog:
+    /// `tools/boss/docs/investigations/bossctl-doctor-failure-signatures-*.md`.
     Diagnose {
-        execution_id: String,
+        /// Execution id (`exec_…`) or work-item id.
+        id: String,
         /// Override the Boss state root.
         #[arg(long)]
         state_root: Option<PathBuf>,
+        /// Skip the raw per-event timeline; print signature findings only.
+        #[arg(long)]
+        signatures_only: bool,
     },
     /// List executions whose dispatch timeline started but never
     /// reached a terminal stage (`pane_spawned ok` or any error).
@@ -1130,11 +1141,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 },
         } => dispatch_tail(cli.json, state_root, n, stage, outcome),
         Command::Dispatch {
-            action: DispatchAction::Diagnose {
-                execution_id,
-                state_root,
-            },
-        } => dispatch_diagnose(cli.json, state_root, &execution_id),
+            action:
+                DispatchAction::Diagnose {
+                    id,
+                    state_root,
+                    signatures_only,
+                },
+        } => dispatch_diagnose(cli.json, state_root, &id, signatures_only),
         Command::Dispatch {
             action:
                 DispatchAction::GhostActive {
@@ -1359,29 +1372,12 @@ fn dispatch_tail(
     Ok(())
 }
 
-fn dispatch_diagnose(json: bool, state_root: Option<PathBuf>, execution_id: &str) -> Result<()> {
-    let root = resolve_state_root(state_root)?;
-    let events = dispatch_reader::read_execution(&root, execution_id)?;
-    if events.is_empty() {
-        if json {
-            println!("{}", build_diagnose_json(execution_id, &[], &[]));
-        } else {
-            println!("no dispatch events recorded for execution {execution_id}");
-        }
-        return Ok(());
-    }
-    let now = now_epoch_ms();
-    let durations = dispatch_reader::stage_durations_ms(&events, now);
-
-    if json {
-        println!("{}", build_diagnose_json(execution_id, &events, &durations));
-    } else {
-        println!("dispatch timeline for execution {execution_id}");
-        for (event, duration_ms) in events.iter().zip(durations.iter()) {
-            print_dispatch_event_detailed(event, *duration_ms);
-        }
-    }
-    Ok(())
+fn dispatch_diagnose(json: bool, state_root: Option<PathBuf>, id: &str, signatures_only: bool) -> Result<()> {
+    let root = resolve_state_root(state_root.clone())?;
+    // Optional state.db: resolve work-item ↔ executions and SIG-2 facts.
+    // Missing/unreadable db is non-fatal — diagnose stays file-scan-first.
+    let db = open_state_db(state_root).ok();
+    doctor::run_diagnose(&root, id, json, signatures_only, now_epoch_ms(), db.as_ref())
 }
 
 fn dispatch_ghost_active(
@@ -1967,24 +1963,6 @@ fn build_tail_json(slice: Vec<&DispatchEvent>) -> serde_json::Value {
     })
 }
 
-fn build_diagnose_json(execution_id: &str, events: &[DispatchEvent], durations: &[u128]) -> serde_json::Value {
-    let detailed: Vec<serde_json::Value> = events
-        .iter()
-        .zip(durations.iter())
-        .map(|(event, dur)| {
-            let mut value = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-            if let Some(obj) = value.as_object_mut() {
-                obj.insert("stage_duration_ms".into(), serde_json::Value::from(*dur as u64));
-            }
-            value
-        })
-        .collect();
-    serde_json::json!({
-        "execution_id": execution_id,
-        "events": detailed,
-    })
-}
-
 fn print_dispatch_event_short(event: &DispatchEvent) {
     let worker = event.worker_id.as_deref().unwrap_or("-");
     let err = event.error_message.as_deref().unwrap_or("");
@@ -1998,40 +1976,6 @@ fn print_dispatch_event_short(event: &DispatchEvent) {
             "{}  {}/{}  exec={}  worker={}  error={}",
             event.ts_epoch_ms, event.stage, event.outcome, event.execution_id, worker, err,
         );
-    }
-}
-
-fn print_dispatch_event_detailed(event: &DispatchEvent, stage_duration_ms: u128) {
-    let worker = event.worker_id.as_deref().unwrap_or("-");
-    println!(
-        "  {}  {}/{}  +{}ms  worker={}",
-        event.ts_epoch_ms, event.stage, event.outcome, stage_duration_ms, worker,
-    );
-    // Decode the claimed slot + interactive page from the worker id so a
-    // Lower Decks spawn/claim failure is distinguishable from a Bridge Crew
-    // one at a glance. Automation/review workers resolve a slot but no page.
-    if let Some(worker_id) = &event.worker_id
-        && let Some(slot) = boss_engine::coordinator::slot_id_from_worker_id(worker_id)
-    {
-        match boss_engine::coordinator::worker_page_label(slot) {
-            Some(page) => println!("    page:      {page} (slot {slot})"),
-            None => println!("    slot:      {slot}"),
-        }
-    }
-    if let Some(lease) = &event.cube_lease_id {
-        println!("    lease:     {lease}");
-    }
-    if let Some(workspace) = &event.cube_workspace_id {
-        println!("    workspace: {workspace}");
-    }
-    if let Some(err) = &event.error_message {
-        println!("    error:     {err}");
-    }
-    if !event.details.is_null() {
-        match serde_json::to_string(&event.details) {
-            Ok(text) => println!("    details:   {text}"),
-            Err(_) => println!("    details:   <unserializable>"),
-        }
     }
 }
 

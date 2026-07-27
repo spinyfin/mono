@@ -94,13 +94,13 @@ fn build_tail_json_round_trips_events_as_array() {
 }
 
 #[test]
-fn build_diagnose_json_attaches_stage_duration_ms_to_each_event() {
+fn build_timeline_json_attaches_stage_duration_ms_to_each_event() {
     let events = vec![
         ev(100, "request_recorded", "ok", "e1"),
         ev(450, "pane_spawned", "ok", "e1"),
     ];
     let durations = vec![350u128, 0u128];
-    let json = build_diagnose_json("e1", &events, &durations);
+    let json = doctor::build_timeline_json("e1", &events, &durations);
     assert_eq!(json["execution_id"], "e1");
     let arr = json["events"].as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -110,8 +110,8 @@ fn build_diagnose_json_attaches_stage_duration_ms_to_each_event() {
 }
 
 #[test]
-fn build_diagnose_json_returns_empty_events_when_none() {
-    let json = build_diagnose_json("exec-missing", &[], &[]);
+fn build_timeline_json_returns_empty_events_when_none() {
+    let json = doctor::build_timeline_json("exec-missing", &[], &[]);
     assert_eq!(json["execution_id"], "exec-missing");
     assert!(json["events"].as_array().unwrap().is_empty());
 }

@@ -7,6 +7,7 @@ rust_binary(
         "src/agents.rs",
         "src/comments.rs",
         "src/dispatch_stats.rs",
+        "src/doctor.rs",
         "src/hosts.rs",
         "src/logs.rs",
         "src/main.rs",
