@@ -1,0 +1,33 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Should the Claude permission-settings leak block the first Grok worker? `grok inspect --json` reports `~/.claude/settings.local.json` as a loaded permission source even under a fresh isolated GROK_HOME with the full [compat.claude] disable block, and no tested compat key stops it. Answering yes makes T-01 a hard gate on T-07 (the design's current assumption). Answering no lets Grok workers run while T-01 proceeds in parallel, accepting that a worker may be applying the machine owner's personal Claude allow/deny rules.",
+    "anchor": "oq-1-claude-permission-settings-leak"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Which pane mode should Grok workers run in? This decides both the spawn flag and what T-03 captures as monitor markers, so it is cheaper to settle before T-03 than after.",
+    "choices": [
+      "--no-alt-screen (inline) — what the gating spike executed and recommends; more scrollback visible to the surface scrape",
+      "--minimal (scrollback-native, small pinned region) — sounds strictly better for scraping but is marked experimental and was never spiked",
+      "Default alt-screen / fullscreen — spike-verified to work, but alt-screen teardown drops TUI chrome from the scrape",
+      "Let T-03 decide empirically by capturing marker stability under all three and picking the most stable"
+    ],
+    "anchor": "execution-shape"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Should GrokDriver declare AwaitingInputSignal in v1? The signal shape exists (Notification with notificationType/level) but its vocabulary is uncharacterised, and the capability's contract forbids synthesising the state from a lower-fidelity channel. The design currently omits it (absence disposition Degrade: a Grok worker shows Working/Idle, never a fabricated WaitingForInput) and earns it via T-24. Answering yes would declare it up front and make T-24 a gate instead.",
+    "anchor": "g-13-awaitinginputsignal"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "How should the engine tell the app that an Esc-cancelled Grok turn ended? Grok skips the Stop hook on Esc, so the engine's only turn-boundary signal never fires and the slot stays pinned at Working while the worker sits idle at its prompt.",
+    "choices": [
+      "Tail events.jsonl for turn_ended/cancelled — observes the real thing; costs a small new bounded tail, but the path is fully constructible from GROK_HOME + cwd + the Boss-assigned session UUID (the design's recommendation)",
+      "Synthesise a turn end engine-side after sending Esc — cheapest, no new transport, but asserts a state it did not observe and is wrong in the optimistic direction if the Esc did not take",
+      "Test whether the StopFailure hook covers the interrupt path first, and only build a tail if it does not"
+    ],
+    "anchor": "oq-3-interrupt-without-stop"
+  }
+]
