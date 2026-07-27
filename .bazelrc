@@ -40,7 +40,35 @@ build --define=BOSS_SHAKE_APP_ID=
 build --define=BOSS_SHAKE_INSTALLATION_ID=
 build --define=BOSS_SHAKE_PRIVATE_KEY_PEM=
 
+# Apply `test:macos`, `test:linux`, and the corresponding build sections below
+# automatically from the host platform.
+common --enable_platform_specific_config
+
+# Test actions start with network access denied. Bazel's darwin-sandbox permits
+# network access by default; a test that truly needs it must opt in visibly
+# with `MONO_TEST_ALLOW_NETWORK=1`.
+test --sandbox_default_allow_network=false
+
+# Bazel's macOS sandbox profile always permits writes to shared host temp and
+# cache directories. Run repository-owned test code under the stricter profile
+# in hermetic_test_wrapper instead. Linux retains Bazel's linux-sandbox, which
+# supplies its own mount and network namespaces.
+test:macos --strategy=TestRunner=local
+
+# Bazel's own test/XML wrappers need the static host PATH before the test
+# binary starts. This run-under wrapper removes that PATH at the user-code
+# boundary, so test code cannot discover undeclared host tools such as gh, bk,
+# codex, claude, or cube.
+test --run_under=//tools/test-sandbox:hermetic_test_wrapper
+
+# Bazel already constructs a test environment rather than inheriting the
+# caller's environment. Keep the credential boundary explicit as defense in
+# depth and as documentation for direct attempts to inject these common keys.
+test --test_env==ANTHROPIC_API_KEY
+test --test_env==OPENAI_API_KEY
+test --test_env==GITHUB_TOKEN
+test --test_env==GH_TOKEN
+
 
 # Import ci-specific configuration.
 import %workspace%/.ci.bazelrc
-

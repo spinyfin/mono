@@ -1,0 +1,14 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+
+sh_binary(
+    name = "hermetic_test_wrapper",
+    srcs = ["hermetic_test_wrapper.sh"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "hermeticity_guard_test",
+    size = "small",
+    srcs = ["hermeticity_guard_test.rs"],
+)
