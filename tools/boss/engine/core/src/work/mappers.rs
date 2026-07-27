@@ -310,11 +310,21 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         human_driven: false,
         // Human close-out summary; trailing column on wide SELECTs only.
         completion_summary: None,
-        // Free-form kanban tags. Trailing column on the wide SELECTs only
-        // (`query_task`, `get_work_tree`, short-id lookup); empty here for
-        // base-SELECT paths that do not need tags.
+        // Free-form kanban tags. Not part of the bare base SELECT; list
+        // surfaces that need them use [`map_task_with_tags`] /
+        // [`map_task_with_parent_provenance_and_tags`], and single-item /
+        // work-tree paths use the wider provenance mappers below.
         tags: Vec::new(),
     })
+}
+
+/// Like [`map_task`] but also reads a trailing `tags` column at index 34.
+/// Used by [`crate::work::WorkDb::list_tasks`] so bulk `boss task list
+/// --json` matches the tags shape already returned by `task show`.
+pub(crate) fn map_task_with_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task(row)?;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(34)?)?;
+    Ok(task)
 }
 
 /// Decode the JSON array stored in `tasks.tags`. Empty/NULL/`[]` → empty
@@ -361,12 +371,25 @@ pub(crate) fn map_task_with_parent(row: &Row<'_>) -> rusqlite::Result<Task> {
 /// Like [`map_task_with_parent`] but also reads `origin_task_short_id`
 /// (index 35), `origin_pr_number` (index 36), and `completed_at`
 /// (index 37). Used by `query_task`, `get_work_item_by_short_id`, and
-/// `list_chores` when those columns are appended to the standard SELECT.
+/// the list-path mappers that append further trailing columns after
+/// these provenance fields.
 pub(crate) fn map_task_with_parent_and_provenance(row: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = map_task_with_parent(row)?;
     task.origin_task_short_id = row.get(35)?;
     task.origin_pr_number = row.get(36)?;
     task.completed_at = row.get::<_, Option<String>>(37)?.filter(|s| !s.is_empty());
+    Ok(task)
+}
+
+/// Like [`map_task_with_parent_and_provenance`] but also reads a trailing
+/// `tags` column at index 38. Used by [`crate::work::WorkDb::list_chores`]
+/// and [`crate::work::WorkDb::list_revisions`] so bulk list JSON matches
+/// `task show` / `chore show`. Distinct from the wider
+/// [`map_task_with_parent_provenance_and_archived_reason`] path (tags at
+/// index 44 after archived/dispatch columns).
+pub(crate) fn map_task_with_parent_provenance_and_tags(row: &Row<'_>) -> rusqlite::Result<Task> {
+    let mut task = map_task_with_parent_and_provenance(row)?;
+    task.tags = decode_task_tags(row.get::<_, Option<String>>(38)?)?;
     Ok(task)
 }
 

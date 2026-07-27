@@ -247,3 +247,161 @@ fn apply_tag_patch_set_then_add_then_remove() {
     .unwrap();
     assert_eq!(got, vec!["a", "c"]);
 }
+
+/// Bulk list surfaces must project `tags` the same way single-item show
+/// does — previously `list_tasks` / `list_chores` / `list_revisions` used
+/// mappers that hard-coded an empty vec, so `boss task list --json` never
+/// emitted the field even when the row carried tags in the DB.
+#[test]
+fn list_tasks_chores_and_revisions_project_tags_like_show() {
+    let path = temp_db_path("tags-list-projection");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Tagged project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: false,
+            no_design_task: true,
+        })
+        .unwrap();
+
+    let tagged_chore = create_test_chore_manual(&db, product.id.clone(), "Tagged chore");
+    let untagged_chore = create_test_chore_manual(&db, product.id.clone(), "Untagged chore");
+    db.update_work_item(
+        &tagged_chore.id,
+        WorkItemPatch {
+            tags: Some(vec!["needs-human".into(), "ci-flake".into()]),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let tagged_task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Tagged task")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    let untagged_task = db
+        .create_task(
+            CreateTaskInput::builder()
+                .product_id(product.id.clone())
+                .project_id(project.id.clone())
+                .name("Untagged task")
+                .autostart(false)
+                .build(),
+        )
+        .unwrap();
+    db.update_work_item(
+        &tagged_task.id,
+        WorkItemPatch {
+            tags: Some(vec!["grok".into()]),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let tagged_revision_id = insert_revision_row(&db, &product.id, &tagged_chore.id);
+    let untagged_revision_id = insert_revision_row(&db, &product.id, &untagged_chore.id);
+    db.update_work_item(
+        &tagged_revision_id,
+        WorkItemPatch {
+            tags: Some(vec!["revision-tag".into()]),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    // Show baseline: tagged rows carry tags; untagged rows are empty vec
+    // (serde skip_serializing_if means the JSON key is omitted — same as
+    // list after this fix).
+    let show_tagged_chore = match db.get_work_item(&tagged_chore.id).unwrap() {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert_eq!(show_tagged_chore.tags, vec!["needs-human", "ci-flake"]);
+    let show_untagged_chore = match db.get_work_item(&untagged_chore.id).unwrap() {
+        WorkItem::Chore(t) => t,
+        other => panic!("expected chore, got {other:?}"),
+    };
+    assert!(show_untagged_chore.tags.is_empty());
+
+    // list_chores
+    let chores = db.list_chores(&product.id, None, false).unwrap();
+    let listed_tagged = chores.iter().find(|t| t.id == tagged_chore.id).expect("tagged chore");
+    let listed_untagged = chores
+        .iter()
+        .find(|t| t.id == untagged_chore.id)
+        .expect("untagged chore");
+    assert_eq!(listed_tagged.tags, show_tagged_chore.tags);
+    assert_eq!(listed_untagged.tags, show_untagged_chore.tags);
+
+    // list_tasks (product-wide + project-scoped)
+    let show_tagged_task = match db.get_work_item(&tagged_task.id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected task, got {other:?}"),
+    };
+    let show_untagged_task = match db.get_work_item(&untagged_task.id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected task, got {other:?}"),
+    };
+    for listed in [
+        db.list_tasks(&product.id, None, None, false).unwrap(),
+        db.list_tasks(&product.id, Some(&project.id), None, false).unwrap(),
+    ] {
+        let tagged = listed.iter().find(|t| t.id == tagged_task.id).expect("tagged task");
+        let untagged = listed.iter().find(|t| t.id == untagged_task.id).expect("untagged task");
+        assert_eq!(tagged.tags, show_tagged_task.tags);
+        assert_eq!(untagged.tags, show_untagged_task.tags);
+    }
+    // Chores also appear on product-wide list_tasks (flavor-complete leaf list).
+    let product_tasks = db.list_tasks(&product.id, None, None, false).unwrap();
+    let chore_on_task_list = product_tasks
+        .iter()
+        .find(|t| t.id == tagged_chore.id)
+        .expect("chore on task list");
+    assert_eq!(chore_on_task_list.tags, show_tagged_chore.tags);
+
+    // list_revisions — compare against the same query_task path show uses.
+    let show_tagged_rev = query_task(&db.connect().unwrap(), &tagged_revision_id)
+        .unwrap()
+        .expect("tagged revision");
+    let show_untagged_rev = query_task(&db.connect().unwrap(), &untagged_revision_id)
+        .unwrap()
+        .expect("untagged revision");
+    assert_eq!(show_tagged_rev.tags, vec!["revision-tag"]);
+    assert!(show_untagged_rev.tags.is_empty());
+
+    let revisions = db.list_revisions(&product.id, None, false, None).unwrap();
+    let listed_tagged_rev = revisions
+        .iter()
+        .find(|t| t.id == tagged_revision_id)
+        .expect("tagged revision");
+    let listed_untagged_rev = revisions
+        .iter()
+        .find(|t| t.id == untagged_revision_id)
+        .expect("untagged revision");
+    assert_eq!(listed_tagged_rev.tags, show_tagged_rev.tags);
+    assert_eq!(listed_untagged_rev.tags, show_untagged_rev.tags);
+
+    // JSON shape: non-empty tags serialize; empty tags are omitted (same as show).
+    let tagged_json = serde_json::to_value(listed_tagged).unwrap();
+    assert_eq!(
+        tagged_json.get("tags").and_then(|v| v.as_array()).map(|a| a.len()),
+        Some(2)
+    );
+    let untagged_json = serde_json::to_value(listed_untagged).unwrap();
+    assert!(
+        untagged_json.get("tags").is_none(),
+        "empty tags must skip_serializing like show, got {untagged_json}"
+    );
+
+    let _ = std::fs::remove_file(path);
+}
