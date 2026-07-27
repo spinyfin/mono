@@ -405,6 +405,7 @@ impl CodexRuntimeState {
 pub fn render_base_config_toml(workspace: &Path) -> String {
     // TOML basic-string escape for paths that may contain backslashes or quotes.
     let workspace_key = toml_basic_string(&workspace.display().to_string());
+    let sandbox_workspace_write = render_sandbox_workspace_write_toml();
     format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
@@ -422,10 +423,115 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
          [features]\n\
          external_agent_memory_import = false\n\
          \n\
+         {sandbox_workspace_write}\
          [projects.{workspace_key}]\n\
          trust_level = \"trusted\"\n\
          \n"
     )
+}
+
+/// `[sandbox_workspace_write]` table for the per-run `config.toml`.
+///
+/// Codex's `--sandbox workspace-write` default renders with no
+/// `[sandbox_workspace_write]` table at all, so `network_access` and
+/// `writable_roots` take Codex's own binary defaults: `false` and `[]`. That
+/// denies the localhost TCP bind Bazel's client/server handshake needs
+/// (`bazel build` aborts with a `java.net.SocketException`, and Bazel's own
+/// shutdown path then hits `sysctl kern.proc.all` outside the seatbelt
+/// allowlist, which is what actually surfaces as `FATAL: bazel crashed due to
+/// an internal error` — a consequence of the socket failure, not an
+/// independent gap) and denies writes to Bazel's cache directories, which sit
+/// outside the workspace by default. See "Bazel under the Codex sandbox" in
+/// `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md` for the
+/// full repro.
+///
+/// `network_access = true` grants full outbound network, not a
+/// localhost-only tier — Codex's `sandbox_workspace_write` schema is
+/// two-valued (`restricted` / `enabled`) with no such tier. Bazel itself also
+/// needs real egress here: bzlmod/module-registry fetches and (absent a
+/// pinned `.bazelversion`) bazelisk's own version-resolution call both go out
+/// over the network on a cold cache.
+///
+/// This table only takes effect under `--sandbox workspace-write`; Reviewer
+/// runs use `--sandbox read-only` (see [`codex_sandbox_for_worker_kind`]),
+/// under which Codex does not consult `sandbox_workspace_write` at all, so no
+/// worker-kind branch is needed here — reviewers don't run build gates and
+/// stay fully denied.
+fn render_sandbox_workspace_write_toml() -> String {
+    let mut out = String::from(
+        "[sandbox_workspace_write]\n\
+         network_access = true\n",
+    );
+    let roots = bazel_writable_roots();
+    if !roots.is_empty() {
+        let quoted: Vec<String> = roots
+            .iter()
+            .map(|r| toml_basic_string(&r.display().to_string()))
+            .collect();
+        out.push_str(&format!("writable_roots = [{}]\n", quoted.join(", ")));
+    }
+    out.push('\n');
+    out
+}
+
+/// Resolve the writable roots Bazel needs outside the workspace.
+///
+/// Always includes Bazel's default `output_user_root` (the parent of the
+/// per-workspace `output_base` holding the local Bazel server's state, action
+/// cache, and sandboxed execroots) — mirroring Bazel's own client resolution
+/// order rather than hardcoding a path: `TEST_TMPDIR` first (Bazel's
+/// convention for a bazel-in-bazel test invocation providing its own scratch
+/// root — the same convention Boss's own bazel-gated test suite for this
+/// function relies on), then the platform cache-dir default Bazel falls back
+/// to when no `--output_user_root` flag applies.
+///
+/// On macOS that default alone (`~/Library/Caches/bazel`) is not enough:
+/// live verification against this repo showed non-fatal but noisy
+/// `Operation not permitted` disk-cache write failures, because mono's own
+/// root `.bazelrc` points `--disk_cache` at `~/.cache/bazelcache` — an
+/// XDG-style path outside `~/Library/Caches` even on macOS. That convention
+/// (shared dotfiles across Linux/macOS hosts pointing bazel cache flags at
+/// `~/.cache`) is common enough that granting it isn't a one-repo special
+/// case, so macOS additionally grants `~/.cache` outright, covering wherever
+/// a repo's `.bazelrc` points `--disk_cache` / `--repository_cache` under it.
+/// Non-macOS already resolves under `${XDG_CACHE_HOME:-~/.cache}` natively,
+/// so no second root is needed there.
+///
+/// Returns an empty `Vec` when `HOME` is unset/empty, leaving `writable_roots`
+/// unset so Codex falls back to its own `[]` default rather than a guessed
+/// path.
+fn bazel_writable_roots() -> Vec<PathBuf> {
+    bazel_writable_roots_impl(
+        std::env::var("TEST_TMPDIR").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        std::env::var("XDG_CACHE_HOME").ok().as_deref(),
+    )
+}
+
+/// Env-injected core of [`bazel_writable_roots`], so tests can exercise every
+/// resolution branch without mutating process-global env (`HOME` in
+/// particular is read by far too much shared test-process state — tempfile,
+/// other threads' tests — to remove safely, even under the crate's
+/// `ENV_LOCK` convention for its own Boss-owned env vars).
+fn bazel_writable_roots_impl(
+    test_tmpdir: Option<&str>,
+    home: Option<&str>,
+    xdg_cache_home: Option<&str>,
+) -> Vec<PathBuf> {
+    if let Some(dir) = test_tmpdir.filter(|d| !d.is_empty()) {
+        return vec![PathBuf::from(dir)];
+    }
+    let Some(home) = home.filter(|h| !h.is_empty()) else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    if cfg!(target_os = "macos") {
+        return vec![home.join("Library/Caches/bazel"), home.join(".cache")];
+    }
+    match xdg_cache_home {
+        Some(xdg) if !xdg.is_empty() => vec![PathBuf::from(xdg).join("bazel")],
+        _ => vec![home.join(".cache/bazel")],
+    }
 }
 
 fn toml_basic_string(s: &str) -> String {
@@ -1597,6 +1703,73 @@ else:
         // No stray unnested/unquoted occurrence of the old, invalid top-level
         // scalar form this config once emitted.
         assert!(!toml.contains("\nexternal_config_migration_prompts = false\n"));
+    }
+
+    #[test]
+    fn base_config_grants_bazel_sandbox_permissions() {
+        let toml = render_base_config_toml(Path::new("/ws"));
+        assert!(toml.contains("[sandbox_workspace_write]"), "{toml}");
+        assert!(toml.contains("network_access = true"), "{toml}");
+        // The table must land before [projects.*] so a duplicate top-level
+        // key introduced later in the format string can't silently shadow it.
+        let sandbox_pos = toml.find("[sandbox_workspace_write]").unwrap();
+        let projects_pos = toml.find("[projects.").unwrap();
+        assert!(sandbox_pos < projects_pos, "{toml}");
+        // writable_roots is present iff the real environment resolves at
+        // least one root (it always does on a dev/CI host with HOME set;
+        // this stays non-brittle if some future test host truly lacks one).
+        let roots = bazel_writable_roots();
+        if roots.is_empty() {
+            assert!(!toml.contains("writable_roots"), "{toml}");
+        } else {
+            let quoted: Vec<String> = roots
+                .iter()
+                .map(|r| toml_basic_string(&r.display().to_string()))
+                .collect();
+            assert!(
+                toml.contains(&format!("writable_roots = [{}]", quoted.join(", "))),
+                "{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn bazel_writable_roots_prefers_test_tmpdir() {
+        assert_eq!(
+            bazel_writable_roots_impl(Some("/scratch/test-tmp"), Some("/Users/test-home"), None),
+            vec![PathBuf::from("/scratch/test-tmp")]
+        );
+    }
+
+    #[test]
+    fn bazel_writable_roots_falls_back_to_platform_cache_dirs() {
+        let roots = bazel_writable_roots_impl(None, Some("/Users/test-home"), None);
+        let expected = if cfg!(target_os = "macos") {
+            vec![
+                PathBuf::from("/Users/test-home/Library/Caches/bazel"),
+                PathBuf::from("/Users/test-home/.cache"),
+            ]
+        } else {
+            vec![PathBuf::from("/Users/test-home/.cache/bazel")]
+        };
+        assert_eq!(roots, expected);
+    }
+
+    #[test]
+    fn bazel_writable_roots_prefers_xdg_cache_home_on_non_macos() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        assert_eq!(
+            bazel_writable_roots_impl(None, Some("/Users/test-home"), Some("/custom/cache")),
+            vec![PathBuf::from("/custom/cache/bazel")]
+        );
+    }
+
+    #[test]
+    fn bazel_writable_roots_empty_without_home_or_test_tmpdir() {
+        assert_eq!(bazel_writable_roots_impl(None, None, None), Vec::<PathBuf>::new());
+        assert_eq!(bazel_writable_roots_impl(Some(""), None, None), Vec::<PathBuf>::new());
     }
 
     #[test]
