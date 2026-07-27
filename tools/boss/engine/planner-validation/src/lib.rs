@@ -534,6 +534,7 @@ mod tests {
             kind: TaskKind::ProjectTask,
             effort: EffortLevel::Small,
             ordinal: 0,
+            deferred: false,
         }
     }
 
@@ -823,6 +824,7 @@ mod tests {
             kind: TaskKind::ProjectTask,
             effort: EffortLevel::Small,
             ordinal: 0,
+            deferred: false,
         }
     }
 

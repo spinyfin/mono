@@ -136,6 +136,7 @@ fn output_from(tasks: &[T], edges: &[E], breakdown_found: bool, confidence: Conf
             kind: spec.kind.clone(),
             effort: spec.effort,
             ordinal: i as i64,
+            deferred: false,
         })
         .collect();
     let proposed_edges: Vec<ProposedEdge> = edges

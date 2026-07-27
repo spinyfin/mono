@@ -722,23 +722,25 @@ item. Treat either signal the same way.\n\
 - **Never silently drop a deferred item.** It still becomes a task — \
 omitting it forces the coordinator to guess what you considered and \
 rejected.\n\
-- **Mark it, don't dispatch it.** Prefix the task's `name` with the literal \
-`[deferred] ` (e.g. `[deferred] Add bulk-export endpoint`), and end its \
-`description` with a line reading exactly `[deferred] future / not a v1 \
-blocker — parked; requires an explicit operator decision before it starts.` \
-followed by the doc's own reason for deferring it, if one is given. This \
-keeps the item visible in the project's task list without implying it is \
-ready to dispatch — it is a signal to the operator, since every task the \
-Planner proposes is staged (`autostart = false`) for human review \
-regardless of scope tier.\n\
-- **Do not gate in-scope work on a deferred task.** Never add a `edges` \
-entry whose `prerequisite` is a `[deferred]`-prefixed task — deferred work \
-is explicitly not being built now, so nothing in-scope should wait on it. A \
-deferred task may still depend on an in-scope one (e.g. it builds on a \
-shared root), which is a normal `dependent` edge.\n\
+- **Set `deferred: true` on the proposed task.** The boolean is the \
+primary/canonical mechanism — set it explicitly; do not encode deferral \
+only in name/description prose. A residual `[deferred]` token in name or \
+description is a Materializer fallback for stale model output only (not \
+something you should emit). Keep the doc's own reason for deferring the \
+item in the task's `description` (why it is future / not a v1 blocker). \
+The Materializer files `tasks.deferred = 1` from this flag, which is what \
+suppresses automatic execution minting on every path (normal reconcile, \
+dependency auto-unblock cascade, project chain). A deferred row stays \
+visible on the board and still unblocks when its prerequisites land, but \
+nothing dispatches until an operator explicitly approves it.\n\
+- **Do not gate in-scope work on a deferred task.** Never add an `edges` \
+entry whose `prerequisite` is a task with `deferred: true` — deferred \
+work is explicitly not being built now, so nothing in-scope should wait \
+on it. A deferred task may still depend on an in-scope one (e.g. it \
+builds on a shared root), which is a normal `dependent` edge.\n\
 - Classify a deferred task's `kind` and `effort` exactly as you would any \
 other task — the deferral is a scheduling signal, not a different shape of \
-work.\n\
+work. For in-scope items set `deferred: false`.\n\
 \n\
 ## coordinator-only landing site gate\n\
 \n\
@@ -756,7 +758,7 @@ deletion\", \"write to the runtime database\", \"update engine taxonomy \
 state directly\" — none of these land in a repo, so none are worker-filable, \
 even when the surrounding design doc's rationale is entirely legitimate.\n\
 - **Account for it visibly — never just leave it out.** Unlike a deferred \
-item (which still becomes a `[deferred] `-prefixed task), a coordinator-only \
+item (which still becomes a task with `deferred: true`), a coordinator-only \
 item must NOT be emitted as a task at all: omit it from `tasks` and add one \
 line per omitted item to `notes` describing the item and stating that it is \
 coordinator-only work the coordinator must perform directly in-session.\n\
@@ -990,14 +992,16 @@ mod tests {
                             "description": "Add the contract types.\n\n[effort-classification] level=`small` matched-rule=`rule 5 (self-contained)` reasons=\"protocol types\"",
                             "kind": "project_task",
                             "effort": "small",
-                            "ordinal": 0
+                            "ordinal": 0,
+                            "deferred": false
                         }, {
                             "handle": "engine-handler",
                             "name": "Engine handler",
                             "description": "Wire the handler.\n\n[effort-classification] level=`medium` matched-rule=`rule 3 (multi-subsystem)` reasons=\"engine + protocol\"",
                             "kind": "project_task",
                             "effort": "medium",
-                            "ordinal": 1
+                            "ordinal": 1,
+                            "deferred": false
                         }],
                         "edges": [
                             { "dependent": "engine-handler", "prerequisite": "protocol-types" }
@@ -1096,17 +1100,28 @@ mod tests {
 
     /// The Planner must not mint fully-startable tasks for design-doc items
     /// the design directive tags `Scope: deferred (future / not a v1
-    /// blocker)` — it must still emit them (never silently drop), but mark
-    /// them `[deferred]` rather than proposing them as ordinary in-scope
+    /// blocker)` — it must still emit them (never silently drop), but set
+    /// `deferred: true` rather than proposing them as ordinary in-scope
     /// work, and never let an in-scope task depend on one.
     #[test]
     fn system_prompt_encodes_scope_tier_handling() {
         assert!(SYSTEM_PROMPT.contains("Scope: in-scope"));
         assert!(SYSTEM_PROMPT.contains("Scope: deferred (future / not a v1 blocker)"));
         assert!(SYSTEM_PROMPT.contains("Never silently drop a deferred item"));
-        assert!(SYSTEM_PROMPT.contains("[deferred] "));
+        assert!(SYSTEM_PROMPT.contains("Set `deferred: true` on the proposed task"));
         assert!(SYSTEM_PROMPT.contains("Do not gate in-scope work on a deferred task"));
         assert!(SYSTEM_PROMPT.contains("stretch goal"));
+        // Boolean is primary/canonical; residual prose is Materializer fallback only.
+        assert!(SYSTEM_PROMPT.contains("primary/canonical mechanism"));
+        assert!(SYSTEM_PROMPT.contains("Materializer fallback for stale model output only"));
+        assert!(
+            !SYSTEM_PROMPT.contains("only mechanism the engine reads"),
+            "do not claim the boolean is the only path — residual prose is a Materializer fallback"
+        );
+        assert!(
+            !SYSTEM_PROMPT.contains("autostart = false"),
+            "autostart alone does not park cascade dispatch; do not claim it does"
+        );
     }
 
     /// The coordinator-only landing site gate must survive edits to this
@@ -1160,7 +1175,8 @@ mod tests {
                         "description": "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"",
                         "kind": "project_task",
                         "effort": "small",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
@@ -1195,7 +1211,8 @@ mod tests {
                         "description": "Do the thing, no audit line here.",
                         "kind": "project_task",
                         "effort": "small",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
@@ -1284,7 +1301,8 @@ mod tests {
                         "description": "First paragraph.\\n\\nSecond paragraph with a \\\"quote\\\".\\n\\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\\\"x\\\"",
                         "kind": "project_task",
                         "effort": "small",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
@@ -1454,7 +1472,8 @@ mod tests {
                         "description": "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5` reasons=\"x\"",
                         "kind": "project_task",
                         "effort": "small",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
@@ -1605,7 +1624,8 @@ mod tests {
                             [effort-classification] level=`large` matched-rule=`rule 2` reasons=\"a project in disguise\"",
                         "kind": "project_task",
                         "effort": "large",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }],
                     "edges": [],
                     "confidence": "high",
@@ -1634,21 +1654,24 @@ mod tests {
                         "description": "Document the closed vocabulary of the detail tables.",
                         "kind": "investigation",
                         "effort": "large",
-                        "ordinal": 0
+                        "ordinal": 0,
+                        "deferred": false
                     }, {
                         "handle": "detail-parser",
                         "name": "Implement the detail-table parser",
                         "description": "Implement the parser against the documented format.",
                         "kind": "project_task",
                         "effort": "medium",
-                        "ordinal": 1
+                        "ordinal": 1,
+                        "deferred": false
                     }, {
                         "handle": "fixture-sweep",
                         "name": "Add the fixture reconciliation test",
                         "description": "Add the reconciliation test over the committed fixtures.",
                         "kind": "project_task",
                         "effort": "small",
-                        "ordinal": 2
+                        "ordinal": 2,
+                        "deferred": false
                     }],
                     "edges": [
                         { "dependent": "detail-parser", "prerequisite": "format-investigation" },
