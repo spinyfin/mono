@@ -164,12 +164,14 @@ struct EngineUnreachableBanner: View {
     let onRestart: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.white)
+                .padding(.top, 2)
             Text(headlineText)
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             Button(action: onRestart) {
                 Text(isRestarting ? "Restarting…" : "Restart engine")
@@ -184,7 +186,7 @@ struct EngineUnreachableBanner: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.red.opacity(0.85))
         .accessibilityElement(children: .contain)
     }
@@ -238,20 +240,26 @@ struct EngineHealthBanner: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
                 Button(action: { withAnimation(.easeInOut(duration: 0.12)) { isExpanded.toggle() } }) {
-                    HStack(spacing: 8) {
+                    HStack(alignment: .top, spacing: 8) {
                         Image(systemName: iconName)
                             .foregroundStyle(.white)
+                            .padding(.top, 2)
+                        // No lineLimit: height grows with Dynamic Type and
+                        // long pause-since strings so the parent VStack
+                        // (ContentView) reserves real space instead of a
+                        // hardcoded top padding.
                         Text(headlineText)
                             .font(.callout.weight(.semibold))
                             .foregroundStyle(.white)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                         Spacer(minLength: 0)
                         Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                             .foregroundStyle(.white)
                             .font(.caption.weight(.semibold))
+                            .padding(.top, 4)
                     }
                     .contentShape(Rectangle())
                 }
@@ -272,7 +280,7 @@ struct EngineHealthBanner: View {
             }
             .padding(.horizontal, 14)
             .padding(.vertical, 8)
-            .frame(maxWidth: .infinity)
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 6) {
@@ -281,6 +289,7 @@ struct EngineHealthBanner: View {
                             Text(issue.title)
                                 .font(.callout.weight(.semibold))
                                 .foregroundStyle(.white)
+                                .fixedSize(horizontal: false, vertical: true)
                             Text(issue.body)
                                 .font(.caption)
                                 .foregroundStyle(.white.opacity(0.92))

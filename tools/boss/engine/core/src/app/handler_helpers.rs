@@ -5,7 +5,7 @@
 
 use super::*;
 
-use boss_engine_utils::iso8601::format_epoch_iso8601;
+use boss_engine_utils::iso8601::{format_epoch_iso8601, format_paused_since_phrase};
 
 /// Build the per-product effort-audit report. Handles the product
 /// lookup, window filter, and chore-corpus / event-log fan-in so
@@ -130,25 +130,41 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
              continue to completion. Run `bossctl dispatch resume` to restore normal dispatch."
                 .to_owned()
         };
+        // Same human "since" phrasing as automation_paused — never a raw
+        // Zulu ISO timestamp in the user-facing banner title.
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let since_suffix = server_state
+            .execution_coordinator
+            .dispatch_paused_since_epoch_s()
+            .map(|s| format_paused_since_phrase(s as i64, now))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default();
         issues.push(EngineHealthIssue {
             kind: "dispatch_paused".to_owned(),
             severity: "warning".to_owned(),
-            title: "Dispatch is globally paused".to_owned(),
+            title: format!("Dispatch is globally paused{since_suffix}"),
             body,
         });
     }
 
     let automation_paused = server_state.execution_coordinator.is_automation_paused();
     if automation_paused {
-        let since_str = server_state
+        // Relative elapsed ("3 days ago") matching the macOS app's
+        // RelativeDateTimeFormatter convention. Never render a Zulu
+        // `...Z` ISO string in a user-facing banner title.
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let since_suffix = server_state
             .execution_coordinator
             .automation_paused_since_epoch_s()
-            .map(|s| format!(" since {}", format_epoch_iso8601(s as i64)))
+            .map(|s| format_paused_since_phrase(s as i64, now))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" {s}"))
             .unwrap_or_default();
         issues.push(EngineHealthIssue {
             kind: "automation_paused".to_owned(),
             severity: "warning".to_owned(),
-            title: format!("Automations paused{since_str}"),
+            title: format!("Automations paused{since_suffix}"),
             body: "The automation scheduler is not starting new triage passes, and the \
                    automation pool is not claiming new work, including tasks a triage worker \
                    produces. Currently-running automation workers continue to completion. \
