@@ -4,7 +4,7 @@
 //! injects into a live worker's pane so the worker answers it at its next
 //! `Stop`/`PostToolUse` boundary. This module owns the per-run pending
 //! queue, the single in-flight slot awaiting a reply, and the observable
-//! [`ProbeLifecycleState`] each probe id moves through.
+//! [`ProbeDeliveryState`] each probe id moves through.
 //!
 //! Split out of `app.rs`; pure structural move — no behavioural change.
 
@@ -88,33 +88,19 @@ pub(super) struct InFlightProbe {
     pub(super) offset_bytes: u64,
 }
 
-/// Observable lifecycle of one probe, keyed by `probe_id`. Queried by
-/// tests and by `dispatch_probe_reply_on_stop` (which asserts a probe
-/// was at least `Injected` before it will report a reply for it).
+/// Everything the engine knows about one probe id after it was accepted:
+/// which run it targets, whether it was urgent, how far delivery got, and
+/// (optionally) an operator-facing note about how it got there.
 ///
-/// This is the corrected-spec replacement for treating "no
-/// `UserPromptSubmit` within the verification window" as a delivery
-/// failure: rather than silently re-delivering (which duplicates the
-/// probe if the CLI *did* enqueue it and the hook was merely slow or
-/// absent), the engine now records `Unconfirmed` and leaves the
-/// redelivery call to whoever is watching the probe topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ProbeLifecycleState {
-    /// Minted and sitting in `pending_probes`, not yet written to the pane.
-    Queued,
-    /// `SendToPane` returned Ok but delivery has not yet been confirmed
-    /// or timed out.
-    Injected,
-    /// A `UserPromptSubmit` hook (or, failing that, a transcript scan)
-    /// confirmed the CLI actually enqueued the injected text.
-    Consumed,
-    /// The verification window elapsed with no confirming signal. The
-    /// write may still have landed — this state means "unproven", not
-    /// "lost" — so the engine does not automatically re-deliver.
-    Unconfirmed,
-    /// `dispatch_probe_reply_on_stop` extracted and published the
-    /// worker's reply.
-    Replied,
+/// The state itself is [`boss_protocol::ProbeDeliveryState`] — the same enum
+/// the wire uses — so `bossctl probe-status` reports exactly what the engine
+/// recorded, with no second vocabulary to keep in sync.
+#[derive(Debug, Clone)]
+pub(super) struct ProbeRecord {
+    pub(super) run_id: String,
+    pub(super) urgent: bool,
+    pub(super) state: ProbeDeliveryState,
+    pub(super) detail: Option<String>,
 }
 
 impl ServerState {
@@ -133,6 +119,18 @@ impl ServerState {
             text,
             urgent,
         };
+        self.probe_lifecycle
+            .lock()
+            .expect("probe_lifecycle mutex poisoned")
+            .insert(
+                probe_id.clone(),
+                ProbeRecord {
+                    run_id: run_id.clone(),
+                    urgent,
+                    state: ProbeDeliveryState::Queued,
+                    detail: None,
+                },
+            );
         let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.entry(run_id).or_default();
         if urgent {
@@ -140,8 +138,6 @@ impl ServerState {
         } else {
             queue.push_back(probe);
         }
-        drop(guard);
-        self.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
         probe_id
     }
 
@@ -227,16 +223,48 @@ impl ServerState {
             .remove(run_id)
     }
 
-    /// Record `probe_id`'s current lifecycle stage. Call sites drive
-    /// every transition explicitly (see [`ProbeLifecycleState`]) —
+    /// Record `probe_id`'s current delivery stage. Call sites drive
+    /// every transition explicitly (see [`ProbeDeliveryState`]) —
     /// there's no automatic advancement based on other bookkeeping,
     /// so a probe id with no entry has never been queued in this
     /// process (or the engine restarted).
-    pub(super) fn set_probe_lifecycle(&self, probe_id: &str, state: ProbeLifecycleState) {
+    ///
+    /// A transition for an id that was never queued is dropped rather than
+    /// inventing a record: `run_id`/`urgent` are only knowable at queue time,
+    /// and a status answer that guessed them would be worse than "unknown
+    /// probe id".
+    pub(super) fn set_probe_lifecycle(&self, probe_id: &str, state: ProbeDeliveryState) {
+        self.set_probe_lifecycle_detail(probe_id, state, None);
+    }
+
+    /// [`Self::set_probe_lifecycle`] plus an operator-facing note explaining
+    /// how the probe reached `state` — surfaced verbatim by
+    /// `bossctl probe-status`. Passing `None` clears any previous note, so a
+    /// probe that recovers from `Unconfirmed` doesn't keep a stale
+    /// explanation.
+    pub(super) fn set_probe_lifecycle_detail(&self, probe_id: &str, state: ProbeDeliveryState, detail: Option<String>) {
+        let mut guard = self.probe_lifecycle.lock().expect("probe_lifecycle mutex poisoned");
+        match guard.get_mut(probe_id) {
+            Some(record) => {
+                record.state = state;
+                record.detail = detail;
+            }
+            None => tracing::warn!(
+                probe_id,
+                state = state.as_str(),
+                "probe lifecycle transition for an id that was never queued; dropping",
+            ),
+        }
+    }
+
+    /// Full record for `probe_id`, if this engine process queued it.
+    /// Answers `FrontendRequest::ProbeStatus`.
+    pub(super) fn probe_record(&self, probe_id: &str) -> Option<ProbeRecord> {
         self.probe_lifecycle
             .lock()
             .expect("probe_lifecycle mutex poisoned")
-            .insert(probe_id.to_owned(), state);
+            .get(probe_id)
+            .cloned()
     }
 
     /// Query the current lifecycle stage for `probe_id`, if any is
@@ -244,11 +272,11 @@ impl ServerState {
     /// extraction for a probe the engine never actually dispatched,
     /// and by tests to assert the corrected no-auto-redelivery
     /// behavior without depending on internal queue contents.
-    pub(super) fn probe_lifecycle_state(&self, probe_id: &str) -> Option<ProbeLifecycleState> {
+    pub(super) fn probe_lifecycle_state(&self, probe_id: &str) -> Option<ProbeDeliveryState> {
         self.probe_lifecycle
             .lock()
             .expect("probe_lifecycle mutex poisoned")
             .get(probe_id)
-            .copied()
+            .map(|record| record.state)
     }
 }

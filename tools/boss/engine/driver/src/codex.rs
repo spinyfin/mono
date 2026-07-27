@@ -34,9 +34,9 @@ use progress::{
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
-    ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity, ProgressIngress,
-    ProgressObservationConfig, ProgressSessionConfig, ProgressSessionNormalizer, ProgressStreamSource, SpawnPlan,
-    SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity,
+    ProgressIngress, ProgressObservationConfig, ProgressSessionConfig, ProgressSessionNormalizer, ProgressStreamSource,
+    SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
     ToolUseInterceptionWiring, TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind,
     default_structured_output_wiring,
 };
@@ -1222,6 +1222,17 @@ impl AgentDriver for CodexDriver {
         WorkerErrorClass::Indeterminate
     }
 
+    /// `codex exec` is the driver the mid-turn injection guard exists for.
+    /// It runs one turn per process with stdin on `/dev/null`, so bytes
+    /// written into the pane mid-turn are never read by the agent, survive in
+    /// the tty input buffer, and are executed by the interactive shell once
+    /// the process exits (ghostty-codex-pane-viability, Q2 Layer D). Declared
+    /// explicitly rather than left to the trait default so that this — the
+    /// motivating case — is stated where the driver lives.
+    fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
+        MidTurnPaneInput::Rejects
+    }
+
     fn structured_output_wiring(
         &self,
         request: &StructuredOutputRequest<'_>,
@@ -1822,5 +1833,17 @@ else:
                 std::env::remove_var(CODEX_HOMES_ROOT_ENV);
             }
         }
+    }
+
+    /// `codex exec` is the motivating case for the mid-turn injection guard:
+    /// one turn per process with stdin on `/dev/null`, so bytes written
+    /// mid-turn are never read and are later executed by the interactive
+    /// shell. Declared explicitly rather than inherited from the trait
+    /// default, so this stays asserted even if the default ever changes.
+    #[test]
+    fn codex_rejects_mid_turn_pane_input() {
+        let driver = CodexDriver::default();
+        assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
+        assert!(!driver.mid_turn_pane_input().buffers());
     }
 }

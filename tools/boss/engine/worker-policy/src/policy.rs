@@ -354,6 +354,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::OpenLiveWorkspaceTerminal { .. }
         | FrontendRequest::OpenReviewTerminal { .. }
         | FrontendRequest::ProbeRun { .. }
+        | FrontendRequest::ProbeStatus { .. }
         | FrontendRequest::ReapRun { .. }
         | FrontendRequest::ReleaseReviewTerminal { .. }
         | FrontendRequest::RequestExecution { .. }

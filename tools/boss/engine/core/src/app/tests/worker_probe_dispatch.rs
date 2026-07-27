@@ -220,14 +220,22 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
 }
 
-/// Safety guard: an urgent probe on PostToolUse while the worker is
-/// mid-turn (`Working`) must **not** write to the pane. Injecting into
-/// a non-accepting foreground process is a safety issue
-/// (ghostty-codex-pane-viability Q2 Layer D), not hygiene. The probe is
-/// left queued for the next Stop boundary (no pop), and Working-on-
-/// PostToolUse is treated as *expected* deferral — no
-/// `ProbeDeliveryEscalated` (multi-tool turns must not spam once per
-/// tool).
+/// Safety guard: an urgent probe on PostToolUse must **not** write to the
+/// pane when the run has no resolvable driver — `register_working_worker`
+/// registers a bare run id with no execution row behind it, so the mid-turn
+/// decision cannot establish what the foreground process does with stdin and
+/// fails closed. Injecting into a non-consuming foreground process is a safety
+/// issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
+///
+/// Note what this does *not* assert: that `Working` alone forbids the write.
+/// It does not — a mid-turn worker on a driver that buffers stdin is
+/// injectable, which is what makes `--urgent` work at all. See
+/// `app::tests::probe_delivery` for both halves of that decision under a
+/// resolvable driver.
+///
+/// The probe is left queued for the next Stop boundary (no pop), and the
+/// deferral is treated as *expected* — no `ProbeDeliveryEscalated`
+/// (multi-tool turns must not spam once per tool).
 #[tokio::test]
 async fn dispatch_urgent_probe_defers_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
@@ -280,7 +288,7 @@ async fn dispatch_urgent_probe_defers_when_worker_not_accepting_input() {
     assert!(still.urgent);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Queued),
+        Some(ProbeDeliveryState::Queued),
     );
 
     // Expected Working deferral must not publish ProbeDeliveryEscalated.
@@ -369,7 +377,7 @@ async fn dispatch_urgent_probe_on_idle_records_unconfirmed_without_redelivery() 
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Unconfirmed),
+        Some(ProbeDeliveryState::Unconfirmed),
         "unconfirmed delivery must be recorded, not left unknown",
     );
     assert!(
@@ -685,6 +693,67 @@ async fn completion_probe_dispatched_on_same_stop_as_completion() {
     );
 }
 
+/// The Stop path records what it can actually vouch for. A parked worker
+/// takes the write as its next prompt, so `Consumed` is honest. A worker
+/// whose live activity is still `Working` on a buffering driver passes the
+/// posture guard, but the text only reaches the composer — nothing here
+/// observed a submission — so that must be recorded as `Buffered`, the same
+/// state the mid-turn urgent path uses.
+#[tokio::test]
+async fn probe_on_stop_records_buffered_for_a_mid_turn_write() {
+    use crate::protocol::WorkerEvent;
+
+    let (server_state, _dir) = test_server_state();
+    // Default driver (`claude`) buffers mid-turn input; activity stays
+    // `Working`, which in production the fan-out would have cleared to
+    // `Idle` before this dispatcher runs.
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    let probe_id = server_state.queue_probe(run_id.clone(), "status?".into(), false);
+
+    let app_sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), app_sink.clone())
+        .await;
+    let server_for_app = server_state.clone();
+    let app_responder = tokio::spawn(async move {
+        let envelope = app_sink.next().await.expect("SendToPane must be enqueued");
+        let request_id = match &envelope.payload {
+            FrontendEvent::EngineRequest { request_id, .. } => request_id.clone(),
+            other => panic!("expected EngineRequest, got {other:?}"),
+        };
+        server_for_app
+            .deliver_app_response(
+                "session-app",
+                &request_id,
+                EngineToAppResponse::SendToPane {
+                    result: Ok(crate::protocol::SendToPaneResult {}),
+                },
+            )
+            .await;
+    });
+
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_probe_on_stop(&server_state, &stop).await;
+    tokio::time::timeout(Duration::from_secs(2), app_responder)
+        .await
+        .expect("timed out waiting for SendToPane")
+        .expect("app_responder panicked");
+
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Buffered),
+        "a mid-turn write must not claim the worker consumed it",
+    );
+}
+
 /// The on-turn-boundary dispatchers follow the **driver's** answer, not the
 /// shape of the event.
 ///
@@ -776,7 +845,7 @@ async fn urgent_probe_multi_tool_post_tool_use_does_not_escalate_spam() {
     assert!(still.urgent);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Queued),
+        Some(ProbeDeliveryState::Queued),
     );
 
     let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
@@ -878,7 +947,7 @@ async fn urgent_probe_defers_through_fanout_then_delivers_on_stop() {
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Consumed),
+        Some(ProbeDeliveryState::Consumed),
     );
 }
 

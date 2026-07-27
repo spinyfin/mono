@@ -113,11 +113,85 @@ pub(super) fn register_working_worker(server_state: &ServerState, run_id: &str, 
     );
 }
 
+/// Seed a product → chore → execution chain so
+/// `WorkDb::get_execution_driver_slug` resolves for the returned execution id,
+/// and register that execution against `slot_id` as a **mid-turn** worker.
+///
+/// `driver` sets `tasks.driver`; `None` leaves it unset so the engine default
+/// (`claude`) applies. This is the fixture the mid-turn pane-input decision
+/// needs, because that decision reads the run's driver — a bare `run_id` with
+/// no execution row resolves to no driver and fails closed, which is correct
+/// behaviour but tests nothing about either driver.
+pub(super) fn register_working_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    let execution_id = execution_id_with_driver(server_state, driver);
+    register_working_worker(server_state, &execution_id, slot_id);
+    execution_id
+}
+
+/// Like [`register_working_worker_with_driver`], but leaves the slot at
+/// [`boss_protocol::WorkerActivity::Spawning`] — a worker whose pane exists
+/// but which has not reached a tool boundary yet. Used to pin that a refusal
+/// for this activity does not blame the driver, which is never consulted.
+pub(super) fn register_spawning_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    use boss_protocol::WorkerActivity;
+
+    let execution_id = execution_id_with_driver(server_state, driver);
+    server_state.worker_registry.register_run_slot(&execution_id, slot_id);
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, execution_id.clone(), "claude-opus-4-7", 0, None);
+    assert_eq!(
+        server_state.live_worker_states.get(slot_id).unwrap().activity,
+        WorkerActivity::Spawning,
+        "register_spawning_worker_with_driver precondition: slot must be Spawning",
+    );
+    execution_id
+}
+
+/// Seed a product → chore → execution chain whose `tasks.driver` is `driver`
+/// (`None` leaves it unset so the engine default, `claude`, applies), and
+/// return the execution id.
+fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) -> String {
+    use boss_protocol::RequestExecutionInput;
+
+    let product = crate::test_support::create_test_product_with_repo(
+        &server_state.work_db,
+        "probe-posture-product",
+        Some("git@example.com:p.git"),
+    );
+    let chore = crate::test_support::create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    if let Some(driver) = driver {
+        server_state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET driver = ?2 WHERE id = ?1",
+                rusqlite::params![chore.id, driver],
+            )
+            .unwrap();
+    }
+    server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap()
+        .id
+}
+
 mod app_channel;
 mod context;
 mod engine_health_report;
 mod open_document;
 mod pr_status;
+mod probe_delivery;
 mod proposals;
 mod session_sink_queue;
 mod t02;

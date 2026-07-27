@@ -73,21 +73,28 @@ impl WorkerActivity {
         matches!(self, WorkerActivity::Terminated | WorkerActivity::Errored)
     }
 
-    /// True iff the pane's foreground worker is in a posture where
-    /// typed / `SendToPane` input is expected to be consumed as agent
-    /// (or interactive-shell) input rather than buffered against a
-    /// non-consuming process.
+    /// True iff the pane's foreground worker is **parked at its prompt**:
+    /// [`Self::Idle`] (between turns) or [`Self::WaitingForInput`] (on a
+    /// permission prompt / human redirect). In those postures a typed /
+    /// `SendToPane` write becomes the worker's next prompt under any driver,
+    /// so this is the driver-independent floor for pane injection.
     ///
-    /// Only [`Self::Idle`] (between turns at the prompt) and
-    /// [`Self::WaitingForInput`] (parked on a permission / human
-    /// redirect) qualify. Mid-turn [`Self::Working`], pre-session
-    /// [`Self::Spawning`], and terminal states do **not**: injecting
-    /// there races the foreground process and — when that process
-    /// does not consume stdin (e.g. `codex exec`) — leaves bytes in
-    /// the tty input buffer that the interactive shell later
-    /// executes (see the ghostty-codex-pane-viability investigation,
-    /// Q2 Layer D). This is a property of live pane activity, not of
-    /// which agent driver owns the run.
+    /// This is **not** the whole injection decision, and callers must not use
+    /// it as one. Pre-session [`Self::Spawning`] and the terminal states are
+    /// never injectable. Mid-turn [`Self::Working`] depends on the driver:
+    /// an interactive-TUI driver (Claude Code) reads stdin continuously and
+    /// holds mid-turn input as the next prompt, whereas `codex exec` runs one
+    /// turn per process with stdin on `/dev/null`, so bytes written mid-turn
+    /// linger in the tty buffer and are executed by the interactive shell
+    /// after the process exits (ghostty-codex-pane-viability, Q2 Layer D).
+    ///
+    /// Treating that difference as a property of activity alone is what made
+    /// `probe --urgent` structurally undeliverable: the urgent path fires on
+    /// `PostToolUse`, where the activity is `Working` by construction, so a
+    /// parked-only predicate refuses every urgent probe on every driver. The
+    /// driver half of the decision is
+    /// `boss_engine_driver::AgentDriver::mid_turn_pane_input`; the engine
+    /// combines both in `PaneInputPosture`.
     pub fn accepts_typed_input(self) -> bool {
         matches!(self, WorkerActivity::Idle | WorkerActivity::WaitingForInput)
     }

@@ -668,9 +668,13 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
                 // in sequence — that's acceptable per the acceptance
                 // criteria.
                 //
-                // Mid-turn (`Working`) is special: `send_input_to_worker`
-                // refuses typed input for safety, but the notice must
-                // not be dropped. Re-queue as a non-urgent probe so
+                // A mid-turn worker is injectable when its driver buffers
+                // pane input (the notice lands in the composer and submits
+                // at the turn boundary). When there is no injectable posture
+                // — no live state, a pre-session/terminal worker, or a
+                // driver that does not read mid-turn stdin —
+                // `send_input_to_worker` refuses for safety, and the notice
+                // must not be dropped. Re-queue as a non-urgent probe so
                 // `dispatch_probe_on_stop` delivers it at the next
                 // Idle/Stop boundary (same durability as deferred
                 // urgent probes).

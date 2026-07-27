@@ -1077,13 +1077,13 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 /// byte offset) so `dispatch_probe_reply_on_stop` can emit the
 /// matching `FrontendEvent::ProbeReplied` when the next boundary lands.
 ///
-/// **Activity guard (fail closed):** same predicate as
-/// [`ServerState::inject_pane_text_verified`] /
-/// [`dispatch_probe_if_idle`]. After a production Stop fan-out the
-/// live activity is normally Idle / WaitingForInput, so the write
-/// proceeds. Missing live state or a non-accepting activity refuses
-/// the write and re-queues the probe — never fail-open into a
-/// non-consuming foreground process.
+/// **Posture guard (fail closed):** the shared
+/// [`ServerState::pane_input_posture_for_run`]. After a production Stop
+/// fan-out the live activity is normally Idle / WaitingForInput, so the
+/// write proceeds. Missing live state, a pre-session/terminal slot, or a
+/// mid-turn slot on a driver that does not read mid-turn stdin refuses the
+/// write and leaves the probe queued — never fail-open into a non-consuming
+/// foreground process.
 pub(super) async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -1109,16 +1109,18 @@ pub(super) async fn dispatch_probe_on_stop(
         }
         return;
     };
-    // Fail closed before pop: missing live state / non-accepting
-    // activity must not write bytes to the pane.
-    if !server_state.pane_accepts_typed_input(slot_id) {
+    // Fail closed before pop: no injectable posture must not write bytes
+    // to the pane. Captured once so the recorded delivery state below can
+    // tell a parked write from a mid-turn buffered one.
+    let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    if !posture.permits_write() {
         tracing::warn!(
             run_id,
             slot_id,
             activity = server_state
                 .pane_typed_input_activity(slot_id)
                 .map(boss_protocol::WorkerActivity::as_str),
-            "probe on Stop refused: worker not accepting typed input; leaving probe queued",
+            "probe on Stop refused: no injectable posture for this worker/driver; leaving probe queued",
         );
         return;
     }
@@ -1143,13 +1145,21 @@ pub(super) async fn dispatch_probe_on_stop(
                 probe_id = %probe.probe_id,
                 "probe injected into pane",
             );
-            // The Stop boundary is the arrival point this delivery
-            // mechanism has always trusted (unlike the urgent
-            // mid-turn path), so a successful SendToPane here is
-            // treated as consumed rather than left pending
-            // confirmation. Activity guard already confirmed the
-            // pane accepts typed input.
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
+            // A parked worker takes the write as its next prompt, so the
+            // Stop boundary is an arrival point this mechanism trusts
+            // without further confirmation. A mid-turn buffering driver is
+            // different: the text sits in the composer until the turn ends,
+            // and nothing here observed it being submitted — record
+            // `Buffered` rather than claiming `Consumed`, matching
+            // `dispatch_urgent_probe_on_post_tool_use`. In production the
+            // fan-out has already set `Idle` by this point, so the mid-turn
+            // case is a narrow race, but the honest state costs nothing.
+            let state = if posture.is_mid_turn() {
+                ProbeDeliveryState::Buffered
+            } else {
+                ProbeDeliveryState::Consumed
+            };
+            server_state.set_probe_lifecycle(&probe_id, state);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
@@ -1164,7 +1174,7 @@ pub(super) async fn dispatch_probe_on_stop(
             // the same probe id — callers waiting on the matching
             // `ProbeReplied` event must not see their id silently
             // reissued.
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -1184,15 +1194,24 @@ const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// call has already completed at this point, so no in-flight Bash is
 /// cancelled.
 ///
-/// **Activity short-circuit (before pop):** mirrors
-/// [`dispatch_probe_if_idle`]. Production ordering is load-bearing:
-/// `dispatch_live_worker_state` applies `PostToolUse` first and forces
-/// activity to `Working`, so a mid-turn pane inject is *expected* to
-/// defer. We therefore leave the probe queued without popping when
-/// the slot is not accepting typed input, and treat that deferral as
-/// normal (no `ProbeDeliveryEscalated` per tool — multi-tool turns
-/// would otherwise spam once per `PostToolUse`). Delivery happens at
-/// the next Stop boundary via [`dispatch_probe_on_stop`].
+/// **Posture short-circuit (before pop):** the ordering in
+/// [`dispatch_worker_event_fanout`] is load-bearing. `dispatch_live_worker_state`
+/// runs first and applies `PostToolUse`, which sets the activity to `Working`
+/// unconditionally — so at *this* boundary the activity is `Working` by
+/// construction, and a parked-only guard would be false here on every driver,
+/// refusing every urgent probe. The guard must therefore reason about
+/// mid-turn input, not about being parked.
+///
+/// The guard is now [`ServerState::pane_input_posture_for_run`], which admits
+/// mid-turn writes when — and only when — the run's driver declares
+/// [`crate::driver::MidTurnPaneInput::Buffers`]. For Claude Code that is the
+/// ordinary case, so an urgent probe delivers at the next tool boundary as
+/// documented. For a driver whose foreground process does not read mid-turn
+/// stdin (`codex exec`) the write is still refused, preserving the tty-leak
+/// protection; the probe stays queued (no pop) for the next Stop boundary via
+/// [`dispatch_probe_on_stop`], and that deferral is treated as normal — no
+/// `ProbeDeliveryEscalated` per tool, since multi-tool turns would otherwise
+/// spam once per `PostToolUse`.
 ///
 /// When the guard passes, the write is not trusted just because
 /// `SendToPane` returned Ok: confirmation still requires a matching
@@ -1200,18 +1219,25 @@ const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// transport/app-level failure the probe is pushed back to the front
 /// so a later retry keeps the same id.
 ///
-/// On an *unconfirmed* write, the corrected understanding of the
-/// probe-6 incident (2026-07-13) is that the text likely still reached
-/// the worker through a channel this engine can't yet observe — the
-/// defect was unverifiable delivery, not lost delivery. So this does
-/// **not** re-queue the probe for redelivery at the next `Stop`
-/// boundary: doing so would hand the worker the same instruction
-/// twice in exactly the scenario the incident actually hit. Instead it
-/// records the probe as `Unconfirmed` in the lifecycle table, still
-/// tracks it as in-flight (so a reply that does arrive is still
-/// captured), and pushes `ProbeDeliveryEscalated` so anyone watching
-/// the probe topic knows delivery is unverified and can choose to
-/// re-issue it deliberately.
+/// A mid-turn injection that has not produced a `UserPromptSubmit` inside the
+/// verification window comes back as [`PaneInjectOutcome::Buffered`], which is
+/// the *expected* result: the agent cannot submit the text until it finishes
+/// the turn it is in. That records `ProbeDeliveryState::Buffered` and needs
+/// no escalation — the worker's reply at the next turn boundary is the
+/// end-to-end confirmation, and `dispatch_probe_reply_on_stop` already
+/// captures it.
+///
+/// On a genuinely *unconfirmed* write (parked worker, nothing observed), the
+/// corrected understanding of the probe-6 incident (2026-07-13) is that the
+/// text likely still reached the worker through a channel this engine can't
+/// yet observe — the defect was unverifiable delivery, not lost delivery. So
+/// this does **not** re-queue the probe for redelivery at the next `Stop`
+/// boundary: doing so would hand the worker the same instruction twice in
+/// exactly the scenario the incident actually hit. Instead it records the
+/// probe as `Unconfirmed` in the lifecycle table, still tracks it as in-flight
+/// (so a reply that does arrive is still captured), and pushes
+/// `ProbeDeliveryEscalated` so anyone watching the probe topic knows delivery
+/// is unverified and can choose to re-issue it deliberately.
 ///
 /// Non-urgent probes are ignored here; they wait for `dispatch_probe_on_stop`.
 pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
@@ -1247,19 +1273,21 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
         return;
     };
 
-    // Short-circuit *before* pop when the pane is not accepting typed
-    // input (mirror `dispatch_probe_if_idle`). Production fan-out
-    // applies PostToolUse → Working first, so this is the common path
-    // for mid-turn urgent probes: defer silently to Stop, do not
-    // escalate once per tool call.
-    if !server_state.pane_accepts_typed_input(slot_id) {
+    // Short-circuit *before* pop when there is no injectable posture for
+    // this (activity, driver) pair. The fan-out has already applied
+    // PostToolUse → Working, so this is `MidTurnBuffered` for an
+    // interactive-TUI driver and `Refused` for one that does not read
+    // mid-turn stdin. A refusal defers silently to Stop rather than
+    // escalating once per tool call.
+    let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    if !posture.permits_write() {
         tracing::debug!(
             run_id,
             slot_id,
             activity = server_state
                 .pane_typed_input_activity(slot_id)
                 .map(boss_protocol::WorkerActivity::as_str),
-            "urgent probe deferred: worker not accepting typed input; remains queued for Stop",
+            "urgent probe deferred: no injectable posture for this worker/driver; remains queued for Stop",
         );
         return;
     }
@@ -1289,15 +1317,18 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
     // Lifecycle `Injected` only after the activity guard has passed
     // (and we are about to write). A pre-pop short-circuit above
     // leaves the probe at `Queued`.
-    server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Injected);
+    server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Injected);
     match server_state
         .inject_pane_text_verified(
-            run_id,
-            slot_id,
-            marked_text,
-            transcript_path.as_deref(),
-            offset_bytes,
-            URGENT_PROBE_VERIFY_TIMEOUT,
+            PaneInjectRequest::builder()
+                .run_id(run_id)
+                .slot_id(slot_id)
+                .text(marked_text)
+                .maybe_transcript_path(transcript_path.as_deref())
+                .offset_bytes(offset_bytes)
+                .verify_timeout(URGENT_PROBE_VERIFY_TIMEOUT)
+                .posture(posture)
+                .build(),
         )
         .await
     {
@@ -1308,7 +1339,22 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 probe_id = %probe.probe_id,
                 "urgent probe injected at tool boundary (delivery confirmed)",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+            server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
+        }
+        PaneInjectOutcome::Buffered => {
+            // The normal successful shape of a mid-turn urgent delivery: the
+            // text is in the agent's composer and it submits it when the
+            // current turn ends. No escalation — the reply at the next turn
+            // boundary is the confirmation.
+            tracing::info!(
+                run_id,
+                slot_id,
+                probe_id = %probe.probe_id,
+                "urgent probe injected at tool boundary and buffered by the mid-turn agent; \
+                 it will be submitted as the worker's next prompt",
+            );
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Buffered);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         PaneInjectOutcome::Unconfirmed => {
@@ -1322,7 +1368,15 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                  the text likely still reached the worker) — recording Unconfirmed and leaving \
                  redelivery to whoever is watching the probe topic",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Unconfirmed);
+            server_state.set_probe_lifecycle_detail(
+                &probe_id,
+                ProbeDeliveryState::Unconfirmed,
+                Some(format!(
+                    "pane write succeeded but no UserPromptSubmit hook or transcript match appeared within \
+                     {URGENT_PROBE_VERIFY_TIMEOUT:?}; not auto-redelivered (redelivery risks a duplicate \
+                     instruction) — re-issue deliberately if the worker shows no sign of it"
+                )),
+            );
             // Still track as in-flight: the text may well have been
             // consumed even though we couldn't confirm it, so a reply
             // at the next Stop boundary should still be captured
@@ -1351,7 +1405,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 activity = activity.map(boss_protocol::WorkerActivity::as_str),
                 "urgent probe refused after pop (activity race); re-queuing for Stop boundary",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
         PaneInjectOutcome::SendFailed(failure) => {
@@ -1362,7 +1416,7 @@ pub(super) async fn dispatch_urgent_probe_on_post_tool_use(
                 probe_id = %probe.probe_id,
                 "urgent probe injection failed; pushing back onto queue",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -1399,9 +1453,12 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
         tracing::debug!(run_id, "probe-if-idle: no slot mapping; probe waits for Stop");
         return;
     };
-    // Same activity predicate as `inject_pane_text_verified`: only
-    // Idle / WaitingForInput accept typed input. Working / Spawning /
-    // terminal / missing live state leave the probe queued for Stop.
+    // Deliberately the *parked-only* predicate, not the full
+    // `pane_input_posture_for_run`: this path exists solely to cover the
+    // worker that will never produce another boundary on its own. A working
+    // worker WILL produce boundaries, and a non-urgent probe's documented
+    // contract is to arrive at the next one — injecting mid-turn here would
+    // silently upgrade every plain `bossctl probe` into an urgent one.
     if !server_state.pane_accepts_typed_input(slot_id) {
         tracing::debug!(
             run_id,
@@ -1434,7 +1491,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
             // Parked (Idle/WaitingForInput) is a reliable delivery
             // boundary just like Stop, so a successful SendToPane
             // here is treated as consumed.
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Consumed);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
@@ -1445,7 +1502,7 @@ pub(super) async fn dispatch_probe_if_idle(server_state: &Arc<ServerState>, run_
                 probe_id = %probe.probe_id,
                 "probe immediate-dispatch failed; pushing back onto queue",
             );
-            server_state.set_probe_lifecycle(&probe_id, ProbeLifecycleState::Queued);
+            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
             server_state.requeue_probe_front(run_id.to_owned(), probe);
         }
     }
@@ -1515,10 +1572,15 @@ pub(super) async fn dispatch_probe_reply_on_stop(
     // Guard against extracting a reply for a probe id whose lifecycle
     // was never actually advanced past being queued (e.g. a stale
     // in-flight entry surviving some other bug) — only a probe that
-    // was actually written into the pane (Injected/Consumed/
+    // was actually written into the pane (Injected/Consumed/Buffered/
     // Unconfirmed) can plausibly have produced a reply.
     match server_state.probe_lifecycle_state(&in_flight.probe_id) {
-        Some(ProbeLifecycleState::Injected | ProbeLifecycleState::Consumed | ProbeLifecycleState::Unconfirmed) => {}
+        Some(
+            ProbeDeliveryState::Injected
+            | ProbeDeliveryState::Consumed
+            | ProbeDeliveryState::Buffered
+            | ProbeDeliveryState::Unconfirmed,
+        ) => {}
         other => {
             tracing::warn!(
                 run_id,
@@ -1559,7 +1621,7 @@ pub(super) async fn dispatch_probe_reply_on_stop(
             return;
         }
     };
-    server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeLifecycleState::Replied);
+    server_state.set_probe_lifecycle(&in_flight.probe_id, ProbeDeliveryState::Replied);
     let envelope = FrontendEventEnvelope::push(FrontendEvent::ProbeReplied {
         run_id: run_id.to_owned(),
         probe_id: in_flight.probe_id.clone(),

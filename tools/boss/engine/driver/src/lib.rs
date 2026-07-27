@@ -632,6 +632,45 @@ pub enum WorkerErrorClass {
     Indeterminate,
 }
 
+/// What a driver's foreground process does with pty bytes that arrive while
+/// it is **mid-turn** (`WorkerActivity::Working`) — the property that decides
+/// whether `probe --urgent` can honour its documented "inject at the next
+/// tool-call boundary" promise.
+///
+/// This is deliberately a *driver* property, not a pane-activity one. The
+/// original typed-input guard (see `boss_protocol::WorkerActivity::
+/// accepts_typed_input`) refused every mid-turn write on the grounds that
+/// injecting there is unsafe. The unsafety it was protecting against is real
+/// but specific: `codex exec` runs one turn per process with stdin on
+/// `/dev/null`, so bytes written mid-turn are never read by the agent, survive
+/// in the tty input buffer, and are then executed by the interactive shell
+/// after the agent exits (ghostty-codex-pane-viability, Q2 Layer D). Applying
+/// that blanket refusal to every driver made `--urgent` structurally
+/// undeliverable for interactive-TUI drivers too, because the activity is
+/// `Working` by construction at exactly the `PostToolUse` boundary the urgent
+/// path fires on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidTurnPaneInput {
+    /// The foreground process reads stdin continuously and holds mid-turn
+    /// input as the next prompt — the same thing a human gets by typing into
+    /// the pane while the agent is working. Mid-turn injection is safe: the
+    /// bytes are consumed by the agent, not left in the tty for the shell.
+    Buffers,
+    /// The foreground process does not consume stdin mid-turn (or it is not
+    /// established that it does). Mid-turn injection must be refused — the
+    /// bytes would linger in the tty and be executed by the shell once the
+    /// process exits. The safe default for any driver that has not proven
+    /// otherwise.
+    Rejects,
+}
+
+impl MidTurnPaneInput {
+    /// True when mid-turn pane writes are safe for this driver.
+    pub fn buffers(self) -> bool {
+        matches!(self, Self::Buffers)
+    }
+}
+
 /// Fidelity tier of the [`WorkerEvent`] stream a driver's
 /// [`Capability::ProgressObservation`] produces (design §Capabilities).
 ///
@@ -1573,6 +1612,19 @@ pub trait AgentDriver: Send + Sync {
     /// transient-recovery decisions.
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass;
 
+    /// What this driver's foreground process does with pty bytes that arrive
+    /// while it is **mid-turn** — the `probe --urgent` / `SendToPane`
+    /// injection point.
+    ///
+    /// Defaults to [`MidTurnPaneInput::Rejects`], the safe answer: a driver
+    /// that has not established what its foreground process does with
+    /// mid-turn stdin must not have bytes written into it (see the type docs
+    /// for the tty-leak this prevents). Override only with evidence about the
+    /// actual process.
+    fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
+        MidTurnPaneInput::Rejects
+    }
+
     // ── StructuredOutput capability ─────────────────────────────────────────
 
     /// Primary-channel wiring for [`Capability::StructuredOutput`]: turn a
@@ -1797,6 +1849,19 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The trait default must be the *safe* answer. A new driver that says
+    /// nothing about mid-turn stdin gets `Rejects`, so the engine never writes
+    /// into a pane whose foreground process might leave the bytes in the tty
+    /// for the interactive shell to execute. Buffering has to be claimed
+    /// deliberately, with evidence about the process.
+    #[test]
+    fn mid_turn_pane_input_defaults_to_rejects() {
+        let stub = test_support::StubDriver::new(test_support::stub_descriptor(), CapabilitySet::new([]));
+        assert_eq!(stub.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
+        assert!(!MidTurnPaneInput::Rejects.buffers());
+        assert!(MidTurnPaneInput::Buffers.buffers());
+    }
 
     #[test]
     fn required_strict_capabilities_refuse_absent_driver() {

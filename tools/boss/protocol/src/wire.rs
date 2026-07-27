@@ -16,12 +16,12 @@ use crate::types::{
     CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
     DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, EditorialAction,
     EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    PrBodyView, PrStatusView, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
-    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
-    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
-    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project,
+    ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
+    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem,
+    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
+    WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -1493,13 +1493,25 @@ pub enum FrontendRequest {
     /// current tool call finishes (so no in-flight Bash is cancelled)
     /// but before the worker starts its next tool call. Urgent probes
     /// are pushed to the front of the per-run queue so they always
-    /// land before any queued non-urgent probes. Returns immediately
-    /// with a `ProbeQueued` event carrying the engine-minted `probe_id`;
-    /// the worker's reply is surfaced asynchronously via
+    /// land before any queued non-urgent probes.
+    ///
+    /// The engine evaluates deliverability **before** accepting, and answers
+    /// with exactly one of two events. On acceptance,
+    /// [`FrontendEvent::ProbeQueued`] carries the engine-minted `probe_id`
+    /// and the [`crate::ProbeDeliveryExpectation`] the engine believes it can
+    /// keep. When the probe cannot be delivered at all — no live pane for the
+    /// run, a terminal worker, or `urgent` against a driver whose foreground
+    /// process does not accept mid-turn input — it answers
+    /// [`FrontendEvent::ProbeRefused`] and queues nothing. Accepting a probe
+    /// that will never arrive is the failure mode this split exists to
+    /// prevent: the caller could not distinguish it from "arriving shortly".
+    ///
+    /// The worker's reply is surfaced asynchronously via
     /// [`FrontendEvent::ProbeReplied`] on the [`probe_topic`] for
-    /// `run_id`. Urgent probes are prefixed with `[coordinator-nudge]`
-    /// in the transcript so the worker and human readers can identify
-    /// coordinator-injected text.
+    /// `run_id`, and delivery progress can be polled with
+    /// [`FrontendRequest::ProbeStatus`]. Urgent probes are prefixed with
+    /// `[coordinator-nudge]` in the transcript so the worker and human
+    /// readers can identify coordinator-injected text.
     ProbeRun {
         run_id: String,
         text: String,
@@ -1510,6 +1522,18 @@ pub enum FrontendRequest {
         /// for the original queue-for-Stop behaviour.
         #[serde(default)]
         urgent: bool,
+    },
+
+    /// Boss-tier RPC: read the current delivery state of one probe, by the
+    /// `probe_id` a prior [`FrontendRequest::ProbeRun`] returned.
+    ///
+    /// Answers [`FrontendEvent::ProbeStatusResult`], or
+    /// [`FrontendEvent::WorkError`] when the id is unknown to this engine
+    /// process (probe ids are minted per process and are not persisted). This
+    /// is the queryable half of honest probe reporting: acceptance says where
+    /// the engine intends to deliver, this says how far it actually got.
+    ProbeStatus {
+        probe_id: String,
     },
 
     /// Boss-only RPC: mark the execution backing `run_id` as the
