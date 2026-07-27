@@ -20,8 +20,9 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AutomationTrigger, DesignDocEntry, DesignDocTree, EffortLevel, ExecutionKind, ExecutionStatus,
-    ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind, TaskStatus, WorkerTierDenialReason,
+    AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, EffortLevel,
+    ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind,
+    TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -243,6 +244,20 @@ fn automation() -> Automation {
             cron: "0 9 * * *".into(),
             timezone: "America/Los_Angeles".into(),
         })
+        .updated_at("1747000000")
+        .build()
+}
+
+fn decision() -> Decision {
+    Decision::builder()
+        .id("dec_1")
+        .product_id("prod_1")
+        .body("We considered and declined this approach.")
+        .created_at("1747000000")
+        .created_by("human")
+        .kind(DecisionKind::Wontfix)
+        .status(DecisionStatus::Active)
+        .title("No checkleft all-gating for now")
         .updated_at("1747000000")
         .build()
 }
@@ -1669,6 +1684,30 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "automation_state_result",
         },
+        // --- Product decision records ---
+        TagCase {
+            label: "DecisionCreated",
+            event: FrontendEvent::DecisionCreated { decision: decision() },
+            expected_tag: "decision_created",
+        },
+        TagCase {
+            label: "DecisionResult",
+            event: FrontendEvent::DecisionResult { decision: decision() },
+            expected_tag: "decision_result",
+        },
+        TagCase {
+            label: "DecisionsList",
+            event: FrontendEvent::DecisionsList {
+                product_id: "prod_1".into(),
+                decisions: vec![],
+            },
+            expected_tag: "decisions_list",
+        },
+        TagCase {
+            label: "DecisionUpdated",
+            event: FrontendEvent::DecisionUpdated { decision: decision() },
+            expected_tag: "decision_updated",
+        },
         TagCase {
             label: "DispatchConcurrencyResult",
             event: FrontendEvent::DispatchConcurrencyResult {
@@ -1859,7 +1898,11 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::AutomationDedupSuppressionsList { .. }
         | FrontendEvent::AutomationTasksList { .. }
         | FrontendEvent::AutomationRunEnqueued { .. }
-        | FrontendEvent::AutomationStateResult { .. } => {}
+        | FrontendEvent::AutomationStateResult { .. }
+        | FrontendEvent::DecisionCreated { .. }
+        | FrontendEvent::DecisionResult { .. }
+        | FrontendEvent::DecisionsList { .. }
+        | FrontendEvent::DecisionUpdated { .. } => {}
     }
 }
 

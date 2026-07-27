@@ -12,14 +12,14 @@ use crate::types::{
     AutomationDedupSuppression, AutomationPatch, AutomationRun, CiBudgetSnapshot, CiRemediation, CommentAnchor,
     CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport, ConflictResolution,
     CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
-    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyFilter,
-    DesignDocContent, DesignDocTreeState, EditorialAction, EngineAttemptListEntry, FollowupMemberOverride,
-    GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch,
-    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
+    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
+    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, EditorialAction,
+    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
+    PrBodyView, PrStatusView, PrWorkItemMatch, Product, Project, ProposalKind, ProposalState, ProposalSubmissionError,
+    RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput,
+    ReviseDocOutcome, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, Task,
+    TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
     WorkerTierDenial,
 };
@@ -471,6 +471,14 @@ pub enum FrontendRequest {
         input: CreateChoreInput,
     },
 
+    /// Record a product-scoped decision (`wontfix` / `decided`).
+    /// Replies with [`FrontendEvent::DecisionCreated`].
+    /// Design: retire-the-coordinator-s-memory T-B2-decision.
+    CreateDecision {
+        #[serde(flatten)]
+        input: CreateDecisionInput,
+    },
+
     CreateExecution {
         #[serde(flatten)]
         input: CreateExecutionInput,
@@ -708,6 +716,12 @@ pub enum FrontendRequest {
     /// [`FrontendEvent::WorkError`] when the id is unknown.
     GetConflictResolution {
         attempt_id: String,
+    },
+
+    /// Fetch a product decision by canonical id. Replies with
+    /// [`FrontendEvent::DecisionResult`] or [`FrontendEvent::WorkError`].
+    GetDecision {
+        id: String,
     },
 
     /// Query the current interactive-pool concurrency cap without changing
@@ -1049,6 +1063,16 @@ pub enum FrontendRequest {
         work_item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         limit: Option<u32>,
+    },
+
+    /// List product-scoped decision records, newest first. By default
+    /// only `active` rows are returned; set `include_inactive` to also
+    /// include `superseded` / `revoked`. Replies with
+    /// [`FrontendEvent::DecisionsList`].
+    ListDecisions {
+        product_id: String,
+        #[serde(default)]
+        include_inactive: bool,
     },
 
     /// List every open `deferred_scope` item across a product, paired with
@@ -1718,6 +1742,13 @@ pub enum FrontendRequest {
         id: String,
     },
 
+    /// Mark an active decision as `revoked` (no longer in force, no
+    /// successor). Idempotent when already revoked. Replies with
+    /// [`FrontendEvent::DecisionUpdated`].
+    RevokeDecision {
+        id: String,
+    },
+
     /// Enqueue an out-of-schedule triage fire for an automation.
     /// `force = true` bypasses the open-task cap. Replies with
     /// [`FrontendEvent::AutomationRunEnqueued`] when the fire was accepted,
@@ -2011,6 +2042,15 @@ pub enum FrontendRequest {
 
     Subscribe {
         topics: Vec<String>,
+    },
+
+    /// Mark an active decision as `superseded` by a successor decision.
+    /// Both ids must be on the same product; the successor must be
+    /// `active`. Replies with [`FrontendEvent::DecisionUpdated`] carrying
+    /// the superseded (predecessor) row.
+    SupersedeDecision {
+        id: String,
+        successor_id: String,
     },
 
     /// Trigger an immediate reconcile pass for a single product's external

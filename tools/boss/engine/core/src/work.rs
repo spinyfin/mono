@@ -171,19 +171,19 @@ pub use boss_protocol::{
     CiRemediation, CommentAnchor, CommentResolution, CommentThreadEntry, CommentWithThread, CommentsBannerState,
     ConflictClassCount, ConflictFileFrequency, ConflictFilePairFrequency, ConflictHotspotReport, ConflictResolution,
     CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput,
-    CreateRevisionInput, CreateRunInput, CreateTaskInput, DeferredScopeAttention, DependencyDirection, DependencyEdge,
-    DependencyFilter, DocOwner, DocOwnerPrLifecycle, EditorialAction, EditorialRules, EffortLevel,
-    EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput,
-    FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN,
-    ListDependenciesInput, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ProjectStatus,
-    RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput,
-    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind,
-    ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
-    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
-    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
-    is_known_created_via,
+    CreateDecisionInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
+    CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DecisionKind, DecisionStatus,
+    DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner, DocOwnerPrLifecycle,
+    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult,
+    ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION,
+    LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project,
+    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
+    ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
+    ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput, StatusActor,
+    THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+    Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
+    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun,
+    WorkTree, is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -428,6 +428,7 @@ mod comment_thread_entries;
 mod comments;
 mod conflict_res;
 mod create_entities;
+mod decisions;
 mod dep_helpers;
 mod design_postmortem;
 mod dispatch;

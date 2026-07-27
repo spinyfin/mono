@@ -59,6 +59,7 @@ mod ci_remediation;
 mod comments;
 mod conflict_resolution;
 mod context;
+mod decisions;
 mod dependencies;
 mod design_docs;
 mod effort;
@@ -1802,6 +1803,7 @@ async fn handle_frontend_connection(
                 automations::handle_create_automation_task(ctx, r).await
             }
             r @ FrontendRequest::CreateChore { .. } => work_items::handle_create_chore(ctx, r).await,
+            r @ FrontendRequest::CreateDecision { .. } => decisions::handle_create_decision(ctx, r).await,
             r @ FrontendRequest::CreateExecution { .. } => executions::handle_create_execution(ctx, r).await,
             r @ FrontendRequest::CreateInvestigation { .. } => work_items::handle_create_investigation(ctx, r).await,
             r @ FrontendRequest::CreateManyChores { .. } => work_items::handle_create_many_chores(ctx, r).await,
@@ -1841,6 +1843,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetDecision { .. } => decisions::handle_get_decision(ctx, r).await,
             r @ FrontendRequest::GetDispatchConcurrency => engine_meta::handle_get_dispatch_concurrency(ctx, r).await,
             r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
             r @ FrontendRequest::GetEngineHealth => engine_meta::handle_get_engine_health(ctx, r).await,
@@ -1887,6 +1890,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListConflictResolutions { .. } => {
                 conflict_resolution::handle_list_conflict_resolutions(ctx, r).await
             }
+            r @ FrontendRequest::ListDecisions { .. } => decisions::handle_list_decisions(ctx, r).await,
             r @ FrontendRequest::ListDeferredScopeAttentions { .. } => {
                 attentions::handle_list_deferred_scope_attentions(ctx, r).await
             }
@@ -1968,6 +1972,7 @@ async fn handle_frontend_connection(
                 conflict_resolution::handle_retry_conflict_resolution(ctx, r).await
             }
             r @ FrontendRequest::RevealWorkItem { .. } => work_items::handle_reveal_work_item(ctx, r).await,
+            r @ FrontendRequest::RevokeDecision { .. } => decisions::handle_revoke_decision(ctx, r).await,
             r @ FrontendRequest::RunAutomation { .. } => automations::handle_run_automation(ctx, r).await,
             r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
             r @ FrontendRequest::SetAutomationPaused { .. } => engine_meta::handle_set_automation_paused(ctx, r).await,
@@ -2006,6 +2011,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
             r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
+            r @ FrontendRequest::SupersedeDecision { .. } => decisions::handle_supersede_decision(ctx, r).await,
             r @ FrontendRequest::SyncProductExternalTracker { .. } => {
                 external_tracker::handle_sync_product_external_tracker(ctx, r).await
             }

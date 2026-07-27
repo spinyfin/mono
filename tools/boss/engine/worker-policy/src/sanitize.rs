@@ -279,6 +279,10 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::AutomationTasksList { .. }
         | FrontendEvent::AutomationRunEnqueued { .. }
         | FrontendEvent::RunHeld { .. }
-        | FrontendEvent::RunHoldReleased { .. }) => passthrough,
+        | FrontendEvent::RunHoldReleased { .. }
+        | FrontendEvent::DecisionCreated { .. }
+        | FrontendEvent::DecisionResult { .. }
+        | FrontendEvent::DecisionsList { .. }
+        | FrontendEvent::DecisionUpdated { .. }) => passthrough,
     }
 }
