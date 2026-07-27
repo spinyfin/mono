@@ -24,6 +24,7 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     integrity-bazel.sh        # mono-integrity: full bazel build + test
     integrity-checkleft.sh    # mono-integrity: checkleft check
   README.md             # this file
+  linux-agents-runbook.md # Linux bazel-any agent host config: sandbox userns requirement, restart procedure, maintenance
 ```
 
 ## Pipeline shape
@@ -55,6 +56,8 @@ Runs the `CHECKS.yaml` checks via `checkleft` (or the equivalent runner). Scoped
 ## Agents and queue
 
 Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in `pipeline.yml`), a heterogeneous fleet mixing personal Macs and Linux cloud agents — see "Pushing from CI" below for why that matters. `mac-app-build` and `boss-release` pin to `macos-arm64` (`${BUILDKITE_MACOS_QUEUE:-macos-arm64}`) since they need a real Mac toolchain. Each step's `ci-env.sh` / inline setup handles toolchain provisioning (rust, bazel, pnpm) on whatever agent it lands on.
+
+For the Linux `bazel-any` hosts specifically — host inventory, the unprivileged-user-namespace requirement `linux-sandbox` depends on, the Bazel-server-restart procedure, and safe maintenance steps — see [`linux-agents-runbook.md`](linux-agents-runbook.md).
 
 ## Pushing from CI (queue heterogeneity)
 
