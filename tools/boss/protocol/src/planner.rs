@@ -125,6 +125,13 @@ pub struct ProposedTask {
     pub effort: EffortLevel,
     /// Soft ordering hint — not a hard dependency gate (edges are).
     pub ordinal: i64,
+    /// When `true`, the Materializer files the row with `tasks.deferred = 1`
+    /// so automatic dispatch (including the dependency auto-unblock cascade)
+    /// will not mint an execution. Defaults to `false` for back-compat with
+    /// proposals that predate this field.
+    #[serde(default)]
+    #[builder(default)]
+    pub deferred: bool,
 }
 
 /// A directed dependency edge between two proposed tasks, expressed by handle.
@@ -262,7 +269,7 @@ pub fn planner_output_schema() -> Value {
                 "description": "Proposed implementation tasks extracted from the design doc.",
                 "items": {
                     "type": "object",
-                    "required": ["handle", "name", "description", "kind", "effort", "ordinal"],
+                    "required": ["handle", "name", "description", "kind", "effort", "ordinal", "deferred"],
                     "additionalProperties": false,
                     "properties": {
                         "handle": {
@@ -290,6 +297,10 @@ pub fn planner_output_schema() -> Value {
                         "ordinal": {
                             "type": "integer",
                             "description": "Soft ordering hint; not a hard dependency gate."
+                        },
+                        "deferred": {
+                            "type": "boolean",
+                            "description": "True when this task is future / not a v1 blocker. Files tasks.deferred so automatic dispatch (including the dependency cascade) will not mint an execution until an operator explicitly approves it."
                         }
                     }
                 }
@@ -382,6 +393,7 @@ mod tests {
                 kind: TaskKind::ProjectTask,
                 effort: EffortLevel::Small,
                 ordinal: 1,
+                deferred: false,
             }],
             edges: vec![],
             merge_order_hints: vec![],
@@ -499,6 +511,7 @@ mod tests {
                 kind: TaskKind::ProjectTask,
                 effort: EffortLevel::Small,
                 ordinal: 1,
+                deferred: false,
             }],
             edges: vec![ProposedEdge {
                 dependent: "impl".into(),
@@ -678,7 +691,8 @@ mod tests {
                 "description": "Add the schema types.",
                 "kind": "project_task",
                 "effort": "small",
-                "ordinal": 1
+                "ordinal": 1,
+                "deferred": false
             }],
             "edges": [{ "dependent": "impl", "prerequisite": "schema" }],
             "merge_order_hints": [{ "task_a": "schema", "task_b": "impl", "reason": "shared config module" }],
@@ -690,6 +704,7 @@ mod tests {
         let output: PlannerOutput = serde_json::from_value(doc).expect("schema-conformant document deserializes");
         assert_eq!(output.tasks[0].kind, TaskKind::ProjectTask);
         assert_eq!(output.tasks[0].effort, EffortLevel::Small);
+        assert!(!output.tasks[0].deferred);
         assert_eq!(output.edges[0].prerequisite, "schema");
         assert_eq!(output.merge_order_hints[0].task_a, "schema");
         assert_eq!(output.confidence, Confidence::High);

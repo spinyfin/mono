@@ -244,6 +244,11 @@ impl Materializer {
 /// `effort_matched_rule` / `effort_reasons` columns and strips it from the
 /// stored description so workers never see the audit boilerplate.
 fn insert_proposed_task(conn: &Connection, product_id: &str, project_id: &str, task: &ProposedTask) -> Result<String> {
+    // Prefer the structured flag. Fall back to a residual prose `[deferred]`
+    // marker in name/description so stale model output (from before the
+    // boolean existed, or a model that still emits the old convention)
+    // cannot re-introduce auto-dispatchable "deferred" rows.
+    let deferred = task.deferred || carries_deferred_marker(&task.name) || carries_deferred_marker(&task.description);
     let created = match task.kind {
         TaskKind::Investigation => insert_investigation_in_tx(
             conn,
@@ -254,6 +259,7 @@ fn insert_proposed_task(conn: &Connection, product_id: &str, project_id: &str, t
                 .description(task.description.clone())
                 .effort_level(task.effort)
                 .autostart(false)
+                .deferred(deferred)
                 .force_duplicate(true)
                 .created_via(CREATED_VIA_ENGINE_AUTO)
                 .build(),
@@ -269,12 +275,21 @@ fn insert_proposed_task(conn: &Connection, product_id: &str, project_id: &str, t
                 .description(task.description.clone())
                 .effort_level(task.effort)
                 .autostart(false)
+                .deferred(deferred)
                 .force_duplicate(true)
                 .created_via(CREATED_VIA_ENGINE_AUTO)
                 .build(),
         )?,
     };
     Ok(created.id)
+}
+
+/// Residual prose-marker fallback for pre-boolean planner output. Matches the
+/// old prompt convention (`[deferred]` prefix on name / marker line in
+/// description). Case-sensitive on the bracketed token — that is what the
+/// model was taught to emit.
+fn carries_deferred_marker(text: &str) -> bool {
+    text.contains("[deferred]")
 }
 
 /// Build the `(trimmed name → id)` map of existing non-deleted tasks in the
@@ -425,6 +440,7 @@ mod tests {
             kind,
             effort: EffortLevel::Small,
             ordinal: 0,
+            deferred: false,
         }
     }
 
@@ -532,6 +548,145 @@ mod tests {
                 &[]
             ),
             1
+        );
+        // In-scope proposals leave the deferred column at 0.
+        for id in &res.created {
+            assert_eq!(task_scalar::<i64>(&db, id, "deferred"), 0);
+        }
+    }
+
+    // ---- apply: deferred classification ------------------------------------
+
+    /// A proposed task with `deferred: true` must land as `tasks.deferred = 1`
+    /// — the structured flag is the mechanism that parks cascade dispatch.
+    #[test]
+    fn proposed_task_with_deferred_true_materializes_deferred_row() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        let mut deferred_task = ptask("bulk-export", "Add bulk-export endpoint", TaskKind::ProjectTask);
+        deferred_task.deferred = true;
+        deferred_task.description = "Future / not a v1 blocker — needs the batch API.\n\n\
+[effort-classification] level=`small` matched-rule=`rule 5 (self-contained)` reasons=\"x\""
+            .to_owned();
+
+        let res = Materializer::apply(&db, &project_id, &run, &output(vec![deferred_task], vec![])).unwrap();
+        assert_eq!(res.created.len(), 1);
+        assert_eq!(
+            task_scalar::<i64>(&db, &res.created[0], "deferred"),
+            1,
+            "deferred: true on the proposal must file tasks.deferred = 1"
+        );
+        // Name stays clean — no prose marker required or applied.
+        assert_eq!(
+            task_scalar::<String>(&db, &res.created[0], "name"),
+            "Add bulk-export endpoint"
+        );
+    }
+
+    /// Residual prose-marker fallback: a proposal that still carries the old
+    /// `[deferred]` token (stale model output) must still park the row even
+    /// when the boolean is false/absent.
+    #[test]
+    fn prose_deferred_marker_still_parks_the_row() {
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        let mut stale = ptask("legacy", "[deferred] Legacy bulk export", TaskKind::ProjectTask);
+        // Boolean false — only the residual marker should trip the fallback.
+        stale.deferred = false;
+
+        let res = Materializer::apply(&db, &project_id, &run, &output(vec![stale], vec![])).unwrap();
+        assert_eq!(res.created.len(), 1);
+        assert_eq!(
+            task_scalar::<i64>(&db, &res.created[0], "deferred"),
+            1,
+            "name/description carrying [deferred] must still set deferred = 1"
+        );
+    }
+
+    /// End-to-end: a deferred proposed dependent behind an in-scope prereq is
+    /// unblocked to `todo` when the prereq lands, but the cascade must not
+    /// mint a ready execution for it.
+    #[test]
+    fn cascade_does_not_mint_execution_for_materialized_deferred_row() {
+        use boss_protocol::{TaskStatus, WorkItem, WorkItemPatch};
+
+        let db = open();
+        let (product_id, project_id) = product_and_project(&db);
+        let run = claim(&db, &product_id, &project_id);
+
+        let mut deferred_dep = ptask("export", "Bulk export", TaskKind::ProjectTask);
+        deferred_dep.deferred = true;
+        deferred_dep.description = "Deferred until batch API lands.\n\n\
+[effort-classification] level=`small` matched-rule=`rule 5 (self-contained)` reasons=\"x\""
+            .to_owned();
+
+        let res = Materializer::apply(
+            &db,
+            &project_id,
+            &run,
+            &output(
+                vec![ptask("schema", "Add schema", TaskKind::ProjectTask), deferred_dep],
+                vec![pedge("export", "schema")],
+            ),
+        )
+        .unwrap();
+        assert_eq!(res.created.len(), 2);
+        assert_eq!(res.edges_created, 1);
+
+        // Resolve which id is which by name.
+        let mut schema_id = None;
+        let mut export_id = None;
+        for id in &res.created {
+            let name = task_scalar::<String>(&db, id, "name");
+            if name == "Add schema" {
+                schema_id = Some(id.clone());
+            } else if name == "Bulk export" {
+                export_id = Some(id.clone());
+            }
+        }
+        let schema_id = schema_id.expect("schema task created");
+        let export_id = export_id.expect("export task created");
+        assert_eq!(task_scalar::<i64>(&db, &export_id, "deferred"), 1);
+
+        // Dependent starts blocked on the in-scope prereq.
+        let status = match db.get_work_item(&export_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
+            other => panic!("expected task, got {other:?}"),
+        };
+        assert_eq!(status, TaskStatus::Blocked);
+
+        // Land the prereq — cascade unblocks the deferred dependent but must
+        // not mint an execution for it.
+        db.update_work_item(
+            &schema_id,
+            WorkItemPatch {
+                status: Some("done".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let status = match db.get_work_item(&export_id).unwrap() {
+            WorkItem::Task(t) | WorkItem::Chore(t) => t.status,
+            other => panic!("expected task, got {other:?}"),
+        };
+        assert_eq!(
+            status,
+            TaskStatus::Todo,
+            "deferred dependent still unblocks when its prereq lands"
+        );
+        assert!(
+            db.list_executions(Some(&export_id)).unwrap().is_empty(),
+            "cascade must not mint an execution for a materialized deferred row"
+        );
+        assert_eq!(
+            task_scalar::<i64>(&db, &export_id, "deferred"),
+            1,
+            "classification survives the cascade"
         );
     }
 
