@@ -4,6 +4,7 @@
 //! Shared fixtures live in [`super::helpers`].
 
 use super::helpers::*;
+use crate::test_support::log_capture;
 
 /// Operators previously saw lease failures show up as a vague
 /// "no slot available" because the engine swallowed the cube
@@ -91,79 +92,6 @@ async fn lease_failure_logs_cube_stderr_at_error_before_recording_failure() {
              Captured lines:\n{:#?}",
         our_lines
     );
-}
-
-/// Shared per-process tracing capture used by tests that need
-/// to assert on log output. We can't install a per-test
-/// subscriber because cargo runs library tests in parallel
-/// threads of the same process and `set_global_default`
-/// rejects a second installer. Tests that opt in slice the
-/// shared buffer by execution_id (which is unique per test) to
-/// isolate their own events.
-mod log_capture {
-    use std::io;
-    use std::sync::{Arc, Mutex, OnceLock};
-
-    use tracing_subscriber::fmt::MakeWriter;
-
-    #[derive(Clone)]
-    pub(super) struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl SharedBuffer {
-        pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Vec<u8>> {
-            self.0.lock().expect("shared log buffer poisoned")
-        }
-    }
-
-    struct SharedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for SharedWriter {
-        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .expect("shared log buffer poisoned")
-                .extend_from_slice(data);
-            Ok(data.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct SharedMakeWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> MakeWriter<'a> for SharedMakeWriter {
-        type Writer = SharedWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            SharedWriter(self.0.clone())
-        }
-    }
-
-    pub(super) fn install() -> SharedBuffer {
-        static BUFFER: OnceLock<SharedBuffer> = OnceLock::new();
-        BUFFER
-            .get_or_init(|| {
-                let buffer = SharedBuffer(Arc::new(Mutex::new(Vec::new())));
-                let subscriber = tracing_subscriber::fmt()
-                    .with_writer(SharedMakeWriter(buffer.0.clone()))
-                    .with_ansi(false)
-                    .with_target(false)
-                    .with_max_level(tracing::Level::TRACE)
-                    .finish();
-                // Tolerate the "already set" race: another test
-                // binary or a stray init in the same process
-                // shouldn't sink the suite. The capture only
-                // works if our subscriber wins, but if it
-                // doesn't, the assertions below will fail
-                // loudly with a clear "no captured lines"
-                // message.
-                let _ = tracing::subscriber::set_global_default(subscriber);
-                buffer
-            })
-            .clone()
-    }
 }
 
 /// Regression for the silent-release dispatch failure: when the

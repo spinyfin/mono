@@ -227,7 +227,13 @@ impl LiveWorkerStateRegistry {
     /// indistinguishable from one that appeared and was cleared
     /// milliseconds later. `#[track_caller]` names the spawn path
     /// (production dispatch vs. the remote-worker lazy registration)
-    /// without threading a reason through every call site.
+    /// without threading a reason through every call site. The line is
+    /// emitted *after* the insert, as `release_slot` emits its own after
+    /// the removal, so the timestamps of the two halves are comparable.
+    ///
+    /// Displacing an existing entry additionally logs a `warn`: that is
+    /// the prior run's last moment of visibility, and it happens with no
+    /// `release_slot` to pair against.
     #[allow(clippy::too_many_arguments)]
     #[track_caller]
     pub fn register_spawn_with_capabilities(
@@ -250,20 +256,19 @@ impl LiveWorkerStateRegistry {
             routing.pool,
             routing.kind,
         );
-        tracing::info!(
-            slot_id,
-            run_id = %state.run_id,
-            model = %state.model,
-            shell_pid = state.shell_pid,
-            pool = state.pool.as_deref().unwrap_or("-"),
-            kind = state.kind.as_deref().unwrap_or("-"),
-            work_item_id = state.work_item_id.as_deref().unwrap_or("-"),
-            awaiting_input_capable,
-            registered_by = %caller,
-            "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
-        );
+        // Copy what the trace line needs before `state` is moved into the
+        // map. The line itself is emitted *after* the mutation, mirroring
+        // `release_slot` — the two halves are meant to be diffed by
+        // timestamp for a run id, so each must be stamped at the point its
+        // own mutation actually lands, not before.
+        let run_id = state.run_id.clone();
+        let model = state.model.clone();
+        let pool = state.pool.clone();
+        let kind = state.kind.clone();
+        let work_item_id = state.work_item_id.clone();
+
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.by_slot.insert(slot_id, state);
+        let displaced = guard.by_slot.insert(slot_id, state);
         guard.notification_pending.remove(&slot_id);
         guard.awaiting_input_capable.insert(slot_id, awaiting_input_capable);
         guard
@@ -274,6 +279,40 @@ impl LiveWorkerStateRegistry {
         // `set_progress_fidelity` — never inherit the prior occupant's tier
         // across a slot recycle.
         guard.progress_fidelity.remove(&slot_id);
+        drop(guard);
+
+        tracing::info!(
+            slot_id,
+            run_id = %run_id,
+            model = %model,
+            shell_pid,
+            pool = pool.as_deref().unwrap_or("-"),
+            kind = kind.as_deref().unwrap_or("-"),
+            work_item_id = work_item_id.as_deref().unwrap_or("-"),
+            awaiting_input_capable,
+            replaced_run_id = displaced.as_ref().map(|prior| prior.run_id.as_str()).unwrap_or("-"),
+            registered_by = %caller,
+            "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
+        );
+
+        // A slot re-registered without an intervening `release_slot` is the
+        // desync `EngineToAppError::SlotBusy` exists to prevent. The prior
+        // run silently disappears from `agents list` here, so without this
+        // line the trace would carry two `registered` events and one
+        // `cleared` for the same slot, and diffing the pair for the
+        // displaced run id would give the wrong answer.
+        if let Some(prior) = displaced {
+            tracing::warn!(
+                slot_id,
+                run_id = %prior.run_id,
+                activity = prior.activity.as_str(),
+                shell_pid = prior.shell_pid,
+                replaced_by_run_id = %run_id,
+                registered_by = %caller,
+                "live-state registry: registration displaced a live entry without a release_slot; \
+                 the prior run's visibility in `bossctl agents list` ends here",
+            );
+        }
     }
 
     /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
@@ -1685,6 +1724,61 @@ mod tests {
         reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
         reg.set_progress_fidelity(1, ProgressFidelity::Coarse);
         assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Coarse);
+    }
+
+    /// The trace is only useful if the `registered`/`cleared` pair balances
+    /// per run id. A slot re-registered without an intervening
+    /// `release_slot` breaks that: the prior run leaves `agents list` with
+    /// no `cleared` line of its own. Pin that the displacement is greppable
+    /// — both as a dedicated `warn` naming the displaced run, and as a
+    /// `replaced_run_id` field on the registration line itself.
+    #[test]
+    fn register_spawn_traces_a_displaced_entry() {
+        let buffer = crate::test_support::log_capture::install();
+        let start = buffer.lock().len();
+
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(7, "run-displaced-first", "claude-opus-4-7", 11, None);
+        reg.register_spawn(7, "run-displaced-second", "claude-opus-4-7", 22, None);
+
+        let captured = String::from_utf8(buffer.lock()[start..].to_vec()).expect("utf8 log capture");
+        let ours: Vec<&str> = captured
+            .lines()
+            .filter(|line| line.contains("run-displaced-"))
+            .collect();
+
+        let warn = ours
+            .iter()
+            .find(|line| line.contains("displaced a live entry without a release_slot"))
+            .unwrap_or_else(|| panic!("no displacement warning captured; lines: {ours:#?}"));
+        assert!(warn.contains("WARN"), "displacement must be a warning: {warn}");
+        assert!(
+            warn.contains("run_id=run-displaced-first"),
+            "the warning must name the run that lost its listing: {warn}"
+        );
+        assert!(
+            warn.contains("replaced_by_run_id=run-displaced-second"),
+            "the warning must name the run that took the slot: {warn}"
+        );
+
+        let second_registration = ours
+            .iter()
+            .find(|line| line.contains("run is now visible") && line.contains("run_id=run-displaced-second"))
+            .unwrap_or_else(|| panic!("no registration line for the second run; lines: {ours:#?}"));
+        assert!(
+            second_registration.contains("replaced_run_id=\"run-displaced-first\""),
+            "the registration line must carry the displaced run id: {second_registration}"
+        );
+
+        // A registration onto an empty slot must not claim a displacement.
+        let first_registration = ours
+            .iter()
+            .find(|line| line.contains("run is now visible") && line.contains("run_id=run-displaced-first"))
+            .unwrap_or_else(|| panic!("no registration line for the first run; lines: {ours:#?}"));
+        assert!(
+            first_registration.contains("replaced_run_id=\"-\""),
+            "a fresh slot must report no displacement: {first_registration}"
+        );
     }
 
     #[test]

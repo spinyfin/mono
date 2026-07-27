@@ -526,6 +526,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
 mod tests {
     use super::*;
     use crate::app::SendToAppError;
+    use crate::driver::test_support::codex_homes_override;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -821,6 +822,27 @@ mod tests {
         async fn dispatch_worker_event(&self, _incoming: crate::events_socket::IncomingHookEvent) {}
     }
 
+    /// One observable step of `start_worker`'s collaborator sequence,
+    /// recorded in call order by [`LiveStateSpawner`].
+    ///
+    /// The whole point of the Codex/Claude pair below is the *ordering*
+    /// (prepare → pane request → register → activate), so the tests assert
+    /// against this sequence rather than against end state only. Each
+    /// variant carries the fact that would otherwise be unobservable: which
+    /// ingress variant the driver asked for, and whether the live-state
+    /// entry existed by the time activation ran.
+    #[derive(Debug, PartialEq, Eq)]
+    enum SpawnStep {
+        /// `prepare_progress_ingress`, tagged with the `ProgressIngress`
+        /// variant the resolved driver returned.
+        Prepared(&'static str),
+        /// The `SpawnWorkerPane` request to the app.
+        PaneRequested,
+        /// `activate_progress_ingress`, tagged with whether the slot's
+        /// live-state entry was already registered when it fired.
+        Activated { registered: bool },
+    }
+
     /// Spawner that wires the two production collaborators `StubSpawner`
     /// leaves at their trait defaults: a real [`LiveWorkerStateRegistry`]
     /// and a real [`crate::agent_jsonl_progress::AgentJsonlProgressManager`].
@@ -838,6 +860,7 @@ mod tests {
         slot_id: u8,
         shell_pid: i32,
         spawn_calls: Arc<AtomicUsize>,
+        steps: std::sync::Mutex<Vec<SpawnStep>>,
     }
 
     impl LiveStateSpawner {
@@ -849,7 +872,17 @@ mod tests {
                 slot_id,
                 shell_pid,
                 spawn_calls: Arc::new(AtomicUsize::new(0)),
+                steps: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        fn record(&self, step: SpawnStep) {
+            self.steps.lock().expect("step log mutex poisoned").push(step);
+        }
+
+        /// The recorded sequence, for a whole-sequence `assert_eq!`.
+        fn steps(&self) -> Vec<SpawnStep> {
+            std::mem::take(&mut *self.steps.lock().expect("step log mutex poisoned"))
         }
     }
 
@@ -861,6 +894,7 @@ mod tests {
             _timeout: Duration,
         ) -> Result<EngineToAppResponse, SendToAppError> {
             self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            self.record(SpawnStep::PaneRequested);
             Ok(EngineToAppResponse::SpawnWorkerPane {
                 result: Ok(SpawnWorkerPaneResult {
                     slot_id: self.slot_id,
@@ -883,46 +917,37 @@ mod tests {
             driver: Arc<dyn AgentDriver>,
             ingress: ProgressIngress,
         ) -> Result<(), String> {
-            let ProgressIngress::AgentJsonlFile(ingress) = ingress else {
-                return Ok(());
+            // Record the variant in *both* arms. Only `AgentJsonlFile`
+            // has a run to prepare, but a test that asserted nothing about
+            // which variant arrived would keep passing — while silently
+            // exercising the no-op arm — if a driver's
+            // `progress_observation_wiring` ever changed shape.
+            let ingress = match ingress {
+                ProgressIngress::AgentJsonlFile(ingress) => {
+                    self.record(SpawnStep::Prepared("AgentJsonlFile"));
+                    ingress
+                }
+                ProgressIngress::HookCallback(_) => {
+                    self.record(SpawnStep::Prepared("HookCallback"));
+                    return Ok(());
+                }
+                ProgressIngress::StdoutJsonl => {
+                    self.record(SpawnStep::Prepared("StdoutJsonl"));
+                    return Ok(());
+                }
             };
             self.jsonl.prepare_run(run_id, driver, ingress, NoopEventSink)
         }
 
         fn activate_progress_ingress(&self, run_id: &str) {
+            self.record(SpawnStep::Activated {
+                registered: self.live_states.get(self.slot_id).is_some(),
+            });
             self.jsonl.activate_run(run_id);
         }
 
         fn stop_progress_ingress(&self, run_id: &str) {
             self.jsonl.stop_run(run_id);
-        }
-    }
-
-    /// Restores a process-global env var on drop. Mirrors the helper in
-    /// `live_status_loop`'s tests; both exist because the Codex homes root
-    /// is resolved from the environment.
-    struct EnvRestore {
-        key: &'static str,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &std::path::Path) -> Self {
-            let prior = std::env::var_os(key);
-            // SAFETY: every test that mutates this key holds
-            // `CODEX_HOMES_ENV_TEST_LOCK` for the duration; the prior value
-            // is restored on drop.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prior }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.prior.as_ref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
         }
     }
 
@@ -970,11 +995,8 @@ mod tests {
     /// there is nothing to starve.
     #[test]
     fn codex_spawn_registers_live_worker_state_like_claude() {
-        let _env_guard = crate::driver::codex::CODEX_HOMES_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let homes = TempDir::new().unwrap();
-        let _homes_env = EnvRestore::set(crate::driver::codex::CODEX_HOMES_ROOT_ENV, homes.path());
+        let _homes_env = codex_homes_override(homes.path());
 
         let workspace = TempDir::new().unwrap();
         let spawner = LiveStateSpawner::new(4, 4242);
@@ -996,6 +1018,17 @@ mod tests {
 
         assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 1);
         assert_eq!(started.slot_id, 4);
+        // The ordering this test exists to pin: the byte-stream ingress is
+        // genuinely prepared (not the no-op arm) *before* the pane request,
+        // and activated only once the slot is registered.
+        assert_eq!(
+            spawner.steps(),
+            vec![
+                SpawnStep::Prepared("AgentJsonlFile"),
+                SpawnStep::PaneRequested,
+                SpawnStep::Activated { registered: true },
+            ],
+        );
 
         let state = spawner
             .live_states
@@ -1012,7 +1045,9 @@ mod tests {
     /// The same spawn against the Claude driver, so the assertion above is
     /// pinned as a *parity* claim rather than a Codex-only snapshot: if a
     /// future change makes registration conditional on the ingress kind,
-    /// exactly one of this pair fails and names which side regressed.
+    /// exactly one of this pair fails and names which side regressed. The
+    /// step sequence asserts the complementary ingress variant, so the two
+    /// halves cannot silently collapse onto the same path.
     #[tokio::test]
     async fn claude_spawn_registers_live_worker_state() {
         let workspace = TempDir::new().unwrap();
@@ -1021,6 +1056,15 @@ mod tests {
         start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
             .await
             .unwrap();
+
+        assert_eq!(
+            spawner.steps(),
+            vec![
+                SpawnStep::Prepared("HookCallback"),
+                SpawnStep::PaneRequested,
+                SpawnStep::Activated { registered: true },
+            ],
+        );
 
         let state = spawner
             .live_states

@@ -10,6 +10,8 @@ Live-worker registration is driver-agnostic and Codex reaches it. What Codex doe
 
 Across the 41 dispatches of the Codex smoke-test work item, the median registered lifetime is **2 seconds**. A worker that exists for two seconds is not observable by a human typing `bossctl agents list`.
 
+Why most of those exits are so short is a **separate, still-open failure** — 33 of the 36 post-#2447 dispatches that got a pane exited in ~1 s without opening a Codex session at all. That is not explained here; see "Open gaps".
+
 ## Hypothesis 1 vs hypothesis 2
 
 Two hypotheses were on the table, deliberately unranked. Both are answerable from code plus the execution ledger.
@@ -56,7 +58,24 @@ The per-run `CODEX_HOME` trees under `$TMPDIR/boss-codex-homes/<execution_id>/` 
 
 **The row's `finished_at` equals the rollout's last record, to the second, in all three.** The engine terminalizes a Codex execution at the instant the `codex` process ends — not on a 30/60 s sweep tick, and not through the completion path.
 
-Note also which rows these are: they predate and postdate PR #2447 ("Fix three blockers that made every Codex dispatch fail", merged 03:21 the same morning). The pre-#2447 rows at 02:25–03:30 are that PR's already-fixed failure and are noise here; the shape is unchanged after it, right through to 15:31.
+#### Split by PR #2447
+
+PR #2447 ("Fix three blockers that made every Codex dispatch fail") merged at `2026-07-27T10:21:40Z` = **03:21:40 PDT**. Splitting the 41 rows on `created_at` against that instant matters, because the pre-#2447 rows are that PR's already-fixed failure and are noise for everything below:
+
+| cohort                                              |   n | no rollout | rollout |
+| --------------------------------------------------- | --: | ---------: | ------: |
+| pre-#2447 (02:25–02:30)                             |   3 |          3 |       0 |
+| post-#2447 (03:26–15:31)                            |  38 |         35 |       3 |
+| — of which never got a workspace (the two `failed`) |   2 |          2 |       0 |
+| — of which spawned a pane                           |  36 |         33 |       3 |
+
+So the honest post-#2447 figure is **33 of 36 dispatches that actually spawned a Codex pane still wrote no rollout at all**, and only 3 opened a session. #2447 did not move this: the pre-#2447 sample is only three rows, all of them zero-rollout too.
+
+#### This is a second, still-undiagnosed failure
+
+Those 33 rows are _not_ explained by the pane-exit mechanism below. That mechanism explains why a run is reaped and delisted **once `codex exec` exits**; it says nothing about why `codex exec` exits in ~1 s having opened no session. And the process demonstrably got some distance in: each of those homes contains Codex-authored state — `installation_id`, `logs_2.sqlite`, `memories_1.sqlite`, `goals_1.sqlite`, `state_5.sqlite` and a `tmp/arg0/codex-arg0XXXXXX` scratch file, none of which Boss writes (Boss provisions only `config.toml`, `AGENTS.md`, `auth.json`, `guards/`, `skills/`, `hook-trust-attestation.json`). So `codex` started, initialised its `CODEX_HOME`, and then exited before its first rollout record. `logs_2.sqlite` is present but has zero rows, so it carries no diagnostic.
+
+**Naming it plainly: "post-#2447 `codex exec` exits within ~1 s having written nothing" is a distinct, open failure, and it is the larger of the two** — it is what keeps 33 of 36 dispatches from doing any work at all, whereas the pane-exit mechanism only governs how the remaining 3 are terminalized. Diagnosing it needs the pane's own stderr or a `codex exec` run reproduced by hand under one of these `CODEX_HOME` trees, neither of which is available from a worker session. It is listed alongside the trace-correlation gap in "The observation this does not fully close".
 
 ### The mechanism
 
@@ -77,13 +96,23 @@ And the engine treats that report as unconditional proof of death:
 - `tools/boss/protocol/src/wire.rs:2216` — `WorkerPaneDied`; the doc states the engine reaps "immediately … skipping its grace period and PID-liveness probe since the app's report is a direct observation".
 - `tools/boss/engine/core/src/app/sessions.rs:314` → `tools/boss/engine/core/src/dead_pid_sweep.rs:510` `reap_reported_pane_death` → `reap_dead_execution`: orphans the execution, releases the pool slot, and drops the live-state entry.
 
-So for Codex, **a successful turn and a dead pane are the same observable event**. That single mechanism explains every row: the 38 that exit in ~1 s having written nothing, the 3 that exit after a completed turn, the uniform `orphaned` status, and the absence from `agents list`.
+So for Codex, **a successful turn and a dead pane are the same observable event**. This mechanism is what makes _every_ row terminalize as `orphaned` and vanish from `agents list` the moment its `codex exec` returns — whether that return is a completed turn (the 3) or the ~1 s zero-rollout exit (the 38). It is the answer to the question this investigation asked.
+
+It is deliberately **not** an answer to _why_ those 38 exit in ~1 s: this mechanism starts at the child's exit and says nothing about what caused it. That is the separate, still-open failure named above. Both are real; conflating them would make the ~1 s exits look like an already-explained consequence of the `exec` wrapping, which they are not.
 
 ### Ordering check
 
 `reap_reported_pane_death` is what writes the terminal row, and it fires _after_ the child exit — so the terminal status is a consequence of the exit, not a cause of it. Symmetrically, the `orphan_sweep` churn-guard attentions are stamped minutes after the executions they name. Nothing in the ledger is a cause of anything earlier than itself.
 
-## The observation this does not fully close
+## Open gaps
+
+Two, tracked separately below.
+
+### Gap 1 — why `codex exec` exits in ~1 s having written nothing
+
+The larger of the two, and untouched by this investigation: 33 of the 36 post-#2447 dispatches that actually spawned a pane exited within ~1–8 s with an initialised `CODEX_HOME` and an empty `sessions/`. See "This is a second, still-undiagnosed failure" above for the evidence and for why it cannot be diagnosed from a worker session.
+
+### Gap 2 — the observation this does not fully close
 
 The pane that prompted this was watched for "well over a minute" while the list stayed empty. No execution row in this series exceeds 48 seconds, and the closest run in time to the cited Claude control run (`exec_18c6210adb239868_5`, ≈04:10) is `exec_18c620ba075a6980_1` (04:05:06–04:05:49). During those 43 seconds a live-state entry _should_ have existed.
 
@@ -92,7 +121,7 @@ I could not settle that specific window. The engine trace, `engine-audit.log` an
 1. The watched pane was one of the 38 fast-fail runs (registered ~1 s, reaped, then a dead-but-still-rendered surface), and the "over a minute" is wall-clock spent looking at a pane the engine had already let go.
 2. The entry was released early during a run that was genuinely alive, by a path other than the child-exit report.
 
-### The instrumentation that closes it
+#### The instrumentation that closes Gap 2
 
 `LiveWorkerStateRegistry::release_slot` already traces every removal with the clearing caller (`live_worker_state.rs:340`, added precisely because a live worker being killed was invisible in the logs). Its counterpart did **not**: `register_spawn_with_capabilities` emitted nothing. The trace could therefore show a slot being cleared with no record it was ever occupied, and "this run never appeared in `agents list`" was indistinguishable from "it appeared and was cleared 900 ms later" — which is exactly the question above.
 
