@@ -267,6 +267,18 @@ Fidelity mapping for the rules Boss expresses today:
 
 The two "lost" rows are what [Guardrail integrity](#guardrail-integrity) resolves.
 
+### Bazel under the Codex sandbox
+
+`--sandbox workspace-write` renders with no `[sandbox_workspace_write]` table in the per-run `config.toml` at all, so `writable_roots` and `network_access` take Codex's own binary defaults — `[]` and `false` — rather than anything Boss chose. Every bazel-gated repo was unbuildable under `--driver codex` as a result; a control run of the same smoke test on `--driver claude` in the same repo passed.
+
+Root cause, reproduced rather than inferred: Bazel's client/server handshake (netty/gRPC) needs to bind a localhost TCP socket, which `network_access = false` denies. `bazel`'s shutdown path then calls `ProcessHandleImpl.children()`, which shells out to `sysctl kern.proc.all` — not in Codex's seatbelt allowlist — turning a `SocketException` into `FATAL: bazel crashed due to an internal error`. The `sysctl` failure is a **consequence**, not an independent blocker: once the bind succeeds it degrades to a harmless `WARNING: failed to get value of sysctl kern.maxprocperuid`. Separately, Bazel's default output base (`~/Library/Caches/bazel/_bazel_$USER` on macOS) sits outside the workspace, so empty `writable_roots` denies it too — reproduced standalone: with `writable_roots` granted but `network_access` still `false`, `bazel build` reproduces the original crash verbatim; both keys are required together.
+
+The fix (`render_sandbox_workspace_write_toml` / `bazel_output_user_root` in `engine/driver/src/codex.rs`) emits an explicit `[sandbox_workspace_write]` table with `network_access = true` and `writable_roots` set to Bazel's default `output_user_root`, derived rather than hardcoded: `TEST_TMPDIR` first (Bazel's own convention for a bazel-in-bazel test invocation), else the platform cache-dir default Bazel itself falls back to when no `--output_user_root` flag applies (`~/Library/Caches/bazel` on macOS, `${XDG_CACHE_HOME:-~/.cache}/bazel` elsewhere).
+
+`network_access = true` is a **full outbound-network grant, not localhost-only** — the `sandbox_workspace_write` schema is two-valued (`restricted` / `enabled`); there is no localhost-only tier to select instead. A newer `[permissions]` profile system with `network.mitm.allowed_domains`-shaped domain scoping appears in the 0.145.0 binary but was not confirmed reachable from the `exec` path in the time available for this fix; a future pass that confirms reachability should prefer a domain-scoped grant (localhost + whatever bazel/bzlmod endpoints are actually needed) over this full grant. The full grant is also load-bearing beyond localhost: bzlmod/module-registry fetches and, absent a pinned `.bazelversion`, bazelisk's own version-resolution call both need real egress on a cold cache.
+
+This grant is scoped to `--sandbox workspace-write` only. Reviewer uses `--sandbox read-only` ([G-3](#g-3-permissionpolicy)), under which Codex does not consult `sandbox_workspace_write` at all — the table is inert for that mode — so no worker-kind branch was needed. Reviewers don't run build gates, so leaving them fully network-denied costs nothing.
+
 ### Hooks — the decisive investigation
 
 This determines the `ToolUseInterception` disposition, so I went at it hard.
