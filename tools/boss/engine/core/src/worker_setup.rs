@@ -1701,7 +1701,13 @@ pub fn write_workspace_files(
     // [`crate::driver::claude::pre_trust_workspace`].
     pre_trust_workspace(&input.workspace_path);
 
-    let agent_rules_path = config_dir.join(descriptor.agent_rules_filename);
+    // Not necessarily under `config_dir`: a driver whose agent reads its
+    // rules file from elsewhere (e.g. Codex's `$CODEX_HOME/AGENTS.md`, never
+    // `.codex/AGENTS.md`) overrides this to point there instead.
+    let agent_rules_path = driver.agent_rules_destination(&input.workspace_path, &input.run_id);
+    if let Some(parent) = agent_rules_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let gitignore_path = config_dir.join(".gitignore");
 
     let preamble = driver.agent_rules_preamble();

@@ -367,21 +367,60 @@ impl CodexRuntimeState {
 ///
 /// - Stamps the cube workspace as trusted so the first-run trust dialog never
 ///   blocks a headless worker.
-/// - Disables Claude external-config migration prompts so a co-located
-///   `.claude/` from a prior Claude worker is never imported into this home.
+/// - Suppresses the external-agent (Claude Code) config-migration notice for
+///   this home and this project, and pins the underlying memory-import
+///   feature off, so a co-located `.claude/` from a prior Claude worker is
+///   never imported into this home.
 /// - Does **not** write hooks; those are appended by
 ///   [`write_hooks_and_attest`] after guard scripts are materialised, so the
 ///   trust gate hashes the exact final handler identity.
+///
+/// # Key provenance (codex-cli 0.145.0 / `openai/codex`)
+///
+/// `external_config_migration_prompts` is **not** a top-level field — it is
+/// nested under `[notice]` as `notice.external_config_migration_prompts`, a
+/// table with `home: Option<bool>` / `home_last_prompted_at` /
+/// `projects: BTreeMap<String, bool>` / `project_last_prompted_at`
+/// (`codex-rs/config/src/types.rs::ExternalConfigMigrationPrompts`). We set
+/// both `home` and this project's entry in `projects` to `true` ("suppress
+/// the prompt for this scope").
+///
+/// That struct only ever gates a **notice** shown by the interactive TUI /
+/// app-server client (`codex-rs/tui/src/external_agent_config_migration*.rs`)
+/// asking the user whether to import another agent's config — it does not
+/// gate the import itself. The actual import path
+/// (`codex-rs/app-server/src/external_agent_migration/processor.rs`) only
+/// runs in response to an explicit `externalAgentConfig/detect` or `/import`
+/// app-server request, which `codex exec` never sends, and is additionally
+/// gated by the `external_agent_memory_import` feature flag — confirmed
+/// `false` (disabled) by default via `codex features list` on 0.145.0. We
+/// pin it `false` explicitly under `[features]` anyway: belt-and-suspenders
+/// against a future default flip silently re-enabling import into a
+/// Boss-owned home.
+///
+/// Verified behaviourally (not just "it parses"): a workspace carrying a
+/// `.claude/CLAUDE.md` marker does not surface that content anywhere in
+/// `codex debug prompt-input`'s model-visible output, with or without these
+/// keys set — the import path is structurally unreachable from `codex exec`.
 pub fn render_base_config_toml(workspace: &Path) -> String {
     // TOML basic-string escape for paths that may contain backslashes or quotes.
     let workspace_key = toml_basic_string(&workspace.display().to_string());
     format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
-         # Suppress Claude Code config / memory import into this CODEX_HOME.\n\
+         # Suppress the external-agent (Claude Code) config-migration notice\n\
+         # for this home and project, and pin the memory-import feature off.\n\
          # Boss workspaces routinely contain a co-located `.claude/` from the\n\
-         # Claude driver path; importing it would wire the wrong hooks.\n\
-         external_config_migration_prompts = false\n\
+         # Claude driver path; see render_base_config_toml's doc comment for\n\
+         # why this is belt-and-suspenders rather than the actual gate.\n\
+         [notice.external_config_migration_prompts]\n\
+         home = true\n\
+         \n\
+         [notice.external_config_migration_prompts.projects]\n\
+         {workspace_key} = true\n\
+         \n\
+         [features]\n\
+         external_agent_memory_import = false\n\
          \n\
          [projects.{workspace_key}]\n\
          trust_level = \"trusted\"\n\
@@ -413,7 +452,9 @@ fn toml_basic_string(s: &str) -> String {
 /// Build the `codex exec …` command body (without the leading `exec `).
 ///
 /// Contract (also enforced by `assert_codex_exec_spawn_contract` in core):
-/// - requires `--json` and `--strict-config`
+/// - requires `--json`, `--strict-config`, and `--skip-git-repo-check`
+///   (cube workspaces are non-colocated jj workspaces with a `.jj` and no
+///   `.git`, so the git-repo trust check would refuse every dispatch)
 /// - forbids `-a` / `--ask-for-approval` (removed on 0.145.0)
 /// - redirects stdin from `/dev/null` so Codex does not block on "Reading
 ///   additional input from stdin..."
@@ -447,7 +488,7 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
     // via [`PermissionArtifacts::extra_args`] (`--sandbox read-only` for
     // Reviewer) applied by the spawn flow — do not hardcode a second source
     // of truth here without also applying extra_args.
-    let mut cmd = String::from("codex exec --json --strict-config --sandbox workspace-write");
+    let mut cmd = String::from("codex exec --json --strict-config --skip-git-repo-check --sandbox workspace-write");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
     // shell-quote so a future slug with spaces/metacharacters cannot break
@@ -484,13 +525,17 @@ pub fn wrap_codex_command_for_pane(exec_body: &str) -> String {
 /// The trust gate requires a real filesystem path (not an inline
 /// `python3 -c` string): `arm_and_attest` content-binds and path-checks the
 /// command. Wrappers live under `$CODEX_HOME/guards/`.
+///
+/// `pub` (fields included) so the config-schema conformance check in
+/// `engine/core`'s `version_pin` can build the exact `append_hooks_toml`
+/// input production uses, without re-implementing guard materialisation.
 #[derive(Debug, Clone)]
-struct MaterializedGuard {
+pub struct MaterializedGuard {
     /// Absolute path written into `config.toml` `command = "…"`.
-    command_path: PathBuf,
+    pub command_path: PathBuf,
     /// Matcher for PreToolUse (`".*"` covers all tools; Bash-only where the
     /// Claude path used a Bash matcher).
-    matcher: Option<&'static str>,
+    pub matcher: Option<&'static str>,
 }
 
 /// Materialise Boss guard scripts under `codex_home/guards/` and return the
@@ -611,7 +656,11 @@ fn write_executable(path: &Path, body: &str) -> anyhow::Result<()> {
 }
 
 /// Append `[[hooks.PreToolUse]]` entries for the materialised guards.
-fn append_hooks_toml(base: &str, guards: &[MaterializedGuard]) -> String {
+///
+/// `pub`: the config-schema conformance check in `engine/core` calls this
+/// directly (with a synthetic guard list) so it validates the exact same
+/// hooks-appended document production writes, not a hand-rolled stand-in.
+pub fn append_hooks_toml(base: &str, guards: &[MaterializedGuard]) -> String {
     let mut out = base.to_owned();
     if !out.ends_with('\n') {
         out.push('\n');
@@ -1114,6 +1163,22 @@ impl AgentDriver for CodexDriver {
         CODEX_AGENT_RULES_PREAMBLE
     }
 
+    /// Codex does not read `.codex/AGENTS.md` at all (verified with `codex
+    /// debug prompt-input`: a root or `$CODEX_HOME` `AGENTS.md` marker
+    /// appears in the model-visible prompt input; a `.codex/AGENTS.md`
+    /// marker does not). Route it to `$CODEX_HOME/AGENTS.md` instead — the
+    /// same per-run home `provision_workspace` already creates, read as
+    /// Codex's "user-level" instructions and concatenated ahead of any
+    /// project-level `AGENTS.md` (confirmed both surface, separated by
+    /// Codex's own `--- project-doc ---` marker). Writing there, rather than
+    /// the workspace root, also means this file never touches the jj-tracked
+    /// tree.
+    fn agent_rules_destination(&self, _workspace: &Path, run_id: &str) -> PathBuf {
+        codex_home_for_run(run_id)
+            .unwrap_or_else(|_| codex_homes_root().join("unknown-run"))
+            .join("AGENTS.md")
+    }
+
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
         // Transcript lookup requires the exact run home supplied when the
         // stdout reader creates its per-ingress progress session.
@@ -1248,6 +1313,25 @@ mod tests {
     }
 
     #[test]
+    fn agent_rules_destination_is_codex_home_not_dot_codex() {
+        // Codex never reads `.codex/AGENTS.md` (verified with `codex debug
+        // prompt-input`). Must route to `$CODEX_HOME/AGENTS.md`, not the
+        // trait default (`<workspace>/<config_dir>/<agent_rules_filename>`).
+        let driver = CodexDriver::default();
+        let workspace = Path::new("/tmp/some-workspace");
+        let destination = driver.agent_rules_destination(workspace, "run-agents-md-1");
+        assert_eq!(
+            destination,
+            codex_home_for_run("run-agents-md-1").unwrap().join("AGENTS.md")
+        );
+        assert!(
+            !destination.starts_with(workspace),
+            "AGENTS.md must not land inside the workspace tree: {}",
+            destination.display()
+        );
+    }
+
+    #[test]
     fn codex_model_menu_sourced_from_debug_models_vocabulary() {
         let driver = CodexDriver::default();
         let menu = &driver.descriptor().model_menu;
@@ -1298,6 +1382,12 @@ mod tests {
         assert!(
             plan.command.contains("--strict-config"),
             "requires --strict-config: {}",
+            plan.command
+        );
+        assert!(
+            plan.command.contains("--skip-git-repo-check"),
+            "requires --skip-git-repo-check: cube workspaces are non-colocated jj \
+             workspaces with no `.git`, so codex would refuse to run without it: {}",
             plan.command
         );
         assert!(
@@ -1439,8 +1529,13 @@ else:
 
         let config = fs::read_to_string(runtime.codex_home.join("config.toml")).unwrap();
         assert!(
-            config.contains("external_config_migration_prompts = false"),
-            "must suppress Claude migration: {config}"
+            config.contains("[notice.external_config_migration_prompts]") && config.contains("home = true"),
+            "must suppress the external-agent config-migration notice via the real \
+             nested key (not a nonexistent top-level field): {config}"
+        );
+        assert!(
+            config.contains("[features]") && config.contains("external_agent_memory_import = false"),
+            "must pin the memory-import feature off: {config}"
         );
         assert!(
             config.contains("trust_level = \"trusted\""),
@@ -1485,7 +1580,12 @@ else:
     fn base_config_escapes_workspace_paths_with_spaces() {
         let toml = render_base_config_toml(Path::new("/Users/a b/ws"));
         assert!(toml.contains("\"/Users/a b/ws\""), "{toml}");
-        assert!(toml.contains("external_config_migration_prompts = false"));
+        assert!(toml.contains("[notice.external_config_migration_prompts]"));
+        assert!(toml.contains("[features]"));
+        assert!(toml.contains("external_agent_memory_import = false"));
+        // No stray unnested/unquoted occurrence of the old, invalid top-level
+        // scalar form this config once emitted.
+        assert!(!toml.contains("\nexternal_config_migration_prompts = false\n"));
     }
 
     #[test]

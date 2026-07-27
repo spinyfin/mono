@@ -166,7 +166,12 @@ pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerE
 /// `CodexDriver::spawn_invocation`. Pin tests call
 /// [`assert_codex_exec_spawn_contract`] so a future production path that
 /// regresses these flags fails the same pin without rewriting the double.
-pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--json", "--strict-config"];
+///
+/// `--skip-git-repo-check` is required because cube workspaces are
+/// non-colocated jj workspaces (a `.jj`, never a `.git`); without it Codex
+/// refuses every dispatch with "Not inside a trusted directory and
+/// --skip-git-repo-check was not specified."
+pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--json", "--strict-config", "--skip-git-repo-check"];
 
 /// Long-form flags that must never appear on a Codex `exec` spawn line.
 ///
