@@ -1,8 +1,9 @@
 # Boss UI Performance Improvements
 
-- **Date:** 2026-07-25
-- **Status:** Design — awaiting review
+- **Date:** 2026-07-25 (design), 2026-07-27 (revised against as-built)
+- **Status:** Implemented — every in-scope code entry (1–11) has landed on `main`. The project's acceptance evidence, entry 16's before/after capture, has **not** been taken; no number in this document has been re-measured since the baseline.
 - **Project:** `proj_18c5b7e300fb2d30_43` (Boss UI Performance improvements)
+- **Shipped in:** mono#2393, #2394, #2395, #2396, #2397, #2399, #2400, #2401, #2402, #2403, #2407, #2409, #2412, #2413, #2416 — merged 2026-07-26. Per-entry PR links are on each breakdown entry below.
 - **Baseline artifact:** 60 s `sample` of Boss 1.0.369, pid 59513, ARM64 / macOS 26.5.2, captured 2026-07-25 19:58 PDT. Coordinator-private: the sample file itself is not in the repo, so the counts and symbol attributions distilled below — including the ones this doc goes on to correct — are the shared baseline.
 - **Remit:** the brief this project was opened from. It lives in Boss rather than in the repo, so its recommendations are reproduced here once, in its own priority order, and referred to by these labels throughout:
   - **P0 #1 — coalesce / debounce work-tree applies.** "Coalesce engine work-tree / work-item events on the main actor (e.g. 16–50 ms debounce, or 'apply latest only' on next run-loop turn)"; prefer diffed updates over "rebuilding the entire published tree every event".
@@ -19,6 +20,19 @@
 Boss burns main-thread CPU because **every kanban card observes the entire `ChatViewModel`**, and that view model has 77 `@Published` properties. Any one of them changing — a transcript chunk, an engine metric, a hover flag, a panel width — invalidates every visible card, which rebuilds a ~35-parameter view whose largest input is a 45-field `WorkTask` struct, and re-runs the layout of a ~340-line card body. Coalescing engine events helps at the margin, but the fan-out is the mechanism. Fix the observation boundary first, then the diff surface, then the layout.
 
 Separately: the main-thread stall watchdog is burning ~7% of a core symbolicating backtraces it then throws away. That is measurement overhead contaminating the artifact used to diagnose everything else, and it is the first thing to fix — not because it stalls the main thread (it does not), but because nothing downstream can be measured cleanly until it stops.
+
+## What shipped, and what did not
+
+The plan held. All eleven in-scope code entries landed in one day, in the dependency order below, and none of them was abandoned or redesigned mid-flight. The three deferrals stayed deferred, and entry 11's investigation confirmed the deferral of entry 12 rather than overturning it.
+
+Four things came out different from the design, and each is written into the relevant section below rather than collected here:
+
+- **`boardStyle` had to move into the snapshot.** Narrowing the card's inputs to a value snapshot silently cut it off from `@Environment(\.kanbanBoardStyle)`, so already-mounted cards kept stale chrome after a board-style flip. Environment values a card renders are now snapshot fields (entry 5).
+- **The column container had to keep observing the model.** Entry 6 detached the card, but detaching the container too left stuck "Queued"/slot text on `taskRuntimesByID`-only updates. `WorkBoardSectionItemsView` observes both `ChatViewModel` and `LiveWorkerStateStore` — which is the design's "Phase 1 moves work from the cards to the container" risk, realised deliberately (entry 6).
+- **Only the popover could be made lazy.** SwiftUI's `confirmationDialog` and `sheet` need to be installed before their boolean flips; mounting with `true` fails intermittently. Entry 10 ships one lazy surface, not four.
+- **Stall backtraces are raw in memory but symbolicated on disk.** Deferring symbolication entirely would have made the JSONL export useless after process death, since ASLR addresses do not survive it (entry 1).
+
+**The measurement half of this plan did not happen.** Every entry whose gate was a `sample` shipped with its capture recorded as an unmet operator follow-up in the PR, and none was returned. That is not an oversight in any one task — it is the human-availability dependency this document flagged as a risk, arriving exactly as described. See "Measurement protocol" for what is and is not still recoverable.
 
 ## Goals
 
@@ -66,6 +80,8 @@ The layout families overlap by nesting and must not be summed.
 ### The mechanism, read off the source
 
 The profile says _what_ is hot. The source says _why_, and the answer is more specific than the remit's problem statement assumed.
+
+Every file and line reference in this section describes the source **as it stood at the 2026-07-25 baseline**, which is the state the diagnosis was made against. The entries below have since changed all of it; the citations are kept unmoved because they are the evidence, not a map of the current tree.
 
 **`WorkBoardCardItem` observes the whole view model.** `Sources/WorkBoardCard.swift:45-46` declares `@ObservedObject var model: ChatViewModel` and `@ObservedObject var liveStates: LiveWorkerStateStore` on the per-card view. `ChatViewModel` has **77 `@Published` properties** (`Sources/ChatViewModel.swift`), including `transcriptsByExecutionID`, `automationRunsByID`, `engineMetrics`, `trunkTokenNote`, `bossPanelWidth`, and `editorialActionsByProductID` — none of which any card renders. Every one of them fires `objectWillChange` on every visible card.
 
@@ -201,19 +217,34 @@ Four phases, in dependency order. Phases 1–3 are the substance; phase 0 exists
 
 ### Phase 0 — make measurement cheap and make the counters exist
 
-**Defer stall-backtrace symbolication.** `capture()` already returns raw addresses and is allocation-free by design. The fix is to keep them raw: store `[UInt]` addresses in `StallRecord`, and symbolicate only when a record is actually read — in `UIStallsViewer` or on export. The idle-stack pre-filter, which today forces full symbolication before it can decide to discard, is replaced by an address-range test: resolve the app image's `[start, end)` bounds **once** at startup, then test each frame numerically. That is an integer comparison per frame instead of a `dladdr` per frame, and it keeps `isIdleEventLoopStack` a pure, unit-testable function over addresses plus a range. Add a floor on symbolication frequency as a backstop.
+**Defer stall-backtrace symbolication.** `capture()` already returned raw addresses and was allocation-free by design; the fix keeps them raw. `StallRecord.frameAddresses: [UInt]` replaced the pre-rendered `backtrace: [String]`, and symbolication moved to the read path — `UIStallsViewer` resolves on expand, into a view-local cache populated from the toggle action rather than from `body`, so no `@State` is mutated during view evaluation. The idle-stack pre-filter, which previously forced full symbolication before it could decide to discard, became an address-range test against the app image's `[start, end)` bounds resolved once at startup: an integer comparison per frame instead of a `dladdr` per frame, with `isIdleEventLoopStack` left a pure, unit-testable function over addresses plus a range.
 
-**Put the monitor behind a default-off setting.** Per review, add a Settings toggle for stall monitoring, defaulting to off, so the common case pays nothing. The monitor remains available in release builds — it is a setting, not a build gate — and the two halves of this item are complementary rather than alternative: the toggle removes the cost for users who are not debugging stalls, and the deferred symbolication is what makes the monitor affordable for the ones who are, including every capture run under the measurement protocol below. The remit's P2 is preserved: stall monitoring survives and is one toggle away.
+Two details the design did not anticipate, both settled during implementation:
+
+- **The durable log still symbolicates at write time.** Raw addresses alone are worthless in an exported JSONL once the process is gone — ASLR makes them unresolvable. So the on-disk mirror carries both: `frame_addresses` as hex strings (JSON numbers would lose 64-bit precision) _and_ a symbolicated `backtrace` array. The saving is on the watchdog's hot path, where discarded false positives now cost nothing; it is not a saving on the write path, which is rare. Address-only lines from the interim shape still decode, with live symbolication as the fallback.
+- **The backstop is a record-rate floor, not a symbolication-rate floor.** `Config.minRecordIntervalMs` (default 100 ms) floors how often a new stall _record_ is accepted after the idle filter, and is checked **before** `recordedBeat` is committed so a rejected beat stays retryable for the same episode.
+
+**Put the monitor behind a default-off setting.** Per review, stall monitoring is a default-off toggle so the common case pays nothing. As built it lives under Settings → **Feature Flags**, in the App (local) section, as `boss.uiStalls.monitoring` — the existing surface for app-local switches rather than a new pane in general Settings. The AppDelegate applies it at launch and re-applies live on `UserDefaults.didChangeNotification`, so flipping it starts and stops the monitor without a relaunch. When off, the watchdog `DispatchQueue` is never created and no timer runs: off means zero cost, not a cheap tick. `UIStallsViewer`'s empty state explains that monitoring is off and how to turn it on, which matters because the window is otherwise indistinguishable from "no stalls happened". The monitor remains available in release builds — it is a setting, not a build gate — and the two halves are complementary rather than alternative: the toggle removes the cost for users who are not debugging stalls, and the deferred symbolication is what makes the monitor affordable for the ones who are. The remit's P2 is preserved: stall monitoring survives and is one toggle away.
 
 **Add dev-visible UI counters** on the existing `PopulationTimingLog` / `os_signpost` rails rather than a new subsystem: `applyWorkTree` calls/sec, incremental task updates/sec, engine events delivered to the main actor/sec, and card body evaluations/sec. Atomic increments, flushed on a 1 Hz timer, zero cost when nothing increments. These are the per-task regression signal — a sample tells you where time went, a counter tells you whether the fan-out actually narrowed.
 
+As built this is `Sources/Diagnostics/UIUpdateCounters.swift`, a sibling of `PopulationTimingLog` sharing its `com.boss.app` / `population` signposter rather than living inside it: the counter type is a rate accumulator with different lifecycle needs from the timing log, and keeping it separate kept both files small. Non-idle flushes emit a `ui-update-rates` signpost event and append to a 128-entry in-memory ring; an idle flush returns `nil` and emits nothing, so the 1 Hz timer costs a four-field zero check when the board is quiet. **The signpost is currently the only way to read these counters** — the ring has an accessor but no viewer, so "dev-visible" in practice means Instruments or the unified log, not a window in the app. That gap is called out in the open questions.
+
 ### Phase 1 — narrow the observation boundary (the main event)
 
-**Introduce `WorkCardSnapshot`**: a small `Equatable` value type holding exactly the fields the card renders, plus booleans that are today recomputed inside `body` (`isDispatchPending`, `isResolvingConflicts`, `isRemediatingCI`, `isAIReviewing`, badge visibility). It is built from a `WorkTask` plus the resolved per-card context. Two `WorkTask`s that differ only in fields the card does not render must produce equal snapshots — that property is the whole point and is what the unit tests assert.
+**Introduce `WorkCardSnapshot`**: a small `Equatable` value type holding exactly the fields the card renders, plus booleans that were previously recomputed inside `body` (`isDispatchPending`, `isResolvingConflicts`, `isRemediatingCI`, `isAIReviewing`, badge visibility). It is built from a `WorkTask` plus the resolved per-card context. Two `WorkTask`s that differ only in fields the card does not render must produce equal snapshots — that property is the whole point and is what the unit tests assert.
 
-**Make `WorkBoardCardView` consume the snapshot, conform to `Equatable`, and apply `.equatable()`** at the call site, exactly as `SegmentRowView` does. The AttributeGraph compare surface becomes a small struct instead of a 45-field one. This is the direct fix for the `LayoutDescriptor::compare` → `WorkTask.==` path.
+It landed as three types, not one, because the card's inputs are not all task fields: `WorkCardSnapshot` itself; `WorkCardSnapshotContext`, the already-resolved per-card inputs the column container supplies (closures stay outside it — only _presence_ flags for the terminal and merge-when-ready buttons are stored); and `WorkCardRevisionRollup`, a slim revision row carrying exactly what `RevisionRollupLine` reads, so a nested rollup never needs a full `WorkTask` either. `AgentActivityState` and `EngineRevisionOrigin` gained `Equatable` conformances to live on the snapshot.
 
-**Drop `@ObservedObject` from the card.** `WorkBoardCardItem` keeps a non-observing reference to the model for action dispatch (`selectWorkCard`, drag handlers) and receives its snapshot as a value. The column container already observes the model; it recomputes snapshots for its cards, and `.equatable()` stops the cards whose snapshot is unchanged before body evaluation or layout. Same treatment for `liveStates` — the resolved live-status value is passed in rather than the store being observed per card.
+Two design choices about what _not_ to put on the snapshot proved as important as the field list. `gatingPrereqs` is not a snapshot field: the context supplies the array, the builder precomputes `autoBlockTooltip` from it, and only the tooltip string participates in equality — so prereq-id churn that leaves the tooltip unchanged does not force a body re-evaluation. Conversely, `boardStyle` _is_ a snapshot field, and had to become one; see below.
+
+**Make `WorkBoardCardView` consume the snapshot, conform to `Equatable`, and apply `.equatable()`** at the call site, exactly as `SegmentRowView` does. The AttributeGraph compare surface becomes a small struct instead of a 45-field one. This is the direct fix for the `LayoutDescriptor::compare` → `WorkTask.==` path. `==` compares the snapshot alone; the action closures are deliberately outside the equatable surface, so a parent re-render that rebuilds handlers does not force the card to re-evaluate.
+
+**Environment values a card renders must become snapshot fields.** `WorkBoardCardView` previously read `@Environment(\.kanbanBoardStyle)` for its fill, border and shadow. Under `.equatable()` that is a read the compare surface cannot see: flipping `boss.kanban.boardStyle` re-styled the columns while already-mounted cards kept their old chrome until some unrelated snapshot field happened to change. The fix is to capture the environment value in `WorkBoardCardItem` into `WorkCardSnapshotContext.boardStyle` → `WorkCardSnapshot.boardStyle`. This is the general shape of the `.equatable()` hazard listed in the risks section, and it is the one that actually bit: an unobserved read during body evaluation is invisible to the conformance, and the symptom is a stale card rather than a compile error.
+
+**Drop `@ObservedObject` from the card.** `WorkBoardCardItem` keeps a non-observing reference to the model for action dispatch (`selectWorkCard`, drag handlers, badge hover, popover, deferred-scope actions) and receives its snapshot as a value. Same treatment for `liveStates` — the resolved live-status value is passed in rather than the store being observed per card, via `WorkCardLiveStatus.resolve(...)`, a pure free function with an injectable `now` so its relative-time labels are testable.
+
+**The observing boundary moves to `WorkBoardSectionItemsView`, and stays observing.** The column container observes both `ChatViewModel` and `LiveWorkerStateStore`, builds each card's snapshot through `ChatViewModel.workCardSnapshot(...)`, resolves the drag-refusal and merge-feedback banner messages, and passes all of it down as values. `.equatable()` then stops the cards whose snapshot did not move. The container's `@ObservedObject var model` is load-bearing and was restored during entry 6's review: without it, updates that only touch `taskRuntime` / `taskRuntimesByID` never reached the snapshot builder, and Doing cards sat on stale "Queued"/slot text until an unrelated invalidation shook them loose. Narrowing the container's observation further is a live option, but it must be done by making the _rebuild_ incremental, not by unsubscribing.
 
 This is the change that turns "77 unrelated publishes invalidate every card" into "a card re-renders when its own inputs change".
 
@@ -223,13 +254,24 @@ This is the change that turns "77 unrelated publishes invalidate every card" int
 
 **Make `invalidateWorkCache` keyed.** A single-item update should drop the caches that item can affect, not all ten. The id index can be patched in place for an update that changes no bucket membership; the dependency and revision caches only need dropping when edges or revision rows actually change.
 
+The mechanism is a `WorkCacheInvalidation` key set plus `invalidateWorkCache(_:)`, and — because every bucket's `didSet` routed through the blanket drop — a `withSuppressedWorkCacheInvalidation` scope that lets `applyIncrementalTaskUpdate` mutate buckets and then apply keyed invalidation itself. What "actually changed" means turned out to be wider than the design assumed, in both derived caches, because both bake snapshots rather than references:
+
+- **Dependencies** drop on a `status` change (edge satisfaction) _and_ on a `name` change, because `WorkDependencyRow` bakes prerequisite titles in at rebuild time.
+- **Revisions** drop on any field change to a revision row at all, because the rollups store whole `WorkTask` values — a rename or a PR-URL edit goes stale just as surely as a structural change does.
+
+The correctness gate is explicit and full-invalidates: project membership, kind, chore-arm or product changes, an unknown previous state, and any dependency edge-list change via `dependenciesByProductID.didSet`. Implementing this also surfaced a latent bug unrelated to performance — bucket eviction used `dict[key]?.removeAll`, a no-op on `Array` values, and product-scoped maps were only scanned under the current product key, so a product flip could strand a twin row under the old key. Eviction now copy-mutates-writes-back and scans all product keys.
+
 ### Phase 3 — cut the layout cost
 
-**Give `FlowLayout` a real cache** — `makeCache`/`updateCache` holding the computed rows and per-subview sizes, so `placeSubviews` reuses what `sizeThatFits` computed instead of redoing every chip measurement.
+**Give `FlowLayout` a real cache** — `makeCache`/`updateCache` holding the computed rows and per-subview sizes, so `placeSubviews` reuses what `sizeThatFits` computed instead of redoing every chip measurement. Rows are recomputed from the cached sizes only when the max width changes, which it does more often than it looks: the proposal width and `bounds.width` frequently differ within a single pass. Chip measurement itself happens once per subview. Wrap rules and spacing defaults are unchanged.
 
-**Decompose `WorkBoardCardView.body`** into stable subviews — revision header, title row, live-status row, badge strip, footer/PR row — each `Equatable` over its own slice of the snapshot, so AttributeGraph skips subtrees whose inputs did not move. A status flip should re-lay-out the status row, not the card.
+**Decompose `WorkBoardCardView.body`** into stable subviews — revision header, title row, live-status row, badge strip, footer/PR row — each `Equatable` over its own slice of the snapshot, so AttributeGraph skips subtrees whose inputs did not move. A status flip re-lays-out the status row, not the card. Each subview is its own file (`WorkBoardCardRevisionHeader`, `WorkBoardCardTitleRow`, `WorkBoardCardLiveStatusRow`, `WorkBoardCardBadgeStrip`, `WorkBoardCardFooter`), and `WorkBoardCardView` is left a thin shell that composes the five with `.equatable()` and keeps only the card chrome — fill, border, shadow, hover. Closures stay outside every `==` surface, the badge strip's included. One layout detail is load-bearing: an empty footer is gated out entirely, or the enclosing `VStack` inserts a phantom spacing gap after the badge strip.
 
-**Make secondary UI lazy** — hover-only chips, popovers, and confirmation dialogs should not be constructed for idle cards.
+**Make secondary UI lazy** — the ~700-line `WorkCardPopoverView` should not sit in every idle card's graph.
+
+This is the one place the design over-reached. SwiftUI's presentation modifiers are not uniformly deferrable: `confirmationDialog` and `sheet` need to be _installed_ before their binding flips false→true, and mounting one already-true is intermittently unreliable. So only the selection popover is attached on demand (via `lazyWorkCardSelectionPopover`, gated on `snapshot.isSelected`, with the presented binding reading live model selection so dismiss and re-read stay consistent). The delete confirmation, the merge-when-ready confirmation, and the popover's repo-picker sheet all stay permanently attached, each with a comment at the site saying why. Their idle cost is one unpresented presentation node per card, which is the price of them working at all. The repo-picker sheet has a second reason to stay put: nested inside the popover content, it inherits the popover's window context, and closing it returns focus where the user expects.
+
+Always-visible badge chips — the terminal button, the merge-button chrome — were considered for hover-gating and deliberately left alone: they are permanent scanning affordances, and hiding them until hover is a UX change, not a performance change.
 
 ### A note on what "success" will look like in the sample
 
@@ -253,6 +295,17 @@ Consequently, for every entry in the breakdown whose gate is a sample:
 - **An agent that cannot get the numbers must say so and stop**, not substitute reasoning about why the change should be faster. "The change looks correct" is not a measurement, and this plan does not accept it as one.
 
 Entries 1, 2, 3, 5, 6, 7, 8, 9, 10, 11 and 16 all depend on a human capture. Entry 4 is the only in-scope entry that does not — it ships no behaviour change and gates entirely on unit tests, which is why it is the one place an agent can self-certify. Entries 12, 13, 14 and 15 are deferred and unscheduled; of those, only entry 15 has a gate that is not a `sample` at all — it is a CI signal, and it is the eventual way out of this whole dependency.
+
+### What actually happened to the captures
+
+**None of them were taken.** Every entry above shipped with its agent-side half complete — code, unit tests, `bazel build` / `bazel test` green, `checkleft` clean, and the written prediction the protocol asks for — and with its sample recorded in the PR as an unmet operator follow-up. The eleven code entries then landed within about three hours of each other.
+
+Two consequences, and the first is irreversible:
+
+- **The per-entry before/after pairs are no longer recoverable.** Entry 5's before-sample had to be taken on the state entry 5 landed onto; entries 6, 9 and 10 have since rewritten the same file. Nobody can now attribute a share of the win to a specific entry in the `WorkBoardCard.swift` chain. The per-entry attribution that motivated "do not batch captures on the serialised chain" was lost by shipping the chain faster than it could be measured, not by batching a capture.
+- **Entry 16 is therefore the only measurement this project will get,** and its scope grows accordingly: it is no longer a confirming whole-project number on top of eleven confirmed per-entry ones, it is the sole evidence that any of this worked. It is also the only remaining check on the possibility that a change made things worse — most plausibly entry 6, which by design moves snapshot construction into the column container on every model publish.
+
+This is the human-availability risk in the "Risks" section below, realised. It is worth stating plainly that the plan's own rule — "a task that cannot state its before/after numbers is not done" — was not enforceable against agent workers who correctly reported that they could not produce the numbers. The rule needed a scheduling mechanism behind it, and did not have one.
 
 ### The protocol itself
 
@@ -284,27 +337,37 @@ sample <Boss_pid> 60 -file /tmp/boss-after-<task>.txt
 
 ## Risks / open questions
 
-**The snapshot can go stale by omission.** If a field is added to `WorkTask` and rendered by the card but not added to `WorkCardSnapshot`, the card renders stale data — and it fails silently. Mitigation: the snapshot is built in one function with an exhaustive `switch`-free explicit field list, unit-tested against "same snapshot ⇒ same rendered inputs", and the builder lives next to the card so the diff that adds a rendered field touches it. This is a real ongoing maintenance cost and reviewers should weigh it against the win. It is the same trade `SegmentRowView` already took.
+**The snapshot can go stale by omission.** If a field is added to `WorkTask` and rendered by the card but not added to `WorkCardSnapshot`, the card renders stale data — and it fails silently.
 
-**Phase 1 moves work from the cards to the container.** After the change, the column container recomputes N snapshots per model publish even when nothing rendered changes. Snapshot construction must stay genuinely cheap or the fan-out is merely relocated. The Phase 0 counters plus the sample are what confirm which happened; if snapshot construction shows up hot, the answer is to make the container's recompute incremental (only for ids the update touched), which is a follow-up, not a redesign.
+The mitigation landed stronger than designed, and in a different place. `WorkCardSnapshotTests` carries a mirror classification gate (`testWorkTaskStoredPropertyClassificationIsExhaustive`) requiring every stored property on `WorkTask` to appear in either the rendered or the non-rendered list: adding a field without classifying it fails the suite. Two table-driven suites then hold the classification honest in both directions — every non-rendered field must preserve snapshot equality when it alone changes, and each of the 27 rendered fields must flip it, evaluated under a column context where that field is visible. That is a real test of the property, not a spot check, and it is the same trade `SegmentRowView` already took.
 
-**`.equatable()` is a correctness hazard if the conformance is wrong.** An `==` that returns `true` when a rendered input changed produces a card that never updates. The conformance must be derived from the snapshot alone, never hand-written per field.
+What did _not_ land as designed is the "builder lives next to the card" half. The builder is split: `WorkCardSnapshot.build(task:context:)` in `Models+WorkCardSnapshot.swift`, and the call site that assembles the context in `ChatViewModel.workCardSnapshot(...)` in `ChatViewModel+BoardHelpers.swift` — neither next to `WorkBoardCard.swift`. The classification gate is what makes that acceptable: proximity was only ever a way of catching the author's attention, and a failing test catches it more reliably.
 
-**Detaching `@ObservedObject` must not detach action dispatch.** The card still calls into the model. Holding a non-observing reference is intended and safe, but any code path that reads mutable model state _during_ body evaluation must be moved into the snapshot or it becomes an unobserved read — a stale-render bug that will not reproduce reliably.
+One deliberate classification is worth knowing about. `dispatchFailedReason` / `dispatchFailedError` / `dispatchFailedAt` are classified **non-rendered**, because the dispatch-failure banner is rendered by `WorkBoardCardItem` from the `WorkTask` directly rather than by the snapshot-driven card. That is consistent today — the item is rebuilt whenever the container recomputes — but it is one of the reasons the item still holds a full `WorkTask`, and it is the first thing to revisit if that changes.
+
+**Phase 1 moves work from the cards to the container.** This materialised, first by design and then by necessity. `WorkBoardSectionItemsView` observes `ChatViewModel` and `LiveWorkerStateStore` and recomputes N snapshots per publish, and entry 6's review confirmed it has to — dropping that observation left stale runtime text on Doing cards. Snapshot construction must therefore stay genuinely cheap or the fan-out is merely relocated, and **that is currently unverified**, because entry 16 has not run. If snapshot construction shows up hot, the answer is to make the container's recompute incremental (only for ids the update touched), which is a follow-up, not a redesign. It is the single most likely thing for the eventual capture to find.
+
+**`.equatable()` is a correctness hazard if the conformance is wrong.** An `==` that returns `true` when a rendered input changed produces a card that never updates. The conformance must be derived from the snapshot alone, never hand-written per field. It bit once, in the form the next paragraph describes — not a wrong `==`, but a rendered input that was never on the snapshot to be compared.
+
+**Detaching `@ObservedObject` must not detach action dispatch, and must not leave unobserved reads.** The card still calls into the model, and holding a non-observing reference for that is intended and safe. The hazard is reads: any mutable state consulted _during_ body evaluation has to move onto the snapshot, or it becomes invisible to `==` — a stale-render bug that will not reproduce reliably. `@Environment` counts, which the design did not say and implementation found out: `kanbanBoardStyle` was read straight from the environment inside the card body, so flipping the board style left already-mounted cards with stale chrome until something unrelated invalidated them. The rule as it now stands is: if the card renders it, it is a snapshot field, whatever kind of ambient plumbing it arrived through.
 
 **Terminal thread growth is unaddressed.** ~11 surfaces, 24 `CVDisplayLink` threads, 1.0–1.1 GB footprint. Out of scope here on the evidence, but the footprint number in the project description is not explained by anything in this plan.
 
-**Measurement is gated on human availability.** Every before/after number this plan depends on has to be captured by a person at the machine (see "Who runs this"). That is a real scheduling dependency, not a formality: an agent can land entry 5 in an afternoon and the task still cannot close until someone runs two 60-second samples. Batching captures — landing several independent entries and sampling once per batch — is tempting and is wrong for anything on the serialised `WorkBoardCard.swift` chain, where per-entry attribution is the whole point. It is acceptable for the depth-0 entries, which touch disjoint files.
+**Measurement is gated on human availability — and this is the risk that fired.** Every before/after number this plan depends on has to be captured by a person at the machine (see "Who runs this"). That was written as a scheduling dependency; in practice the code outran it completely. All eleven in-scope entries landed inside a single day with every capture unreturned, which cost the per-entry attribution on the `WorkBoardCard.swift` chain outright — not by batching captures, which the plan warned about, but by never taking them. Whatever this project is judged to have achieved now rests entirely on entry 16.
+
+**The counters have no in-app reader.** Entry 2 shipped `UIUpdateCounters` with a 128-entry ring and a documented JSON shape, but the only consumers are the `ui-update-rates` signpost and the unit tests. Entries 5, 6 and 10 all name "card body evaluations/sec" as their primary success signal, and reading it today means attaching Instruments or filtering the unified log — a heavier setup than the `MetricsViewer` / `UIStallsViewer` / `TerminalLoopViewer` surfaces this app already has for comparable diagnostics. It is a plausible contributor to why no capture came back.
 
 **Open questions for a human.** The still-open ones — 2 and 3 — are also filed as a questions manifest alongside this doc (`boss-ui-performance-improvements.attentions.json`), which the engine reads to raise them inline in the design-doc viewer. Question 1 is answered and is therefore **not** in the manifest; it is kept here, struck through, only so the numbering that the entries below cite stays stable.
 
 1. ~~**Stall monitor disposition.**~~ **Answered in review.** Keep the monitor in release, defer symbolication so it is cheap, and add a Settings toggle that **defaults to off** — the reviewer's reasoning being that UI stalls rarely need debugging, so the default build should not pay for the watchdog. Debug-build gating remains rejected. Folded into entry 1; no longer blocking Phase 0.
-2. **Is off-main CPU in scope?** The goal says main-thread CPU. The `consumeLines` buffer-scan and engine JSON-decode findings above are both real and both off-main, and are currently tagged deferred on that basis (entries 12 and 13). If the real concern is the process sitting at 25–90% CPU overall, they should be promoted.
+2. **Is off-main CPU in scope?** Still open, and now narrowed rather than answered. The goal says main-thread CPU; the `consumeLines` buffer-scan and engine JSON-decode findings are both real and both off-main, and are tagged deferred on that basis (entries 12 and 13). Entry 11's investigation ([`firstindex-hot-leaf-attribution-2026-07-26.md`](../investigations/firstindex-hot-leaf-attribution-2026-07-26.md)) removed the ambiguity in the premise — the leaf is definitely the socket byte scan on `Boss.EngineClient`, definitely not `applyWorkTree` — and recommends keeping entry 12 deferred unless this question is answered "total process CPU". What remains is purely the product decision, which only a human can make.
 3. **Is the 1.0–1.1 GB footprint in scope?** Named in the project description, absent from the goal, and not addressed by anything here.
 
-## Proposed implementation task breakdown
+## Implementation task breakdown
 
-Sixteen entries. Dependency depth and parallelism are called out per entry; file-overlap serialisation is called out where it is real.
+Sixteen entries. Dependency depth and parallelism are called out per entry; file-overlap serialisation is called out where it is real. Each in-scope entry carries a **Shipped** line recording the PR that closed it and how the landed change differed from the entry as written; the ladder itself is preserved as planned, because the plan was followed.
+
+Several entries shipped as two PRs where the design described one piece of work. That was a deliberate reviewability split, not scope drift, and it is noted per entry.
 
 **Read the measurement protocol's "Who runs this" section before scheduling any of these.** Where an entry's **Metric** names sample counts, that metric is captured by a human, not by the agent implementing the entry — agents must not launch Boss.app. The implementing agent lands the code, keeps `bazel build` / `bazel test` green, and writes down which numbers the change should move and in which direction; a person captures the before/after pair and returns them. Entries whose metric needs no capture say so explicitly.
 
@@ -327,7 +390,8 @@ Two complementary halves, both from the review decision on open question 1.
 - **Files:** `Sources/Diagnostics/MainThreadBacktrace.swift`, `Sources/Diagnostics/MainThreadStallMonitor.swift`, `Sources/Diagnostics/StallLog.swift`, `Sources/Diagnostics/UIStallsViewer.swift`, `Sources/BossMacApp.swift`, plus the settings view and its defaults store
 - **Metric — human capture required** (see "Who runs this"): three readings, per the exemption this entry holds from the "both samples agree on the setting" rule. **Before**, on the unmodified build where the monitor is unconditionally on: `MainThreadStallMonitor` inclusive samples and `dyld3::MachOLoaded::findClosestSymbol` top-of-stack (document baselines 3166 — ~7% of window — and 2552, for orientation only; the entry's own before-sample is what it reports against). **After, monitor on:** target both under 300. **After, monitor off** (the new default): both must be **zero**, and that is the most important of the three. The agent-side gate is unit tests over `isIdleEventLoopStack` as a pure address/range function, and that flipping the setting starts and stops the monitor.
 - **Functional check (human):** recorded stalls still appear in the UI Stalls window with correct symbols after the change, with the setting on.
-- Scope: in-scope
+- **Shipped:** mono#2397 (cheap capture) and mono#2407 (default-off toggle), split for reviewability. Two divergences. The durable JSONL keeps writing symbolicated `backtrace` strings alongside hex `frame_addresses`, because raw ASLR addresses are unresolvable once the process is gone — the deferral is on the watchdog path, not the write path. And the backstop became a record-rate floor (`Config.minRecordIntervalMs`, 100 ms) checked before `recordedBeat` commits, rather than a symbolication-frequency floor. The toggle landed in Settings → Feature Flags (App/local section) as `boss.uiStalls.monitoring`, not as a new general-Settings control. All three sample readings are outstanding.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 2. Add dev-visible UI update counters
 
@@ -337,7 +401,8 @@ Add counters on the existing `PopulationTimingLog` / `os_signpost` rails: `apply
 - **Dependencies:** none — runs in parallel with entry 1
 - **Files:** `Sources/Diagnostics/PopulationTimingLog.swift` (or a sibling), `Sources/ChatViewModel+WorkItemEvents.swift`, `Sources/EngineClient.swift`
 - **Metric — human capture required:** counters emit under load and read zero at idle; overhead below noise in a 60 s sample (no new symbol above 50 inclusive samples). The agent-side gate is unit tests over the counter accumulation and flush logic; only the on-device reading and the overhead confirmation need a person.
-- Scope: in-scope
+- **Shipped:** mono#2395 (the counter primitive) and mono#2400 (wiring into `applyWorkTree`, `applyIncrementalTaskUpdate`, `EngineClient.emit`, `WorkBoardCardView.body`, plus starting the 1 Hz flush at launch). It landed as `Sources/Diagnostics/UIUpdateCounters.swift` — a sibling of `PopulationTimingLog` on the same signposter, not a change to it. The engine-event counter deliberately increments **on main-actor delivery**, not on client-queue enqueue, which is what made entry 7's batching legible as a counter drop rather than invisible. No in-app reader exists for the ring; the signpost is the only read surface today.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 3. Give `FlowLayout` a layout cache
 
@@ -348,7 +413,8 @@ Replace `cache: inout Void` with a real `makeCache`/`updateCache` holding comput
 - **Files:** new `Sources/FlowLayout.swift`, `Sources/WorkBoardCard.swift` (deletion only)
 - **Ordering note:** lands before entries 5, 6 and 9, which rewrite `WorkBoardCard.swift` substantially. Landing it first keeps the deletion trivial to rebase.
 - **Metric — human capture required:** `sizeThatFits` inclusive samples, baseline 5108; `placeChildren` baseline 4874. Expected to move both; report each.
-- Scope: in-scope
+- **Shipped:** mono#2393 (pure extraction, no behaviour change) then mono#2399 (the cache). Splitting the move from the rewrite was the right call for exactly the reason the ordering note gives — the extraction had to be trivially rebasable ahead of the `WorkBoardCard.swift` chain. The cache holds per-subview sizes measured once plus the rows for the last max width used, and recomputes rows when the max width changes, which happens more often than expected because the proposal width and `bounds.width` routinely differ inside one pass.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 4. Introduce `WorkCardSnapshot`
 
@@ -358,7 +424,8 @@ Add a small `Equatable` value type holding exactly the fields `WorkBoardCardView
 - **Dependencies:** none — runs in parallel with entries 1, 2 and 3
 - **Files:** new `Sources/Models+WorkCardSnapshot.swift`, `Tests/BossTests/`
 - **Metric — no capture needed:** no runtime metric; this entry ships no behaviour change. Gate is unit tests asserting that two `WorkTask`s differing only in non-rendered fields produce equal snapshots, and that every rendered field is covered. The only in-scope entry an implementing agent can close on its own.
-- Scope: in-scope
+- **Shipped:** mono#2396 (types and builder) and mono#2402 (exhaustive equality coverage). It landed as three types rather than one — `WorkCardSnapshot`, `WorkCardSnapshotContext` for already-resolved per-card inputs, and `WorkCardRevisionRollup` for nested rollup rows — with `Equatable` added to `AgentActivityState` and `EngineRevisionOrigin` so they could sit on the snapshot. The test half grew past what this entry asked for: as well as the equality assertions, it enforces that every stored property on `WorkTask` is explicitly classified rendered or non-rendered, which is what actually protects against the stale-by-omission risk. This is the only entry that closed on its own gate, exactly as predicted.
+- Scope: in-scope — **landed and closed**
 
 ### 5. `WorkBoardCardView` consumes the snapshot and conforms to `Equatable`
 
@@ -368,7 +435,9 @@ Change the card's inputs from ~35 loose parameters (including the 45-field `Work
 - **Dependencies:** entry 4 (`WorkCardSnapshot`); lands after entry 3
 - **Files:** `Sources/WorkBoardCard.swift`, `Sources/ContentView.swift`
 - **Metric — human capture required:** `WorkTask.==` inclusive samples, baseline 1991; `__derived_struct_equals` baseline 2110; `outlined init with copy of` / `outlined destroy of` baseline 1800. Plus card body evaluations/sec from entry 2.
-- Scope: in-scope
+- **Shipped:** mono#2403. Three things settled during review. `boardStyle` moved out of `@Environment` and onto the snapshot, because an environment read inside `body` is invisible to `.equatable()` and left mounted cards with stale chrome after a board-style flip. `gatingPrereqs` went the other way — it stays off the snapshot, with only the derived `autoBlockTooltip` participating in equality, so prereq-id churn with an unchanged tooltip costs nothing. And `hasReviewRow` was pinned to the pre-snapshot semantics (`prURL != nil`, not non-empty) so an empty-string PR URL still reserves the review-indicator row. `RevisionRollupLine` now takes `WorkCardRevisionRollup`, completing the removal of `WorkTask` from the card's render path.
+- **Residual:** `WorkBoardCardItem` — the wrapper, not the `.equatable()` card — still stores a full `WorkTask`, for `task.id`, `shortID`, `name`, `prURL`, the dispatch-failure banner, and the popover's `WorkCardPopoverView(model:task:)`. The 45-field compare surface is out of the card but not out of the board's view tree.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 6. Detach the card from whole-`ChatViewModel` observation
 
@@ -379,7 +448,9 @@ Remove `@ObservedObject var model: ChatViewModel` and `@ObservedObject var liveS
 - **Files:** `Sources/WorkBoardCard.swift`, `Sources/ContentView.swift`
 - **Ordering note:** substantial co-edit with entry 5 in both files. Must land after it and forward-port entry 5's changes preservingly — integrate, never revert.
 - **Metric — human capture required:** card body evaluations/sec from entry 2 is the primary signal — expect a large drop under a load that publishes non-board state (streaming transcript, engine metrics). Plus `AG::Graph` inclusive, baseline 18923, and main-thread on-CPU samples, baseline ~24950. This entry carries the plan's headline win, so its capture is the one least worth batching with anything else.
-- Scope: in-scope
+- **Shipped:** mono#2412. The card detached as designed; the container did not, and could not. A first pass left `WorkBoardSectionItemsView` non-observing too, which broke live updates — snapshot inputs sourced from `taskRuntime` / `taskRuntimesByID`, selection, highlight ids, and the drag/merge notices stopped recomputing, so Doing cards held stale "Queued"/slot text until an unrelated invalidation. The container was given `@ObservedObject var model` (and `liveStates`) in review, which is the design's own "work moves to the container" trade taken knowingly. Two supporting extractions landed with it: `ChatViewModel.workCardSnapshot(...)` centralises snapshot construction, and `WorkCardLiveStatus.resolve(...)` is a pure live-status helper with an injectable `now`, unit-tested across the dispatch-pending, dispatcher-wait, recovery and non-Doing paths. Gating `liveStates` observation to Doing columns was considered and left alone — non-Doing snapshots ignore live state and `.equatable()` already skips them.
+- **Capture note:** this entry carried the headline win and is precisely the one whose isolated before/after was lost when entries 9 and 10 landed on top of it hours later.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 7. Batch engine→UI event delivery
 
@@ -390,7 +461,8 @@ Replace the per-event `Task { @MainActor in ... }` in `EngineClient.emit` with a
 - **Files:** `Sources/EngineClient.swift`, `Sources/ChatViewModel+EventHandling.swift`
 - **Parallelism:** independent of entries 3–6; may run alongside them
 - **Metric — human capture required:** main-actor deliveries/sec from entry 2; `EngineClient` main-thread inclusive samples, baseline 1486 of 3747 total.
-- Scope: in-scope
+- **Shipped:** mono#2401, as designed and with no divergence. Events enqueue under an unfair lock; the first enqueue onto an empty queue schedules exactly one main-actor task, which drains FIFO and re-checks the queue so events arriving mid-drain join the same turn. The counter still increments per delivery, not per enqueue, so the batching shows up as fewer main-actor turns rather than as a counter that quietly stops counting. `ChatViewModel+EventHandling` documents that `handle` may now run N times back-to-back inside one drain; routing is unchanged, and the 150 ms `scheduleWorkTreeRefetch` debounce was left alone as intended.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 8. Make work-cache invalidation targeted
 
@@ -400,7 +472,8 @@ Replace the blanket `invalidateWorkCache()` — which drops ten caches on every 
 - **Dependencies:** entry 7
 - **Files:** `Sources/ChatViewModel.swift`, `Sources/ChatViewModel+WorkItemEvents.swift`, `Sources/ChatViewModel+BoardHelpers.swift`
 - **Metric — human capture required:** `ChatViewModel.*` inclusive samples, baseline 2344; `applyWorkTree` baseline 1219. Correctness gate is the agent's and is explicit: a task update that changes project membership, kind, or a dependency edge must still fully invalidate — cover each in unit tests.
-- Scope: in-scope
+- **Shipped:** mono#2409. The keying is finer-grained than the entry describes in one direction and coarser in another. Because every bucket `didSet` routed through the blanket drop, the change needed `withSuppressedWorkCacheInvalidation` so `applyIncrementalTaskUpdate` can mutate buckets and then apply keys itself. And "when edges or revision rows actually change" turned out to mean more than structure: the dependency caches also drop on a **name** change, because `WorkDependencyRow` bakes prerequisite titles in at rebuild time, and the revision caches drop on **any** field change to a revision row, because the rollups store whole `WorkTask` values. The correctness gate held as specified. The work also fixed a latent, unrelated bug it exposed: bucket eviction used `dict[key]?.removeAll`, a no-op on `Array` values, and only scanned the current product key, so a product flip could strand a twin row under the old one.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 9. Decompose `WorkBoardCardView.body` into stable subviews
 
@@ -411,7 +484,8 @@ Split the ~340-line body (`Sources/WorkBoardCard.swift:649-987`) into revision h
 - **Files:** `Sources/WorkBoardCard.swift`, new sibling files per subview
 - **Ordering note:** rewrites the same file as entries 5 and 6; strictly after both.
 - **Metric — human capture required:** `sizeThatFits` baseline 5108, `StackLayout` baseline 5053, `placeChildren` baseline 4874, `AG::Graph` baseline 18923. Note explicitly: `WorkBoardCardView`'s own samples (364) are **not** the success metric — the body getter is cheap, the tree it returns is not.
-- Scope: in-scope
+- **Shipped:** mono#2413, with the five-way split exactly as named, one file per subview. `WorkBoardCardView` is now a thin shell holding only card chrome. Slice-isolation unit tests assert the intended behaviour directly — a live-status flip, a rename, a priority change, a PR row appearing, revision-header gating, and the badge strip ignoring closure identity each invalidate only their own slice. One layout trap surfaced: an empty footer has to be gated out entirely, or the enclosing `VStack` leaves a phantom spacing gap after the badge strip.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 10. Make secondary card UI lazy
 
@@ -421,7 +495,8 @@ Stop constructing hover-only chips, popovers, and confirmation dialogs for idle 
 - **Dependencies:** entry 9
 - **Files:** `Sources/WorkBoardCard.swift`, `Sources/WorkCardPopover.swift`
 - **Metric — human capture required:** `AG::Graph` inclusive and card body evaluations/sec, measured on an idle board with no pointer over any card. The "no pointer over any card" condition is itself a reason this cannot be automated or agent-run.
-- Scope: in-scope
+- **Shipped:** mono#2416, at roughly a quarter of the entry's scope, and that ceiling is a SwiftUI constraint rather than a decision. Only the selection popover is attached on demand — `lazyWorkCardSelectionPopover`, gated on `snapshot.isSelected`, with the presented binding reading live model selection so dismiss and re-read agree. That is the ~700-line `WorkCardPopoverView` out of every idle card's graph, which was the entry's main target. **The confirmation dialogs and the repo-picker sheet stay permanently attached:** `confirmationDialog` and `sheet` must be installed before their binding flips false→true, and mounting one already-true fails intermittently. A first pass made all of them lazy and was walked back inside the same PR once that surfaced. The repo-picker sheet has a second reason to stay nested in the popover content — it inherits the popover's window context, and closing it returns focus there. Their residual idle cost is one unpresented presentation node per card. Hover-gating the always-visible terminal and merge chips was considered and dropped: they are permanent scanning affordances, so hiding them is a UX change, not a performance one.
+- Scope: in-scope — **landed, unmeasured**
 
 ### 11. Investigate: attribute the `firstIndex(of:)` hot leaf
 
@@ -431,7 +506,8 @@ Confirm or refute that `specialized Collection<>.firstIndex(of:) (in Boss)` — 
 - **Dependencies:** none — runs in parallel with everything
 - **Files:** new `tools/boss/docs/investigations/` note
 - **Metric — human capture required:** a targeted sample with the leaf attributed to a named thread and call site; no code change to measure. Note the shape of this entry: an agent can do the static half — enumerate the call sites, read `consumeLines()`, and write the note's argument — but the sample that confirms or refutes it has to come from a person. Split it that way rather than dispatching an agent at the whole thing; the static half already exists in the "Findings" section above and only needs the capture to close.
-- Scope: in-scope
+- **Shipped:** mono#2394 — [`firstindex-hot-leaf-attribution-2026-07-26.md`](../investigations/firstindex-hot-leaf-attribution-2026-07-26.md). Confirmed, and it upheld this document's reading over the distilled baseline's: the leaf is the newline scan at `EngineClient.swift:189` in `consumeLines()`, on the `Boss.EngineClient` serial queue, off the main thread. The `applyWorkTree` / `ChatViewModel` paths use `firstIndex(where:)`, a different specialisation, so they cannot be the source. The note recommends keeping entry 12 deferred for a main-thread-CPU goal — correcting the attribution does not move the cost onto the main thread. The static half is closed; the confirming capture is not.
+- Scope: in-scope — **static half landed; capture outstanding**
 
 ### 12. Reduce the `EngineClient` receive-buffer scan cost
 
@@ -440,7 +516,7 @@ Replace the repeated `firstIndex(of: 0x0A)` scan plus O(n) `removeSubrange` per 
 - **Effort:** small
 - **Dependencies:** entry 11
 - **Metric:** `firstIndex(of:)` top-of-stack, baseline 278; `consumeLines()` inclusive, baseline 940 on `DispatchQueue_129`.
-- Scope: deferred (future / not a v1 blocker) — off the main thread, so it does not advance the stated goal of cutting main-thread CPU. Promote if open question 2 is answered "total process CPU".
+- Scope: deferred (future / not a v1 blocker) — off the main thread, so it does not advance the stated goal of cutting main-thread CPU. Promote if open question 2 is answered "total process CPU". Entry 11's investigation confirmed the attribution and explicitly recommended holding the deferral, so this is now waiting on the product decision alone, not on any further analysis.
 
 ### 13. Reduce engine event JSON decode volume
 
@@ -479,7 +555,8 @@ Capture the full before/after comparison across the landed work under one contro
 - **Dependencies:** entries 1, 2, 3, 5, 6, 7, 8, 9, 10 — every in-scope entry that lands a behaviour change, including entry 2, whose counters this entry reports. Entry 4 comes along transitively through 5; entry 11 is an investigation with no landed change to measure.
 - **Files:** new `tools/boss/docs/investigations/` or `postmortems/` report
 - **Metric:** the full protocol, against a clean before-sample captured with no menu or popover open — explicitly **not** against the numbers in this document, which carry ~11% modal-loop contamination. Both samples with stall monitoring in the same state; record which.
-- Scope: in-scope
+- **Status: outstanding, and its role has changed.** This entry was scoped as the independent whole-project number sitting on top of eleven confirmed per-entry ones. None of those captures happened, so it is now the **only** measurement this project will produce — the sole evidence that the work achieved anything, and the only check on whether any part of it regressed. Two practical consequences for whoever runs it. First, the before-sample cannot be taken any more: every in-scope change is already on `main`, so what is available is an after-sample compared against the 2026-07-25 baseline, contamination and all — which the baseline discipline above explicitly forbids as a comparison basis. The honest options are to sample a build at the pre-project commit as the before, or to state plainly that the comparison is against a contaminated baseline and treat only large movements as signal. Second, since per-entry attribution is gone, a disappointing result cannot be pinned on an entry from the numbers alone; the first hypothesis to test is the container-side snapshot rebuild described under entry 6.
+- Scope: in-scope — **not started**
 
 ---
 
@@ -493,3 +570,5 @@ Capture the full before/after comparison across the landed work under one contro
 - **Serialised on `WorkBoardCard.swift`:** 3 → 5 → 6 → 9 → 10. These five substantially co-edit that file and must land in that order, each forward-porting its predecessors preservingly.
 - **Final:** 16 (verification sweep), after every in-scope entry that lands a behaviour change — 1, 2, 3, 5, 6, 7, 8, 9, 10.
 - **Off the ladder:** 12, 13 and 15 are deferred and unscheduled (14 is deferred too, but is listed at depth 0 above because it depends on nothing). 15 would come after 16, since it needs the sweep's numbers to calibrate its threshold.
+
+**How it actually ran.** The ladder was followed exactly — the serialised `WorkBoardCard.swift` chain landed 3 → 5 → 6 → 9 → 10 in order, each forward-porting its predecessors, and the concurrent legs (1, 2 → 7 → 8, 4, 11) landed alongside as planned. What the plan did not anticipate is the pace: all eleven in-scope code entries merged on 2026-07-26, most within a three-hour window. The dependency graph was sound and the parallelism analysis was accurate; what it lacked was a rate limit tied to the one input the graph could not schedule — a person at the machine with `sample` running.
