@@ -52,9 +52,17 @@ test --sandbox_default_allow_network=false
 
 # Bazel's macOS sandbox profile always permits writes to shared host temp and
 # cache directories. Run repository-owned test code under the stricter profile
-# in hermetic_test_wrapper instead. Linux retains Bazel's linux-sandbox, which
-# supplies its own mount and network namespaces.
+# in hermetic_test_wrapper instead.
 test:macos --strategy=TestRunner=local
+
+# Linux test actions must use the namespace-capable sandbox. Naming the
+# strategy explicitly prevents Bazel from silently falling back to
+# processwrapper-sandbox, which provides neither a mount boundary nor a network
+# namespace. /tmp is a per-action tmpfs so the wrapper can give Unix sockets a
+# short path without exposing the host's shared temporary directory. If the
+# agent cannot provide linux-sandbox, test execution fails closed.
+test:linux --strategy=TestRunner=linux-sandbox
+test:linux --sandbox_tmpfs_path=/tmp
 
 # Bazel's own test/XML wrappers need the static host PATH before the test
 # binary starts. This run-under wrapper removes that PATH at the user-code
@@ -69,6 +77,9 @@ test --test_env==ANTHROPIC_API_KEY
 test --test_env==OPENAI_API_KEY
 test --test_env==GITHUB_TOKEN
 test --test_env==GH_TOKEN
+test --test_env==BOSS_SHAKE_APP_ID
+test --test_env==BOSS_SHAKE_INSTALLATION_ID
+test --test_env==BOSS_SHAKE_PRIVATE_KEY_PEM
 
 
 # Import ci-specific configuration.

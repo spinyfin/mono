@@ -59,3 +59,14 @@ sh_test(
         ":hermetic_test_wrapper",
     ],
 )
+
+sh_test(
+    name = "linux_policy_source_test",
+    size = "small",
+    srcs = ["linux_policy_source_test.sh"],
+    data = [
+        ":defs.bzl",
+        ":hermetic_test_wrapper.sh",
+        "//:.bazelrc",
+    ],
+)

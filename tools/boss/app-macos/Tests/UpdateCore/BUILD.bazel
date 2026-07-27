@@ -4,6 +4,16 @@ load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
 package(default_visibility = ["//visibility:private"])
 
+config_setting(
+    name = "coverage_enabled",
+    values = {"collect_code_coverage": "true"},
+)
+
+_COVERAGE_LINKOPTS = select({
+    ":coverage_enabled": ["-fprofile-instr-generate"],
+    "//conditions:default": [],
+})
+
 macos_unit_test(
     name = "UpdateTests",
     size = "small",
@@ -18,6 +28,7 @@ swift_library(
     testonly = True,
     srcs = glob(["*.swift"]),
     copts = [],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "UpdateTests",
     deps = ["//tools/boss/app-macos/Sources/UpdateCore"],
 )

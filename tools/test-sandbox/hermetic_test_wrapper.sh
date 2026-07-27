@@ -9,7 +9,14 @@ set -euo pipefail
 # environment variables cannot enable it for another test action.
 cleanup_supervisor="${TEST_SRCDIR:?}/${TEST_WORKSPACE:?}/tools/test-sandbox/cleanup_guard_test"
 if [[ "$#" -gt 0 && -x "${cleanup_supervisor}" && "$1" -ef "${cleanup_supervisor}" ]]; then
-  unset ANTHROPIC_API_KEY OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN
+  unset \
+    ANTHROPIC_API_KEY \
+    OPENAI_API_KEY \
+    GITHUB_TOKEN \
+    GH_TOKEN \
+    BOSS_SHAKE_APP_ID \
+    BOSS_SHAKE_INSTALLATION_ID \
+    BOSS_SHAKE_PRIVATE_KEY_PEM
   exec "$@"
 fi
 
@@ -35,12 +42,16 @@ if [[ ! -d "${runtime_bin}" || ! -f "${runtime_manifest}" || ! -f "${developer_d
   exit 126
 fi
 
-if [[ "${OSTYPE:-}" == darwin* ]]; then
+if [[ "${OSTYPE:-}" == darwin* || "${OSTYPE:-}" == linux* ]]; then
+  # On Linux, .bazelrc makes /tmp a per-action linux-sandbox tmpfs. This keeps
+  # Unix-domain socket paths well below sockaddr_un.sun_path without exposing
+  # a shared host temp directory. macOS protects the same private directory
+  # with the generated Seatbelt profile below.
   test_tmpdir="$("${runtime_bin}/mktemp" -d /tmp/mono-test.XXXXXX)"
   owns_test_tmpdir=1
 else
-  test_tmpdir="${TEST_TMPDIR:?}"
-  owns_test_tmpdir=0
+  printf 'unsupported test sandbox host: %s\n' "${OSTYPE:-unknown}" >&2
+  exit 126
 fi
 
 export TEST_TMPDIR="${test_tmpdir}"
@@ -61,7 +72,14 @@ fi
 # the registered local Apple toolchain.
 export PATH="${xcode_bin}:${runtime_bin}"
 
-unset ANTHROPIC_API_KEY OPENAI_API_KEY GITHUB_TOKEN GH_TOKEN
+unset \
+  ANTHROPIC_API_KEY \
+  OPENAI_API_KEY \
+  GITHUB_TOKEN \
+  GH_TOKEN \
+  BOSS_SHAKE_APP_ID \
+  BOSS_SHAKE_INSTALLATION_ID \
+  BOSS_SHAKE_PRIVATE_KEY_PEM
 
 child_pid=""
 
@@ -180,6 +198,7 @@ fi
     "${TEST_UNDECLARED_OUTPUTS_DIR:-}"
     "${TEST_UNDECLARED_OUTPUTS_ANNOTATIONS_DIR:-}"
     "${COVERAGE_DIR:-}"
+    "${COVERAGE_OUTPUT_FILE:-}"
     "${XML_OUTPUT_FILE:-}"
     "${TEST_SHARD_STATUS_FILE:-}"
     "${TEST_PREMATURE_EXIT_FILE:-}"

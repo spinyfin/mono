@@ -27,7 +27,15 @@ fn assert_write_denied(path: &Path) {
 
 #[test]
 fn credentials_and_host_tools_are_not_in_the_test_environment() {
-    for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
+    for key in [
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "BOSS_SHAKE_APP_ID",
+        "BOSS_SHAKE_INSTALLATION_ID",
+        "BOSS_SHAKE_PRIVATE_KEY_PEM",
+    ] {
         assert!(env::var_os(key).is_none(), "{key} reached repository-owned test code");
     }
 
@@ -49,6 +57,30 @@ fn credentials_and_host_tools_are_not_in_the_test_environment() {
             "{forbidden_binary} is reachable through the declared test PATH"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_private_temp_root_is_short_and_action_private() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let private_root = env::var_os("TEST_TMPDIR").expect("Bazel must set TEST_TMPDIR");
+    let private_root = Path::new(&private_root);
+    assert!(
+        private_root.starts_with("/tmp/mono-test."),
+        "Linux TEST_TMPDIR must live in the per-action /tmp tmpfs: {}",
+        private_root.display()
+    );
+    assert!(
+        private_root.as_os_str().as_bytes().len() + "/tmp/engine.sock".len() < 108,
+        "Linux TEST_TMPDIR is too long for sockaddr_un.sun_path: {}",
+        private_root.display()
+    );
+    assert_eq!(
+        env::var_os("TMPDIR").as_deref(),
+        Some(private_root.join("tmp").as_os_str()),
+        "TMPDIR must be nested directly beneath the short private root"
+    );
 }
 
 #[cfg(target_os = "macos")]

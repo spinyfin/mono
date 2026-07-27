@@ -3,6 +3,16 @@ load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
 load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
+config_setting(
+    name = "coverage_enabled",
+    values = {"collect_code_coverage": "true"},
+)
+
+_COVERAGE_LINKOPTS = select({
+    ":coverage_enabled": ["-fprofile-instr-generate"],
+    "//conditions:default": [],
+})
+
 package(default_visibility = ["//visibility:private"])
 
 exports_files([
@@ -127,6 +137,7 @@ swift_library(
     testonly = True,
     srcs = _COMMENTS_TRANSCRIPT_SHARD_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsCommentsTranscript",
     deps = [":boss_mac_app_lib"],
 )
@@ -145,6 +156,7 @@ swift_library(
     testonly = True,
     srcs = _SHARD1_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard1",
     deps = [":boss_mac_app_lib"],
 )
@@ -163,6 +175,7 @@ swift_library(
     testonly = True,
     srcs = _SHARD2_SRCS,
     copts = ["-DTEXTUAL_ENABLE_TEXT_SELECTION"],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard2",
     deps = [":boss_mac_app_lib"],
 )
@@ -207,6 +220,7 @@ swift_library(
         "-DTEXTUAL_ENABLE_TEXT_SELECTION",
         "-DBOSS_BAZEL_TEST_BUILD",
     ],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "BossTestsShard3",
     deps = [":boss_mac_app_lib"],
 )
