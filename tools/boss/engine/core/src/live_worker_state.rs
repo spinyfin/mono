@@ -176,6 +176,7 @@ impl LiveWorkerStateRegistry {
     /// must call [`Self::register_spawn_with_capabilities`] instead, so the
     /// capability travels with registration rather than depending on a
     /// second call that a future call site could forget.
+    #[track_caller]
     pub fn register_spawn(
         &self,
         slot_id: u8,
@@ -215,7 +216,20 @@ impl LiveWorkerStateRegistry {
     /// (slot/run/model/pid/binding/capability) predate this method's
     /// routing stamp, and collapsing them further would obscure the
     /// call site. Routing is already a struct to absorb pool + kind.
+    ///
+    /// Registration is traced, mirroring [`Self::release_slot`]'s removal
+    /// trace. This registry is the *only* thing `bossctl agents list`
+    /// renders, so "was this run ever listed, and for how long?" is a
+    /// question operators ask of the engine trace after the fact. Removal
+    /// was already greppable; registration was not, so the trace could
+    /// show a slot being cleared with no record that it was ever occupied
+    /// — and a run that never appeared in `agents list` was
+    /// indistinguishable from one that appeared and was cleared
+    /// milliseconds later. `#[track_caller]` names the spawn path
+    /// (production dispatch vs. the remote-worker lazy registration)
+    /// without threading a reason through every call site.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn register_spawn_with_capabilities(
         &self,
         slot_id: u8,
@@ -226,6 +240,7 @@ impl LiveWorkerStateRegistry {
         awaiting_input_capable: bool,
         routing: LiveSpawnRouting,
     ) {
+        let caller = std::panic::Location::caller();
         let state = LiveWorkerState::new_spawning_with_routing(
             slot_id,
             run_id,
@@ -234,6 +249,18 @@ impl LiveWorkerStateRegistry {
             binding,
             routing.pool,
             routing.kind,
+        );
+        tracing::info!(
+            slot_id,
+            run_id = %state.run_id,
+            model = %state.model,
+            shell_pid = state.shell_pid,
+            pool = state.pool.as_deref().unwrap_or("-"),
+            kind = state.kind.as_deref().unwrap_or("-"),
+            work_item_id = state.work_item_id.as_deref().unwrap_or("-"),
+            awaiting_input_capable,
+            registered_by = %caller,
+            "live-state registry: slot entry registered; run is now visible to `bossctl agents list`",
         );
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         guard.by_slot.insert(slot_id, state);

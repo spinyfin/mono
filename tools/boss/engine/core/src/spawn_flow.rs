@@ -811,6 +811,225 @@ mod tests {
         assert_eq!(spawn_calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Sink that swallows every decoded progress envelope. The codex
+    /// live-state tests care that the file ingress can be *prepared and
+    /// activated* inside `start_worker`, not what it eventually decodes.
+    struct NoopEventSink;
+
+    #[async_trait::async_trait]
+    impl crate::stdout_progress::WorkerEventSink for NoopEventSink {
+        async fn dispatch_worker_event(&self, _incoming: crate::events_socket::IncomingHookEvent) {}
+    }
+
+    /// Spawner that wires the two production collaborators `StubSpawner`
+    /// leaves at their trait defaults: a real [`LiveWorkerStateRegistry`]
+    /// and a real [`crate::agent_jsonl_progress::AgentJsonlProgressManager`].
+    ///
+    /// Both are what a byte-stream driver actually exercises — the file
+    /// ingress is prepared *before* the pane request and the live-state
+    /// entry is stamped *after* it, so a driver whose ingress preparation
+    /// fails never reaches registration at all. Testing Codex against the
+    /// default no-op implementations would silently skip exactly the
+    /// ordering that matters.
+    struct LiveStateSpawner {
+        registry: WorkerRegistry,
+        live_states: LiveWorkerStateRegistry,
+        jsonl: crate::agent_jsonl_progress::AgentJsonlProgressManager,
+        slot_id: u8,
+        shell_pid: i32,
+        spawn_calls: Arc<AtomicUsize>,
+    }
+
+    impl LiveStateSpawner {
+        fn new(slot_id: u8, shell_pid: i32) -> Self {
+            Self {
+                registry: WorkerRegistry::new(),
+                live_states: LiveWorkerStateRegistry::new(),
+                jsonl: crate::agent_jsonl_progress::AgentJsonlProgressManager::new(),
+                slot_id,
+                shell_pid,
+                spawn_calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkerSpawner for LiveStateSpawner {
+        async fn send_to_app_request(
+            &self,
+            _request: EngineToAppRequest,
+            _timeout: Duration,
+        ) -> Result<EngineToAppResponse, SendToAppError> {
+            self.spawn_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(EngineToAppResponse::SpawnWorkerPane {
+                result: Ok(SpawnWorkerPaneResult {
+                    slot_id: self.slot_id,
+                    shell_pid: self.shell_pid,
+                }),
+            })
+        }
+
+        fn worker_registry(&self) -> &WorkerRegistry {
+            &self.registry
+        }
+
+        fn live_worker_state_registry(&self) -> Option<&LiveWorkerStateRegistry> {
+            Some(&self.live_states)
+        }
+
+        fn prepare_progress_ingress(
+            &self,
+            run_id: &str,
+            driver: Arc<dyn AgentDriver>,
+            ingress: ProgressIngress,
+        ) -> Result<(), String> {
+            let ProgressIngress::AgentJsonlFile(ingress) = ingress else {
+                return Ok(());
+            };
+            self.jsonl.prepare_run(run_id, driver, ingress, NoopEventSink)
+        }
+
+        fn activate_progress_ingress(&self, run_id: &str) {
+            self.jsonl.activate_run(run_id);
+        }
+
+        fn stop_progress_ingress(&self, run_id: &str) {
+            self.jsonl.stop_run(run_id);
+        }
+    }
+
+    /// Restores a process-global env var on drop. Mirrors the helper in
+    /// `live_status_loop`'s tests; both exist because the Codex homes root
+    /// is resolved from the environment.
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &std::path::Path) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: every test that mutates this key holds
+            // `CODEX_HOMES_ENV_TEST_LOCK` for the duration; the prior value
+            // is restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    /// Build a `StartWorkerInput` for the real `CodexDriver`, plus the
+    /// per-run `CODEX_HOME` layout `CodexDriver::provision_workspace`
+    /// leaves behind in production (the `sessions/` directory the rollout
+    /// ingress roots itself at).
+    fn codex_input(workspace: &TempDir, homes_root: &std::path::Path, run_id: &str, slot_id: u8) -> StartWorkerInput {
+        std::fs::create_dir_all(homes_root.join(run_id).join("sessions")).unwrap();
+        let mut input = sample_input(workspace);
+        input.run_id = run_id.to_owned();
+        input.slot_id = slot_id;
+        input.model = "gpt-5.6-sol".into();
+        input.initial_input = "exec codex exec --json\n".into();
+        input.work_item_binding = Some(WorkItemBinding {
+            work_item_id: "task-codex-1".into(),
+            work_item_name: "Hello world from Codex".into(),
+            execution_id: run_id.to_owned(),
+        });
+        input.driver = crate::driver::DriverRegistry::default()
+            .require("codex")
+            .expect("codex driver is registered");
+        input
+    }
+
+    /// Regression — `bossctl agents list` renders the engine's
+    /// [`LiveWorkerStateRegistry`] and nothing else, so a worker missing
+    /// from it is invisible to every operator verb keyed on that list
+    /// (`agents status`, `agents send`, `agents stop`, the coordinator's
+    /// "who is working on X" lookup).
+    ///
+    /// Codex is the first driver whose progress arrives over a byte stream
+    /// (`ProgressIngress::AgentJsonlFile`) rather than the hook socket, and
+    /// that ingress is prepared *before* `SpawnWorkerPane` — an unhappy
+    /// preparation short-circuits `start_worker` before it ever reaches the
+    /// registration below. This pins that a Codex spawn lands in the same
+    /// registry, with the same routing stamps, as a Claude spawn.
+    ///
+    /// Written as a sync test driving its own current-thread runtime rather
+    /// than `#[tokio::test]`: `CodexDriver` resolves its homes root from the
+    /// process environment, so the override guard has to stay held for the
+    /// whole spawn — and holding a `MutexGuard` across an `.await` is the
+    /// real hazard `clippy::await_holding_lock` names. `block_on` keeps the
+    /// guard inside a single blocking call on a runtime this test owns, so
+    /// there is nothing to starve.
+    #[test]
+    fn codex_spawn_registers_live_worker_state_like_claude() {
+        let _env_guard = crate::driver::codex::CODEX_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let homes = TempDir::new().unwrap();
+        let _homes_env = EnvRestore::set(crate::driver::codex::CODEX_HOMES_ROOT_ENV, homes.path());
+
+        let workspace = TempDir::new().unwrap();
+        let spawner = LiveStateSpawner::new(4, 4242);
+        let input = codex_input(&workspace, homes.path(), "exec-codex-1", 4);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let started = runtime.block_on(async {
+            let started = start_worker(&spawner, input, StdDuration::from_secs(1))
+                .await
+                .expect("codex spawn should succeed");
+            // Cancel the file ingress inside the runtime that owns its task,
+            // so the tempdir is not pulled out from under a live poller.
+            spawner.stop_progress_ingress("exec-codex-1");
+            started
+        });
+
+        assert_eq!(spawner.spawn_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(started.slot_id, 4);
+
+        let state = spawner
+            .live_states
+            .get(4)
+            .expect("a Codex spawn must register a LiveWorkerState — `agents list` reads only this registry");
+        assert_eq!(state.run_id, "exec-codex-1");
+        assert_eq!(state.model, "gpt-5.6-sol");
+        assert_eq!(state.shell_pid, 4242);
+        assert_eq!(state.pool.as_deref(), Some("main"));
+        assert_eq!(state.kind.as_deref(), Some("chore_implementation"));
+        assert_eq!(state.work_item_id.as_deref(), Some("task-codex-1"));
+    }
+
+    /// The same spawn against the Claude driver, so the assertion above is
+    /// pinned as a *parity* claim rather than a Codex-only snapshot: if a
+    /// future change makes registration conditional on the ingress kind,
+    /// exactly one of this pair fails and names which side regressed.
+    #[tokio::test]
+    async fn claude_spawn_registers_live_worker_state() {
+        let workspace = TempDir::new().unwrap();
+        let spawner = LiveStateSpawner::new(3, 77);
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let state = spawner
+            .live_states
+            .get(3)
+            .expect("a Claude spawn registers a LiveWorkerState");
+        assert_eq!(state.run_id, "run-test");
+        assert_eq!(state.pool.as_deref(), Some("main"));
+    }
+
     fn ok_spawner_capturing() -> StubSpawner {
         StubSpawner {
             registry: WorkerRegistry::new(),
