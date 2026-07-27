@@ -1,0 +1,1 @@
+reply with exactly the single token: GKIT_PROBE_OK. no tools.

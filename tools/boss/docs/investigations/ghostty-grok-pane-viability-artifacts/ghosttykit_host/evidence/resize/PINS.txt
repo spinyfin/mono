@@ -1,0 +1,10 @@
+host: ghosttykit_grok_spike (throwaway)
+scenario: resize
+grok_bin: /Users/brianduff/.grok/bin/grok
+grok_home: /tmp/grok-pane-spike/home
+cwd: /tmp/grok-pane-spike/cwd
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+interrupt_api: ghostty_surface_key Esc
+date: 2026-07-27T23:13:31Z

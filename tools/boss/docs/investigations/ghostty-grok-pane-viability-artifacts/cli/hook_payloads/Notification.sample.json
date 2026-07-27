@@ -1,0 +1,15 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-pane-spike/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=notification\nGROK_HOOK_NAME=global/dump-all:notification[0].hooks[0]\nGROK_SESSION_ID=7445803d-9743-4e2c-a557-a5aae71a83e0\nGROK_WORKSPACE_ROOT=/private/tmp/grok-pane-spike/cwd",
+  "stdin": {
+    "hookEventName": "notification",
+    "sessionId": "7445803d-9743-4e2c-a557-a5aae71a83e0",
+    "cwd": "/private/tmp/grok-pane-spike/cwd",
+    "workspaceRoot": "/private/tmp/grok-pane-spike/cwd",
+    "timestamp": "2026-07-27T23:00:13.144083+00:00",
+    "transcriptPath": "/tmp/grok-pane-spike/home/sessions/%2Fprivate%2Ftmp%2Fgrok-pane-spike%2Fcwd/7445803d-9743-4e2c-a557-a5aae71a83e0/updates.jsonl",
+    "permissionMode": "bypassPermissions",
+    "notificationType": "task_complete",
+    "message": "Background task completed: call-57c2d145-00b1-4013-af54-005998099961-0",
+    "level": "info"
+  }
+}

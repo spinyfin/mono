@@ -1,0 +1,23 @@
+reason: script_finished
+scenario: resize
+session_id: dccaef32-3fac-4808-ab88-b2f739707705
+saw_gkit_grok_ok: true
+saw_probe_ok: false
+saw_cancel_language: false
+viewport_final_bytes: 1378
+screen_final_bytes: 3731
+viewport_contains_gkit_grok_ok: true
+viewport_contains_probe: false
+viewport_contains_esc_after: false
+viewport_contains_sleep_done: false
+viewport_contains_resize_ok: true
+mid_inject_side_effect: (absent)
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 4308
+tty: /dev/ttys008
+foreground_pid_at_end: 3641
+snapshot_count: 18
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+interrupt_api: ghostty_surface_key(Esc keycode 0x35)  # Boss sendInterrupt
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

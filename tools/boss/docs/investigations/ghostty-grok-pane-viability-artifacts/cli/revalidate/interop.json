@@ -1,0 +1,26 @@
+{
+  "text": "INTEROP_OK",
+  "stopReason": "EndTurn",
+  "sessionId": "a6c595c6-c1a5-4ab9-81b0-f8060d8d534c",
+  "requestId": "f685e7d0-dcc4-406a-9030-66c07a79d9cb",
+  "thought": "The user wants me to reply with exactly: INTEROP_OK\n",
+  "usage": {
+    "input_tokens": 2157,
+    "cache_read_input_tokens": 11136,
+    "output_tokens": 43,
+    "reasoning_tokens": 35,
+    "total_tokens": 13336
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.0079128,
+  "total_cost_usd_ticks": 79128000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 2157,
+      "outputTokens": 43,
+      "cacheReadInputTokens": 11136,
+      "modelCalls": 1,
+      "costUSD": 0.0079128
+    }
+  }
+}

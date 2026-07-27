@@ -1,0 +1,45 @@
+zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+Last login: Mon Jul 27 16:11:58 on ttys008
+brianduff@brians-laptop run_out % zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+
+  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K
+
+
+     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.                                              4:12 PM
+                  
+                                                                                                                         
+     ◆ user_prompt_submit  [hooks: 1]                                                                                    
+     ◆ Thought for 0.1s                                                                                                  
+                                                                                                                         
+     ESC_AFTER_OK                                                                                                4:12 PM 
+                                                                                                                         
+     Worked for 1.4s                                                                                    stop  [hooks: 1] 
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+
+
+
+
+
+
+
+
+                                                                                                                    
+
+                                                                                                                          
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                    │
+  ╰─────────────────────────────────────────────────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+.:shortcuts                                                                                     
+
+
+Resume this session with:
+  grok --resume bf9b7291-f5ab-48db-9a71-3bffe7c25ea0
+SCRIPT_DONE
+brianduff@brians-laptop run_out % 

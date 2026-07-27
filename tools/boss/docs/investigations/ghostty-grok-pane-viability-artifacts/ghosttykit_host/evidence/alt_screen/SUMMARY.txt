@@ -1,0 +1,23 @@
+reason: post_quit_window
+scenario: alt_screen
+session_id: 8682cf50-863c-4ec6-b0fb-1cf47e9a10e6
+saw_gkit_grok_ok: true
+saw_probe_ok: true
+saw_cancel_language: false
+viewport_final_bytes: 461
+screen_final_bytes: 461
+viewport_contains_gkit_grok_ok: false
+viewport_contains_probe: true
+viewport_contains_esc_after: false
+viewport_contains_sleep_done: false
+viewport_contains_resize_ok: false
+mid_inject_side_effect: (absent)
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 6541
+tty: /dev/ttys008
+foreground_pid_at_end: 5828
+snapshot_count: 15
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+interrupt_api: ghostty_surface_key(Esc keycode 0x35)  # Boss sendInterrupt
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

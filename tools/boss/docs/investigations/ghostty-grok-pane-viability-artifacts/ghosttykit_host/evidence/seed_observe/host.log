@@ -1,0 +1,75 @@
+[0.0] === ghosttykit_grok_spike start 2026-07-27T23:11:58Z ===
+[0.0] host: ghosttykit_grok_spike (throwaway)
+scenario: seed_observe
+grok_bin: /Users/brianduff/.grok/bin/grok
+grok_home: /tmp/grok-pane-spike/home
+cwd: /tmp/grok-pane-spike/cwd
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+interrupt_api: ghostty_surface_key Esc
+date: 2026-07-27T23:11:58Z
+[0.0] ghostty_init ok
+[0.0] ghostty_app_new ok
+[0.1] scenario=seed_observe sid=1b6c772c-41ff-44dc-bd3f-924ee887ded4
+[0.1] initial_input=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+[0.1] ghostty_surface_new ok
+[0.1] timers armed; waiting for grok in embed surface
+[0.5] viewport_bytes=114 fg_pid=92830 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:09:33 on ttys018
+[0.9] viewport_bytes=220 fg_pid=93252 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:09:33 on ttys018\nbrianduff@brians-laptop run_out % zsh /private/tmp/grok-pane-spike/ghosttykit_host/
+[2.1] viewport_bytes=2374 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.1] OBSERVED gkit-grok-ok in surface text
+[2.5] viewport_bytes=2374 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.9] viewport_bytes=2374 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[3.3] viewport_bytes=2535 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[3.3] INJECT probe body=reply with exactly the single token: GKIT_PROBE_OK. no tools.
+[3.3] INJECT probe Return sent
+[3.7] viewport_bytes=2650 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                        3.0K / 500K │ +1\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[3.7] OBSERVED GKIT_PROBE_OK in surface text
+[3.7] INJECT mid_or_idle_tool body=Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE_TEXT > /private/tmp/grok-pane-spike/ghosttykit_host/run_out/injected_side_effect.txt ; then reply DONE.
+[3.7] INJECT mid_or_idle_tool Return sent
+[4.1] viewport_bytes=2772 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                        3.0K / 500K │ +2\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[4.5] viewport_bytes=2772 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                        3.0K / 500K │ +2\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[4.9] viewport_bytes=2772 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                        3.2K / 500K │ +2\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[5.3] viewport_bytes=2772 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                         13K / 500K │ +1\n\n\n     ❯ reply with exactly the single token: GKIT_PROBE_OK. no tools.  
+[5.7] viewport_bytes=2772 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                         13K / 500K │ +1\n\n\n     ❯ reply with exactly the single token: GKIT_PROBE_OK. no tools.  
+[6.1] viewport_bytes=3617 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[6.5] viewport_bytes=3617 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[6.9] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[7.3] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[7.7] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[8.1] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[8.5] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[8.9] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[9.3] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[9.7] viewport_bytes=3743 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[10.1] viewport_bytes=3869 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[10.5] viewport_bytes=3869 fg_pid=93252 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run exactly: echo GKIT_INJECT_VIA_SURFACE
+[37.3] INJECT quit body=/quit
+[37.3] INJECT quit Return sent
+[37.7] viewport_bytes=3746 fg_pid=92830 exited=false preview=       ghosttykit_host/run_out/injected_side_effect.txt ; then reply DONE.                                                  \n                                                                          
+[42.3] finish reason=post_quit_window
+[42.3] SUMMARY written:
+reason: post_quit_window
+scenario: seed_observe
+session_id: 1b6c772c-41ff-44dc-bd3f-924ee887ded4
+saw_gkit_grok_ok: true
+saw_probe_ok: true
+saw_cancel_language: false
+viewport_final_bytes: 3746
+screen_final_bytes: 4218
+viewport_contains_gkit_grok_ok: false
+viewport_contains_probe: false
+viewport_contains_esc_after: false
+viewport_contains_sleep_done: false
+viewport_contains_resize_ok: false
+mid_inject_side_effect: GKIT_INJECT_VIA_SURFACE_TEXT
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 93252
+tty: /dev/ttys008
+foreground_pid_at_end: 92830
+snapshot_count: 25
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+interrupt_api: ghostty_surface_key(Esc keycode 0x35)  # Boss sendInterrupt
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

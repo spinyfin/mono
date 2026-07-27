@@ -1,0 +1,14 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-pane-spike/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=user_prompt_submit\nGROK_HOOK_NAME=global/dump-all:user_prompt_submit[0].hooks[0]\nGROK_SESSION_ID=7727264c-bc7d-4419-b201-4e4b13fd3d03\nGROK_WORKSPACE_ROOT=/private/tmp/grok-pane-spike/cwd",
+  "stdin": {
+    "hookEventName": "user_prompt_submit",
+    "sessionId": "7727264c-bc7d-4419-b201-4e4b13fd3d03",
+    "cwd": "/private/tmp/grok-pane-spike/cwd",
+    "workspaceRoot": "/private/tmp/grok-pane-spike/cwd",
+    "timestamp": "2026-07-27T22:56:07.643311+00:00",
+    "transcriptPath": "/tmp/grok-pane-spike/home/sessions/%2Fprivate%2Ftmp%2Fgrok-pane-spike%2Fcwd/7727264c-bc7d-4419-b201-4e4b13fd3d03/updates.jsonl",
+    "promptId": "e7a0c825-9712-4cf5-ab0e-5d8a248bc1c8",
+    "permissionMode": "bypassPermissions",
+    "prompt": "<user_query>\nWrite the exact text TOOL_PROBE_OK into a new file named tool_probe.txt in the current directory using your file write/edit tools. Then reply with only the word DONE.\n</user_query>"
+  }
+}

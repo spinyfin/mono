@@ -1,0 +1,26 @@
+{
+  "text": "EFFORT_OK",
+  "stopReason": "EndTurn",
+  "sessionId": "dbea7ddc-2191-4106-ad14-522280bfe2ef",
+  "requestId": "808161bd-fa79-4a23-8477-331af738c1af",
+  "thought": "The user wants me to reply with exactly \"EFFORT_OK\".",
+  "usage": {
+    "input_tokens": 13293,
+    "cache_read_input_tokens": 0,
+    "output_tokens": 25,
+    "reasoning_tokens": 17,
+    "total_tokens": 13318
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.026736,
+  "total_cost_usd_ticks": 267360000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 13293,
+      "outputTokens": 25,
+      "cacheReadInputTokens": 0,
+      "modelCalls": 1,
+      "costUSD": 0.026736
+    }
+  }
+}

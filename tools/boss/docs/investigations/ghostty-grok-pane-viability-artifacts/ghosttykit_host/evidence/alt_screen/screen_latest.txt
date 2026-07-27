@@ -1,0 +1,12 @@
+zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+Last login: Mon Jul 27 16:13:51 on ttys018
+brianduff@brians-laptop run_out % zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+
+Force Exact Token Reply No Tools
+> reply with exactly the single token: GKIT_PROBE_OK. no tools.
+  GKIT_PROBE_OK
+
+Resume this session with:
+  grok --resume 8682cf50-863c-4ec6-b0fb-1cf47e9a10e6
+SCRIPT_DONE
+brianduff@brians-laptop run_out % 
