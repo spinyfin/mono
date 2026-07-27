@@ -163,7 +163,10 @@ pub enum StartWorkerError {
     WriteFiles(std::io::Error),
     #[error("sending SpawnWorkerPane to app: {0}")]
     Send(#[from] crate::app::SendToAppError),
-    #[error("app reported spawn error: {0:?}")]
+    // Use Display (not Debug) so SlotBusy's "desync, not capacity"
+    // wording reaches dispatch.jsonl / attention bodies rather than the
+    // opaque `SlotBusy { occupying_run_id: ... }` debug dump.
+    #[error("app reported spawn error: {0}")]
     AppError(EngineToAppError),
     #[error("app responded with unexpected response variant")]
     ResponseKindMismatch,
