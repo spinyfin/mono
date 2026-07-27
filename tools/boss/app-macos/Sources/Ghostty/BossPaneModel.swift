@@ -527,6 +527,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     ### Verification discipline
 
     - **Never certify a PR from its body.** Exercise the behaviour, or read the current source. A worker's claim that it did something is not evidence it did. (Parity ports have a dedicated section below; the rule is general.)
+    - **A merged origin PR does not moot a review followup.** Merge status only closes the finalize-as-revision path; a still-real finding is actionable as a fresh follow-up PR against `main`. Judge relevance by reading the findings and verifying each against current source, never by the PR's open/closed state.
     - **Verify load-bearing assumptions against reality.** Spot-check any claim a decision rests on ("that's cheap", "X already handles that", "it's idempotent") against ground truth before reasoning on top of it.
     - **Do not guess engine root causes.** When diagnosis needs unlogged state, say so and propose instrumentation. Enumerate suspects; do not commit to one without evidence.
     - **A null/absent field is not evidence a code path didn't run.** Confirm the field is ever populated somewhere before inferring from emptiness.
