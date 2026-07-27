@@ -45,8 +45,11 @@ fi
 if [[ "${OSTYPE:-}" == darwin* || "${OSTYPE:-}" == linux* ]]; then
   # On Linux, .bazelrc makes /tmp a per-action linux-sandbox tmpfs. This keeps
   # Unix-domain socket paths well below sockaddr_un.sun_path without exposing
-  # a shared host temp directory. macOS protects the same private directory
-  # with the generated Seatbelt profile below.
+  # a shared host temp directory. hermeticity_guard_test's
+  # linux_private_temp_root_is_short_and_action_private fails the action if
+  # /tmp is not actually mounted as tmpfs or contains entries from outside
+  # this action. macOS protects the same private directory with the
+  # generated Seatbelt profile below.
   test_tmpdir="$("${runtime_bin}/mktemp" -d /tmp/mono-test.XXXXXX)"
   owns_test_tmpdir=1
 else

@@ -88,6 +88,41 @@ fn linux_private_temp_root_is_short_and_action_private() {
         Some(private_root.join("tmp").as_os_str()),
         "TMPDIR must be nested directly beneath the short private root"
     );
+
+    // The prefix/length checks above only inspect the string the wrapper's
+    // `mktemp` produced; they hold even if `--sandbox_tmpfs_path=/tmp` were
+    // dropped from .bazelrc, since the wrapper unconditionally names its
+    // private root under /tmp. Verify /tmp is actually the per-action tmpfs
+    // (not the shared host /tmp) by reading the live mount table.
+    let mounts = std::fs::read_to_string("/proc/self/mounts").expect("/proc/self/mounts must be readable");
+    let tmp_is_tmpfs = mounts.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let _device = fields.next();
+        let mount_point = fields.next();
+        let fs_type = fields.next();
+        mount_point == Some("/tmp") && fs_type == Some("tmpfs")
+    });
+    assert!(
+        tmp_is_tmpfs,
+        "Linux TEST_TMPDIR must live in the per-action /tmp tmpfs, but /proc/self/mounts shows no tmpfs mounted at /tmp: {mounts}"
+    );
+
+    // An action-private tmpfs holds only this action's own entries; a shared
+    // host /tmp would additionally contain other actions' or the host's
+    // leftover temp files.
+    let private_root_name = private_root
+        .file_name()
+        .expect("TEST_TMPDIR must have a file name")
+        .as_bytes();
+    for entry in std::fs::read_dir("/tmp").expect("/tmp must be readable") {
+        let entry = entry.expect("reading /tmp entries must not fail");
+        let name = entry.file_name();
+        assert!(
+            name.as_bytes() == private_root_name || name.as_bytes().starts_with(b"mono-test."),
+            "/tmp contains an entry not owned by this action, indicating a shared host /tmp rather than a per-action tmpfs: {}",
+            entry.path().display()
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]

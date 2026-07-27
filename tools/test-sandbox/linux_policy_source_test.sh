@@ -17,6 +17,6 @@ for key in \
   BOSS_SHAKE_APP_ID \
   BOSS_SHAKE_INSTALLATION_ID \
   BOSS_SHAKE_PRIVATE_KEY_PEM; do
-  grep -Fqx "test --test_env==${key}" "${bazelrc}"
+  grep -Fqx "test --test_env=${key}=" "${bazelrc}"
   grep -Fq "${key}" "${wrapper}"
 done

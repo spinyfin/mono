@@ -73,13 +73,13 @@ test --run_under=//tools/test-sandbox:hermetic_test_wrapper
 # Bazel already constructs a test environment rather than inheriting the
 # caller's environment. Keep the credential boundary explicit as defense in
 # depth and as documentation for direct attempts to inject these common keys.
-test --test_env==ANTHROPIC_API_KEY
-test --test_env==OPENAI_API_KEY
-test --test_env==GITHUB_TOKEN
-test --test_env==GH_TOKEN
-test --test_env==BOSS_SHAKE_APP_ID
-test --test_env==BOSS_SHAKE_INSTALLATION_ID
-test --test_env==BOSS_SHAKE_PRIVATE_KEY_PEM
+test --test_env=ANTHROPIC_API_KEY=
+test --test_env=OPENAI_API_KEY=
+test --test_env=GITHUB_TOKEN=
+test --test_env=GH_TOKEN=
+test --test_env=BOSS_SHAKE_APP_ID=
+test --test_env=BOSS_SHAKE_INSTALLATION_ID=
+test --test_env=BOSS_SHAKE_PRIVATE_KEY_PEM=
 
 
 # Import ci-specific configuration.
