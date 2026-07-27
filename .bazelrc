@@ -70,6 +70,29 @@ test:linux --sandbox_tmpfs_path=/tmp
 # codex, claude, or cube.
 test --run_under=//tools/test-sandbox:hermetic_test_wrapper
 
+# Align analysis configuration across build / cquery / test.
+#
+# On Bazel 9.x, `cquery` inherits options from `test` (CqueryCommand
+# inheritsOptionsFrom=TestCommand), so `test --run_under=...` above is also
+# applied to every cquery. `--run_under` is analysis-affecting: a cquery that
+# carries it runs under a different configuration than a plain `bazel build`
+# (which does not set it), and each flip discards the analysis cache. repobin
+# (and other tools) interleave build + cquery constantly, so this thrash is
+# continuous. Empty `cquery --run_under=` is not valid on this Bazel version
+# ("Empty command"), so instead give `build` the same non-empty value. The
+# flag only affects test/run execution prefixes, not compile actions; setting
+# it on build is an analysis-config alignment so build and cquery share a
+# cache. Do not remove or weaken the `test --run_under` line — that wrapper
+# is what enforces test hermeticity.
+build --run_under=//tools/test-sandbox:hermetic_test_wrapper
+
+# `bazel run` inherits build options. The hermetic test wrapper requires
+# TEST_SRCDIR and the audited test runtime, so it is not suitable for
+# interactive runs. Override with an argv-passthrough prefix so `bazel run`
+# keeps working. This reintroduces a build↔run analysis-cache flip; that
+# path is far rarer than build↔cquery (repobin).
+run --run_under=/usr/bin/env
+
 # Bazel already constructs a test environment rather than inheriting the
 # caller's environment. Keep the credential boundary explicit as defense in
 # depth and as documentation for direct attempts to inject these common keys.
