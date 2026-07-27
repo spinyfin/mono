@@ -2,11 +2,11 @@
 
 This runbook documents the configuration of the Linux hosts backing the `bazel-any` Buildkite queue, and the maintenance procedures for touching them safely. It exists because a 2026-07-27 incident (below) cost hours to diagnose purely because none of this was written down anywhere durable — it lived only in a person's head and in an incident thread.
 
-Everything in this document was verified against the live hosts (`ssh empiricist` / `ssh zoologist` / `ssh diziet` as the `bduff` user) and the live Buildkite agent registrations (`bk agent list`) on 2026-07-27. There is **no passwordless sudo** on any of these hosts for the `bduff` account, so anything that requires root is called out explicitly in "Needs operator input" at the end rather than guessed.
+Host facts here were verified against the live hosts (`ssh empiricist` / `ssh zoologist` / `ssh diziet` as the `bduff` user) and the live Buildkite agent registrations (`bk agent list`) on 2026-07-27, except where explicitly noted as unverified. There is **no passwordless sudo** on any of these hosts for the `bduff` account, so anything that requires root is called out explicitly in "Needs operator input" at the end rather than guessed.
 
 ## Host inventory
 
-The Linux side of the `bazel-any` queue is three hosts running four agent registrations:
+The Linux side of the `bazel-any` queue is three hosts running four agent registrations. Other Linux agents exist on other queues (`sma-ci-1`/`sma-ci-2` on `bazel-any-test`, `sma-release-1` on `linux-release`); they are out of scope here and their userns config has not been checked — they may have the same AppArmor exposure described below.
 
 | Host         | Agent(s)                       | OS                            |
 | ------------ | ------------------------------ | ----------------------------- |
@@ -136,8 +136,9 @@ A killed/shut-down server restarts automatically and lazily on the next `bazel` 
 These are live CI hosts feeding a shared queue — a job can land mid-restart if you don't pause first. Before touching a host's Bazel state, kernel sysctls, or anything else that could disrupt an in-flight or about-to-land job:
 
 ```sh
-# Pause every agent on the host you're about to touch. Repeat --agent-id per registration
-# (empiricist has two: empiricist-1 and empiricist-2).
+# Pause every agent on the host you're about to touch — run it once per registration
+# (empiricist has two: empiricist-1 and empiricist-2). <agent-id> is the UUID from
+# `bk agent list --output json` (`.[] | {name, id}`), not the agent name.
 bk agent pause <agent-id> --timeout-in-minutes <N>
 ```
 
@@ -184,7 +185,7 @@ Per `.buildkite/README.md` ("Pushing from CI"), the Linux Buildkite agents are b
 ## Bazel startup rc files
 
 - `.ci.linux.startup.bazelrc` — Linux-only, sets the `/mnt/ssd` output root (see "Disk layout" above). Read by `.buildkite/steps/ci-env.sh` when `OS_TYPE=linux`.
-- `.ci.darwin.startup.bazelrc` — the macOS equivalent (pins `/Volumes/ssd/...` and the Xcode toolchain — not this doc's scope).
+- `.ci.darwin.startup.bazelrc` — the macOS equivalent; sets the darwin output root to `/private/var/tmp/bazel_darwin_ci_output_base` (it must stay on the internal case-insensitive volume — see the comment in that file, which documents that pointing it at `/Volumes/ssd` is exactly what broke `mac-app-build` under Xcode 26.5 and was deliberately reverted). The macOS Xcode pin is in `.ci.bazelrc` (`build:ci-darwin`), not here — out of this doc's scope.
 - Both are startup-option `.bazelrc`s specifically because `--output_user_root` (and similar) must be a **startup** flag, not a build flag — see the comment in `.buildkite/steps/ci-env.sh` explaining why `CI_BAZEL_STARTUP_FLAGS` is the single source of truth every CI code path must read from, to avoid two daemons running against the same output base at once.
 
 ## Other configuration observed
@@ -192,7 +193,7 @@ Per `.buildkite/README.md` ("Pushing from CI"), the Linux Buildkite agents are b
 - **systemd unit**: `buildkite-agent.service` (plain, not the `buildkite-agent@.service` template) runs as `User=buildkite-agent`, `Environment=HOME=/var/lib/buildkite-agent`, `ExecStart=/usr/bin/buildkite-agent start` on all three hosts. `empiricist`'s second agent registration (`empiricist-2`) is **not** a second systemd unit instance — both `empiricist-1` and `empiricist-2` come from the single running `buildkite-agent start` process (confirmed via `ps aux`: one process, two Bazel server children with distinct `--workspace_directory=.../empiricist-{1,2}/flunge/mono`). The exact mechanism (multiple `spawn`s configured in `buildkite-agent.cfg`) could not be confirmed without root — see "Needs operator input".
 - **Hooks**: `/etc/buildkite-agent/hooks/` on all three hosts contains only the stock `*.sample` files — no active custom hooks (`checkout`, `command`, `environment`, etc.) are configured on any of the three Linux agents.
 - **Stale build directories**: `zoologist` has a leftover `/var/lib/buildkite-agent/builds/zoologist-2/` (a `mono` checkout, last touched 2026-06-05) and `diziet` has a leftover `/var/lib/buildkite-agent/builds/diziet-2/` (a `flunge-ci` checkout, last touched 2026-06-14). Neither corresponds to a currently-registered agent in `bk agent list` — these are checkouts left behind by a previously-registered second agent slot on each host that no longer exists. They are not part of the current live agent inventory; do not treat their presence as evidence of a second active agent on those hosts.
-- **Bazel version**: `bazel 9.2.0` on all three hosts (via bazelisk-style version resolution — `zoologist`/`diziet` re-downloaded the release on invocation, `empiricist` had it cached).
+- **Bazel version**: all three hosts run bazelisk via `/usr/bin/bazel`. Outside a workspace this resolves to `9.2.0` (bazelisk's default, verified on `empiricist`; `zoologist`/`diziet` re-downloaded the release on invocation, `empiricist` had it cached) — but that fallback is not what CI runs. Inside the actual agent checkout (e.g. `/var/lib/buildkite-agent/builds/empiricist-1/flunge/mono`), `bazel --version` reports `9.1.0`, because the repo pins `.bazelversion` to that value as of 2026-07-27. Debugging a version-specific sandbox/strategy issue should reason about `9.1.0`, not `9.2.0`.
 - **OS**: Ubuntu 26.04 LTS ("resolute") on all three hosts, kernel `7.0.0-22-generic` (`empiricist`/`zoologist`) or `7.0.0-28-generic` (`diziet`).
 
 ## Needs operator input

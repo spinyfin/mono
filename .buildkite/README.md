@@ -23,8 +23,8 @@ The full design is at [`tools/boss/docs/designs/boss-ci-buildkite-pipeline-mirro
     integrity-commit-delta.sh # mono-integrity: commit-delta check
     integrity-bazel.sh        # mono-integrity: full bazel build + test
     integrity-checkleft.sh    # mono-integrity: checkleft check
-  README.md             # this file
-  linux-agents-runbook.md # Linux bazel-any agent host config: sandbox userns requirement, restart procedure, maintenance
+  README.md               # this file
+  linux-agents-runbook.md # Linux bazel-any host config + maintenance runbook
 ```
 
 ## Pipeline shape
