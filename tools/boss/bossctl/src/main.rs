@@ -98,7 +98,7 @@ enum Command {
         #[command(subcommand)]
         action: WorkAction,
     },
-    /// Inspect the cube workspace pool.
+    /// Inspect cube workspaces and their current leases.
     Workspace {
         #[command(subcommand)]
         action: WorkspaceAction,
@@ -791,7 +791,9 @@ enum ProposalsAction {
 
 #[derive(Subcommand, Debug)]
 enum WorkspaceAction {
-    /// Summarize cube workspace pool state.
+    /// List cube workspaces and their current leases. Workspaces are
+    /// provisioned on demand — there is no fixed pool, and a fully-leased
+    /// listing is not a capacity limit.
     Summary,
 }
 
@@ -2044,7 +2046,7 @@ async fn workspace_summary(socket_path: &Option<String>, json: bool) -> Result<(
                     })
                 );
             } else if workspaces.is_empty() {
-                println!("no workspaces in cube pool");
+                println!("no cube workspaces exist yet (they are created on demand)");
             } else {
                 for ws in &workspaces {
                     print_workspace_entry_short(ws);
