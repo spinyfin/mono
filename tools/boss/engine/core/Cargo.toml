@@ -29,6 +29,7 @@ boss-dispatch-events = { path = "../dispatch-events" }
 boss-dispatch-reader = { path = "../dispatch-reader" }
 boss-editorial = { path = "../editorial" }
 boss-engine-design-docs = { path = "../design-docs" }
+boss-engine-codex-rollout-retention = { path = "../codex-rollout-retention" }
 boss-engine-driver = { path = "../driver" }
 boss-engine-effort = { path = "../effort" }
 boss-feature-flags = { path = "../feature-flags" }

@@ -1233,6 +1233,19 @@ pub async fn serve_with_merge_probe(
         crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
     );
 
+    // Periodic Boss-owned Codex home reclaim: deletes recorded per-run
+    // CODEX_HOME trees for terminal executions past the retention window
+    // (and a total-bytes backstop). Operates only on paths stored in
+    // driver_runtime_state — never scans ~/.codex or cwd under cube
+    // workspaces. Live (non-terminal) executions are never touched.
+    // Spawned before the execution-row prune so a reclaim pass can see
+    // DB pointers that prune would otherwise remove (the prune path also
+    // reclaims homes that lose their last pointer; see execution_retention).
+    let _codex_home_retention_sweep_handle = crate::codex_home_retention_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::codex_home_retention_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic execution-retention sweep: prunes terminal `work_executions`
     // rows (abandoned/failed/orphaned/cancelled) past the retention bound,
     // keeping a per-work-item diagnostics floor of recent failures. Bounds
@@ -1241,7 +1254,9 @@ pub async fn serve_with_merge_probe(
     // queries over `work_executions` (and, transitively, the Automations
     // pane's run history). Fires on boot, so the first pass after this
     // ships also performs the one-time cleanup of any pre-existing
-    // backlog. See `crate::work::execution_retention` for the full policy.
+    // backlog. Each pass reclaims policy-eligible Codex homes first, then
+    // prunes rows (and any homes that lose their last DB pointer). See
+    // `crate::work::execution_retention` for the full policy.
     let _execution_retention_sweep_handle = crate::execution_retention_sweep::spawn_loop(
         server_state.work_db.clone(),
         crate::execution_retention_sweep::DEFAULT_INTERVAL,

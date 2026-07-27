@@ -192,6 +192,19 @@ enum Command {
         #[command(subcommand)]
         action: ExecutionsAction,
     },
+    /// Reclaim Boss-owned per-run Codex homes past retention policy.
+    ///
+    /// Operates only on roots recorded in
+    /// `work_executions.driver_runtime_state` — never scans `~/.codex` or
+    /// deletes a rollout because its cwd is under a cube workspace. Live
+    /// (non-terminal) executions are never touched. A running engine already
+    /// runs this on a background sweep (`codex_home_retention_sweep`); this
+    /// verb is for on-demand cleanup between sweeps or while the engine is
+    /// stopped.
+    CodexHomes {
+        #[command(subcommand)]
+        action: CodexHomesAction,
+    },
     /// Read-only inspection of `work_comments` and `answer_agent_runs` rows.
     ///
     /// Reads `state.db` directly (same resolution as `metrics`/`hosts`) —
@@ -954,6 +967,29 @@ enum ExecutionsAction {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum CodexHomesAction {
+    /// Reclaim recorded Boss-owned `CODEX_HOME` trees past the retention
+    /// policy (age, with a total-bytes backstop). Only roots stored on
+    /// execution rows are candidates; live executions are never touched.
+    Sweep {
+        /// Only reclaim homes whose execution age anchor (`finished_at`,
+        /// else `created_at`) is older than this many days.
+        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_AGE_DAYS)]
+        older_than_days: u64,
+        /// Total-bytes backstop across retained terminal homes: once
+        /// exceeded, the oldest are reclaimed first regardless of age.
+        #[arg(long, default_value_t = boss_engine::codex_rollout_retention::DEFAULT_MAX_TOTAL_BYTES)]
+        max_total_bytes: u64,
+        /// Preview what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Override the Boss state-root directory.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
 // Per-binary build-info stamp + `version_string` accessor. The
 // include!(env!("BOSS_BUILD_INFO_RS")) must be evaluated in this crate
 // (this rust_binary sets its own rustc_env), so the shared logic is a
@@ -1225,6 +1261,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     state_root,
                 },
         } => executions_prune(cli.json, state_root, older_than_days, keep_per_work_item, dry_run),
+        Command::CodexHomes {
+            action:
+                CodexHomesAction::Sweep {
+                    older_than_days,
+                    max_total_bytes,
+                    dry_run,
+                    state_root,
+                },
+        } => codex_homes_sweep(cli.json, state_root, older_than_days, max_total_bytes, dry_run).await,
         Command::Comments {
             action:
                 comments::CommentsAction::List {
@@ -2158,6 +2203,7 @@ fn executions_prune(
             "{}",
             serde_json::json!({
                 "deleted": outcome.deleted,
+                "codex_homes_reclaimed": outcome.codex_homes_reclaimed,
                 "dry_run": dry_run,
                 "older_than_days": older_than_days,
                 "keep_per_work_item": keep_per_work_item,
@@ -2170,8 +2216,58 @@ fn executions_prune(
         );
     } else {
         println!(
-            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item)",
-            outcome.deleted, older_than_days, keep_per_work_item
+            "deleted {} terminal execution row(s) older than {}d (kept {} most recent per work item); reclaimed {} Codex home(s)",
+            outcome.deleted, older_than_days, keep_per_work_item, outcome.codex_homes_reclaimed
+        );
+    }
+    Ok(())
+}
+
+/// `bossctl codex-homes sweep` — on-demand reclaim of recorded Boss-owned
+/// CODEX_HOME trees past retention. Never scans `~/.codex`.
+async fn codex_homes_sweep(
+    json: bool,
+    state_root: Option<PathBuf>,
+    older_than_days: u64,
+    max_total_bytes: u64,
+    dry_run: bool,
+) -> Result<()> {
+    let db = open_state_db(state_root)?;
+    let policy = boss_engine::codex_rollout_retention::CodexHomeRetentionPolicy::new(
+        std::time::Duration::from_secs(older_than_days.saturating_mul(24 * 60 * 60)),
+        max_total_bytes,
+    );
+    let outcome = boss_engine::codex_home_retention_sweep::run_one_pass_with_policy(&db, &policy, dry_run).await;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "scanned": outcome.scanned,
+                "deleted": outcome.deleted,
+                "deleted_bytes": outcome.deleted_bytes,
+                "skipped_live": outcome.skipped_live,
+                "kept_in_policy": outcome.kept_in_policy,
+                "errors": outcome.errors,
+                "dry_run": dry_run,
+                "older_than_days": older_than_days,
+                "max_total_bytes": max_total_bytes,
+            })
+        );
+    } else if dry_run {
+        println!(
+            "would reclaim {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}",
+            outcome.deleted, outcome.deleted_bytes, outcome.scanned, outcome.skipped_live, outcome.kept_in_policy
+        );
+    } else {
+        println!(
+            "reclaimed {} recorded Codex home(s) ({} bytes); scanned={}, skipped_live={}, kept_in_policy={}, errors={}",
+            outcome.deleted,
+            outcome.deleted_bytes,
+            outcome.scanned,
+            outcome.skipped_live,
+            outcome.kept_in_policy,
+            outcome.errors
         );
     }
     Ok(())
