@@ -27,6 +27,7 @@ mod dispatch_stats;
 mod doctor;
 mod hosts;
 mod logs;
+mod probe;
 mod review;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
@@ -78,6 +79,12 @@ enum Command {
     /// for it to finish its current turn. The engine always waits for
     /// any in-flight tool call to return before injecting, so no work
     /// is discarded.
+    ///
+    /// The engine checks that the probe can actually be delivered before
+    /// accepting it, and prints the boundary it committed to. If it cannot
+    /// deliver — no live pane, a terminal worker, or `--urgent` against a
+    /// driver that will not take mid-turn input — this exits non-zero rather
+    /// than reporting a queued probe that would never arrive.
     Probe {
         /// Worker reference: run id, slot id, or crew name (e.g.
         /// `Riker`). Crew names resolve only over currently-live
@@ -92,6 +99,19 @@ enum Command {
         /// the worker and human readers can identify them.
         #[arg(long)]
         urgent: bool,
+    },
+    /// Report the delivery state of a previously accepted probe, by the
+    /// `probe_id` that `bossctl probe` printed.
+    ///
+    /// States: `queued` (waiting for its boundary), `injected` (written,
+    /// awaiting confirmation), `consumed` (the worker's CLI took it as a
+    /// prompt), `buffered` (written into a mid-turn agent's composer; it
+    /// submits at the end of the turn), `unconfirmed` (written but unproven —
+    /// exits non-zero), `replied` (the worker answered). Probe ids live in
+    /// the running engine process and are not retained across a restart.
+    ProbeStatus {
+        /// Probe id from `bossctl probe`, e.g. `probe-4`.
+        probe_id: String,
     },
     /// Work-item dispatch aliases for symmetry with `boss`.
     Work {
@@ -1035,7 +1055,10 @@ fn main() -> ExitCode {
 
 async fn dispatch(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Probe { agent, text, urgent } => probe_run(&cli.socket_path, cli.json, agent, text, urgent).await,
+        Command::Probe { agent, text, urgent } => {
+            probe::probe_run(&cli.socket_path, cli.json, agent, text, urgent).await
+        }
+        Command::ProbeStatus { probe_id } => probe::probe_status(&cli.socket_path, cli.json, probe_id).await,
         Command::Agents {
             action: AgentsAction::Status { agent },
         } => agents::agents_status(&cli.socket_path, cli.json, agent).await,
@@ -1981,53 +2004,9 @@ fn print_dispatch_event_short(event: &DispatchEvent) {
     }
 }
 
-async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
+pub(crate) async fn connect(socket_path: &Option<String>) -> Result<BossClient> {
     let discovery = Discovery::from_env(socket_path.as_deref()).context("resolving engine discovery profile")?;
     BossClient::connect(&discovery).await.context("connecting to engine")
-}
-
-async fn probe_run(socket_path: &Option<String>, json: bool, agent: String, text: String, urgent: bool) -> Result<()> {
-    let mut client = connect(socket_path).await?;
-    let states = agents::fetch_live_states(&mut client).await?;
-    let run_id = agents::resolve_agent_ref(&agent, &states)?.run_id.clone();
-    let response = client
-        .send_request(&FrontendRequest::ProbeRun {
-            run_id: run_id.clone(),
-            text,
-            urgent,
-        })
-        .await
-        .context("sending ProbeRun")?;
-    match response {
-        FrontendEvent::ProbeQueued {
-            run_id: returned,
-            probe_id,
-            urgent: is_urgent,
-        } => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "status": if is_urgent { "urgent" } else { "queued" },
-                        "run_id": returned,
-                        "probe_id": probe_id,
-                        "urgent": is_urgent,
-                    })
-                );
-            } else if is_urgent {
-                println!(
-                    "urgent probe queued for run {returned} (probe_id={probe_id}); will inject at next tool boundary"
-                );
-            } else {
-                println!("probe queued for run {returned} (probe_id={probe_id})");
-            }
-            Ok(())
-        }
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected probe: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
 }
 
 async fn workspace_summary(socket_path: &Option<String>, json: bool) -> Result<()> {

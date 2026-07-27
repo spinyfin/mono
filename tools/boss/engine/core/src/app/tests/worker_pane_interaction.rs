@@ -301,7 +301,7 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
             let probe_id = server_state.queue_probe(run_id.to_owned(), msg.clone(), /*urgent=*/ false);
             assert_eq!(
                 server_state.probe_lifecycle_state(&probe_id),
-                Some(ProbeLifecycleState::Queued),
+                Some(ProbeDeliveryState::Queued),
             );
         }
         other => panic!("expected NotAcceptingInput(Working), got {other:?}"),

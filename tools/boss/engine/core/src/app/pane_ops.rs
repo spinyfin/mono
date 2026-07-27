@@ -172,10 +172,12 @@ impl ServerState {
     /// resolved slot on success so `bossctl agents send` can echo back
     /// which pane was targeted (useful when the agent reference was a
     /// crew name). Mirrors [`focus_worker_pane`] in shape, but refuses
-    /// when the live worker is not accepting typed input (see
-    /// [`SendInputError::NotAcceptingInput`] /
-    /// `inject_pane_text_verified`'s activity guard). When the guard
-    /// passes it also verifies the write actually became a queued
+    /// when the run's `(activity, driver)` pair yields no injectable
+    /// posture (see [`SendInputError::NotAcceptingInput`] /
+    /// `pane_input_posture_for_run`). A mid-turn worker on a driver whose
+    /// foreground process buffers stdin *is* injectable — the write lands in
+    /// the agent's composer, exactly as a human's keystrokes would. When the
+    /// guard passes it also verifies the write actually became a queued
     /// prompt. This is the chore-update auto-notice path implicated
     /// in the probe-6 incident.
     ///
@@ -195,18 +197,31 @@ impl ServerState {
             return Err(SendInputError::UnknownRun);
         };
         let (transcript_path, offset_bytes) = super::worker_events::transcript_offset_for_run(self, run_id).await;
+        let posture = self.pane_input_posture_for_run(run_id, slot_id);
         match self
             .inject_pane_text_verified(
-                run_id,
-                slot_id,
-                text.clone(),
-                transcript_path.as_deref(),
-                offset_bytes,
-                Duration::from_secs(6),
+                PaneInjectRequest::builder()
+                    .run_id(run_id)
+                    .slot_id(slot_id)
+                    .text(text.clone())
+                    .maybe_transcript_path(transcript_path.as_deref())
+                    .offset_bytes(offset_bytes)
+                    .verify_timeout(Duration::from_secs(6))
+                    .posture(posture)
+                    .build(),
             )
             .await
         {
             PaneInjectOutcome::Confirmed => Ok(slot_id),
+            PaneInjectOutcome::Buffered => {
+                tracing::info!(
+                    run_id,
+                    slot_id,
+                    "send_input_to_worker: text buffered by a mid-turn agent; it will surface as the \
+                     worker's next prompt at the turn boundary",
+                );
+                Ok(slot_id)
+            }
             PaneInjectOutcome::Unconfirmed => {
                 tracing::warn!(
                     run_id,

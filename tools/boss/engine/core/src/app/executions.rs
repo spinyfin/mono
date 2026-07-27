@@ -326,8 +326,28 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
             );
             return;
         }
+        // Decide *before* minting a probe id whether this probe can actually
+        // be delivered, and refuse if not. A queue-accepted-then-silently-
+        // dropped probe is indistinguishable to the caller from one that is
+        // about to arrive, which is what cost an operator a worker restart:
+        // two probes were reported "queued", neither could ever be delivered,
+        // and the only evidence was a `debug!` line inside the engine.
+        let expected_delivery = match probe_delivery_expectation(&server_state, &run_id, urgent) {
+            Ok(expectation) => expectation,
+            Err(reason) => {
+                tracing::warn!(run_id = %run_id, urgent, %reason, "probe refused: undeliverable");
+                send_response(&sink, &request_id, FrontendEvent::ProbeRefused { run_id, reason });
+                return;
+            }
+        };
         let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
-        tracing::info!(run_id = %run_id, probe_id = %probe_id, urgent, "probe queued");
+        tracing::info!(
+            run_id = %run_id,
+            probe_id = %probe_id,
+            urgent,
+            expected_delivery = expected_delivery.as_str(),
+            "probe queued",
+        );
         // A human/coordinator probe on this run IS the documented ack
         // gesture for a worker-declared escalation/blocker (e.g.
         // `bossctl probe <agent> "[effort-escalation-ack] …"`) — resolve any
@@ -369,8 +389,121 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
                 run_id,
                 probe_id,
                 urgent,
+                expected_delivery: Some(expected_delivery),
             },
         );
+    }
+}
+
+/// Decide where a probe for `run_id` would be delivered, or why it cannot be.
+///
+/// `Ok(expectation)` is a commitment: the engine believes it can deliver at
+/// that boundary. `Err(reason)` means the probe must be refused rather than
+/// queued — the caller has no way to distinguish a silently-undeliverable
+/// probe from one that is about to arrive, so accepting it is worse than
+/// saying no.
+///
+/// Refusals are limited to conditions where delivery is genuinely impossible:
+///
+/// * no slot mapping, or no live state for the mapped slot — there is no pane
+///   to write into;
+/// * a terminal worker (`Terminated`/`Errored`) — it will never read anything
+///   again;
+/// * `--urgent` against a worker whose `(activity, driver)` pair has no
+///   mid-turn posture. Urgent's whole contract is tool-boundary delivery, and
+///   at a `PostToolUse` boundary the activity is `Working` by construction, so
+///   a driver that refuses mid-turn input can never honour it. Refusing is
+///   honest; silently downgrading to Stop-boundary delivery under an
+///   `--urgent` flag is not.
+///
+/// A `Spawning` worker is *not* refused: it has a pane and will reach a turn
+/// boundary, so a non-urgent probe legitimately waits for it.
+fn probe_delivery_expectation(
+    server_state: &ServerState,
+    run_id: &str,
+    urgent: bool,
+) -> Result<ProbeDeliveryExpectation, String> {
+    let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
+        return Err(format!(
+            "run {run_id} has no live worker pane (no slot mapping); there is nothing to inject into"
+        ));
+    };
+    let Some(activity) = server_state.pane_typed_input_activity(slot_id) else {
+        return Err(format!(
+            "run {run_id} is mapped to slot {slot_id} but the engine has no live worker state for it; \
+             cannot confirm there is a pane to inject into"
+        ));
+    };
+    if activity.is_terminal() {
+        return Err(format!(
+            "run {run_id} (slot {slot_id}) is {}; a probe would never be read",
+            activity.as_str(),
+        ));
+    }
+    let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    match (urgent, posture) {
+        // Parked at its prompt: `dispatch_probe_if_idle` writes during this
+        // call, because no further boundary is coming on its own.
+        (_, PaneInputPosture::Parked) => Ok(ProbeDeliveryExpectation::Immediate),
+        (true, PaneInputPosture::MidTurnBuffered) => Ok(ProbeDeliveryExpectation::NextToolBoundary),
+        (false, _) => Ok(ProbeDeliveryExpectation::NextTurnBoundary),
+        (true, PaneInputPosture::Refused) => Err(format!(
+            "run {run_id} (slot {slot_id}) is {} and its driver does not accept mid-turn pane input, so an \
+             urgent probe cannot be delivered at a tool boundary. Re-issue without --urgent to wait for the \
+             worker's next turn boundary.",
+            activity.as_str(),
+        )),
+    }
+}
+
+pub(super) async fn handle_probe_status(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        sink,
+        request_id,
+        peer_pid,
+        ..
+    } = ctx;
+    let FrontendRequest::ProbeStatus { probe_id } = req else {
+        unreachable!()
+    };
+    {
+        // Same tier as `ProbeRun`: whoever may issue a probe may read what
+        // became of it, including from a worker pane.
+        if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::Error {
+                    message: "probe_status requires app or Boss authority".to_owned(),
+                },
+            );
+            return;
+        }
+        match server_state.probe_record(&probe_id) {
+            Some(record) => send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::ProbeStatusResult {
+                    run_id: record.run_id,
+                    probe_id,
+                    state: record.state,
+                    urgent: record.urgent,
+                    detail: record.detail,
+                },
+            ),
+            // Probe ids are minted per engine process and never persisted, so
+            // "unknown" legitimately covers both a typo and an id from before
+            // the last engine restart. Say so rather than reporting a state.
+            None => send_work_error(
+                &sink,
+                &request_id,
+                format!(
+                    "unknown probe id: {probe_id} (probe ids are per-engine-process and are not \
+                     retained across an engine restart)"
+                ),
+            ),
+        }
     }
 }
 

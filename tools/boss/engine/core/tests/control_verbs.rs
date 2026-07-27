@@ -497,6 +497,16 @@ async fn probe_run_does_not_reject_local_caller_as_boss_only() -> Result<()> {
         })
         .await?;
     match response {
+        // `ProbeRefused` is the expected answer for a run with no live pane
+        // and is itself proof that authorization passed — the auth gate
+        // returns `Error` and short-circuits before the deliverability check
+        // this response comes from.
+        FrontendEvent::ProbeRefused { reason, .. } => {
+            assert!(
+                !reason.contains("authority"),
+                "a deliverability refusal must not be an auth refusal in disguise: {reason}"
+            );
+        }
         FrontendEvent::ProbeQueued { .. } => {}
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
             assert!(
@@ -537,53 +547,55 @@ async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
 }
 
 #[tokio::test]
-async fn probe_run_returns_unique_probe_ids() -> Result<()> {
-    // Wire-shape smoke: `ProbeRun` must surface the engine-minted
-    // `probe_id` so callers can correlate the queued probe with the
-    // eventual `ProbeReplied` push (deeper end-to-end coverage of
-    // that flow lives in the `dispatch_probe_reply_emits_…` unit
-    // test). Two back-to-back probes for the same run must mint
-    // distinct ids.
+async fn probe_run_refuses_a_run_with_no_live_pane_rather_than_queueing_it() -> Result<()> {
+    // Wire-shape smoke for the refusal contract. A probe aimed at a run the
+    // engine has no pane for can never be delivered, and reporting it as
+    // queued is what left an operator unable to distinguish "arriving
+    // shortly" from "never going to arrive" — they restarted a healthy worker
+    // to get a message into it. Both attempts must be refused, and the
+    // refusal must name the blocking condition rather than being generic.
+    //
+    // The accepted-probe shapes this test used to cover (`probe_id` minting,
+    // the echoed `urgent` flag, the committed delivery boundary) need a live
+    // worker slot, which this out-of-process harness cannot register; they are
+    // covered in-process in `app::tests::probe_delivery`, alongside
+    // `queue_probe_mints_unique_probe_ids` in `worker_probe_dispatch`.
     let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-    let first = client
-        .send_request(&FrontendRequest::ProbeRun {
-            run_id: "run-xyz".to_owned(),
-            text: "first".to_owned(),
-            urgent: false,
-        })
-        .await?;
-    let second = client
-        .send_request(&FrontendRequest::ProbeRun {
-            run_id: "run-xyz".to_owned(),
-            text: "second".to_owned(),
-            urgent: false,
-        })
-        .await?;
-    let id_first = match first {
-        FrontendEvent::ProbeQueued { probe_id, .. } => probe_id,
-        other => return Err(anyhow!("unexpected response to first probe: {other:?}")),
-    };
-    let id_second = match second {
-        FrontendEvent::ProbeQueued { probe_id, .. } => probe_id,
-        other => return Err(anyhow!("unexpected response to second probe: {other:?}")),
-    };
-    assert!(!id_first.is_empty(), "probe_id must be populated");
-    assert!(!id_second.is_empty(), "probe_id must be populated");
-    assert_ne!(id_first, id_second, "back-to-back probes must mint distinct ids");
+    for text in ["first", "second"] {
+        let response = client
+            .send_request(&FrontendRequest::ProbeRun {
+                run_id: "run-xyz".to_owned(),
+                text: text.to_owned(),
+                urgent: false,
+            })
+            .await?;
+        match response {
+            FrontendEvent::ProbeRefused { run_id, reason } => {
+                assert_eq!(run_id, "run-xyz");
+                assert!(
+                    reason.contains("no live worker pane"),
+                    "refusal must name the blocking condition: {reason}"
+                );
+            }
+            other => return Err(anyhow!("unexpected response to probe {text:?}: {other:?}")),
+        }
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn urgent_probe_echoes_urgent_flag_in_queued_response() -> Result<()> {
-    // Wire-shape smoke for the urgency indicator: a `ProbeRun` with
-    // `urgent: true` must echo `urgent: true` in the `ProbeQueued`
-    // response so the caller (`bossctl probe --urgent`) can confirm
-    // the delivery semantics the engine accepted. A non-urgent probe
-    // must echo `urgent: false` (backwards-compatible default).
+async fn urgent_probe_against_a_run_with_no_pane_is_refused_too() -> Result<()> {
+    // The `--urgent` flag must not buy a probe past the deliverability check.
+    // An urgent probe promises tool-boundary delivery; with no pane at all
+    // there is no boundary that could honour it, so the answer is the same
+    // refusal as the non-urgent case.
+    //
+    // The positive urgent shapes — `urgent: true` echoed back and an
+    // `expected_delivery` of `next_tool_boundary` — require a registered
+    // worker slot and live in `app::tests::probe_delivery`.
     let engine = spawn_engine().await?;
     let mut client = BossClient::connect_socket(engine.socket_str()).await?;
-
     let urgent_resp = client
         .send_request(&FrontendRequest::ProbeRun {
             run_id: "run-urgent".to_owned(),
@@ -592,24 +604,43 @@ async fn urgent_probe_echoes_urgent_flag_in_queued_response() -> Result<()> {
         })
         .await?;
     match urgent_resp {
-        FrontendEvent::ProbeQueued { urgent, .. } => {
-            assert!(urgent, "urgent probe must echo urgent: true");
+        FrontendEvent::ProbeRefused { run_id, reason } => {
+            assert_eq!(run_id, "run-urgent");
+            assert!(
+                reason.contains("no live worker pane"),
+                "refusal must name the blocking condition: {reason}"
+            );
         }
         other => return Err(anyhow!("unexpected response to urgent probe: {other:?}")),
     }
+    Ok(())
+}
 
-    let normal_resp = client
-        .send_request(&FrontendRequest::ProbeRun {
-            run_id: "run-normal".to_owned(),
-            text: "check in later".to_owned(),
-            urgent: false,
+#[tokio::test]
+async fn probe_status_reports_an_unknown_probe_id_as_an_error() -> Result<()> {
+    // Wire-shape smoke for the queryable delivery state: the verb is
+    // reachable, and an id this engine process never minted comes back as an
+    // error rather than a fabricated state. (Probe ids are per-process and
+    // are not persisted, so "unknown" is a real answer, not a bug.)
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let response = client
+        .send_request(&FrontendRequest::ProbeStatus {
+            probe_id: "probe-never-minted".to_owned(),
         })
         .await?;
-    match normal_resp {
-        FrontendEvent::ProbeQueued { urgent, .. } => {
-            assert!(!urgent, "non-urgent probe must echo urgent: false");
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("unknown probe id"),
+                "unknown probe id must be reported as such: {message}"
+            );
+            assert!(
+                !message.contains("requires app or Boss authority"),
+                "probe_status must not reject local callers on auth grounds: {message}"
+            );
         }
-        other => return Err(anyhow!("unexpected response to normal probe: {other:?}")),
+        other => return Err(anyhow!("unexpected response: {other:?}")),
     }
     Ok(())
 }

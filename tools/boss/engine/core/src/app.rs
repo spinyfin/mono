@@ -131,14 +131,14 @@ use worker_events::{
 };
 
 // Re-import verified pane-injection types so child modules can access them via `use super::*`.
-use pane_delivery::{PaneInjectOutcome, PaneSendFailure};
+use pane_delivery::{PaneInjectOutcome, PaneInjectRequest, PaneInputPosture, PaneSendFailure};
 
 // Re-import the split-out `ServerState` submodules' items so `app.rs` and every
 // child module can reach them via `use super::*`. `RpcTier` and `SendToAppError`
 // keep their public `boss_engine::app::` paths.
 pub use app_session::SendToAppError;
 use app_session::{APP_CHANNEL_UNHEALTHY_STREAK, AppChannelHealth, AppSessionHandle};
-use probes::{InFlightProbe, PendingProbe, ProbeLifecycleState, ServerStateProbeQueuer};
+use probes::{InFlightProbe, PendingProbe, ProbeRecord, ServerStateProbeQueuer};
 use trust::PidFileGuard;
 pub use trust::{PeerClass, RpcTier};
 
@@ -147,7 +147,7 @@ pub use trust::{PeerClass, RpcTier};
 // functions over the wire types — see the crate docs for why they live
 // outside `boss-engine`.
 use boss_engine_worker_policy::{sanitize_event_for_worker, variant_name, worker_verb_decision};
-use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
+use boss_protocol::{ProbeDeliveryExpectation, ProbeDeliveryState, WorkerTierDenial, WorkerTierDenialReason};
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
@@ -638,12 +638,15 @@ struct ServerState {
     /// offset captured at dispatch time bounds the read, so we don't
     /// re-emit text that pre-dated the probe.
     in_flight_probes: StdMutex<HashMap<String, InFlightProbe>>,
-    /// Lifecycle state per `probe_id`. Written at each transition
-    /// (queued / injected / consumed / unconfirmed / replied) and read
-    /// by `dispatch_probe_reply_on_stop` and by tests asserting the
-    /// corrected no-auto-redelivery behavior. See [`ProbeLifecycleState`].
+    /// Per-`probe_id` delivery record: the run it targets, whether it was
+    /// urgent, its current [`ProbeDeliveryState`] and an optional
+    /// operator-facing note. Written at each transition (queued / injected /
+    /// consumed / buffered / unconfirmed / replied) and read by
+    /// `dispatch_probe_reply_on_stop`, by the `ProbeStatus` RPC that
+    /// `bossctl probe-status` calls, and by tests asserting the corrected
+    /// no-auto-redelivery behavior. See [`ProbeRecord`].
     #[builder(default)]
-    probe_lifecycle: StdMutex<HashMap<String, ProbeLifecycleState>>,
+    probe_lifecycle: StdMutex<HashMap<String, ProbeRecord>>,
     /// One-shot waiters for the next `UserPromptSubmit` hook on a
     /// run, keyed by `run_id`. Each run can have *multiple* waiters
     /// registered concurrently (an urgent probe and a chore-update
@@ -1986,6 +1989,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::OpenReviewTerminal { .. } => review::handle_open_review_terminal(ctx, r).await,
             r @ FrontendRequest::PlanProject { .. } => planner_ops::handle_plan_project(ctx, r).await,
             r @ FrontendRequest::ProbeRun { .. } => executions::handle_probe_run(ctx, r).await,
+            r @ FrontendRequest::ProbeStatus { .. } => executions::handle_probe_status(ctx, r).await,
             r @ FrontendRequest::ReapRun { .. } => executions::handle_reap_run(ctx, r).await,
             r @ FrontendRequest::RecordEffortEscalation { .. } => effort::handle_record_effort_escalation(ctx, r).await,
             r @ FrontendRequest::RecordProducerSideConflict { .. } => {

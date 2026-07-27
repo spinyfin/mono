@@ -4,22 +4,34 @@
 //! writes them to the worker's pty. It does not prove the foreground
 //! process treated them as a pending user prompt. Text injected while
 //! the worker is idle at its prompt (the `Stop`-boundary probe path)
-//! has proven reliable, but text injected while the worker is actively
-//! mid-turn — the urgent `PostToolUse` probe path, and the
-//! chore-update auto-notice, which can land at any point in a turn —
-//! races the TUI's input handling. Worse, when the foreground process
+//! has proven reliable. Text injected while the worker is actively
+//! mid-turn — the urgent `PostToolUse` probe path, and the chore-update
+//! auto-notice, which can land at any point in a turn — depends on what
+//! the driver's foreground process does with mid-turn stdin: when it
 //! does not consume stdin at all (e.g. `codex exec`), injected bytes
 //! survive in the tty input buffer and are later executed by the
 //! interactive shell (ghostty-codex-pane-viability investigation, Q2
 //! Layer D). That is a **safety** issue, not hygiene.
 //!
 //! Before any write, [`ServerState::inject_pane_text_verified`] therefore
-//! consults live [`boss_protocol::WorkerActivity`]: only
-//! [`boss_protocol::WorkerActivity::Idle`] and
-//! [`boss_protocol::WorkerActivity::WaitingForInput`] accept typed
-//! input ([`boss_protocol::WorkerActivity::accepts_typed_input`]). A
-//! refusal is surfaced as [`PaneInjectOutcome::NotAcceptingInput`] —
-//! never silently dropped, and never gated on a single driver.
+//! consults a [`PaneInputPosture`], which combines two orthogonal facts:
+//!
+//! * the slot's live [`boss_protocol::WorkerActivity`] — is the worker
+//!   parked at its prompt ([`boss_protocol::WorkerActivity::accepts_typed_input`]),
+//!   mid-turn, pre-session, or gone; and
+//! * the run's driver — does its foreground process buffer mid-turn stdin
+//!   ([`crate::driver::AgentDriver::mid_turn_pane_input`])?
+//!
+//! Conflating those two was the delivery bug: the guard refused *every*
+//! mid-turn write, and the urgent probe path fires on `PostToolUse` where
+//! the activity is `Working` by construction, so `probe --urgent` could
+//! never deliver on any driver. Splitting them keeps the refusal exactly
+//! where the tty-leak risk is (a driver whose process does not read
+//! mid-turn stdin) and lets an interactive TUI take mid-turn input the
+//! same way it takes a human's keystrokes.
+//!
+//! A refusal is surfaced as [`PaneInjectOutcome::NotAcceptingInput`] —
+//! never silently dropped.
 //!
 //! The probe-6 incident originally looked like a silent delivery
 //! loss: the engine logged "injected" and the worker ran on for 20+
@@ -47,12 +59,101 @@
 use super::*;
 use boss_protocol::WorkerActivity;
 
+/// Whether a pane write is permitted for a given `(activity, driver)` pair,
+/// and if so at which of the two delivery postures.
+///
+/// Built with [`ServerState::pane_input_posture_for_run`], which resolves the
+/// run's driver once and pairs it with the slot's live activity. Keeping this
+/// a single value (rather than two separate predicate calls at each site)
+/// means the urgent path, the Stop path and `bossctl agents send` cannot drift
+/// apart on what they consider injectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneInputPosture {
+    /// The worker is parked at its prompt ([`WorkerActivity::Idle`] /
+    /// [`WorkerActivity::WaitingForInput`]). The write becomes the next
+    /// prompt immediately; this is safe under every driver.
+    Parked,
+    /// The worker is mid-turn ([`WorkerActivity::Working`]) and its driver
+    /// declares [`crate::driver::MidTurnPaneInput::Buffers`]: the foreground
+    /// process is reading stdin, so the write is held in the agent's composer
+    /// and submitted when the current turn ends — the same thing a human gets
+    /// by typing into the pane while the agent works.
+    MidTurnBuffered,
+    /// No write may be issued. Either there is no live state for the slot
+    /// (fail closed — unknown is not "accepting"), the worker is pre-session
+    /// or terminal, or it is mid-turn on a driver whose foreground process
+    /// does not consume mid-turn stdin (the tty-leak case the guard exists
+    /// for).
+    Refused,
+}
+
+impl PaneInputPosture {
+    /// Resolve the posture for a live `activity` (None = no live state for
+    /// the slot) against a driver's mid-turn stdin behaviour.
+    pub(crate) fn resolve(activity: Option<WorkerActivity>, mid_turn: crate::driver::MidTurnPaneInput) -> Self {
+        match activity {
+            Some(a) if a.accepts_typed_input() => Self::Parked,
+            Some(WorkerActivity::Working) if mid_turn.buffers() => Self::MidTurnBuffered,
+            _ => Self::Refused,
+        }
+    }
+
+    /// True when a write may be issued at all.
+    pub(crate) fn permits_write(self) -> bool {
+        !matches!(self, Self::Refused)
+    }
+
+    /// True when the write lands in a mid-turn agent's input buffer rather
+    /// than becoming its prompt straight away — the case where "no
+    /// `UserPromptSubmit` yet" is expected rather than anomalous.
+    pub(crate) fn is_mid_turn(self) -> bool {
+        matches!(self, Self::MidTurnBuffered)
+    }
+}
+
+/// One verified pane-injection request.
+///
+/// Bundled rather than passed as seven positional arguments so the call sites
+/// name what they are supplying — in particular that `transcript_path` /
+/// `offset_bytes` are a snapshot the caller took *before* the write (the same
+/// one used for reply extraction), so the transcript fallback only ever scans
+/// bytes written after the injection.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(crate) struct PaneInjectRequest<'a> {
+    pub(crate) run_id: &'a str,
+    pub(crate) slot_id: u8,
+    pub(crate) text: String,
+    /// Transcript path to fall back to when no `UserPromptSubmit` hook
+    /// arrives, or `None` when the run has no transcript recorded yet.
+    pub(crate) transcript_path: Option<&'a str>,
+    /// Byte length of `transcript_path` at snapshot time; the fallback scan
+    /// starts here.
+    pub(crate) offset_bytes: u64,
+    /// How long to wait for a confirming signal before falling back to the
+    /// transcript scan and then reporting `Buffered`/`Unconfirmed`.
+    pub(crate) verify_timeout: Duration,
+    /// The injectable posture the caller resolved via
+    /// [`ServerState::pane_input_posture_for_run`].
+    pub(crate) posture: PaneInputPosture,
+}
+
 /// Outcome of [`ServerState::inject_pane_text_verified`].
 #[derive(Debug)]
 pub(crate) enum PaneInjectOutcome {
     /// `SendToPane` succeeded and either a matching `UserPromptSubmit`
     /// hook or a transcript scan confirmed the text was consumed.
     Confirmed,
+    /// `SendToPane` succeeded into a mid-turn agent whose driver buffers
+    /// stdin ([`PaneInputPosture::MidTurnBuffered`]), and no
+    /// `UserPromptSubmit` arrived inside the verification window. Unlike
+    /// [`Self::Unconfirmed`] this is the *expected* shape of a successful
+    /// mid-turn delivery: the agent is still finishing its turn, so it has
+    /// not submitted the buffered text yet and cannot be expected to. The
+    /// end-to-end confirmation for this case is the worker's reply at the
+    /// next turn boundary, which the in-flight probe machinery already
+    /// captures.
+    Buffered,
     /// `SendToPane` succeeded (bytes reached the app/pty) but neither a
     /// `UserPromptSubmit` hook nor a transcript scan confirmed delivery
     /// before the timeout. This is NOT proof the write was lost — the
@@ -61,13 +162,13 @@ pub(crate) enum PaneInjectOutcome {
     /// Callers must record this as an observable "unconfirmed" state
     /// rather than treating it as a failure and re-delivering the text.
     Unconfirmed,
-    /// Refused before any pty write: the slot's live
-    /// [`WorkerActivity`] is not one that accepts typed input
-    /// ([`WorkerActivity::accepts_typed_input`]), or no live state is
-    /// registered for the slot. `activity` is `None` when the registry
-    /// has no entry for the slot (fail closed — unknown is not
-    /// "accepting"). Callers must surface this rather than silently
-    /// drop the text or re-issue the write.
+    /// Refused before any pty write: the resolved [`PaneInputPosture`] was
+    /// [`PaneInputPosture::Refused`] — the slot is pre-session or terminal,
+    /// no live state is registered for it, or it is mid-turn on a driver that
+    /// does not consume mid-turn stdin. `activity` is `None` when the
+    /// registry has no entry for the slot (fail closed — unknown is not
+    /// "accepting"). Callers must surface this rather than silently drop the
+    /// text or re-issue the write.
     NotAcceptingInput { activity: Option<WorkerActivity> },
     /// `SendToPane` itself failed at the transport or app layer.
     /// Carries enough detail for callers that need a typed error
@@ -199,23 +300,84 @@ impl ServerState {
         self.live_worker_states.get(slot_id).map(|s| s.activity)
     }
 
-    /// True when `slot_id` has a live worker whose
-    /// [`WorkerActivity::accepts_typed_input`].
+    /// True when `slot_id` has a live worker parked at its prompt. This is
+    /// the driver-independent floor only — for the full injection decision
+    /// (which also admits mid-turn writes on a buffering driver) use
+    /// [`Self::pane_input_posture_for_run`].
     pub(super) fn pane_accepts_typed_input(&self, slot_id: u8) -> bool {
         self.pane_typed_input_activity(slot_id)
             .is_some_and(WorkerActivity::accepts_typed_input)
     }
 
-    /// Write `text` into `run_id`'s worker pane (`slot_id`) and wait up
-    /// to `verify_timeout` for confirmation that the CLI actually
+    /// What this run's driver does with mid-turn pane input.
+    ///
+    /// Fails closed to [`crate::driver::MidTurnPaneInput::Rejects`] when the
+    /// driver cannot be resolved (unknown execution, unregistered slug, DB
+    /// error). An unresolvable driver is exactly the case where we cannot
+    /// rule out the tty-leak, so it must not be treated as buffering.
+    pub(super) fn run_mid_turn_pane_input(&self, run_id: &str) -> crate::driver::MidTurnPaneInput {
+        use crate::driver::{DriverRegistry, MidTurnPaneInput};
+
+        let slug = match self.work_db.get_execution_driver_slug(run_id) {
+            Ok(Some(slug)) => slug,
+            Ok(None) => {
+                tracing::debug!(
+                    run_id,
+                    "pane posture: no driver recorded for run; refusing mid-turn input",
+                );
+                return MidTurnPaneInput::Rejects;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    ?err,
+                    "pane posture: driver lookup failed; refusing mid-turn input",
+                );
+                return MidTurnPaneInput::Rejects;
+            }
+        };
+        match DriverRegistry::default().get(&slug) {
+            Some(driver) => driver.mid_turn_pane_input(),
+            None => {
+                tracing::warn!(
+                    run_id,
+                    driver = %slug,
+                    "pane posture: driver slug not in registry; refusing mid-turn input",
+                );
+                MidTurnPaneInput::Rejects
+            }
+        }
+    }
+
+    /// Resolve the full [`PaneInputPosture`] for `run_id` on `slot_id`:
+    /// the slot's live activity paired with the run driver's mid-turn stdin
+    /// behaviour. Every pane-injection site goes through this so they cannot
+    /// disagree about what is injectable.
+    pub(super) fn pane_input_posture_for_run(&self, run_id: &str, slot_id: u8) -> PaneInputPosture {
+        let activity = self.pane_typed_input_activity(slot_id);
+        // Skip the driver lookup entirely when the activity alone decides —
+        // parked slots are injectable under every driver, and pre-session /
+        // terminal slots under none. Only `Working` needs the DB round-trip.
+        if activity.is_some_and(WorkerActivity::accepts_typed_input) {
+            return PaneInputPosture::Parked;
+        }
+        if activity != Some(WorkerActivity::Working) {
+            return PaneInputPosture::Refused;
+        }
+        PaneInputPosture::resolve(activity, self.run_mid_turn_pane_input(run_id))
+    }
+
+    /// Write `req.text` into `req.run_id`'s worker pane (`req.slot_id`) and
+    /// wait up to `req.verify_timeout` for confirmation that the CLI actually
     /// enqueued it as the next prompt, rather than merely accepting the
     /// pty write.
     ///
-    /// **Activity guard (first):** refuses with
-    /// [`PaneInjectOutcome::NotAcceptingInput`] when the slot's live
-    /// [`WorkerActivity`] is not accepting typed input (or is unknown).
-    /// No bytes are written to the pty in that case — this is the
-    /// safety fix for mid-turn / non-consuming foreground processes.
+    /// **Posture guard (first):** `req.posture` must have been resolved by the
+    /// caller via [`Self::pane_input_posture_for_run`]. A
+    /// [`PaneInputPosture::Refused`] posture returns
+    /// [`PaneInjectOutcome::NotAcceptingInput`] with no bytes written to the
+    /// pty — this is the safety guard for foreground processes that do not
+    /// consume mid-turn stdin.
     ///
     /// **Confirmation (when the guard passes):** either a matching
     /// `UserPromptSubmit` hook, or (since that hook firing for
@@ -224,30 +386,32 @@ impl ServerState {
     /// gap in one signal doesn't by itself produce a false
     /// "unconfirmed".
     ///
-    /// `transcript_path`/`offset_bytes` should be captured by the
-    /// caller *before* this call (the same snapshot used for reply
-    /// extraction) so the transcript fallback only looks at bytes
-    /// written after the injection, not pre-existing content.
-    ///
-    /// Returns [`PaneInjectOutcome::Unconfirmed`], not an error, when
-    /// neither signal confirms in time — see the module docs for why
-    /// callers must not treat that as proof of loss.
-    pub(super) async fn inject_pane_text_verified(
-        &self,
-        run_id: &str,
-        slot_id: u8,
-        text: String,
-        transcript_path: Option<&str>,
-        offset_bytes: u64,
-        verify_timeout: Duration,
-    ) -> PaneInjectOutcome {
+    /// When neither signal confirms in time the result depends on the
+    /// posture, because "no prompt submitted yet" means different things in
+    /// each: a [`PaneInputPosture::Parked`] worker should have submitted
+    /// immediately, so that is [`PaneInjectOutcome::Unconfirmed`]; a
+    /// [`PaneInputPosture::MidTurnBuffered`] worker is still finishing its
+    /// turn and is *expected* not to have submitted yet, so that is
+    /// [`PaneInjectOutcome::Buffered`]. Neither is an error, and neither is
+    /// proof of loss — see the module docs for why callers must not
+    /// auto-redeliver.
+    pub(super) async fn inject_pane_text_verified(&self, req: PaneInjectRequest<'_>) -> PaneInjectOutcome {
+        let PaneInjectRequest {
+            run_id,
+            slot_id,
+            text,
+            transcript_path,
+            offset_bytes,
+            verify_timeout,
+            posture,
+        } = req;
         let activity = self.pane_typed_input_activity(slot_id);
-        if !activity.is_some_and(WorkerActivity::accepts_typed_input) {
+        if !posture.permits_write() {
             tracing::warn!(
                 run_id,
                 slot_id,
                 activity = activity.map(WorkerActivity::as_str),
-                "pane injection refused: worker is not accepting typed input"
+                "pane injection refused: no injectable posture for this worker/driver pair"
             );
             return PaneInjectOutcome::NotAcceptingInput { activity };
         }
@@ -292,6 +456,17 @@ impl ServerState {
                         "pane injection confirmed via transcript scan (no UserPromptSubmit observed)",
                     );
                     return PaneInjectOutcome::Confirmed;
+                }
+                if posture.is_mid_turn() {
+                    // Expected: the agent is still mid-turn, so it has not
+                    // submitted the buffered text yet. Not an anomaly, and
+                    // not a delivery failure.
+                    tracing::info!(
+                        run_id,
+                        slot_id,
+                        "pane injection buffered by a mid-turn agent; prompt submission awaits the turn boundary",
+                    );
+                    return PaneInjectOutcome::Buffered;
                 }
                 PaneInjectOutcome::Unconfirmed
             }

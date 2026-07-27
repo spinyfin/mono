@@ -220,14 +220,22 @@ async fn dispatch_probe_reply_emits_probe_replied_after_followup_stop() {
     );
 }
 
-/// Safety guard: an urgent probe on PostToolUse while the worker is
-/// mid-turn (`Working`) must **not** write to the pane. Injecting into
-/// a non-accepting foreground process is a safety issue
-/// (ghostty-codex-pane-viability Q2 Layer D), not hygiene. The probe is
-/// left queued for the next Stop boundary (no pop), and Working-on-
-/// PostToolUse is treated as *expected* deferral — no
-/// `ProbeDeliveryEscalated` (multi-tool turns must not spam once per
-/// tool).
+/// Safety guard: an urgent probe on PostToolUse must **not** write to the
+/// pane when the run has no resolvable driver — `register_working_worker`
+/// registers a bare run id with no execution row behind it, so the mid-turn
+/// decision cannot establish what the foreground process does with stdin and
+/// fails closed. Injecting into a non-consuming foreground process is a safety
+/// issue (ghostty-codex-pane-viability Q2 Layer D), not hygiene.
+///
+/// Note what this does *not* assert: that `Working` alone forbids the write.
+/// It does not — a mid-turn worker on a driver that buffers stdin is
+/// injectable, which is what makes `--urgent` work at all. See
+/// `app::tests::probe_delivery` for both halves of that decision under a
+/// resolvable driver.
+///
+/// The probe is left queued for the next Stop boundary (no pop), and the
+/// deferral is treated as *expected* — no `ProbeDeliveryEscalated`
+/// (multi-tool turns must not spam once per tool).
 #[tokio::test]
 async fn dispatch_urgent_probe_defers_when_worker_not_accepting_input() {
     use crate::protocol::WorkerEvent;
@@ -280,7 +288,7 @@ async fn dispatch_urgent_probe_defers_when_worker_not_accepting_input() {
     assert!(still.urgent);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Queued),
+        Some(ProbeDeliveryState::Queued),
     );
 
     // Expected Working deferral must not publish ProbeDeliveryEscalated.
@@ -369,7 +377,7 @@ async fn dispatch_urgent_probe_on_idle_records_unconfirmed_without_redelivery() 
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Unconfirmed),
+        Some(ProbeDeliveryState::Unconfirmed),
         "unconfirmed delivery must be recorded, not left unknown",
     );
     assert!(
@@ -776,7 +784,7 @@ async fn urgent_probe_multi_tool_post_tool_use_does_not_escalate_spam() {
     assert!(still.urgent);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Queued),
+        Some(ProbeDeliveryState::Queued),
     );
 
     let drain = tokio::time::timeout(Duration::from_millis(50), watch_sink.next()).await;
@@ -878,7 +886,7 @@ async fn urgent_probe_defers_through_fanout_then_delivers_on_stop() {
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
-        Some(ProbeLifecycleState::Consumed),
+        Some(ProbeDeliveryState::Consumed),
     );
 }
 

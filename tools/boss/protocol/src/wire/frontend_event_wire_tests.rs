@@ -672,8 +672,28 @@ fn tag_cases() -> Vec<TagCase> {
                 run_id: "run_1".into(),
                 probe_id: "probe_1".into(),
                 urgent: true,
+                expected_delivery: Some(ProbeDeliveryExpectation::NextToolBoundary),
             },
             expected_tag: "probe_queued",
+        },
+        TagCase {
+            label: "ProbeRefused",
+            event: FrontendEvent::ProbeRefused {
+                run_id: "run_1".into(),
+                reason: "no live worker pane".into(),
+            },
+            expected_tag: "probe_refused",
+        },
+        TagCase {
+            label: "ProbeStatusResult",
+            event: FrontendEvent::ProbeStatusResult {
+                run_id: "run_1".into(),
+                probe_id: "probe_1".into(),
+                state: ProbeDeliveryState::Buffered,
+                urgent: true,
+                detail: None,
+            },
+            expected_tag: "probe_status_result",
         },
         TagCase {
             label: "ProbeReplied",
@@ -1902,7 +1922,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DecisionCreated { .. }
         | FrontendEvent::DecisionResult { .. }
         | FrontendEvent::DecisionsList { .. }
-        | FrontendEvent::DecisionUpdated { .. } => {}
+        | FrontendEvent::DecisionUpdated { .. }
+        | FrontendEvent::ProbeRefused { .. }
+        | FrontendEvent::ProbeStatusResult { .. } => {}
     }
 }
 

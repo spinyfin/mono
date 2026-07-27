@@ -15,10 +15,10 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, nor
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, ModelMenu, PermissionArtifacts,
-    PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
-    SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, MidTurnPaneInput, ModelMenu,
+    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressObservationWiring, SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
 };
 
 pub mod structured_output;
@@ -737,6 +737,18 @@ impl AgentDriver for ClaudeDriver {
             ErrorClass::Permanent => WorkerErrorClass::Permanent,
             ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
+    }
+
+    /// Claude Code runs as a long-lived interactive TUI that reads stdin for
+    /// the whole session, including while a turn is in flight: text arriving
+    /// mid-turn is held in its composer and submitted as the next prompt once
+    /// the turn ends. That is precisely what a human gets by typing into a
+    /// worker pane while the agent is working, and it is what makes
+    /// `probe --urgent` deliverable at a `PostToolUse` boundary. Unlike
+    /// `codex exec`, the process never exits between turns leaving unread
+    /// bytes behind for the shell to execute.
+    fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
+        MidTurnPaneInput::Buffers
     }
 
     fn structured_output_wiring(
@@ -1668,5 +1680,16 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
         let key = workspace.display().to_string();
         assert_eq!(value["projects"][&key]["hasTrustDialogAccepted"], true);
+    }
+
+    /// Claude Code is a long-lived interactive TUI that reads stdin for the
+    /// whole session, so mid-turn pane input lands in its composer and is
+    /// submitted as the next prompt. This is what makes `probe --urgent`
+    /// deliverable at a tool boundary; a regression here silently makes every
+    /// urgent probe undeliverable again.
+    #[test]
+    fn claude_buffers_mid_turn_pane_input() {
+        assert_eq!(ClaudeDriver.mid_turn_pane_input(), MidTurnPaneInput::Buffers);
+        assert!(ClaudeDriver.mid_turn_pane_input().buffers());
     }
 }

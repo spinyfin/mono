@@ -113,11 +113,53 @@ pub(super) fn register_working_worker(server_state: &ServerState, run_id: &str, 
     );
 }
 
+/// Seed a product → chore → execution chain so
+/// `WorkDb::get_execution_driver_slug` resolves for the returned execution id,
+/// and register that execution against `slot_id` as a **mid-turn** worker.
+///
+/// `driver` sets `tasks.driver`; `None` leaves it unset so the engine default
+/// (`claude`) applies. This is the fixture the mid-turn pane-input decision
+/// needs, because that decision reads the run's driver — a bare `run_id` with
+/// no execution row resolves to no driver and fails closed, which is correct
+/// behaviour but tests nothing about either driver.
+pub(super) fn register_working_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    use boss_protocol::RequestExecutionInput;
+
+    let product = crate::test_support::create_test_product_with_repo(
+        &server_state.work_db,
+        "probe-posture-product",
+        Some("git@example.com:p.git"),
+    );
+    let chore = crate::test_support::create_test_chore_manual(&server_state.work_db, product.id.clone(), "c");
+    if let Some(driver) = driver {
+        server_state
+            .work_db
+            .connect()
+            .unwrap()
+            .execute(
+                "UPDATE tasks SET driver = ?2 WHERE id = ?1",
+                rusqlite::params![chore.id, driver],
+            )
+            .unwrap();
+    }
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    register_working_worker(server_state, &execution.id, slot_id);
+    execution.id
+}
+
 mod app_channel;
 mod context;
 mod engine_health_report;
 mod open_document;
 mod pr_status;
+mod probe_delivery;
 mod proposals;
 mod session_sink_queue;
 mod t02;

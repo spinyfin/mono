@@ -255,13 +255,15 @@ pub enum FrontendEvent {
     },
     /// Engine confirms the Boss session pid was registered.
     BossSessionRegistered,
-    /// Engine confirms a probe was queued for the given run. The
-    /// engine-minted `probe_id` lets callers correlate a queued probe
-    /// with the eventual [`FrontendEvent::ProbeReplied`] push, which
-    /// arrives on the [`probe_topic`] for `run_id` once the worker's
-    /// follow-up Stop boundary lands. `urgent` echoes the flag from
-    /// the originating [`FrontendRequest::ProbeRun`] call so the
-    /// caller can confirm the delivery semantics that were accepted.
+    /// Engine **accepted** a probe for the given run, having first checked
+    /// that it can actually be delivered. The engine-minted `probe_id` lets
+    /// callers correlate the probe with the eventual
+    /// [`FrontendEvent::ProbeReplied`] push (on the [`probe_topic`] for
+    /// `run_id`) and query progress via [`FrontendRequest::ProbeStatus`].
+    ///
+    /// An undeliverable probe produces [`FrontendEvent::ProbeRefused`]
+    /// instead, so receiving this event means the engine has committed to a
+    /// specific delivery boundary rather than merely having stored the text.
     ProbeQueued {
         run_id: String,
         probe_id: String,
@@ -270,6 +272,42 @@ pub enum FrontendEvent {
         /// next `PostToolUse` boundary rather than the next `Stop`.
         #[serde(default)]
         urgent: bool,
+        /// Which boundary the engine expects to deliver at, evaluated against
+        /// the worker's live activity and its driver at accept time. `None`
+        /// only when decoding a payload from an engine predating this field —
+        /// a live engine always states an expectation, since accepting
+        /// without one is what made the old reporting dishonest.
+        #[serde(default)]
+        expected_delivery: Option<ProbeDeliveryExpectation>,
+    },
+    /// Engine **refused** a probe: it evaluated delivery and concluded the
+    /// text would never reach the worker, so nothing was queued and no
+    /// `probe_id` was minted. `reason` is operator-facing and names the
+    /// blocking condition (no live pane, terminal worker, `--urgent` against
+    /// a driver that cannot take mid-turn input, …).
+    ///
+    /// Clients must treat this as a failure — a non-zero exit for a CLI.
+    /// Reporting it as success is precisely the bug this event exists to fix:
+    /// an operator who cannot tell "queued, arriving shortly" from "never
+    /// going to arrive" ends up restarting a healthy worker to make progress.
+    ProbeRefused {
+        run_id: String,
+        reason: String,
+    },
+    /// Current delivery state of the probe named by `probe_id`, answering
+    /// [`FrontendRequest::ProbeStatus`].
+    ProbeStatusResult {
+        run_id: String,
+        probe_id: String,
+        state: ProbeDeliveryState,
+        /// Echoes whether the probe was queued as urgent.
+        #[serde(default)]
+        urgent: bool,
+        /// Optional operator-facing note about how the probe reached `state`
+        /// — e.g. why a write came back unconfirmed. `None` when the state
+        /// speaks for itself.
+        #[serde(default)]
+        detail: Option<String>,
     },
     /// Push: the worker for `run_id` has replied to a previously
     /// dispatched probe. Emitted on the Stop boundary that follows
