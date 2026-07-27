@@ -445,6 +445,9 @@ pub(crate) async fn run_create_investigation(
     };
     let name = required_text(args.name, "Investigation name", ctx)?;
     let description = optional_text(args.description, "Description", ctx)?;
+    // Non-blocking: warn on stderr when this name overlaps an active
+    // product decision. Never fails the create, never touches stdout.
+    warn_if_overlapping_decision(client, &product.id, &name).await;
     let model_override = normalize_non_empty(args.model);
     let driver = normalize_non_empty(args.driver);
     validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;

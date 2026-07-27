@@ -89,6 +89,34 @@ rust_test(
     ),
 )
 
+# End-to-end coverage for `boss decision` create/list/show/revoke/supersede
+# plus the create-time overlap warning (stderr-only, non-blocking).
+rust_test(
+    name = "decision_test",
+    size = "small",
+    timeout = "moderate",
+    srcs = [
+        "tests/decision.rs",
+    ],
+    crate_root = "tests/decision.rs",
+    data = [":boss"],
+    edition = "2024",
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":common",
+        ":harness",
+        "//tools/boss/client",
+        "//tools/boss/engine/core:engine_lib",
+        "//tools/boss/protocol",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
+
 # End-to-end coverage for the `boss` CLI's typed-id → product inference.
 # Spawns an in-process engine and drives the `boss` binary as a real
 # subprocess; the data dep stages it into the test's runfiles tree at
