@@ -14,7 +14,10 @@ final class APIKeyStoreTests: XCTestCase {
         super.setUp()
         // A path two levels deep that does NOT yet exist, so saving also
         // exercises intermediate-directory creation.
-        let dir = NSTemporaryDirectory()
+        let temporaryDirectory = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+            ?? NSTemporaryDirectory()
+        let dir = temporaryDirectory
+            + "/"
             + "boss-apikeystore-tests-\(UUID().uuidString)/nested"
         keyPath = dir + "/anthropic-api-key"
         setenv(APIKeyStore.fileOverrideEnvVar, keyPath, 1)

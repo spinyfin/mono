@@ -17,7 +17,9 @@ import os
 /// parses it well within the time the old quadratic scan would have taken.
 final class EngineClientLargeMessageFramingTests: XCTestCase {
     func testLargeSingleLineMessageParsesPromptly() throws {
-        let socketPath = "/tmp/boss-engineclient-test-\(UUID().uuidString).sock"
+        let temporaryDirectory = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+            ?? NSTemporaryDirectory()
+        let socketPath = "\(temporaryDirectory)/boss-engineclient-test-\(UUID().uuidString).sock"
         defer { unlink(socketPath) }
 
         // ~6 MB payload — matches the size the investigation measured

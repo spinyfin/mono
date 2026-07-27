@@ -132,7 +132,18 @@ struct AssetDownloader: Sendable {
     /// `UpdateDownloader` — that lifecycle concern belongs to the app layer,
     /// not this leaf module.
     static let live = AssetDownloader { url, onProgress in
-        try await DownloadTaskRunner.run(url: url, onProgress: onProgress)
+        try await DownloadTaskRunner.run(
+            url: url,
+            temporaryDirectory: liveTemporaryDirectory(),
+            onProgress: onProgress
+        )
+    }
+
+    /// Keep live archive ownership aligned with Foundation's production temp
+    /// semantics. In particular, do not reinterpret ambient `TMPDIR` text:
+    /// Foundation validates and canonicalizes the platform temporary directory.
+    static func liveTemporaryDirectory(fileManager: FileManager = .default) -> URL {
+        fileManager.temporaryDirectory
     }
 }
 
@@ -146,6 +157,7 @@ struct AssetDownloader: Sendable {
 /// rather than continuing to completion in the background.
 private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
     private let onProgress: @Sendable (DownloadProgress) -> Void
+    private let temporaryDirectory: URL
     private let lock = NSLock()
     private var continuation: CheckedContinuation<URL, Error>?
     private var coalescer = DownloadProgressCoalescer()
@@ -154,12 +166,23 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
     /// delegate (and its retained `onProgress` closure) alive indefinitely.
     private var session: URLSession?
 
-    private init(onProgress: @escaping @Sendable (DownloadProgress) -> Void) {
+    private init(
+        temporaryDirectory: URL,
+        onProgress: @escaping @Sendable (DownloadProgress) -> Void
+    ) {
+        self.temporaryDirectory = temporaryDirectory
         self.onProgress = onProgress
     }
 
-    static func run(url: URL, onProgress: @escaping @Sendable (DownloadProgress) -> Void) async throws -> URL {
-        let delegate = DownloadTaskRunner(onProgress: onProgress)
+    static func run(
+        url: URL,
+        temporaryDirectory: URL,
+        onProgress: @escaping @Sendable (DownloadProgress) -> Void
+    ) async throws -> URL {
+        let delegate = DownloadTaskRunner(
+            temporaryDirectory: temporaryDirectory,
+            onProgress: onProgress
+        )
         let session = URLSession(configuration: .ephemeral, delegate: delegate, delegateQueue: nil)
         // Safe without the lock: no delegate callback can fire until `task.resume()` below.
         delegate.session = session
@@ -205,7 +228,7 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        let stable = FileManager.default.temporaryDirectory
+        let stable = temporaryDirectory
             .appendingPathComponent("boss-update-\(UUID().uuidString).zip")
         do {
             try? FileManager.default.removeItem(at: stable)

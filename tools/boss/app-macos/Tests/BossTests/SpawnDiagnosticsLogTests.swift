@@ -36,7 +36,11 @@ final class SpawnDiagnosticsLogTests: XCTestCase {
     func testWritesJsonlLinesToDailyFile() throws {
         // End-to-end through the on-disk mirror: the request and the failure
         // both land as JSONL lines in a `spawn-<date>.jsonl` file.
-        let dir = FileManager.default.temporaryDirectory
+        let dir = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
             .appendingPathComponent("spawn-diag-test-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 

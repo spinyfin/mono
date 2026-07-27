@@ -1,12 +1,25 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
 package(default_visibility = ["//visibility:private"])
+
+config_setting(
+    name = "coverage_enabled",
+    values = {"collect_code_coverage": "true"},
+)
+
+_COVERAGE_LINKOPTS = select({
+    ":coverage_enabled": ["-fprofile-instr-generate"],
+    "//conditions:default": [],
+})
 
 macos_unit_test(
     name = "UpdateTests",
     size = "small",
+    env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":update_tests_lib"],
 )
 
@@ -15,6 +28,7 @@ swift_library(
     testonly = True,
     srcs = glob(["*.swift"]),
     copts = [],
+    linkopts = _COVERAGE_LINKOPTS,
     module_name = "UpdateTests",
     deps = ["//tools/boss/app-macos/Sources/UpdateCore"],
 )

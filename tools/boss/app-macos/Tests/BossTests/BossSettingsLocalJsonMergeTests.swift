@@ -7,7 +7,11 @@ import XCTest
 /// survive every app restart.
 final class BossSettingsLocalJsonMergeTests: XCTestCase {
     private func withScratchSettingsPath(_ body: (URL) throws -> Void) rethrows {
-        let dir = FileManager.default.temporaryDirectory
+        let dir = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
             .appendingPathComponent("BossSettingsLocalJsonMergeTests-\(UUID().uuidString)")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }

@@ -1,0 +1,14 @@
+diff --git a/apple/testing/default_runner/macos_test_runner.template.sh b/apple/testing/default_runner/macos_test_runner.template.sh
+index 27ed2b0..d76d6c2 100644
+--- a/apple/testing/default_runner/macos_test_runner.template.sh
++++ b/apple/testing/default_runner/macos_test_runner.template.sh
+@@ -123,7 +123,8 @@ fi
+ 
+ XCTESTRUN_ENV=""
+ for SINGLE_TEST_ENV in ${TEST_ENV//,/ }; do
+-  IFS== read key value <<< "$SINGLE_TEST_ENV"
++  key="${SINGLE_TEST_ENV%%=*}"
++  value="${SINGLE_TEST_ENV#*=}"
+   XCTESTRUN_ENV+="<key>$(escape "$key")</key><string>$(escape "$value")</string>"
+ done
+ 

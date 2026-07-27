@@ -13,7 +13,11 @@ final class UpdateDownloaderTests: XCTestCase {
     private var tempRoot: URL!
 
     override func setUpWithError() throws {
-        tempRoot = FileManager.default.temporaryDirectory
+        tempRoot = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
             .appendingPathComponent("UpdateDownloaderTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
     }
@@ -23,6 +27,34 @@ final class UpdateDownloaderTests: XCTestCase {
     }
 
     // MARK: Happy path
+
+    func testLiveDownloaderUsesFoundationTemporaryDirectory() {
+        XCTAssertEqual(
+            AssetDownloader.liveTemporaryDirectory().standardizedFileURL,
+            FileManager.default.temporaryDirectory.standardizedFileURL
+        )
+    }
+
+    func testLiveDownloaderDoesNotInterpretMalformedAmbientTMPDIR() {
+        let original = ProcessInfo.processInfo.environment["TMPDIR"]
+        defer {
+            if let original {
+                setenv("TMPDIR", original, 1)
+            } else {
+                unsetenv("TMPDIR")
+            }
+        }
+
+        let expected = FileManager.default.temporaryDirectory.standardizedFileURL
+        for malformed in ["", "relative/path", "/path/that/does/not/exist", "://not-a-file-url"] {
+            setenv("TMPDIR", malformed, 1)
+            XCTAssertEqual(
+                AssetDownloader.liveTemporaryDirectory().standardizedFileURL,
+                expected,
+                "live download temp semantics must remain Foundation-owned for TMPDIR=\(malformed)"
+            )
+        }
+    }
 
     func testReadyStagesBundleZipAndManifest() async throws {
         let downloader = makeDownloader(current: "1.0.27", runningTeamID: nil)

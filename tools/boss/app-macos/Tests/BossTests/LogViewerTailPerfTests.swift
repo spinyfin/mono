@@ -16,7 +16,11 @@ import os
 final class LogViewerTailPerfTests: XCTestCase {
 
     private func makeTempDir() throws -> URL {
-        let dir = FileManager.default.temporaryDirectory
+        let dir = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
             .appendingPathComponent("boss-tail-test-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir

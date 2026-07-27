@@ -1,0 +1,72 @@
+load("@rules_rust//rust:defs.bzl", "rust_test")
+load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load(":defs.bzl", "network_enabled_rust_test")
+load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
+
+exports_files(["macos_direct_test_runner.template.sh"])
+
+macos_direct_test_runner(
+    name = "macos_direct_test_runner",
+    visibility = ["//visibility:public"],
+)
+
+sh_binary(
+    name = "xcodebuild",
+    srcs = ["xcodebuild.sh"],
+)
+
+sh_binary(
+    name = "hermetic_test_wrapper",
+    srcs = ["hermetic_test_wrapper.sh"],
+    data = [
+        ":xcodebuild",
+        "@test_runtime_tools//:runtime",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "hermeticity_guard_test",
+    size = "small",
+    srcs = ["hermeticity_guard_test.rs"],
+)
+
+rust_test(
+    name = "xcode_capability_guard_test",
+    size = "small",
+    srcs = ["hermeticity_guard_test.rs"],
+    env = {"MONO_TEST_XCODE_TOOLCHAIN": "1"},
+)
+
+network_enabled_rust_test(
+    name = "network_opt_in_test",
+    size = "small",
+    srcs = ["network_opt_in_test.rs"],
+)
+
+sh_binary(
+    name = "cleanup_child",
+    srcs = ["cleanup_child.sh"],
+)
+
+sh_test(
+    name = "cleanup_guard_test",
+    size = "small",
+    srcs = ["cleanup_guard_test.sh"],
+    data = [
+        ":cleanup_child",
+        ":hermetic_test_wrapper",
+    ],
+)
+
+sh_test(
+    name = "linux_policy_source_test",
+    size = "small",
+    srcs = ["linux_policy_source_test.sh"],
+    data = [
+        ":defs.bzl",
+        ":hermetic_test_wrapper.sh",
+        "//:.bazelrc",
+    ],
+)
