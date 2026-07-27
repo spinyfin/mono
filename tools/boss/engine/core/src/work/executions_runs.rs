@@ -1135,9 +1135,20 @@ impl WorkDb {
         Ok((execution, run))
     }
 
-    /// Record a pre-start failure for `execution_id`, inserting a failed
-    /// `work_run` and either resetting the execution to `ready` with a
-    /// backoff delay (retry) or marking it permanently `failed`.
+    /// Record a pre-start failure for `execution_id`, either resetting the
+    /// execution to `ready` with a backoff delay (retry) or marking it
+    /// permanently `failed` (and inserting a single failed `work_run`).
+    ///
+    /// **Why intermediate retries do not insert `work_runs`.** Each
+    /// intermediate retry used to insert a `status='failed'` bookkeeping
+    /// row that never hosted a worker and therefore never received a
+    /// transcript path. With up to three retries that alone produced a
+    /// large fraction of the fleet-wide `work_runs.transcript_path IS NULL`
+    /// rows (and would have left the same hole in the per-run cost
+    /// columns that share the hook-driven persist seam). Retry state is
+    /// already durable on the execution (`pre_start_failure_count` /
+    /// `dispatch_not_before`); the permanent-fail path still inserts one
+    /// failed run so operators have a terminal history row.
     ///
     /// `retry_delays` controls how many retries are allowed and the delay
     /// between each. An empty slice means "no retries; fail immediately."
@@ -1148,6 +1159,11 @@ impl WorkDb {
     /// `change_create`, and `run_start` (before the worker has any
     /// side effects). Do NOT call it for failures at or after
     /// `run_started` — those require `finish_execution_run`.
+    ///
+    /// Returns `(execution, run, outcome)` where `run` is `Some` only on
+    /// [`PreStartFailureOutcome::PermanentFail`] (the terminal failed
+    /// bookkeeping row). On [`PreStartFailureOutcome::Retry`] it is
+    /// `None` — no `work_runs` row was written.
     pub fn record_pre_start_failure(
         &self,
         execution_id: &str,
@@ -1155,7 +1171,7 @@ impl WorkDb {
         cube_repo_id: Option<&str>,
         error_text: &str,
         retry_delays: &[Duration],
-    ) -> Result<(WorkExecution, WorkRun, PreStartFailureOutcome)> {
+    ) -> Result<(WorkExecution, Option<WorkRun>, PreStartFailureOutcome)> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -1171,16 +1187,7 @@ impl WorkDb {
         let new_count = execution.pre_start_failure_count + 1;
         let max_retries = retry_delays.len() as i64;
 
-        let run_id = next_id("run");
-        tx.execute(
-            "INSERT INTO work_runs (
-                id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
-                artifacts_path, created_at, started_at, finished_at
-             ) VALUES (?1, ?2, ?3, 'failed', ?4, NULL, NULL, NULL, ?5, ?5, ?5)",
-            params![run_id, execution_id, agent_id, error_text, now],
-        )?;
-
-        let outcome = if new_count <= max_retries {
+        let (outcome, run_id) = if new_count <= max_retries {
             let delay = retry_delays[(new_count - 1) as usize];
             let dispatch_not_before =
                 (boss_engine_utils::epoch_time::now_epoch_secs() as u64 + delay.as_secs()).to_string();
@@ -1197,8 +1204,17 @@ impl WorkDb {
                  WHERE id = ?1",
                 params![execution_id, new_count, cube_repo_id, dispatch_not_before],
             )?;
-            PreStartFailureOutcome::Retry { delay }
+            (PreStartFailureOutcome::Retry { delay }, None)
         } else {
+            // Terminal only: one failed bookkeeping run for operator history.
+            let run_id = next_id("run");
+            tx.execute(
+                "INSERT INTO work_runs (
+                    id, execution_id, agent_id, status, error_text, result_summary, transcript_path,
+                    artifacts_path, created_at, started_at, finished_at
+                 ) VALUES (?1, ?2, ?3, 'failed', ?4, NULL, NULL, NULL, ?5, ?5, ?5)",
+                params![run_id, execution_id, agent_id, error_text, now],
+            )?;
             tx.execute(
                 "UPDATE work_executions
                  SET status = 'failed',
@@ -1212,11 +1228,14 @@ impl WorkDb {
                  WHERE id = ?1",
                 params![execution_id, new_count, cube_repo_id, now],
             )?;
-            PreStartFailureOutcome::PermanentFail
+            (PreStartFailureOutcome::PermanentFail, Some(run_id))
         };
 
         let execution = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        let run = query_run(&tx, &run_id)?.with_context(|| format!("missing run after insert: {run_id}"))?;
+        let run = match run_id.as_deref() {
+            Some(id) => Some(query_run(&tx, id)?.with_context(|| format!("missing run after insert: {id}"))?),
+            None => None,
+        };
         let mut pending = PendingEvents::new();
         if matches!(outcome, PreStartFailureOutcome::PermanentFail) {
             // Canonical terminalization trace — see `mark_execution_orphaned`.
@@ -1519,17 +1538,31 @@ impl WorkDb {
     /// returned "0 rows updated" and the `transcript_path` column
     /// stayed NULL forever. PR #366 and PR #372 both shipped trying
     /// to fix the symptom without spotting the cross-namespace join.
-    /// This implementation resolves the most-recent `work_runs` row
-    /// for the execution and writes against its `id`, so the caller
-    /// can keep handing us an execution id without worrying about the
+    /// This implementation resolves a target `work_runs` row for the
+    /// execution and writes against its `id`, so the caller can keep
+    /// handing us an execution id without worrying about the
     /// run/execution split.
     ///
-    /// The lookup picks the latest run per `(created_at DESC, id
-    /// DESC)`: an execution can have multiple `work_runs` rows from
-    /// re-spawns, but only one is "live" at any moment (the others
-    /// are terminal). The live one is always the most recent insert,
-    /// so writing to it lines up with the running worker's actual
-    /// transcript file.
+    /// **Target selection.** An execution can have multiple `work_runs`
+    /// rows: pre-start failure bookkeeping (`record_pre_start_failure` /
+    /// `fail_execution_start`) inserts `status='failed'` rows that never
+    /// host a worker, then a later `start_execution_run` inserts the
+    /// real agent-session row. Pure `(created_at DESC, id DESC)` always
+    /// picks the most recent insert, which is correct while that row is
+    /// the live agent session — but after a re-queue / re-dispatch the
+    /// newest row can be a pre-start failure sibling that will never
+    /// receive hooks, while the real session row (still the one the
+    /// worker's BOSS_RUN_ID belongs to) sits one row back with
+    /// `transcript_path` still NULL. Hooks arriving for that execution
+    /// then either stamp the path onto the bookkeeping row or, once
+    /// that row is terminal-failed and a newer session starts, leave
+    /// the prior session row unfilled forever.
+    ///
+    /// Order of preference (see [`Self::resolve_run_id_for_execution_hooks`]):
+    /// 1. unfinished rows (`finished_at IS NULL`) — the live session;
+    /// 2. non-`failed` rows — pane-spawn parks the dispatch/spawn run as
+    ///    `completed` within ~1s while the worker keeps running;
+    /// 3. newest by `(created_at DESC, id DESC)` as a last resort.
     ///
     /// Idempotent for the first writer per run (the
     /// `WHERE transcript_path IS NULL` clause keeps every subsequent
@@ -1539,7 +1572,7 @@ impl WorkDb {
     ///
     /// Returns:
     /// - `Updated` — the row's `transcript_path` was just written.
-    /// - `AlreadySet` — the latest run for this execution already
+    /// - `AlreadySet` — the selected run for this execution already
     ///   has a non-NULL `transcript_path`; legitimate steady-state
     ///   no-op.
     /// - `RowMissing` — no `work_runs` row exists yet for this
@@ -1554,17 +1587,7 @@ impl WorkDb {
         transcript_path: &str,
     ) -> Result<SetRunTranscriptPathOutcome> {
         let conn = self.connect()?;
-        let latest_run_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![execution_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(run_id) = latest_run_id else {
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(SetRunTranscriptPathOutcome::RowMissing);
         };
         let updated = conn.execute(
@@ -1600,17 +1623,10 @@ impl WorkDb {
         snapshot: crate::run_cost::RunCostSnapshot,
     ) -> Result<bool> {
         let conn = self.connect()?;
-        let latest_run_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![execution_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(run_id) = latest_run_id else {
+        // Same target selection as `set_run_transcript_path_if_unset`: cost
+        // and path ride the same hook seam, so they must land on the same
+        // run row (the agent-session run, not a pre-start failure sibling).
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
             return Ok(false);
         };
         let updated = conn.execute(
@@ -1674,28 +1690,29 @@ impl WorkDb {
     /// `bossctl live-status debug --json` reported `transcript_path:
     /// null` for live slots even when the underlying `work_runs` row
     /// had the column populated. This helper closes that gap by
-    /// keying on `execution_id` and resolving the latest `work_runs`
-    /// row the same way the write side does (`ORDER BY created_at
-    /// DESC, id DESC LIMIT 1`).
+    /// keying on `execution_id` and resolving the target `work_runs`
+    /// row the same way the write side does (see
+    /// [`Self::set_run_transcript_path_if_unset`]).
     ///
     /// Returns `Ok(None)` when either the execution has no
-    /// `work_runs` row yet, or the latest row's `transcript_path`
+    /// `work_runs` row yet, or the selected row's `transcript_path`
     /// column is still NULL — both are legitimate steady states
     /// while a worker is still booting. Returns `Err` only on a real
     /// SQL failure; callers should log-and-default rather than abort.
     pub fn transcript_path_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
-        let path: Option<Option<String>> = conn
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        let path: Option<String> = conn
             .query_row(
-                "SELECT transcript_path FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![execution_id],
+                "SELECT transcript_path FROM work_runs WHERE id = ?1",
+                params![run_id],
                 |row| row.get(0),
             )
-            .optional()?;
-        Ok(path.flatten())
+            .optional()?
+            .flatten();
+        Ok(path)
     }
 
     /// Atomically claim the one current provider session id for an execution.
@@ -2117,6 +2134,38 @@ impl WorkDb {
         }
         query_run(&conn, run_id).require("run", run_id)
     }
+}
+
+/// Pick the `work_runs` row that hook-driven writes (transcript path,
+/// cost snapshot) and the live-status read path should target for an
+/// execution.
+///
+/// Preference order (see `WorkDb::set_run_transcript_path_if_unset`):
+/// 1. unfinished (`finished_at IS NULL`) — the live agent session;
+/// 2. non-`failed` — pane-spawn parks the dispatch run as `completed`
+///    almost immediately while the worker keeps emitting hooks;
+/// 3. newest by `(created_at DESC, id DESC)`.
+///
+/// Pre-start failure bookkeeping rows (`status='failed'`, never hosted a
+/// worker) sort last so a later re-queue's failed sibling cannot capture
+/// path/cost writes that belong to the real session row, and so the
+/// live-status resolver does not report NULL when only a failed sibling
+/// is newer than a path-bearing session.
+fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT id FROM work_runs
+         WHERE execution_id = ?1
+         ORDER BY
+           CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
+           CASE WHEN status = 'failed' THEN 1 ELSE 0 END,
+           created_at DESC,
+           id DESC
+         LIMIT 1",
+        params![execution_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
 }
 
 #[cfg(test)]

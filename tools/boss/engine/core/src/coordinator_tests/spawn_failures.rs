@@ -1321,14 +1321,16 @@ async fn pre_start_failure_retries_then_permanently_fails() {
         execution.pre_start_failure_count
     );
 
+    // Intermediate pre-start retries do not insert work_runs rows; only
+    // the permanent failure leaves a single failed bookkeeping run.
     let runs = db.list_runs(&execution_id).unwrap();
     assert_eq!(
         runs.len(),
-        2,
-        "expected 2 run rows (one per attempt); got {}",
+        1,
+        "expected 1 permanent-fail run row (intermediate retries insert none); got {}",
         runs.len()
     );
-    assert!(runs.iter().all(|r| r.status == "failed"));
+    assert_eq!(runs[0].status, "failed");
 
     // Exactly one execution row — retries reuse the same row.
     let all_executions = db.list_executions(Some(&chore.id)).unwrap();
@@ -1396,14 +1398,16 @@ async fn pre_start_failure_retries_and_succeeds_on_second_attempt() {
         execution.pre_start_failure_count
     );
 
-    // Only the one failed run row (from the initial attempt) + the active run.
+    // Intermediate pre-start retries insert no work_runs row — only the
+    // successful start_execution_run does.
     let runs = db.list_runs(&execution_id).unwrap();
     assert_eq!(
         runs.len(),
-        2,
-        "expected 1 failed run + 1 active run; got {}",
+        1,
+        "expected only the active agent-session run after a retried pre-start; got {}",
         runs.len()
     );
+    assert_eq!(runs[0].status, "active");
 
     // No attention items — the retry succeeded.
     let attention_items = db.list_attention_items(&execution_id).unwrap();

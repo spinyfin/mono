@@ -1406,6 +1406,176 @@ fn starts_ready_execution_run_and_attaches_workspace() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Hook-driven path writes must target the agent-session run, not a
+/// newer pre-start failure bookkeeping sibling.
+///
+/// `record_pre_start_failure` inserts `status='failed'` rows that never
+/// host a worker. Pure "latest by created_at" would make those siblings
+/// absorb (or block) path/cost writes for the real session after a
+/// re-queue: the session row stays NULL forever even though hooks for
+/// the execution keep arriving with a transcript path. Prefer unfinished
+/// then non-failed when resolving the target run.
+#[test]
+fn transcript_path_prefers_agent_session_over_prestart_failure_sibling() {
+    let path = temp_db_path("transcript-prefer-session");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "session vs prestart");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    // First agent session: start, park as completed (pane-spawn shape),
+    // then stamp the transcript path as the dispatcher would.
+    let (_execution, session_run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&session_run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    let set = db
+        .set_run_transcript_path_if_unset(&execution.id, "/t/session.jsonl")
+        .unwrap();
+    assert_eq!(set, SetRunTranscriptPathOutcome::Updated);
+    assert_eq!(
+        db.get_run(&session_run.id).unwrap().transcript_path.as_deref(),
+        Some("/t/session.jsonl"),
+    );
+
+    // Re-queue for another attempt (ci_remediation-style): flip back to
+    // ready, then record a pre-start failure. That inserts a newer failed
+    // run that must NOT become the path-write target for residual hooks
+    // still carrying the prior session's BOSS_RUN_ID / path.
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'ready', finished_at = NULL WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    }
+    let (_execution, fail_run, outcome) = db
+        .record_pre_start_failure(
+            &execution.id,
+            "worker-2",
+            Some("mono"),
+            "cube lease failed",
+            &[], // no retries → permanent fail row
+        )
+        .unwrap();
+    assert!(matches!(outcome, PreStartFailureOutcome::PermanentFail));
+    let fail_run = fail_run.expect("permanent fail must insert a bookkeeping run");
+
+    // Residual hook: path must remain on the session row (AlreadySet),
+    // not migrate onto the pre-start failure sibling.
+    let residual = db
+        .set_run_transcript_path_if_unset(&execution.id, "/t/should-not-win.jsonl")
+        .unwrap();
+    assert_eq!(
+        residual,
+        SetRunTranscriptPathOutcome::AlreadySet,
+        "pre-start failure sibling must not be selected over the path-bearing session run",
+    );
+    assert_eq!(
+        db.get_run(&session_run.id).unwrap().transcript_path.as_deref(),
+        Some("/t/session.jsonl"),
+        "session run path must be preserved",
+    );
+
+    // Read side must also surface the session path, not NULL from the
+    // newer failed sibling.
+    assert_eq!(
+        db.transcript_path_for_execution(&execution.id).unwrap().as_deref(),
+        Some("/t/session.jsonl"),
+        "read path must prefer the agent-session row over a newer pre-start failure",
+    );
+
+    let runs = db.list_runs(&execution.id).unwrap();
+    assert_eq!(runs.len(), 2, "session + permanent pre-start failure");
+    assert_eq!(fail_run.id, runs.iter().find(|r| r.id != session_run.id).unwrap().id);
+    assert!(
+        fail_run.transcript_path.is_none(),
+        "pre-start failure bookkeeping row must not receive a transcript_path",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// After a pre-start failure, the real `start_execution_run` row must
+/// still receive the first hook's transcript_path (active unfinished
+/// preferred over the older failed sibling).
+#[test]
+fn transcript_path_lands_on_active_run_after_prior_prestart_failure() {
+    let path = temp_db_path("transcript-active-after-prestart");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "prestart then start");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    let (_execution, fail_run, outcome) = db
+        .record_pre_start_failure(
+            &execution.id,
+            "worker-1",
+            Some("mono"),
+            "lease failed",
+            &[std::time::Duration::from_secs(1)], // retry — stay ready
+        )
+        .unwrap();
+    assert!(matches!(outcome, PreStartFailureOutcome::Retry { .. }));
+    assert!(
+        fail_run.is_none(),
+        "intermediate pre-start retries must not insert a work_runs bookkeeping row",
+    );
+    assert!(
+        db.list_runs(&execution.id).unwrap().is_empty(),
+        "no work_runs until start_execution_run or permanent pre-start fail",
+    );
+
+    let (_execution, active_run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-2",
+            "mono",
+            "lease-2",
+            "mono-agent-002",
+            "/tmp/mono-agent-002",
+        )
+        .unwrap();
+    assert!(active_run.transcript_path.is_none());
+
+    let set = db
+        .set_run_transcript_path_if_unset(&execution.id, "/t/active.jsonl")
+        .unwrap();
+    assert_eq!(set, SetRunTranscriptPathOutcome::Updated);
+    assert_eq!(
+        db.get_run(&active_run.id).unwrap().transcript_path.as_deref(),
+        Some("/t/active.jsonl"),
+        "active agent-session run must receive the path after a prior pre-start retry",
+    );
+    assert_eq!(
+        db.list_runs(&execution.id).unwrap().len(),
+        1,
+        "only the agent-session run exists after a retried pre-start failure",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     let path = temp_db_path("cancel-active");
