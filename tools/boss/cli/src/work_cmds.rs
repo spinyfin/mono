@@ -629,6 +629,8 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                 let automation = resolve_automation(&mut client, &selector, product.as_ref()).await?;
                 let name = required_text(args.name, "Task name", ctx)?;
                 let description = optional_text(args.description, "Description", ctx)?;
+                // Non-blocking decision-overlap warning (same as the main create path).
+                warn_if_overlapping_decision(&mut client, &automation.product_id, &name).await;
                 let task = create_automation_task(
                     &mut client,
                     &automation.id,
@@ -666,6 +668,9 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
             if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
+            // Non-blocking: warn on stderr when this name overlaps an active
+            // product decision. Never fails the create, never touches stdout.
+            warn_if_overlapping_decision(&mut client, &product.id, &name).await;
             let model_override = normalize_non_empty(args.model);
             let driver = normalize_non_empty(args.driver);
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;
@@ -795,6 +800,9 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
             if product.repo_remote_url.is_none() && resolved_repo.is_none() && !ctx.allow_input {
                 return Err(repo_resolution::unresolved_repo_error(&product.slug));
             }
+            // Non-blocking: warn on stderr when this name overlaps an active
+            // product decision. Never fails the create, never touches stdout.
+            warn_if_overlapping_decision(&mut client, &product.id, &name).await;
             let model_override = normalize_non_empty(args.model);
             let driver = normalize_non_empty(args.driver);
             validate_driver_model_pair(driver.as_deref(), model_override.as_deref())?;

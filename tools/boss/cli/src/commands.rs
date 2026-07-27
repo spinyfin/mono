@@ -92,6 +92,21 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: CommentCommand,
     },
+    /// Manage product decision records: standing "considered and declined"
+    /// / operator-owned rulings that outlive any single work item.
+    ///
+    /// Decisions live in a per-product `D<n>` namespace (`D1`, `D2`, …) and
+    /// surface as a non-blocking stderr warning when a new task/chore name
+    /// looks like something already decided. Lifecycle: `active` →
+    /// `revoked` (no successor) or `superseded` (replaced by another
+    /// decision).
+    ///
+    /// See `tools/boss/docs/designs/retire-the-coordinator-s-memory-make-the-defaults-teach-the-right-thing.md`
+    /// §T-B2-decision.
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
     /// Manage automations: standing, scheduled maintenance instructions that
     /// periodically triage and spawn work outside the normal backlog.
     ///
@@ -679,6 +694,111 @@ impl From<DependDirectionArg> for DependencyDirection {
 /// Automations are standing scheduled instructions in a per-product `A<n>`
 /// namespace. Selectors accept either `A<n>` (requires `--product`) or the
 /// canonical `auto_…` id (product is inferred from the row).
+/// Subcommands under `boss decision …`.
+///
+/// Product-scoped decision records (`wontfix` / `decided`) over the
+/// engine's `product_decisions` table. Selectors accept `D<n>` (requires
+/// `--product`) or the canonical `dec_…` id.
+#[derive(Debug, Subcommand)]
+pub(crate) enum DecisionCommand {
+    /// Record a product-scoped decision.
+    ///
+    /// `--name` maps to the decision title; `--description` to the body.
+    /// Both are required (empty is rejected by the engine). Defaults to
+    /// `kind=wontfix`; pass `--kind decided` for an affirmative ruling.
+    Create(DecisionCreateArgs),
+    /// List decisions for a product, newest first.
+    ///
+    /// By default only `active` rows; pass `--include-inactive` to also
+    /// include `superseded` / `revoked`.
+    List(DecisionListArgs),
+    /// Show one decision by `D<n>` or `dec_…` id.
+    Show(DecisionSelectorArgs),
+    /// Mark an active decision as `revoked` (no longer in force, no
+    /// successor). Idempotent when already revoked.
+    Revoke(DecisionSelectorArgs),
+    /// Mark an active decision as `superseded` by a successor decision.
+    /// Both must be on the same product; the successor must be `active`.
+    Supersede(DecisionSupersedeArgs),
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub(crate) enum DecisionKindArg {
+    /// Considered and deliberately declined.
+    #[default]
+    Wontfix,
+    /// Affirmative standing operator-owned ruling.
+    Decided,
+}
+
+impl DecisionKindArg {
+    pub(crate) fn as_protocol(self) -> boss_protocol::DecisionKind {
+        match self {
+            Self::Wontfix => boss_protocol::DecisionKind::Wontfix,
+            Self::Decided => boss_protocol::DecisionKind::Decided,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DecisionCreateArgs {
+    /// Product to record the decision against (id or slug).
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Short title of the decision (maps to the engine `title` field).
+    #[arg(long)]
+    pub(crate) name: Option<String>,
+    /// Full body explaining the decision (maps to the engine `body` field).
+    #[arg(long)]
+    pub(crate) description: Option<String>,
+    /// Decision kind: `wontfix` (default) or `decided`.
+    #[arg(long, value_enum, default_value_t = DecisionKindArg::Wontfix)]
+    pub(crate) kind: DecisionKindArg,
+    /// Free-form search tokens (space- or comma-separated) that help
+    /// surface this decision when filing semantically near work.
+    #[arg(long)]
+    pub(crate) keywords: Option<String>,
+    /// Optional work-item id (`task_…` / `T<n>`) that motivated the decision.
+    #[arg(long)]
+    pub(crate) related_work_item: Option<String>,
+    /// Who is recording the decision. Defaults to `user:$USER` (or
+    /// `user:cli` when `$USER` is unset).
+    #[arg(long)]
+    pub(crate) created_by: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DecisionListArgs {
+    /// Product whose decisions to list.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+    /// Include `superseded` / `revoked` rows (hidden by default).
+    #[arg(long)]
+    pub(crate) include_inactive: bool,
+}
+
+/// Shared selector args for show / revoke.
+#[derive(Debug, Args)]
+pub(crate) struct DecisionSelectorArgs {
+    /// Decision selector: `D<n>` (e.g. `D1`) or canonical `dec_…` id.
+    pub(crate) selector: String,
+    /// Product context for `D<n>` selectors. Not needed for `dec_…` ids.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct DecisionSupersedeArgs {
+    /// Decision to mark as superseded: `D<n>` or `dec_…` id.
+    pub(crate) selector: String,
+    /// Successor decision that replaces it: `D<n>` or `dec_…` id.
+    #[arg(long = "by")]
+    pub(crate) by: String,
+    /// Product context for `D<n>` selectors.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum AutomationCommand {
     /// Create a new automation for a product.
