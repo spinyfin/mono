@@ -30,6 +30,68 @@ pub fn format_epoch_iso8601(epoch_secs: i64) -> String {
         .to_string()
 }
 
+/// Relative elapsed phrase for a past epoch relative to `now_secs`
+/// (e.g. `"3 days ago"`, `"2 hours ago"`, `"just now"`). Used by
+/// user-facing pause banners so operators see elapsed duration rather
+/// than a raw Zulu ISO timestamp. Returns `None` when `epoch_secs` is
+/// in the future relative to `now_secs`.
+///
+/// Covers all ages (minutes through years) so callers do not need a
+/// local-timezone absolute formatter — the workspace chrono dep is built
+/// without the `clock` feature, so `chrono::Local` is unavailable.
+pub fn format_elapsed_ago(epoch_secs: i64, now_secs: i64) -> Option<String> {
+    let elapsed = now_secs.checked_sub(epoch_secs)?;
+    if elapsed < 0 {
+        return None;
+    }
+    let phrase = if elapsed < 60 {
+        "just now".to_owned()
+    } else if elapsed < 3600 {
+        let n = elapsed / 60;
+        if n == 1 {
+            "1 minute ago".to_owned()
+        } else {
+            format!("{n} minutes ago")
+        }
+    } else if elapsed < 86_400 {
+        let n = elapsed / 3600;
+        if n == 1 {
+            "1 hour ago".to_owned()
+        } else {
+            format!("{n} hours ago")
+        }
+    } else if elapsed < 86_400 * 30 {
+        let n = elapsed / 86_400;
+        if n == 1 {
+            "1 day ago".to_owned()
+        } else {
+            format!("{n} days ago")
+        }
+    } else if elapsed < 86_400 * 365 {
+        let n = elapsed / (86_400 * 30);
+        if n <= 1 {
+            "1 month ago".to_owned()
+        } else {
+            format!("{n} months ago")
+        }
+    } else {
+        let n = elapsed / (86_400 * 365);
+        if n <= 1 {
+            "1 year ago".to_owned()
+        } else {
+            format!("{n} years ago")
+        }
+    };
+    Some(phrase)
+}
+
+/// User-facing elapsed phrase for a pause banner title (e.g. `"3 days
+/// ago"`, `"just now"`). Never emits a Zulu ISO string. Returns an empty
+/// string when the epoch is in the future (caller keeps a bare subject).
+pub fn format_paused_since_phrase(epoch_secs: i64, now_secs: i64) -> String {
+    format_elapsed_ago(epoch_secs, now_secs).unwrap_or_default()
+}
+
 /// Strict parse of a canonical UTC timestamp
 /// (`YYYY-MM-DDTHH:MM:SS[.fff]Z`, with a space also accepted in place of
 /// the `T` separator) into Unix epoch seconds. Returns `None` for any
@@ -148,6 +210,48 @@ mod tests {
         assert_eq!(parse_iso8601_to_epoch("2026-02-30T00:00:00Z"), None);
         // A space in place of the `T` separator is accepted.
         assert_eq!(parse_iso8601_to_epoch("2026-05-07 18:55:45Z"), Some(1_778_180_145));
+    }
+
+    // ── format_elapsed_ago / format_paused_since_phrase ─────────────────────
+
+    #[test]
+    fn format_elapsed_ago_buckets() {
+        let now = 1_700_000_000;
+        assert_eq!(format_elapsed_ago(now, now).as_deref(), Some("just now"));
+        assert_eq!(format_elapsed_ago(now - 30, now).as_deref(), Some("just now"));
+        assert_eq!(format_elapsed_ago(now - 60, now).as_deref(), Some("1 minute ago"));
+        assert_eq!(format_elapsed_ago(now - 180, now).as_deref(), Some("3 minutes ago"));
+        assert_eq!(format_elapsed_ago(now - 3600, now).as_deref(), Some("1 hour ago"));
+        assert_eq!(format_elapsed_ago(now - 7200, now).as_deref(), Some("2 hours ago"));
+        assert_eq!(format_elapsed_ago(now - 86_400, now).as_deref(), Some("1 day ago"));
+        assert_eq!(format_elapsed_ago(now - 3 * 86_400, now).as_deref(), Some("3 days ago"));
+        assert_eq!(
+            format_elapsed_ago(now - 40 * 86_400, now).as_deref(),
+            Some("1 month ago")
+        );
+        assert_eq!(
+            format_elapsed_ago(now - 90 * 86_400, now).as_deref(),
+            Some("3 months ago")
+        );
+        assert_eq!(
+            format_elapsed_ago(now - 400 * 86_400, now).as_deref(),
+            Some("1 year ago")
+        );
+        // Future instants are rejected.
+        assert_eq!(format_elapsed_ago(now + 10, now), None);
+    }
+
+    #[test]
+    fn format_paused_since_phrase_is_relative_never_zulu() {
+        let now = 1_700_000_000;
+        assert_eq!(format_paused_since_phrase(now - 3 * 86_400, now), "3 days ago");
+        assert_eq!(format_paused_since_phrase(now, now), "just now");
+        let old = format_paused_since_phrase(now - 60 * 86_400, now);
+        assert!(old.ends_with("ago"), "got {old}");
+        assert!(!old.ends_with('Z'), "must not be Zulu ISO; got {old}");
+        assert!(!old.contains('T'), "must not be ISO compact form; got {old}");
+        // Future → empty so the banner keeps a bare subject line.
+        assert_eq!(format_paused_since_phrase(now + 5, now), "");
     }
 
     // ── parse_iso8601_lenient (GitHub) ──────────────────────────────────────

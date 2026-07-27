@@ -131,7 +131,10 @@ async fn engine_health_report_flags_automation_paused() {
 
     // Pause automation through the same coordinator API the human toggle
     // uses. Dispatch itself stays unpaused — the two flags are independent.
-    state.execution_coordinator.set_automation_paused(true, 0);
+    // Use a real (non-zero) pause start so the banner title includes a
+    // human "since" phrase rather than a bare "Automations paused".
+    let paused_since = (boss_engine_utils::epoch_time::now_epoch_secs() as u64).saturating_sub(3 * 86_400);
+    state.execution_coordinator.set_automation_paused(true, paused_since);
 
     let report = build_engine_health_report(&state);
     assert!(
@@ -151,6 +154,53 @@ async fn engine_health_report_flags_automation_paused() {
     assert!(
         !issue.title.is_empty() && !issue.body.is_empty(),
         "title and body must be populated so the banner has user-visible text",
+    );
+    // User-facing title must never render a Zulu ISO timestamp.
+    assert!(
+        !issue.title.ends_with('Z') && !issue.title.contains('T'),
+        "banner title must use human local/relative time, not Zulu ISO; got {:?}",
+        issue.title,
+    );
+    assert!(
+        issue.title.contains("Automations paused"),
+        "title must keep the pause subject; got {:?}",
+        issue.title,
+    );
+    assert!(
+        issue.title.contains("ago") || issue.title.contains("since "),
+        "title must include a human since/ago phrase; got {:?}",
+        issue.title,
+    );
+}
+
+/// Dispatch-paused banner must also use human local/relative time for
+/// `paused_since`, matching the automation banner — never a Zulu ISO
+/// string. Regression guard for the shared pause-banner timestamp fix.
+#[tokio::test]
+async fn engine_health_report_dispatch_paused_title_is_human_local() {
+    let (state, _dir) = test_server_state();
+    let paused_since = (boss_engine_utils::epoch_time::now_epoch_secs() as u64).saturating_sub(2 * 3600);
+    state.execution_coordinator.set_dispatch_paused(
+        true,
+        paused_since,
+        crate::coordinator::DispatchPauseOrigin::Operator,
+    );
+
+    let report = build_engine_health_report(&state);
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.kind == "dispatch_paused")
+        .expect("dispatch_paused issue must be present");
+    assert!(
+        !issue.title.ends_with('Z') && !issue.title.contains('T'),
+        "banner title must use human local/relative time, not Zulu ISO; got {:?}",
+        issue.title,
+    );
+    assert!(
+        issue.title.contains("ago") || issue.title.contains("since ") || issue.title.contains("paused"),
+        "title must remain user-readable; got {:?}",
+        issue.title,
     );
 }
 
