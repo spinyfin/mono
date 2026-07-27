@@ -2007,6 +2007,21 @@ pub(crate) struct TaskCreateArgs {
     #[arg(long, value_enum)]
     pub(crate) effort: Option<EffortLevelArg>,
 
+    /// Which §Q4 heuristic rule produced `--effort` (e.g.
+    /// `rule 3 (multi-subsystem)`). First-class effort-classification
+    /// provenance — pass this on the same create call as `--effort`
+    /// instead of stuffing an `[effort-classification]` tag into
+    /// `--description` (a follow-up description update races autostart).
+    #[arg(long = "effort-matched-rule", value_name = "RULE", allow_hyphen_values = true)]
+    pub(crate) effort_matched_rule: Option<String>,
+
+    /// Short reasons summary for the effort classification (e.g.
+    /// `names protocol types + engine core surfaces`). Companion to
+    /// `--effort-matched-rule`; bake both into the create call so the
+    /// audit trail is atomic with the row insert.
+    #[arg(long = "effort-reasons", value_name = "REASONS", allow_hyphen_values = true)]
+    pub(crate) effort_reasons: Option<String>,
+
     /// Model slug for the resolved driver (e.g. `fable`, `opus`, `sonnet`, `haiku`,
     /// or a fully-qualified id like `claude-fable-5`). Stored verbatim — the driver
     /// is the source of truth on valid slugs.
@@ -2213,6 +2228,14 @@ pub(crate) struct ChoreCreateArgs {
     #[arg(long, value_enum)]
     pub(crate) effort: Option<EffortLevelArg>,
 
+    /// See `boss task create --effort-matched-rule`.
+    #[arg(long = "effort-matched-rule", value_name = "RULE", allow_hyphen_values = true)]
+    pub(crate) effort_matched_rule: Option<String>,
+
+    /// See `boss task create --effort-reasons`.
+    #[arg(long = "effort-reasons", value_name = "REASONS", allow_hyphen_values = true)]
+    pub(crate) effort_reasons: Option<String>,
+
     /// Model slug for the resolved driver. Stored verbatim.
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
@@ -2281,6 +2304,14 @@ pub(crate) struct InvestigationCreateArgs {
 
     #[arg(long, value_enum)]
     pub(crate) effort: Option<EffortLevelArg>,
+
+    /// See `boss task create --effort-matched-rule`.
+    #[arg(long = "effort-matched-rule", value_name = "RULE", allow_hyphen_values = true)]
+    pub(crate) effort_matched_rule: Option<String>,
+
+    /// See `boss task create --effort-reasons`.
+    #[arg(long = "effort-reasons", value_name = "REASONS", allow_hyphen_values = true)]
+    pub(crate) effort_reasons: Option<String>,
 
     #[arg(long, value_name = "SLUG")]
     pub(crate) model: Option<String>,
@@ -2637,6 +2668,20 @@ pub(crate) struct TaskUpdateArgs {
     /// dispatcher's product / engine default again (design §Q3).
     #[arg(long = "unset-effort")]
     pub(crate) unset_effort: bool,
+
+    /// Set or clear the heuristic matched-rule provenance for
+    /// `--effort` (e.g. `rule 3 (multi-subsystem)`). Pass
+    /// `--effort-matched-rule ""` to clear. When `--effort` is set
+    /// without provenance, the engine clears both provenance columns
+    /// so a hand-set level is detectable.
+    #[arg(long = "effort-matched-rule", value_name = "RULE", allow_hyphen_values = true)]
+    pub(crate) effort_matched_rule: Option<String>,
+
+    /// Set or clear the heuristic reasons provenance for `--effort`.
+    /// Pass `--effort-reasons ""` to clear. See
+    /// `--effort-matched-rule`.
+    #[arg(long = "effort-reasons", value_name = "REASONS", allow_hyphen_values = true)]
+    pub(crate) effort_reasons: Option<String>,
 
     /// Model slug for the resolved driver. Stored verbatim. Mutually
     /// exclusive with `--unset-model`.

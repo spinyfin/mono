@@ -337,3 +337,96 @@ fn update_sets_clears_and_validates_reasoning() {
 
     let _ = std::fs::remove_file(path);
 }
+
+/// First-class effort provenance: create with explicit matched-rule /
+/// reasons; round-trip through query; lift a legacy
+/// `[effort-classification]` tag out of description into the columns and
+/// strip it from the stored description.
+#[test]
+fn effort_provenance_roundtrips_and_lifts_legacy_tag() {
+    let path = temp_db_path("effort-provenance");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+
+    let explicit = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Multi-subsystem wiring")
+                .description("Wire the handler.")
+                .effort_level(EffortLevel::Medium)
+                .effort_matched_rule("rule 3 (multi-subsystem)")
+                .effort_reasons("names engine + protocol surfaces")
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        explicit.effort_matched_rule.as_deref(),
+        Some("rule 3 (multi-subsystem)")
+    );
+    assert_eq!(
+        explicit.effort_reasons.as_deref(),
+        Some("names engine + protocol surfaces")
+    );
+    assert_eq!(explicit.description, "Wire the handler.");
+
+    // Legacy tag in description is lifted into columns and stripped.
+    let tagged = db
+        .create_chore(
+            CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Lifted tag chore")
+                .description(
+                    "Do the thing.\n\n[effort-classification] level=`small` matched-rule=`rule 5 (self-contained)` reasons=\"protocol types\"",
+                )
+                .effort_level(EffortLevel::Small)
+                .force_duplicate(true)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(tagged.description, "Do the thing.");
+    assert_eq!(tagged.effort_matched_rule.as_deref(), Some("rule 5 (self-contained)"));
+    assert_eq!(tagged.effort_reasons.as_deref(), Some("protocol types"));
+
+    // Hand-set: patching effort_level without provenance clears provenance.
+    let hand_set = match db
+        .update_work_item(
+            &explicit.id,
+            WorkItemPatch {
+                effort_level: Some("large".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap()
+    {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore"),
+    };
+    assert_eq!(hand_set.effort_level, Some(EffortLevel::Large));
+    assert!(hand_set.effort_matched_rule.is_none());
+    assert!(hand_set.effort_reasons.is_none());
+
+    // Explicit provenance on update.
+    let reclassified = match db
+        .update_work_item(
+            &explicit.id,
+            WorkItemPatch {
+                effort_level: Some("medium".into()),
+                effort_matched_rule: Some("rule 4 (multi-subsystem hint)".into()),
+                effort_reasons: Some("spans cli + engine".into()),
+                ..WorkItemPatch::default()
+            },
+        )
+        .unwrap()
+    {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        _ => panic!("expected chore"),
+    };
+    assert_eq!(
+        reclassified.effort_matched_rule.as_deref(),
+        Some("rule 4 (multi-subsystem hint)")
+    );
+    assert_eq!(reclassified.effort_reasons.as_deref(), Some("spans cli + engine"));
+
+    let _ = std::fs::remove_file(path);
+}

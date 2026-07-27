@@ -685,6 +685,8 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_effort_matched_rule(args.effort_matched_rule)
+                    .maybe_effort_reasons(args.effort_reasons)
                     .maybe_model_override(model_override)
                     .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
@@ -809,6 +811,8 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
                     .created_via(CREATED_VIA_CLI)
                     .maybe_repo_remote_url(resolved_repo)
                     .maybe_effort_level(args.effort.map(EffortLevel::from))
+                    .maybe_effort_matched_rule(args.effort_matched_rule)
+                    .maybe_effort_reasons(args.effort_reasons)
                     .maybe_model_override(model_override)
                     .maybe_reasoning(args.reasoning.map(ReasoningMode::from))
                     .maybe_driver(driver)
@@ -1133,6 +1137,9 @@ pub(crate) async fn run_update_leaf(
         // maps to NULL in the engine (clears the field). The engine rejects
         // a non-empty detail with no accompanying blocked_reason.
         blocked_detail: args.blocked_detail,
+        // Preserve empty-string "clear" for effort provenance, same contract.
+        effort_matched_rule: args.effort_matched_rule,
+        effort_reasons: args.effort_reasons,
         tags,
         add_tags,
         remove_tags,
@@ -1140,7 +1147,7 @@ pub(crate) async fn run_update_leaf(
     };
     ensure_patch_present(
         &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
     )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {

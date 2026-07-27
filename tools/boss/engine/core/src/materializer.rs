@@ -239,8 +239,10 @@ impl Materializer {
 /// `(name, project_id)` dedup, so the product-scoped 60-second recent-
 /// duplicate heuristic (which would otherwise abort the whole populate on an
 /// unrelated same-named task elsewhere in the product) must not derail it.
-/// The `[effort-classification]` audit line is already appended to
-/// `task.description` by the Planner, so it is passed through verbatim.
+/// The Planner still appends an `[effort-classification]` audit line to
+/// `task.description`; insert lifts it into first-class
+/// `effort_matched_rule` / `effort_reasons` columns and strips it from the
+/// stored description so workers never see the audit boilerplate.
 fn insert_proposed_task(conn: &Connection, product_id: &str, project_id: &str, task: &ProposedTask) -> Result<String> {
     let created = match task.kind {
         TaskKind::Investigation => insert_investigation_in_tx(
@@ -505,9 +507,18 @@ mod tests {
             assert_eq!(task_scalar::<String>(&db, id, "kind"), "project_task");
         }
 
-        // The effort-classification line survives into the description.
+        // Effort-classification is lifted into first-class provenance columns
+        // and stripped from the stored description (tag stuffing races
+        // autostart when applied as a follow-up write).
         let desc = task_scalar::<String>(&db, &res.created[0], "description");
-        assert!(desc.contains("[effort-classification]"));
+        assert!(
+            !desc.contains("[effort-classification]"),
+            "audit tag must not remain in description: {desc}"
+        );
+        let rule = task_scalar::<Option<String>>(&db, &res.created[0], "effort_matched_rule");
+        assert_eq!(rule.as_deref(), Some("rule 5 (self-contained)"));
+        let reasons = task_scalar::<Option<String>>(&db, &res.created[0], "effort_reasons");
+        assert_eq!(reasons.as_deref(), Some("x"));
 
         // The tag is readable via the accessor.
         let tagged = db.list_task_ids_for_planner_run(&run).unwrap();

@@ -155,7 +155,13 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let id = next_id("task");
     let now = now_string();
     let ordinal = next_task_ordinal(conn, &input.project_id)?;
-    let description = input.description.unwrap_or_default();
+    // Lift any legacy `[effort-classification]` tag out of description into
+    // first-class provenance columns (or honour explicit create-time flags).
+    let (description, effort_matched_rule, effort_reasons) = crate::effort::resolve_effort_provenance_for_create(
+        input.description.unwrap_or_default(),
+        input.effort_matched_rule,
+        input.effort_reasons,
+    );
     // Human-driven rows never autostart: no agent worker is meant to run.
     let autostart_value: i64 = if input.human_driven || !input.autostart { 0 } else { 1 };
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
@@ -170,9 +176,9 @@ pub(crate) fn insert_task_in_tx(conn: &Connection, input: CreateTaskInput) -> Re
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven)
-         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
-        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred_value, human_driven_value],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
+         VALUES (?1, ?2, ?3, 'project_task', ?4, ?5, 'todo', ?6, NULL, NULL, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        params![id, input.product_id, input.project_id, input.name, description, ordinal, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
     )?;
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
@@ -228,7 +234,11 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
         .with_context(|| format!("missing product after existence check: {}", input.product_id))?;
     let id = next_id("task");
     let now = now_string();
-    let description = input.description.unwrap_or_default();
+    let (description, effort_matched_rule, effort_reasons) = crate::effort::resolve_effort_provenance_for_create(
+        input.description.unwrap_or_default(),
+        input.effort_matched_rule,
+        input.effort_reasons,
+    );
     // Human-driven rows never autostart: no agent worker is meant to run.
     let autostart_value: i64 = if input.human_driven || !input.autostart { 0 } else { 1 };
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
@@ -248,9 +258,9 @@ pub(crate) fn insert_chore_in_tx(conn: &Connection, input: CreateChoreInput) -> 
     let short_id = allocate_short_id(conn, &input.product_id)?;
 
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven)
-         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
-        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value],
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, origin_task_short_id, origin_pr_number, deferred, human_driven, effort_matched_rule, effort_reasons)
+         VALUES (?1, ?2, NULL, ?3, ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        params![id, input.product_id, kind_str, input.name, description, now, autostart_value, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, input.origin_task_short_id, input.origin_pr_number, deferred_value, human_driven_value, effort_matched_rule, effort_reasons],
     )?;
 
     apply_create_time_dependencies(conn, &id, &input.depends_on, &now)?;
@@ -279,7 +289,11 @@ pub(crate) fn insert_investigation_in_tx(
     }
     let id = next_id("task");
     let now = now_string();
-    let description = input.description.unwrap_or_default();
+    let (description, effort_matched_rule, effort_reasons) = crate::effort::resolve_effort_provenance_for_create(
+        input.description.unwrap_or_default(),
+        input.effort_matched_rule,
+        input.effort_reasons,
+    );
     // Human-driven rows never autostart: no agent worker is meant to run.
     let autostart_value: i64 = if input.human_driven || !input.autostart { 0 } else { 1 };
     let deferred_value: i64 = if input.deferred { 1 } else { 0 };
@@ -293,13 +307,13 @@ pub(crate) fn insert_investigation_in_tx(
     let driver = normalize_model_override(input.driver);
     let short_id = allocate_short_id(conn, &input.product_id)?;
     conn.execute(
-        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven)
-         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+        "INSERT INTO tasks (id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, priority, created_via, repo_remote_url, effort_level, model_override, reasoning, driver, short_id, deferred, human_driven, effort_matched_rule, effort_reasons)
+         VALUES (?1, ?2, ?3, 'investigation', ?4, ?5, 'todo', NULL, NULL, NULL, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             id, input.product_id, input.project_id, input.name, description, now,
             autostart_value, priority, created_via, repo_remote_url,
             effort_level, model_override, reasoning, driver, short_id, deferred_value,
-            human_driven_value
+            human_driven_value, effort_matched_rule, effort_reasons
         ],
     )?;
     query_task(conn, &id)?.with_context(|| format!("missing investigation after insert: {id}"))

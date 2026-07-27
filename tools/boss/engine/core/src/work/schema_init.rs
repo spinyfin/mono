@@ -621,6 +621,11 @@ impl WorkDb {
         // label — this sibling column is where prose goes instead of
         // being crammed (and truncated) into the label.
         migrate_tasks_blocked_detail_column(conn)?;
+        // `tasks.effort_matched_rule` / `tasks.effort_reasons`: first-class
+        // effort-classification provenance (matched §Q4 rule + reasons
+        // summary). Replaces free-text `[effort-classification]` tag
+        // stuffing into `description`, which races autostart.
+        migrate_tasks_effort_provenance_columns(conn)?;
         // `automation_runs.first_attempted_at`: the first-attempt timestamp
         // the scheduler's retry deadline is measured from, distinct from
         // `started_at` which the retry upsert rewrites on every attempt.

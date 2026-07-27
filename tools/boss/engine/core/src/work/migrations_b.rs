@@ -2086,6 +2086,28 @@ pub(crate) fn migrate_tasks_blocked_detail_column(conn: &Connection) -> Result<(
     Ok(())
 }
 
+/// Add `tasks.effort_matched_rule` and `tasks.effort_reasons`: first-class
+/// effort-classification provenance that replaces stuffing a free-text
+/// `[effort-classification]` tag into `description` (which races autostart
+/// when applied as a follow-up update after create). Both columns are
+/// `NULL` for hand-set levels and for every row written before this
+/// migration — no backfill; the engine still recognises a legacy tag in
+/// `description` for hand-set detection on pre-migration rows.
+pub(crate) fn migrate_tasks_effort_provenance_columns(conn: &Connection) -> Result<()> {
+    for (column, ddl) in [
+        (
+            "effort_matched_rule",
+            "ALTER TABLE tasks ADD COLUMN effort_matched_rule TEXT",
+        ),
+        ("effort_reasons", "ALTER TABLE tasks ADD COLUMN effort_reasons TEXT"),
+    ] {
+        if !table_has_column(conn, "tasks", column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Widen the `conflict_resolutions` idempotency key from
 /// `(work_item_id, base_sha_at_trigger)` to `(work_item_id,
 /// base_sha_at_trigger, head_sha_before)`.

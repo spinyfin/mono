@@ -151,6 +151,14 @@ pub struct CreateChoreInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
 
+    /// See [`CreateTaskInput::effort_matched_rule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// See [`CreateTaskInput::effort_reasons`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
+
     /// See [`CreateTaskInput::model_override`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
@@ -230,6 +238,14 @@ pub struct CreateInvestigationInput {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
+
+    /// See [`CreateTaskInput::effort_matched_rule`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// See [`CreateTaskInput::effort_reasons`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_override: Option<String>,
@@ -329,6 +345,15 @@ pub struct CreateTaskInput {
     /// falls through to product / engine default per design §Q3.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
+
+    /// See [`Task::effort_matched_rule`]. First-class replacement for
+    /// stuffing an `[effort-classification]` tag into `description`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// See [`Task::effort_reasons`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
 
     /// Explicit model slug override. `None` → no override; dispatcher
     /// resolves per design §Q3 precedence. Stored verbatim.
@@ -724,6 +749,29 @@ pub struct Task {
     /// explicit `--effort` flag on `boss task/chore create|edit`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_level: Option<EffortLevel>,
+
+    /// Which §Q4 heuristic rule produced [`Self::effort_level`] when the
+    /// level was derived by the coordinator/Planner (e.g.
+    /// `"rule 3 (multi-subsystem)"`). `None` when the level was hand-set
+    /// via `--effort` with no provenance, or when no level is set.
+    ///
+    /// First-class replacement for the free-text `[effort-classification]
+    /// matched-rule=\`…\`` tag that used to be stuffed into
+    /// [`Self::description`] — stuffing raced autostart (a follow-up
+    /// description update after create re-probed a live worker). Presence
+    /// of this field (or a legacy audit tag still sitting in `description`
+    /// on pre-migration rows) is how `effort_is_hand_set` tells heuristic
+    /// levels apart from hand-set ones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_matched_rule: Option<String>,
+
+    /// Short free-text reasons summary for the effort classification
+    /// (e.g. `"names protocol types + engine core surfaces"`). Companion
+    /// to [`Self::effort_matched_rule`]; `None` when the level was
+    /// hand-set or never classified. First-class replacement for the
+    /// free-text `reasons="…"` half of the `[effort-classification]` tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_reasons: Option<String>,
 
     /// Stable pointer to the upstream tracker issue linked to this work item.
     /// `None` when no external tracker binding exists. Populated by the

@@ -967,6 +967,12 @@ pub(crate) fn print_task_details(title: &str, task: &Task, parent_product: Optio
     if let Some(level) = task.effort_level {
         println!("Effort: {level}");
     }
+    if let Some(rule) = task.effort_matched_rule.as_deref() {
+        println!("Effort matched rule: {rule}");
+    }
+    if let Some(reasons) = task.effort_reasons.as_deref() {
+        println!("Effort reasons: {reasons}");
+    }
     if let Some(reasoning) = task.reasoning {
         println!("Reasoning: {reasoning}");
     }
