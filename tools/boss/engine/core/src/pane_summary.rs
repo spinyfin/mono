@@ -26,18 +26,21 @@
 //! only feeds the visual titlebar.
 //!
 //! Failure modes are silent on purpose. If the API key is missing
-//! or the request fails (timeout, transport, 5xx), we fall back to
-//! a deterministic local trim of the work item name. That keeps the
+//! or the request fails after a single bounded retry of transient
+//! errors (timeout, transport, 429, 5xx), we fall back to a
+//! deterministic local trim of the work item name. That keeps the
 //! pane spawn flow on its happy path even when the network or
 //! Anthropic is down. The fallback is *not* cached so a later spawn
-//! can still call the API and store a real summary.
+//! can still call the API and store a real summary. Auth / other 4xx
+//! and decode errors are not retried — they will not heal on a second
+//! attempt and would only add spawn latency.
 
 use std::time::Duration;
 
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
+use crate::claude_client::{self, CallConfig, Message, MessagesRequest, RetryPolicy};
 use crate::utility_model::{UtilityCall, UtilityModel, UtilityTask};
 use crate::work::{WorkDb, WorkItem};
 use boss_protocol::ExecutionKind;
@@ -61,11 +64,31 @@ const SUMMARY_MAX_TOKENS: u32 = 60;
 /// previously-stored stale labels (e.g. v2 Title Case noun phrases)
 /// refresh themselves under the v3 gerund-phrase prompt.
 const PROMPT_VERSION: &str = "v3";
-/// Hard timeout on the round-trip. Worker spawn is user-visible and
-/// we'd rather show the fallback than block the pane on a slow
-/// upstream. Sonnet on a tiny prompt typically returns in well
-/// under a second.
+/// Hard timeout on a single round-trip attempt. Worker spawn is
+/// user-visible and we'd rather show the fallback than block the pane
+/// on a slow upstream. Sonnet on a tiny prompt typically returns in
+/// well under a second. Applied per attempt (not across the whole
+/// retry budget) — see [`SUMMARY_ATTEMPTS`].
 const SUMMARY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total attempts for the pane-summary utility-model call. One retry
+/// only: transport blips / 429 / 5xx are the common transient failures
+/// that a single re-issue absorbs, and this call sits on the
+/// `SpawnWorkerPane` path so every extra attempt adds directly to
+/// spawn latency. Non-transient errors (auth, other 4xx, decode) are
+/// never retried — see [`claude_client::ClaudeError::is_retryable`].
+///
+/// Wall-clock ceiling:
+/// `SUMMARY_ATTEMPTS * SUMMARY_TIMEOUT + (SUMMARY_ATTEMPTS - 1) * SUMMARY_BACKOFF`
+/// = 2 × 5s + 250ms = **10.25s** worst case (both attempts timing out).
+/// Happy path stays under a second; a transport fail that recovers on
+/// the second attempt typically costs a few hundred ms of backoff plus
+/// one short model RTT.
+const SUMMARY_ATTEMPTS: u32 = 2;
+/// Backoff before the single retry. Short on purpose: this is spawn-
+/// path, and the blips we care about (connection reset, brief 5xx)
+/// recover in tens of milliseconds — a long pause only inflates pane
+/// open latency without improving absorb rate.
+const SUMMARY_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Compute a stable hash of the inputs that, if changed, must
 /// invalidate the cached summary. Used as the `basis_hash` column
@@ -319,15 +342,25 @@ fn build_prompt(name: &str, description: &str) -> String {
 
 /// Ask for a short gerund summary via the shared [`crate::claude_client`]
 /// pipeline, addressed at whatever the [`UtilityModel`] provider resolved, and
-/// pull the first text block out of the response. Errors are bucketed into
-/// `anyhow` because the caller (`get_or_generate`) only logs them.
+/// pull the first text block out of the response. Transient failures
+/// (transport, timeout, 429, 5xx) are retried once under a tight spawn-path
+/// budget — see [`SUMMARY_ATTEMPTS`] / [`SUMMARY_BACKOFF`]. Auth failures,
+/// other 4xx, and decode errors fail fast without retry. Errors are bucketed
+/// into `anyhow` because the caller (`get_or_generate`) only logs them; the
+/// final failure after the budget is exhausted still surfaces so the caller
+/// can WARN.
 pub async fn claude_short_summary(call: &UtilityCall, name: &str, description: &str) -> Result<String> {
     let request = MessagesRequest::builder()
         .model(call.model.clone())
         .max_tokens(SUMMARY_MAX_TOKENS)
         .messages(vec![Message::user(build_prompt(name, description))])
         .build();
-    let config = CallConfig::new(SUMMARY_TIMEOUT).with_endpoint(call.endpoint.clone());
+    // Explicit spawn-path policy rather than `CallConfig::new`'s default:
+    // pin the attempt count and short backoff so a future default change
+    // cannot quietly inflate (or strip) retry on the critical spawn path.
+    let config = CallConfig::new(SUMMARY_TIMEOUT)
+        .with_retry(RetryPolicy::new(SUMMARY_ATTEMPTS, SUMMARY_BACKOFF, SUMMARY_BACKOFF))
+        .with_endpoint(call.endpoint.clone());
 
     let response = claude_client::send_messages(&call.api_key, &request, &config).await?;
     let cleaned = clean_summary(response.first_text().unwrap_or_default());
@@ -704,5 +737,100 @@ mod tests {
 
         let summary = claude_short_summary(&call, "name", "desc").await.expect("mock success");
         assert_eq!(summary, "fixing the pane titlebar");
+    }
+
+    /// Transient transport-class failure (HTTP 503 stands in for the same
+    /// `is_retryable` branch as a connection reset / timeout): first attempt
+    /// fails, second succeeds, and the gerund is returned. Without the
+    /// spawn-path retry this would permanently cost the pane its title.
+    #[tokio::test]
+    async fn retries_transient_5xx_then_returns_gerund() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("overloaded"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "fixing the fencer scraper"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
+
+        let summary = claude_short_summary(&call, "Fix fencer scraper", "desc")
+            .await
+            .expect("retry should absorb the transient 503");
+        assert_eq!(summary, "fixing the fencer scraper");
+    }
+
+    /// Auth / other 4xx must fail fast: a 401 followed by a 200 that a retry
+    /// would reach proves we surface the auth error without a second attempt
+    /// (and without adding spawn latency for a failure that will not heal).
+    #[tokio::test]
+    async fn does_not_retry_auth_4xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("invalid x-api-key"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "should not be reached"}],
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("bad-key".to_owned()), |_| None)
+            .with_endpoint(format!("{}/v1/messages", server.uri()));
+        let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
+
+        let err = claude_short_summary(&call, "name", "desc")
+            .await
+            .expect_err("401 must fail without retrying into the 200");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("401") || msg.contains("invalid x-api-key") || msg.contains("anthropic returned"),
+            "expected auth/API error to surface, got: {msg}",
+        );
+    }
+
+    /// Connection refused is the live-observed failure mode
+    /// (`transport error: error sending request for url …`). Pointing at an
+    /// unbound port produces that class of error; with `SUMMARY_ATTEMPTS = 2`
+    /// the client retries once then surfaces the transport error — never a
+    /// success, and never more than the pinned attempt count.
+    #[tokio::test]
+    async fn transport_error_exhausts_budget_then_surfaces() {
+        let provider = crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+            .with_endpoint("http://127.0.0.1:1/v1/messages");
+        let call = provider.resolve(UtilityTask::PaneSummary).expect("key was supplied");
+
+        let started = std::time::Instant::now();
+        let err = claude_short_summary(&call, "name", "desc")
+            .await
+            .expect_err("unreachable endpoint must fail");
+        let elapsed = started.elapsed();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("transport error") || msg.contains("error sending request"),
+            "expected transport error, got: {msg}",
+        );
+        // Two connection-refused attempts + one short backoff should finish
+        // well under a second — and far under the 10.25s wall-clock ceiling.
+        // A hang or an accidental raise of SUMMARY_TIMEOUT would blow this.
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "transport-error budget should fail fast, took {elapsed:?}",
+        );
     }
 }
