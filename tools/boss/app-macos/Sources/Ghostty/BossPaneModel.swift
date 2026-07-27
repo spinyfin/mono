@@ -395,16 +395,7 @@ private let bossFilingGuidanceDirect = """
     Workflow:
 
     1. Find the Boss product: `boss product list --json` — identify the product named "Boss" (or equivalent).
-    2. Create the chore with the `[effort-classification]` tag baked into the `--description` (one atomic write — do NOT do a separate update after create, as that races with autostart and produces a spurious worker re-read probe). Example:
-       ```sh
-       boss chore create --product <id> --name "…" --effort <level> --reasoning <mode> \
-         --description "$(cat <<'EOF'
-       <brief>
-
-       [effort-classification] level=`<level>` matched-rule=`…` reasons="…"
-       EOF
-       )"
-       ```
+    2. Create the chore, passing the effort classification as flags on the same call: `boss chore create --product <id> --name "…" --effort <level> --reasoning <mode> --effort-matched-rule "…" --effort-reasons "…" --description "<brief>"`.
     3. Confirm the short_id and name to the user.
 
     **Exception:** if the user explicitly asks to file a GitHub issue instead, use `boss shake`:
@@ -427,7 +418,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - `bossctl agents list / status / focus / send / interrupt / launch / stop / transcript`
     - `bossctl probe <run-id> "question"` — inject a probe a worker answers on its next Stop boundary.
     - `bossctl work start <work-item-id>` — schedule a work item.
-    - `bossctl workspace summary` — view the cube pool.
+    - `bossctl workspace summary` — list cube workspaces and their current leases. Workspaces are provisioned on demand; there is no fixed pool to exhaust.
 
     Use `boss` for taxonomy CRUD (products, projects, tasks, chores) with `--no-input --json`.
 
@@ -547,7 +538,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Levels: `trivial | small | medium | large`. Never emit `max` — human-only.
 
-    At create time: run the heuristic, pass `--effort <level>`, and include the `[effort-classification]` audit tag directly in the `--description` you pass to the create call — one atomic write. Do NOT do a separate update after create; see "Audit trail on the row" below.
+    At create time: run the heuristic, then pass `--effort <level>` together with `--effort-matched-rule` and `--effort-reasons` on the same create call. These are first-class columns on the row — never stuff an `[effort-classification]` tag into `--description`.
 
     ### Rules (top-to-bottom, first match wins)
 
@@ -568,44 +559,16 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     Override with explicit reasoning when intent is clear; record in the reasons string. `max` is off-limits regardless.
 
-    ### Audit trail on the row
+    ### Effort-classification provenance (first-class fields)
 
-    The CLI has no first-class comment surface. Audit tags go into the `description` field, each on its own line separated from the preceding text by a blank line. **The write timing differs by tag type.**
+    `--effort-matched-rule "<rule>"` and `--effort-reasons "<summary>"` are columns on the row. They are accepted by `boss task create`, `boss chore create`, `boss task create-investigation`, and `boss task update`. Pass them on the same call as `--effort`; there is nothing to append afterwards, and nothing to write into `--description`.
 
-    #### `[effort-classification]` — bake into the initial create call (one atomic write)
+    - Create: `boss chore create --product <id> --name "…" --effort small --reasoning standard --effort-matched-rule "rule 7 (short desc fallback)" --effort-reasons "single-clause title, description < 1500 B" --description "<brief>"`
+    - Escalation (post-dispatch — see "Worker effort escalation"): `boss task update <row-id> --effort large --effort-matched-rule "worker escalation" --effort-reasons "<the worker's reason, verbatim>"`
+    - Setting `--effort` on `update` without provenance clears both columns, which is how a hand-set level stays distinguishable from a heuristic one. Pass `--effort-matched-rule ""` / `--effort-reasons ""` to clear explicitly.
+    - Read them back from `boss task show --json` as `effort_matched_rule` and `effort_reasons`.
 
-    Compose the tag into the `--description` you pass to `boss chore create` / `boss task create`:
-
-    ```sh
-    boss chore create --product <id> --name "…" --effort small --reasoning standard \
-      --description "$(cat <<'EOF'
-    <the chore brief>
-
-    [effort-classification] level=`small` matched-rule=`rule 7 (short desc fallback)` reasons="single-clause title, description < 1500 B"
-    EOF
-    )"
-    ```
-
-    **Do NOT follow `boss chore create` / `boss task create` with a separate `boss task update` to append this tag.** `boss chore create` auto-dispatches a worker. A follow-up description edit lands after the worker is live, and the engine propagates it as a "[chore-update] re-read the spec" probe even when the only delta is the audit tag. (This two-write pattern raced with autostart and produced a spurious re-read probe on T1026 — root cause documented in T1027.)
-
-    #### `[effort-escalation]` — fetch-then-update after the worker's run
-
-    Escalation is a post-dispatch event: the worker has already finished before the marker fires, so a second write is safe. Use the fetch-then-update recipe:
-
-    ```sh
-    EXISTING=$(boss task show <row-id> --json | jq -r '.description // ""')
-    AUDIT='[effort-escalation] original=`small` new=`large` matched-markers=`…` reason="…"'
-    boss task update <row-id> --description "$EXISTING
-
-    $AUDIT"
-    ```
-
-    Tag conventions (always single line, leading bracket-tag, key=value pairs, double-quoted reason):
-
-    - `[effort-classification]` — creation-time heuristic result. Include `level=` and `matched-rule=` plus a `reasons="…"` summary.
-    - `[effort-escalation]` — worker-requested escalation processed by the Boss (see "Worker effort escalation" below). Include `original=`, `new=`, `matched-markers=`, `reason="…"`.
-
-    Future re-classification re-runs the heuristic and compares against the most recent `[effort-classification]` entry to decide whether to overwrite a heuristic level (per the "Re-classification" edge-case rule). Hand-set levels are detectable by the absence of any `[effort-classification]` tag.
+    Never follow a create with a description update just to record provenance. `boss chore create` auto-dispatches a worker; a follow-up description edit lands after that worker is live and the engine propagates it as a "[chore-update] re-read the spec" probe. The flags exist precisely so the audit trail is atomic with the row insert.
 
     ### Worked examples
 
@@ -642,13 +605,12 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     On malformed: log one chat line noting the issue; do nothing else.
 
-    ### On a valid marker — 5 steps in order
+    ### On a valid marker — 4 steps in order
 
     1. **Identify the row** — the work item the worker is running. Use `bossctl agents status <agent>` if needed.
-    2. **Update durably:** `boss task update <row-id> --effort <requested_level>`. If non-zero, surface the error and stop.
-    3. **Record for feedback loop:** append an `[effort-escalation]` audit line to the row's `description` per "Audit trail on the row" above. Include: `original=<old-level>`, `new=<requested-level>`, `matched-markers=<markers from the creation-time reasons string>`, and the worker's reason verbatim as `reason="…"`. Example: "[effort-escalation] original=`small` new=`large` matched-markers=`short description, no large/medium markers` reason=\\"ran into a multi-subsystem race…\\"".
-    4. **Ack the worker:** `bossctl probe <agent> "[effort-escalation-ack] level=<new-level> next_dispatch=true"`. Always use `next_dispatch=true`.
-    5. **Never mid-flight swap** — do not interrupt, stop, or re-spawn the worker. Only the next dispatch sees the updated level.
+    2. **Update durably, with provenance:** `boss task update <row-id> --effort <requested_level> --effort-matched-rule "worker escalation" --effort-reasons "<the worker's reason, verbatim>"`. If it exits non-zero, surface the error and stop. Do not append an audit line to `description`.
+    3. **Ack the worker:** `bossctl probe <agent> "[effort-escalation-ack] level=<new-level> next_dispatch=true"`. Always use `next_dispatch=true`.
+    4. **Never mid-flight swap** — do not interrupt, stop, or re-spawn the worker. Only the next dispatch sees the updated level.
 
     Re-dispatch is automatic: when the row is re-triggered, the dispatcher reads its current `effort_level`.
 
@@ -661,26 +623,15 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
 
     ## CLI shape gotchas
 
-    ### 1. `boss <verb> --json` returns a wrapped object — except `show`
+    ### 1. JSON envelope shapes
 
-    - `boss chore show --json` / `boss task show --json` → flat row object: the row's own fields (`id`, `short_id`, `status`, `description`, …) alongside `dependencies`, `executions`, `attention_items`, and `attention_groups` at the top level. No `chore`/`task` wrapper — project fields directly.
-    - `boss project show --json` → `{project: {...}, dependencies: [...], design_doc: {...}}` (still wrapped)
-    - `boss chore list --json` → `{chores: [...]}` (still wrapped)
-    - `boss task list --json` → `{tasks: [...]}` (still wrapped)
+    - `boss task show --json` / `boss chore show --json` → flat row object: the row's own fields at the top level, plus `dependencies`, `executions`, `attention_items`, `attention_groups`. No wrapper.
+    - `boss project show --json` → `{project, dependencies, design_doc}`.
+    - `boss task list --json` → `{tasks: [...]}`; `boss chore list --json` → `{chores: [...]}`.
 
-    Check `jq 'keys'` before projecting fields on `project show` or any `list` verb. Projecting `{id, short_id, name}` on the top level silently returns `null` when that wrapper is forgotten. `show` for `chore`/`task` is the exception — it is already flat, so project directly.
+    ### 2. Duplicate-create guard
 
-    ### 2. `boss <kind> create` succeeded if you saw the header line
-
-    **Never retry without first confirming the row doesn't exist:**
-
-    ```sh
-    boss chore list --product <p> --json | jq '.chores[0:5] | .[] | {short_id, name}'
-    # or for tasks:
-    boss task list --project <proj> --json | jq '.tasks[0:5] | .[] | {short_id, name}'
-    ```
-
-    Blind retries produce duplicate rows (no de-dup gate).
+    A create whose `name` matches a non-deleted row in the same product created within the last 60 seconds is refused with `A task/chore named "…" was created N seconds ago (id: …, short_id: T…); pass --force-duplicate to create another`. A retry after an apparently-failed create is therefore safe inside that window: it either succeeds or names the row that already exists. Outside the window the guard does not fire — check before re-creating something old.
 
     ### 3. Heredoc for descriptions with backticks / `$vars`
 
