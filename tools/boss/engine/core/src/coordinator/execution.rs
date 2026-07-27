@@ -2133,9 +2133,11 @@ impl ExecutionCoordinator {
 
         match outcome {
             PreStartFailureOutcome::Retry { delay } => {
+                // Intermediate retries do not insert a work_runs row — retry
+                // state lives on the execution (`pre_start_failure_count` /
+                // `dispatch_not_before`). See `record_pre_start_failure`.
                 tracing::info!(
                     execution_id = %execution.id,
-                    run_id = %run.id,
                     worker_id,
                     pre_start_failure_count = execution.pre_start_failure_count,
                     max_retries = self.pre_start_retry_delays.len(),
@@ -2152,9 +2154,10 @@ impl ExecutionCoordinator {
                 });
             }
             PreStartFailureOutcome::PermanentFail => {
+                let run_id = run.as_ref().map(|r| r.id.as_str()).unwrap_or("(none)");
                 tracing::warn!(
                     execution_id = %execution.id,
-                    run_id = %run.id,
+                    run_id,
                     worker_id,
                     pre_start_failure_count = execution.pre_start_failure_count,
                     error = %error,

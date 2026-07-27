@@ -189,12 +189,19 @@ pub use boss_protocol::{
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
 /// this to decide whether to schedule a delayed kick (retry) or surface
 /// a permanent failure to the operator.
+///
+/// Intermediate [`Self::Retry`] attempts do **not** insert a `work_runs`
+/// row (retry state is on the execution). Only [`Self::PermanentFail`]
+/// inserts a failed bookkeeping run — intermediate failed rows were a
+/// major source of permanent `transcript_path IS NULL` on `work_runs`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PreStartFailureOutcome {
     /// The execution has been reset to `ready` with a `dispatch_not_before`
     /// delay. The coordinator should kick the scheduler after `delay`.
+    /// No `work_runs` row was inserted.
     Retry { delay: Duration },
-    /// All retry attempts exhausted. The execution is now `failed`.
+    /// All retry attempts exhausted. The execution is now `failed` and a
+    /// single failed `work_runs` row was inserted for operator history.
     /// The coordinator should surface an attention item.
     PermanentFail,
 }
