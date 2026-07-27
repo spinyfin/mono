@@ -1,8 +1,11 @@
 use std::env;
-use std::fs::{File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 fn assert_write_denied(path: &Path) {
@@ -66,8 +69,12 @@ fn linux_private_temp_root_is_short_and_action_private() {
 
     let private_root = env::var_os("TEST_TMPDIR").expect("Bazel must set TEST_TMPDIR");
     let private_root = Path::new(&private_root);
+    // `Path::starts_with` matches whole path *components*, not string prefixes:
+    // "/tmp/mono-test.XXXXXX".starts_with("/tmp/mono-test.") is false because the
+    // final component "mono-test.XXXXXX" isn't equal to the component "mono-test.".
+    // Compare raw bytes instead so the random mktemp suffix doesn't break the check.
     assert!(
-        private_root.starts_with("/tmp/mono-test."),
+        private_root.as_os_str().as_bytes().starts_with(b"/tmp/mono-test."),
         "Linux TEST_TMPDIR must live in the per-action /tmp tmpfs: {}",
         private_root.display()
     );
