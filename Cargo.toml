@@ -109,6 +109,7 @@ hashbrown = { version = "0.15.5", features = ["default-hasher", "serde"] }
 indicatif = "0.17.11"
 jsonwebtoken = "10.4.0"
 keyring = "3.6.3"
+libc = "0.2.186"
 rand = "0.8"
 rayon = "1.10"
 rsa = "0.9"

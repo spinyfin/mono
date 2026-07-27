@@ -36,6 +36,18 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
     #[cfg(test)]
     test_hooks::record_call();
 
+    // Provider-session identity is engine-owned lifecycle state, independent
+    // of whether the driver had filesystem runtime state to clean up. Clear it
+    // before any early return below so every normal termination path prunes
+    // the one persisted identity.
+    if let Err(err) = work_db.clear_run_progress_session_identity(execution_id) {
+        tracing::warn!(
+            execution_id,
+            error = %format!("{err:#}"),
+            "driver workspace teardown: failed to clear progress session identity (non-fatal)",
+        );
+    }
+
     let runtime_state = match work_db.get_driver_runtime_state(execution_id) {
         Ok(state) => state,
         Err(err) => {
@@ -157,6 +169,39 @@ mod tests {
         let chore = create_test_chore(&db, &product.id, "test chore");
         let execution = create_ready_chore_execution(&db, &chore.id);
         teardown_driver_workspace(&db, &execution.id, None).await;
+    }
+
+    #[tokio::test]
+    async fn teardown_prunes_progress_session_identity() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "test chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+        assert!(
+            !db.claim_run_progress_session_identity(&execution.id, "thread-a")
+                .unwrap()
+        );
+        assert!(
+            db.claim_run_progress_session_identity(&execution.id, "thread-a")
+                .unwrap()
+        );
+
+        teardown_driver_workspace(&db, &execution.id, None).await;
+
+        assert!(
+            !db.claim_run_progress_session_identity(&execution.id, "thread-a")
+                .unwrap(),
+            "normal teardown must clear the durable identity"
+        );
     }
 
     #[tokio::test]

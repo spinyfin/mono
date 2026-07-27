@@ -37,11 +37,28 @@ pub enum TailError {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("transcript line is not valid JSON: {error} (line: {line:?})")]
     Json { error: serde_json::Error, line: String },
+    #[error("transcript containment: {0}")]
+    Containment(String),
+}
+
+#[derive(Debug)]
+struct TranscriptContainment {
+    root: PathBuf,
+    canonical_root: PathBuf,
+    root_identity: FileIdentity,
+    file_identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
 }
 
 #[derive(Debug)]
 pub struct TranscriptTail {
     path: PathBuf,
+    containment: Option<TranscriptContainment>,
     offset: u64,
     /// Buffer for a trailing partial line carried across polls.
     partial: String,
@@ -51,9 +68,31 @@ impl TranscriptTail {
     pub fn new<P: Into<PathBuf>>(path: P) -> Self {
         Self {
             path: path.into(),
+            containment: None,
             offset: 0,
             partial: String::new(),
         }
+    }
+
+    /// Create a tail whose file must remain a regular, single-link file under
+    /// `root` at every poll. Construction validates the persisted path;
+    /// [`Self::poll`] repeats the check against the descriptor it actually
+    /// consumes so path replacement after persistence cannot redirect reads.
+    pub fn new_contained<P: Into<PathBuf>, R: Into<PathBuf>>(path: P, root: R) -> Result<Self, TailError> {
+        let path = path.into();
+        let root = root.into();
+        let (canonical_root, root_identity, file_identity) = verify_initial_containment(&path, &root)?;
+        Ok(Self {
+            path,
+            containment: Some(TranscriptContainment {
+                root,
+                canonical_root,
+                root_identity,
+                file_identity,
+            }),
+            offset: 0,
+            partial: String::new(),
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -64,13 +103,16 @@ impl TranscriptTail {
     /// values. Returns an empty vec if the file does not exist or has
     /// not grown.
     pub async fn poll(&mut self) -> Result<Vec<serde_json::Value>, TailError> {
-        let mut file = match fs::File::open(&self.path).await {
+        let mut file = match open_no_follow(&self.path).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e.into()),
         };
 
         let metadata = file.metadata().await?;
+        if let Some(containment) = self.containment.as_ref() {
+            verify_opened_containment(&self.path, containment, &metadata).await?;
+        }
         let size = metadata.len();
 
         // Truncation / rotation: file shrunk below our cursor, so the
@@ -120,6 +162,124 @@ impl TranscriptTail {
 
         Ok(values)
     }
+}
+
+fn verify_initial_containment(path: &Path, root: &Path) -> Result<(PathBuf, FileIdentity, FileIdentity), TailError> {
+    let root_meta = std::fs::symlink_metadata(root).map_err(TailError::Io)?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(TailError::Containment(format!(
+            "root {} is not a real directory",
+            root.display()
+        )));
+    }
+    let canonical_root = std::fs::canonicalize(root).map_err(TailError::Io)?;
+    let path_meta = std::fs::symlink_metadata(path).map_err(TailError::Io)?;
+    if path_meta.file_type().is_symlink() || !path_meta.is_file() {
+        return Err(TailError::Containment(format!(
+            "path {} is not a real file",
+            path.display()
+        )));
+    }
+    let canonical_path = std::fs::canonicalize(path).map_err(TailError::Io)?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(TailError::Containment(format!(
+            "path {} is outside root {}",
+            canonical_path.display(),
+            canonical_root.display()
+        )));
+    }
+    Ok((canonical_root, file_identity(&root_meta), file_identity(&path_meta)))
+}
+
+async fn open_no_follow(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    options.open(path).await
+}
+
+async fn verify_opened_containment(
+    path: &Path,
+    containment: &TranscriptContainment,
+    opened: &std::fs::Metadata,
+) -> Result<(), TailError> {
+    let root_meta = fs::symlink_metadata(&containment.root).await?;
+    if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
+        return Err(TailError::Containment(format!(
+            "root {} was replaced",
+            containment.root.display()
+        )));
+    }
+    let canonical_root = fs::canonicalize(&containment.root).await?;
+    if canonical_root != containment.canonical_root {
+        return Err(TailError::Containment(format!(
+            "root {} changed identity",
+            containment.root.display()
+        )));
+    }
+    if file_identity(&root_meta) != containment.root_identity {
+        return Err(TailError::Containment(format!(
+            "root {} was replaced in place",
+            containment.root.display()
+        )));
+    }
+
+    let path_meta = fs::symlink_metadata(path).await?;
+    if path_meta.file_type().is_symlink() || !path_meta.is_file() || !opened.is_file() {
+        return Err(TailError::Containment(format!(
+            "path {} is no longer a real file",
+            path.display()
+        )));
+    }
+    let canonical_path = fs::canonicalize(path).await?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err(TailError::Containment(format!(
+            "path {} escaped root {}",
+            canonical_path.display(),
+            canonical_root.display()
+        )));
+    }
+    if !same_file_identity(opened, &path_meta) {
+        return Err(TailError::Containment(format!(
+            "opened file {} differs from the persisted path",
+            path.display()
+        )));
+    }
+    if file_identity(opened) != containment.file_identity {
+        return Err(TailError::Containment(format!(
+            "path {} was replaced in place",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> FileIdentity {
+    FileIdentity { device: 0, inode: 0 }
+}
+
+#[cfg(unix)]
+fn same_file_identity(opened: &std::fs::Metadata, path: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    opened.dev() == path.dev() && opened.ino() == path.ino() && opened.nlink() == 1
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(_opened: &std::fs::Metadata, _path: &std::fs::Metadata) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -255,5 +415,70 @@ mod tests {
         let events = tail.poll().await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["hello"], "world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_tail_rejects_file_replaced_by_symlink_after_persistence() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        std::fs::write(&path, "{\"safe\":true}\n").unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        std::fs::write(&outside, "{\"stolen\":true}\n").unwrap();
+        let mut tail = TranscriptTail::new_contained(&path, &root).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        assert!(tail.poll().await.is_err(), "O_NOFOLLOW must reject the replaced file");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_tail_rejects_file_replaced_by_regular_file_after_persistence() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout.jsonl");
+        std::fs::write(&path, "{\"safe\":true}\n").unwrap();
+        let mut tail = TranscriptTail::new_contained(&path, &root).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "{\"replaced\":true}\n").unwrap();
+
+        assert!(
+            matches!(tail.poll().await, Err(TailError::Containment(_))),
+            "the tail must remain pinned to the file selected at construction"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_tail_rejects_parent_replaced_after_persistence() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("sessions");
+        let day = root.join("2026-07-26");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout.jsonl");
+        std::fs::write(&path, "{\"safe\":true}\n").unwrap();
+        let outside_day = dir.path().join("outside-day");
+        std::fs::create_dir_all(&outside_day).unwrap();
+        std::fs::write(outside_day.join("rollout.jsonl"), "{\"stolen\":true}\n").unwrap();
+        let mut tail = TranscriptTail::new_contained(&path, &root).unwrap();
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&day).unwrap();
+        symlink(&outside_day, &day).unwrap();
+
+        assert!(
+            matches!(tail.poll().await, Err(TailError::Containment(_))),
+            "the opened descriptor must be rejected when a parent redirects outside the root"
+        );
     }
 }

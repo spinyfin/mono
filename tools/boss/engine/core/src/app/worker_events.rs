@@ -51,6 +51,10 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
 /// already the `&Arc<ServerState>` they need.
 #[async_trait::async_trait]
 impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
+    fn progress_identity_store(&self) -> Option<Arc<dyn crate::driver::ProgressIdentityStore>> {
+        Some(self.work_db.clone())
+    }
+
     async fn dispatch_worker_event(&self, incoming: crate::events_socket::IncomingHookEvent) {
         dispatch_worker_event_fanout(self, &incoming).await;
     }

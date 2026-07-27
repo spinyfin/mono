@@ -44,7 +44,7 @@ impl Default for DriverRegistry {
     fn default() -> Self {
         let mut drivers: HashMap<&'static str, Arc<dyn AgentDriver>> = HashMap::new();
         drivers.insert("claude", Arc::new(ClaudeDriver));
-        drivers.insert("codex", Arc::new(CodexDriver));
+        drivers.insert("codex", Arc::new(CodexDriver::default()));
         Self { drivers }
     }
 }

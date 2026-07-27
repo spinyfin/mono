@@ -1,8 +1,7 @@
 //! `CodexDriver` — OpenAI Codex agent driver.
 //!
-//! Implements spawn + Boss-owned per-run `CODEX_HOME` provisioning for
-//! `codex exec --json`. Progress normalisation is a follow-on row; behavioural
-//! methods that would otherwise silently no-op still refuse explicitly.
+//! Implements spawn + Boss-owned per-run `CODEX_HOME` provisioning and the
+//! native `codex exec --json` progress normaliser.
 //!
 //! See `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md`
 //! (T-11 / capability declaration) and
@@ -25,12 +24,17 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
+mod progress;
+
+use progress::{CodexProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
+
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
-    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan,
-    SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
+    ProgressSessionConfig, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, StructuredOutputArtifacts,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
+    TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -715,8 +719,13 @@ fn which_codex() -> Option<PathBuf> {
 ///
 /// Registered under the `"codex"` slug. Declares the v1 capability set from
 /// the Codex driver design; spawn / provision / permission / interception are
-/// implemented here. Progress normalisation is a follow-on row.
-pub struct CodexDriver;
+/// implemented here.
+#[derive(Default)]
+pub struct CodexDriver {
+    // Keep this type non-unit so callers can use `Default` uniformly with
+    // stateful drivers without tripping clippy's unit-default lint.
+    _private: (),
+}
 
 #[async_trait]
 impl AgentDriver for CodexDriver {
@@ -986,24 +995,37 @@ impl AgentDriver for CodexDriver {
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        // Progress-normaliser follow-on implements the real mapping
-        // (thread.started / turn.* / item.*). Refuse every envelope explicitly
-        // so a premature stdout-ingress wire-up degrades to "driver could not
-        // decode" counters rather than panicking or inventing Claude-shaped
-        // events.
-        let kind = raw.get("type").and_then(|v| v.as_str()).unwrap_or("<missing type>");
-        Err(NormalizeError::UnknownEvent(format!(
-            "{kind} (CodexDriver progress normaliser is not implemented yet)"
+        // Stateless compatibility path for direct callers. Stdout ingestion
+        // owns a durable per-reader session via `progress_session` below.
+        CodexProgressSession::new(None, None, None, None).normalize_progress_event(raw)
+    }
+
+    fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        let homes_root = codex_homes_root();
+        let codex_home = config
+            .run_id
+            .as_deref()
+            .and_then(|run_id| match codex_home_for_run(run_id) {
+                Ok(home) => Some(home),
+                Err(err) => {
+                    tracing::warn!(run_id, %err, "codex stdout: invalid run id for progress session");
+                    None
+                }
+            });
+        Some(Box::new(CodexProgressSession::new(
+            codex_home,
+            Some(homes_root),
+            config.run_id.clone(),
+            config.identity_store.clone(),
         )))
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
-        // Once the progress normaliser maps `turn.completed` →
-        // `WorkerEvent::Stop`, the boundary is the same shape as Claude's:
-        // Stop means the turn ended. `codex exec` does not re-enter via
-        // stop-hooks, so continuation is always false. Implementing this now
-        // is correct and trivial; it simply never fires until the normaliser
-        // lands.
+        // The progress normaliser maps every terminal stdout envelope
+        // (`turn.completed`, `turn.failed`, and unrecoverable top-level
+        // `error`) to `WorkerEvent::Stop`, so the boundary is the same shape
+        // as Claude's: Stop means the turn ended. `codex exec` does not
+        // re-enter via stop-hooks, so continuation is always false.
         match event {
             WorkerEvent::Stop {
                 session_id,
@@ -1038,21 +1060,31 @@ impl AgentDriver for CodexDriver {
         CODEX_AGENT_RULES_PREAMBLE
     }
 
-    fn transcript_path_for_session(&self, _raw: &serde_json::Value) -> Option<String> {
-        // Primary discovery is `$CODEX_HOME/sessions/…/rollout-*-<thread_id>.jsonl`
-        // derived from thread.started + the provisioned home (TranscriptAccess
-        // gap) — not a field on the stdout stream. That needs provision's
-        // runtime state plus the normaliser's sticky thread_id. Honest None
-        // until then: callers retry on a later payload / fall back.
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
+        // Transcript lookup requires the exact run home supplied when the
+        // stdout reader creates its per-ingress progress session.
+        let _ = raw;
         None
     }
 
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        Some(Box::new(CodexTranscriptSession::default()))
+    }
+
+    fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        let homes_root = codex_homes_root();
+        let codex_home = codex_home_for_run(run_id)?;
+        let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
+            anyhow!(
+                "Codex transcript root for run {run_id:?} is missing, symlinked, replaced, or outside {}",
+                homes_root.display()
+            )
+        })?;
+        Ok(Some(sessions))
+    }
+
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-        // Codex rollout line schema remapping is follow-on (TranscriptAccess /
-        // transcript-tail generalisation). Pass-through until a real remapper
-        // lands — identity is wrong for Codex shapes but does not invent data;
-        // the live-status path already tolerates unrecognised entries.
-        raw
+        normalize_rollout(raw)
     }
 
     fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {
@@ -1150,7 +1182,7 @@ mod tests {
 
     #[test]
     fn codex_descriptor_matches_design() {
-        let driver = CodexDriver;
+        let driver = CodexDriver::default();
         let d = driver.descriptor();
         assert_eq!(d.name, "codex");
         assert_eq!(d.label, "OpenAI Codex");
@@ -1163,7 +1195,8 @@ mod tests {
 
     #[test]
     fn codex_model_menu_sourced_from_debug_models_vocabulary() {
-        let menu = &CodexDriver.descriptor().model_menu;
+        let driver = CodexDriver::default();
+        let menu = &driver.descriptor().model_menu;
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Trivial), Some("low"));
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Small), Some("medium"));
         assert_eq!((menu.effort_value_for_level)(EffortLevel::Medium), Some("high"));
@@ -1176,7 +1209,7 @@ mod tests {
 
     #[test]
     fn codex_declares_design_capability_set() {
-        let caps = CodexDriver.capabilities();
+        let caps = CodexDriver::default().capabilities();
         for cap in [
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -1206,7 +1239,7 @@ mod tests {
 
     #[test]
     fn spawn_invocation_meets_codex_exec_contract() {
-        let plan = CodexDriver.spawn_invocation(spawn_request("gpt-5.6-terra", "run-spawn-1"));
+        let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-spawn-1"));
         assert!(plan.command.contains("--json"), "requires --json: {}", plan.command);
         assert!(
             plan.command.contains("--strict-config"),
@@ -1251,7 +1284,7 @@ mod tests {
         // Choice (a): do not return to an interactive prompt after the worker
         // exits. The spawn line must start with `exec` so the shell is
         // replaced by codex; buffered injects cannot be eval'd by zsh after.
-        let plan = CodexDriver.spawn_invocation(spawn_request("gpt-5.6-sol", "run-pane-a"));
+        let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-sol", "run-pane-a"));
         let trimmed = plan.command.trim_start();
         assert!(
             trimmed.starts_with("exec "),
@@ -1338,7 +1371,8 @@ else:
             }
         }
 
-        let state = CodexDriver
+        let driver = CodexDriver::default();
+        let state = driver
             .provision_workspace(&workspace, "hello prompt", "run-prov-1")
             .await
             .expect("provision")
@@ -1369,7 +1403,7 @@ else:
         );
 
         // Teardown adopts auth but retains the home for policy-based reclaim.
-        CodexDriver
+        driver
             .teardown_workspace(Some(&workspace), "run-prov-1", Some(&state))
             .await
             .unwrap();
@@ -1409,11 +1443,12 @@ else:
             workspace_path: PathBuf::from("/ws"),
             forwarder_binary: PathBuf::from("/bin/boss-event"),
         };
-        match CodexDriver.progress_observation_wiring(&config) {
+        let driver = CodexDriver::default();
+        match driver.progress_observation_wiring(&config) {
             ProgressIngress::StdoutJsonl => {}
             ProgressIngress::HookCallback(_) => panic!("Codex progress is StdoutJsonl, not hooks"),
         }
-        assert_eq!(CodexDriver.progress_fidelity(), ProgressFidelity::Rich);
+        assert_eq!(driver.progress_fidelity(), ProgressFidelity::Rich);
     }
 
     #[test]
@@ -1423,12 +1458,13 @@ else:
             stop_hook_active: true,
             stop_reason: StopReason::Completed,
         };
-        let boundary = CodexDriver.turn_boundary(&event).expect("Stop is a boundary");
+        let driver = CodexDriver::default();
+        let boundary = driver.turn_boundary(&event).expect("Stop is a boundary");
         assert_eq!(boundary.session_id, "thread-1");
         assert_eq!(boundary.reason, StopReason::Completed);
         assert!(!boundary.continuation);
         assert!(
-            CodexDriver
+            driver
                 .turn_boundary(&WorkerEvent::SessionStart {
                     session_id: "thread-1".into(),
                     source: boss_protocol::SessionStartSource::Startup,
@@ -1438,18 +1474,12 @@ else:
     }
 
     #[test]
-    fn normalize_progress_event_refuses_until_normaliser_lands() {
+    fn normalize_progress_event_requires_thread_start_before_turn_events() {
         let raw = serde_json::json!({"type": "turn.completed"});
-        let err = CodexDriver
-            .normalize_progress_event(&raw)
-            .expect_err("normaliser is not implemented yet");
-        match err {
-            NormalizeError::UnknownEvent(msg) => {
-                assert!(msg.contains("turn.completed"), "{msg}");
-                assert!(msg.contains("not implemented"), "{msg}");
-            }
-            other => panic!("expected UnknownEvent, got {other:?}"),
-        }
+        assert!(matches!(
+            CodexDriver::default().normalize_progress_event(&raw),
+            Err(NormalizeError::MissingField("thread_id"))
+        ));
     }
 
     #[test]
@@ -1516,7 +1546,7 @@ else:
         assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Standard), "workspace-write");
         // Final command after permission merge must prefer reviewer read-only
         // over the spawn-plan default workspace-write.
-        let plan = CodexDriver.spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
+        let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
         assert!(
             plan.command.contains("--sandbox workspace-write"),
             "spawn default is workspace-write: {}",
@@ -1557,7 +1587,7 @@ else:
         }
         .to_driver_runtime_state();
 
-        let err = CodexDriver
+        let err = CodexDriver::default()
             .teardown_workspace(None, "run-bad", Some(&state))
             .await
             .expect_err("teardown must refuse out-of-root home");
@@ -1578,7 +1608,7 @@ else:
             auth_policy: "SnapshotWithRefreshAdoption".into(),
         }
         .to_driver_runtime_state();
-        let err = CodexDriver
+        let err = CodexDriver::default()
             .teardown_workspace(None, "run-root", Some(&root_state))
             .await
             .expect_err("teardown must refuse homes root");

@@ -9,6 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
@@ -779,6 +780,66 @@ pub enum ProgressIngress {
     StdoutJsonl,
 }
 
+/// Run-scoped context supplied when a stdout progress reader starts.
+///
+/// Stream protocols commonly omit session identity after their first
+/// envelope. Mutable correlation therefore belongs to the reader session,
+/// not the registry's shared [`AgentDriver`] instance. `run_id` also lets a
+/// driver resolve run-owned artifacts without scanning another run's state.
+#[derive(Clone, Default)]
+pub struct ProgressSessionConfig {
+    pub run_id: Option<String>,
+    pub identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+}
+
+impl std::fmt::Debug for ProgressSessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProgressSessionConfig")
+            .field("run_id", &self.run_id)
+            .field("has_identity_store", &self.identity_store.is_some())
+            .finish()
+    }
+}
+
+/// Engine-owned durable storage for one run's current provider session id.
+///
+/// The driver must not persist this identity inside an agent-writable home.
+/// Implementations atomically compare and replace the one bounded identity
+/// for `run_id`; `Ok(true)` means the same id was already present (resume).
+pub trait ProgressIdentityStore: Send + Sync {
+    fn claim_progress_identity(&self, run_id: &str, session_id: &str) -> Result<bool, String>;
+}
+
+/// Mutable normalizer owned by one progress ingress.
+///
+/// A registry driver may be shared by concurrent readers; implementations of
+/// this trait are not shared. The reader invokes both methods in stream order,
+/// so sticky session identity and transcript discovery cannot cross streams.
+pub trait ProgressSessionNormalizer: Send {
+    fn normalize_progress_event(&mut self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
+
+    /// Normalize one provider envelope into its ordered worker-event fanout.
+    ///
+    /// Most envelopes map one-to-one and use this default. A provider may
+    /// override the batch form when one wire event carries two distinct parts
+    /// of the shared contract—for example, a fatal error message followed by
+    /// the authoritative turn-ending [`WorkerEvent::Stop`].
+    fn normalize_progress_events(&mut self, raw: &serde_json::Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
+        self.normalize_progress_event(raw).map(|event| vec![event])
+    }
+
+    fn transcript_path_for_session(&mut self, raw: &serde_json::Value) -> Option<String>;
+}
+
+/// Mutable normalizer owned by one transcript consumer.
+///
+/// Some transcript dialects put tool input and output in separate records.
+/// Per-tail state correlates those records without leaking call ids across
+/// concurrently running slots.
+pub trait TranscriptSessionNormalizer: Send {
+    fn normalize_transcript_entry(&mut self, raw: serde_json::Value) -> serde_json::Value;
+}
+
 /// A turn-ended signal for [`Capability::TurnBoundary`]: the driver-agnostic
 /// form of "the worker finished a turn and is now idle".
 ///
@@ -791,15 +852,16 @@ pub enum ProgressIngress {
 /// - **Claude** fires a `Stop` hook into the `boss-event` shim, which the
 ///   engine decodes into [`WorkerEvent::Stop`] — that variant is the
 ///   boundary.
-/// - **Codex** emits a native, typed `turn.completed` on its `--json` stdout
-///   stream (verified against codex-cli 0.145.0; see
+/// - **Codex** emits native, typed terminal envelopes on its `--json` stdout
+///   stream (`turn.completed`, `turn.failed`, and unrecoverable `error`;
+///   verified against codex-cli 0.145.0; see
 ///   `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`).
 ///   Its driver decodes that to [`WorkerEvent::Stop`] in
 ///   [`AgentDriver::normalize_progress_event`] and reports the boundary
-///   here. Routing a native turn event through this method is the
-///   first-class path; what a driver must *not* do is manufacture a
-///   Claude-shaped hook payload to satisfy Claude-shaped plumbing behind
-///   the engine's back.
+///   here, preserving a fatal diagnostic immediately before the `Stop`.
+///   Routing a native turn event through this method is the first-class path;
+///   what a driver must *not* do is manufacture a Claude-shaped hook payload
+///   to satisfy Claude-shaped plumbing behind the engine's back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnEnd {
     /// Session identity of the turn that ended, as the driver reports it.
@@ -1294,6 +1356,16 @@ pub trait AgentDriver: Send + Sync {
     /// [`boss_protocol::normalize_hook_event`].
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError>;
 
+    /// Create mutable correlation state for one stdout ingress.
+    ///
+    /// Hook-callback drivers return `None` and keep using the stateless
+    /// methods above. A stdout driver whose wire omits session identity after
+    /// its first record returns a fresh normalizer here; the generic reader
+    /// owns it for exactly one stream.
+    fn progress_session(&self, _config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
+        None
+    }
+
     // ── TurnBoundary capability ─────────────────────────────────────────────
 
     /// Report whether `event` — one already-decoded
@@ -1406,6 +1478,21 @@ pub trait AgentDriver: Send + Sync {
     /// Returns `None` when the payload carries no (or an empty) transcript
     /// path; the caller retries on a later payload.
     fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String>;
+
+    /// Create mutable correlation state for one transcript tail.
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        None
+    }
+
+    /// Canonical root a local transcript must remain beneath at every read.
+    ///
+    /// `Ok(None)` is the legacy unrestricted path used by drivers whose
+    /// transcript path is itself authoritative. A contained driver returns a
+    /// root; an invalid or replaced run home returns `Err` so callers reject
+    /// the transcript rather than falling back to an unrestricted open.
+    fn transcript_containment_root(&self, _run_id: &str) -> anyhow::Result<Option<PathBuf>> {
+        Ok(None)
+    }
 
     /// Normalise a raw transcript JSONL entry to the canonical redactable
     /// field shape that `boss_engine_live_status_redact` and the live-status

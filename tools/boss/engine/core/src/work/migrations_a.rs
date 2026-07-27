@@ -407,6 +407,18 @@ pub(crate) fn migrate_work_executions_driver_runtime_state(conn: &Connection) ->
     Ok(())
 }
 
+/// Engine-owned, bounded provider-session identity for the latest worker run.
+///
+/// This deliberately lives in SQLite rather than the provider's writable
+/// home. It survives an engine restart while the run is active and is cleared
+/// by driver teardown when the run terminates.
+pub(crate) fn migrate_work_runs_progress_session_id(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_runs", "progress_session_id")? {
+        conn.execute("ALTER TABLE work_runs ADD COLUMN progress_session_id TEXT", [])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
     table_has_column(conn, "work_executions", column)
 }

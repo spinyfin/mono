@@ -673,6 +673,10 @@ impl WorkDb {
         // every termination path. Survives workspace release so future
         // Codex retention can operate only on a recorded root.
         migrate_work_executions_driver_runtime_state(conn)?;
+        // `work_runs.progress_session_id`: the one current provider session
+        // identity, stored in engine-owned SQLite rather than an
+        // agent-writable provider home. Cleared by normal teardown.
+        migrate_work_runs_progress_session_id(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

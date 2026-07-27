@@ -258,15 +258,50 @@ fn render_entry(line: &Value) -> String {
     match entry_type {
         "user" => {
             // User-side payloads usually wrap a tool_result; we want
-            // just a short marker that the worker received output.
+            // a short marker plus enough output to explain the next action.
             if let Some(name) = line.get("tool_name").and_then(Value::as_str) {
-                return format!("user: {name} returned");
+                let output = line
+                    .get("tool_response")
+                    .and_then(compact_value_text)
+                    .map(|text| boss_engine_utils::string_clip::clip_to_bytes(&text, 200));
+                return match output {
+                    Some(output) if !output.is_empty() => format!("user: {name} returned {output}"),
+                    _ => format!("user: {name} returned"),
+                };
             }
-            "user: prompt".to_owned()
+            line.get("text")
+                .and_then(Value::as_str)
+                .map(|text| {
+                    let one_line = text.trim().replace('\n', " ");
+                    format!(
+                        "user: {}",
+                        boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
+                    )
+                })
+                .unwrap_or_else(|| "user: prompt".to_owned())
         }
         "assistant" => render_assistant(line),
         "system" => String::new(),
         _ => String::new(),
+    }
+}
+
+fn compact_value_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.trim().replace('\n', " ")),
+        Value::Array(values) => {
+            let joined = values
+                .iter()
+                .filter_map(compact_value_text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        Value::Object(object) => ["text", "stdout", "stderr", "content", "output"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(compact_value_text)),
+        _ => None,
     }
 }
 
@@ -474,6 +509,22 @@ mod tests {
         let s = render_entry(&line);
         assert!(s.contains("Edit"));
         assert!(s.contains("app.rs"));
+    }
+
+    #[test]
+    fn render_entry_includes_user_text_and_tool_output() {
+        assert_eq!(
+            render_entry(&json!({"type":"user","text":"please inspect the parser"})),
+            "user: please inspect the parser"
+        );
+        assert_eq!(
+            render_entry(&json!({
+                "type":"user",
+                "tool_name":"Bash",
+                "tool_response":{"stdout":"all tests passed\n"}
+            })),
+            "user: Bash returned all tests passed"
+        );
     }
 
     #[test]

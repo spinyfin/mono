@@ -44,7 +44,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::driver::{AgentDriver, ClaudeDriver};
+use crate::driver::{AgentDriver, TranscriptSessionNormalizer};
 use crate::live_status::{self, SummarizerOutcome};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::metrics::Registry;
@@ -488,12 +488,31 @@ struct SlotHandle {
     join: Option<JoinHandle<()>>,
 }
 
+/// The execution-specific half of a live-status slot.
+///
+/// Keeping the run id and its resolved driver together prevents callers from
+/// accidentally pairing a transcript with the engine's default driver.
+pub struct LiveStatusRun {
+    pub run_id: String,
+    pub driver: Arc<dyn AgentDriver>,
+}
+
+impl LiveStatusRun {
+    pub fn new(run_id: impl Into<String>, driver: Arc<dyn AgentDriver>) -> Self {
+        Self {
+            run_id: run_id.into(),
+            driver,
+        }
+    }
+}
+
 /// Configuration captured at slot start. Carried by value into the
 /// task so the manager can drop the entry on `stop_slot` without
 /// waiting for the task.
 struct SlotConfig {
     slot_id: u8,
     run_id: String,
+    driver: Arc<dyn AgentDriver>,
     /// Where this slot's summarizer calls go. Held instead of a bare API key:
     /// the provider owns endpoint, model *and* credential together, and is
     /// chosen independently of the work item's driver.
@@ -637,16 +656,18 @@ impl LiveStatusManager {
     pub fn start_slot(
         &self,
         slot_id: u8,
-        run_id: String,
+        run: LiveStatusRun,
         utility: Arc<dyn UtilityModel>,
         registry: Arc<LiveWorkerStateRegistry>,
         broadcaster: Arc<dyn LiveStatusBroadcaster>,
         resolver: Arc<dyn TranscriptPathResolver>,
     ) {
         self.stop_slot(slot_id);
+        let LiveStatusRun { run_id, driver } = run;
         tracing::info!(
             slot_id,
             run_id = %run_id,
+            driver = driver.descriptor().name,
             utility_provider = utility.provider_id(),
             "live_status: start_slot — spawning per-slot summarizer task",
         );
@@ -664,6 +685,7 @@ impl LiveStatusManager {
         let cfg = SlotConfig {
             slot_id,
             run_id,
+            driver,
             utility,
             registry,
             broadcaster,
@@ -752,11 +774,28 @@ impl LiveStatusManager {
 /// `run_slot_loop` so the wiring itself — not just
 /// `AgentDriver::normalize_transcript_entry` in isolation — has test
 /// coverage.
-fn normalize_lines<D: AgentDriver>(driver: &D, lines: Vec<Value>) -> Vec<Value> {
+fn normalize_lines(
+    driver: &dyn AgentDriver,
+    session: &mut Option<Box<dyn TranscriptSessionNormalizer>>,
+    lines: Vec<Value>,
+) -> Vec<Value> {
     lines
         .into_iter()
-        .map(|raw| driver.normalize_transcript_entry(raw))
+        .map(|raw| match session.as_mut() {
+            Some(session) => session.normalize_transcript_entry(raw),
+            None => driver.normalize_transcript_entry(raw),
+        })
         .collect()
+}
+
+fn start_transcript_tail(driver: &dyn AgentDriver, run_id: &str, path: PathBuf) -> Result<TranscriptTail, String> {
+    match driver
+        .transcript_containment_root(run_id)
+        .map_err(|err| format!("{err:#}"))?
+    {
+        Some(root) => TranscriptTail::new_contained(path, root).map_err(|err| err.to_string()),
+        None => Ok(TranscriptTail::new(path)),
+    }
 }
 
 /// Per-slot loop body. Receives triggers on `rx`, runs the
@@ -776,6 +815,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
     let SlotConfig {
         slot_id,
         run_id,
+        driver,
         utility,
         registry,
         broadcaster,
@@ -784,6 +824,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
         debug_store,
     } = cfg;
     let mut tail: Option<TranscriptTail> = None;
+    let mut transcript_session = driver.transcript_session();
     let mut transcript_buffer: Vec<Value> = Vec::new();
     let mut post_tool_use_count: u32 = 0;
     let mut last_success_at: Option<Instant> = None;
@@ -948,7 +989,18 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                 debug_store.update(slot_id, |snap| {
                     snap.transcript_path = Some(path_str);
                 });
-                tail = Some(TranscriptTail::new(path));
+                match start_transcript_tail(driver.as_ref(), &run_id, path) {
+                    Ok(started) => tail = Some(started),
+                    Err(err) => {
+                        tracing::warn!(
+                            slot_id,
+                            run_id = %run_id,
+                            %err,
+                            "live_status: transcript path failed driver containment policy",
+                        );
+                        continue;
+                    }
+                }
             } else {
                 tracing::info!(
                     slot_id,
@@ -967,12 +1019,7 @@ async fn run_slot_loop(cfg: SlotConfig, mut rx: mpsc::UnboundedReceiver<Trigger>
                     new_lines_count = new_lines.len();
                     // Normalise through the run's driver before anything
                     // downstream (redaction, summarisation) sees the entry.
-                    // The engine is Claude-default today; once the dispatch
-                    // gate selects a driver per run, this picks the run's
-                    // driver instead of hardcoding `ClaudeDriver`. For Claude
-                    // this is a no-op passthrough — see
-                    // `ClaudeDriver::normalize_transcript_entry`.
-                    transcript_buffer.extend(normalize_lines(&ClaudeDriver, new_lines));
+                    transcript_buffer.extend(normalize_lines(driver.as_ref(), &mut transcript_session, new_lines));
                 }
                 Err(err) => {
                     tracing::warn!(slot_id, ?err, "live_status: transcript tail error");
@@ -1114,12 +1161,22 @@ mod tests {
     use boss_engine_structured_output::fallback::FallbackCandidate;
     use boss_protocol::{NormalizeError, WorkerEvent};
     use std::path::Path;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// A provider that resolves no credential, so a slot loop reaches
     /// `SummarizerOutcome::NoApiKey` and never issues a network call — the
     /// exact behaviour these tests relied on when the slot took a `None` key.
     fn keyless_utility() -> Arc<dyn UtilityModel> {
         Arc::new(crate::utility_model::AnthropicUtilityModel::from_lookup(None, |_| None))
+    }
+
+    fn claude_driver() -> Arc<dyn AgentDriver> {
+        Arc::new(crate::driver::ClaudeDriver)
+    }
+
+    fn live_run(run_id: &str) -> LiveStatusRun {
+        LiveStatusRun::new(run_id, claude_driver())
     }
 
     /// Stub driver whose `normalize_transcript_entry` rewrites a marker
@@ -1204,11 +1261,85 @@ mod tests {
             serde_json::json!({"tool_name": "Bash"}),
             serde_json::json!({"tool_name": "Read"}),
         ];
-        let out = normalize_lines(&MarkingDriver, lines);
+        let mut session = None;
+        let out = normalize_lines(&MarkingDriver, &mut session, lines);
         assert_eq!(out.len(), 2);
         for line in &out {
             assert_eq!(line["marked"], serde_json::Value::Bool(true));
         }
+    }
+
+    #[test]
+    fn codex_rollout_survives_normalize_redact_and_render_pipeline() {
+        let lines = vec![
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"inspecting the split module"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"call-1",
+                    "name":"exec",
+                    "input":"cargo test -p boss-engine"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-1",
+                    "output":[{"type":"input_text","text":"all tests passed"}]
+                }
+            }),
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"turn_aborted","reason":"interrupted"}
+            }),
+        ];
+        let driver = crate::driver::CodexDriver::default();
+        let mut session = driver.transcript_session();
+        let normalized = normalize_lines(&driver, &mut session, lines);
+        let rendered = live_status::redact_and_assemble(&normalized);
+
+        assert!(rendered.contains("inspecting the split module"), "{rendered}");
+        assert!(rendered.contains("Bash(cargo test -p boss-engine)"), "{rendered}");
+        assert!(rendered.contains("all tests passed"), "{rendered}");
+        assert!(rendered.contains("turn aborted: interrupted"), "{rendered}");
+    }
+
+    #[test]
+    fn codex_sensitive_command_and_correlated_output_are_both_dropped() {
+        let lines = vec![
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"secret-call",
+                    "name":"exec",
+                    "input":"cat /Users/operator/.ssh/id_rsa"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"secret-call",
+                    "output":"PRIVATE KEY BODY"
+                }
+            }),
+        ];
+        let driver = crate::driver::CodexDriver::default();
+        let mut session = driver.transcript_session();
+        let normalized = normalize_lines(&driver, &mut session, lines);
+        let rendered = live_status::redact_and_assemble(&normalized);
+
+        assert!(rendered.is_empty(), "sensitive call/output leaked: {rendered}");
+        assert_eq!(
+            normalized[1]["tool_input"]["command"],
+            "cat /Users/operator/.ssh/id_rsa"
+        );
     }
 
     #[derive(Default)]
@@ -1242,6 +1373,122 @@ mod tests {
         }
     }
 
+    struct EnvRestore {
+        key: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvRestore {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let prior = std::env::var_os(key);
+            // SAFETY: this engine test binary has no other test mutating the
+            // Codex homes override. The prior value is restored on drop.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prior }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match self.prior.as_ref() {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_live_status_slot_uses_run_driver_and_redacted_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let homes = tmp.path().join("homes");
+        let run_id = "run-codex-live-status";
+        let day = homes.join(run_id).join("sessions/2026/07/26");
+        std::fs::create_dir_all(&day).unwrap();
+        let transcript = day.join("rollout-2026-07-26T00-00-00-thread.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"agent_message","message":"inspecting codex rollout safely"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "call_id":"secret-call",
+                    "name":"exec",
+                    "input":"cat /Users/operator/.ssh/id_rsa"
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"secret-call",
+                    "output":"PRIVATE KEY BODY"
+                }
+            }),
+        ];
+        let jsonl = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&transcript, jsonl).unwrap();
+        let _env = EnvRestore::set(crate::driver::codex::CODEX_HOMES_ROOT_ENV, &homes);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content":[{"type":"text","text":"reading the Codex rollout"}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let utility: Arc<dyn UtilityModel> = Arc::new(
+            crate::utility_model::AnthropicUtilityModel::from_lookup(Some("test-key".to_owned()), |_| None)
+                .with_endpoint(format!("{}/v1/messages", server.uri())),
+        );
+        let registry = Arc::new(LiveWorkerStateRegistry::new());
+        registry.register_spawn(9, run_id, "gpt-5.6-terra", 0, None);
+        let manager = LiveStatusManager::new();
+        let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript.clone())));
+        manager.start_slot(
+            9,
+            LiveStatusRun::new(run_id, Arc::new(crate::driver::CodexDriver::default())),
+            utility,
+            registry.clone(),
+            broadcaster,
+            resolver,
+        );
+        manager.notify(9, Trigger::ActivityChanged(WorkerActivity::Working));
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if registry.get(9).and_then(|state| state.live_status).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Codex live-status slot did not summarize the rollout");
+
+        let requests = server.received_requests().await.unwrap();
+        let request = requests.first().expect("summarizer request");
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(body.contains("inspecting codex rollout safely"), "{body}");
+        assert!(!body.contains("id_rsa"), "sensitive command leaked: {body}");
+        assert!(!body.contains("PRIVATE KEY BODY"), "sensitive output leaked: {body}");
+        assert_eq!(
+            registry.get(9).unwrap().live_status.as_deref(),
+            Some("reading the Codex rollout")
+        );
+        manager.stop_slot(9);
+    }
+
     #[test]
     fn manager_start_replaces_existing_slot() {
         // start_slot on a slot that's already running tears down the
@@ -1259,14 +1506,14 @@ mod tests {
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
             mgr.start_slot(
                 3,
-                "run-a".into(),
+                live_run("run-a"),
                 keyless_utility(),
                 registry.clone(),
                 bc.clone(),
                 res.clone(),
             );
             assert!(mgr.has_slot(3));
-            mgr.start_slot(3, "run-b".into(), keyless_utility(), registry, bc, res);
+            mgr.start_slot(3, live_run("run-b"), keyless_utility(), registry, bc, res);
             assert!(mgr.has_slot(3));
             mgr.stop_slot(3);
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1287,7 +1534,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(1, "run-1".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            1,
+            live_run("run-1"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         mgr.notify(1, Trigger::ActivityChanged(WorkerActivity::Errored));
         // Let the task pick up the trigger and write the literal.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1306,7 +1560,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(2, "run-2".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            2,
+            live_run("run-2"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         // No prior status → literal lands.
         mgr.notify(2, Trigger::ActivityChanged(WorkerActivity::WaitingForInput));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1334,7 +1595,7 @@ mod tests {
         registry.register_spawn(4, "run-4", "claude-opus-4-7", 0, None);
         let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-        mgr.start_slot(4, "run-4".into(), keyless_utility(), registry, bc, res);
+        mgr.start_slot(4, live_run("run-4"), keyless_utility(), registry, bc, res);
         assert!(mgr.has_slot(4));
         mgr.stop_slot(4);
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1389,7 +1650,14 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(6, "run-6".into(), keyless_utility(), registry.clone(), bc_dyn, res_dyn);
+        mgr.start_slot(
+            6,
+            live_run("run-6"),
+            keyless_utility(),
+            registry.clone(),
+            bc_dyn,
+            res_dyn,
+        );
         // Mark Working so the disable arm is the only barrier.
         mgr.notify(6, Trigger::ActivityChanged(WorkerActivity::Working));
         mgr.set_enabled(6, false);
@@ -1442,7 +1710,7 @@ mod tests {
         registry.register_spawn(7, "run-7", "claude-opus-4-7", 0, None);
         let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
         let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-        mgr.start_slot(7, "run-7".into(), keyless_utility(), registry, bc, res);
+        mgr.start_slot(7, live_run("run-7"), keyless_utility(), registry, bc, res);
         mgr.notify(7, Trigger::Stop);
         tokio::time::sleep(Duration::from_millis(40)).await;
         let snap = mgr.debug_store().snapshot_for(7);
@@ -1465,7 +1733,7 @@ mod tests {
             registry.register_spawn(8, "run-8", "claude-opus-4-7", 0, None);
             let bc: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
             let res: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(None));
-            mgr.start_slot(8, "run-8".into(), keyless_utility(), registry, bc, res);
+            mgr.start_slot(8, live_run("run-8"), keyless_utility(), registry, bc, res);
             mgr.notify(8, Trigger::Stop);
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(mgr.debug_store().snapshot_for(8).last_trigger_kind.is_some());
@@ -1492,7 +1760,7 @@ mod tests {
         let res = Arc::new(CannedResolver::new(None));
         let bc_dyn: Arc<dyn LiveStatusBroadcaster> = bc.clone();
         let res_dyn: Arc<dyn TranscriptPathResolver> = res.clone();
-        mgr.start_slot(5, "run-5".into(), keyless_utility(), registry, bc_dyn, res_dyn);
+        mgr.start_slot(5, live_run("run-5"), keyless_utility(), registry, bc_dyn, res_dyn);
         // Drive the slot into Working so the post-tool-use trigger
         // doesn't hit the quiet-state guard.
         mgr.notify(5, Trigger::ActivityChanged(WorkerActivity::Working));
