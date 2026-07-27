@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Throwaway GhosttyKit embed harness for the ghostty+codex pane viability spike.
+// Throwaway GhosttyKit embed harness for the ghostty+grok pane viability spike.
 // Uses the same embedding surface Boss uses (GhosttyKit / libghostty), not
 // standalone Ghostty.app + outsider shell_pid observation.
 import PackageDescription

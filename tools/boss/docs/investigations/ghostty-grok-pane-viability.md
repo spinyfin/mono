@@ -354,7 +354,7 @@ via `ghostty_surface_text` + Return. Surface showed `GKIT_PROBE_OK`. A subsequen
 
 `SPIKE_SCENARIO=esc_interrupt`: seed asked for `sleep 45` via shell tool; host sent Esc at ~6s.
 
-Session telemetry (authoritative):
+Session telemetry (authoritative). Full redacted excerpt committed at [`ghosttykit_host/evidence/esc_interrupt/session_telemetry_excerpt.md`](./ghostty-grok-pane-viability-artifacts/ghosttykit_host/evidence/esc_interrupt/session_telemetry_excerpt.md) (session `bf9b7291-f5ab-48db-9a71-3bffe7c25ea0`):
 
 ```json
 {
@@ -366,14 +366,14 @@ Session telemetry (authoritative):
 ```
 
 ```json
-{"sessionUpdate":"turn_completed","stop_reason":"cancelled",…}
+{"sessionUpdate":"turn_completed","stop_reason":"cancelled",…,"_meta":{"cancelTrigger":"esc"}}
 ```
 
 ```json
 {"type":"tool_result",…,"content":"Tool execution was cancelled by the user (tool `run_terminal_command` was not executed)."}
 ```
 
-Post-Esc probe `ESC_AFTER_OK` succeeded; process later exited 0 after `/quit`.
+Post-Esc probe `ESC_AFTER_OK` succeeded (`redirect_kind: cancel_then_send`); process later exited 0 after `/quit`.
 
 **Doc caveat (verified-by-official-doc):** Esc mid-turn cancel is for default UI; in **fullscreen vim mode** Esc is a no-op for cancel (use Ctrl+C). Boss should not enable vim mode for workers.
 
@@ -509,7 +509,7 @@ export SPIKE_SCENARIO=seed_observe           # esc_interrupt | resize | alt_scre
 | Q5 hooks             | `cli/hook_payloads/*.sample.json`                                                |
 | Q6 fail-open / trust | `cli/failopen/`, untrusted project test narrative                                |
 | Q7 sessions          | seed session under spike `GROK_HOME` (not fully committed); type histogram in Q7 |
-| Q8 Esc               | `ghosttykit_host/evidence/esc_interrupt/` + session `events.jsonl` quote in Q8   |
+| Q8 Esc               | `ghosttykit_host/evidence/esc_interrupt/` incl. `session_telemetry_excerpt.md`   |
 | Q8 SIGTERM           | headless exit 143 narrative                                                      |
 | Q9 effort / models   | `cli/revalidate/effort_low.json`                                                 |
 | Q10 interop          | `cli/revalidate/interop.json` + absent canary                                    |
