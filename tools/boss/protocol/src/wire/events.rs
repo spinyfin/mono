@@ -1315,4 +1315,24 @@ pub enum FrontendEvent {
     AutomationRunEnqueued {
         automation_id: String,
     },
+
+    // --- Product decision records (T-B2-decision) ---
+    /// Response to [`FrontendRequest::CreateDecision`].
+    DecisionCreated {
+        decision: Decision,
+    },
+    /// Response to [`FrontendRequest::GetDecision`].
+    DecisionResult {
+        decision: Decision,
+    },
+    /// Response to [`FrontendRequest::ListDecisions`].
+    DecisionsList {
+        product_id: String,
+        decisions: Vec<Decision>,
+    },
+    /// Response to [`FrontendRequest::RevokeDecision`] or
+    /// [`FrontendRequest::SupersedeDecision`].
+    DecisionUpdated {
+        decision: Decision,
+    },
 }

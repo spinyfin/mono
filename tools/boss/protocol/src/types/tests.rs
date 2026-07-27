@@ -613,6 +613,79 @@ fn short_id_label_formats_some_and_passes_through_none() {
     assert_eq!(short_id_label(None), None);
 }
 
+// ── Decision vocabulary + wire shape ─────────────────────────────────────
+
+#[test]
+fn decision_kind_parses_and_serializes() {
+    for kind in DecisionKind::ALL {
+        assert_eq!(kind.as_str().parse::<DecisionKind>().unwrap(), *kind);
+        assert_eq!(
+            serde_json::to_value(kind).unwrap(),
+            serde_json::Value::String(kind.as_str().to_owned())
+        );
+    }
+    assert!("unknown".parse::<DecisionKind>().is_err());
+}
+
+#[test]
+fn decision_status_parses_and_is_active() {
+    for status in DecisionStatus::ALL {
+        assert_eq!(status.as_str().parse::<DecisionStatus>().unwrap(), *status);
+    }
+    assert!(DecisionStatus::Active.is_active());
+    assert!(!DecisionStatus::Superseded.is_active());
+    assert!(!DecisionStatus::Revoked.is_active());
+    assert!("unknown".parse::<DecisionStatus>().is_err());
+}
+
+#[test]
+fn decision_short_id_label_formats_d_prefix() {
+    assert_eq!(decision_short_id_label(Some(12)), Some("D12".to_owned()));
+    assert_eq!(decision_short_id_label(None), None);
+}
+
+#[test]
+fn decision_roundtrips_and_skips_none_optionals() {
+    let decision = Decision::builder()
+        .id("dec_1")
+        .short_id(3)
+        .product_id("prod_1")
+        .body("Rationale prose.")
+        .created_at("1747000000")
+        .created_by("human")
+        .kind(DecisionKind::Decided)
+        .status(DecisionStatus::Active)
+        .title("Local concurrency ceiling stands")
+        .updated_at("1747000000")
+        .keywords("concurrency remote")
+        .build();
+    let raw = serde_json::to_value(&decision).unwrap();
+    assert_eq!(raw["kind"], "decided");
+    assert_eq!(raw["status"], "active");
+    assert_eq!(raw["short_id"], 3);
+    assert!(!raw.as_object().unwrap().contains_key("superseded_by"));
+    assert!(!raw.as_object().unwrap().contains_key("related_work_item_id"));
+    let back: Decision = serde_json::from_value(raw).unwrap();
+    assert_eq!(back, decision);
+    assert_eq!(back.display_label(), "D3");
+}
+
+#[test]
+fn create_decision_input_roundtrips() {
+    let input = CreateDecisionInput::builder()
+        .product_id("prod_1")
+        .body("body")
+        .created_by("human")
+        .kind(DecisionKind::Wontfix)
+        .title("title")
+        .build();
+    let raw = serde_json::to_value(&input).unwrap();
+    let back: CreateDecisionInput = serde_json::from_value(raw).unwrap();
+    assert_eq!(back.product_id, "prod_1");
+    assert_eq!(back.kind, DecisionKind::Wontfix);
+    assert!(back.created_via.is_none());
+}
+
 fn sample_product_json(extra: Value) -> Value {
     let mut base = json!({
         "id": "prod_1",

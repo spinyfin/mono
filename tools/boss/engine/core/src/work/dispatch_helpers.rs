@@ -64,6 +64,14 @@ pub(crate) fn allocate_attention_group_short_id(conn: &Connection, product_id: &
     allocate_next_short_id(conn, "attention_group_short_id_sequences", product_id)
 }
 
+/// Parallel to [`allocate_short_id`] for the product-decision `D<n>`
+/// namespace. Reads and advances `decision_short_id_sequences` for
+/// `product_id`. Must be called inside the same transaction as the
+/// `product_decisions` row insert.
+pub(crate) fn allocate_decision_short_id(conn: &Connection, product_id: &str) -> Result<i64> {
+    allocate_next_short_id(conn, "decision_short_id_sequences", product_id)
+}
+
 /// Validate the `(execution_id, work_item_id)` discriminant on a
 /// `CreateAttentionItemInput` and return the canonical pair to write.
 /// Exactly one of the two must be set; both-set or neither-set is a

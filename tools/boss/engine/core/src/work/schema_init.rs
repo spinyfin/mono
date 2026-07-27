@@ -648,6 +648,11 @@ impl WorkDb {
         // existing `pr_body_before`. Backs `boss pr body` returning title
         // and body together.
         migrate_work_executions_pr_title_before(conn)?;
+        // `product_decisions` + `decision_short_id_sequences`: product-scoped
+        // wontfix/decided records (T-B2-decision). New table only — no
+        // `tasks` column changes, so no collision with effort-provenance /
+        // blocked_detail migrations above.
+        migrate_product_decisions_table(conn)?;
         // `github_api_calls`: per-call GitHub API usage telemetry (caller
         // subsystem, API bucket, rateLimit reading). Independent of every
         // other table and additive-only. Rides the current schema marker.

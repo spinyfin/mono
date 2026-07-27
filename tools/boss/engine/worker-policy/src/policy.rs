@@ -145,12 +145,14 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // its own shell. Denying them would gate design-doc reading behind
         // a capability the worker demonstrably already has.
         FrontendRequest::FindWorkItemsByPr { .. }
+        | FrontendRequest::GetDecision { .. }
         | FrontendRequest::GetProductDesignDoc { .. }
         | FrontendRequest::GetWorkItem { .. }
         | FrontendRequest::GetWorkItemByShortId { .. }
         | FrontendRequest::GetWorkTree { .. }
         | FrontendRequest::GetWorkerContext { .. }
         | FrontendRequest::ListChores { .. }
+        | FrontendRequest::ListDecisions { .. }
         | FrontendRequest::ListProductDesignDocs { .. }
         | FrontendRequest::ListProducts
         | FrontendRequest::ListProjects { .. }
@@ -413,11 +415,14 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::CommentsSetStatus { .. }
         | FrontendRequest::CommentsUpdateAnchor { .. }
         | FrontendRequest::CreateAutomation { .. }
+        | FrontendRequest::CreateDecision { .. }
         | FrontendRequest::DeleteAutomation { .. }
         | FrontendRequest::DisableAutomation { .. }
         | FrontendRequest::EnableAutomation { .. }
         | FrontendRequest::EvaluateEditorialRules { .. }
         | FrontendRequest::GetAutomation { .. }
+        | FrontendRequest::RevokeDecision { .. }
+        | FrontendRequest::SupersedeDecision { .. }
         // Automation *state* is coordinator configuration, not work
         // taxonomy: it is not in the design's exposed read set, and a triage
         // worker never needs it — its automation id arrives in the prompt,

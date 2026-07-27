@@ -2395,6 +2395,52 @@ pub(crate) fn migrate_automation_runs_first_attempted_at_column(conn: &Connectio
     Ok(())
 }
 
+/// Create `product_decisions` + `decision_short_id_sequences`: the
+/// durable product-scoped decision corpus (wontfix / decided).
+///
+/// Deliberately a **new table**, not a new `tasks.status` value —
+/// `cancelled` already covers terminal-without-delivery work items,
+/// and product knowledge that should surface when filing near work
+/// needs its own searchable corpus. Parallel to `automations` /
+/// `automation_short_id_sequences` (own dense per-product `D<n>`
+/// namespace). Does **not** touch `tasks` columns, so it has no
+/// schema-migration collision with the effort-provenance /
+/// `blocked_detail` columns on `tasks`.
+///
+/// Idempotent — `CREATE TABLE / INDEX IF NOT EXISTS`.
+///
+/// Design: `tools/boss/docs/designs/retire-the-coordinator-s-memory-make-the-defaults-teach-the-right-thing.md`
+/// §T-B2-decision.
+pub(crate) fn migrate_product_decisions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS product_decisions (
+             id                    TEXT PRIMARY KEY,
+             short_id              INTEGER,
+             product_id            TEXT NOT NULL,
+             kind                  TEXT NOT NULL,
+             status                TEXT NOT NULL DEFAULT 'active',
+             title                 TEXT NOT NULL,
+             body                  TEXT NOT NULL,
+             keywords              TEXT,
+             related_work_item_id  TEXT,
+             superseded_by         TEXT,
+             created_by            TEXT NOT NULL,
+             created_via           TEXT NOT NULL DEFAULT 'unknown',
+             created_at            TEXT NOT NULL,
+             updated_at            TEXT NOT NULL
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS product_decisions_product_short_id_idx
+             ON product_decisions(product_id, short_id) WHERE short_id IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS product_decisions_product_status_idx
+             ON product_decisions(product_id, status, created_at);
+         CREATE TABLE IF NOT EXISTS decision_short_id_sequences (
+             product_id TEXT PRIMARY KEY,
+             next_value INTEGER NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 /// Create `github_api_calls`: one append-only row per GitHub API call the
 /// engine makes, with the caller subsystem, the API bucket, and the
 /// `rateLimit` reading the response carried.
