@@ -329,9 +329,9 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // Decide *before* minting a probe id whether this probe can actually
         // be delivered, and refuse if not. A queue-accepted-then-silently-
         // dropped probe is indistinguishable to the caller from one that is
-        // about to arrive, which is what cost an operator a worker restart:
-        // two probes were reported "queued", neither could ever be delivered,
-        // and the only evidence was a `debug!` line inside the engine.
+        // about to arrive, so the caller cannot tell a healthy worker from an
+        // unreachable one. Deciding up front makes the refusal visible in the
+        // response rather than only in a `debug!` line inside the engine.
         let expected_delivery = match probe_delivery_expectation(&server_state, &run_id, urgent) {
             Ok(expectation) => expectation,
             Err(reason) => {
@@ -416,8 +416,14 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
 ///   honest; silently downgrading to Stop-boundary delivery under an
 ///   `--urgent` flag is not.
 ///
-/// A `Spawning` worker is *not* refused: it has a pane and will reach a turn
-/// boundary, so a non-urgent probe legitimately waits for it.
+/// The two `--urgent` refusals have distinct reasons, because they have
+/// distinct causes: a `Spawning` worker has no tool boundary yet (the driver
+/// is never consulted), while a `Working` worker on a non-buffering driver
+/// has boundaries the driver will not read at. Naming the driver in the
+/// former case would assert something false about it.
+///
+/// A `Spawning` worker is *not* refused for a **non-urgent** probe: it has a
+/// pane and will reach a turn boundary, so the probe legitimately waits.
 fn probe_delivery_expectation(
     server_state: &ServerState,
     run_id: &str,
@@ -447,6 +453,16 @@ fn probe_delivery_expectation(
         (_, PaneInputPosture::Parked) => Ok(ProbeDeliveryExpectation::Immediate),
         (true, PaneInputPosture::MidTurnBuffered) => Ok(ProbeDeliveryExpectation::NextToolBoundary),
         (false, _) => Ok(ProbeDeliveryExpectation::NextTurnBoundary),
+        // A non-`Working` activity never consulted the driver, so the reason
+        // must not blame it. The only non-terminal, non-parked activity left
+        // here is `Spawning`: the worker has a pane but has not started a
+        // turn, so there is no tool boundary for `--urgent` to aim at.
+        (true, PaneInputPosture::Refused) if activity != boss_protocol::WorkerActivity::Working => Err(format!(
+            "run {run_id} (slot {slot_id}) is {}; it has not reached a tool boundary yet, so an urgent probe \
+             has nowhere to be delivered. Re-issue without --urgent to wait for the worker's next turn \
+             boundary.",
+            activity.as_str(),
+        )),
         (true, PaneInputPosture::Refused) => Err(format!(
             "run {run_id} (slot {slot_id}) is {} and its driver does not accept mid-turn pane input, so an \
              urgent probe cannot be delivered at a tool boundary. Re-issue without --urgent to wait for the \

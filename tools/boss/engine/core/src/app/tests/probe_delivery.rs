@@ -208,9 +208,9 @@ async fn parked_workers_are_injectable_regardless_of_driver() {
 
 // ── Honest reporting ────────────────────────────────────────────────────────
 
-/// A probe for a run with no live pane cannot be delivered, so it must be
-/// refused rather than accepted. This is the case that burned the operator:
-/// the CLI reported "queued" and there was no way to learn otherwise.
+/// A probe for a run with no live pane can never be delivered, so it must be
+/// refused rather than reported queued — a queued report is indistinguishable
+/// from one that is about to arrive.
 #[tokio::test]
 async fn probe_run_refuses_when_the_run_has_no_live_pane() {
     let (server_state, _dir) = test_server_state();
@@ -239,7 +239,8 @@ async fn probe_run_refuses_when_the_run_has_no_live_pane() {
 /// `--urgent` promises tool-boundary delivery. Against a driver that cannot
 /// take mid-turn input that promise is unkeepable, so the engine refuses
 /// instead of silently downgrading to Stop-boundary delivery under a flag that
-/// says otherwise — and the reason tells the operator what to do instead.
+/// says otherwise — and the reason names the remedy (re-issue without
+/// `--urgent`).
 #[tokio::test]
 async fn probe_run_refuses_urgent_for_a_driver_that_rejects_mid_turn_input() {
     let (server_state, _dir) = test_server_state();
@@ -266,6 +267,67 @@ async fn probe_run_refuses_urgent_for_a_driver_that_rejects_mid_turn_input() {
     // Nothing was queued: a refused probe must not leave state behind that a
     // later boundary could deliver.
     assert!(server_state.pop_pending_probe(&run_id).is_none());
+}
+
+/// A `Spawning` worker is refused for `--urgent` too — it has no tool
+/// boundary yet — but for a different reason, and the reason must say so.
+/// The driver is never consulted on this path (the posture short-circuits
+/// before the lookup), so blaming it would assert something false: this
+/// fixture's driver is the default `claude`, which *does* take mid-turn
+/// input.
+#[tokio::test]
+async fn probe_run_refuses_urgent_for_a_spawning_worker_without_blaming_the_driver() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_spawning_worker_with_driver(&server_state, 4, None);
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        FrontendRequest::ProbeRun {
+            run_id: run_id.clone(),
+            text: "are you up yet".into(),
+            urgent: true,
+        },
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeRefused { reason, .. } => {
+            assert!(
+                reason.contains("spawning") && reason.contains("--urgent"),
+                "refusal must name the pre-session state and the flag: {reason}"
+            );
+            assert!(
+                !reason.contains("driver"),
+                "the driver was never consulted for a spawning worker, so the reason must not blame it: {reason}"
+            );
+        }
+        other => panic!("expected ProbeRefused, got {other:?}"),
+    }
+    assert!(server_state.pop_pending_probe(&run_id).is_none());
+}
+
+/// The same `Spawning` worker accepts a *non-urgent* probe: it has a pane and
+/// will reach a turn boundary, so waiting for it is a promise the engine can
+/// keep.
+#[tokio::test]
+async fn probe_run_accepts_a_non_urgent_probe_for_a_spawning_worker() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_spawning_worker_with_driver(&server_state, 4, None);
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        FrontendRequest::ProbeRun {
+            run_id,
+            text: "no rush".into(),
+            urgent: false,
+        },
+    )
+    .await;
+    match sole_response(&sink).await {
+        FrontendEvent::ProbeQueued { expected_delivery, .. } => {
+            assert_eq!(expected_delivery, Some(ProbeDeliveryExpectation::NextTurnBoundary));
+        }
+        other => panic!("expected ProbeQueued, got {other:?}"),
+    }
 }
 
 /// The same worker accepts a *non-urgent* probe, because waiting for the next
@@ -369,8 +431,8 @@ async fn probe_run_refuses_a_terminal_worker() {
     }
 }
 
-/// `ProbeStatus` reports the state the delivery path recorded, so an operator
-/// can tell a probe that landed from one that is still waiting.
+/// `ProbeStatus` reports the state the delivery path recorded, so a probe that
+/// landed is distinguishable from one that is still waiting.
 #[tokio::test]
 async fn probe_status_reports_the_recorded_delivery_state() {
     let (server_state, _dir) = test_server_state();

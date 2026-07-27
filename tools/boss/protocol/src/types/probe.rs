@@ -1,17 +1,13 @@
 //! Probe delivery reporting types.
 //!
-//! A probe is text the coordinator injects into a live worker's pane. Queueing
-//! one used to be reported as unconditional success — `bossctl probe` printed
-//! "queued" (or "will inject at next tool boundary") and exited 0 whether or
-//! not delivery was possible. When delivery then never happened there was no
-//! way to tell "arriving shortly" from "never going to arrive", which cost an
-//! operator a worker restart and several minutes of in-flight work.
+//! A probe is text the coordinator injects into a live worker's pane.
 //!
-//! These two types are what makes the reporting honest: the engine states up
-//! front *which boundary* it expects to deliver at
-//! ([`ProbeDeliveryExpectation`]), refuses outright when it cannot deliver at
-//! all, and exposes a per-probe-id [`ProbeDeliveryState`] that can be queried
-//! afterwards.
+//! These two types are what make accepting a probe a commitment rather than a
+//! receipt: the engine states up front *which boundary* it expects to deliver
+//! at ([`ProbeDeliveryExpectation`]), refuses outright when it cannot deliver
+//! at all, and exposes a per-probe-id [`ProbeDeliveryState`] that can be
+//! queried afterwards. Without them, "arriving shortly" and "never going to
+//! arrive" are indistinguishable from outside the engine.
 
 use serde::{Deserialize, Serialize};
 
@@ -140,7 +136,7 @@ mod tests {
             let parsed: ProbeDeliveryState = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, state);
             // `as_str` is what CLI output renders; it must agree with the
-            // wire form so operators and JSON consumers see one vocabulary.
+            // wire form so text and JSON output share one vocabulary.
             assert_eq!(json, format!("\"{}\"", state.as_str()));
         }
     }

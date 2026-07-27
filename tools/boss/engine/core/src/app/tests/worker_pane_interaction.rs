@@ -239,10 +239,17 @@ async fn send_input_to_worker_records_unconfirmed_without_probe_fallback() {
 }
 
 /// Safety guard (ghostty-codex-pane-viability Q2 Layer D):
-/// `send_input_to_worker` must refuse when the live worker is mid-turn
-/// (`Working`) so bytes are never written into a pane whose foreground
-/// process may not consume stdin. The refusal is a typed error — not a
-/// silent drop and not a successful "unconfirmed" write.
+/// `send_input_to_worker` must refuse a mid-turn (`Working`) worker whose
+/// driver cannot be resolved, so bytes are never written into a pane whose
+/// foreground process may not consume stdin. `register_working_worker`
+/// registers a bare run id with no execution row, so
+/// `get_execution_driver_slug` resolves to `None` and the posture fails
+/// closed — that unresolvable-driver path is what this test pins, *not*
+/// `Working` by itself. A mid-turn worker on a driver that buffers is
+/// injectable; see
+/// `send_input_to_worker_writes_to_a_mid_turn_worker_on_a_buffering_driver`.
+/// The refusal is a typed error — not a silent drop and not a successful
+/// "unconfirmed" write.
 #[tokio::test]
 async fn send_input_to_worker_refuses_when_worker_not_accepting_input() {
     use boss_protocol::WorkerActivity;
@@ -274,9 +281,12 @@ async fn send_input_to_worker_refuses_when_worker_not_accepting_input() {
     );
 }
 
-/// Chore-update notify path: when `send_input_to_worker` refuses mid-turn
-/// (`NotAcceptingInput`), the notice must be re-queued as a non-urgent
-/// probe for Stop/idle delivery — never silently discarded.
+/// Chore-update notify path: whenever `send_input_to_worker` comes back
+/// `NotAcceptingInput`, the notice must be re-queued as a non-urgent probe
+/// for Stop/idle delivery — never silently discarded. As above, the refusal
+/// here comes from an unresolvable driver failing closed rather than from
+/// `Working` alone; the delivered-mid-turn counterpart is
+/// `chore_update_notify_delivers_mid_turn_on_a_buffering_driver`.
 #[tokio::test]
 async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
     use boss_protocol::WorkerActivity;
@@ -314,6 +324,121 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
         .expect("chore-update notice must be re-queued for Stop delivery");
     assert!(!queued.urgent, "chore-update requeue must be non-urgent (Stop path)");
     assert_eq!(queued.text, msg);
+}
+
+/// The other half of the mid-turn decision: a `Working` worker whose driver
+/// declares `MidTurnPaneInput::Buffers` (the engine default, `claude`) *is*
+/// injectable. `send_input_to_worker` writes the exact text to the pane and
+/// returns `Ok(slot_id)` on `PaneInjectOutcome::Buffered` — no
+/// `UserPromptSubmit` is expected, because the agent cannot submit the text
+/// until its current turn ends.
+#[tokio::test(start_paused = true)]
+async fn send_input_to_worker_writes_to_a_mid_turn_worker_on_a_buffering_driver() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let run_clone = run_id.clone();
+    let send = tokio::spawn(async move {
+        server_clone
+            .send_input_to_worker(&run_clone, "mid-turn nudge".into())
+            .await
+    });
+
+    let envelope = sink.next().await.expect("a SendToPane EngineRequest must be enqueued");
+    let (request_id, request) = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    match request {
+        EngineToAppRequest::SendToPane(input) => {
+            assert_eq!(input.slot_id, 6);
+            assert_eq!(input.text, "mid-turn nudge", "the exact text must reach the pane");
+        }
+        other => panic!("expected SendToPane, got {other:?}"),
+    }
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SendToPane {
+                result: Ok(crate::protocol::SendToPaneResult {}),
+            },
+        )
+        .await;
+
+    // No `UserPromptSubmit` follows — the turn is still in flight. Drive
+    // past the verification window so the buffered outcome is reached
+    // deterministically.
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    let slot = send
+        .await
+        .expect("send task")
+        .expect("a mid-turn write on a buffering driver must succeed");
+    assert_eq!(slot, 6);
+}
+
+/// User-visible consequence of the above for the chore-update auto-notice:
+/// against a mid-turn worker on a buffering driver the notice is delivered
+/// into the composer now, rather than refused and re-queued as a probe for
+/// the next Stop boundary.
+#[tokio::test(start_paused = true)]
+async fn chore_update_notify_delivers_mid_turn_on_a_buffering_driver() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 9, None);
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let msg = build_chore_update_message("old", "new", "old desc", "new desc").expect("message");
+
+    let server_clone = server_state.clone();
+    let run_clone = run_id.clone();
+    let msg_clone = msg.clone();
+    let send = tokio::spawn(async move { server_clone.send_input_to_worker(&run_clone, msg_clone).await });
+
+    let envelope = sink.next().await.expect("a SendToPane EngineRequest must be enqueued");
+    let (request_id, request) = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    match request {
+        EngineToAppRequest::SendToPane(input) => {
+            assert_eq!(input.slot_id, 9);
+            assert_eq!(input.text, msg, "the chore-update notice must reach the pane verbatim");
+        }
+        other => panic!("expected SendToPane, got {other:?}"),
+    }
+
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::SendToPane {
+                result: Ok(crate::protocol::SendToPaneResult {}),
+            },
+        )
+        .await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+
+    // Mirror the work_items notify path: only `NotAcceptingInput` re-queues.
+    match send.await.expect("send task") {
+        Ok(slot) => assert_eq!(slot, 9),
+        other => panic!("expected Ok(9) for a buffering mid-turn driver, got {other:?}"),
+    }
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_none(),
+        "a delivered mid-turn notice must not also be re-queued as a probe",
+    );
 }
 
 /// Fail closed when the slot has no live-worker-state entry: unknown

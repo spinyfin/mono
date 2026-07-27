@@ -6,9 +6,8 @@
 //! anything and answers `ProbeRefused` when it cannot commit to a boundary;
 //! [`probe_run`] turns that into a non-zero exit. It must never print a
 //! warning and exit 0: the whole point is that "queued, arriving shortly" and
-//! "never going to arrive" have to look different from the outside, because an
-//! operator who cannot tell them apart ends up restarting a healthy worker to
-//! get a message into it.
+//! "never going to arrive" have to look different from the outside, since
+//! acting on the difference means either waiting or restarting the worker.
 
 use anyhow::{Context, Result, bail};
 use boss_protocol::{FrontendEvent, FrontendRequest};
@@ -54,10 +53,8 @@ pub async fn probe_run(
                     })
                 );
             } else {
-                // Describe the boundary the engine actually committed to.
-                // The previous text asserted "will inject at next tool
-                // boundary" for every `--urgent` probe, which was a promise
-                // the engine could not keep and printed anyway.
+                // Print the boundary the engine committed to rather than
+                // inferring one from the urgent flag.
                 let when = expected_delivery
                     .map(|e| e.describe().to_owned())
                     .unwrap_or_else(|| "delivery boundary not reported by this engine".to_owned());
@@ -95,14 +92,21 @@ pub async fn probe_run(
 
 /// Read the delivery state the engine recorded for `probe_id`.
 ///
-/// Exits non-zero when the probe reached `unconfirmed`. That state means the
-/// engine wrote the text but could not prove the worker took it — the thing an
-/// operator most needs a loud signal for, and the thing that previously looked
-/// identical to success. It is deliberately *not* a redelivery instruction:
-/// the engine does not auto-redeliver an unconfirmed probe because the text
-/// may well have landed, and a second copy would hand the worker the same
-/// instruction twice. Re-issuing is a judgement call the operator makes with
-/// the worker's transcript in front of them.
+/// The exit code answers "did the read work?", not "did the probe land?": any
+/// state the engine could report exits 0, and only an unreadable or unknown
+/// probe id exits non-zero. The delivery judgement travels in the `delivered`
+/// field (`--json`) or the printed `state=`, so a consumer gets one predicate
+/// per question instead of an exit code that means both.
+///
+/// `unconfirmed` still gets an explanatory line on stderr: the engine wrote
+/// the text but could not prove the worker took it. That is deliberately
+/// *not* a redelivery instruction — the engine does not auto-redeliver an
+/// unconfirmed probe because the text may well have landed, and a second copy
+/// would hand the worker the same instruction twice. Re-issuing is a
+/// judgement call to be made with the worker's transcript in hand.
+///
+/// The loud-failure requirement for undeliverable probes is met up front by
+/// [`probe_run`], which refuses before a probe id is ever minted.
 pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
@@ -138,11 +142,15 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
                     println!("  {detail}");
                 }
             }
+            // The read succeeded, so this exits 0 whatever the state is —
+            // `delivered` / `state=` carry the judgement. Unconfirmed still
+            // warrants a warning, on stderr so it does not corrupt `--json`
+            // stdout.
             if state == boss_protocol::ProbeDeliveryState::Unconfirmed {
-                bail!(
-                    "probe {returned} is unconfirmed: the write reached the pane but the engine could not prove \
-                     the worker took it. It may still have landed — check the worker's transcript before \
-                     re-issuing, since a second copy would repeat the instruction."
+                eprintln!(
+                    "warning: probe {returned} is unconfirmed: the write reached the pane but the engine could \
+                     not prove the worker took it. It may still have landed — check the worker's transcript \
+                     before re-issuing, since a second copy would repeat the instruction."
                 );
             }
             Ok(())

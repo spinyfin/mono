@@ -106,9 +106,12 @@ enum Command {
     /// States: `queued` (waiting for its boundary), `injected` (written,
     /// awaiting confirmation), `consumed` (the worker's CLI took it as a
     /// prompt), `buffered` (written into a mid-turn agent's composer; it
-    /// submits at the end of the turn), `unconfirmed` (written but unproven —
-    /// exits non-zero), `replied` (the worker answered). Probe ids live in
-    /// the running engine process and are not retained across a restart.
+    /// submits at the end of the turn), `unconfirmed` (written but unproven;
+    /// also warns on stderr), `replied` (the worker answered). Any state the
+    /// engine can report exits 0 — read `delivered` (or `state=`) for the
+    /// delivery judgement; a non-zero exit means the id could not be read.
+    /// Probe ids live in the running engine process and are not retained
+    /// across a restart.
     ProbeStatus {
         /// Probe id from `bossctl probe`, e.g. `probe-4`.
         probe_id: String,

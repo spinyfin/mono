@@ -286,10 +286,9 @@ pub enum FrontendEvent {
     /// blocking condition (no live pane, terminal worker, `--urgent` against
     /// a driver that cannot take mid-turn input, …).
     ///
-    /// Clients must treat this as a failure — a non-zero exit for a CLI.
-    /// Reporting it as success is precisely the bug this event exists to fix:
-    /// an operator who cannot tell "queued, arriving shortly" from "never
-    /// going to arrive" ends up restarting a healthy worker to make progress.
+    /// Clients must treat this as a failure — a non-zero exit for a CLI. An
+    /// accepted-but-undeliverable probe is indistinguishable from one about
+    /// to arrive, so a refusal must be reported as a refusal.
     ProbeRefused {
         run_id: String,
         reason: String,

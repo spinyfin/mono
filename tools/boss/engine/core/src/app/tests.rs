@@ -127,6 +127,39 @@ pub(super) fn register_working_worker_with_driver(
     slot_id: u8,
     driver: Option<&str>,
 ) -> String {
+    let execution_id = execution_id_with_driver(server_state, driver);
+    register_working_worker(server_state, &execution_id, slot_id);
+    execution_id
+}
+
+/// Like [`register_working_worker_with_driver`], but leaves the slot at
+/// [`boss_protocol::WorkerActivity::Spawning`] — a worker whose pane exists
+/// but which has not reached a tool boundary yet. Used to pin that a refusal
+/// for this activity does not blame the driver, which is never consulted.
+pub(super) fn register_spawning_worker_with_driver(
+    server_state: &ServerState,
+    slot_id: u8,
+    driver: Option<&str>,
+) -> String {
+    use boss_protocol::WorkerActivity;
+
+    let execution_id = execution_id_with_driver(server_state, driver);
+    server_state.worker_registry.register_run_slot(&execution_id, slot_id);
+    server_state
+        .live_worker_states
+        .register_spawn(slot_id, execution_id.clone(), "claude-opus-4-7", 0, None);
+    assert_eq!(
+        server_state.live_worker_states.get(slot_id).unwrap().activity,
+        WorkerActivity::Spawning,
+        "register_spawning_worker_with_driver precondition: slot must be Spawning",
+    );
+    execution_id
+}
+
+/// Seed a product → chore → execution chain whose `tasks.driver` is `driver`
+/// (`None` leaves it unset so the engine default, `claude`, applies), and
+/// return the execution id.
+fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) -> String {
     use boss_protocol::RequestExecutionInput;
 
     let product = crate::test_support::create_test_product_with_repo(
@@ -146,12 +179,11 @@ pub(super) fn register_working_worker_with_driver(
             )
             .unwrap();
     }
-    let execution = server_state
+    server_state
         .work_db
         .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
-        .unwrap();
-    register_working_worker(server_state, &execution.id, slot_id);
-    execution.id
+        .unwrap()
+        .id
 }
 
 mod app_channel;

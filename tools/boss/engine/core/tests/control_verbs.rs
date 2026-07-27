@@ -550,10 +550,9 @@ async fn agents_send_does_not_reject_local_caller_as_boss_only() -> Result<()> {
 async fn probe_run_refuses_a_run_with_no_live_pane_rather_than_queueing_it() -> Result<()> {
     // Wire-shape smoke for the refusal contract. A probe aimed at a run the
     // engine has no pane for can never be delivered, and reporting it as
-    // queued is what left an operator unable to distinguish "arriving
-    // shortly" from "never going to arrive" — they restarted a healthy worker
-    // to get a message into it. Both attempts must be refused, and the
-    // refusal must name the blocking condition rather than being generic.
+    // queued makes it indistinguishable from one that is "arriving shortly".
+    // Both attempts must be refused, and the refusal must name the blocking
+    // condition rather than being generic.
     //
     // The accepted-probe shapes this test used to cover (`probe_id` minting,
     // the echoed `urgent` flag, the committed delivery boundary) need a live

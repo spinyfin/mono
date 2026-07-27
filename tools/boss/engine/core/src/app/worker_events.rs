@@ -1110,8 +1110,10 @@ pub(super) async fn dispatch_probe_on_stop(
         return;
     };
     // Fail closed before pop: no injectable posture must not write bytes
-    // to the pane.
-    if !server_state.pane_input_posture_for_run(run_id, slot_id).permits_write() {
+    // to the pane. Captured once so the recorded delivery state below can
+    // tell a parked write from a mid-turn buffered one.
+    let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
+    if !posture.permits_write() {
         tracing::warn!(
             run_id,
             slot_id,
@@ -1143,13 +1145,21 @@ pub(super) async fn dispatch_probe_on_stop(
                 probe_id = %probe.probe_id,
                 "probe injected into pane",
             );
-            // The Stop boundary is the arrival point this delivery
-            // mechanism has always trusted (unlike the urgent
-            // mid-turn path), so a successful SendToPane here is
-            // treated as consumed rather than left pending
-            // confirmation. Activity guard already confirmed the
-            // pane accepts typed input.
-            server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Consumed);
+            // A parked worker takes the write as its next prompt, so the
+            // Stop boundary is an arrival point this mechanism trusts
+            // without further confirmation. A mid-turn buffering driver is
+            // different: the text sits in the composer until the turn ends,
+            // and nothing here observed it being submitted — record
+            // `Buffered` rather than claiming `Consumed`, matching
+            // `dispatch_urgent_probe_on_post_tool_use`. In production the
+            // fan-out has already set `Idle` by this point, so the mid-turn
+            // case is a narrow race, but the honest state costs nothing.
+            let state = if posture.is_mid_turn() {
+                ProbeDeliveryState::Buffered
+            } else {
+                ProbeDeliveryState::Consumed
+            };
+            server_state.set_probe_lifecycle(&probe_id, state);
             server_state.note_probe_dispatched(run_id.to_owned(), probe.probe_id, transcript_path, offset_bytes);
         }
         Err(err) => {
@@ -1185,13 +1195,12 @@ const URGENT_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// cancelled.
 ///
 /// **Posture short-circuit (before pop):** the ordering in
-/// [`dispatch_worker_event_fanout`] is load-bearing and was the whole bug.
-/// `dispatch_live_worker_state` runs first and applies `PostToolUse`, which
-/// sets the activity to `Working` unconditionally — so at *this* boundary the
-/// activity is `Working` by construction, and a parked-only guard refuses
-/// 100% of urgent probes on 100% of drivers. That is what made `--urgent`
-/// undeliverable across ~27 consecutive tool boundaries in the field, with
-/// only a `debug!` line to show for it.
+/// [`dispatch_worker_event_fanout`] is load-bearing. `dispatch_live_worker_state`
+/// runs first and applies `PostToolUse`, which sets the activity to `Working`
+/// unconditionally — so at *this* boundary the activity is `Working` by
+/// construction, and a parked-only guard would be false here on every driver,
+/// refusing every urgent probe. The guard must therefore reason about
+/// mid-turn input, not about being parked.
 ///
 /// The guard is now [`ServerState::pane_input_posture_for_run`], which admits
 /// mid-turn writes when — and only when — the run's driver declares
