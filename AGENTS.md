@@ -4,6 +4,42 @@
 - `checkleft` (the linter) lives in this repo, at `tools/checkleft/` — it is not a standalone external repo. Don't go hunting elsewhere for it; it's published to crates.io and released as prebuilt binaries from here (see `tools/checkleft/docs/buildkite-release-setup.md`). A private manual playground that _consumes_ those prebuilts (Rust + Bazel, rules_multitool) lives at `brianduff/checkleft-sandbox` — see `tools/checkleft/docs/checkleft-sandbox.md`.
 - **Run `checkleft run` with no flags.** Its change detection scopes the run to what you actually touched, which is what makes it fast in a monorepo — no SHA or base-ref plumbing needed. **Do not run `checkleft --all`.** It is reserved for CI's dedicated integrity pipeline, for work that modifies checkleft itself, or for a case with a strong stated justification. `--all` is not a stricter superset of the default: checks with `changed_lines_only` become a no-op under it, so it reports every pre-existing violation in the repo and buries the findings that belong to your change.
 
+## No Boss work-item ids in PRs, commits, or source
+
+`spinyfin/mono` runs `boss-ism/pr-text-leakage` (changeset scope) and
+`boss-ism/file-text-leakage` (changed-lines file scope) in root
+`CHECKS.yaml`. Both forbid internal Boss work-item id shapes
+(`T<n>` / `P<n>`) in worker-authored text:
+
+- **PR titles and bodies**, and **commit messages** — hard error via
+  `boss-ism/pr-text-leakage` (`\b[TP]\d+\b`). A PR cannot cite the
+  work-item id that spawned it, and the check also trips on incidental
+  text such as a quoted commit title that embeds a short id like
+  `(T` + digits + `)`.
+- **Source and docs** — `boss-ism/file-text-leakage` flags the same
+  shape on changed lines (floored at three digits to avoid ISO-8601 /
+  percentile false positives). Confirmed when a recovered patch whose
+  comments cited a work-item id failed local `checkleft run`.
+
+**Cite the public PR instead** (e.g. `mono#2303`), never the work-item
+id. Do not reference a work-item id _anywhere_ a worker writes —
+commit messages, code comments, design docs, or PR body.
+
+If you hit this check, **fix the text at the root**. Do not add a
+bypass, exclusion, or allowlist entry for the check. That is the same
+root-cause rule as the section below.
+
+## Operational docs workers should know
+
+- Bazel / Xcode LaunchServices pin on macOS hosts:
+  [`tools/boss/docs/mac-toolchain-xcode-pinning.md`](tools/boss/docs/mac-toolchain-xcode-pinning.md)
+- Boss forensic surfaces (`engine-audit.log`, per-task cost / transcripts):
+  [`tools/boss/docs/forensic-surfaces.md`](tools/boss/docs/forensic-surfaces.md)
+- Post-crash orphan recovery:
+  [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
+- Operator runbooks:
+  [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
+
 ## Prefer crates over modules for distinct units of functionality (Rust)
 
 We generally keep distinct units in their own crates rather than as modules inside a larger crate: bazel incrementality is per-crate, so smaller crates mean smaller rebuild and retest scopes. When adding or extracting such a unit, it is OK to do light dependency/interface refactoring to support the split — e.g. introduce a small trait or plain context type at the boundary, or move shared types down into a lower-level crate. Keep each crate's dependency list minimal and the edges one-directional: a transport/utility/pipeline crate must never import from the higher-level crate that consumes it; if a cycle threatens, the shared types belong in a lower crate, not in the consumer. "Generally" means use judgment: a tiny glue module doesn't need a crate; a unit with its own vocabulary, tests, and multiple consumers does.
