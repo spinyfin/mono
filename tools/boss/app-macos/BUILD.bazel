@@ -1,6 +1,7 @@
 load("@build_bazel_rules_apple//apple:macos.bzl", "macos_application", "macos_unit_test")
 load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
 load("//tools/boss/installer:pkg.bzl", "boss_short_version_plist")
+load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
 
 package(default_visibility = ["//visibility:private"])
 
@@ -112,12 +113,10 @@ _SHARD2_SRCS = [
     "Tests/BossTests/WorkItemRepoRowTests.swift",
 ]
 
-# rules_apple invokes xcodebuild, whose test runner writes DerivedData support
-# files outside TEST_TMPDIR. Keep this documented exemption equal on all shards.
 macos_unit_test(
     name = "BossTestsCommentsTranscript",
     size = "small",
-    env = {"MONO_TEST_ALLOW_OUTSIDE_WRITES": "1"},
+    env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_tests_comments_transcript_lib"],
 )
@@ -134,7 +133,7 @@ swift_library(
 macos_unit_test(
     name = "BossTestsShard1",
     size = "small",
-    env = {"MONO_TEST_ALLOW_OUTSIDE_WRITES": "1"},
+    env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_tests_shard1_lib"],
 )
@@ -151,7 +150,7 @@ swift_library(
 macos_unit_test(
     name = "BossTestsShard2",
     size = "small",
-    env = {"MONO_TEST_ALLOW_OUTSIDE_WRITES": "1"},
+    env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_tests_shard2_lib"],
 )
@@ -168,7 +167,7 @@ swift_library(
 macos_unit_test(
     name = "BossTestsShard3",
     size = "small",
-    env = {"MONO_TEST_ALLOW_OUTSIDE_WRITES": "1"},
+    env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
     deps = [":boss_mac_app_tests_shard3_lib"],
 )

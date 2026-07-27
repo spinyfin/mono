@@ -205,7 +205,10 @@ private final class DownloadTaskRunner: NSObject, URLSessionDownloadDelegate, @u
     }
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        let stable = FileManager.default.temporaryDirectory
+        let temporaryDirectory = ProcessInfo.processInfo.environment["TMPDIR"].map {
+            URL(fileURLWithPath: $0, isDirectory: true)
+        } ?? FileManager.default.temporaryDirectory
+        let stable = temporaryDirectory
             .appendingPathComponent("boss-update-\(UUID().uuidString).zip")
         do {
             try? FileManager.default.removeItem(at: stable)

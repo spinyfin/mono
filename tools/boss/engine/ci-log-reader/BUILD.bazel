@@ -23,9 +23,6 @@ rust_test(
     size = "small",
     crate = ":ci-log-reader",
     edition = "2024",
-    # The fake bk/gh shell fixtures use here-documents whose anonymous output
-    # pipes cannot be path-allowlisted by macOS Seatbelt.
-    env = {"MONO_TEST_ALLOW_OUTSIDE_WRITES": "1"},
     proc_macro_deps = all_crate_deps(
         proc_macro = True,
         proc_macro_dev = True,

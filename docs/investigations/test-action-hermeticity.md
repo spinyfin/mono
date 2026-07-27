@@ -2,7 +2,7 @@
 
 ## Audit findings
 
-The repository uses Bazel 8.3.0. Before this policy, `--incompatible_strict_action_env` was already enabled by default and test actions used Bazel's `standalone` test action context routed through the platform spawn strategy. On macOS, ordinary test actions therefore appeared as `darwin-sandbox`; the `ci-linux` and `ci-darwin` configurations changed cache locations and the Apple toolchain but did not change the test strategy.
+The repository uses Bazel 9.1.0. Before this policy, `--incompatible_strict_action_env` was already enabled by default and test actions used Bazel's `standalone` test action context routed through the platform spawn strategy. On macOS, ordinary test actions therefore appeared as `darwin-sandbox`; the `ci-linux` and `ci-darwin` configurations changed cache locations and the Apple toolchain but did not change the test strategy.
 
 That existing sandbox was not an outside-world boundary:
 
@@ -18,35 +18,36 @@ The developer shell had `ANTHROPIC_API_KEY` set during the audit, but the same n
 Every `bazel test` now uses `//tools/test-sandbox:hermetic_test_wrapper` at the repository-owned test-code boundary. The wrapper:
 
 - removes common API credentials even if a caller attempts to inject them;
-- replaces the developer's `PATH` with a fixed allowlist that does not contain `gh`, `bk`, `codex`, `claude`, or `cube`;
+- replaces the developer's `PATH` with Bazel-declared runtime inputs and, on macOS, denies execution of undeclared absolute host binaries;
 - points `TMPDIR`, `TMP`, and `TEMP` at the test's private temporary root;
 - denies external network while retaining loopback and Unix-domain sockets for in-process mock servers and integration fixtures;
+- denies Keychain database reads and securityd IPC on macOS;
 - on macOS, applies a Seatbelt profile that denies filesystem writes outside the private test root and declared Bazel output paths.
 
 Linux retains Bazel's `linux-sandbox` test strategy and its mount/network namespaces. macOS uses a local Bazel TestRunner action because Bazel's built-in Darwin profile hardcodes broad host-writable paths and macOS rejects a stricter nested sandbox. Build and compilation actions continue to use their normal Bazel strategies. The repository wrapper applies the stricter Seatbelt profile before repository test code starts.
 
-The macOS wrapper creates a short, unique `/private/tmp/mono-test.XXXXXX` root and removes it after the test. A short path is required for Unix-domain-socket integration tests: Bazel's local TestRunner output-base path plus a tempfile component exceeds `sockaddr_un.sun_path`.
+The macOS wrapper creates a short, unique `/tmp/mono-test.XXXXXX` root (physically `/private/tmp/mono-test.XXXXXX`) and removes it after the test. EXIT, INT, TERM, and HUP traps preserve the test status and forward signals to the complete test process group before cleanup. `//tools/test-sandbox:cleanup_guard_test` exercises TERM and HUP and verifies that neither the root nor child/descendant processes survive. A short path is required for Unix-domain-socket integration tests: Bazel's local TestRunner output-base path plus a tempfile component exceeds `sockaddr_un.sun_path`.
 
-## Explicit exemptions
+## Declared runtime and target-level capabilities
 
-There are no external-network or credential exemptions.
+There are no ambient credential exemptions. External network is available only through the target-level capability below.
 
 The following local capabilities remain:
 
 - Loopback TCP and Unix-domain sockets are available to all tests for hermetic mock servers and in-process engine/client integration. External addresses remain denied.
-- The curated runtime PATH contains only the POSIX, Git, Python, archive, checksum, and Xcode tools required by existing tests and Bazel-generated runners: `awk`, `basename`, `bash`, `cat`, `chmod`, `cp`, `cut`, `date`, `dirname`, `echo`, `env`, `false`, `find`, `git`, `grep`, `head`, `ln`, `mkdir`, `mkfifo`, `mktemp`, `mv`, `od`, `printf`, `pwd`, `python3`, `rm`, `sed`, `sh`, `shasum`, `sleep`, `sort`, `tail`, `tee`, `touch`, `tr`, `true`, `uname`, `unzip`, `wc`, `xcodebuild`, and `xcrun`. It deliberately excludes operator-installed service CLIs. These tools should move to declared Bazel toolchains over time; the fixed list prevents discovery of additional host binaries in the meantime.
-- `//tools/boss/engine/ci-log-reader:ci-log-reader_test` sets `MONO_TEST_ALLOW_OUTSIDE_WRITES=1`. Its fake CLI fixtures use shell here-documents whose anonymous output pipes cannot be expressed as path allowlists in a Seatbelt profile. External network, credentials, and the curated PATH policy still apply.
-- The five `macos_unit_test` targets under `//tools/boss/app-macos` set `MONO_TEST_ALLOW_OUTSIDE_WRITES=1`. Apple's `xcodebuild` test runner writes DerivedData and result-bundle support data outside `TEST_TMPDIR`. External network, credentials, and the curated PATH policy still apply.
+- `@test_runtime_tools//:runtime` is a local configured repository that resolves the fixed POSIX, Git, Python, archive, and checksum runtime set to final realpaths. The wrapper consumes that target as runfiles, builds its PATH only from those inputs, and translates the current target's runfiles manifest into exact process-exec grants. The Homebrew Python framework tree is recorded as an explicit audited runtime tree because its launcher delegates to the versioned framework binary; it is not copied into every test's runfiles tree. Operator CLIs remain absent, and the guard proves an absolute `/opt/homebrew/bin/gh` attempt is denied.
+- Xcode is a separate target-level capability. The five `macos_unit_test` targets use `XCODE_TEST_ENV`, which permits the registered `/Applications/Xcode.app` toolchain, injects the private test root into the generated `.xctestrun`, sends DerivedData there, and disables system diagnostic collection. The Apple runner's shell heredoc is patched out. Because `testmanagerd` does not preserve per-action Seatbelt path extensions, these targets use explicit write denials for system roots, the host user tree except Bazel-owned result paths, and shared `/tmp` and `/var/tmp`; their fixtures write only under injected `TEST_TMPDIR`. `TestSandboxPolicyTests` proves the Xcode-backed test process cannot create files in the host home or shared temp.
+- `//tools/boss/engine/ci-log-reader:ci-log-reader_test` needs no write capability. Its four fake CLI heredocs use shell `printf`, so the normal private-root-only policy applies.
 
-No target can reach external network by default. A future test that genuinely requires it must set `MONO_TEST_ALLOW_NETWORK=1` on the target and document why.
+No target can reach external network by default. A Rust test that genuinely requires external network must use `network_enabled_rust_test`. That single target-level macro adds Bazel's `requires-network` execution requirement for Linux and the wrapper marker for macOS. `//tools/test-sandbox:network_opt_in_test` validates the opt-in while the default hermeticity guard validates the deny path.
 
 ## Measurements
 
-The representative target was `//tools/boss/engine/comment-classifier:comment-classifier_test`, forced to execute with `--cache_test_results=no` on a warm build cache:
+The representative build target was `//tools/boss/engine/comment-classifier:comment-classifier_test`. Each side used an initial analysis-warming build followed by three identical `bazel build --noshow_progress` runs:
 
-| Path                                  | Wall clock | Test action |
-| ------------------------------------- | ---------: | ----------: |
-| Previous Darwin sandbox behavior      |     0.37 s |       0.1 s |
-| Enforced wrapper and Seatbelt profile |     0.42 s |       0.1 s |
+| State                            |   Warm wall-clock runs |    Mean | Cache behavior                         |
+| -------------------------------- | ---------------------: | ------: | -------------------------------------- |
+| Before declared runtime revision | 0.47 s, 0.45 s, 0.50 s | 0.473 s | 9 action-cache hits, 1 internal action |
+| After declared runtime revision  | 0.47 s, 0.45 s, 0.49 s | 0.470 s | 9 action-cache hits, 1 internal action |
 
-The measured warm overhead was about 50 ms. Build actions are unaffected by the test-only policy; `bazel build` continues to use the disk cache and normal Darwin sandbox/local strategy selection. Switching strategy flags invalidates Bazel's analysis cache, so cold one-shot comparisons were dominated by reanalysis and were not representative of steady-state cost.
+The measured warm build difference was -3 ms (within run-to-run noise), and cache behavior was identical. The initial post-change build took 1.00 s versus 1.04 s before; both reloaded roughly 330 packages after the test run-under analysis option changed and both were dominated by reanalysis. Build actions continue to use the disk cache and normal Darwin sandbox/local strategy selection.

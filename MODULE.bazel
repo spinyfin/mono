@@ -25,6 +25,20 @@ bazel_dep(name = "rules_swift", version = "3.5.0", repo_name = "build_bazel_rule
 bazel_dep(name = "rules_apple", version = "4.5.1", repo_name = "build_bazel_rules_apple")
 bazel_dep(name = "rules_swift_package_manager", version = "1.13.0")
 
+single_version_override(
+    module_name = "rules_apple",
+    patch_strip = 1,
+    patches = ["//third_party/patches:rules_apple-4.5.1-no-test-env-heredoc.patch"],
+    version = "4.5.1",
+)
+
+test_runtime_repository = use_repo_rule(
+    "//tools/test-sandbox:repositories.bzl",
+    "test_runtime_repository",
+)
+
+test_runtime_repository(name = "test_runtime_tools")
+
 # Zig-based hermetic CC toolchain used for musl cross-compilation.
 # Provides @zig_sdk//libc_aware/toolchain:linux_amd64_musl (and arm64 variant)
 # which cross-compile C/C++ code from any host to a fully-static musl binary.

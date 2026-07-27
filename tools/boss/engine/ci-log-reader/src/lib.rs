@@ -825,9 +825,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let script = r#"#!/bin/sh
 if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=1" ]; then
-    cat <<'JSON'
-[{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{"slug":"flunge-ci"},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{"id":"job-uuid-1","state":"failed"}]}]
-JSON
+    printf '%s\n' '[{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{"slug":"flunge-ci"},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{"id":"job-uuid-1","state":"failed"}]}]'
     exit 0
 fi
 echo "unhandled args: $@" 1>&2
@@ -875,9 +873,7 @@ if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page
     exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" = "/builds?state[]=failed&state[]=failing&per_page=100&page=2" ]; then
-    cat <<'JSON'
-[{{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{{"slug":"flunge-ci"}},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{{"id":"job-uuid-1","state":"failed"}}]}}]
-JSON
+    printf '%s\n' '[{{"branch":"trunk-merge/pr-1007/d772adf2","pipeline":{{"slug":"flunge-ci"}},"number":2364,"web_url":"https://buildkite.com/flunge/flunge-ci/builds/2364","jobs":[{{"id":"job-uuid-1","state":"failed"}}]}}]'
     exit 0
 fi
 echo "unhandled args: $@" 1>&2
@@ -1150,13 +1146,12 @@ if [ "$1" = "job" ] && [ "$2" = "log" ]; then
         echo "missing --pipeline/--build-number flags: $@" 1>&2
         exit 3
     fi
-    cat <<LOG
-preamble line 1
-preamble line 2
-TEST FAILED at frob_bar_test.rs:42
-last meaningful line
-coordinates: pipeline=$4 build=$6 job=$7
-LOG
+    printf '%s\n' \
+        'preamble line 1' \
+        'preamble line 2' \
+        'TEST FAILED at frob_bar_test.rs:42' \
+        'last meaningful line' \
+        "coordinates: pipeline=$4 build=$6 job=$7"
     exit 0
 fi
 if [ "$1" = "build" ] && [ "$2" = "retry" ]; then
@@ -1246,11 +1241,10 @@ exit 2
 #   gh run view --log-failed --job <job-id>
 #   gh run rerun <run-id> --failed
 if [ "$1" = "run" ] && [ "$2" = "view" ]; then
-    cat <<'LOG'
-2026-05-15T10:00:00Z my-job: starting
-2026-05-15T10:00:01Z my-job: assertion failed
-2026-05-15T10:00:02Z my-job: exiting with code 1
-LOG
+    printf '%s\n' \
+        '2026-05-15T10:00:00Z my-job: starting' \
+        '2026-05-15T10:00:01Z my-job: assertion failed' \
+        '2026-05-15T10:00:02Z my-job: exiting with code 1'
     exit 0
 fi
 if [ "$1" = "run" ] && [ "$2" = "rerun" ]; then

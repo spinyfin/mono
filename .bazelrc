@@ -45,8 +45,9 @@ build --define=BOSS_SHAKE_PRIVATE_KEY_PEM=
 common --enable_platform_specific_config
 
 # Test actions start with network access denied. Bazel's darwin-sandbox permits
-# network access by default; a test that truly needs it must opt in visibly
-# with `MONO_TEST_ALLOW_NETWORK=1`.
+# network access by default; Rust tests that truly need it must use
+# `network_enabled_rust_test`, which applies both the Linux execution
+# requirement and the macOS wrapper marker.
 test --sandbox_default_allow_network=false
 
 # Bazel's macOS sandbox profile always permits writes to shared host temp and

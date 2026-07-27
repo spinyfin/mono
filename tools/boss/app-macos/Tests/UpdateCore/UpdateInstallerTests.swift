@@ -12,7 +12,11 @@ final class UpdateInstallerTests: XCTestCase {
     private var tempRoot: URL!
 
     override func setUpWithError() throws {
-        tempRoot = FileManager.default.temporaryDirectory
+        tempRoot = URL(
+            fileURLWithPath: ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+                ?? NSTemporaryDirectory(),
+            isDirectory: true
+        )
             .appendingPathComponent("UpdateInstallerTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: updatesDir, withIntermediateDirectories: true)

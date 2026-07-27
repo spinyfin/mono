@@ -18,7 +18,9 @@ import os
 /// should escalate.
 final class EngineClientReconnectBackoffTests: XCTestCase {
     func testReconnectDelayEscalatesAcrossConsecutiveFailures() throws {
-        let socketPath = "/tmp/boss-engineclient-backoff-test-\(UUID().uuidString).sock"
+        let temporaryDirectory = ProcessInfo.processInfo.environment["TEST_TMPDIR"]
+            ?? NSTemporaryDirectory()
+        let socketPath = "\(temporaryDirectory)/boss-engineclient-backoff-test-\(UUID().uuidString).sock"
         defer { unlink(socketPath) }
 
         let server = try ImmediatelyClosingUnixSocketServer(path: socketPath)
