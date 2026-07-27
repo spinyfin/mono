@@ -4,8 +4,10 @@
 //! engine's frontend socket so that re-stubbing them shows up as a
 //! red test instead of silently degrading the coordinator.
 //!
-//! - `cancel_execution` (work cancel): mark a non-terminal execution
-//!   `cancelled`; refuse to cancel a row that's already terminal.
+//! - `cancel_execution` (work cancel / executions cancel): mark a
+//!   non-terminal execution `cancelled`; refuse already-terminal rows.
+//!   `queued_only` (executions cancel) additionally refuses rows that
+//!   have already started and points at `agents stop`.
 //! - `tail_run_transcript` (agents transcript): return the last N
 //!   lines of a run's transcript, or surface a structured error when
 //!   no transcript path is recorded yet.
@@ -154,6 +156,8 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: execution_id.clone(),
+            reason: None,
+            queued_only: false,
         })
         .await?;
     let cancelled = match response {
@@ -172,7 +176,11 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     // silently no-op — this is what guards the engine against double
     // cancels racing the reconciler.
     let response = client
-        .send_request(&FrontendRequest::CancelExecution { execution_id })
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id,
+            reason: None,
+            queued_only: false,
+        })
         .await?;
     match response {
         FrontendEvent::WorkError { message } => {
@@ -194,6 +202,8 @@ async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: "exec_does_not_exist".to_owned(),
+            reason: None,
+            queued_only: false,
         })
         .await?;
     match response {
@@ -204,6 +214,67 @@ async fn work_cancel_unknown_execution_returns_clear_error() -> Result<()> {
             );
         }
         other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    Ok(())
+}
+
+/// `queued_only` (the `bossctl executions cancel` gate) accepts a ready
+/// row and stamps it `cancelled`, and refuses a running row with a
+/// message that points at `agents stop`.
+#[tokio::test]
+async fn executions_cancel_queued_only_accepts_ready_refuses_running() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution {
+        work_item_id: _,
+        execution_id: ready_id,
+    } = seed_execution(&mut client).await?;
+
+    let response = client
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id: ready_id.clone(),
+            reason: Some("moot after work completed elsewhere".to_owned()),
+            queued_only: true,
+        })
+        .await?;
+    let cancelled = match response {
+        FrontendEvent::ExecutionCancelled { execution } => execution,
+        other => return Err(anyhow!("unexpected response cancelling ready: {other:?}")),
+    };
+    assert_eq!(cancelled.id, ready_id);
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+
+    // Seed a second ready execution and start it via WorkDb so the
+    // status is `running` without needing a live worker pane.
+    let SeededExecution {
+        work_item_id: _,
+        execution_id: running_id,
+    } = seed_execution(&mut client).await?;
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.start_execution_run(
+        &running_id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )?;
+
+    let response = client
+        .send_request(&FrontendRequest::CancelExecution {
+            execution_id: running_id.clone(),
+            reason: Some("should refuse".to_owned()),
+            queued_only: true,
+        })
+        .await?;
+    match response {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("agents stop") || message.contains("already started"),
+                "expected refuse-with-agents-stop message, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError for running+queued_only, got: {other:?}")),
     }
     Ok(())
 }

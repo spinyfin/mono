@@ -1481,6 +1481,57 @@ fn cancel_execution_preserves_in_review_and_done_status() {
     let _ = std::fs::remove_file(path);
 }
 
+/// `queued_only` is the gate behind `bossctl executions cancel`: it
+/// accepts never-started rows and refuses anything that has already
+/// left the dispatchable set, pointing live workers at `agents stop`.
+#[test]
+fn cancel_execution_queued_only_accepts_ready_refuses_running() {
+    let path = temp_db_path("cancel-queued-only");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Moot ready");
+    let ready = create_ready_chore_execution(&db, chore.id.clone());
+    let cancelled = db
+        .cancel_execution_with(
+            &ready.id,
+            CancelExecutionOpts {
+                reason: Some("moot after work completed elsewhere".to_owned()),
+                queued_only: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+
+    let running = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id)
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let err = db
+        .cancel_execution_with(
+            &running.id,
+            CancelExecutionOpts {
+                reason: Some("should refuse".to_owned()),
+                queued_only: true,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("agents stop") || err.contains("already started"),
+        "expected refuse message pointing at agents stop, got: {err}"
+    );
+    // Row must still be running — refuse is not a partial cancel.
+    assert_eq!(db.get_execution(&running.id).unwrap().status, ExecutionStatus::Running);
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// The "AI reviewing" badge (`ai_reviewing`) must be honest: it may only show
 /// when a reviewer agent is actually in flight (`pr_review` execution
 /// `running`), never while the review is merely enqueued or stuck in the

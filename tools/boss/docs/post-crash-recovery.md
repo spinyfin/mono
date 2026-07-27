@@ -21,8 +21,10 @@ Compared to the other terminal statuses:
 
 - `completed` / `failed`: the worker finished its turn and the
   completion handler stamped the verdict.
-- `cancelled`: a human invoked `bossctl work cancel <execution>` or
-  `bossctl agents stop <agent>`.
+- `cancelled`: a human invoked `bossctl executions cancel <execution>`
+  (never-started rows only), `bossctl work cancel <execution>` (any
+  non-terminal row), or `bossctl agents stop <agent>` (live worker).
+  Operator cancellation is distinct from the engine losing a run.
 - `abandoned`: the row never produced a `work_runs` entry (the engine
   crashed mid-dispatch, before the worker spawned).
 - `orphaned`: the row had a live worker once; the engine no longer
@@ -81,6 +83,20 @@ are left intact so a re-dispatch can pick the same branch back up.
 
 `agents reap` requires `RpcTier::BossOnly`. Worker panes cannot
 invoke it (they shouldn't be reaping each other).
+
+**Do not use `agents reap` to cancel a never-started (`ready` /
+`queued`) execution.** That is not what the verb is for, and the
+resulting `orphaned` status misrepresents an operator decision as
+"engine lost the run." Use:
+
+```
+bossctl executions cancel <execution-id> --reason "…"
+# or every never-started execution on a work item:
+bossctl executions cancel --work-item <id> --reason "…"
+```
+
+`executions cancel` refuses rows that have already started and points
+at `bossctl agents stop` instead.
 
 ## What happens after reap
 
