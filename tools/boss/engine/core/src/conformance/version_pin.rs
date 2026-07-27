@@ -203,6 +203,134 @@ fn codex_exec_spawn_satisfies_shared_flag_contract() {
     assert_codex_exec_spawn_contract(&production);
 }
 
+/// Config-schema conformance: the exact `config.toml` production writes
+/// (`render_base_config_toml` + `append_hooks_toml`) must actually load
+/// under `--strict-config` on the pinned codex binary.
+///
+/// This is the check that would have caught the `external_config_migration_prompts`
+/// top-level-field bug: every other test in this module pins the `--json`
+/// stream *contract*, not the config *schema*, so a hand-written config
+/// literal with an invalid key sailed through untested. Soft-skip when
+/// `codex` is absent, same convention as
+/// [`installed_codex_matches_pinned_version_when_present`]; set
+/// `BOSS_REQUIRE_CODEX_CLI=1` to require it.
+///
+/// Network-free: points the model provider at a closed local port so the
+/// process fails fast on a connection error rather than requiring real
+/// credentials. Config parsing happens strictly before any network attempt
+/// (confirmed live: a config-schema error exits in well under 100ms with no
+/// `thread.started`/`turn.started` ever printed; a valid config reaches both
+/// within about a second), so within the bounded wait below, "we saw
+/// `thread.started`" and "we saw the fatal config-load error" are mutually
+/// exclusive, distinguishable outcomes — never a race.
+#[test]
+fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let require = require_codex_cli();
+    let codex_bin = match Command::new("which").arg("codex").output() {
+        Ok(o) if o.status.success() => {
+            let path = String::from_utf8_lossy(&o.stdout).trim().to_owned();
+            if path.is_empty() { None } else { Some(path) }
+        }
+        _ => None,
+    };
+    let Some(codex_bin) = codex_bin else {
+        if require {
+            panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
+        }
+        eprintln!(
+            "codex not on PATH; skipping config-schema conformance check \
+             (set BOSS_REQUIRE_CODEX_CLI=1 to require it)"
+        );
+        return;
+    };
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let workspace = tmp.path().join("ws");
+    std::fs::create_dir_all(&workspace).expect("create workspace dir");
+    let codex_home = tmp.path().join("codex_home");
+    std::fs::create_dir_all(&codex_home).expect("create codex home");
+
+    // Exact production document: base config + one synthetic hook, the same
+    // shape `write_hooks_and_attest` builds from `materialize_guards`.
+    let base = crate::driver::codex::render_base_config_toml(&workspace);
+    let guards = vec![crate::driver::codex::MaterializedGuard {
+        command_path: PathBuf::from("/bin/true"),
+        matcher: Some(".*"),
+    }];
+    let full = crate::driver::codex::append_hooks_toml(&base, &guards);
+    std::fs::write(codex_home.join("config.toml"), &full).expect("write config.toml");
+
+    let mut child = Command::new(&codex_bin)
+        .current_dir(&workspace)
+        .env("CODEX_HOME", &codex_home)
+        .args([
+            "exec",
+            "--json",
+            "--strict-config",
+            "--skip-git-repo-check",
+            "-c",
+            "model_provider=boss_conformance_probe",
+            "-c",
+            r#"model_providers.boss_conformance_probe={name="probe",base_url="http://127.0.0.1:1/v1",wire_api="responses"}"#,
+            "hi",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn codex exec");
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => break,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(err) => panic!("waiting on codex exec: {err}"),
+        }
+    }
+    // Best-effort: process may have already exited (bad-config case).
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let stdout = String::from_utf8_lossy(&stdout_reader.join().expect("join stdout reader")).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().expect("join stderr reader")).into_owned();
+    let combined = format!("{stdout}\n{stderr}");
+
+    assert!(
+        !combined.contains("Error loading config.toml") && !combined.contains("unknown configuration field"),
+        "generated config.toml must load under --strict-config on pinned codex \
+         {PINNED_CODEX_CLI_VERSION}; got stdout={stdout:?} stderr={stderr:?}",
+    );
+    assert!(
+        stdout.contains("\"thread.started\""),
+        "expected codex to get past config load and start a turn (thread.started); \
+         got stdout={stdout:?} stderr={stderr:?}",
+    );
+}
+
 #[test]
 fn unknown_turn_item_variants_are_tolerated_not_fatal() {
     // Four new TurnItem variants shipped unannounced (DynamicToolCall,

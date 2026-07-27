@@ -1491,6 +1491,24 @@ pub trait AgentDriver: Send + Sync {
     /// naming the hook mechanism and the `.claude/`-style gitignore contract.
     fn agent_rules_preamble(&self) -> &'static str;
 
+    /// Absolute path [`crate::worker_setup::write_workspace_files`] (in
+    /// `engine/core`) must write the rendered agent-rules body to, so the
+    /// driver's own agent actually reads it.
+    ///
+    /// Default: `<workspace>/<descriptor.config_dir>/<descriptor.agent_rules_filename>`
+    /// (e.g. Claude's `.claude/CLAUDE.md`) — correct whenever the driver reads
+    /// its rules file from its workspace-local config dir. A driver that reads
+    /// rules from somewhere else entirely (e.g. Codex, which reads
+    /// `AGENTS.md` from the workspace root or `$CODEX_HOME`, never from
+    /// `.codex/`) must override this rather than silently writing a file its
+    /// own agent never opens.
+    fn agent_rules_destination(&self, workspace: &Path, _run_id: &str) -> PathBuf {
+        let descriptor = self.descriptor();
+        workspace
+            .join(descriptor.config_dir)
+            .join(descriptor.agent_rules_filename)
+    }
+
     // ── TranscriptAccess capability ──────────────────────────────────────────
 
     /// Report where this driver's transcript for the current session lives,
