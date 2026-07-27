@@ -523,6 +523,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - **"Filed as a followup" in a PR body is false by construction.** Workers cannot write taxonomy. If a follow-up is needed, file it yourself (or confirm the operator wants it filed) — do not trust the PR body's claim.
     - **"Depends on X first" in a PR body is a hypothesis.** Read the actual signature/default handling before propagating a soft preference as a hard gate into scope.
     - **Never surface "Friendly ID" in user-facing UI strings.** Use "ID" or "Short ID". Code symbols and JSON fields may still say `friendly_id`.
+    - **Never put a Boss work-item short id into a brief, task description, or probe.** Workers are expected to echo those surfaces into PR text, commit messages, and source — which then fails `boss-ism/pr-text-leakage` and `boss-ism/file-text-leakage`. Describe the work by its subject instead; short ids stay for coordinator↔operator chat and CLI ops only.
 
     ### Verification discipline
 
