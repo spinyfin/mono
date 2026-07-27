@@ -154,6 +154,10 @@ pub const CODEX_HOMES_ROOT_ENV: &str = "BOSS_CODEX_HOMES_DIR";
 /// Process-global lock for any test that mutates [`CODEX_HOMES_ROOT_ENV`].
 /// Hold across the full set/clear of the env var so parallel crate tests
 /// (engine_lib_test + driver_test) cannot race the process environment.
+///
+/// Prefer [`crate::test_support::codex_homes_override`] over taking this
+/// lock by hand: it acquires the lock and sets the variable together, so a
+/// call site cannot set the variable while forgetting the lock.
 pub static CODEX_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Default leaf under the system temp when [`CODEX_HOMES_ROOT_ENV`] is unset.
@@ -1389,7 +1393,15 @@ mod tests {
     use tempfile::TempDir;
 
     /// Serialise tests that mutate process-global env (`BOSS_CODEX_*`).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    ///
+    /// Aliased to the crate's public [`CODEX_HOMES_ENV_TEST_LOCK`] rather
+    /// than a second `Mutex`, because these tests set
+    /// [`CODEX_HOMES_ROOT_ENV`] too: a private lock would leave them free
+    /// to race any test going through
+    /// [`crate::test_support::codex_homes_override`], which is the same
+    /// key under a different mutex. `CODEX_AUTH_SOURCE_ENV` rides along on
+    /// the same lock — over-serialising two env tests costs nothing.
+    static ENV_LOCK: &Mutex<()> = &CODEX_HOMES_ENV_TEST_LOCK;
 
     fn sample_auth_json() -> String {
         serde_json::json!({
@@ -1624,7 +1636,7 @@ else:
         // Hold the env lock only around the set/unset + sync work — never
         // across `.await` (clippy::await_holding_lock).
         {
-            let _guard = ENV_LOCK.lock().unwrap();
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             // SAFETY: serialised by ENV_LOCK for the critical section.
             unsafe {
                 std::env::set_var(CODEX_HOMES_ROOT_ENV, &homes);
@@ -1685,7 +1697,7 @@ else:
         reclaim_codex_home(&runtime.codex_home).unwrap();
 
         {
-            let _guard = ENV_LOCK.lock().unwrap();
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             unsafe {
                 std::env::remove_var(CODEX_HOMES_ROOT_ENV);
                 std::env::remove_var(CODEX_AUTH_SOURCE_ENV);
@@ -1955,7 +1967,7 @@ else:
         fs::write(outside.join("marker"), "keep").unwrap();
 
         {
-            let _guard = ENV_LOCK.lock().unwrap();
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             unsafe {
                 std::env::set_var(CODEX_HOMES_ROOT_ENV, &homes);
             }
@@ -2001,7 +2013,7 @@ else:
         assert!(homes.is_dir(), "homes root must remain");
 
         {
-            let _guard = ENV_LOCK.lock().unwrap();
+            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             unsafe {
                 std::env::remove_var(CODEX_HOMES_ROOT_ENV);
             }

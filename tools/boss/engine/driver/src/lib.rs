@@ -1707,6 +1707,56 @@ pub mod test_support {
         SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
     };
 
+    /// RAII override of [`crate::codex::CODEX_HOMES_ROOT_ENV`], obtained
+    /// from [`codex_homes_override`].
+    ///
+    /// Holds [`crate::codex::CODEX_HOMES_ENV_TEST_LOCK`] for its whole
+    /// lifetime and restores the prior value of the variable on drop, so
+    /// two tests in the same binary cannot interleave their overrides.
+    /// That coupling is the point: the lock and the `set_var` are acquired
+    /// together by construction, so no call site can set the variable
+    /// while forgetting the lock.
+    pub struct CodexHomesOverride {
+        /// Dropped last-but-one; releasing it after the restore below is
+        /// what makes the whole set/restore pair atomic w.r.t. other tests.
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    /// Point per-run `CODEX_HOME` resolution at `root` for as long as the
+    /// returned guard lives.
+    ///
+    /// Every test in every crate that needs a disposable homes root goes
+    /// through here. Because the guard owns a `MutexGuard`, holding it
+    /// across an `.await` would trip `clippy::await_holding_lock`; tests
+    /// that need async work under the override drive their own
+    /// current-thread runtime with `block_on` instead, which keeps the
+    /// guard inside a single blocking call on a runtime the test owns.
+    pub fn codex_homes_override(root: &Path) -> CodexHomesOverride {
+        let lock = crate::codex::CODEX_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = std::env::var_os(crate::codex::CODEX_HOMES_ROOT_ENV);
+        // SAFETY: `lock` is held for the lifetime of the returned guard and
+        // is the process-wide gate on this key, so no other thread is
+        // reading or writing it concurrently. The prior value is restored
+        // in `Drop` before the lock is released.
+        unsafe { std::env::set_var(crate::codex::CODEX_HOMES_ROOT_ENV, root) };
+        CodexHomesOverride { _lock: lock, prior }
+    }
+
+    impl Drop for CodexHomesOverride {
+        fn drop(&mut self) {
+            // SAFETY: same as in `codex_homes_override` — the lock this
+            // guard owns is still held, and is released only after this
+            // body returns.
+            match self.prior.as_ref() {
+                Some(value) => unsafe { std::env::set_var(crate::codex::CODEX_HOMES_ROOT_ENV, value) },
+                None => unsafe { std::env::remove_var(crate::codex::CODEX_HOMES_ROOT_ENV) },
+            }
+        }
+    }
+
     /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
     /// resolves everything to one `"stub-model"` slug, which is enough for
     /// tests that only exercise capability declaration or the seams a stub

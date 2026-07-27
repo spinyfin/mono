@@ -486,16 +486,10 @@ mod tests {
 
     #[test]
     fn prune_reclaims_codex_home_when_last_db_pointer_is_removed() {
-        let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let homes_root = tmp.path().join("boss-codex-homes");
         std::fs::create_dir_all(&homes_root).unwrap();
-        // SAFETY: serialised by CODEX_HOMES_ENV_TEST_LOCK.
-        unsafe {
-            std::env::set_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV, &homes_root);
-        }
+        let _env_guard = boss_engine_driver::test_support::codex_homes_override(&homes_root);
 
         let db = open_db();
         let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
@@ -537,24 +531,14 @@ mod tests {
             "last DB pointer gone → home must be reclaimed: {outcome:?}"
         );
         assert!(!home.exists(), "orphaned CODEX_HOME must not remain on disk");
-
-        unsafe {
-            std::env::remove_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV);
-        }
     }
 
     #[test]
     fn prune_does_not_reclaim_codex_home_still_referenced_by_another_row() {
-        let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let homes_root = tmp.path().join("boss-codex-homes");
         std::fs::create_dir_all(&homes_root).unwrap();
-        // SAFETY: serialised by CODEX_HOMES_ENV_TEST_LOCK.
-        unsafe {
-            std::env::set_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV, &homes_root);
-        }
+        let _env_guard = boss_engine_driver::test_support::codex_homes_override(&homes_root);
 
         let db = open_db();
         let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
@@ -594,9 +578,5 @@ mod tests {
             "shared path still referenced by live row must not be reclaimed"
         );
         assert!(home.join("marker").is_file(), "live owner's home must survive");
-
-        unsafe {
-            std::env::remove_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV);
-        }
     }
 }

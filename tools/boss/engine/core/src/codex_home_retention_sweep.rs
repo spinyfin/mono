@@ -205,25 +205,30 @@ mod tests {
         execution.id
     }
 
-    #[tokio::test]
-    async fn sweep_reclaims_only_recorded_terminal_roots_past_age() {
+    /// Driven by a test-owned current-thread runtime rather than
+    /// `#[tokio::test]` so the homes-root override can be held for the
+    /// whole sweep instead of only around the `set_var`. Releasing it early
+    /// left the rest of this test running against a root any parallel test
+    /// in this binary could move out from under it; `block_on` keeps the
+    /// guard out of every `.await` (`clippy::await_holding_lock`) without
+    /// giving up that coverage.
+    #[test]
+    fn sweep_reclaims_only_recorded_terminal_roots_past_age() {
         let tmp = tempfile::tempdir().unwrap();
         let homes_root = tmp.path().join("boss-codex-homes");
         std::fs::create_dir_all(&homes_root).unwrap();
 
-        // Point the safety check at our temp homes root. Hold the env lock
-        // only around set/unset — never across `.await`
-        // (clippy::await_holding_lock).
-        {
-            let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            // SAFETY: serialised by CODEX_HOMES_ENV_TEST_LOCK.
-            unsafe {
-                std::env::set_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV, &homes_root);
-            }
-        }
+        // Point the safety check at our temp homes root for the duration.
+        let _env_guard = boss_engine_driver::test_support::codex_homes_override(&homes_root);
 
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(sweep_reclaims_only_recorded_terminal_roots_past_age_body(&homes_root));
+    }
+
+    async fn sweep_reclaims_only_recorded_terminal_roots_past_age_body(homes_root: &std::path::Path) {
         let (_dir, db) = open_db();
         let product_id = create_test_product_with_repo(&db, "p", Some("https://github.com/test/repo")).id;
         // Separate work items so a live execution is not superseded by a
@@ -291,15 +296,6 @@ mod tests {
             outcome2.deleted, 1,
             "already-gone path still counts as reclaimed: {outcome2:?}"
         );
-
-        {
-            let _env_guard = boss_engine_driver::codex::CODEX_HOMES_ENV_TEST_LOCK
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            unsafe {
-                std::env::remove_var(boss_engine_driver::codex::CODEX_HOMES_ROOT_ENV);
-            }
-        }
     }
 
     #[tokio::test]

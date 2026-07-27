@@ -1151,6 +1151,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex as TokioMutex;
 
+    use crate::driver::test_support::codex_homes_override;
     use crate::driver::{
         CapabilitySet, DriverDescriptor, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress,
         ProgressObservationConfig, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
@@ -1373,32 +1374,17 @@ mod tests {
         }
     }
 
-    struct EnvRestore {
-        key: &'static str,
-        prior: Option<std::ffi::OsString>,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &Path) -> Self {
-            let prior = std::env::var_os(key);
-            // SAFETY: this engine test binary has no other test mutating the
-            // Codex homes override. The prior value is restored on drop.
-            unsafe { std::env::set_var(key, value) };
-            Self { key, prior }
-        }
-    }
-
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match self.prior.as_ref() {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn codex_live_status_slot_uses_run_driver_and_redacted_rollout() {
+    /// Driven by a test-owned current-thread runtime rather than
+    /// `#[tokio::test]`, because [`codex_homes_override`] owns
+    /// `CODEX_HOMES_ENV_TEST_LOCK` and must stay held for the whole run:
+    /// this is not the only test in this binary that points the Codex
+    /// homes root at a temp tree (see
+    /// `spawn_flow::tests::codex_spawn_registers_live_worker_state_like_claude`),
+    /// and libtest runs them on parallel threads. Holding the guard across
+    /// an `.await` is what `clippy::await_holding_lock` names; `block_on`
+    /// keeps it inside one blocking call on a runtime this test owns.
+    #[test]
+    fn codex_live_status_slot_uses_run_driver_and_redacted_rollout() {
         let tmp = tempfile::tempdir().unwrap();
         let homes = tmp.path().join("homes");
         let run_id = "run-codex-live-status";
@@ -1435,8 +1421,20 @@ mod tests {
             .join("\n")
             + "\n";
         std::fs::write(&transcript, jsonl).unwrap();
-        let _env = EnvRestore::set(crate::driver::codex::CODEX_HOMES_ROOT_ENV, &homes);
+        let _env = codex_homes_override(&homes);
 
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(codex_live_status_slot_body(run_id, &transcript));
+    }
+
+    /// The async half of
+    /// [`codex_live_status_slot_uses_run_driver_and_redacted_rollout`],
+    /// split out so the homes-root guard can be held by the sync caller
+    /// across the whole `block_on` without ever crossing an `.await`.
+    async fn codex_live_status_slot_body(run_id: &str, transcript: &Path) {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
@@ -1454,7 +1452,7 @@ mod tests {
         registry.register_spawn(9, run_id, "gpt-5.6-terra", 0, None);
         let manager = LiveStatusManager::new();
         let broadcaster: Arc<dyn LiveStatusBroadcaster> = Arc::new(CountingBroadcaster::default());
-        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript.clone())));
+        let resolver: Arc<dyn TranscriptPathResolver> = Arc::new(CannedResolver::new(Some(transcript.to_path_buf())));
         manager.start_slot(
             9,
             LiveStatusRun::new(run_id, Arc::new(crate::driver::CodexDriver::default())),
