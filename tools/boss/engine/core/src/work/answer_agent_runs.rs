@@ -184,10 +184,10 @@ impl WorkDb {
     /// Every answer-agent run for a comment, oldest first — the full history
     /// [`Self::latest_answer_agent_run_for_comment`] and
     /// [`Self::running_answer_agent_run_for_comment`] only sample a single row
-    /// of. Backs `bossctl comments show` / `bossctl comments runs`, which
-    /// otherwise had no way to answer "how many answer-agent runs has this
-    /// comment had, and how did each end" without raw SQL against
-    /// `answer_agent_runs`.
+    /// of. Backs `boss comment show` / `boss comment runs` (and the bossctl
+    /// direct-DB twins), which otherwise had no way to answer "how many
+    /// answer-agent runs has this comment had, and how did each end" without
+    /// raw SQL against `answer_agent_runs`.
     pub fn list_answer_agent_runs_for_comment(&self, comment_id: &str) -> Result<Vec<AnswerAgentRun>> {
         let conn = self.connect()?;
         let cols = Self::answer_agent_run_columns();

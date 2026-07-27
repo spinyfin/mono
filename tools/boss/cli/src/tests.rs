@@ -9,8 +9,8 @@ use super::{
     TaskStatusArg, apply_project_list_filters, apply_task_list_filters, classify_bind_pr, classify_lint_finding,
     compile_schedule, decide_open_design_action, dependency_status_is_satisfied, ensure_explicit_product_matches,
     expect_leaf_work_item, format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
-    parse_attention_group_selector, parse_automation_selector, pick_by_index, split_shake_report, status_vocab,
-    task_json_with_runtime, validate_github_pr_url, with_display_status,
+    parse_attention_group_selector, parse_automation_selector, pick_by_index, resolve_comments_artifact,
+    split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url, with_display_status,
 };
 use boss_protocol::{
     Product, Project, ProjectDesignDocState, ProjectStatus, ResolvedDesignDoc, ResolvedDesignDocKind, Task, TaskKind,
@@ -2794,4 +2794,49 @@ fn parse_attention_group_selector_rejects_unknown_form() {
     assert!(parse_attention_group_selector("randomstring").is_err());
     assert!(parse_attention_group_selector("auto_abc").is_err()); // automation id — wrong namespace
     assert!(parse_attention_group_selector("T42").is_err()); // task id — wrong namespace
+}
+
+// --- boss comment list artifact-selector resolution ---
+
+#[test]
+fn comment_list_task_shorthand_maps_to_work_item_kind() {
+    let (kind, id) = resolve_comments_artifact(Some("task-42".to_owned()), None, "pr_doc".to_owned())
+        .expect("--task alone should resolve");
+    assert_eq!(kind, "work_item");
+    assert_eq!(id, "task-42");
+}
+
+#[test]
+fn comment_list_task_shorthand_ignores_artifact_kind() {
+    let (kind, id) = resolve_comments_artifact(Some("task-7".to_owned()), None, "some_other_kind".to_owned())
+        .expect("--task alone should resolve");
+    assert_eq!(kind, "work_item");
+    assert_eq!(id, "task-7");
+}
+
+#[test]
+fn comment_list_artifact_uses_supplied_kind() {
+    let (kind, id) = resolve_comments_artifact(None, Some("pr_doc:repo:branch:path".to_owned()), "pr_doc".to_owned())
+        .expect("--artifact alone should resolve");
+    assert_eq!(kind, "pr_doc");
+    assert_eq!(id, "pr_doc:repo:branch:path");
+}
+
+#[test]
+fn comment_list_rejects_both_task_and_artifact() {
+    let err = resolve_comments_artifact(Some("task-1".to_owned()), Some("art-1".to_owned()), "pr_doc".to_owned())
+        .expect_err("passing both should error");
+    assert!(
+        err.to_string().contains("pass only one of --task or --artifact"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn comment_list_rejects_neither_task_nor_artifact() {
+    let err = resolve_comments_artifact(None, None, "pr_doc".to_owned()).expect_err("passing neither should error");
+    assert!(
+        err.to_string().contains("pass --task <id> or --artifact <id>"),
+        "unexpected error: {err}"
+    );
 }

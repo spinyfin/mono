@@ -1478,6 +1478,15 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "comment_result",
         },
         TagCase {
+            label: "CommentsGetResult",
+            event: FrontendEvent::CommentsGetResult {
+                comment: work_comment(),
+                thread_entries: vec![],
+                answer_agent_runs: vec![],
+            },
+            expected_tag: "comments_get_result",
+        },
+        TagCase {
             label: "CommentsList",
             event: FrontendEvent::CommentsList {
                 artifact_kind: "work_item".into(),
@@ -1485,6 +1494,14 @@ fn tag_cases() -> Vec<TagCase> {
                 comments: vec![],
             },
             expected_tag: "comments_list",
+        },
+        TagCase {
+            label: "AnswerAgentRunsList",
+            event: FrontendEvent::AnswerAgentRunsList {
+                comment_id: "cmt_1".into(),
+                answer_agent_runs: vec![],
+            },
+            expected_tag: "answer_agent_runs_list",
         },
         TagCase {
             label: "CommentsBannerState",
@@ -1820,10 +1837,12 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::GitHubAuthState { .. }
         | FrontendEvent::TrunkStatus { .. }
         | FrontendEvent::CommentResult { .. }
+        | FrontendEvent::CommentsGetResult { .. }
         | FrontendEvent::CommentsList { .. }
         | FrontendEvent::CommentsBannerState { .. }
         | FrontendEvent::CommentsResolved { .. }
         | FrontendEvent::CommentsReviseDocResult { .. }
+        | FrontendEvent::AnswerAgentRunsList { .. }
         | FrontendEvent::ReviewTerminalReady { .. }
         | FrontendEvent::LiveWorkspaceTerminalReady { .. }
         | FrontendEvent::MergeWhenReadyAccepted { .. }

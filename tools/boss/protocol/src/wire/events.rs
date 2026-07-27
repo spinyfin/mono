@@ -1157,6 +1157,14 @@ pub enum FrontendEvent {
     CommentResult {
         comment: WorkComment,
     },
+    /// Reply to [`FrontendRequest::CommentsGet`]: one comment with its
+    /// thread entries and full answer-agent-run history (the shape
+    /// `boss comment show` / `bossctl comments show` print).
+    CommentsGetResult {
+        comment: WorkComment,
+        thread_entries: Vec<CommentThreadEntry>,
+        answer_agent_runs: Vec<AnswerAgentRun>,
+    },
     /// Reply to `comments_list`. Each comment carries its thread entries and
     /// whether an answer-agent run is currently in flight for it — design
     /// `comment-triggered-document-revisions.md` §"UI / thread behavior".
@@ -1182,6 +1190,12 @@ pub enum FrontendEvent {
     /// Reply to `CommentsReviseDoc`.
     CommentsReviseDocResult {
         outcome: ReviseDocOutcome,
+    },
+    /// Reply to [`FrontendRequest::ListAnswerAgentRuns`]: every
+    /// `answer_agent_runs` row for `comment_id`, oldest first.
+    AnswerAgentRunsList {
+        comment_id: String,
+        answer_agent_runs: Vec<AnswerAgentRun>,
     },
     /// Response to [`FrontendRequest::OpenReviewTerminal`]: the engine
     /// has leased a workspace, fetched the PR branch, and created a new
