@@ -26,7 +26,7 @@ use tokio::time::Duration;
 
 use std::sync::Arc;
 
-use crate::driver::{AgentDriver, Capability};
+use crate::driver::{AgentDriver, Capability, ProgressIngress, ProgressObservationConfig};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, EnvVar, SpawnWorkerPaneInput, SpawnWorkerPaneResult,
@@ -170,6 +170,8 @@ pub enum StartWorkerError {
     AppError(EngineToAppError),
     #[error("app responded with unexpected response variant")]
     ResponseKindMismatch,
+    #[error("preparing progress ingress: {0}")]
+    ProgressIngress(String),
 }
 
 /// Public API for callers that want to wire pane-spawning into the
@@ -207,6 +209,24 @@ pub trait WorkerSpawner: Send + Sync {
     /// `release_worker_pane` runs.
     fn start_live_status_slot(&self, _slot_id: u8, _run_id: &str, _driver: Arc<dyn AgentDriver>) {}
 
+    /// Prepare a run-correlated progress source before pane spawn. File
+    /// ingress implementations snapshot pre-existing candidates here but do
+    /// not dispatch until [`Self::activate_progress_ingress`].
+    fn prepare_progress_ingress(
+        &self,
+        _run_id: &str,
+        _driver: Arc<dyn AgentDriver>,
+        _ingress: ProgressIngress,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Activate the prepared source after live-state registration.
+    fn activate_progress_ingress(&self, _run_id: &str) {}
+
+    /// Cancel a prepared or active source after spawn failure/teardown.
+    fn stop_progress_ingress(&self, _run_id: &str) {}
+
     /// Whether the `default_pr_draft_mode` setting is enabled. When
     /// `true`, the worker's CLAUDE.md gets a directive to pass
     /// `--draft` to `gh pr create`. Default `false` for tests.
@@ -243,6 +263,14 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     input: StartWorkerInput,
     spawn_timeout: StdDuration,
 ) -> Result<StartedWorker, StartWorkerError> {
+    let progress_ingress = input.driver.progress_observation_wiring(&ProgressObservationConfig {
+        events_socket_path: input.events_socket_path.clone(),
+        lease_id: input.lease_id.clone(),
+        run_id: input.run_id.clone(),
+        workspace_path: input.workspace_path.clone(),
+        forwarder_binary: input.boss_event_path.clone(),
+    });
+
     // 1. Write CLAUDE.md + .gitignore into the workspace and the worker
     //    settings file outside it (see worker_setup module docs).
     let setup = WorkerSetupInput {
@@ -257,6 +285,9 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         worker_kind: input.worker_kind.clone(),
     };
     let written = write_workspace_files(&setup, input.driver.as_ref()).map_err(StartWorkerError::WriteFiles)?;
+    spawner
+        .prepare_progress_ingress(&input.run_id, input.driver.clone(), progress_ingress)
+        .map_err(StartWorkerError::ProgressIngress)?;
 
     // 2. Build the SpawnWorkerPane request. Workers get a strict env
     //    allowlist (per `v2-design-risks.md` R3): a sanitized PATH
@@ -380,7 +411,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     let (slot_id, shell_pid, ack_timed_out) = match send_outcome {
         Ok(EngineToAppResponse::SpawnWorkerPane { result }) => match result {
             Ok(SpawnWorkerPaneResult { slot_id, shell_pid }) => (slot_id, shell_pid, false),
-            Err(err) => return Err(StartWorkerError::AppError(err)),
+            Err(err) => {
+                spawner.stop_progress_ingress(&input.run_id);
+                return Err(StartWorkerError::AppError(err));
+            }
         },
         Ok(
             EngineToAppResponse::ReleaseWorkerPane { .. }
@@ -391,6 +425,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             | EngineToAppResponse::OpenDocument { .. }
             | EngineToAppResponse::ListHostedPanes { .. },
         ) => {
+            spawner.stop_progress_ingress(&input.run_id);
             return Err(StartWorkerError::ResponseKindMismatch);
         }
         Err(crate::app::SendToAppError::Timeout) => {
@@ -406,7 +441,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
             );
             (claimed_slot, 0, true)
         }
-        Err(err) => return Err(StartWorkerError::Send(err)),
+        Err(err) => {
+            spawner.stop_progress_ingress(&input.run_id);
+            return Err(StartWorkerError::Send(err));
+        }
     };
 
     // The engine dictates the slot; the app's response slot is just a
@@ -474,6 +512,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         //    on `release_worker_pane`.
         spawner.start_live_status_slot(slot_id, &input.run_id, input.driver.clone());
     }
+    spawner.activate_progress_ingress(&input.run_id);
 
     Ok(StartedWorker {
         slot_id,

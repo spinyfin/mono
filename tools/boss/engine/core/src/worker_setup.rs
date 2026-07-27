@@ -641,15 +641,13 @@ fn settings_value(
 }
 
 /// Resolve a driver's [`ProgressIngress`] into the settings-file `hooks`
-/// map. [`ProgressIngress::StdoutJsonl`] drivers (Codex) have no
-/// hook-callback wiring at all — their progress is read from the worker's
-/// stdout by [`crate::stdout_progress`], not this Claude-style hooks map
-/// — so this returns an empty map for that arm instead of assuming a
-/// `HookCallback` that was never produced.
+/// map. Byte-stream drivers (`StdoutJsonl` and `AgentJsonlFile`) have no
+/// hook-callback wiring at all, so this returns an empty map for those arms
+/// instead of assuming a `HookCallback` that was never produced.
 fn hooks_map_for_ingress(ingress: ProgressIngress) -> serde_json::Map<String, serde_json::Value> {
     match ingress {
         ProgressIngress::HookCallback(wiring) => wiring.hooks,
-        ProgressIngress::StdoutJsonl => serde_json::Map::new(),
+        ProgressIngress::StdoutJsonl | ProgressIngress::AgentJsonlFile(_) => serde_json::Map::new(),
     }
 }
 

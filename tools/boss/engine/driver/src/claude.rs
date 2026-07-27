@@ -959,7 +959,9 @@ mod tests {
     fn expect_hook_callback(ingress: ProgressIngress) -> ProgressObservationWiring {
         match ingress {
             ProgressIngress::HookCallback(wiring) => wiring,
-            ProgressIngress::StdoutJsonl => panic!("ClaudeDriver must produce HookCallback wiring"),
+            ProgressIngress::StdoutJsonl | ProgressIngress::AgentJsonlFile(_) => {
+                panic!("ClaudeDriver must produce HookCallback wiring")
+            }
         }
     }
 

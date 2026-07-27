@@ -23,6 +23,47 @@ use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionN
 
 const MAX_TRACKED_ROLLOUT_CALLS: usize = 256;
 
+#[derive(Clone)]
+pub(super) struct RolloutToolCall {
+    tool_name: String,
+    tool_input: Value,
+}
+
+fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>) -> Option<(String, RolloutToolCall)> {
+    if !matches!(item_type, "custom_tool_call" | "function_call") {
+        return None;
+    }
+    let call_id = payload.get("call_id")?.as_str()?.to_owned();
+    let provider_name = payload.get("name")?.as_str()?;
+    let raw_input = payload
+        .get("input")
+        .or_else(|| payload.get("arguments"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let parsed_input = match raw_input {
+        Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+        other => other,
+    };
+
+    let (tool_name, tool_input) = match provider_name {
+        "exec" | "exec_command" => {
+            let command = parsed_input
+                .get("cmd")
+                .or_else(|| parsed_input.get("command"))
+                .cloned()
+                .or_else(|| parsed_input.as_str().map(|value| Value::String(value.to_owned())))
+                .unwrap_or(parsed_input);
+            ("Bash".to_owned(), json!({"command": command}))
+        }
+        other => (other.to_owned(), parsed_input),
+    };
+    Some((call_id, RolloutToolCall { tool_name, tool_input }))
+}
+
+fn is_rollout_tool_output(item_type: &str) -> bool {
+    matches!(item_type, "custom_tool_call_output" | "function_call_output")
+}
+
 /// Mutable state owned by one stdout reader.
 ///
 /// `current_thread_id` never lives on the registry's shared driver.
@@ -240,6 +281,222 @@ impl ProgressSessionNormalizer for CodexProgressSession {
 
     fn transcript_path_for_session(&mut self, raw: &Value) -> Option<String> {
         self.transcript_path(raw)
+    }
+}
+
+/// Mutable state owned by one rollout-file reader.
+///
+/// Rollout records carry the thread id only on `session_meta`, and tool
+/// outputs carry only a `call_id`. Keeping both correlations inside the
+/// reader-owned session prevents concurrent Codex runs from sharing state.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+pub(super) struct CodexRolloutProgressSession {
+    current_thread_id: Option<String>,
+    run_id: Option<String>,
+    identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+    transcript_path: Option<PathBuf>,
+    calls: HashMap<String, RolloutToolCall>,
+    call_order: VecDeque<String>,
+    turn_terminal: bool,
+}
+
+impl CodexRolloutProgressSession {
+    pub(super) fn new(
+        run_id: Option<String>,
+        identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+        transcript_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            current_thread_id: None,
+            run_id,
+            identity_store,
+            transcript_path,
+            calls: HashMap::new(),
+            call_order: VecDeque::new(),
+            turn_terminal: false,
+        }
+    }
+
+    fn classify_thread_start(&self, thread_id: &str) -> SessionStartSource {
+        let (Some(run_id), Some(identity_store)) = (self.run_id.as_deref(), self.identity_store.as_deref()) else {
+            return SessionStartSource::Startup;
+        };
+        match identity_store.claim_progress_identity(run_id, thread_id) {
+            Ok(true) => SessionStartSource::Resume,
+            Ok(false) => SessionStartSource::Startup,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    %err,
+                    "codex rollout: could not persist engine-owned thread identity"
+                );
+                SessionStartSource::Startup
+            }
+        }
+    }
+
+    fn remember_call(&mut self, call_id: String, call: RolloutToolCall) {
+        if let std::collections::hash_map::Entry::Occupied(mut existing) = self.calls.entry(call_id.clone()) {
+            existing.insert(call);
+            return;
+        }
+        while self.calls.len() >= MAX_TRACKED_ROLLOUT_CALLS {
+            let Some(oldest) = self.call_order.pop_front() else {
+                break;
+            };
+            self.calls.remove(&oldest);
+        }
+        self.calls.insert(call_id.clone(), call);
+        self.call_order.push_back(call_id);
+    }
+
+    fn take_call(&mut self, call_id: &str) -> Option<RolloutToolCall> {
+        let call = self.calls.remove(call_id)?;
+        if let Some(index) = self.call_order.iter().position(|known| known == call_id) {
+            self.call_order.remove(index);
+        }
+        Some(call)
+    }
+
+    fn session_id(&self) -> Result<String, NormalizeError> {
+        self.current_thread_id
+            .clone()
+            .ok_or(NormalizeError::MissingField("session_meta.payload.id"))
+    }
+
+    fn normalize_events(&mut self, raw: &Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
+        let obj = raw
+            .as_object()
+            .ok_or_else(|| NormalizeError::Malformed("expected Codex rollout JSON object".into()))?;
+        let record_type = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(NormalizeError::MissingField("type"))?;
+        let payload = obj
+            .get("payload")
+            .and_then(Value::as_object)
+            .ok_or(NormalizeError::MissingField("payload"))?;
+
+        match record_type {
+            "session_meta" => {
+                let thread_id = payload
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or(NormalizeError::MissingField("payload.id"))?;
+                let source = self.classify_thread_start(thread_id);
+                self.current_thread_id = Some(thread_id.to_owned());
+                self.turn_terminal = false;
+                self.calls.clear();
+                self.call_order.clear();
+                Ok(vec![WorkerEvent::SessionStart {
+                    session_id: thread_id.to_owned(),
+                    source,
+                    model: None,
+                }])
+            }
+            "event_msg" => {
+                let event_type = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or(NormalizeError::MissingField("payload.type"))?;
+                let session_id = self.session_id()?;
+                match event_type {
+                    "task_started" => {
+                        self.turn_terminal = false;
+                        Ok(vec![WorkerEvent::UserPromptSubmit {
+                            session_id,
+                            prompt: String::new(),
+                        }])
+                    }
+                    "task_complete" if !self.turn_terminal => {
+                        self.turn_terminal = true;
+                        Ok(vec![WorkerEvent::Stop {
+                            session_id,
+                            stop_hook_active: false,
+                            stop_reason: StopReason::Completed,
+                        }])
+                    }
+                    "task_complete" => Err(NormalizeError::UnknownEvent(
+                        "duplicate rollout task_complete".to_owned(),
+                    )),
+                    "turn_aborted" if !self.turn_terminal => {
+                        self.turn_terminal = true;
+                        let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
+                        Ok(vec![
+                            WorkerEvent::Notification {
+                                session_id: session_id.clone(),
+                                message: format!("turn aborted: {reason}"),
+                            },
+                            WorkerEvent::Stop {
+                                session_id,
+                                stop_hook_active: false,
+                                stop_reason: StopReason::Other,
+                            },
+                        ])
+                    }
+                    "turn_aborted" => Err(NormalizeError::UnknownEvent(
+                        "duplicate rollout turn_aborted".to_owned(),
+                    )),
+                    _ => Err(NormalizeError::UnknownEvent(format!("event_msg/{event_type}"))),
+                }
+            }
+            "response_item" => {
+                let item_type = payload
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .ok_or(NormalizeError::MissingField("payload.type"))?;
+                let session_id = self.session_id()?;
+                if let Some((call_id, call)) = canonical_rollout_tool_call(item_type, payload) {
+                    let event = WorkerEvent::PreToolUse {
+                        session_id,
+                        tool_name: call.tool_name.clone(),
+                        tool_input: call.tool_input.clone(),
+                    };
+                    self.remember_call(call_id, call);
+                    return Ok(vec![event]);
+                }
+                if is_rollout_tool_output(item_type) {
+                    let call_id = payload
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .ok_or(NormalizeError::MissingField("payload.call_id"))?;
+                    let call = self.take_call(call_id).ok_or_else(|| {
+                        NormalizeError::UnknownEvent(format!("unmatched rollout tool output {call_id}"))
+                    })?;
+                    return Ok(vec![WorkerEvent::PostToolUse {
+                        session_id,
+                        tool_name: call.tool_name,
+                        tool_input: call.tool_input,
+                        // Preserve the rollout dialect's exact `payload.output`
+                        // value. Codex's PR capture override flattens the
+                        // observed string/array forms without pretending this
+                        // is stdout's `aggregated_output`.
+                        tool_response: payload.get("output").cloned().unwrap_or(Value::Null),
+                    }]);
+                }
+                Err(NormalizeError::UnknownEvent(format!("response_item/{item_type}")))
+            }
+            _ => Err(NormalizeError::UnknownEvent(record_type.to_owned())),
+        }
+    }
+}
+
+impl ProgressSessionNormalizer for CodexRolloutProgressSession {
+    fn normalize_progress_event(&mut self, raw: &Value) -> Result<WorkerEvent, NormalizeError> {
+        self.normalize_events(raw)?
+            .pop()
+            .ok_or_else(|| NormalizeError::UnknownEvent("empty rollout event batch".to_owned()))
+    }
+
+    fn normalize_progress_events(&mut self, raw: &Value) -> Result<Vec<WorkerEvent>, NormalizeError> {
+        self.normalize_events(raw)
+    }
+
+    fn transcript_path_for_session(&mut self, _raw: &Value) -> Option<String> {
+        self.transcript_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned())
     }
 }
 
@@ -512,7 +769,7 @@ pub(super) fn normalize_rollout(raw: Value) -> Value {
 
 #[derive(Default)]
 pub(super) struct CodexTranscriptSession {
-    exec_inputs: HashMap<String, Value>,
+    tool_calls: HashMap<String, RolloutToolCall>,
     exec_order: VecDeque<String>,
 }
 
@@ -547,60 +804,58 @@ impl CodexTranscriptSession {
         }
     }
 
-    fn remember_exec(&mut self, call_id: &str, input: Value) {
-        if self.exec_inputs.contains_key(call_id) {
-            self.exec_inputs.insert(call_id.to_owned(), input);
+    fn remember_exec(&mut self, call_id: &str, call: RolloutToolCall) {
+        if let std::collections::hash_map::Entry::Occupied(mut existing) = self.tool_calls.entry(call_id.to_owned()) {
+            existing.insert(call);
             return;
         }
-        while self.exec_inputs.len() >= MAX_TRACKED_ROLLOUT_CALLS {
+        while self.tool_calls.len() >= MAX_TRACKED_ROLLOUT_CALLS {
             let Some(oldest) = self.exec_order.pop_front() else {
                 break;
             };
-            self.exec_inputs.remove(&oldest);
+            self.tool_calls.remove(&oldest);
         }
-        self.exec_inputs.insert(call_id.to_owned(), input);
+        self.tool_calls.insert(call_id.to_owned(), call);
         self.exec_order.push_back(call_id.to_owned());
     }
 
-    fn take_exec(&mut self, call_id: &str) -> Option<Value> {
-        let input = self.exec_inputs.remove(call_id)?;
+    fn take_exec(&mut self, call_id: &str) -> Option<RolloutToolCall> {
+        let call = self.tool_calls.remove(call_id)?;
         if let Some(index) = self.exec_order.iter().position(|known| known == call_id) {
             self.exec_order.remove(index);
         }
-        Some(input)
+        Some(call)
     }
 
     fn normalize_rollout_response_item(&mut self, item_type: &str, payload: &Map<String, Value>) -> Option<Value> {
-        match item_type {
-            "custom_tool_call" if payload.get("name").and_then(Value::as_str) == Some("exec") => {
-                let call_id = payload.get("call_id")?.as_str()?;
-                let input = json!({"command": payload.get("input")?.as_str()?});
-                self.remember_exec(call_id, input.clone());
-                Some(json!({
-                    "type":"assistant",
-                    "content":[{
-                        "type":"tool_use",
-                        "name":"Bash",
-                        "input":input,
-                    }]
-                }))
-            }
-            "custom_tool_call_output" => {
-                let call_id = payload.get("call_id")?.as_str()?;
-                let Some(tool_input) = self.take_exec(call_id) else {
-                    tracing::debug!(call_id, "codex rollout: omitting unmatched custom tool output body");
-                    return Some(json!({"type":"system"}));
-                };
-                Some(json!({
-                    "type":"user",
-                    "tool_name":"Bash",
-                    "tool_input":tool_input,
-                    "tool_response":payload.get("output").cloned().unwrap_or(Value::Null),
-                }))
-            }
-            "message" => normalize_rollout_message(payload),
-            _ => None,
+        if let Some((call_id, call)) = canonical_rollout_tool_call(item_type, payload) {
+            let normalized = json!({
+                "type":"assistant",
+                "content":[{
+                    "type":"tool_use",
+                    "name":call.tool_name,
+                    "input":call.tool_input,
+                }]
+            });
+            self.remember_exec(&call_id, call);
+            return Some(normalized);
         }
+        if is_rollout_tool_output(item_type) {
+            let call_id = payload.get("call_id")?.as_str()?;
+            let Some(call) = self.take_exec(call_id) else {
+                tracing::debug!(call_id, "codex rollout: omitting unmatched tool output body");
+                return Some(json!({"type":"system"}));
+            };
+            return Some(json!({
+                "type":"user",
+                "tool_name":call.tool_name,
+                "tool_input":call.tool_input,
+                "tool_response":payload.get("output").cloned().unwrap_or(Value::Null),
+            }));
+        }
+        (item_type == "message")
+            .then(|| normalize_rollout_message(payload))
+            .flatten()
     }
 }
 
@@ -1000,6 +1255,154 @@ mod tests {
             output["tool_response"],
             json!([{"type":"input_text","text":"rollout\n"}])
         );
+    }
+
+    #[test]
+    fn real_rollout_dialect_maps_directly_to_ordered_worker_milestones() {
+        let mut session = CodexRolloutProgressSession::new(
+            Some("run-real".into()),
+            None,
+            Some(PathBuf::from("/tmp/rollout-real.jsonl")),
+        );
+        let records = [
+            json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-real","cwd":"/tmp/workspace"}
+            }),
+            json!({
+                "type":"event_msg",
+                "payload":{"type":"task_started","turn_id":"turn-real"}
+            }),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"exec_command",
+                    "call_id":"call-real",
+                    "arguments":r#"{"cmd":"gh pr create --title test"}"#
+                }
+            }),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-real",
+                    "output":"https://github.com/example/repo/pull/7\n"
+                }
+            }),
+            json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"task_complete",
+                    "turn_id":"turn-real",
+                    "last_agent_message":"done"
+                }
+            }),
+        ];
+        let events = records
+            .iter()
+            .flat_map(|record| session.normalize_progress_events(record).unwrap())
+            .collect::<Vec<_>>();
+
+        assert!(matches!(
+            &events[0],
+            WorkerEvent::SessionStart { session_id, .. } if session_id == "thread-real"
+        ));
+        assert!(matches!(
+            &events[1],
+            WorkerEvent::UserPromptSubmit { session_id, .. } if session_id == "thread-real"
+        ));
+        assert_eq!(
+            events[2],
+            WorkerEvent::PreToolUse {
+                session_id: "thread-real".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command":"gh pr create --title test"}),
+            }
+        );
+        assert_eq!(
+            events[3],
+            WorkerEvent::PostToolUse {
+                session_id: "thread-real".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command":"gh pr create --title test"}),
+                tool_response: json!("https://github.com/example/repo/pull/7\n"),
+            }
+        );
+        assert_eq!(
+            events[4],
+            WorkerEvent::Stop {
+                session_id: "thread-real".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Completed,
+            }
+        );
+        assert_eq!(
+            session.transcript_path_for_session(&records[4]).as_deref(),
+            Some("/tmp/rollout-real.jsonl")
+        );
+    }
+
+    #[test]
+    fn rollout_custom_tool_variant_and_abort_preserve_ordered_fanout() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-custom","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call-custom",
+                    "input":"printf custom"
+                }
+            }))
+            .unwrap();
+        let post = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-custom",
+                    "output":[{"type":"input_text","text":"custom\n"}]
+                }
+            }))
+            .unwrap();
+        assert!(matches!(
+            &post[0],
+            WorkerEvent::PostToolUse {
+                tool_name,
+                tool_response,
+                ..
+            } if tool_name == "Bash" && tool_response.is_array()
+        ));
+
+        let terminal = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"turn_aborted","reason":"interrupted"}
+            }))
+            .unwrap();
+        assert!(matches!(&terminal[0], WorkerEvent::Notification { .. }));
+        assert!(matches!(
+            &terminal[1],
+            WorkerEvent::Stop {
+                stop_reason: StopReason::Other,
+                ..
+            }
+        ));
+        assert!(matches!(
+            session.normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete"}
+            })),
+            Err(NormalizeError::UnknownEvent(_))
+        ));
     }
 
     #[test]

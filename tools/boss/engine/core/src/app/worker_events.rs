@@ -41,10 +41,10 @@ fn worker_event_kind(event: &crate::protocol::WorkerEvent) -> &'static str {
 }
 
 /// The engine's [`crate::stdout_progress::WorkerEventSink`]: a
-/// `ProgressIngress::StdoutJsonl` driver's progress lands here and takes the
-/// identical fan-out the events-socket accept loop takes for a
+/// A byte-stream driver's progress (`StdoutJsonl` or `AgentJsonlFile`) lands
+/// here and takes the identical fan-out the events-socket accept loop takes for a
 /// `ProgressIngress::HookCallback` driver. This impl is the whole of the
-/// stdout arm's engine-side behaviour — everything downstream of it is shared
+/// byte-stream arm's engine-side behaviour — everything downstream is shared
 /// with the hook path, by construction.
 /// Implemented on `Arc<ServerState>` rather than `ServerState` because the
 /// fan-out's handlers clone the `Arc` into spawned work; `&self` is then
@@ -66,8 +66,8 @@ impl crate::stdout_progress::WorkerEventSink for Arc<ServerState> {
 /// Transport-agnostic on purpose. Both progress ingresses converge here:
 /// [`crate::events_socket`] (a `ProgressIngress::HookCallback` driver's
 /// `boss-event` shim over the unix socket) and
-/// [`crate::stdout_progress`] (a `ProgressIngress::StdoutJsonl` driver's
-/// stdout stream). By the time an event reaches this function the driver has
+/// [`crate::stdout_progress`] (a byte-stream driver's stdout or rollout
+/// stream). By the time an event reaches this function the driver has
 /// already normalised it, so which transport carried it is no longer
 /// observable — which is exactly the property that makes live-status, the
 /// staleness sweeps, and the kanban see the same shapes from either one.
@@ -333,8 +333,8 @@ pub(super) async fn dispatch_live_worker_state(
         // the free-text slice (and command string) via
         // `AgentDriver::pr_url_capture_feed` — Claude from the
         // PostToolUse `tool_response.{stdout,stderr}` object,
-        // Codex from `command_execution.aggregated_output` on the
-        // stdout-JSONL stream. The engine then runs the *shared*
+        // Codex from the correlated rollout
+        // `response_item.payload.output` value. The engine then runs the *shared*
         // regex + command gates and stages against the
         // execution_id so the on-Stop handler picks it up without
         // shelling out to `jj log` or polling GitHub for the

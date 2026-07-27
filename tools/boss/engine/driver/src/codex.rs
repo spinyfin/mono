@@ -26,15 +26,19 @@ use serde::{Deserialize, Serialize};
 
 mod progress;
 
-use progress::{CodexProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
+use progress::{
+    CodexProgressSession, CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout,
+    verified_sessions_root,
+};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, ModelMenu,
-    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
-    ProgressSessionConfig, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, StructuredOutputArtifacts,
-    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
-    TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
+    ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity, ProgressIngress,
+    ProgressObservationConfig, ProgressSessionConfig, ProgressSessionNormalizer, ProgressStreamSource, SpawnPlan,
+    SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind,
+    default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -133,7 +137,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// the mechanism this session uses.
 const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
-     via the Codex `exec --json` event stream.\n\
+     via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
      strong stated justification.";
@@ -711,6 +715,20 @@ fn which_codex() -> Option<PathBuf> {
     }
 }
 
+fn rollout_output_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(rollout_output_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        serde_json::Value::Object(object) => object.get("text").map(rollout_output_text).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CodexDriver
 // ---------------------------------------------------------------------------
@@ -815,6 +833,8 @@ impl AgentDriver for CodexDriver {
             .with_context(|| format!("resolving Boss-owned CODEX_HOME for run_id {run_id:?}"))?;
         fs::create_dir_all(&codex_home)
             .with_context(|| format!("creating Boss-owned CODEX_HOME {}", codex_home.display()))?;
+        fs::create_dir_all(codex_home.join("sessions"))
+            .with_context(|| format!("creating Codex sessions directory under {}", codex_home.display()))?;
 
         // Auth: SnapshotWithRefreshAdoption. Source is the operator auth
         // discovery path (or BOSS_CODEX_AUTH_SOURCE when set for tests);
@@ -978,20 +998,21 @@ impl AgentDriver for CodexDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(&self, _config: &ProgressObservationConfig) -> ProgressIngress {
-        // Progress channel is stdout JSONL (`codex exec --json`), not hooks
-        // (codex-progress-channel-decision-2026-07-24). Hooks remain the
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
+        // Pane-hosted Codex stdout belongs to Ghostty's pty master; the engine
+        // cannot read it from `shell_pid`. Codex independently writes a raw
+        // rollout JSONL under the run-private CODEX_HOME, so the engine tails
+        // that file and feeds it to the generic JSONL reader. Hooks remain the
         // ToolUseInterception transport only.
-        //
-        // **Transport premise (ghostty pane-viability Q1):** `StdoutJsonl` is
-        // valid only when the engine (or an observer that owns the stream)
-        // holds the worker's stdout — e.g. engine-spawned `codex exec --json`
-        // with a pipe, or a file channel such as the rollout. An outsider
-        // process that holds only `shell_pid` under an app-owned Ghostty pty
-        // reads zero bytes. Do not assume pane attach hands the engine a
-        // readable stdout stream. Pane-to-engine progress handoff is seam 5
-        // (undecided); this row spawns without claiming end-to-end observation.
-        ProgressIngress::StdoutJsonl
+        let directory = codex_home_for_run(&config.run_id)
+            .unwrap_or_else(|_| codex_homes_root().join("__invalid_run__"))
+            .join("sessions");
+        ProgressIngress::AgentJsonlFile(AgentJsonlFileIngress {
+            directory,
+            filename_prefix: "rollout-".to_owned(),
+            filename_suffix: ".jsonl".to_owned(),
+            workspace_path: config.workspace_path.clone(),
+        })
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
@@ -1012,12 +1033,19 @@ impl AgentDriver for CodexDriver {
                     None
                 }
             });
-        Some(Box::new(CodexProgressSession::new(
-            codex_home,
-            Some(homes_root),
-            config.run_id.clone(),
-            config.identity_store.clone(),
-        )))
+        match config.source {
+            ProgressStreamSource::StdoutJsonl => Some(Box::new(CodexProgressSession::new(
+                codex_home,
+                Some(homes_root),
+                config.run_id.clone(),
+                config.identity_store.clone(),
+            ))),
+            ProgressStreamSource::AgentJsonlFile => Some(Box::new(CodexRolloutProgressSession::new(
+                config.run_id.clone(),
+                config.identity_store.clone(),
+                config.transcript_path.clone(),
+            ))),
+        }
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
@@ -1054,6 +1082,32 @@ impl AgentDriver for CodexDriver {
         ToolUseInterceptionWiring {
             pre_tool_use_hooks: Vec::new(),
         }
+    }
+
+    fn pr_url_capture_feed(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        tool_response: &serde_json::Value,
+    ) -> Option<PrUrlCaptureFeed> {
+        if tool_name != "Bash" {
+            return None;
+        }
+        let command = tool_input
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| tool_input.as_str())
+            .unwrap_or("")
+            .to_owned();
+        Some(PrUrlCaptureFeed {
+            // Rollout tool completion is
+            // `response_item.payload.output`, observed as either a string
+            // (`function_call_output`) or text-content array
+            // (`custom_tool_call_output`). Keep extraction here, rather than
+            // pretending the value is stdout's `aggregated_output`.
+            output_text: rollout_output_text(tool_response),
+            command,
+        })
     }
 
     fn agent_rules_preamble(&self) -> &'static str {
@@ -1435,7 +1489,7 @@ else:
     }
 
     #[test]
-    fn codex_progress_ingress_is_stdout_jsonl() {
+    fn codex_progress_ingress_is_run_correlated_rollout_jsonl() {
         let config = ProgressObservationConfig {
             events_socket_path: PathBuf::from("/tmp/events.sock"),
             lease_id: "lease".into(),
@@ -1445,10 +1499,53 @@ else:
         };
         let driver = CodexDriver::default();
         match driver.progress_observation_wiring(&config) {
-            ProgressIngress::StdoutJsonl => {}
-            ProgressIngress::HookCallback(_) => panic!("Codex progress is StdoutJsonl, not hooks"),
+            ProgressIngress::AgentJsonlFile(file) => {
+                assert_eq!(file.directory, codex_home_for_run("run").unwrap().join("sessions"));
+                assert_eq!(file.workspace_path, PathBuf::from("/ws"));
+                assert_eq!(file.filename_prefix, "rollout-");
+                assert_eq!(file.filename_suffix, ".jsonl");
+            }
+            ProgressIngress::StdoutJsonl | ProgressIngress::HookCallback(_) => {
+                panic!("Codex progress must use the rollout file, not pane stdout or hooks")
+            }
         }
         assert_eq!(driver.progress_fidelity(), ProgressFidelity::Rich);
+    }
+
+    #[test]
+    fn codex_pr_capture_reads_rollout_payload_output_shapes() {
+        let driver = CodexDriver::default();
+        let input = serde_json::json!({"command":"gh pr create --title rollout"});
+
+        let function_output = driver
+            .pr_url_capture_feed(
+                "Bash",
+                &input,
+                &serde_json::json!("https://github.com/example/repo/pull/41\n"),
+            )
+            .unwrap();
+        assert_eq!(function_output.command, "gh pr create --title rollout");
+        assert_eq!(function_output.output_text, "https://github.com/example/repo/pull/41\n");
+
+        let custom_output = driver
+            .pr_url_capture_feed(
+                "Bash",
+                &input,
+                &serde_json::json!([
+                    {"type":"input_text","text":"created"},
+                    {"type":"input_text","text":"https://github.com/example/repo/pull/42"}
+                ]),
+            )
+            .unwrap();
+        assert_eq!(
+            custom_output.output_text,
+            "created\nhttps://github.com/example/repo/pull/42"
+        );
+        assert!(
+            driver
+                .pr_url_capture_feed("Read", &input, &serde_json::json!("ignored"))
+                .is_none()
+        );
     }
 
     #[test]
