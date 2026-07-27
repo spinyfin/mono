@@ -1,7 +1,8 @@
-//! Stdout-JSONL progress ingress: the reader behind
-//! [`boss_engine_driver::ProgressIngress::StdoutJsonl`].
+//! Generic JSONL progress reader behind
+//! [`boss_engine_driver::ProgressIngress::StdoutJsonl`] and
+//! [`boss_engine_driver::ProgressIngress::AgentJsonlFile`].
 //!
-//! Boss has exactly two progress transports (see
+//! Boss has three progress transports (see
 //! `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`):
 //!
 //! - **`HookCallback`** — Claude's settings-file hooks fan every lifecycle/tool
@@ -10,7 +11,12 @@
 //!   and is untouched by this crate.
 //! - **`StdoutJsonl`** — the worker process itself emits one JSON envelope per
 //!   line on stdout. Nothing forwards it; the engine has to read the stream.
-//!   That is this crate.
+//! - **`AgentJsonlFile`** — a pane-hosted worker writes raw JSONL to a
+//!   run-private file. The engine tails the file because it does not own the
+//!   pane's pty master.
+//!
+//! Both byte-stream transports use this crate. Their provider dialect stays
+//! in the driver-owned per-reader session normalizer.
 //!
 //! Without this reader a hookless driver has no progress signal at all: the
 //! socket ingress is only ever fed by a Claude hook, so a Codex worker would
@@ -216,8 +222,19 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
             ProgressSessionConfig {
                 run_id: Some(run_id.into()),
                 identity_store,
+                ..ProgressSessionConfig::default()
             },
         )
+    }
+
+    /// Wrap a run-correlated JSONL stream with an explicit provider source
+    /// and transcript path.
+    ///
+    /// File-backed rollout ingress uses this entry point so the driver creates
+    /// its rollout-dialect session normalizer. Framing, anomaly handling, line
+    /// bounds, and ordered batch delivery remain this same reader.
+    pub fn for_session(stream: R, driver: Arc<dyn AgentDriver>, session_config: ProgressSessionConfig) -> Self {
+        Self::with_config_and_session(stream, driver, ReaderConfig::default(), session_config)
     }
 
     /// [`Self::new`] with an explicit config.

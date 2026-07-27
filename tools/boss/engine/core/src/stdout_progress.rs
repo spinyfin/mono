@@ -3,12 +3,13 @@
 //! [`crate::events_socket`] is the ingress for a
 //! [`crate::driver::ProgressIngress::HookCallback`] driver: its worker's hooks
 //! fire the `boss-event` shim, which forwards each payload over the unix
-//! events socket. A [`crate::driver::ProgressIngress::StdoutJsonl`] driver has
-//! no shim and no hooks — its worker writes one JSON envelope per line to its
-//! own stdout and nothing forwards it. Without something reading that stream
-//! such a worker emits no progress at all: it never leaves `Spawning`, the
-//! staleness sweep sees no cadence, and no `Stop` ever reaches the completion
-//! handler.
+//! events socket. Byte-stream drivers have no progress shim or progress hooks:
+//! engine-owned processes use [`crate::driver::ProgressIngress::StdoutJsonl`],
+//! while pane-hosted Codex uses
+//! [`crate::driver::ProgressIngress::AgentJsonlFile`] because Ghostty owns the
+//! pty master. Without something reading the selected stream such a worker
+//! emits no progress at all: it never leaves `Spawning`, the staleness sweep
+//! sees no cadence, and no `Stop` ever reaches the completion handler.
 //!
 //! This module is the engine side of that reader. The framing, parsing, and
 //! tolerance machinery lives in [`boss_engine_stdout_progress`]; here we
@@ -17,7 +18,7 @@
 //! produces, and hand it to a [`WorkerEventSink`]. The engine's sink is
 //! `ServerState`, whose implementation calls the identical dispatch fan-out
 //! the socket accept loop calls — so both transports drive one activity
-//! machine over one code path, and the stdout arm is an additional ingress
+//! machine over one code path, and each byte-stream arm is an additional ingress
 //! rather than a parallel implementation.
 //!
 //! **Claude is unaffected.** `ClaudeDriver` is a `HookCallback` driver; its
@@ -26,12 +27,10 @@
 //!
 //! # What is not here
 //!
-//! Nothing in the engine currently spawns a worker whose stdout it owns —
-//! workers run in libghostty panes hosted by the app, and the only registered
-//! driver is Claude. [`run_stdout_progress_ingress`] is therefore generic over
-//! [`AsyncRead`]: a child process's `ChildStdout`, an SSH channel, or a test
-//! pipe all attach unchanged once a `StdoutJsonl` driver and a spawn path that
-//! can hand over a stream exist.
+//! [`run_stdout_progress_ingress`] remains generic over [`AsyncRead`] for
+//! engine-owned child stdout, SSH channels, and tests. Production pane-hosted
+//! Codex uses [`crate::agent_jsonl_progress`] to expose the growing rollout
+//! file as that same `AsyncRead`; it does not redirect or scrape pane output.
 
 use std::sync::Arc;
 
@@ -158,13 +157,68 @@ where
     R: AsyncRead + Unpin,
     S: WorkerEventSink + ?Sized,
 {
+    run_jsonl_progress_ingress_in(
+        registry,
+        run_id,
+        driver_slug,
+        stream,
+        sink,
+        crate::driver::ProgressSessionConfig {
+            run_id: Some(run_id.to_owned()),
+            identity_store: sink.progress_identity_store(),
+            ..crate::driver::ProgressSessionConfig::default()
+        },
+    )
+    .await
+}
+
+/// Shared JSONL ingress used by both process-owned stdout and agent rollout
+/// files. `session_config.source` selects the driver's dialect normalizer;
+/// framing and fan-out are identical.
+pub async fn run_jsonl_progress_ingress_in<R, S>(
+    registry: &crate::driver::DriverRegistry,
+    run_id: &str,
+    driver_slug: &str,
+    stream: R,
+    sink: &S,
+    session_config: crate::driver::ProgressSessionConfig,
+) -> Result<ReaderStats, UnknownDriverError>
+where
+    R: AsyncRead + Unpin,
+    S: WorkerEventSink + ?Sized,
+{
     let driver = registry
         .get(driver_slug)
         .ok_or_else(|| UnknownDriverError(driver_slug.to_owned()))?
         .clone();
-    tracing::info!(run_id, driver = driver_slug, "stdout progress: ingress started");
+    Ok(run_jsonl_progress_ingress_with_driver(run_id, driver_slug, driver, stream, sink, session_config).await)
+}
 
-    let mut reader = StdoutJsonlProgressReader::for_run(stream, driver.clone(), run_id, sink.progress_identity_store());
+/// Shared JSONL ingress with an already resolved run driver.
+///
+/// File-ingress preparation carries the exact `Arc<dyn AgentDriver>` used by
+/// provision/spawn, so it uses this path rather than resolving a second
+/// registry instance after the pane is live.
+pub async fn run_jsonl_progress_ingress_with_driver<R, S>(
+    run_id: &str,
+    driver_slug: &str,
+    driver: std::sync::Arc<dyn crate::driver::AgentDriver>,
+    stream: R,
+    sink: &S,
+    session_config: crate::driver::ProgressSessionConfig,
+) -> ReaderStats
+where
+    R: AsyncRead + Unpin,
+    S: WorkerEventSink + ?Sized,
+{
+    tracing::info!(
+        run_id,
+        driver = driver_slug,
+        source = ?session_config.source,
+        "jsonl progress: ingress started"
+    );
+
+    let mut reader = StdoutJsonlProgressReader::for_session(stream, driver.clone(), session_config);
     let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {
@@ -212,9 +266,9 @@ where
         oversized_lines = stats.oversized_lines,
         unterminated_tails = stats.unterminated_tails,
         ended_with_io_error = stats.ended_with_io_error,
-        "stdout progress: ingress ended",
+        "jsonl progress: ingress ended",
     );
-    Ok(stats)
+    stats
 }
 
 #[cfg(test)]

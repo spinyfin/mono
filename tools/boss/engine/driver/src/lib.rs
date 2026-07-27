@@ -750,8 +750,23 @@ pub struct ProgressObservationWiring {
     pub hooks: serde_json::Map<String, serde_json::Value>,
 }
 
+/// A run-correlated JSONL file source owned by the engine.
+///
+/// `directory` is a driver-resolved, run-private root. The engine snapshots
+/// matching files before pane spawn, then accepts exactly one new file whose
+/// `session_meta.payload.cwd` matches `workspace_path`. That two-part
+/// correlation prevents a stale transcript from an earlier process from
+/// being attached to the current execution.
+#[derive(Debug, Clone)]
+pub struct AgentJsonlFileIngress {
+    pub directory: PathBuf,
+    pub filename_prefix: String,
+    pub filename_suffix: String,
+    pub workspace_path: PathBuf,
+}
+
 /// The transport a driver's [`Capability::ProgressObservation`] event source
-/// rides. Two disjoint transports exist (see
+/// rides. Three disjoint transports exist (see
 /// `tools/boss/docs/investigations/codex-progress-channel-decision-2026-07-24.md`):
 ///
 /// - Claude wires a hooks map ([`ProgressObservationWiring`]) that fans every
@@ -760,27 +775,36 @@ pub struct ProgressObservationWiring {
 /// - Codex has no equally robust hook signal for *progress*: its hook trust
 ///   model fails open and silently on an untrusted/misconfigured hook (no
 ///   error, no log line — reproduction 2 in the decision doc), which is
-///   disqualifying for a liveness signal specifically. Its worker process
-///   instead emits a `stdout` JSONL stream (`thread.started` → `turn.started`
-///   → `item.started`/`item.completed` → `turn.completed`) that a reader
-///   parses and feeds to [`AgentDriver::normalize_progress_event`]. That
-///   reader is `boss_engine_stdout_progress`, attached to the engine's
-///   activity machine by `boss_engine::stdout_progress`; a driver that
-///   selects this variant has no settings-file hook wiring to merge.
+///   disqualifying for a liveness signal specifically. Engine-spawned
+///   processes can use their raw stdout JSONL. Pane-hosted Codex workers use
+///   the run-private rollout JSONL file instead, because the engine does not
+///   own Ghostty's pty master. Both byte streams feed the same generic JSONL
+///   reader and shared event fan-out; only their driver normalizers differ.
 ///
-/// A driver without hook-callback wiring returns [`Self::StdoutJsonl`] here
-/// rather than an empty [`ProgressObservationWiring`] — the absence of hooks
-/// is a distinct, named transport, not a degenerate case of the hook one.
+/// A driver without hook-callback wiring returns the appropriate byte-stream
+/// arm here rather than an empty [`ProgressObservationWiring`] — the absence
+/// of hooks is a distinct, named transport, not a degenerate hook case.
 #[derive(Debug, Clone)]
 pub enum ProgressIngress {
     /// Claude-style: a hooks map merged into the worker settings file.
     HookCallback(ProgressObservationWiring),
-    /// Codex-style: the engine reads and parses the worker's stdout JSONL
-    /// stream; no settings-file wiring is produced.
+    /// Engine-owned process: parse the worker's stdout JSONL stream; no
+    /// settings-file wiring is produced.
     StdoutJsonl,
+    /// Pane-hosted agent: the engine tails one run-correlated JSONL file and
+    /// feeds its raw bytes to the same reader used for stdout JSONL.
+    AgentJsonlFile(AgentJsonlFileIngress),
 }
 
-/// Run-scoped context supplied when a stdout progress reader starts.
+/// Which provider dialect the generic JSONL reader is consuming.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ProgressStreamSource {
+    #[default]
+    StdoutJsonl,
+    AgentJsonlFile,
+}
+
+/// Run-scoped context supplied when a JSONL progress reader starts.
 ///
 /// Stream protocols commonly omit session identity after their first
 /// envelope. Mutable correlation therefore belongs to the reader session,
@@ -790,6 +814,8 @@ pub enum ProgressIngress {
 pub struct ProgressSessionConfig {
     pub run_id: Option<String>,
     pub identity_store: Option<Arc<dyn ProgressIdentityStore>>,
+    pub source: ProgressStreamSource,
+    pub transcript_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ProgressSessionConfig {
@@ -797,6 +823,8 @@ impl std::fmt::Debug for ProgressSessionConfig {
         f.debug_struct("ProgressSessionConfig")
             .field("run_id", &self.run_id)
             .field("has_identity_store", &self.identity_store.is_some())
+            .field("source", &self.source)
+            .field("transcript_path", &self.transcript_path)
             .finish()
     }
 }
@@ -1347,7 +1375,8 @@ pub trait AgentDriver: Send + Sync {
     /// [`ProgressIngress::HookCallback`] carrying the `hooks` block routing
     /// every hook event to the `boss-event` shim, which the spawn flow merges
     /// into the worker settings; a driver with no hook-callback wiring
-    /// returns [`ProgressIngress::StdoutJsonl`] instead.
+    /// returns the byte-stream ingress appropriate to its topology
+    /// (`StdoutJsonl` or `AgentJsonlFile`) instead.
     fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress;
 
     /// Decode one raw event-source payload into a typed [`WorkerEvent`] that

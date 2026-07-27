@@ -12,6 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex, Notify, oneshot};
 
+use crate::agent_jsonl_progress::AgentJsonlProgressManager;
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
@@ -308,6 +309,30 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         );
     }
 
+    fn prepare_progress_ingress(
+        &self,
+        run_id: &str,
+        driver: Arc<dyn AgentDriver>,
+        ingress: crate::driver::ProgressIngress,
+    ) -> Result<(), String> {
+        let crate::driver::ProgressIngress::AgentJsonlFile(ingress) = ingress else {
+            return Ok(());
+        };
+        let Some(arc_self) = self._self_weak.upgrade() else {
+            return Err("ServerState already dropped".to_owned());
+        };
+        self.agent_jsonl_progress_manager
+            .prepare_run(run_id, driver, ingress, arc_self)
+    }
+
+    fn activate_progress_ingress(&self, run_id: &str) {
+        self.agent_jsonl_progress_manager.activate_run(run_id);
+    }
+
+    fn stop_progress_ingress(&self, run_id: &str) {
+        self.agent_jsonl_progress_manager.stop_run(run_id);
+    }
+
     fn draft_pr_mode(&self) -> bool {
         self.settings.is_enabled("default_pr_draft_mode")
     }
@@ -473,6 +498,11 @@ struct ServerState {
     /// when `spawn_flow` calls `start_live_status_slot`; torn down
     /// in `release_worker_pane`.
     live_status_manager: Arc<LiveStatusManager>,
+    /// One prepared/active run-correlated JSONL file source per execution.
+    /// Prepared before Ghostty launch, activated after live-slot
+    /// registration, and cancelled through `release_worker_pane`.
+    #[builder(default = Arc::new(AgentJsonlProgressManager::new()))]
+    agent_jsonl_progress_manager: Arc<AgentJsonlProgressManager>,
     /// Engine-wide counters for the hook-event dispatcher. Surfaced
     /// by the `bossctl live-status debug` verb so an operator can
     /// see at a glance whether hooks are arriving, whether their
@@ -1317,6 +1347,10 @@ impl ServerState {
     /// `WaitingForInput`, making the UI think the worker was still
     /// running.
     pub async fn release_worker_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        // A file ingress is prepared before pane spawn, so stop it even when
+        // no slot was ever mapped. Cancellation closes the source stream and
+        // lets the generic reader flush/drain without blocking teardown.
+        self.agent_jsonl_progress_manager.stop_run(run_id);
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             tracing::debug!(
                 run_id,
