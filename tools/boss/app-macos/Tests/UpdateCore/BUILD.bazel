@@ -9,6 +9,7 @@ macos_unit_test(
     size = "small",
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":update_tests_lib"],
 )
 

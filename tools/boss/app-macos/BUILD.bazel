@@ -118,6 +118,7 @@ macos_unit_test(
     size = "small",
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_comments_transcript_lib"],
 )
 
@@ -135,6 +136,7 @@ macos_unit_test(
     size = "small",
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard1_lib"],
 )
 
@@ -152,6 +154,7 @@ macos_unit_test(
     size = "small",
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard2_lib"],
 )
 
@@ -169,6 +172,7 @@ macos_unit_test(
     size = "small",
     env = XCODE_TEST_ENV,
     minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
     deps = [":boss_mac_app_tests_shard3_lib"],
 )
 

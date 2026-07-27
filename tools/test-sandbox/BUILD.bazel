@@ -2,6 +2,14 @@ load("@rules_rust//rust:defs.bzl", "rust_test")
 load("@rules_shell//shell:sh_binary.bzl", "sh_binary")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load(":defs.bzl", "network_enabled_rust_test")
+load(":macos_direct_test_runner.bzl", "macos_direct_test_runner")
+
+exports_files(["macos_direct_test_runner.template.sh"])
+
+macos_direct_test_runner(
+    name = "macos_direct_test_runner",
+    visibility = ["//visibility:public"],
+)
 
 sh_binary(
     name = "xcodebuild",
@@ -22,13 +30,13 @@ rust_test(
     name = "hermeticity_guard_test",
     size = "small",
     srcs = ["hermeticity_guard_test.rs"],
-    rustc_flags = select({
-        "@platforms//os:macos": [
-            "-l",
-            "framework=Security",
-        ],
-        "//conditions:default": [],
-    }),
+)
+
+rust_test(
+    name = "xcode_capability_guard_test",
+    size = "small",
+    srcs = ["hermeticity_guard_test.rs"],
+    env = {"MONO_TEST_XCODE_TOOLCHAIN": "1"},
 )
 
 network_enabled_rust_test(
@@ -50,5 +58,4 @@ sh_test(
         ":cleanup_child",
         ":hermetic_test_wrapper",
     ],
-    env = {"MONO_TEST_WRAPPER_META_TEST": "1"},
 )

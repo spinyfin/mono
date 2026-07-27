@@ -5,6 +5,26 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::Path;
 use std::process::Command;
 
+fn assert_write_denied(path: &Path) {
+    match OpenOptions::new().write(true).create_new(true).open(path) {
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) => {}
+        Err(error) => {
+            panic!(
+                "outside-sandbox write to {} failed for an incidental reason instead of sandbox denial: {error}",
+                path.display()
+            )
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(path);
+            panic!("the test sandbox unexpectedly allowed a write to {}", path.display());
+        }
+    }
+}
+
 #[test]
 fn credentials_and_host_tools_are_not_in_the_test_environment() {
     for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "GH_TOKEN"] {
@@ -82,16 +102,20 @@ fn keychain_files_and_securityd_ipc_are_denied() {
         "security failed for an incidental reason: {error}"
     );
 
+    const BOOTSTRAP_NOT_PRIVILEGED: i32 = 1100;
     unsafe extern "C" {
-        fn SecKeychainCopyDefault(keychain: *mut *mut std::ffi::c_void) -> i32;
+        static bootstrap_port: u32;
+        fn bootstrap_look_up(bootstrap_port: u32, service_name: *const std::ffi::c_char, service: *mut u32) -> i32;
     }
-    let mut keychain = std::ptr::null_mut();
-    // SAFETY: Security.framework initializes the out pointer when the call
-    // succeeds; this guard only checks the OSStatus and never dereferences it.
-    let status = unsafe { SecKeychainCopyDefault(&mut keychain) };
-    assert_ne!(
-        status, 0,
-        "Security.framework unexpectedly reached securityd and returned the default Keychain"
+    let service_name = std::ffi::CString::new("com.apple.securityd").unwrap();
+    let mut service = 0;
+    // SAFETY: bootstrap_port is initialized by libSystem. bootstrap_look_up
+    // reads the NUL-terminated service name and initializes the integer out
+    // port; the guard never sends to or otherwise owns that port.
+    let status = unsafe { bootstrap_look_up(bootstrap_port, service_name.as_ptr(), &mut service) };
+    assert_eq!(
+        status, BOOTSTRAP_NOT_PRIVILEGED,
+        "securityd Mach lookup was not rejected with the sandbox-specific denial (status {status})"
     );
 }
 
@@ -117,18 +141,85 @@ fn writes_outside_the_test_sandbox_are_denied() {
         "/var/tmp"
     };
     let path = format!("{outside_tmp}/mono-hermeticity-guard-{}", std::process::id());
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Err(error)
-            if matches!(
-                error.kind(),
-                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
-            ) => {}
-        Err(error) => {
-            panic!("outside-sandbox write failed for an incidental reason instead of sandbox denial: {error}")
-        }
-        Ok(_) => {
-            let _ = std::fs::remove_file(&path);
-            panic!("the test sandbox unexpectedly allowed a write to {path}");
+    assert_write_denied(Path::new(&path));
+}
+
+#[test]
+fn private_and_declared_output_paths_remain_writable() {
+    let private_root = env::var_os("TEST_TMPDIR").expect("Bazel must set TEST_TMPDIR");
+    let private_file = Path::new(&private_root).join("hermeticity-private-write");
+    std::fs::write(&private_file, b"private").expect("the private test root must remain writable");
+    let renamed_private_file = Path::new(&private_root).join("hermeticity-private-renamed");
+    std::fs::rename(&private_file, &renamed_private_file)
+        .expect("renames inside the private test root must remain writable");
+    let nested_private_root = Path::new(&private_root).join("hermeticity-nested");
+    std::fs::create_dir(&nested_private_root).expect("private nested directories must remain writable");
+    let nested_source = nested_private_root.join("source");
+    let nested_destination = nested_private_root.join("destination");
+    std::fs::write(&nested_source, b"nested").expect("private nested files must remain writable");
+    std::fs::rename(&nested_source, &nested_destination)
+        .expect("nested renames inside the private test root must remain writable");
+
+    let output_root =
+        env::var_os("TEST_UNDECLARED_OUTPUTS_DIR").expect("Bazel must declare an undeclared-output directory");
+    let output_file = Path::new(&output_root).join("hermeticity-declared-write");
+    std::fs::write(&output_file, b"declared").expect("the declared Bazel output directory must remain writable");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn xcode_capability_retains_the_write_allowlist() {
+    if env::var("MONO_TEST_XCODE_TOOLCHAIN").as_deref() != Ok("1") {
+        return;
+    }
+
+    if let Some(host_tmpdir) = env::var_os("MONO_TEST_HOST_TMPDIR") {
+        let host_tmpdir = Path::new(&host_tmpdir);
+        let private_root = env::var_os("TEST_TMPDIR").unwrap();
+        if host_tmpdir.is_dir() && !host_tmpdir.starts_with(Path::new(&private_root)) {
+            let path = host_tmpdir.join(format!("mono-xcode-host-temp-{}", std::process::id()));
+            assert_write_denied(&path);
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn xcode_capability_uses_the_configured_developer_root() {
+    if env::var("MONO_TEST_XCODE_TOOLCHAIN").as_deref() != Ok("1") {
+        return;
+    }
+
+    let developer_root = env::var_os("MONO_TEST_XCODE_DEVELOPER_DIR")
+        .expect("the Xcode capability must publish its configured developer root");
+    let developer_root =
+        std::fs::canonicalize(developer_root).expect("the configured developer root must be canonicalizable");
+
+    let output = Command::new("/usr/bin/xcrun")
+        .args(["--find", "xcodebuild"])
+        .output()
+        .expect("the Xcode capability must permit the system xcrun launcher");
+    assert!(
+        output.status.success(),
+        "xcrun could not resolve xcodebuild: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let resolved = String::from_utf8(output.stdout).expect("xcrun output must be UTF-8");
+    let resolved = std::fs::canonicalize(resolved.trim()).expect("xcrun's xcodebuild path must exist");
+    assert!(
+        resolved.starts_with(&developer_root),
+        "xcrun resolved {} outside configured developer root {}",
+        resolved.display(),
+        developer_root.display()
+    );
+
+    let output = Command::new("/usr/bin/xcodebuild")
+        .arg("-version")
+        .output()
+        .expect("the system xcodebuild launcher must reach the configured developer executable");
+    assert!(
+        output.status.success(),
+        "configured xcodebuild was not executable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

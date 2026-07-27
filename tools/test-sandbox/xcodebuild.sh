@@ -17,6 +17,9 @@ for argument in "$@"; do
       -e "s#__MONO_TEST_TMPDIR__#${TEST_TMPDIR}#g" \
       -e "s#__MONO_TEST_PROCESS_TMPDIR__#${TMPDIR}#g" \
       -e "s#__MONO_TEST_HOME__#${HOME}#g" \
+      -e "s#__MONO_TEST_HOST_TMPDIR__#${MONO_TEST_HOST_TMPDIR:-}#g" \
+      -e "s#__MONO_TEST_UNDECLARED_OUTPUTS_DIR__#${TEST_UNDECLARED_OUTPUTS_DIR:?}#g" \
+      -e "s#__MONO_TEST_XCODE_DEVELOPER_DIR__#${MONO_TEST_XCODE_DEVELOPER_DIR:?}#g" \
       -i "" \
       "${argument}"
     break
