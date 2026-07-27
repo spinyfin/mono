@@ -4,11 +4,12 @@ use clap::Parser;
 
 use super::{
     AttentionGroupSelector, AutomationCommand, AutomationSelector, BindPrAction, BulkCreateItem, ChoreCommand, Cli,
-    Commands, DependCommand, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction, ProductCommand, ProductStatus,
-    ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand, TaskListCriteria, TaskPriority,
-    TaskStatusArg, apply_project_list_filters, apply_task_list_filters, classify_bind_pr, classify_lint_finding,
-    compile_schedule, decide_open_design_action, dependency_status_is_satisfied, ensure_explicit_product_matches,
-    expect_leaf_work_item, format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
+    Commands, CommentCommand, DependCommand, EffortLevelArg, LintSeverity, MoveTarget, OpenDesignAction,
+    ProductCommand, ProductStatus, ProjectCommand, ProjectStatusArg, RepoSelector, RunContext, TaskCommand,
+    TaskListCriteria, TaskPriority, TaskStatusArg, apply_project_list_filters, apply_task_list_filters,
+    classify_bind_pr, classify_lint_finding, compile_schedule, decide_open_design_action, default_comment_author,
+    dependency_status_is_satisfied, ensure_explicit_product_matches, expect_leaf_work_item,
+    format_project_design_doc_line, format_repo_line, is_typed_work_item_id, lint_summary_line,
     parse_attention_group_selector, parse_automation_selector, pick_by_index, resolve_comments_artifact,
     split_shake_report, status_vocab, task_json_with_runtime, validate_github_pr_url, with_display_status,
 };
@@ -2839,4 +2840,134 @@ fn comment_list_rejects_neither_task_nor_artifact() {
         err.to_string().contains("pass --task <id> or --artifact <id>"),
         "unexpected error: {err}"
     );
+}
+
+// --- boss <kind> comment / boss comment create ---
+
+#[test]
+fn parses_task_comment_command() {
+    let cli = Cli::parse_from([
+        "boss",
+        "task",
+        "comment",
+        "task_abc",
+        "--body",
+        "needs human input on scope",
+        "--product",
+        "boss",
+    ]);
+    match cli.command {
+        Commands::Task {
+            command: TaskCommand::Comment(args),
+        } => {
+            assert_eq!(args.id, "task_abc");
+            assert_eq!(args.body, "needs human input on scope");
+            assert_eq!(args.product.as_deref(), Some("boss"));
+            assert!(args.exact.is_none());
+            assert!(args.author.is_none());
+        }
+        _ => panic!("expected task comment command"),
+    }
+}
+
+#[test]
+fn parses_chore_comment_command_with_exact() {
+    let cli = Cli::parse_from([
+        "boss",
+        "chore",
+        "comment",
+        "task_abc",
+        "--body",
+        "note",
+        "--exact",
+        "span text",
+        "--prefix",
+        "pre ",
+        "--suffix",
+        " post",
+        "--author",
+        "user:alice",
+    ]);
+    match cli.command {
+        Commands::Chore {
+            command: ChoreCommand::Comment(args),
+        } => {
+            assert_eq!(args.id, "task_abc");
+            assert_eq!(args.body, "note");
+            assert_eq!(args.exact.as_deref(), Some("span text"));
+            assert_eq!(args.prefix, "pre ");
+            assert_eq!(args.suffix, " post");
+            assert_eq!(args.author.as_deref(), Some("user:alice"));
+        }
+        _ => panic!("expected chore comment command"),
+    }
+}
+
+#[test]
+fn parses_comment_create_with_task_shorthand() {
+    let cli = Cli::parse_from([
+        "boss",
+        "comment",
+        "create",
+        "--task",
+        "task_xyz",
+        "--body",
+        "audit note",
+        "--product",
+        "boss",
+    ]);
+    match cli.command {
+        Commands::Comment {
+            command: CommentCommand::Create(args),
+        } => {
+            assert_eq!(args.task.as_deref(), Some("task_xyz"));
+            assert!(args.artifact.is_none());
+            assert_eq!(args.body, "audit note");
+            assert_eq!(args.product.as_deref(), Some("boss"));
+            // work_item path defaults doc_version to "cli" at run time, not parse.
+            assert!(args.doc_version.is_none());
+        }
+        _ => panic!("expected comment create command"),
+    }
+}
+
+#[test]
+fn parses_comment_create_with_artifact() {
+    let cli = Cli::parse_from([
+        "boss",
+        "comment",
+        "create",
+        "--artifact",
+        "pr_doc:owner/repo:main:docs/x.md",
+        "--artifact-kind",
+        "pr_doc",
+        "--body",
+        "fix this",
+        "--exact",
+        "heading",
+        "--doc-version",
+        "abc123",
+    ]);
+    match cli.command {
+        Commands::Comment {
+            command: CommentCommand::Create(args),
+        } => {
+            assert_eq!(args.artifact.as_deref(), Some("pr_doc:owner/repo:main:docs/x.md"));
+            assert_eq!(args.artifact_kind, "pr_doc");
+            assert_eq!(args.exact.as_deref(), Some("heading"));
+            assert_eq!(args.body, "fix this");
+            assert_eq!(args.doc_version.as_deref(), Some("abc123"));
+        }
+        _ => panic!("expected comment create command"),
+    }
+}
+
+#[test]
+fn default_comment_author_is_user_prefixed() {
+    let author = default_comment_author();
+    assert!(
+        author.starts_with("user:"),
+        "author should be user-prefixed, got {author}"
+    );
+    assert!(author.len() > "user:".len());
 }
