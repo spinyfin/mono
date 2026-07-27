@@ -252,6 +252,28 @@ pub(super) async fn dispatch_live_worker_state(
                 );
             }
         }
+
+        // Fold any transcript records appended since the prior hook into a
+        // cumulative, idempotent snapshot. This deliberately runs before the
+        // slot lookup and independently of finalization, matching the
+        // transcript-path persistence above: startup races, engine restarts,
+        // late hooks, and runs that never reach a clean finalize still retain
+        // every cost record observed while hooks were arriving.
+        match server_state
+            .run_cost_capture
+            .capture_and_persist(&server_state.work_db, run_id, std::path::Path::new(path))
+            .await
+        {
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = run_id,
+                    transcript_path = %path,
+                    %error,
+                    "failed to capture cumulative run cost from transcript",
+                );
+            }
+        }
     }
     let slot_id = match server_state.worker_registry.slot_for_run(run_id) {
         Some(slot_id) => slot_id,

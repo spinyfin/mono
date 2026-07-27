@@ -682,6 +682,9 @@ impl WorkDb {
         // identity, stored in engine-owned SQLite rather than an
         // agent-writable provider home. Cleared by normal teardown.
         migrate_work_runs_progress_session_id(conn)?;
+        // Raw provider usage on the run row. Captured on hook delivery rather
+        // than finalization so orphaned executions retain their observed cost.
+        migrate_work_runs_cost_columns(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -821,6 +824,26 @@ mod tests {
             worker_proposals_exists,
             "expected worker_proposals table from migrate_worker_proposals_table"
         );
+
+        let run_cost_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('work_runs')
+                 WHERE name IN (
+                     'model',
+                     'output_tokens',
+                     'input_tokens',
+                     'cache_creation_tokens',
+                     'cache_read_tokens',
+                     'cache_creation_5m_tokens',
+                     'cache_creation_1h_tokens',
+                     'rounds',
+                     'agent_active_ms'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(run_cost_columns, 9, "expected all per-run cost columns");
     }
 
     /// The fast path a brand-new database actually takes must reach the
