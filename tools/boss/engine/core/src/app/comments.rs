@@ -26,9 +26,23 @@ pub(super) async fn handle_comments_create(ctx: Dispatch, req: FrontendRequest) 
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::CommentsCreate { input } = req else {
+    let FrontendRequest::CommentsCreate { mut input } = req else {
         unreachable!()
     };
+    // Mirror `handle_comments_list`: `pr_doc` keys are stored with the full
+    // git remote URL as the repo component, but callers (CLI `--artifact`,
+    // chat, PR links) routinely spell `owner/repo`. Resolve to an existing
+    // stored key so a slug-form create lands on the same thread the app uses.
+    // Falls back to the supplied id when no equivalent row exists yet.
+    if input.artifact_kind == "pr_doc" {
+        match work_db.resolve_pr_doc_artifact_id(&input.artifact_id) {
+            Ok(resolved) => input.artifact_id = resolved,
+            Err(err) => {
+                send_work_error(&sink, &request_id, &err);
+                return;
+            }
+        }
+    }
     {
         let artifact_kind = input.artifact_kind.clone();
         let artifact_id = input.artifact_id.clone();

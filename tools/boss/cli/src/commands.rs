@@ -83,9 +83,11 @@ pub(crate) enum Commands {
         #[command(subcommand)]
         command: ChoreCommand,
     },
-    /// Manage markdown-viewer comment threads: read-only list/show/runs
-    /// inspection for operators and the coordinator, plus the one write
-    /// action a read-only answer-agent worker is permitted (`reply`).
+    /// Manage markdown-viewer comment threads: create / list / show / runs
+    /// for operators and the coordinator, plus the one write action a
+    /// read-only answer-agent worker is permitted (`reply`). For the
+    /// common work-item case prefer `boss task comment` /
+    /// `boss chore comment`.
     Comment {
         #[command(subcommand)]
         command: CommentCommand,
@@ -505,6 +507,11 @@ pub(crate) enum TaskCommand {
     /// `--product`, `--status`, `--priority`, or `--parent`.
     #[command(name = "list-revisions")]
     ListRevisions(RevisionListArgs),
+    /// Post a top-level comment on a leaf work item via the existing
+    /// engine comment machinery (`CommentsCreate`). Prefer this over
+    /// stuffing free-text notes into `--description`. Read-side
+    /// inspection is `boss comment list --task <id>` / `boss comment show`.
+    Comment(KindCommentArgs),
 }
 
 /// Subcommands under `boss chore ...`. Kind-agnostic verbs here are
@@ -546,6 +553,8 @@ pub(crate) enum ChoreCommand {
     /// Alias for `boss task unlink-external`. Accepts any leaf work item id.
     #[command(name = "unlink-external")]
     UnlinkExternal(TaskIdArg),
+    /// Alias for `boss task comment`. Accepts any leaf work item id.
+    Comment(KindCommentArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -574,73 +583,6 @@ pub(crate) struct PrStatusArgs {
     /// exhausted; never blocks or errors on throttling.
     #[arg(long)]
     pub(crate) refresh: bool,
-}
-
-#[derive(Debug, Subcommand)]
-pub(crate) enum CommentCommand {
-    /// List comments on an artifact. `--task` is shorthand for a work-item
-    /// comment thread; pass `--artifact` + `--artifact-kind` for a
-    /// `pr_doc:<owner>/<repo>:<branch>:<path>` composite key. Excludes
-    /// `resolved`/`dismissed` unless `--include-resolved` — `orphaned`
-    /// comments are always included. Engine-RPC half of
-    /// `bossctl comments list`.
-    List(CommentListArgs),
-    /// Show one comment: anchor, status, intent classification, thread
-    /// entries, and full answer-agent-run history. Engine-RPC half of
-    /// `bossctl comments show`.
-    Show(CommentShowArgs),
-    /// List every `answer_agent_runs` row for a comment, oldest first.
-    /// Engine-RPC half of `bossctl comments runs`.
-    Runs(CommentRunsArgs),
-    /// Post the answer agent's reply to the comment thread this run was
-    /// spawned for. The target thread is derived from the caller's own
-    /// `BOSS_RUN_ID` — there is no `--comment-id` (or similar) flag, by
-    /// design: this is the one write action a read-only answer-agent
-    /// session is permitted, and it must not be able to target any other
-    /// comment. Post exactly one reply; a second call fails (the tracking
-    /// run row is no longer `running`).
-    Reply(CommentReplyArgs),
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct CommentListArgs {
-    /// Work item (task/chore) id whose comments to list — shorthand
-    /// for `--artifact-kind work_item --artifact <id>`.
-    #[arg(long)]
-    pub(crate) task: Option<String>,
-    /// Raw artifact id (e.g. a `pr_doc:<owner>/<repo>:<branch>:<path>`
-    /// composite key — an SSH or HTTPS remote URL also works for
-    /// `<owner>/<repo>`). Pairs with `--artifact-kind`.
-    #[arg(long)]
-    pub(crate) artifact: Option<String>,
-    /// Artifact kind for `--artifact` (`work_item` or `pr_doc`).
-    #[arg(long, default_value = "pr_doc")]
-    pub(crate) artifact_kind: String,
-    /// Include `resolved`/`dismissed` comments (excluded by default).
-    #[arg(long)]
-    pub(crate) include_resolved: bool,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct CommentShowArgs {
-    /// Comment id (`cmt_…`).
-    pub(crate) comment_id: String,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct CommentRunsArgs {
-    /// Comment id (`cmt_…`) whose answer-agent runs to list.
-    pub(crate) comment_id: String,
-}
-
-#[derive(Debug, Args)]
-pub(crate) struct CommentReplyArgs {
-    /// The comprehensive answer to post. Pass the full text inline —
-    /// there is deliberately no `--body-file` (a file-reading flag on this
-    /// command would let a read-only session exfiltrate arbitrary file
-    /// contents into the thread).
-    #[arg(long)]
-    pub(crate) body: String,
 }
 
 #[derive(Debug, Clone, Args)]

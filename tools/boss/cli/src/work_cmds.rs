@@ -770,6 +770,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::CreateInvestigation(args) => run_create_investigation(&mut client, ctx, args).await,
         TaskCommand::CreateRevision(args) => run_create_revision(&mut client, ctx, args).await,
         TaskCommand::ListRevisions(args) => run_list_revisions(&mut client, ctx, args).await,
+        TaskCommand::Comment(args) => run_kind_comment(&mut client, ctx, args).await,
     }
 }
 
@@ -862,6 +863,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
         ChoreCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
         ChoreCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         ChoreCommand::CreateMany(args) => run_chore_create_many(&mut client, ctx, args).await,
+        ChoreCommand::Comment(args) => run_kind_comment(&mut client, ctx, args).await,
     }
 }
 
@@ -870,7 +872,165 @@ pub(crate) async fn run_comment_command(command: CommentCommand, ctx: &RunContex
         CommentCommand::List(args) => run_comment_list(ctx, args).await,
         CommentCommand::Show(args) => run_comment_show(ctx, args).await,
         CommentCommand::Runs(args) => run_comment_runs(ctx, args).await,
+        CommentCommand::Create(args) => {
+            let mut client = connect_for_work(ctx).await?;
+            run_comment_create(&mut client, ctx, args).await
+        }
         CommentCommand::Reply(args) => run_comment_reply(ctx, args).await,
+    }
+}
+
+/// Default author stamp for CLI-authored comments — mirrors the app's
+/// `user:<name>` convention (`user:cli` when `$USER` is unset).
+pub(crate) fn default_comment_author() -> String {
+    let name = std::env::var("USER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "cli".to_owned());
+    format!("user:{name}")
+}
+
+/// `boss task comment` / `boss chore comment` — post a top-level comment on
+/// a leaf work item via `CommentsCreate`. Resolves friendly short ids and
+/// defaults the text-quote anchor to the item's name when `--exact` is
+/// omitted (CLI free-form notes are not text selections).
+pub(crate) async fn run_kind_comment(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: KindCommentArgs,
+) -> Result<(), CliError> {
+    if args.body.trim().is_empty() {
+        return Err(CliError::usage("--body may not be empty"));
+    }
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product.clone()).await?;
+    let (item, _label) = expect_leaf_work_item(get_work_item(client, &resolved_id).await?)?;
+    let exact = args
+        .exact
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| item.name.clone());
+    if exact.trim().is_empty() {
+        return Err(CliError::usage(
+            "--exact may not be empty (work item has no name to default to)",
+        ));
+    }
+    let author = args
+        .author
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(default_comment_author);
+    create_and_print_comment(
+        client,
+        ctx,
+        CreateCommentInput {
+            artifact_kind: "work_item".to_owned(),
+            artifact_id: item.id,
+            anchor: CommentAnchor {
+                exact,
+                prefix: args.prefix,
+                suffix: args.suffix,
+            },
+            body: args.body,
+            author,
+            doc_version: "cli".to_owned(),
+            plain_text_projection_version: 0,
+        },
+    )
+    .await
+}
+
+/// `boss comment create` — kind-agnostic create over `CommentsCreate`.
+/// `--task` is shorthand for a work-item thread (and enables name-default
+/// for `--exact`); `--artifact` + `--artifact-kind` covers `pr_doc` keys.
+pub(crate) async fn run_comment_create(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: CommentCreateArgs,
+) -> Result<(), CliError> {
+    if args.body.trim().is_empty() {
+        return Err(CliError::usage("--body may not be empty"));
+    }
+    let (artifact_kind, artifact_id, default_exact) = match (args.task, args.artifact) {
+        (Some(_), Some(_)) => return Err(CliError::usage("pass only one of --task or --artifact")),
+        (None, None) => {
+            return Err(CliError::usage(
+                "pass --task <id> or --artifact <id> (with --artifact-kind)",
+            ));
+        }
+        (Some(task_sel), None) => {
+            let resolved_id = resolve_selector_to_primary_id(client, ctx, &task_sel, args.product.clone()).await?;
+            let (item, _) = expect_leaf_work_item(get_work_item(client, &resolved_id).await?)?;
+            ("work_item".to_owned(), item.id, Some(item.name))
+        }
+        (None, Some(artifact_id)) => (args.artifact_kind, artifact_id, None),
+    };
+    let exact = match args.exact.filter(|s| !s.trim().is_empty()).or(default_exact) {
+        Some(exact) if !exact.trim().is_empty() => exact,
+        _ => {
+            return Err(CliError::usage(
+                "--exact is required for non-work-item artifacts (and when the work item has no name)",
+            ));
+        }
+    };
+    // Free-form work-item notes have no document digest — stamp `cli`.
+    // For `pr_doc` (and any other non-work_item kind) the caller must supply
+    // the document version/digest the text-quote anchor refers to.
+    let doc_version = match args.doc_version.filter(|s| !s.trim().is_empty()) {
+        Some(v) => v,
+        None if artifact_kind == "work_item" => "cli".to_owned(),
+        None => {
+            return Err(CliError::usage(
+                "--doc-version is required when --artifact-kind is not work_item \
+                 (pass the document digest/version the anchor refers to)",
+            ));
+        }
+    };
+    let author = args
+        .author
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(default_comment_author);
+    create_and_print_comment(
+        client,
+        ctx,
+        CreateCommentInput {
+            artifact_kind,
+            artifact_id,
+            anchor: CommentAnchor {
+                exact,
+                prefix: args.prefix,
+                suffix: args.suffix,
+            },
+            body: args.body,
+            author,
+            doc_version,
+            plain_text_projection_version: 0,
+        },
+    )
+    .await
+}
+
+async fn create_and_print_comment(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    input: CreateCommentInput,
+) -> Result<(), CliError> {
+    match client
+        .send_request(&FrontendRequest::CommentsCreate { input })
+        .await
+        .map_err(CliError::internal)?
+    {
+        FrontendEvent::CommentResult { comment } => {
+            print_entity(ctx, &serde_json::json!({ "comment": comment }), || {
+                if !ctx.quiet {
+                    println!(
+                        "Created comment {} on {}:{}",
+                        comment.id, comment.artifact_kind, comment.artifact_id
+                    );
+                }
+            })
+        }
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("comment create", &other)),
     }
 }
 
