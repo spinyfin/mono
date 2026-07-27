@@ -1602,8 +1602,8 @@ pub enum StopOutcome {
 /// wider than the single-digit-millisecond flush race seen in the field
 /// (assistant text written 33ms before the finaliser's read, which still
 /// lost the race with zero retries).
-const TRIAGE_TRANSCRIPT_READ_ATTEMPTS: u32 = 5;
-const TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS: u64 = 20;
+pub(crate) const TRIAGE_TRANSCRIPT_READ_ATTEMPTS: u32 = 5;
+pub(crate) const TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS: u64 = 20;
 
 /// Outcome of reading a finished triage execution's final assistant message
 /// from its transcript (see [`WorkerCompletionHandler::read_final_triage_message`]).

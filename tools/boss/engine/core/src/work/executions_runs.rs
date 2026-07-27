@@ -1580,6 +1580,88 @@ impl WorkDb {
         }
     }
 
+    /// Persist the cumulative raw-usage snapshot for the latest run of an
+    /// execution.
+    ///
+    /// The dispatcher derives this snapshot by incrementally tailing the
+    /// transcript on every hook. Values are assignments, not SQL increments:
+    /// retrying a hook or rebuilding the in-memory tail after an engine
+    /// restart is therefore idempotent. Incremental snapshots use `COALESCE`
+    /// so a transcript that has not yet emitted (for example) a turn-duration
+    /// record cannot erase a value captured by an earlier hook. A snapshot
+    /// rebuilt after transcript replacement assigns every field verbatim,
+    /// including NULL, so values removed from the new generation cannot
+    /// survive. Cache-write TTL splits additionally carry an observed/known
+    /// signal because NULL also means "usage observed but the provider omitted
+    /// its TTL breakdown".
+    pub(crate) fn set_run_cost_snapshot(
+        &self,
+        execution_id: &str,
+        snapshot: crate::run_cost::RunCostSnapshot,
+    ) -> Result<bool> {
+        let conn = self.connect()?;
+        let latest_run_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(run_id) = latest_run_id else {
+            return Ok(false);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs
+             SET model = CASE WHEN ?12 = 1 THEN ?2 ELSE COALESCE(?2, model) END,
+                 output_tokens = CASE WHEN ?12 = 1 THEN ?3 ELSE COALESCE(?3, output_tokens) END,
+                 input_tokens = CASE WHEN ?12 = 1 THEN ?4 ELSE COALESCE(?4, input_tokens) END,
+                 cache_creation_tokens = CASE
+                     WHEN ?12 = 1 THEN ?5
+                     ELSE COALESCE(?5, cache_creation_tokens)
+                 END,
+                 cache_read_tokens = CASE
+                     WHEN ?12 = 1 THEN ?6
+                     ELSE COALESCE(?6, cache_read_tokens)
+                 END,
+                 cache_creation_5m_tokens = CASE
+                     WHEN ?12 = 1 THEN ?7
+                     WHEN ?9 IS NULL THEN cache_creation_5m_tokens
+                     WHEN ?9 = 0 THEN NULL
+                     ELSE ?7
+                 END,
+                 cache_creation_1h_tokens = CASE
+                     WHEN ?12 = 1 THEN ?8
+                     WHEN ?9 IS NULL THEN cache_creation_1h_tokens
+                     WHEN ?9 = 0 THEN NULL
+                     ELSE ?8
+                 END,
+                 rounds = CASE WHEN ?12 = 1 THEN ?10 ELSE COALESCE(?10, rounds) END,
+                 agent_active_ms = CASE
+                     WHEN ?12 = 1 THEN ?11
+                     ELSE COALESCE(?11, agent_active_ms)
+                 END
+             WHERE id = ?1",
+            params![
+                run_id,
+                snapshot.model,
+                snapshot.output_tokens,
+                snapshot.input_tokens,
+                snapshot.cache_creation_tokens,
+                snapshot.cache_read_tokens,
+                snapshot.cache_creation_5m_tokens,
+                snapshot.cache_creation_1h_tokens,
+                snapshot.cache_creation_ttl_split_known,
+                snapshot.rounds,
+                snapshot.agent_active_ms,
+                snapshot.full_replacement,
+            ],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Read-side companion to [`set_run_transcript_path_if_unset`].
     ///
     /// **Namespace warning — same trap as the write side.** Every

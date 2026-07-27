@@ -252,6 +252,64 @@ pub(super) async fn dispatch_live_worker_state(
                 );
             }
         }
+
+        // Fold transcript records appended since the prior hook into a
+        // cumulative, idempotent snapshot. The driver-owned containment root
+        // was resolved at ingress alongside the turn boundary; failure to
+        // resolve it refuses the read instead of degrading a contained driver
+        // (notably Codex) to an unrestricted tail.
+        let containment_root = match incoming.transcript_containment_root() {
+            Ok(root) => Some(root),
+            Err(error) => {
+                tracing::warn!(
+                    execution_id = run_id,
+                    transcript_path = %path,
+                    %error,
+                    "refusing run cost capture because transcript containment could not be resolved",
+                );
+                None
+            }
+        };
+
+        // A provider can fire its turn boundary just before flushing the
+        // final assistant usage and turn-duration records. Poll with the same
+        // bounded linear-backoff shape used by triage transcript readback.
+        // This remains independent of successful finalization and runs before
+        // slot lookup, so orphaned and late-hook executions retain the final
+        // observed cost too. Missing synthetic/test paths take one poll only.
+        if let Some(containment_root) = containment_root {
+            let settle_attempts = if incoming.is_turn_boundary() && tokio::fs::try_exists(path).await.unwrap_or(false) {
+                crate::completion::TRIAGE_TRANSCRIPT_READ_ATTEMPTS
+            } else {
+                1
+            };
+            for attempt in 1..=settle_attempts {
+                if attempt > 1 {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        crate::completion::TRIAGE_TRANSCRIPT_READ_RETRY_BASE_MS * u64::from(attempt - 1),
+                    ))
+                    .await;
+                }
+                if let Err(error) = server_state
+                    .run_cost_capture
+                    .capture_and_persist(
+                        &server_state.work_db,
+                        run_id,
+                        std::path::Path::new(path),
+                        containment_root,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        execution_id = run_id,
+                        transcript_path = %path,
+                        %error,
+                        "failed to capture cumulative run cost from transcript",
+                    );
+                    break;
+                }
+            }
+        }
     }
     let slot_id = match server_state.worker_registry.slot_for_run(run_id) {
         Some(slot_id) => slot_id,

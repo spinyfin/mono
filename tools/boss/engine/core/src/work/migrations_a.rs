@@ -419,6 +419,31 @@ pub(crate) fn migrate_work_runs_progress_session_id(conn: &Connection) -> Result
     Ok(())
 }
 
+/// Raw per-run agent usage captured incrementally from transcript records.
+///
+/// Cache-write tokens keep both the provider's total and its 5-minute /
+/// 1-hour breakdown. The total preserves usage when an older provider record
+/// lacks the split; nullable split columns keep that absence explicit instead
+/// of silently assigning the write to the wrong price.
+pub(crate) fn migrate_work_runs_cost_columns(conn: &Connection) -> Result<()> {
+    for (column, sql_type) in [
+        ("model", "TEXT"),
+        ("output_tokens", "INTEGER"),
+        ("input_tokens", "INTEGER"),
+        ("cache_creation_tokens", "INTEGER"),
+        ("cache_read_tokens", "INTEGER"),
+        ("cache_creation_5m_tokens", "INTEGER"),
+        ("cache_creation_1h_tokens", "INTEGER"),
+        ("rounds", "INTEGER"),
+        ("agent_active_ms", "INTEGER"),
+    ] {
+        if !table_has_column(conn, "work_runs", column)? {
+            conn.execute(&format!("ALTER TABLE work_runs ADD COLUMN {column} {sql_type}"), [])?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn work_executions_has_column(conn: &Connection, column: &str) -> Result<bool> {
     table_has_column(conn, "work_executions", column)
 }

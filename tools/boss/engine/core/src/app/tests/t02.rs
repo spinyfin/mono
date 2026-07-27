@@ -77,6 +77,490 @@ async fn dispatch_persists_transcript_path_even_without_slot_mapping() {
     );
 }
 
+/// Cost capture tails the transcript at hook time rather than waiting for
+/// completion. The run below deliberately remains active throughout the
+/// assertion, modelling an execution that may later disappear without a
+/// finalize callback.
+#[tokio::test]
+async fn dispatch_persists_cost_for_never_finalized_run_and_dedupes_rounds() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "cost-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "cost capture");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-cost".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("cost.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-5","content":[{"type":"thinking","thinking":"working"}],"usage":{"input_tokens":100,"output_tokens":2,"cache_creation_input_tokens":30,"cache_read_input_tokens":400,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":25}}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":30,"cache_read_input_tokens":400,"cache_creation":{"ephemeral_5m_input_tokens":5,"ephemeral_1h_input_tokens":25}}}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"id":"msg-2","model":"claude-opus-5","content":[{"type":"tool_use","name":"Bash"}],"usage":{"input_tokens":10,"output_tokens":3,"cache_creation_input_tokens":0,"cache_read_input_tokens":50}}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","durationMs":1200}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","durationMs":800}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "cost-session".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+    // Re-delivery with no new transcript bytes must be an idempotent snapshot,
+    // not a second accounting of the same messages or durations.
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    let conn = server_state.work_db.connect().unwrap();
+    type CapturedCost = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        String,
+        Option<String>,
+    );
+    let captured: CapturedCost = conn
+        .query_row(
+            "SELECT model, output_tokens, input_tokens, cache_creation_tokens,
+                    cache_read_tokens, cache_creation_5m_tokens,
+                    cache_creation_1h_tokens, rounds, agent_active_ms, status,
+                    finished_at
+             FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        captured,
+        (
+            Some("claude-opus-5".into()),
+            Some(23),
+            Some(110),
+            Some(30),
+            Some(450),
+            Some(5),
+            Some(25),
+            Some(2),
+            Some(2_000),
+            "active".into(),
+            None,
+        ),
+        "usage must be durable before the run reaches any finalize path",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_leaves_agent_active_null_without_turn_duration() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "duration-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "duration absent");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-duration".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("no-duration.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-sonnet-5","usage":{"input_tokens":7,"output_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "duration-session".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    let conn = server_state.work_db.connect().unwrap();
+    let agent_active_ms: Option<i64> = conn
+        .query_row(
+            "SELECT agent_active_ms FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        agent_active_ms, None,
+        "missing turn-duration evidence must remain distinguishable from a measured zero",
+    );
+}
+
+#[tokio::test]
+async fn dispatch_clears_known_cache_ttl_split_when_later_usage_is_unsplit() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+    use std::io::Write;
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "ttl-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "ttl split");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-ttl".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("ttl.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"msg-known-zero","model":"claude-opus","usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "ttl-session".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+    {
+        let conn = server_state.work_db.connect().unwrap();
+        let split: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT cache_creation_5m_tokens, cache_creation_1h_tokens
+                 FROM work_runs WHERE id = ?1",
+                [&run.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(split, (Some(0), Some(0)));
+    }
+
+    let mut file = std::fs::OpenOptions::new().append(true).open(&transcript).unwrap();
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "id": "msg-unsplit",
+                "model": "claude-opus",
+                "usage": {
+                    "input_tokens": 2,
+                    "output_tokens": 1,
+                    "cache_creation_input_tokens": 40,
+                    "cache_read_input_tokens": 0
+                }
+            }
+        })
+    )
+    .unwrap();
+    drop(file);
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    let conn = server_state.work_db.connect().unwrap();
+    let split: (Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT cache_creation_tokens, cache_creation_5m_tokens,
+                    cache_creation_1h_tokens
+             FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        split,
+        (Some(40), None, None),
+        "observed non-zero usage without a TTL breakdown must clear formerly-known split values",
+    );
+}
+
+#[tokio::test]
+async fn transcript_replacement_clears_cost_fields_missing_from_the_new_generation() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+
+    type PersistedCost = (
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    );
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "rewrite-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "rewrite cost");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-rewrite".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("rewrite.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"old","model":"claude-opus","usage":{"input_tokens":3,"output_tokens":2,"cache_creation_input_tokens":4,"cache_read_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":1}}}}"#,
+            "\n",
+            r#"{"type":"system","subtype":"turn_duration","uuid":"duration-old","durationMs":20}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::PostToolUse {
+            session_id: "rewrite-session".into(),
+            tool_name: "Bash".into(),
+            tool_input: serde_json::Value::Null,
+            tool_response: serde_json::Value::Null,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+
+    let read_cost = || -> PersistedCost {
+        let conn = server_state.work_db.connect().unwrap();
+        conn.query_row(
+            "SELECT model, output_tokens, input_tokens, cache_creation_tokens,
+                    cache_read_tokens, cache_creation_5m_tokens,
+                    cache_creation_1h_tokens, rounds, agent_active_ms
+             FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        read_cost(),
+        (
+            Some("claude-opus".into()),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(3),
+            Some(1),
+            Some(1),
+            Some(20),
+        )
+    );
+
+    // The replacement still contains a round, but deliberately omits model,
+    // usage, and duration. Full-replacement persistence must clear all fields
+    // absent from the recomputed snapshot rather than COALESCEing old values.
+    std::fs::write(
+        &transcript,
+        concat!(r#"{"type":"assistant","message":{"id":"replacement"}}"#, "\n"),
+    )
+    .unwrap();
+    dispatch_live_worker_state(&server_state, &event).await;
+    assert_eq!(read_cost(), (None, None, None, None, None, None, None, Some(1), None));
+
+    // An empty generation produces no accumulator snapshot at all. The
+    // generation-reset signal must still issue a full NULL assignment.
+    std::fs::write(&transcript, "").unwrap();
+    dispatch_live_worker_state(&server_state, &event).await;
+    assert_eq!(read_cost(), (None, None, None, None, None, None, None, None, None));
+}
+
+#[tokio::test]
+async fn stop_settle_captures_usage_and_duration_appended_after_boundary() {
+    use crate::protocol::WorkerEvent;
+    use boss_protocol::RequestExecutionInput;
+    use tokio::io::AsyncWriteExt;
+
+    let (server_state, dir) = test_server_state();
+    let product = create_test_product_with_repo(&server_state.work_db, "settle-p", Some("git@example.com:p.git"));
+    let chore = create_test_chore_manual(&server_state.work_db, product.id.clone(), "stop settle");
+    let execution = server_state
+        .work_db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+    let run = server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution.id.clone(),
+            agent_id: "agent-settle".into(),
+            status: Some("active".into()),
+            transcript_path: None,
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    let transcript = dir.path().join("settle.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"id":"msg-before","model":"claude-opus","usage":{"input_tokens":5,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+
+    let append_path = transcript.clone();
+    let append = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&append_path)
+            .await
+            .unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"assistant","message":{"id":"msg-after","model":"claude-opus","usage":{"input_tokens":7,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","durationMs":99}"#,
+                "\n",
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    });
+    let event = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "settle-session".into(),
+            stop_hook_active: false,
+            stop_reason: boss_protocol::StopReason::Completed,
+        },
+        Some(execution.id.clone()),
+        Some(transcript.to_string_lossy().into_owned()),
+    );
+    dispatch_live_worker_state(&server_state, &event).await;
+    append.await.unwrap();
+
+    let conn = server_state.work_db.connect().unwrap();
+    let captured: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT input_tokens, output_tokens, rounds, agent_active_ms
+             FROM work_runs WHERE id = ?1",
+            [&run.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        captured,
+        (Some(12), Some(3), Some(2), Some(99)),
+        "bounded Stop settling must include records flushed after the boundary",
+    );
+}
+
 /// A remote worker holds no libghostty pane, so the spawn flow never
 /// registers a slot for it and `slot_for_run` is `None` — but its hooks
 /// tunnel back over the forwarded events socket. The dispatcher must

@@ -517,6 +517,10 @@ struct ServerState {
     /// run lacks the field. See [`TranscriptPathCache`] for why this
     /// is the structural fix for the 2026-05-12 incident.
     transcript_path_cache: Arc<crate::live_status_loop::TranscriptPathCache>,
+    /// Incremental transcript tails and cumulative raw usage per execution.
+    /// The dispatcher snapshots these counters to `work_runs` before any
+    /// completion gate, preserving spend for runs that become orphaned.
+    run_cost_capture: Arc<crate::run_cost::RunCostCapture>,
     /// Reads product markdown trees and documents from GitHub for the
     /// Designs tab. Holds the HEAD-validated per-repo listing cache, so
     /// it lives on `ServerState` (process lifetime) rather than being
@@ -1189,6 +1193,7 @@ impl ServerState {
                     metrics_for_dispatcher,
                 )))
                 .transcript_path_cache(Arc::new(crate::live_status_loop::TranscriptPathCache::new()))
+                .run_cost_capture(Arc::new(crate::run_cost::RunCostCapture::new()))
                 .design_docs(Arc::new(boss_engine_design_docs::DesignDocsService::new()))
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
@@ -1445,6 +1450,7 @@ impl ServerState {
         // No correctness consequence — the work_runs row is the
         // durable source of truth — but a bounded cache is hygienic.
         self.transcript_path_cache.forget(run_id);
+        self.run_cost_capture.forget(run_id);
         self.broadcast_live_worker_states().await;
         // A slot was mapped, so a worker had finished spawning: its pane
         // was torn down and (above) its OS process tree signalled. Report
