@@ -245,27 +245,49 @@ pub enum EngineToAppResponse {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Errors the app can return on an engine→app pane RPC, plus a few
+/// engine-synthesised variants that never travel on the wire.
+///
+/// Capacity / concurrency limits are **not** expressed here. The engine
+/// decides whether a worker may claim a slot before it ever sends
+/// `SpawnWorkerPane`. Do not read [`Self::SlotBusy`] (or the legacy
+/// [`Self::NoAvailableSlot`]) as "the system is at capacity" — that
+/// misread is the defect this surface exists to prevent.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, thiserror::Error)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EngineToAppError {
-    /// All 8 worker slots are in use. Retained for completeness;
-    /// since the engine now picks the slot, this is effectively
-    /// unreachable from `SpawnWorkerPane` (the engine returns
-    /// before the request is even sent when the pool is full).
+    /// Legacy "app could not free a slot" signal from before the engine
+    /// owned slot allocation. Retained so older wire payloads still
+    /// deserialise; unreachable from modern `SpawnWorkerPane` because
+    /// the engine only requests a slot it has already claimed. **Not**
+    /// the operator-facing capacity signal — concurrency caps live on
+    /// the engine claim path, not this RPC.
+    #[error("no free worker slot (legacy app signal; engine-side claim already enforces concurrency)")]
     NoAvailableSlot,
     /// `ReleaseWorkerPane` / `SendToPane` / `FocusWorkerPane` /
     /// `InterruptWorkerPane` referred to a slot the app does not
     /// recognise — already released, never allocated, or stale after
     /// an app restart.
+    #[error("unknown worker slot")]
     UnknownSlot,
-    /// `SpawnWorkerPane` requested a slot the app considers already
-    /// in use (a session is hosted there). Surfaces engine↔app
-    /// disagreement instead of silently re-allocating; the engine
-    /// must reconcile rather than retry blindly. `occupying_run_id`
-    /// is the run id the app has stamped on the slot (`None` only for
-    /// apps predating this field) — the engine logs it in
-    /// `dispatch.jsonl` so a `SlotBusy` spawn failure identifies which
-    /// pane is squatting the slot without coordinator archaeology.
+    /// Engine↔app **slot occupancy desync** — not capacity exhaustion.
+    ///
+    /// `SpawnWorkerPane` asked for a slot the app already hosts a
+    /// session in. The engine believed the slot free (it claimed it);
+    /// the app disagrees. Reconcile husk panes / leaked claims rather
+    /// than treating this as "no capacity" or retrying the same slot
+    /// blindly.
+    ///
+    /// `occupying_run_id` is the run id the app has stamped on the slot
+    /// (`None` only for apps predating this field). The engine already
+    /// knows the requested `slot_id` (it sent it on
+    /// [`SpawnWorkerPaneInput`]) and logs both into `dispatch.jsonl`
+    /// under `details.slot_busy`, so an echoed `slot_id` on this error
+    /// is unnecessary — the squatting pane is identifiable without it.
+    #[error(
+        "requested slot already hosts a pane (engine/app slot desync, not capacity); \
+         occupying_run_id={occupying_run_id:?}"
+    )]
     SlotBusy {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         occupying_run_id: Option<String>,
@@ -273,10 +295,13 @@ pub enum EngineToAppError {
     /// App lost its connection to the engine before responding. The
     /// engine synthesises this on the caller's side; the app never
     /// sends it on the wire.
+    #[error("app disconnected")]
     AppDisconnected,
     /// Engine-side timeout. Synthesised by the engine.
+    #[error("engine→app request timed out")]
     Timeout,
     /// App-side failure with detail.
+    #[error("app internal error: {message}")]
     Internal { message: String },
 }
 
@@ -362,8 +387,47 @@ mod tests {
         };
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("run-husk"));
+        // Wire shape stays `slot_busy` + optional `occupying_run_id` only —
+        // no `slot_id` echo and no pool/capacity fields. The engine already
+        // knows the requested slot from SpawnWorkerPaneInput.
+        assert!(!json.contains("slot_id"));
+        assert!(!json.contains("pool"));
+        assert!(!json.contains("capacity"));
         let parsed: EngineToAppResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn slot_busy_display_teaches_desync_not_capacity() {
+        // Operators and coordinator memory historically misread SlotBusy
+        // as "pool full / no capacity". Display must make the real meaning
+        // self-evident so that misread cannot re-form from the error text.
+        let err = EngineToAppError::SlotBusy {
+            occupying_run_id: Some("run-husk".into()),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("desync"),
+            "SlotBusy Display must name desync; got {text:?}"
+        );
+        assert!(
+            text.contains("not capacity"),
+            "SlotBusy Display must reject the capacity misread; got {text:?}"
+        );
+        assert!(
+            text.contains("run-husk"),
+            "SlotBusy Display must surface occupying_run_id; got {text:?}"
+        );
+        assert!(
+            !text.to_lowercase().contains("pool"),
+            "SlotBusy Display must not reintroduce pool vocabulary; got {text:?}"
+        );
+
+        let legacy = EngineToAppError::NoAvailableSlot.to_string();
+        assert!(
+            !legacy.to_lowercase().contains("pool"),
+            "NoAvailableSlot Display must not say pool; got {legacy:?}"
+        );
     }
 
     #[test]
