@@ -11,15 +11,19 @@
 //!
 //! The activity values mirror the lifecycle hook events:
 //! `Spawning` is the initial state set by the engine spawn flow before
-//! any hook has fired; `SessionStart` does not transition activity by
-//! itself (it stamps the model name and refreshes timestamps). Once
-//! claude is up, activity flip-flops between `Working` (PreToolUse →
-//! PostToolUse) and `Idle` (Stop with no pending probe / notification).
-//! `WaitingForInput` is set when a `Notification` immediately precedes
-//! a `Stop`, indicating claude is paused on a permission prompt.
-//! `Errored` and `Terminated` are terminal-ish — `SessionEnd` moves
-//! the slot to `Terminated` and the engine's slot allocator clears
-//! the entry on release.
+//! any hook has fired; `SessionStart(Startup)` leaves `Spawning` for
+//! `Idle` and stamps the authoritative model when the hook payload
+//! carries one. `SessionStart(Resume)` stamps model + `last_event_at`
+//! without leaving `Spawning` (reattach proof-of-life); a stale-activity
+//! timer then downgrades `Spawning` → `Idle` once `last_event_at` ages
+//! out so a degraded events stream cannot leave the slot advertising
+//! "spawning" forever. Once the session is up, activity flip-flops
+//! between `Working` (PreToolUse → PostToolUse) and `Idle` (Stop with
+//! no pending probe / notification). `WaitingForInput` is set when a
+//! `Notification` immediately precedes a `Stop`, indicating claude is
+//! paused on a permission prompt. `Errored` and `Terminated` are
+//! terminal-ish — `SessionEnd` moves the slot to `Terminated` and the
+//! engine's slot allocator clears the entry on release.
 
 use serde::{Deserialize, Serialize};
 
@@ -134,9 +138,11 @@ pub struct LiveWorkerState {
     pub name: String,
     pub run_id: String,
     /// Model identifier the worker is running on, e.g. `opus` (the
-    /// family alias the engine defaults to). Initially the
-    /// engine-launched default; once `SessionStart` reports a model,
-    /// this updates to the authoritative value.
+    /// family alias the engine defaults to) or a full slug such as
+    /// `claude-opus-4-7`. Initially the engine-launched default; once a
+    /// `SessionStart` hook payload carries `model`, the reducer overwrites
+    /// this with that authoritative value. Absent model on the hook
+    /// (Codex stdout `thread.started`) leaves the launch default in place.
     pub model: String,
     /// Best-effort shell pid the app returned at spawn. `0` if the
     /// app did not yet plumb pid back through `proc_listpids`.

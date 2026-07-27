@@ -705,6 +705,7 @@ mod tests {
             &boss_protocol::WorkerEvent::SessionStart {
                 session_id: "s".to_owned(),
                 source: boss_protocol::SessionStartSource::Resume,
+                model: None,
             },
         );
 
@@ -731,6 +732,7 @@ mod tests {
             &boss_protocol::WorkerEvent::SessionStart {
                 session_id: "s".to_owned(),
                 source: boss_protocol::SessionStartSource::Startup,
+                model: None,
             },
         );
         assert_ne!(

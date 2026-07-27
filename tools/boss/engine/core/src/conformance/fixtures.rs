@@ -108,6 +108,7 @@ pub fn expected_session_events() -> Vec<WorkerEvent> {
         WorkerEvent::SessionStart {
             session_id: CANONICAL_SESSION_ID.to_owned(),
             source: SessionStartSource::Startup,
+            model: None,
         },
         WorkerEvent::UserPromptSubmit {
             session_id: CANONICAL_SESSION_ID.to_owned(),
@@ -136,8 +137,16 @@ pub fn expected_session_events() -> Vec<WorkerEvent> {
 /// different identity field names still compare equal.
 pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerEvent {
     match &mut event {
-        WorkerEvent::SessionStart { session_id: s, .. }
-        | WorkerEvent::UserPromptSubmit { session_id: s, .. }
+        WorkerEvent::SessionStart {
+            session_id: s, model, ..
+        } => {
+            *s = session_id.to_owned();
+            // Activity-machine equivalence ignores model: Claude SessionStart
+            // hooks carry it, Codex stdout `thread.started` does not. Model
+            // authority is covered by dedicated normalizer + reducer tests.
+            *model = None;
+        }
+        WorkerEvent::UserPromptSubmit { session_id: s, .. }
         | WorkerEvent::PreToolUse { session_id: s, .. }
         | WorkerEvent::PostToolUse { session_id: s, .. }
         | WorkerEvent::Stop { session_id: s, .. }
@@ -389,6 +398,7 @@ impl AgentDriver for CodexShapedDriver {
             ("thread.started", _) => WorkerEvent::SessionStart {
                 session_id,
                 source: SessionStartSource::Startup,
+                model: None,
             },
             ("turn.started", _) => WorkerEvent::UserPromptSubmit {
                 session_id,

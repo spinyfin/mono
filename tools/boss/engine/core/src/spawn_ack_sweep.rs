@@ -662,6 +662,7 @@ mod tests {
             &WorkerEvent::SessionStart {
                 session_id: "s".to_owned(),
                 source: boss_protocol::SessionStartSource::Resume,
+                model: None,
             },
         );
 

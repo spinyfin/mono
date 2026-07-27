@@ -108,6 +108,7 @@ fn only_stop_shaped_events_are_turn_boundaries_on_either_driver() {
         WorkerEvent::SessionStart {
             session_id: CANONICAL_SESSION_ID.to_owned(),
             source: boss_protocol::SessionStartSource::Startup,
+            model: None,
         },
         WorkerEvent::UserPromptSubmit {
             session_id: CANONICAL_SESSION_ID.to_owned(),

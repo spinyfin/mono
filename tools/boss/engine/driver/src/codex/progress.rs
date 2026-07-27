@@ -108,9 +108,13 @@ impl CodexProgressSession {
                 self.current_thread_id = Some(thread_id.to_owned());
                 self.turn_terminal = false;
                 self.terminal_message = None;
+                // Codex stdout `thread.started` has no model field; SessionStart
+                // model remains None and the live-worker reducer keeps the
+                // launch default until a Claude-compatible hook supplies one.
                 Ok(vec![WorkerEvent::SessionStart {
                     session_id: thread_id.to_owned(),
                     source,
+                    model: None,
                 }])
             }
             StdoutEnvelope::Unknown {
@@ -691,6 +695,7 @@ mod tests {
             WorkerEvent::SessionStart {
                 session_id: "thread-1".into(),
                 source: SessionStartSource::Startup,
+                model: None,
             }
         );
         assert!(matches!(
@@ -757,6 +762,7 @@ mod tests {
             WorkerEvent::SessionStart {
                 session_id: "same-thread".into(),
                 source: SessionStartSource::Resume,
+                model: None,
             }
         );
         assert!(matches!(

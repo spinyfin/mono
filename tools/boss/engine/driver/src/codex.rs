@@ -1468,6 +1468,7 @@ else:
                 .turn_boundary(&WorkerEvent::SessionStart {
                     session_id: "thread-1".into(),
                     source: boss_protocol::SessionStartSource::Startup,
+                    model: None,
                 })
                 .is_none()
         );
