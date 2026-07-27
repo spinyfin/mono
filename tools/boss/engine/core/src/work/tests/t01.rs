@@ -1502,6 +1502,12 @@ fn transcript_path_prefers_agent_session_over_prestart_failure_sibling() {
         Some("/t/session.jsonl"),
         "read path must prefer the agent-session row over a newer pre-start failure",
     );
+    // Host resolution must pair with the same target (session was local).
+    assert_eq!(
+        db.latest_run_host_for_execution(&execution.id).unwrap().as_deref(),
+        Some("local"),
+        "host read must prefer the agent-session row over a newer pre-start failure",
+    );
 
     let runs = db.list_runs(&execution.id).unwrap();
     assert_eq!(runs.len(), 2, "session + permanent pre-start failure");
@@ -1510,6 +1516,173 @@ fn transcript_path_prefers_agent_session_over_prestart_failure_sibling() {
         fail_run.transcript_path.is_none(),
         "pre-start failure bookkeeping row must not receive a transcript_path",
     );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Cost snapshots ride the same hook seam as transcript_path and must
+/// land on the agent-session run_id even when a newer permanent pre-start
+/// failure sibling is pure-latest by created_at.
+#[test]
+fn cost_snapshot_prefers_agent_session_over_prestart_failure_sibling() {
+    let path = temp_db_path("cost-prefer-session");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "cost vs prestart");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    let (_execution, session_run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&session_run.id)
+            .execution_status(ExecutionStatus::WaitingHuman)
+            .run_status("completed")
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(
+        db.set_run_transcript_path_if_unset(&execution.id, "/t/session.jsonl")
+            .unwrap(),
+        SetRunTranscriptPathOutcome::Updated,
+    );
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'ready', finished_at = NULL WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    }
+    let (_execution, fail_run, outcome) = db
+        .record_pre_start_failure(
+            &execution.id,
+            "worker-2",
+            Some("mono"),
+            "cube lease failed",
+            &[], // permanent fail bookkeeping row
+        )
+        .unwrap();
+    assert!(matches!(outcome, PreStartFailureOutcome::PermanentFail));
+    let fail_run = fail_run.expect("permanent fail must insert a bookkeeping run");
+
+    let wrote = db
+        .set_run_cost_snapshot(
+            &execution.id,
+            crate::run_cost::RunCostSnapshot::builder()
+                .model("claude-opus-4-5")
+                .output_tokens(42)
+                .input_tokens(100)
+                .build(),
+        )
+        .unwrap();
+    assert!(wrote, "cost snapshot must update the agent-session run");
+
+    let conn = db.connect().unwrap();
+    let (session_model, session_out, session_in): (Option<String>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT model, output_tokens, input_tokens FROM work_runs WHERE id = ?1",
+            [&session_run.id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(session_model.as_deref(), Some("claude-opus-4-5"));
+    assert_eq!(session_out, Some(42));
+    assert_eq!(session_in, Some(100));
+
+    let (fail_model, fail_out): (Option<String>, Option<i64>) = conn
+        .query_row(
+            "SELECT model, output_tokens FROM work_runs WHERE id = ?1",
+            [&fail_run.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        fail_model.is_none() && fail_out.is_none(),
+        "pre-start failure bookkeeping row must not receive cost columns",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// When both the agent-session and a newer permanent pre-start sibling
+/// are `status='failed'`, prefer the path-bearing session over pure-latest.
+#[test]
+fn transcript_path_prefers_path_bearing_failed_session_over_newer_bookkeeping() {
+    let path = temp_db_path("transcript-failed-session-vs-bookkeeping");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "failed session vs bookkeeping");
+    let execution = db
+        .request_execution(RequestExecutionInput::builder().work_item_id(chore.id.clone()).build())
+        .unwrap();
+
+    let (_execution, session_run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            "/tmp/mono-agent-001",
+        )
+        .unwrap();
+    // Stamp path while the session is still unfinished (live hook shape).
+    assert_eq!(
+        db.set_run_transcript_path_if_unset(&execution.id, "/t/failed-session.jsonl")
+            .unwrap(),
+        SetRunTranscriptPathOutcome::Updated,
+    );
+    db.finish_execution_run(
+        FinishExecutionRunInput::builder()
+            .execution_id(&execution.id)
+            .run_id(&session_run.id)
+            .execution_status(ExecutionStatus::Failed)
+            .run_status("failed")
+            .error_text("worker crashed")
+            .build(),
+    )
+    .unwrap();
+
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE work_executions SET status = 'ready', finished_at = NULL WHERE id = ?1",
+            [&execution.id],
+        )
+        .unwrap();
+    }
+    let (_execution, fail_run, outcome) = db
+        .record_pre_start_failure(&execution.id, "worker-2", Some("mono"), "cube lease failed", &[])
+        .unwrap();
+    assert!(matches!(outcome, PreStartFailureOutcome::PermanentFail));
+    let fail_run = fail_run.expect("permanent fail inserts bookkeeping run");
+    assert_eq!(fail_run.status, "failed");
+    assert_eq!(db.get_run(&session_run.id).unwrap().status, "failed");
+
+    assert_eq!(
+        db.transcript_path_for_execution(&execution.id).unwrap().as_deref(),
+        Some("/t/failed-session.jsonl"),
+        "path-bearing failed agent session must beat a newer path-less bookkeeping row",
+    );
+    assert_eq!(
+        db.set_run_transcript_path_if_unset(&execution.id, "/t/should-not-win.jsonl")
+            .unwrap(),
+        SetRunTranscriptPathOutcome::AlreadySet,
+    );
+    assert!(db.get_run(&fail_run.id).unwrap().transcript_path.is_none());
 
     let _ = std::fs::remove_file(path);
 }

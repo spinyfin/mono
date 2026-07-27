@@ -1558,11 +1558,13 @@ impl WorkDb {
     /// that row is terminal-failed and a newer session starts, leave
     /// the prior session row unfilled forever.
     ///
-    /// Order of preference (see [`Self::resolve_run_id_for_execution_hooks`]):
+    /// Order of preference (see [`resolve_run_id_for_execution_hooks`]):
     /// 1. unfinished rows (`finished_at IS NULL`) — the live session;
     /// 2. non-`failed` rows — pane-spawn parks the dispatch/spawn run as
     ///    `completed` within ~1s while the worker keeps running;
-    /// 3. newest by `(created_at DESC, id DESC)` as a last resort.
+    /// 3. rows with a non-NULL `transcript_path` — so a failed agent session
+    ///    beats a newer path-less permanent pre-start bookkeeping sibling;
+    /// 4. newest by `(created_at DESC, id DESC)` as a last resort.
     ///
     /// Idempotent for the first writer per run (the
     /// `WHERE transcript_path IS NULL` clause keeps every subsequent
@@ -1717,26 +1719,26 @@ impl WorkDb {
 
     /// Atomically claim the one current provider session id for an execution.
     ///
-    /// Returns `true` when the latest run already held `session_id` (resume)
-    /// and `false` when this call installed a new identity (startup). The
-    /// value lives in engine-owned SQLite, not the agent-writable provider
-    /// home, and is bounded to one string on the latest run row.
+    /// Returns `true` when the selected agent-session run already held
+    /// `session_id` (resume) and `false` when this call installed a new
+    /// identity (startup). The value lives in engine-owned SQLite, not the
+    /// agent-writable provider home, and is bounded to one string on the
+    /// agent-session run row (same target selection as hook-driven path/cost
+    /// writes — see [`resolve_run_id_for_execution_hooks`]).
     pub fn claim_run_progress_session_identity(&self, execution_id: &str, session_id: &str) -> Result<bool> {
         let mut conn = self.connect()?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let row: Option<(String, Option<String>)> = tx
-            .query_row(
-                "SELECT id, progress_session_id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![execution_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((run_id, prior)) = row else {
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&tx, execution_id)? else {
             bail!("no work_runs row for execution {execution_id}");
         };
+        let prior: Option<String> = tx
+            .query_row(
+                "SELECT progress_session_id FROM work_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
         let resumed = prior.as_deref() == Some(session_id);
         if !resumed {
             tx.execute(
@@ -1750,18 +1752,18 @@ impl WorkDb {
 
     /// Clear the engine-owned provider session identity during normal
     /// execution teardown. Returns `false` when no run row exists.
+    ///
+    /// Targets the same agent-session row as
+    /// [`Self::claim_run_progress_session_identity`] so a newer pre-start
+    /// failure bookkeeping sibling cannot capture the clear.
     pub fn clear_run_progress_session_identity(&self, execution_id: &str) -> Result<bool> {
         let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
         let updated = conn.execute(
-            "UPDATE work_runs
-             SET progress_session_id = NULL
-             WHERE id = (
-                 SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1
-             )",
-            params![execution_id],
+            "UPDATE work_runs SET progress_session_id = NULL WHERE id = ?1",
+            params![run_id],
         )?;
         Ok(updated > 0)
     }
@@ -1783,7 +1785,7 @@ impl WorkDb {
         Ok(count > 0)
     }
 
-    /// Host id of the most-recent `work_runs` row for `execution_id`,
+    /// Host id of the agent-session `work_runs` row for `execution_id`,
     /// or `None` when the execution has no run yet.
     ///
     /// The distributed-execution dispatch path stamps `host_id` on the
@@ -1792,58 +1794,57 @@ impl WorkDb {
     /// whether the recorded `transcript_path` lives on the local
     /// filesystem (`host_id = 'local'`) or must be pulled over SSH, and
     /// the live-status dispatcher reads it to decide whether a slotless
-    /// run is a remote worker that warrants a virtual slot. Resolves the
-    /// latest run the same way [`Self::transcript_path_for_execution`]
-    /// does (`ORDER BY created_at DESC, id DESC`), so it always reflects
-    /// the live run after a re-spawn.
+    /// run is a remote worker that warrants a virtual slot.
+    ///
+    /// Resolves the target run with the same preference order as
+    /// [`Self::transcript_path_for_execution`] /
+    /// [`resolve_run_id_for_execution_hooks`] so host and path stay
+    /// paired when a newer pre-start failure bookkeeping sibling exists.
     pub fn latest_run_host_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
         let host: Option<String> = conn
-            .query_row(
-                "SELECT host_id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1",
-                params![execution_id],
-                |row| row.get(0),
-            )
+            .query_row("SELECT host_id FROM work_runs WHERE id = ?1", params![run_id], |row| {
+                row.get(0)
+            })
             .optional()?;
         Ok(host)
     }
 
-    /// Persist the remote worker pid onto the latest `work_runs` row for
-    /// `execution_id`. The SSH spawn path captures the pid from the
+    /// Persist the remote worker pid onto the agent-session `work_runs` row
+    /// for `execution_id`. The SSH spawn path captures the pid from the
     /// wrapper handshake (`parse_remote_pid`) and stamps it here so the
     /// design's "Storage Additions" `work_runs.remote_pid` — the
     /// addressing key for control-channel signal delivery — is durable.
     ///
-    /// Mirrors [`Self::set_run_transcript_path_if_unset`]'s namespace
-    /// handling: `execution_id` is the `exec_*` id the spawn path holds,
-    /// resolved to the live `work_runs.id`. Returns `true` when a row was
-    /// updated, `false` when no run exists yet (benign — the caller logs
-    /// and moves on; the pid is informational, not a spawn precondition).
+    /// Mirrors [`Self::set_run_transcript_path_if_unset`]'s namespace and
+    /// target selection: `execution_id` is the `exec_*` id the spawn path
+    /// holds, resolved to the agent-session `work_runs.id` via
+    /// [`resolve_run_id_for_execution_hooks`]. Returns `true` when a row
+    /// was updated, `false` when no run exists yet (benign — the caller
+    /// logs and moves on; the pid is informational, not a spawn
+    /// precondition).
     pub fn set_run_remote_pid_for_execution(&self, execution_id: &str, remote_pid: i64) -> Result<bool> {
         let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
         let updated = conn.execute(
-            "UPDATE work_runs
-             SET remote_pid = ?2
-             WHERE id = (
-                 SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1
-             )",
-            params![execution_id, remote_pid],
+            "UPDATE work_runs SET remote_pid = ?2 WHERE id = ?1",
+            params![run_id, remote_pid],
         )?;
         Ok(updated > 0)
     }
 
     /// Persist the real OS shell pid of a *local* libghostty worker pane onto
-    /// the latest `work_runs` row for `execution_id`. The macOS app reports
-    /// this via the `UpdateWorkerShellPid` RPC once the pane's surface
-    /// attaches; the engine stamps it here so the pid is durable across an
-    /// engine restart (the in-memory [`crate::live_worker_state::LiveWorkerStateRegistry`]
-    /// is empty on boot). [`crate::dead_pane_sweep`] then probes this pid with
+    /// the agent-session `work_runs` row for `execution_id`. The macOS app
+    /// reports this via the `UpdateWorkerShellPid` RPC once the pane's
+    /// surface attaches; the engine stamps it here so the pid is durable
+    /// across an engine restart (the in-memory
+    /// [`crate::live_worker_state::LiveWorkerStateRegistry`] is empty on
+    /// boot). [`crate::dead_pane_sweep`] then probes this pid with
     /// `kill(pid, 0)` to detect a pane that died with its host app while the
     /// execution row is still `waiting_human`.
     ///
@@ -1853,20 +1854,17 @@ impl WorkDb {
     /// write **race-free** with respect to in-memory slot registration — the
     /// concurrent-spawn race that could drop the pid from the live registry
     /// ("no live slot found for run_id") cannot drop it from the DB. Mirrors
-    /// [`Self::set_run_remote_pid_for_execution`]. Returns `true` when a row
-    /// was updated, `false` when no run exists yet (benign).
+    /// [`Self::set_run_remote_pid_for_execution`] (same
+    /// [`resolve_run_id_for_execution_hooks`] target). Returns `true` when a
+    /// row was updated, `false` when no run exists yet (benign).
     pub fn set_run_shell_pid_for_execution(&self, execution_id: &str, shell_pid: i64) -> Result<bool> {
         let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
         let updated = conn.execute(
-            "UPDATE work_runs
-             SET shell_pid = ?2
-             WHERE id = (
-                 SELECT id FROM work_runs
-                 WHERE execution_id = ?1
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT 1
-             )",
-            params![execution_id, shell_pid],
+            "UPDATE work_runs SET shell_pid = ?2 WHERE id = ?1",
+            params![run_id, shell_pid],
         )?;
         Ok(updated > 0)
     }
@@ -2137,20 +2135,25 @@ impl WorkDb {
 }
 
 /// Pick the `work_runs` row that hook-driven writes (transcript path,
-/// cost snapshot) and the live-status read path should target for an
-/// execution.
+/// cost snapshot), progress-session claim/clear, remote/shell pid stamps,
+/// and the live-status path/host read path should target for an execution.
 ///
 /// Preference order (see `WorkDb::set_run_transcript_path_if_unset`):
 /// 1. unfinished (`finished_at IS NULL`) — the live agent session;
 /// 2. non-`failed` — pane-spawn parks the dispatch run as `completed`
 ///    almost immediately while the worker keeps emitting hooks;
-/// 3. newest by `(created_at DESC, id DESC)`.
+/// 3. rows with a non-NULL `transcript_path` — when both candidates are
+///    terminal-failed (agent-session fail vs a newer permanent pre-start
+///    bookkeeping sibling), prefer the row that actually hosted a worker
+///    and already has path/cost; pure newest would otherwise hand residual
+///    hooks and host reads to the path-less bookkeeping row;
+/// 4. newest by `(created_at DESC, id DESC)`.
 ///
 /// Pre-start failure bookkeeping rows (`status='failed'`, never hosted a
 /// worker) sort last so a later re-queue's failed sibling cannot capture
 /// path/cost writes that belong to the real session row, and so the
-/// live-status resolver does not report NULL when only a failed sibling
-/// is newer than a path-bearing session.
+/// live-status resolver does not report NULL/wrong-host when only a failed
+/// sibling is newer than a path-bearing session.
 fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> Result<Option<String>> {
     conn.query_row(
         "SELECT id FROM work_runs
@@ -2158,6 +2161,7 @@ fn resolve_run_id_for_execution_hooks(conn: &Connection, execution_id: &str) -> 
          ORDER BY
            CASE WHEN finished_at IS NULL THEN 0 ELSE 1 END,
            CASE WHEN status = 'failed' THEN 1 ELSE 0 END,
+           CASE WHEN transcript_path IS NOT NULL THEN 0 ELSE 1 END,
            created_at DESC,
            id DESC
          LIMIT 1",
