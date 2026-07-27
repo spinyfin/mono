@@ -606,9 +606,20 @@ async fn reconcile_existing(
             // project status is not already the target column; this prevents
             // a regression if the user has manually advanced the item to a
             // later column while the task is still in progress.
+            //
+            // Issues without project membership (e.g. GitHub repo/label
+            // secondary source with no `project_item_id`) must be skipped:
+            // set_project_status would no-op as "success" while
+            // project_status stays unset, re-queuing every tick forever.
             if task.status == TaskStatus::Active {
                 let already_at_target = upstream.project_status.as_deref() == Some(in_progress_column);
-                if !already_at_target {
+                let has_project_membership = upstream
+                    .upstream_ref
+                    .raw
+                    .get("project_item_id")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if !already_at_target && has_project_membership {
                     in_progress_candidates.push(InProgressCandidate {
                         work_item_id: work_item_id.clone(),
                         upstream_ref: upstream.upstream_ref.clone(),

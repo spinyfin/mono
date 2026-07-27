@@ -405,6 +405,138 @@ impl GitHubTracker {
             runner: Box::new(runner),
         }
     }
+
+    /// Enumerate every issue currently on the configured Projects V2 board.
+    async fn fetch_project_items(&self, ctx: &TrackerContext, config: &GitHubConfig) -> Result<Vec<UpstreamItem>> {
+        let project_number_str = config.project_number.to_string();
+        let mut items: Vec<UpstreamItem> = Vec::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let mut vars: Vec<(&str, &str)> = vec![("org", &config.org), ("number", &project_number_str)];
+            if let Some(c) = cursor.as_deref() {
+                vars.push(("after", c));
+            }
+
+            let response = self
+                .runner
+                .graphql(GITHUB_GRAPHQL_QUERY, &vars, opt_token(ctx))
+                .await
+                .map_err(map_graphql_error)?;
+
+            check_graphql_errors(&response)?;
+
+            // Null projectV2 means the project doesn't exist.
+            if response
+                .pointer("/data/organization/projectV2")
+                .is_some_and(|v| v.is_null())
+            {
+                return Err(TrackerError::ConfigInvalid(format!(
+                    "project #{} not found in org '{}'",
+                    config.project_number, config.org
+                )));
+            }
+
+            let nodes = response
+                .pointer("/data/organization/projectV2/items/nodes")
+                .and_then(|n| n.as_array())
+                .ok_or_else(|| {
+                    TrackerError::Transient("unexpected GraphQL response shape: missing items.nodes".to_owned())
+                })?;
+
+            for node in nodes {
+                if let Some(item) = parse_project_item(node, config) {
+                    items.push(item);
+                }
+            }
+
+            let page_info = response.pointer("/data/organization/projectV2/items/pageInfo");
+            let has_next = page_info
+                .and_then(|p| p.get("hasNextPage"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if !has_next {
+                break;
+            }
+
+            cursor = page_info
+                .and_then(|p| p.get("endCursor"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
+    /// Enumerate issues in the configured `org/repo`, independent of project
+    /// membership. This is the escape hatch for issues filed with
+    /// `gh issue create` (no `--project`): they never appear on the board but
+    /// still need to be imported when they live in the bound repo and match a
+    /// non-empty `label_filter`.
+    ///
+    /// Callers must only invoke this when `label_filter` is non-empty — a
+    /// whole-repo REST walk is too expensive as a default secondary source.
+    ///
+    /// Paginated REST `GET /repos/{org}/{repo}/issues`. GitHub includes PRs in
+    /// this endpoint; those are skipped. Label matching uses the same OR
+    /// semantics as [`parse_project_item`].
+    async fn fetch_repo_issues(&self, ctx: &TrackerContext, config: &GitHubConfig) -> Result<Vec<UpstreamItem>> {
+        let mut items: Vec<UpstreamItem> = Vec::new();
+        // Safety cap: 50 pages × 100 = 5000 issues. Plenty for a product-bound
+        // repo; avoids a runaway loop if GitHub keeps returning full pages.
+        const MAX_PAGES: u32 = 50;
+        let mut page: u32 = 1;
+
+        loop {
+            let path = format!(
+                "repos/{}/{}/issues?state=all&per_page=100&page={}",
+                config.org, config.repo, page
+            );
+            let response = self
+                .runner
+                .rest_get(&path, opt_token(ctx))
+                .await
+                .map_err(map_write_error)?;
+
+            let Some(nodes) = response.body.as_array() else {
+                return Err(TrackerError::Transient(
+                    "unexpected REST response shape: issues list is not an array".to_owned(),
+                ));
+            };
+
+            if nodes.is_empty() {
+                break;
+            }
+
+            for node in nodes {
+                // The Issues REST list endpoint returns pull requests too.
+                if node.get("pull_request").is_some() {
+                    continue;
+                }
+                let Some(item) = parse_rest_issue(node, &config.org, &config.repo) else {
+                    continue;
+                };
+                if let Some(filter) = &config.label_filter
+                    && !filter.iter().any(|f| item.labels.iter().any(|l| l == f))
+                {
+                    continue;
+                }
+                items.push(item);
+            }
+
+            if nodes.len() < 100 || page >= MAX_PAGES {
+                break;
+            }
+            page += 1;
+        }
+
+        Ok(items)
+    }
 }
 
 impl Default for GitHubTracker {
@@ -435,67 +567,40 @@ impl ExternalTracker for GitHubTracker {
 
     async fn fetch_items(&self, ctx: &TrackerContext) -> Result<Vec<UpstreamItem>> {
         let config = GitHubConfig::from_ctx(ctx)?;
-        let project_number_str = config.project_number.to_string();
-        let mut items: Vec<UpstreamItem> = Vec::new();
-        let mut cursor: Option<String> = None;
 
-        loop {
-            let cursor_val = cursor.as_deref().unwrap_or("");
-            let mut vars: Vec<(&str, &str)> = vec![("org", &config.org), ("number", &project_number_str)];
-            if let Some(c) = cursor.as_deref() {
-                vars.push(("after", c));
-                let _ = cursor_val; // suppress unused warning
-            }
+        // Source 1: every issue currently on the Projects V2 board.
+        let mut items = self.fetch_project_items(ctx, &config).await?;
 
-            let response = self
-                .runner
-                .graphql(GITHUB_GRAPHQL_QUERY, &vars, opt_token(ctx))
-                .await
-                .map_err(map_graphql_error)?;
-
-            check_graphql_errors(&response)?;
-
-            // Null projectV2 means the project doesn't exist.
-            if response
-                .pointer("/data/organization/projectV2")
-                .is_some_and(|v| v.is_null())
-            {
-                return Err(TrackerError::ConfigInvalid(format!(
-                    "project #{} not found in org '{}'",
-                    config.project_number, config.org
-                )));
-            }
-
-            let nodes = response
-                .pointer("/data/organization/projectV2/items/nodes")
-                .and_then(|n| n.as_array())
-                .ok_or_else(|| {
-                    TrackerError::Transient("unexpected GraphQL response shape: missing items.nodes".to_owned())
-                })?;
-
-            for node in nodes {
-                if let Some(item) = parse_project_item(node, &config) {
-                    items.push(item);
+        // Source 2 (gated): repo issues not on the board. Only enabled when
+        // `label_filter` is non-empty — without a label constraint this would
+        // flood every issue in the bound repo. Workers that `gh issue create`
+        // with a product label but without `--project` show up here.
+        // Project-sourced items win on collision because they carry
+        // `project_item_id` / `project_status` for Behavior 6.
+        //
+        // Secondary-source failures are isolated: board items already
+        // fetched remain usable; we log and continue rather than aborting
+        // the whole pass.
+        let label_filter_active = config.label_filter.as_ref().is_some_and(|labels| !labels.is_empty());
+        if label_filter_active {
+            match self.fetch_repo_issues(ctx, &config).await {
+                Ok(repo_items) => {
+                    let mut seen: std::collections::HashSet<String> =
+                        items.iter().map(|i| i.upstream_ref.canonical_id.clone()).collect();
+                    for item in repo_items {
+                        if seen.insert(item.upstream_ref.canonical_id.clone()) {
+                            items.push(item);
+                        }
+                    }
                 }
-            }
-
-            let page_info = response.pointer("/data/organization/projectV2/items/pageInfo");
-            let has_next = page_info
-                .and_then(|p| p.get("hasNextPage"))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-
-            if !has_next {
-                break;
-            }
-
-            cursor = page_info
-                .and_then(|p| p.get("endCursor"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_owned());
-
-            if cursor.is_none() {
-                break;
+                Err(e) => {
+                    tracing::warn!(
+                        org = %config.org,
+                        repo = %config.repo,
+                        error = %e,
+                        "repo secondary source failed; continuing with project board items only"
+                    );
+                }
             }
         }
 
@@ -578,14 +683,20 @@ impl ExternalTracker for GitHubTracker {
         let config = GitHubConfig::from_ctx(ctx)?;
         let target_column = config.in_progress_column_name().to_owned();
 
-        let project_item_id = ref_
+        // Issues ingested via the repo/label path (not on the project board)
+        // have no project_item_id. Behavior 6 has nothing to update until the
+        // issue is added to the project. The reconciler skips candidates
+        // without project membership so this path is a defensive no-op only
+        // (no network, no "success" metric inflation from a real mutation).
+        let Some(project_item_id) = ref_
             .raw
             .get("project_item_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                TrackerError::ConfigInvalid("upstream ref missing 'project_item_id' in raw blob".to_owned())
-            })?
-            .to_owned();
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_owned())
+        else {
+            return Ok(());
+        };
 
         // Fetch project metadata: project node ID, Status field ID, option IDs.
         let project_number_str = config.project_number.to_string();
@@ -987,6 +1098,20 @@ mod tests {
         })
     }
 
+    fn rest_issue_with_labels(number: u64, title: &str, labels: &[&str]) -> Value {
+        json!({
+            "number": number,
+            "title": title,
+            "body": "Some description.",
+            "state": "open",
+            "state_reason": null,
+            "html_url": format!("https://github.com/spinyfin/mono/issues/{number}"),
+            "labels": labels.iter().map(|l| json!({"name": l})).collect::<Vec<_>>(),
+            "assignees": [],
+            "updated_at": "2026-05-17T10:00:00Z"
+        })
+    }
+
     fn issue_ref(number: u64) -> UpstreamRef {
         UpstreamRef {
             kind: "github".to_owned(),
@@ -1170,6 +1295,8 @@ mod tests {
             false,
             "c",
         ));
+        // Repo list also has a non-matching issue; label filter must drop it.
+        fake.push_rest_get_ok(json!([rest_issue_with_labels(99, "Repo only", &["ui"])]));
         let tracker = GitHubTracker::with_runner(fake);
         let ctx = github_ctx_with_label_filter(&["boss"]);
         let items = tracker.fetch_items(&ctx).await.expect("fetch_items");
@@ -1188,6 +1315,8 @@ mod tests {
             false,
             "c",
         ));
+        // Empty REST page: secondary source is active because label_filter is set.
+        fake.push_rest_get_ok(json!([]));
         let tracker = GitHubTracker::with_runner(fake);
         let ctx = github_ctx_with_label_filter(&["bug"]);
         let items = tracker.fetch_items(&ctx).await.expect("fetch_items");
@@ -1223,6 +1352,167 @@ mod tests {
         let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#42");
+    }
+
+    // ── fetch_items: repo secondary source (escape hatch) ─────────────────────
+
+    #[tokio::test]
+    async fn fetch_items_skips_repo_source_without_label_filter() {
+        // Without label_filter the secondary REST source must not run — even
+        // if a rest response were queued, board-only walk is the full result.
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(
+            vec![open_issue_node("PVTI_1", 1, "On board only", &[])],
+            false,
+            "c",
+        ));
+        // Deliberately do NOT queue a REST response; if the secondary source
+        // runs, FakeGhRunner panics on an empty queue.
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker.fetch_items(&github_ctx()).await.expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#1");
+    }
+
+    #[tokio::test]
+    async fn fetch_items_includes_repo_issues_not_on_project() {
+        // Project board is empty; the issue lives only in the bound repo.
+        // Secondary source requires a non-empty label_filter.
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        fake.push_rest_get_ok(json!([rest_issue_with_labels(
+            77,
+            "Filed without --project",
+            &["boss"]
+        )]));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#77");
+        assert_eq!(items[0].title, "Filed without --project");
+        // Repo-sourced items have no project_item_id / project_status.
+        assert!(items[0].upstream_ref.raw.get("project_item_id").is_none());
+        assert!(items[0].project_status.is_none());
+    }
+
+    #[tokio::test]
+    async fn fetch_items_dedups_repo_issue_already_on_project() {
+        let mut fake = FakeGhRunner::new();
+        // open_issue_node carries Status=Todo and accepts labels for the filter.
+        fake.push_graphql_ok(graphql_page(
+            vec![open_issue_node("PVTI_1", 10, "On board", &["boss"])],
+            false,
+            "c",
+        ));
+        // Same issue also appears in the repo list (label_filter active).
+        fake.push_rest_get_ok(json!([rest_issue_with_labels(10, "On board", &["boss"])]));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("fetch_items");
+        assert_eq!(items.len(), 1, "project + repo must not double-count");
+        // Project-sourced wins: project_status and project_item_id present.
+        assert_eq!(items[0].project_status.as_deref(), Some("Todo"));
+        assert_eq!(
+            items[0]
+                .upstream_ref
+                .raw
+                .get("project_item_id")
+                .and_then(|v| v.as_str()),
+            Some("PVTI_1")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_items_repo_source_skips_pull_requests() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        fake.push_rest_get_ok(json!([
+            {
+                "number": 5,
+                "title": "A PR disguised as an issue",
+                "body": "",
+                "state": "open",
+                "state_reason": null,
+                "html_url": "https://github.com/spinyfin/mono/pull/5",
+                "labels": [{"name": "boss"}],
+                "assignees": [],
+                "updated_at": "2026-05-17T10:00:00Z",
+                "pull_request": { "url": "https://api.github.com/repos/spinyfin/mono/pulls/5" }
+            },
+            rest_issue_with_labels(6, "Real issue", &["boss"])
+        ]));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#6");
+    }
+
+    #[tokio::test]
+    async fn fetch_items_repo_source_applies_label_filter() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        fake.push_rest_get_ok(json!([
+            rest_issue_with_labels(1, "Wanted", &["boss"]),
+            rest_issue_with_labels(2, "Noise", &["infra"]),
+        ]));
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("fetch_items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#1");
+    }
+
+    #[tokio::test]
+    async fn fetch_items_repo_source_paginates() {
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(vec![], false, ""));
+        // Full first page (100 items) forces a second request.
+        let page1: Vec<Value> = (1..=100).map(|n| rest_issue_with_labels(n, "p1", &["boss"])).collect();
+        let page2 = json!([rest_issue_with_labels(101, "p2", &["boss"])]);
+        fake.push_rest_get_ok(Value::Array(page1));
+        fake.push_rest_get_ok(page2);
+
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("fetch_items");
+        assert_eq!(items.len(), 101);
+        assert_eq!(items[100].upstream_ref.canonical_id, "spinyfin/mono#101");
+    }
+
+    #[tokio::test]
+    async fn fetch_items_repo_source_error_does_not_abort_board_items() {
+        // Board walk succeeds; secondary REST fails. Board items must still
+        // be returned — secondary failures are isolated.
+        let mut fake = FakeGhRunner::new();
+        fake.push_graphql_ok(graphql_page(
+            vec![open_issue_node("PVTI_1", 10, "Board item", &["boss"])],
+            false,
+            "c",
+        ));
+        fake.push_rest_get_err(403, "Forbidden (HTTP 403)");
+        let tracker = GitHubTracker::with_runner(fake);
+        let items = tracker
+            .fetch_items(&github_ctx_with_label_filter(&["boss"]))
+            .await
+            .expect("board items must survive secondary REST failure");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].upstream_ref.canonical_id, "spinyfin/mono#10");
     }
 
     // ── fetch_items: gh itself fails (network / auth) ─────────────────────────
@@ -1535,7 +1825,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_project_status_returns_config_invalid_on_missing_project_item_id() {
+    async fn set_project_status_is_noop_when_project_item_id_missing() {
+        // Repo-sourced issues have no project_item_id. Defensive no-op: the
+        // reconciler skips these candidates so this path should rarely run.
         let ref_without_item_id = UpstreamRef {
             kind: "github".to_owned(),
             canonical_id: "spinyfin/mono#1".to_owned(),
@@ -1543,11 +1835,10 @@ mod tests {
         };
         let fake = FakeGhRunner::new();
         let tracker = GitHubTracker::with_runner(fake);
-        let err = tracker
+        tracker
             .set_project_status(&github_ctx(), &ref_without_item_id)
             .await
-            .expect_err("should fail when project_item_id missing");
-        assert!(matches!(err, TrackerError::ConfigInvalid(_)));
+            .expect("missing project_item_id must not fail");
     }
 
     #[tokio::test]
