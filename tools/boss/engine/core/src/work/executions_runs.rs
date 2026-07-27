@@ -1586,9 +1586,12 @@ impl WorkDb {
     /// The dispatcher derives this snapshot by incrementally tailing the
     /// transcript on every hook. Values are assignments, not SQL increments:
     /// retrying a hook or rebuilding the in-memory tail after an engine
-    /// restart is therefore idempotent. Optional values use `COALESCE` so a
-    /// transcript that has not emitted (for example) a turn-duration record
-    /// cannot erase a value captured by an earlier hook.
+    /// restart is therefore idempotent. Optional scalar values use `COALESCE`
+    /// so a transcript that has not emitted (for example) a turn-duration
+    /// record cannot erase a value captured by an earlier hook. Cache-write
+    /// TTL splits carry a separate observed/known signal because NULL also
+    /// means "usage observed but the provider omitted its TTL breakdown"; that
+    /// state must explicitly clear a formerly-known split.
     pub(crate) fn set_run_cost_snapshot(
         &self,
         execution_id: &str,
@@ -1615,10 +1618,18 @@ impl WorkDb {
                  input_tokens = COALESCE(?4, input_tokens),
                  cache_creation_tokens = COALESCE(?5, cache_creation_tokens),
                  cache_read_tokens = COALESCE(?6, cache_read_tokens),
-                 cache_creation_5m_tokens = COALESCE(?7, cache_creation_5m_tokens),
-                 cache_creation_1h_tokens = COALESCE(?8, cache_creation_1h_tokens),
-                 rounds = COALESCE(?9, rounds),
-                 agent_active_ms = COALESCE(?10, agent_active_ms)
+                 cache_creation_5m_tokens = CASE
+                     WHEN ?9 IS NULL THEN cache_creation_5m_tokens
+                     WHEN ?9 = 0 THEN NULL
+                     ELSE ?7
+                 END,
+                 cache_creation_1h_tokens = CASE
+                     WHEN ?9 IS NULL THEN cache_creation_1h_tokens
+                     WHEN ?9 = 0 THEN NULL
+                     ELSE ?8
+                 END,
+                 rounds = COALESCE(?10, rounds),
+                 agent_active_ms = COALESCE(?11, agent_active_ms)
              WHERE id = ?1",
             params![
                 run_id,
@@ -1629,6 +1640,7 @@ impl WorkDb {
                 snapshot.cache_read_tokens,
                 snapshot.cache_creation_5m_tokens,
                 snapshot.cache_creation_1h_tokens,
+                snapshot.cache_creation_ttl_split_known,
                 snapshot.rounds,
                 snapshot.agent_active_ms,
             ],

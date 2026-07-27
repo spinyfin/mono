@@ -11,7 +11,7 @@
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
@@ -63,10 +63,21 @@ pub struct IncomingHookEvent {
     pub run_id: Option<String>,
     pub transcript_path: Option<String>,
     pub event: WorkerEvent,
-    /// Deliberately private: the only way to populate it is [`Self::resolve`],
-    /// which derives it from a driver. A boundary that could be hand-set at a
-    /// construction site is a boundary the driver seam does not actually own.
+    driver_resolution: DriverHookResolution,
+}
+
+#[derive(Debug, Clone)]
+struct DriverHookResolution {
+    /// Deliberately private: the only way to populate it is
+    /// [`IncomingHookEvent::resolve`], which derives it from a driver. A
+    /// boundary that could be hand-set at a construction site is a boundary
+    /// the driver seam does not actually own.
     turn_boundary: Option<TurnEnd>,
+    /// Driver-owned root the transcript path must remain beneath, resolved at
+    /// the same seam as the turn boundary. `Err` is retained rather than
+    /// degraded to unrestricted access: a broken containment root must make
+    /// transcript consumers refuse the read.
+    transcript_containment_root: Result<Option<PathBuf>, String>,
 }
 
 impl IncomingHookEvent {
@@ -85,26 +96,41 @@ impl IncomingHookEvent {
         transcript_path: Option<String>,
         peer_pid: Option<libc::pid_t>,
     ) -> Self {
-        let turn_boundary = driver.turn_boundary(&event);
+        let driver_resolution = DriverHookResolution {
+            turn_boundary: driver.turn_boundary(&event),
+            transcript_containment_root: match run_id.as_deref() {
+                Some(run_id) => driver
+                    .transcript_containment_root(run_id)
+                    .map_err(|error| format!("{error:#}")),
+                None => Ok(None),
+            },
+        };
         Self {
             peer_pid,
             run_id,
             transcript_path,
             event,
-            turn_boundary,
+            driver_resolution,
         }
     }
 
     /// The driver-supplied turn-ended signal for this event, or `None` when
     /// the driver does not consider it a turn boundary.
     pub fn turn_boundary(&self) -> Option<&TurnEnd> {
-        self.turn_boundary.as_ref()
+        self.driver_resolution.turn_boundary.as_ref()
     }
 
     /// Whether this event ends a worker turn, per its driver. The gate every
     /// on-turn-boundary dispatcher opens with.
     pub fn is_turn_boundary(&self) -> bool {
-        self.turn_boundary.is_some()
+        self.driver_resolution.turn_boundary.is_some()
+    }
+
+    pub fn transcript_containment_root(&self) -> Result<Option<&Path>, &str> {
+        match &self.driver_resolution.transcript_containment_root {
+            Ok(root) => Ok(root.as_deref()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Test-only shorthand for [`Self::resolve`] against the engine's default

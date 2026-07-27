@@ -27,6 +27,10 @@ pub(crate) struct RunCostSnapshot {
     pub cache_read_tokens: Option<i64>,
     pub cache_creation_5m_tokens: Option<i64>,
     pub cache_creation_1h_tokens: Option<i64>,
+    /// `None`: no usage observation in this snapshot. `Some(false)`: usage
+    /// was observed but at least one non-zero cache write lacked a TTL split,
+    /// so persisted split columns must be explicitly cleared to NULL.
+    pub cache_creation_ttl_split_known: Option<bool>,
     pub rounds: Option<i64>,
     pub agent_active_ms: Option<i64>,
 }
@@ -50,9 +54,9 @@ struct CostAccumulator {
     messages: HashMap<String, Option<MessageUsage>>,
     codex_usage_by_transcript: HashMap<PathBuf, MessageUsage>,
     codex_rounds: std::collections::HashSet<String>,
-    duration_record_ids: std::collections::HashSet<String>,
-    agent_active_ms: i64,
-    saw_turn_duration: bool,
+    duration_by_id: HashMap<String, i64>,
+    anonymous_duration_ms: i64,
+    saw_anonymous_duration: bool,
 }
 
 impl CostAccumulator {
@@ -60,18 +64,17 @@ impl CostAccumulator {
         match value.get("type").and_then(Value::as_str) {
             Some("assistant") => self.ingest_assistant(value),
             Some("system") if value.get("subtype").and_then(Value::as_str) == Some("turn_duration") => {
-                if let Some(id) = value.get("uuid").and_then(Value::as_str)
-                    && !self.duration_record_ids.insert(format!("claude:{id}"))
-                {
-                    return;
-                }
                 if let Some(duration_ms) = value
                     .get("durationMs")
                     .or_else(|| value.get("duration_ms"))
                     .and_then(nonnegative_i64)
                 {
-                    self.agent_active_ms = self.agent_active_ms.saturating_add(duration_ms);
-                    self.saw_turn_duration = true;
+                    if let Some(id) = value.get("uuid").and_then(Value::as_str) {
+                        self.duration_by_id.insert(format!("claude:{id}"), duration_ms);
+                    } else {
+                        self.anonymous_duration_ms = self.anonymous_duration_ms.saturating_add(duration_ms);
+                        self.saw_anonymous_duration = true;
+                    }
                 }
             }
             Some("turn_context") => {
@@ -175,8 +178,7 @@ impl CostAccumulator {
                 if self.codex_rounds.insert(turn_id.to_owned())
                     && let Some(duration_ms) = value.pointer("/payload/duration_ms").and_then(nonnegative_i64)
                 {
-                    self.agent_active_ms = self.agent_active_ms.saturating_add(duration_ms);
-                    self.saw_turn_duration = true;
+                    self.duration_by_id.insert(format!("codex:{turn_id}"), duration_ms);
                 }
             }
             _ => {}
@@ -187,7 +189,8 @@ impl CostAccumulator {
         if self.messages.is_empty()
             && self.codex_rounds.is_empty()
             && self.codex_usage_by_transcript.is_empty()
-            && !self.saw_turn_duration
+            && self.duration_by_id.is_empty()
+            && !self.saw_anonymous_duration
         {
             return None;
         }
@@ -203,6 +206,12 @@ impl CostAccumulator {
             |f: fn(&MessageUsage) -> i64| usages.iter().fold(0_i64, |total, usage| total.saturating_add(f(usage)));
         let cache_creation_tokens = saw_usage.then(|| sum(|usage| usage.cache_creation_tokens));
         let ttl_split_known = usages.iter().all(|usage| usage.cache_creation_ttl_split_known);
+        let agent_active_ms = self
+            .duration_by_id
+            .values()
+            .fold(self.anonymous_duration_ms, |total, duration| {
+                total.saturating_add(*duration)
+            });
 
         Some(RunCostSnapshot {
             model: self.model.clone(),
@@ -214,9 +223,33 @@ impl CostAccumulator {
                 .then(|| sum(|usage| usage.cache_creation_5m_tokens)),
             cache_creation_1h_tokens: (saw_usage && ttl_split_known)
                 .then(|| sum(|usage| usage.cache_creation_1h_tokens)),
+            cache_creation_ttl_split_known: saw_usage.then_some(ttl_split_known),
             rounds: Some((self.messages.len() + self.codex_rounds.len()) as i64),
-            agent_active_ms: self.saw_turn_duration.then_some(self.agent_active_ms),
+            agent_active_ms: (!self.duration_by_id.is_empty() || self.saw_anonymous_duration)
+                .then_some(agent_active_ms),
         })
+    }
+
+    fn merge_from(&mut self, other: &Self) {
+        if let Some(model) = other.model.as_ref() {
+            self.model = Some(model.clone());
+        }
+        for (message_id, usage) in &other.messages {
+            match usage {
+                Some(usage) => {
+                    self.messages.insert(message_id.clone(), Some(usage.clone()));
+                }
+                None => {
+                    self.messages.entry(message_id.clone()).or_insert(None);
+                }
+            }
+        }
+        self.codex_usage_by_transcript
+            .extend(other.codex_usage_by_transcript.clone());
+        self.codex_rounds.extend(other.codex_rounds.iter().cloned());
+        self.duration_by_id.extend(other.duration_by_id.clone());
+        self.anonymous_duration_ms = self.anonymous_duration_ms.saturating_add(other.anonymous_duration_ms);
+        self.saw_anonymous_duration |= other.saw_anonymous_duration;
     }
 }
 
@@ -232,17 +265,74 @@ fn nonnegative_i64(value: &Value) -> Option<i64> {
 }
 
 #[derive(Debug)]
-struct RunCostTail {
-    tails: HashMap<PathBuf, TranscriptTail>,
+struct TranscriptCostTail {
+    tail: TranscriptTail,
+    containment_root: Option<PathBuf>,
     accumulator: CostAccumulator,
 }
 
-impl RunCostTail {
-    fn new() -> Self {
-        Self {
-            tails: HashMap::new(),
+impl TranscriptCostTail {
+    fn new(transcript_path: &Path, containment_root: Option<&Path>) -> Result<Self, String> {
+        let tail = match containment_root {
+            Some(root) => TranscriptTail::new_contained(transcript_path.to_owned(), root.to_owned())
+                .map_err(|error| error.to_string())?,
+            None => TranscriptTail::new(transcript_path.to_owned()),
+        };
+        Ok(Self {
+            tail,
+            containment_root: containment_root.map(Path::to_owned),
             accumulator: CostAccumulator::default(),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunCostTail {
+    tails: HashMap<PathBuf, TranscriptCostTail>,
+}
+
+impl RunCostTail {
+    async fn poll(&mut self, transcript_path: &Path, containment_root: Option<&Path>) -> Result<(), String> {
+        let replace = match self.tails.get(transcript_path) {
+            Some(state)
+                if state.containment_root.is_some() && state.containment_root.as_deref() != containment_root =>
+            {
+                return Err(format!(
+                    "refusing transcript containment downgrade or root change for {}",
+                    transcript_path.display()
+                ));
+            }
+            Some(state) => state.containment_root.as_deref() != containment_root,
+            None => false,
+        };
+        if replace {
+            self.tails.remove(transcript_path);
         }
+        if !self.tails.contains_key(transcript_path) {
+            let tail = TranscriptCostTail::new(transcript_path, containment_root)?;
+            self.tails.insert(transcript_path.to_owned(), tail);
+        }
+        let state = self
+            .tails
+            .get_mut(transcript_path)
+            .expect("transcript cost tail was just inserted");
+        let generation = state.tail.generation();
+        let values = state.tail.poll().await.map_err(|error| error.to_string())?;
+        if state.tail.generation() != generation {
+            state.accumulator = CostAccumulator::default();
+        }
+        for value in values {
+            state.accumulator.ingest(transcript_path, &value);
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<RunCostSnapshot> {
+        let mut combined = CostAccumulator::default();
+        for state in self.tails.values() {
+            combined.merge_from(&state.accumulator);
+        }
+        combined.snapshot()
     }
 }
 
@@ -262,24 +352,18 @@ impl RunCostCapture {
         work_db: &crate::work::WorkDb,
         execution_id: &str,
         transcript_path: &Path,
+        containment_root: Option<&Path>,
     ) -> Result<bool, String> {
         let state = {
             let mut guard = self.inner.lock().expect("run cost capture mutex poisoned");
             guard
                 .entry(execution_id.to_owned())
-                .or_insert_with(|| Arc::new(Mutex::new(RunCostTail::new())))
+                .or_insert_with(|| Arc::new(Mutex::new(RunCostTail::default())))
                 .clone()
         };
         let mut state = state.lock().await;
-        let tail = state
-            .tails
-            .entry(transcript_path.to_owned())
-            .or_insert_with(|| TranscriptTail::new(transcript_path.to_owned()));
-        let values = tail.poll().await.map_err(|error| error.to_string())?;
-        for value in values {
-            state.accumulator.ingest(transcript_path, &value);
-        }
-        let Some(snapshot) = state.accumulator.snapshot() else {
+        state.poll(transcript_path, containment_root).await?;
+        let Some(snapshot) = state.snapshot() else {
             return Ok(false);
         };
         // Keep the per-execution lock through the DB assignment so two hooks
@@ -301,6 +385,7 @@ impl RunCostCapture {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tempfile::TempDir;
 
     #[test]
     fn assistant_records_replace_usage_by_message_id() {
@@ -381,5 +466,92 @@ mod tests {
         assert_eq!(snapshot.output_tokens, Some(20));
         assert_eq!(snapshot.rounds, Some(1));
         assert_eq!(snapshot.agent_active_ms, Some(321));
+    }
+
+    #[tokio::test]
+    async fn truncation_rebuilds_tokens_rounds_and_uuidless_durations() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"old-1","model":"claude-opus","usage":{"input_tokens":100,"output_tokens":10}}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"id":"old-2","model":"claude-opus","usage":{"input_tokens":50,"output_tokens":5}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","durationMs":300}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let mut tail = RunCostTail::default();
+        tail.poll(&path, None).await.unwrap();
+        let before = tail.snapshot().unwrap();
+        assert_eq!(before.input_tokens, Some(150));
+        assert_eq!(before.rounds, Some(2));
+        assert_eq!(before.agent_active_ms, Some(300));
+
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"new","model":"claude-sonnet","usage":{"input_tokens":7,"output_tokens":2}}}"#,
+                "\n",
+                r#"{"type":"system","subtype":"turn_duration","durationMs":11}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        tail.poll(&path, None).await.unwrap();
+        let after = tail.snapshot().unwrap();
+        assert_eq!(after.model.as_deref(), Some("claude-sonnet"));
+        assert_eq!(after.input_tokens, Some(7));
+        assert_eq!(after.output_tokens, Some(2));
+        assert_eq!(after.rounds, Some(1));
+        assert_eq!(after.agent_active_ms, Some(11));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contained_cost_tail_rejects_symlink_replacement() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"safe","model":"claude-opus","usage":{"input_tokens":1}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let outside = dir.path().join("outside.jsonl");
+        std::fs::write(
+            &outside,
+            concat!(
+                r#"{"type":"assistant","message":{"id":"stolen","model":"other","usage":{"input_tokens":999}}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut tail = RunCostTail::default();
+        tail.poll(&path, Some(&root)).await.unwrap();
+        let downgrade_error = tail.poll(&path, None).await.unwrap_err();
+        assert!(
+            downgrade_error.contains("containment downgrade"),
+            "a contained cost tail must never become unrestricted: {downgrade_error}",
+        );
+        std::fs::remove_file(&path).unwrap();
+        symlink(&outside, &path).unwrap();
+
+        let error = tail.poll(&path, Some(&root)).await.unwrap_err();
+        assert!(
+            error.contains("transcript"),
+            "contained run-cost tail must reject path replacement: {error}",
+        );
+        assert_eq!(tail.snapshot().unwrap().input_tokens, Some(1));
     }
 }

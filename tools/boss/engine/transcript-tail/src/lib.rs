@@ -55,12 +55,24 @@ struct FileIdentity {
     inode: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, bon::Builder)]
+#[builder(on(String, into))]
 pub struct TranscriptTail {
     path: PathBuf,
+    #[builder(skip)]
     containment: Option<TranscriptContainment>,
+    #[builder(skip)]
+    file_identity: Option<FileIdentity>,
+    #[builder(skip)]
     offset: u64,
+    /// Incremented whenever the watched file is truncated or, for
+    /// unrestricted tails, replaced by a different inode. Callers that fold
+    /// lines into cumulative state use this to discard the old generation
+    /// before ingesting the replay from byte zero.
+    #[builder(skip)]
+    generation: u64,
     /// Buffer for a trailing partial line carried across polls.
+    #[builder(skip)]
     partial: String,
 }
 
@@ -69,7 +81,9 @@ impl TranscriptTail {
         Self {
             path: path.into(),
             containment: None,
+            file_identity: None,
             offset: 0,
+            generation: 0,
             partial: String::new(),
         }
     }
@@ -90,13 +104,19 @@ impl TranscriptTail {
                 root_identity,
                 file_identity,
             }),
+            file_identity: Some(file_identity),
             offset: 0,
+            generation: 0,
             partial: String::new(),
         })
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Read any new content since the last poll and return parsed JSONL
@@ -114,13 +134,21 @@ impl TranscriptTail {
             verify_opened_containment(&self.path, containment, &metadata).await?;
         }
         let size = metadata.len();
+        let opened_identity = file_identity(&metadata);
+        let replaced = self
+            .file_identity
+            .is_some_and(|prior_identity| prior_identity != opened_identity);
 
-        // Truncation / rotation: file shrunk below our cursor, so the
-        // log was rolled. Reset and re-read from the top.
-        if size < self.offset {
+        // Truncation / rotation: a shorter file or a new unrestricted inode
+        // means byte offsets and every cumulative consumer derived from them
+        // belong to an obsolete generation. Reset and re-read from the top.
+        // Contained tails reject replacement above instead of following it.
+        if size < self.offset || replaced {
             self.offset = 0;
             self.partial.clear();
+            self.generation = self.generation.saturating_add(1);
         }
+        self.file_identity = Some(opened_identity);
 
         if size == self.offset {
             return Ok(Vec::new());
@@ -372,6 +400,7 @@ mod tests {
         let second = tail.poll().await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0]["b"], 3);
+        assert_eq!(tail.generation(), 1);
     }
 
     #[tokio::test]
