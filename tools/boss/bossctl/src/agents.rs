@@ -1142,6 +1142,16 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
     if let Some(id) = &state.execution_id {
         println!("  execution:     {id}");
     }
+    // Attributed pool + execution kind (stamped at spawn). Shown so
+    // `agents status`/`list` can diagnose pool routing without joining
+    // the execution table — independent of physical slot occupancy
+    // (spilled automation still reports pool=automation).
+    if let Some(pool) = &state.pool {
+        println!("  pool:          {pool}");
+    }
+    if let Some(kind) = &state.kind {
+        println!("  kind:          {kind}");
+    }
     if let Some(tool) = &state.current_tool {
         println!("  current_tool:  {tool}");
     }
@@ -1154,16 +1164,31 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
 }
 
 fn print_live_state_short(state: &LiveWorkerState) {
+    println!("{}", format_live_state_short(state));
+}
+
+/// One-line `agents list` row for a live worker. Pure so tests can pin
+/// the pool + exec-kind columns without capturing stdout.
+fn format_live_state_short(state: &LiveWorkerState) -> String {
     let tool = state.current_tool.as_deref().unwrap_or("-");
     let work_item = state.work_item_id.as_deref().unwrap_or("-");
     let work_item_name = state.work_item_name.as_deref().unwrap_or("-");
-    print!(
-        "slot {}  name={}  run={}  model={}  activity={}  tool={}  work_item={}  work_item_name=\"{}\"",
+    // `pool` / `kind` always print (as `-` when unset) so a glance at
+    // `agents list` shows attributed routing even for test / direct-
+    // launch spawns that never stamped them. Values match
+    // `LiveWorkerState::{pool,kind}` — `"main"`/`"automation"`/`"review"`
+    // and e.g. `"task_implementation"` / `"pr_review"`.
+    let pool = state.pool.as_deref().unwrap_or("-");
+    let kind = state.kind.as_deref().unwrap_or("-");
+    let mut line = format!(
+        "slot {}  name={}  run={}  model={}  activity={}  pool={}  kind={}  tool={}  work_item={}  work_item_name=\"{}\"",
         state.slot_id,
         state.name,
         state.run_id,
         state.model,
         state.activity.as_str(),
+        pool,
+        kind,
         tool,
         work_item,
         work_item_name,
@@ -1172,12 +1197,12 @@ fn print_live_state_short(state: &LiveWorkerState) {
     // this slot — without this an auto-recovering worker prints as plain
     // `activity=idle`, indistinguishable from a normally-finished turn.
     if let Some(recovery) = &state.recovery_status {
-        print!("  recovery=\"{recovery}\"");
+        line.push_str(&format!("  recovery=\"{recovery}\""));
     }
     if state.held {
-        print!("  held=true");
+        line.push_str("  held=true");
     }
-    println!();
+    line
 }
 
 #[cfg(test)]
@@ -1194,6 +1219,37 @@ mod tests {
         let mut state = LiveWorkerState::new_spawning(slot_id, run_id, "opus", 0, None);
         state.name = name.to_owned();
         state
+    }
+
+    #[test]
+    fn format_live_state_short_shows_pool_and_kind_dashes_when_unset() {
+        let state = worker(3, "run_a", "Riker");
+        let line = format_live_state_short(&state);
+        assert!(
+            line.contains("pool=-") && line.contains("kind=-"),
+            "expected pool=- and kind=- placeholders when unset: {line}"
+        );
+        assert!(
+            line.starts_with("slot 3  name=Riker  run=run_a  model=opus  activity=spawning  pool=-  kind=-"),
+            "unexpected column order: {line}"
+        );
+    }
+
+    #[test]
+    fn format_live_state_short_renders_stamped_pool_and_kind() {
+        let mut state = worker(5, "run_b", "Data");
+        state.pool = Some("automation".to_owned());
+        state.kind = Some("automation_triage".to_owned());
+        state.held = true;
+        let line = format_live_state_short(&state);
+        assert!(
+            line.contains("pool=automation") && line.contains("kind=automation_triage"),
+            "expected stamped pool+kind: {line}"
+        );
+        assert!(
+            line.ends_with("held=true"),
+            "held suffix should still trail the row: {line}"
+        );
     }
 
     fn task(id: &str, kind: TaskKind) -> Task {
