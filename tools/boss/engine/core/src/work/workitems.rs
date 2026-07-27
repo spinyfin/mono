@@ -1144,21 +1144,21 @@ impl WorkDb {
         let mut tasks = if let Some(project_id) = project_id {
             ensure_project_belongs_to_product(&conn, project_id, product_id)?;
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, tags
                  FROM tasks
                  WHERE product_id = ?1 AND project_id = ?2 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
-            let rows = stmt.query_map(params![product_id, project_id], map_task)?;
+            let rows = stmt.query_map(params![product_id, project_id], map_task_with_tags)?;
             collect_rows(rows)?
         } else {
             let mut stmt = conn.prepare(&format!(
-                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning
+                "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, tags
                  FROM tasks
                  WHERE product_id = ?1 AND kind IN ({kind_clause}){deleted_clause}
                  ORDER BY COALESCE(ordinal, 0) ASC, created_at ASC",
             ))?;
-            let rows = stmt.query_map([product_id], map_task)?;
+            let rows = stmt.query_map([product_id], map_task_with_tags)?;
             collect_rows(rows)?
         };
 
@@ -1270,16 +1270,16 @@ impl WorkDb {
             ""
         };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags
              FROM tasks
              WHERE product_id = ?1 AND kind = 'revision'{deleted_clause}{parent_clause}
              ORDER BY created_at ASC",
         ))?;
         let mut revisions: Vec<Task> = if let Some(parent_id) = parent_id.as_deref() {
-            let rows = stmt.query_map(params![product_id, parent_id], map_task_with_parent_and_provenance)?;
+            let rows = stmt.query_map(params![product_id, parent_id], map_task_with_parent_provenance_and_tags)?;
             collect_rows(rows)?
         } else {
-            let rows = stmt.query_map([product_id], map_task_with_parent_and_provenance)?;
+            let rows = stmt.query_map([product_id], map_task_with_parent_provenance_and_tags)?;
             collect_rows(rows)?
         };
         if let Some(filter) = dep_filter {
@@ -1306,12 +1306,12 @@ impl WorkDb {
         // See `list_tasks` for the include-deleted contract.
         let deleted_clause = if include_deleted { "" } else { " AND deleted_at IS NULL" };
         let mut stmt = conn.prepare(&format!(
-            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at
+            "SELECT id, product_id, project_id, kind, name, description, status, ordinal, pr_url, deleted_at, created_at, updated_at, autostart, last_status_actor, priority, created_via, blocked_reason, blocked_attempt_id, repo_remote_url, effort_level, model_override, ci_attempt_budget, ci_attempts_used, short_id, ci_required_state, review_required_state, ci_required_detail, review_required_detail, pr_state_polled_at, merge_queue_state, merge_queue_detail, driver, pr_mergeable_state, reasoning, parent_task_id, origin_task_short_id, origin_pr_number, completed_at, tags
              FROM tasks
              WHERE product_id = ?1 AND kind IN ('chore', 'followup'){deleted_clause}
              ORDER BY created_at ASC",
         ))?;
-        let rows = stmt.query_map([product_id], map_task_with_parent_and_provenance)?;
+        let rows = stmt.query_map([product_id], map_task_with_parent_provenance_and_tags)?;
         let mut chores: Vec<Task> = collect_rows(rows)?;
         if let Some(filter) = dep_filter {
             apply_dep_filter(
