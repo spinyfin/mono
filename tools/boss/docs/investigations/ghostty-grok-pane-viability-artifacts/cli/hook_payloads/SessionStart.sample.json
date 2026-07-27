@@ -1,0 +1,12 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=session_start\nGROK_HOOK_NAME=global/dump-all:session_start[0].hooks[0]\nGROK_SESSION_ID=019fa5ca-e48f-7801-b7f8-eae8e35f4de4\nGROK_WORKSPACE_ROOT=/private/tmp",
+  "stdin": {
+    "hookEventName": "session_start",
+    "sessionId": "019fa5ca-e48f-7801-b7f8-eae8e35f4de4",
+    "cwd": "/private/tmp",
+    "workspaceRoot": "/private/tmp",
+    "timestamp": "2026-07-27T22:56:06.506940+00:00",
+    "permissionMode": "bypassPermissions",
+    "source": "new"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "text": "REVAL_OK",
+  "stopReason": "EndTurn",
+  "sessionId": "331273d3-6401-4e24-9d6c-bb5e9e0be9bf",
+  "requestId": "8a66cc5a-a34d-470e-909d-c9d971693924",
+  "thought": "The user wants me to reply with exactly: REVAL_OK\n",
+  "usage": {
+    "input_tokens": 2157,
+    "cache_read_input_tokens": 11136,
+    "output_tokens": 37,
+    "reasoning_tokens": 29,
+    "total_tokens": 13330
+  },
+  "num_turns": 1,
+  "total_cost_usd": 0.0078768,
+  "total_cost_usd_ticks": 78768000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 2157,
+      "outputTokens": 37,
+      "cacheReadInputTokens": 11136,
+      "modelCalls": 1,
+      "costUSD": 0.0078768
+    }
+  }
+}

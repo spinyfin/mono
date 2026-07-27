@@ -1,0 +1,147 @@
+[0.0] === ghosttykit_grok_spike start 2026-07-27T23:12:46Z ===
+[0.0] host: ghosttykit_grok_spike (throwaway)
+scenario: esc_interrupt
+grok_bin: /Users/brianduff/.grok/bin/grok
+grok_home: /tmp/grok-pane-spike/home
+cwd: /tmp/grok-pane-spike/cwd
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+interrupt_api: ghostty_surface_key Esc
+date: 2026-07-27T23:12:46Z
+[0.0] ghostty_init ok
+[0.0] ghostty_app_new ok
+[0.1] scenario=esc_interrupt sid=bf9b7291-f5ab-48db-9a71-3bffe7c25ea0
+[0.1] initial_input=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+[0.1] ghostty_surface_new ok
+[0.1] timers armed; waiting for grok in embed surface
+[0.5] viewport_bytes=114 fg_pid=99005 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:11:58 on ttys008
+[0.9] viewport_bytes=220 fg_pid=99356 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:11:58 on ttys008\nbrianduff@brians-laptop run_out % zsh /private/tmp/grok-pane-spike/ghosttykit_host/
+[1.7] viewport_bytes=0 fg_pid=99356 exited=false preview=
+[2.1] viewport_bytes=2382 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.1] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[2.5] viewport_bytes=2382 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.5] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[2.9] viewport_bytes=2450 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.9] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[3.3] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[3.3] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[3.7] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[3.7] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[4.1] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[4.1] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[4.5] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[4.5] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[4.9] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.2K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[4.9] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[5.3] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.2K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[5.3] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[5.7] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[5.7] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[6.1] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[6.1] INTERRUPT Esc (mid_turn)
+[6.1] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[6.5] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ Use the shell tool to run: sleep 45. Do not skip the sleep. Aft
+[6.5] OBSERVED possible-cancel language in surface text
+[6.5] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[6.9] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[7.3] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[7.7] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[8.1] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[8.5] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[8.9] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[9.3] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[9.7] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[10.1] OBSERVED SLEEP_DONE (Esc may have failed to cancel)
+[10.1] INJECT post_esc_probe body=reply with exactly the single token: ESC_AFTER_OK. no tools.
+[10.1] INJECT post_esc_probe Return sent
+[10.5] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.   
+[10.5] OBSERVED ESC_AFTER_OK in surface text
+[10.9] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.   
+[10.9] OBSERVED ESC_AFTER_OK in surface text
+[11.3] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.   
+[11.3] OBSERVED ESC_AFTER_OK in surface text
+[11.7] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.   
+[11.7] OBSERVED ESC_AFTER_OK in surface text
+[12.1] OBSERVED ESC_AFTER_OK in surface text
+[12.5] OBSERVED ESC_AFTER_OK in surface text
+[12.9] OBSERVED ESC_AFTER_OK in surface text
+[13.3] OBSERVED ESC_AFTER_OK in surface text
+[13.7] OBSERVED ESC_AFTER_OK in surface text
+[14.1] OBSERVED ESC_AFTER_OK in surface text
+[14.5] OBSERVED ESC_AFTER_OK in surface text
+[14.9] OBSERVED ESC_AFTER_OK in surface text
+[15.3] viewport_bytes=2594 fg_pid=99356 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: ESC_AFTER_OK. no tools.   
+[15.3] OBSERVED ESC_AFTER_OK in surface text
+[15.7] OBSERVED ESC_AFTER_OK in surface text
+[16.1] OBSERVED ESC_AFTER_OK in surface text
+[16.5] OBSERVED ESC_AFTER_OK in surface text
+[16.9] OBSERVED ESC_AFTER_OK in surface text
+[17.3] OBSERVED ESC_AFTER_OK in surface text
+[17.7] OBSERVED ESC_AFTER_OK in surface text
+[18.1] OBSERVED ESC_AFTER_OK in surface text
+[18.5] OBSERVED ESC_AFTER_OK in surface text
+[18.9] OBSERVED ESC_AFTER_OK in surface text
+[19.3] OBSERVED ESC_AFTER_OK in surface text
+[19.7] OBSERVED ESC_AFTER_OK in surface text
+[20.1] OBSERVED ESC_AFTER_OK in surface text
+[20.5] OBSERVED ESC_AFTER_OK in surface text
+[20.9] OBSERVED ESC_AFTER_OK in surface text
+[21.3] OBSERVED ESC_AFTER_OK in surface text
+[21.7] OBSERVED ESC_AFTER_OK in surface text
+[22.1] OBSERVED ESC_AFTER_OK in surface text
+[22.5] OBSERVED ESC_AFTER_OK in surface text
+[22.9] OBSERVED ESC_AFTER_OK in surface text
+[23.3] OBSERVED ESC_AFTER_OK in surface text
+[23.7] OBSERVED ESC_AFTER_OK in surface text
+[24.1] OBSERVED ESC_AFTER_OK in surface text
+[24.5] OBSERVED ESC_AFTER_OK in surface text
+[24.9] OBSERVED ESC_AFTER_OK in surface text
+[25.3] OBSERVED ESC_AFTER_OK in surface text
+[25.7] OBSERVED ESC_AFTER_OK in surface text
+[26.1] OBSERVED ESC_AFTER_OK in surface text
+[26.5] OBSERVED ESC_AFTER_OK in surface text
+[26.9] OBSERVED ESC_AFTER_OK in surface text
+[27.3] OBSERVED ESC_AFTER_OK in surface text
+[27.7] OBSERVED ESC_AFTER_OK in surface text
+[28.1] OBSERVED ESC_AFTER_OK in surface text
+[28.5] OBSERVED ESC_AFTER_OK in surface text
+[28.9] OBSERVED ESC_AFTER_OK in surface text
+[29.3] OBSERVED ESC_AFTER_OK in surface text
+[29.7] OBSERVED ESC_AFTER_OK in surface text
+[30.1] OBSERVED ESC_AFTER_OK in surface text
+[30.1] INJECT quit body=/quit
+[30.1] INJECT quit Return sent
+[30.5] viewport_bytes=2475 fg_pid=99005 exited=false preview=                  \n                                                                                                                         \n     ◆ user_prompt_submit  [hooks: 1]                    
+[30.5] OBSERVED ESC_AFTER_OK in surface text
+[30.5] pane script finished (grok exited)
+[30.9] OBSERVED ESC_AFTER_OK in surface text
+[31.3] OBSERVED ESC_AFTER_OK in surface text
+[31.7] OBSERVED ESC_AFTER_OK in surface text
+[32.1] OBSERVED ESC_AFTER_OK in surface text
+[32.5] OBSERVED ESC_AFTER_OK in surface text
+[32.5] finish reason=script_finished
+[32.5] SUMMARY written:
+reason: script_finished
+scenario: esc_interrupt
+session_id: bf9b7291-f5ab-48db-9a71-3bffe7c25ea0
+saw_gkit_grok_ok: false
+saw_probe_ok: false
+saw_cancel_language: true
+viewport_final_bytes: 2475
+screen_final_bytes: 2943
+viewport_contains_gkit_grok_ok: false
+viewport_contains_probe: false
+viewport_contains_esc_after: true
+viewport_contains_sleep_done: false
+viewport_contains_resize_ok: false
+mid_inject_side_effect: (absent)
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 99356
+tty: /dev/ttys008
+foreground_pid_at_end: 99005
+snapshot_count: 21
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+interrupt_api: ghostty_surface_key(Esc keycode 0x35)  # Boss sendInterrupt
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

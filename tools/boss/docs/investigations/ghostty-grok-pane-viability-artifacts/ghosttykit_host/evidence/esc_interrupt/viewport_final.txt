@@ -1,0 +1,37 @@
+                  
+                                                                                                                         
+     ◆ user_prompt_submit  [hooks: 1]                                                                                    
+     ◆ Thought for 0.1s                                                                                                  
+                                                                                                                         
+     ESC_AFTER_OK                                                                                                4:12 PM 
+                                                                                                                         
+     Worked for 1.4s                                                                                    stop  [hooks: 1] 
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+                                                                                                                         
+
+
+
+
+
+
+
+
+                                                                                                                    
+
+                                                                                                                          
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                    │
+  ╰─────────────────────────────────────────────────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+.:shortcuts                                                                                     
+
+
+Resume this session with:
+  grok --resume bf9b7291-f5ab-48db-9a71-3bffe7c25ea0
+SCRIPT_DONE
+brianduff@brians-laptop run_out % 

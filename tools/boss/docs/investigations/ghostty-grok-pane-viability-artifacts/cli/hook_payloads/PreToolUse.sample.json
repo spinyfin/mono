@@ -1,0 +1,19 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-pane-spike/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=pre_tool_use\nGROK_HOOK_NAME=global/dump-all:pre_tool_use[0].hooks[0]\nGROK_SESSION_ID=7727264c-bc7d-4419-b201-4e4b13fd3d03\nGROK_WORKSPACE_ROOT=/private/tmp/grok-pane-spike/cwd",
+  "stdin": {
+    "hookEventName": "pre_tool_use",
+    "sessionId": "7727264c-bc7d-4419-b201-4e4b13fd3d03",
+    "cwd": "/private/tmp/grok-pane-spike/cwd",
+    "workspaceRoot": "/private/tmp/grok-pane-spike/cwd",
+    "timestamp": "2026-07-27T22:56:09.311609+00:00",
+    "transcriptPath": "/tmp/grok-pane-spike/home/sessions/%2Fprivate%2Ftmp%2Fgrok-pane-spike%2Fcwd/7727264c-bc7d-4419-b201-4e4b13fd3d03/updates.jsonl",
+    "permissionMode": "bypassPermissions",
+    "toolName": "write",
+    "toolUseId": "call-b8e62e24-8073-4514-92c9-ad0e8e29b6a7-0",
+    "toolInput": {
+      "file_path": "/private/tmp/grok-pane-spike/cwd/tool_probe.txt",
+      "content": "TOOL_PROBE_OK\n"
+    },
+    "toolInputTruncated": false
+  }
+}

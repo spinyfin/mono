@@ -1,0 +1,111 @@
+[0.0] === ghosttykit_grok_spike start 2026-07-27T23:13:31Z ===
+[0.0] host: ghosttykit_grok_spike (throwaway)
+scenario: resize
+grok_bin: /Users/brianduff/.grok/bin/grok
+grok_home: /tmp/grok-pane-spike/home
+cwd: /tmp/grok-pane-spike/cwd
+ghosttykit_prebuilt: ghosttykit-5659cef (spinyfin/ghostty-prebuilts)
+observe_api: ghostty_surface_read_text
+inject_api: ghostty_surface_text + ghostty_surface_key
+interrupt_api: ghostty_surface_key Esc
+date: 2026-07-27T23:13:31Z
+[0.0] ghostty_init ok
+[0.0] ghostty_app_new ok
+[0.0] scenario=resize sid=dccaef32-3fac-4808-ab88-b2f739707705
+[0.0] initial_input=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh
+[0.1] ghostty_surface_new ok
+[0.1] timers armed; waiting for grok in embed surface
+[0.5] viewport_bytes=114 fg_pid=3641 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:12:46 on ttys008
+[1.7] viewport_bytes=220 fg_pid=4308 exited=false preview=zsh /private/tmp/grok-pane-spike/ghosttykit_host/run_out/pane_script.sh\nLast login: Mon Jul 27 16:12:46 on ttys008\nbrianduff@brians-laptop run_out % zsh /private/tmp/grok-pane-spike/ghosttykit_host/
+[2.5] viewport_bytes=0 fg_pid=4308 exited=false preview=
+[2.9] viewport_bytes=2390 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[2.9] OBSERVED gkit-grok-ok in surface text
+[3.3] viewport_bytes=2390 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[3.7] viewport_bytes=2390 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                      +1\n\n\n\n\n                                                                  
+[4.1] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[4.5] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[4.9] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[5.3] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.0K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[5.7] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                             3.2K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[6.1] viewport_bytes=2591 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                              13K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok. do not use t
+[6.1] RESIZE small (500.0, 320.0)
+[6.5] viewport_bytes=601 fg_pid=4308 exited=false preview= /private/tmp/grok-pane-spike/cwd                  13K / 500K\n    reply with exactly the single token: gkit-      4:13 PM\n    grok-ok. do not use tools. Then wait for\n    further instructions.\n\n 
+[8.1] RESIZE large (1100.0, 700.0)
+[8.5] viewport_bytes=1074 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                           13K / 500K\n\n\n     ❯ reply with exactly the single token: gkit-grok-ok.
+[10.1] INJECT post_resize_probe body=reply with exactly: RESIZE_OK. no tools.
+[10.1] INJECT post_resize_probe Return sent
+[10.5] viewport_bytes=1224 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                           13K / 500K\n\n\n     ❯ reply with exactly: RESIZE_OK. no tools.          
+[10.5] OBSERVED RESIZE_OK in surface text
+[10.9] viewport_bytes=1224 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                           13K / 500K\n\n\n     ❯ reply with exactly: RESIZE_OK. no tools.          
+[10.9] OBSERVED RESIZE_OK in surface text
+[11.3] viewport_bytes=1253 fg_pid=4308 exited=false preview=\n  /private/tmp/grok-pane-spike/cwd                                                                                           13K / 500K\n\n\n     ❯ reply with exactly: RESIZE_OK. no tools.          
+[11.3] OBSERVED RESIZE_OK in surface text
+[11.7] OBSERVED RESIZE_OK in surface text
+[12.1] OBSERVED RESIZE_OK in surface text
+[12.5] OBSERVED RESIZE_OK in surface text
+[12.9] OBSERVED RESIZE_OK in surface text
+[13.3] OBSERVED RESIZE_OK in surface text
+[13.7] OBSERVED RESIZE_OK in surface text
+[14.1] OBSERVED RESIZE_OK in surface text
+[14.5] OBSERVED RESIZE_OK in surface text
+[14.9] OBSERVED RESIZE_OK in surface text
+[15.3] OBSERVED RESIZE_OK in surface text
+[15.7] OBSERVED RESIZE_OK in surface text
+[16.1] OBSERVED RESIZE_OK in surface text
+[16.5] OBSERVED RESIZE_OK in surface text
+[16.9] OBSERVED RESIZE_OK in surface text
+[17.3] OBSERVED RESIZE_OK in surface text
+[17.7] OBSERVED RESIZE_OK in surface text
+[18.1] OBSERVED RESIZE_OK in surface text
+[18.5] OBSERVED RESIZE_OK in surface text
+[18.9] OBSERVED RESIZE_OK in surface text
+[19.3] OBSERVED RESIZE_OK in surface text
+[19.7] OBSERVED RESIZE_OK in surface text
+[20.1] OBSERVED RESIZE_OK in surface text
+[20.5] OBSERVED RESIZE_OK in surface text
+[20.9] OBSERVED RESIZE_OK in surface text
+[21.3] OBSERVED RESIZE_OK in surface text
+[21.7] OBSERVED RESIZE_OK in surface text
+[22.1] OBSERVED RESIZE_OK in surface text
+[22.5] OBSERVED RESIZE_OK in surface text
+[22.9] OBSERVED RESIZE_OK in surface text
+[23.3] OBSERVED RESIZE_OK in surface text
+[23.7] OBSERVED RESIZE_OK in surface text
+[24.1] OBSERVED RESIZE_OK in surface text
+[24.5] OBSERVED RESIZE_OK in surface text
+[24.9] OBSERVED RESIZE_OK in surface text
+[25.1] INJECT quit body=/quit
+[25.1] INJECT quit Return sent
+[25.3] viewport_bytes=1378 fg_pid=3641 exited=false preview=\n\n     ◆ user_prompt_submit  [hooks: 1]\n     ◆ Thought for 0.0s\n                \n     RESIZE_OK                                                                                                    
+[25.3] OBSERVED RESIZE_OK in surface text
+[25.3] pane script finished (grok exited)
+[25.7] OBSERVED RESIZE_OK in surface text
+[26.1] OBSERVED RESIZE_OK in surface text
+[26.5] OBSERVED RESIZE_OK in surface text
+[26.9] OBSERVED RESIZE_OK in surface text
+[27.3] OBSERVED RESIZE_OK in surface text
+[27.3] finish reason=script_finished
+[27.3] SUMMARY written:
+reason: script_finished
+scenario: resize
+session_id: dccaef32-3fac-4808-ab88-b2f739707705
+saw_gkit_grok_ok: true
+saw_probe_ok: false
+saw_cancel_language: false
+viewport_final_bytes: 1378
+screen_final_bytes: 3731
+viewport_contains_gkit_grok_ok: true
+viewport_contains_probe: false
+viewport_contains_esc_after: false
+viewport_contains_sleep_done: false
+viewport_contains_resize_ok: true
+mid_inject_side_effect: (absent)
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 4308
+tty: /dev/ttys008
+foreground_pid_at_end: 3641
+snapshot_count: 18
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)  # Boss SendToPane / submitText
+interrupt_api: ghostty_surface_key(Esc keycode 0x35)  # Boss sendInterrupt
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)  # Boss Claude monitor path

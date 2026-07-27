@@ -1,0 +1,18 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-pane-spike/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=stop\nGROK_HOOK_NAME=global/dump-all:stop[0].hooks[0]\nGROK_SESSION_ID=7727264c-bc7d-4419-b201-4e4b13fd3d03\nGROK_WORKSPACE_ROOT=/private/tmp/grok-pane-spike/cwd",
+  "stdin": {
+    "hookEventName": "stop",
+    "sessionId": "7727264c-bc7d-4419-b201-4e4b13fd3d03",
+    "cwd": "/private/tmp/grok-pane-spike/cwd",
+    "workspaceRoot": "/private/tmp/grok-pane-spike/cwd",
+    "timestamp": "2026-07-27T22:56:10.900430+00:00",
+    "transcriptPath": "/tmp/grok-pane-spike/home/sessions/%2Fprivate%2Ftmp%2Fgrok-pane-spike%2Fcwd/7727264c-bc7d-4419-b201-4e4b13fd3d03/updates.jsonl",
+    "promptId": "e7a0c825-9712-4cf5-ab0e-5d8a248bc1c8",
+    "permissionMode": "bypassPermissions",
+    "reason": "end_turn",
+    "stopHookActive": false,
+    "lastAssistantMessage": "DONE",
+    "backgroundTasks": [],
+    "sessionCrons": []
+  }
+}

@@ -1,0 +1,37 @@
+       ghosttykit_host/run_out/injected_side_effect.txt ; then reply DONE.                                                  
+                                                                                                                            
+                                                                                                                            
+     ◆ user_prompt_submit  [hooks: 1]                                                                                       
+     ◆ Thought for 0.1s                                                                                                     
+                                                                                                                            
+     I'll run the exact shell command you specified, then reply DONE.                                            4:12 PM    
+                                                                                                                           █
+  ┃  ◆ Run Write probe token to side-effect file  [hooks: 2]                                                               █
+     ◆ Thought for 0.0s                                                                                                    █
+                                                                                                                           █
+     DONE                                                                                                        4:12 PM   █
+                                                                                                                           █
+     Worked for 3.8s                                                                                    stop  [hooks: 1]   █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+                                                                                                                           █
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                    │
+  ╰─────────────────────────────────────────────────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+.:shortcuts                                                                                     
+
+
+Resume this session with:
+  grok --resume 1b6c772c-41ff-44dc-bd3f-924ee887ded4
+SCRIPT_DONE
+brianduff@brians-laptop run_out % 
