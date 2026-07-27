@@ -1046,6 +1046,7 @@ mod tests {
             WorkerEvent::SessionStart {
                 session_id: "sess-1".to_owned(),
                 source: boss_protocol::SessionStartSource::Startup,
+                model: None,
             },
             WorkerEvent::UserPromptSubmit {
                 session_id: "sess-1".to_owned(),

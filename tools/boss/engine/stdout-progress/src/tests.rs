@@ -157,6 +157,7 @@ impl AgentDriver for CodexShapedDriver {
             ("thread.started", _) => WorkerEvent::SessionStart {
                 session_id,
                 source: SessionStartSource::Startup,
+                model: None,
             },
             ("turn.started", _) => WorkerEvent::UserPromptSubmit {
                 session_id,
@@ -563,7 +564,7 @@ fn codex_turn_completed_is_a_non_continuation_turn_boundary() {
 #[tokio::test]
 async fn session_identity_comes_from_the_stream() {
     let (events, _) = drain(CODEX_TURN).await;
-    let WorkerEvent::SessionStart { session_id, source } = &events[0] else {
+    let WorkerEvent::SessionStart { session_id, source, .. } = &events[0] else {
         panic!("expected SessionStart, got {:?}", events[0]);
     };
     assert_eq!(session_id, "019f974c-3d59-7533-b320-3963123c809b");

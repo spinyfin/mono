@@ -348,6 +348,7 @@ async fn dispatch_records_row_missing_when_no_run_exists_for_execution() {
         WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
+            model: None,
         },
         Some(execution.id.clone()),
         Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
@@ -434,6 +435,7 @@ async fn dispatch_persists_transcript_path_from_cache_when_payload_omits_it() {
         WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: SessionStartSource::Startup,
+            model: None,
         },
         Some(execution.id.clone()),
         Some("/home/u/.claude/projects/foo/sess-1.jsonl".into()),
@@ -786,6 +788,7 @@ async fn transcript_path_resolver_resolves_execution_id_after_hook_persist() {
         WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
+            model: None,
         },
         Some(execution.id.clone()),
         Some(path.into()),
@@ -918,6 +921,7 @@ async fn tail_transcript_resolver_surfaces_path_via_both_namespaces() {
         WorkerEvent::SessionStart {
             session_id: "claude-sess-1".into(),
             source: crate::protocol::SessionStartSource::Startup,
+            model: None,
         },
         Some(execution.id.clone()),
         Some(path.into()),

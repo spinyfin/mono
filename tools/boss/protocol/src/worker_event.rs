@@ -21,6 +21,13 @@ pub enum WorkerEvent {
     SessionStart {
         session_id: String,
         source: SessionStartSource,
+        /// Model identifier from the hook payload when present (Claude and
+        /// Codex Claude-compatible hooks both include `model` on
+        /// `SessionStart`). `None` when the payload omitted it — e.g. a
+        /// Codex stdout-JSONL `thread.started` envelope, which has no model
+        /// field. The live-worker reducer treats a present value as
+        /// authoritative over the launch default stamped at spawn.
+        model: Option<String>,
     },
     UserPromptSubmit {
         session_id: String,
@@ -113,6 +120,7 @@ pub fn normalize_hook_event(raw: &serde_json::Value) -> Result<WorkerEvent, Norm
         "SessionStart" => WorkerEvent::SessionStart {
             session_id,
             source: parse_session_start_source(obj.get("source").and_then(|v| v.as_str())),
+            model: optional_nonempty_string(obj.get("model")),
         },
         "UserPromptSubmit" => WorkerEvent::UserPromptSubmit {
             session_id,
@@ -176,6 +184,15 @@ fn string_or_empty(value: Option<&serde_json::Value>) -> String {
     value.and_then(|v| v.as_str()).map(str::to_owned).unwrap_or_default()
 }
 
+/// Pull a non-empty string field, or `None` if missing / empty / non-string.
+fn optional_nonempty_string(value: Option<&serde_json::Value>) -> Option<String> {
+    value
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,8 +210,43 @@ mod tests {
             WorkerEvent::SessionStart {
                 session_id: "sess-1".into(),
                 source: SessionStartSource::Startup,
+                model: None,
             }
         );
+    }
+
+    #[test]
+    fn session_start_extracts_model_when_present() {
+        // Claude and Codex Claude-compatible hooks both carry `model` on
+        // SessionStart (verified live; see codex-as-a-first-class-agent-driver
+        // design captures). Empty / whitespace-only values are treated as
+        // absent so a present-but-blank field cannot overwrite the launch
+        // default with "".
+        let raw = json!({
+            "session_id": "sess-1",
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "claude-opus-4-7",
+        });
+        assert_eq!(
+            normalize_hook_event(&raw).unwrap(),
+            WorkerEvent::SessionStart {
+                session_id: "sess-1".into(),
+                source: SessionStartSource::Startup,
+                model: Some("claude-opus-4-7".into()),
+            }
+        );
+
+        let blank = json!({
+            "session_id": "sess-1",
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "model": "   ",
+        });
+        let WorkerEvent::SessionStart { model, .. } = normalize_hook_event(&blank).unwrap() else {
+            panic!("expected SessionStart");
+        };
+        assert!(model.is_none());
     }
 
     #[test]

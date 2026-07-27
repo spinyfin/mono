@@ -1598,15 +1598,18 @@ pub async fn serve_with_merge_probe(
     let _metrics_flush_handle =
         crate::metrics::spawn_flush_task(server_state.metrics.clone(), server_state.work_db.clone());
 
-    // Periodic stalled-spawn detector: transitions workers from `Spawning`
-    // to `WaitingForInput` when they've been stuck without any hook event
-    // for longer than STALLED_SPAWN_THRESHOLD_SECS. The initial directory-trust
-    // prompt that Claude Code shows before `SessionStart` (for Opus /
-    // `--permission-mode auto` workers) blocks the run with no Notification hook,
-    // so the normal detection path never fires. This sweep detects the stall and
-    // flips the activity so the kanban dot + WorkerWaitingIndicator signal the
-    // operator that attention is needed. Runs every 10 seconds — the prompt
-    // appears at session startup, so fast detection matters.
+    // Periodic stalled-spawn + stale-activity honesty timers. Two complementary
+    // Spawning-lie fixes share one 10s tick so agents-list activity stays
+    // trustworthy after events.sock degrades:
+    //
+    // 1. `mark_stalled_spawns` — Spawning with *no* hook ever
+    //    (`last_event_at == None`) past STALLED_SPAWN_THRESHOLD_SECS →
+    //    WaitingForInput (directory-trust prompt before SessionStart).
+    // 2. `downgrade_stale_activity` — Spawning with a *stale*
+    //    `last_event_at` (an event arrived, then silence) past
+    //    STALE_ACTIVITY_DOWNGRADE_SECS → Idle. Covers SessionStart(Resume)
+    //    reattach stamps and any other path that sets last_event_at
+    //    without leaving Spawning, then loses the events stream.
     {
         let live_worker_states = server_state.live_worker_states.clone();
         let server_clone = Arc::clone(&server_state);
@@ -1615,14 +1618,25 @@ pub async fn serve_with_merge_probe(
             loop {
                 interval.tick().await;
                 let now = boss_engine_utils::epoch_time::now_epoch_secs();
-                let changed =
+                let stalled =
                     live_worker_states.mark_stalled_spawns(now, crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS);
-                if !changed.is_empty() {
+                if !stalled.is_empty() {
                     tracing::info!(
-                        slots = ?changed,
+                        slots = ?stalled,
                         "stalled-spawn sweep: transitioned slots from Spawning to WaitingForInput \
                          (no hook event since spawn — likely blocked on initial directory-trust prompt)",
                     );
+                }
+                let downgraded = live_worker_states
+                    .downgrade_stale_activity(now, crate::live_worker_state::STALE_ACTIVITY_DOWNGRADE_SECS);
+                if !downgraded.is_empty() {
+                    tracing::info!(
+                        slots = ?downgraded,
+                        "stale-activity sweep: downgraded slots from Spawning to Idle \
+                         (last_event_at aged out — events stream silent after at least one hook)",
+                    );
+                }
+                if !stalled.is_empty() || !downgraded.is_empty() {
                     server_clone.broadcast_live_worker_states().await;
                 }
             }

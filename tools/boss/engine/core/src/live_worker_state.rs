@@ -84,6 +84,20 @@ pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 /// the 2026-07-03/04 false-live incident this split addresses.
 pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 
+/// How long after the most recent hook a slot may keep advertising
+/// `Spawning` before [`LiveWorkerStateRegistry::downgrade_stale_activity`]
+/// moves it to `Idle`.
+///
+/// Covers the shape `mark_stalled_spawns` deliberately ignores: a slot
+/// that *did* receive at least one hook (so `last_event_at` is set —
+/// typically `SessionStart(Resume)` on reattach, which stamps the
+/// timestamp without leaving `Spawning`) and then went quiet because
+/// `events.sock` degraded. Without this timer the slot sits at
+/// `activity=spawning` forever, which is a lie once an event has been
+/// observed. Same 30s window as the stalled-spawn threshold so the two
+/// honesty timers move in lockstep.
+pub const STALE_ACTIVITY_DOWNGRADE_SECS: i64 = 30;
+
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]
 pub struct LiveWorkerStateRegistry {
@@ -432,9 +446,10 @@ impl LiveWorkerStateRegistry {
     /// (event arrived before spawn registered or after release) — the
     /// caller should treat that as a benign drop.
     ///
-    /// Source the model from `SessionStart` events: the hook payload
-    /// itself does not currently carry the model id, but we can
-    /// safely retain whatever launch default was stamped at spawn.
+    /// `SessionStart` carries an optional `model` from the hook payload;
+    /// when present it is treated as authoritative and overwrites the
+    /// launch default stamped at spawn. When absent (Codex stdout
+    /// `thread.started`, older fixtures), the launch default is retained.
     pub fn apply_event(&self, slot_id: u8, event: &WorkerEvent) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let now = current_iso8601();
@@ -459,15 +474,40 @@ impl LiveWorkerStateRegistry {
         state.recovery_status = None;
 
         match event {
-            WorkerEvent::SessionStart { source, .. } => {
+            WorkerEvent::SessionStart { source, model, .. } => {
+                // Authoritative model from the hook when present. Launch
+                // defaults (`opus`, resolved effort slug, …) are a
+                // provisional stamp so the UI never shows "Claude Unknown"
+                // before the first hook; once SessionStart reports the
+                // real id we prefer it. Empty/None leaves the launch value.
+                if let Some(model) = model {
+                    state.model = model.clone();
+                }
                 // SessionStart with source=resume keeps the existing
-                // model + activity (worker is resuming a session, not
-                // spawning fresh). For startup, leave the spawning →
-                // idle transition for the first Stop; SessionStart on
-                // its own only confirms the worker is alive.
-                if matches!(source, SessionStartSource::Startup) && state.activity == WorkerActivity::Spawning {
+                // activity when the slot has already left Spawning
+                // (worker is resuming mid-life, not spawning fresh). For
+                // Startup — and for any SessionStart that arrives while
+                // still Spawning — leave Spawning for Idle: the session
+                // is alive. SessionStart alone does not start a turn;
+                // Working arrives on UserPromptSubmit / PreToolUse.
+                if state.activity == WorkerActivity::Spawning
+                    && matches!(
+                        source,
+                        SessionStartSource::Startup
+                            | SessionStartSource::Clear
+                            | SessionStartSource::Compact
+                            | SessionStartSource::Other
+                    )
+                {
                     state.activity = WorkerActivity::Idle;
                 }
+                // Resume deliberately leaves Spawning alone so reattach /
+                // spawn-ack proof-of-life can stamp last_event_at without
+                // claiming the worker is past spawn. The stale-activity
+                // timer ([`Self::downgrade_stale_activity`]) then moves
+                // Spawning → Idle once last_event_at ages out, instead of
+                // silently advertising "spawning" after events.sock
+                // degrades and no further hooks arrive.
             }
             WorkerEvent::UserPromptSubmit { .. } => {
                 state.activity = WorkerActivity::Working;
@@ -720,6 +760,53 @@ impl LiveWorkerStateRegistry {
             }
             state.activity = WorkerActivity::WaitingForInput;
             state.last_event_at = Some(iso8601_utc(now_epoch_secs));
+            changed.push(*slot_id);
+        }
+        changed
+    }
+
+    /// Downgrade `Spawning` slots whose `last_event_at` is older than
+    /// `threshold_secs` to `Idle`.
+    ///
+    /// Complements [`Self::mark_stalled_spawns`]: that method only
+    /// considers slots that have *never* received a hook
+    /// (`last_event_at == None`) and promotes them to
+    /// `WaitingForInput` under the directory-trust-prompt hypothesis.
+    /// This method owns the complementary lie — a slot that *did*
+    /// receive a hook (so `last_event_at` is set) but is still
+    /// advertising `Spawning`. That shape arises when:
+    ///
+    /// - `SessionStart(Resume)` stamps `last_event_at` without leaving
+    ///   `Spawning` (deliberate: reattach/spawn-ack need a proof-of-life
+    ///   signal that does not claim the worker is past spawn), then
+    /// - `events.sock` degrades and no further hooks arrive.
+    ///
+    /// After the threshold the honest claim is "we saw life, then
+    /// silence" — `Idle` — not "still spawning". Leaves
+    /// `last_event_at == None` alone (stalled-spawn / spawn-ack own
+    /// that), and never touches non-`Spawning` activities
+    /// (`Working` with a long think, `WaitingForInput` while a human
+    /// decides, …).
+    ///
+    /// Returns the slot IDs that changed so callers can broadcast.
+    pub fn downgrade_stale_activity(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let cutoff = iso8601_utc(now_epoch_secs.saturating_sub(threshold_secs));
+        let mut changed = Vec::new();
+        for (slot_id, state) in guard.by_slot.iter_mut() {
+            if state.activity != WorkerActivity::Spawning {
+                continue;
+            }
+            let Some(last) = state.last_event_at.as_deref() else {
+                // No event yet — mark_stalled_spawns / spawn_ack_sweep.
+                continue;
+            };
+            // Fixed-width ISO-8601: lexicographic order == chronological.
+            if last >= cutoff.as_str() {
+                continue;
+            }
+            state.activity = WorkerActivity::Idle;
+            state.current_tool = None;
             changed.push(*slot_id);
         }
         changed
@@ -1154,6 +1241,7 @@ mod tests {
             &WorkerEvent::SessionStart {
                 session_id: "s".into(),
                 source: SessionStartSource::Startup,
+                model: None,
             },
         );
         let state = reg.get(1).unwrap();
@@ -1418,6 +1506,7 @@ mod tests {
             &WorkerEvent::SessionStart {
                 session_id: "s".into(),
                 source: SessionStartSource::Startup,
+                model: None,
             },
         );
 
@@ -1591,5 +1680,142 @@ mod tests {
         reg.set_progress_fidelity(1, ProgressFidelity::Coarse);
         reg.release_slot(1);
         assert_eq!(reg.progress_fidelity_for_slot(1), ProgressFidelity::Rich);
+    }
+
+    // ── SessionStart model authority + stale-activity downgrade ──────────────
+
+    #[test]
+    fn session_start_model_overwrites_launch_default() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "opus", 1, None);
+        assert_eq!(reg.get(1).unwrap().model, "opus");
+
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Startup,
+                model: Some("claude-opus-4-7".into()),
+            },
+        );
+        assert_eq!(
+            reg.get(1).unwrap().model,
+            "claude-opus-4-7",
+            "SessionStart model is authoritative over the launch default",
+        );
+    }
+
+    #[test]
+    fn session_start_without_model_keeps_launch_default() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "opus", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Startup,
+                model: None,
+            },
+        );
+        assert_eq!(
+            reg.get(1).unwrap().model,
+            "opus",
+            "absent model must not wipe the launch default",
+        );
+    }
+
+    #[test]
+    fn session_start_resume_stamps_model_but_leaves_spawning() {
+        // Resume is the reattach proof-of-life path: stamp model + last_event_at
+        // without claiming the worker is past spawn. The stale-activity timer
+        // then downgrades Spawning → Idle once last_event_at ages out.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "opus", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Resume,
+                model: Some("claude-sonnet-4-6".into()),
+            },
+        );
+        let state = reg.get(1).unwrap();
+        assert_eq!(state.model, "claude-sonnet-4-6");
+        assert_eq!(state.activity, WorkerActivity::Spawning);
+        assert!(state.last_event_at.is_some());
+    }
+
+    #[test]
+    fn stale_last_event_at_downgrades_spawning_to_idle() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        // Resume leaves Spawning while stamping last_event_at.
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Resume,
+                model: None,
+            },
+        );
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Spawning);
+
+        // Age last_event_at past the downgrade threshold.
+        let now = 1_700_000_100_i64;
+        let stale_at = iso8601_utc(now - STALE_ACTIVITY_DOWNGRADE_SECS - 1);
+        reg.set_last_event_at_for_test(1, stale_at);
+
+        let changed = reg.downgrade_stale_activity(now, STALE_ACTIVITY_DOWNGRADE_SECS);
+        assert_eq!(changed, vec![1]);
+        assert_eq!(
+            reg.get(1).unwrap().activity,
+            WorkerActivity::Idle,
+            "stale last_event_at while Spawning must not keep advertising spawning",
+        );
+    }
+
+    #[test]
+    fn recent_last_event_at_does_not_downgrade_spawning() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.apply_event(
+            1,
+            &WorkerEvent::SessionStart {
+                session_id: "s".into(),
+                source: SessionStartSource::Resume,
+                model: None,
+            },
+        );
+        let now = 1_700_000_100_i64;
+        reg.set_last_event_at_for_test(1, iso8601_utc(now - 5));
+
+        let changed = reg.downgrade_stale_activity(now, STALE_ACTIVITY_DOWNGRADE_SECS);
+        assert!(changed.is_empty());
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Spawning);
+    }
+
+    #[test]
+    fn downgrade_stale_activity_ignores_slots_with_no_events() {
+        // No last_event_at → mark_stalled_spawns / spawn_ack_sweep, not us.
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        let now = 1_700_000_100_i64;
+        let changed = reg.downgrade_stale_activity(now, STALE_ACTIVITY_DOWNGRADE_SECS);
+        assert!(changed.is_empty());
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Spawning);
+    }
+
+    #[test]
+    fn downgrade_stale_activity_ignores_non_spawning() {
+        let reg = LiveWorkerStateRegistry::new();
+        reg.register_spawn(1, "run-1", "claude-opus-4-7", 1, None);
+        reg.apply_event(1, &pre_tool("Bash"));
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+
+        let now = 1_700_000_100_i64;
+        reg.set_last_event_at_for_test(1, iso8601_utc(now - STALE_ACTIVITY_DOWNGRADE_SECS - 60));
+        let changed = reg.downgrade_stale_activity(now, STALE_ACTIVITY_DOWNGRADE_SECS);
+        assert!(changed.is_empty());
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
     }
 }
