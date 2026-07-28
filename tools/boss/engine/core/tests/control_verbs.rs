@@ -139,9 +139,10 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         execution_id,
     } = seed_execution(&mut client).await?;
 
-    // Drive the chore into the Doing column the same way real workers
-    // do — manual `active` status flip — so we can verify cancel
-    // resets the kanban state. The seed leaves it `todo`.
+    // Drive the chore into Doing and start the execution so cancel is on
+    // a *live* row. Demote policy only returns active → todo for live
+    // cancel of the work item's latest execution (never-started ready/
+    // queued cancel leaves kanban alone — see work/tests).
     client
         .send_request(&FrontendRequest::UpdateWorkItem {
             id: work_item_id.clone(),
@@ -152,6 +153,15 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
         })
         .await?;
     assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Active);
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.start_execution_run(
+        &execution_id,
+        "worker-1",
+        "mono",
+        "lease-1",
+        "mono-agent-001",
+        "/tmp/mono-agent-001",
+    )?;
 
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
@@ -168,8 +178,8 @@ async fn work_cancel_marks_execution_cancelled() -> Result<()> {
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some(), "cancel must stamp finished_at");
 
-    // Active → todo: the kanban card returns to To-Do because the
-    // execution backing it is gone.
+    // Live cancel of the current execution: active → todo so the kanban
+    // card returns to Backlog (stop/abandon semantics).
     assert_eq!(fetch_task_status(&mut client, &work_item_id).await?, TaskStatus::Todo);
 
     // Cancelling a row that's already terminal should error rather than
