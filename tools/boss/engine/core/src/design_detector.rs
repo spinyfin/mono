@@ -19,8 +19,8 @@
 //!   `design_doc_branch` when it is already set. Uses the PR's **head**
 //!   branch (e.g. `boss/exec_*`) so the viewer can fetch the doc while
 //!   the PR is still open. The `raw_content_url` builder percent-encodes
-//!   `/` as `%2F` in the `?ref=` query param so slashed branch names
-//!   round-trip correctly through the Swift URL parser.
+//!   `/` as `%2F` in the branch's own path segment so slashed branch
+//!   names round-trip correctly through `raw.githubusercontent.com`.
 //! - [`on_design_pr_merged`] — fired when `mark_chore_pr_merged`
 //!   transitions a `kind=design` task to `done`. If the project
 //!   already has a path, only the branch is updated to the PR's base
@@ -51,9 +51,9 @@ pub(crate) struct PrScanResult {
 /// match, populates (or updates) the project's design-doc pointer using the PR's **head** branch so
 /// the in-app viewer can fetch the doc from the PR branch while the PR
 /// is still open. The `raw_content_url` builder percent-encodes `/` as
-/// `%2F` in `?ref=` so slashed branch names like `boss/exec_*` round-trip
-/// correctly through `parseRawContentURL` in the Swift app and reach
-/// the GitHub Contents API as a proper query parameter.
+/// `%2F` in the branch's own path segment so slashed branch names like
+/// `boss/exec_*` round-trip correctly through `raw.githubusercontent.com`,
+/// which takes the ref as a path segment rather than a query parameter.
 ///
 /// [`WorkDb::sync_project_design_doc_from_detector`] is used for the
 /// initial (pointer-is-NULL) case; it is a no-op when the path is already
@@ -129,8 +129,8 @@ pub async fn on_design_pr_detected(work_db: &WorkDb, task_id: &str, product_id: 
     let repo_remote_url = resolve_product_repo(work_db, task_id, product_id);
     // Use the head branch (e.g. `boss/exec_*`) so the in-app viewer can
     // fetch the doc from the PR branch while the PR is still open. The
-    // raw_content_url builder encodes `/` as `%2F` in `?ref=` so slashed
-    // branch names round-trip correctly through the Swift URL parser.
+    // raw_content_url builder encodes `/` as `%2F` in the branch's own
+    // path segment so slashed branch names round-trip correctly.
     let head_ref_name = scan.head_ref_name;
     let branch = head_ref_name.as_deref();
     // Captured for the cross-doc comment migration below; the Ok(false)

@@ -211,15 +211,17 @@ pub(crate) fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, pat
 
 /// Build the GitHub raw-content URL for a design doc.
 ///
-/// Format: `https://raw.githubusercontent.com/<owner>/<repo>/<path>?ref=<branch>`
+/// Format: `https://raw.githubusercontent.com/<owner>/<repo>/<branch>/<path>`
 ///
-/// The branch is carried in `?ref=` rather than embedded as URL path
-/// segments. Branch names like `boss/exec_*` contain `/`, which would be
-/// split into separate path components when the Swift app parses the URL —
-/// `segments[2]` would capture only `boss`, not `boss/exec_…`, causing
-/// the GitHub Contents API call to fail with 404. Percent-encoding the
-/// slash as `%2F` in the query parameter lets `URLComponents.queryItems`
-/// recover the full branch name on the Swift side.
+/// `raw.githubusercontent.com` takes the ref as a **path segment**, not a
+/// `?ref=` query parameter — that query-param shape is only valid for the
+/// GitHub Contents API (`api.github.com/repos/.../contents/...?ref=...`).
+/// A `?ref=` here is silently ignored by raw and the branch's first path
+/// component (e.g. `tools` from `tools/boss/docs/...`) gets misparsed as
+/// the ref, 404ing. Branch names like `boss/exec_*` contain `/`, which
+/// would otherwise be split into separate path segments, so the ref is
+/// percent-encoded (`/` as `%2F`) before being placed in its own segment;
+/// GitHub decodes it back to the literal branch name server-side.
 ///
 /// Returns `None` when the repo URL can't be parsed as a github.com URL
 /// (e.g. an enterprise mirror or non-GitHub host) so callers know the
@@ -227,12 +229,12 @@ pub(crate) fn render_design_doc_web_url(repo_remote_url: &str, branch: &str, pat
 /// web URL.
 pub(crate) fn render_design_doc_raw_content_url(repo_remote_url: &str, branch: &str, path: &str) -> Option<String> {
     // Percent-encode only `/` in branch names. Other characters legal in
-    // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a query
-    // string without encoding.
+    // Git branch names (alphanumeric, `-`, `_`, `.`) are safe in a URL
+    // path segment without encoding.
     let encoded_ref = branch.replace('/', "%2F");
     crate::completion::parse_repo_slug(repo_remote_url)
         .ok()
-        .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{path}?ref={encoded_ref}"))
+        .map(|slug| format!("https://raw.githubusercontent.com/{slug}/{encoded_ref}/{path}"))
 }
 
 /// Look up a product by `repo_remote_url`. Used by
@@ -478,11 +480,11 @@ mod tests {
     // ---- render_design_doc_raw_content_url ---------------------------
 
     #[test]
-    fn raw_content_url_github_carries_branch_in_ref() {
+    fn raw_content_url_github_carries_branch_as_path_segment() {
         let url = render_design_doc_raw_content_url("git@github.com:org/mono.git", "main", "docs/design.md");
         assert_eq!(
             url,
-            Some("https://raw.githubusercontent.com/org/mono/docs/design.md?ref=main".to_owned())
+            Some("https://raw.githubusercontent.com/org/mono/main/docs/design.md".to_owned())
         );
     }
 
@@ -491,7 +493,7 @@ mod tests {
         let url = render_design_doc_raw_content_url("https://github.com/org/mono", "boss/exec_123", "docs/design.md");
         assert_eq!(
             url,
-            Some("https://raw.githubusercontent.com/org/mono/docs/design.md?ref=boss%2Fexec_123".to_owned()),
+            Some("https://raw.githubusercontent.com/org/mono/boss%2Fexec_123/docs/design.md".to_owned()),
         );
     }
 
