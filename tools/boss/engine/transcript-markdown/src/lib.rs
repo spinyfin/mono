@@ -14,9 +14,25 @@
 //! - [`parse_transcript_checked`] — same, but returns an error when the
 //!   schema can't be identified, for callers (the CLI) that must not
 //!   present an unrecognised-format transcript as an empty one.
+//! - [`parse_transcript_values`] — already-deserialized entries → the same
+//!   (for callers that normalize through a driver first).
 //! - [`events_to_segments`] — normalized events → [`Vec<TranscriptSegment>`]
 //! - [`segments_to_markdown`] — flat document from segments (CLI / single-blob)
 //! - [`render_text`] — plain-text rendering for the CLI transcript command
+//!
+//! # Two accepted Claude-family entry dialects
+//!
+//! Within the Claude Code schema path, Claude's own transcript wraps turn
+//! content in a `message` envelope
+//! (`{"type":"assistant","message":{"content":[…]}}`). Every other driver
+//! reshapes its native log into the *canonical* entry shape via
+//! `AgentDriver::normalize_transcript_entry`, which puts `content` (or a bare
+//! `text`) at the top level (`{"type":"assistant","content":[…]}`). Both are
+//! parsed here, so a caller that normalizes through the run's driver first
+//! (see `boss_engine::driver_transcript`) gets the same events regardless of
+//! which agent produced the file. Accepting only the `message` envelope is
+//! what made the marker scans — `[blocked]`, `[effort-escalation]`,
+//! `[deferred-scope]`, `NO_CHANGES_NEEDED` — silently Claude-only.
 
 use boss_engine_codex_rollout::{
     canonical_rollout_tool_call, canonical_rollout_tool_output, extract_text_blocks as extract_codex_text_blocks,
@@ -248,6 +264,27 @@ fn parse_transcript_claude(jsonl_content: &str) -> Vec<TranscriptEvent> {
         };
         let new_events = parse_one_value(&value, &mut seq);
         events.extend(new_events);
+    }
+    events
+}
+
+/// Parse already-deserialized transcript entries into normalized events.
+///
+/// Same semantics as the Claude-family path of [`parse_transcript`], for
+/// callers that must transform each entry before parsing — notably a
+/// driver-aware read, which routes every line through
+/// `AgentDriver::normalize_transcript_entry` so a non-Claude transcript
+/// arrives here in the canonical entry shape. Unrecognised entries are
+/// skipped, exactly as they are for a raw text parse.
+///
+/// Accepts any iterator of owned [`Value`]s so a caller can stream normalized
+/// entries without materialising a whole-transcript `Vec<Value>` first (see
+/// `boss_engine::driver_transcript::parse_transcript_with_driver`).
+pub fn parse_transcript_values(values: impl IntoIterator<Item = Value>) -> Vec<TranscriptEvent> {
+    let mut events = Vec::new();
+    let mut seq: u64 = 0;
+    for value in values {
+        events.extend(parse_one_value(&value, &mut seq));
     }
     events
 }
@@ -510,15 +547,27 @@ fn parse_one_value(value: &Value, seq: &mut u64) -> Vec<TranscriptEvent> {
     }
 }
 
+/// The turn content of a user/assistant entry, in whichever of the two
+/// accepted dialects it arrived in (see the crate docs): Claude's
+/// `message.content` envelope, or the canonical normalized shape's top-level
+/// `content` / bare `text`.
+///
+/// `message.content` is checked first so a Claude entry is read exactly as it
+/// always was; the top-level lookups only ever fire for an entry that has no
+/// `message` envelope at all.
+fn turn_content(obj: &serde_json::Map<String, Value>) -> Option<&Value> {
+    obj.get("message")
+        .and_then(|message| message.get("content"))
+        .or_else(|| obj.get("content"))
+        .or_else(|| obj.get("text"))
+}
+
 fn parse_user_message(
     obj: &serde_json::Map<String, Value>,
     timestamp: Option<String>,
     seq: &mut u64,
 ) -> Vec<TranscriptEvent> {
-    let Some(message) = obj.get("message") else {
-        return Vec::new();
-    };
-    let Some(content) = message.get("content") else {
+    let Some(content) = turn_content(obj) else {
         return Vec::new();
     };
     extract_text_blocks(content, "user", timestamp, None, seq)
@@ -530,13 +579,15 @@ fn parse_assistant_message(
     model: Option<String>,
     seq: &mut u64,
 ) -> Vec<TranscriptEvent> {
-    let Some(message) = obj.get("message") else {
+    let Some(content) = turn_content(obj) else {
         return Vec::new();
     };
-    let Some(content) = message.get("content") else {
-        return Vec::new();
-    };
-    let model = model.or_else(|| message.get("model").and_then(|v| v.as_str()).map(|s| s.to_owned()));
+    let model = model.or_else(|| {
+        obj.get("message")
+            .and_then(|message| message.get("model"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned())
+    });
 
     let mut events = Vec::new();
     if let Some(arr) = content.as_array() {
@@ -1085,6 +1136,84 @@ mod tests {
             other => panic!("unexpected kind: {other:?}"),
         }
         assert_eq!(events[0].model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn parses_canonical_assistant_entry_without_a_message_envelope() {
+        // The shape every non-Claude driver's `normalize_transcript_entry`
+        // produces: `content` at the top level, no `message` wrapper. Reading
+        // only the Claude envelope is what made the Stop-boundary marker scans
+        // blind on those drivers.
+        let jsonl =
+            r#"{"type":"assistant","content":[{"type":"text","text":"[blocked] reason=\"lock file is unwritable\""}]}"#;
+        let events = parse_transcript(jsonl);
+        assert_eq!(events.len(), 1, "canonical assistant entry must parse: {events:?}");
+        match &events[0].kind {
+            TranscriptEventKind::AssistantText(t) => {
+                assert!(t.starts_with("[blocked] reason="), "got {t}");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_canonical_user_entry_with_bare_text() {
+        let jsonl = r#"{"type":"user","text":"run the build"}"#;
+        let events = parse_transcript(jsonl);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            TranscriptEventKind::UserText(t) => assert_eq!(t, "run the build"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_canonical_assistant_tool_use_without_a_message_envelope() {
+        let jsonl =
+            r#"{"type":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"jj diff"}}]}"#;
+        let events = parse_transcript(jsonl);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            TranscriptEventKind::ToolUse { name, input } => {
+                assert_eq!(name, "Bash");
+                assert_eq!(input["command"], "jj diff");
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_transcript_values_matches_a_raw_text_parse() {
+        let jsonl = concat!(
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"go"}]}}"#,
+            "\n",
+            r#"{"type":"assistant","content":[{"type":"text","text":"done"}]}"#,
+            "\n",
+        );
+        let values = jsonl
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).unwrap());
+        let from_values = parse_transcript_values(values);
+        let from_text = parse_transcript(jsonl);
+        assert_eq!(from_values.len(), from_text.len());
+        assert_eq!(from_values.len(), 2);
+        // `seq` numbering must be continuous across entries either way.
+        assert_eq!(from_values[0].seq, 0);
+        assert_eq!(from_values[1].seq, 1);
+    }
+
+    #[test]
+    fn message_envelope_still_wins_over_a_top_level_content_field() {
+        // Defensive: if an entry somehow carries both, the Claude envelope is
+        // authoritative — the top-level lookup is a fallback, not an override.
+        let jsonl = r#"{"type":"assistant","content":[{"type":"text","text":"fallback"}],"message":{"content":[{"type":"text","text":"envelope"}]}}"#;
+        let events = parse_transcript(jsonl);
+        assert_eq!(events.len(), 1);
+        match &events[0].kind {
+            TranscriptEventKind::AssistantText(t) => assert_eq!(t, "envelope"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
     }
 
     #[test]

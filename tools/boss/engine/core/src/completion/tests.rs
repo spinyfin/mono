@@ -679,6 +679,72 @@ fn write_assistant_transcript(db: &WorkDb, workspace_path: &Path, execution_id: 
         .unwrap();
 }
 
+/// Point `work_item_id`'s driver at `slug`, so
+/// `WorkDb::get_execution_driver_slug` — and therefore every driver-aware
+/// read of its executions' transcripts — resolves to that driver.
+fn set_work_item_driver(db: &WorkDb, work_item_id: &str, slug: &str) {
+    db.update_work_item(
+        work_item_id,
+        crate::work::WorkItemPatch {
+            driver: Some(slug.to_owned()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+}
+
+/// Write a transcript for `execution_id` in the **canonical entry shape** —
+/// what every driver's `normalize_transcript_entry` produces, as opposed to
+/// [`write_assistant_transcript`]'s Claude-native `message` envelope — and
+/// register its path.
+///
+/// Lets a test assert a Stop-boundary behaviour holds for *every* registered
+/// driver without the test itself having to know each backend's native
+/// dialect (which would just re-hardcode the per-driver knowledge the driver
+/// abstraction exists to hold).
+fn write_canonical_assistant_transcript(db: &WorkDb, workspace_path: &Path, execution_id: &str, text: &str) {
+    let obj = serde_json::json!({
+        "type": "assistant",
+        "content": [{"type": "text", "text": text}]
+    });
+    let jsonl = format!("{obj}\n");
+    let transcript_path = workspace_path.join(format!("transcript-{execution_id}.jsonl"));
+    std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
+    db.set_run_transcript_path_if_unset(execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+}
+
+/// Write a transcript for `execution_id` in Codex's **native rollout
+/// dialect** — `session_meta` / `event_msg` / `response_item` envelopes, none
+/// of which the Claude transcript parser recognises — and register its path.
+///
+/// This is the shape the engine actually finds on disk for a Codex run
+/// (`work_runs.transcript_path` points at the rollout JSONL under the
+/// run-private `CODEX_HOME`), so a test using it exercises the real
+/// normalize-then-parse path rather than a pre-canonicalised stand-in. `text`
+/// is emitted the way Codex records a final answer: as the `agent_message`
+/// event and again as the assistant `response_item`.
+fn write_codex_rollout_transcript(db: &WorkDb, workspace_path: &Path, execution_id: &str, text: &str) {
+    let lines = [
+        serde_json::json!({"type": "session_meta", "payload": {"id": "session-1"}}),
+        serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+        serde_json::json!({"type": "event_msg", "payload": {"type": "agent_message", "message": text}}),
+        serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        }),
+    ];
+    let jsonl = lines.iter().map(|line| format!("{line}\n")).collect::<String>();
+    let transcript_path = workspace_path.join(format!("rollout-{execution_id}.jsonl"));
+    std::fs::write(&transcript_path, jsonl.as_bytes()).unwrap();
+    db.set_run_transcript_path_if_unset(execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+}
+
 /// Build a revision fixture but leave `execution.pr_url` as NULL
 /// (simulates an execution created before pr_url was reliably stamped).
 /// The parent chore still has `pr_url` set so the chain-root lookup

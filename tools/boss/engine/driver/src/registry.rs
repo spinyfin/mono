@@ -66,6 +66,17 @@ impl DriverRegistry {
         self.drivers.get(slug)
     }
 
+    /// Every registered slug, in unspecified order.
+    ///
+    /// Exists so a behaviour that must hold for *all* drivers can be asserted
+    /// against the registry itself rather than a hand-listed set that silently
+    /// stops covering the newest driver the moment one is added — the shape of
+    /// bug that let Stop-boundary marker handling be Claude-only in practice
+    /// while reading as driver-agnostic.
+    pub fn slugs(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.drivers.keys().copied()
+    }
+
     /// Clone of the registered driver for `slug`, or [`UnknownDriverSlug`]
     /// when the slug is unrecognised.
     ///
@@ -195,6 +206,17 @@ mod tests {
         resolver
             .check_dispatch(&TaskKind::Design)
             .expect("Grok provides ToolUseInterception + StructuredOutput for Design");
+    }
+
+    #[test]
+    fn slugs_enumerates_every_registered_driver() {
+        let reg = DriverRegistry::default();
+        let mut slugs: Vec<&str> = reg.slugs().collect();
+        slugs.sort_unstable();
+        assert_eq!(slugs, vec!["claude", "codex"]);
+        for slug in reg.slugs() {
+            assert!(reg.require(slug).is_ok(), "enumerated slug must resolve: {slug}");
+        }
     }
 
     #[test]

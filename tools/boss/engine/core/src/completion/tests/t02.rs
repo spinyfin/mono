@@ -1086,6 +1086,156 @@ async fn blocked_marker_files_attention_and_suppresses_nudge() {
 }
 
 #[tokio::test]
+async fn blocked_marker_files_attention_on_a_codex_worker_native_rollout() {
+    // Field incident: a Codex worker emitted the sanctioned `[blocked]`
+    // marker in the exact documented format and no attention item of any
+    // blocked kind was ever created — the work item was silently
+    // redispatched. `work_runs.transcript_path` for a Codex run points at the
+    // rollout JSONL, whose `session_meta`/`event_msg`/`response_item`
+    // envelopes the Claude transcript parser does not recognise, so the
+    // Stop-boundary read found zero assistant turns and the marker scan
+    // returned without looking at anything. Marker handling read as
+    // driver-agnostic while being Claude-only in practice.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    set_work_item_driver(&db, &chore_id, "codex");
+    let marker = "[blocked] reason=\"jj describe cannot create the .jj store lock: Operation not \
+                  permitted; this prevents committing, bookmarking, and opening the required PR.\"";
+    write_codex_rollout_transcript(&db, workspace.path(), &execution_id, marker);
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::EscalationPending { .. }),
+        "a [blocked] marker on a non-Claude driver must suppress the auto-nudge; got {outcome:?}",
+    );
+    assert!(
+        probes.snapshot().is_empty(),
+        "the produce-a-PR nudge must NOT fire while the blocker is unresolved; got {:?}",
+        probes.snapshot(),
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    let blocked: Vec<_> = items
+        .iter()
+        .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+        .collect();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "exactly one worker_blocked attention item must be filed — the rollout records the same \
+         final answer more than once, which must not multiply the item; got {items:?}",
+    );
+    assert_eq!(blocked[0].status, "open");
+    assert!(
+        blocked[0].body_markdown.contains("[blocked] reason="),
+        "the attention body must carry the marker verbatim; got: {}",
+        blocked[0].body_markdown,
+    );
+}
+
+#[tokio::test]
+async fn blocked_marker_files_attention_for_every_registered_driver() {
+    // The driver-agnostic half of the coverage: the same well-formed marker,
+    // in the canonical entry shape every driver's `normalize_transcript_entry`
+    // is contracted to produce, must file a blocked attention item under EVERY
+    // slug in the registry — including any driver added after this test was
+    // written. A fix that only works for one hardcoded second backend fails
+    // here the moment a third is registered.
+    let marker = "[blocked] reason=\"ambiguous requirement; need a coordinator decision\"";
+    for slug in crate::driver::DriverRegistry::default().slugs() {
+        let workspace = tempdir().unwrap();
+        let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+        set_work_item_driver(&db, &chore_id, slug);
+        write_canonical_assistant_transcript(&db, workspace.path(), &execution_id, marker);
+        let detector = StubPrDetector::ok(None);
+        let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+
+        let outcome = handler.on_stop(&execution_id).await;
+        assert!(
+            matches!(outcome, StopOutcome::EscalationPending { .. }),
+            "driver {slug}: an unresolved blocker must suppress the auto-nudge; got {outcome:?}",
+        );
+        assert!(
+            probes.snapshot().is_empty(),
+            "driver {slug}: no produce-a-PR nudge may fire while the blocker is unresolved",
+        );
+        let items = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+                .count(),
+            1,
+            "driver {slug}: exactly one worker_blocked attention item must be filed; got {items:?}",
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_blocked_marker_on_a_non_claude_driver_is_still_filed_loudly() {
+    // A malformed marker must surface the ambiguity rather than being
+    // silently dropped — on every driver, not just the one whose transcript
+    // dialect the parser happened to be written against.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    set_work_item_driver(&db, &chore_id, "codex");
+    write_codex_rollout_transcript(&db, workspace.path(), &execution_id, "[blocked]");
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    handler.on_stop(&execution_id).await;
+    let items = db.list_attention_items(&execution_id).unwrap();
+    let item = items
+        .iter()
+        .find(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+        .expect("a malformed marker must still file an attention item on a non-Claude driver");
+    assert!(
+        item.body_markdown.contains("Parse warning"),
+        "a malformed marker must be flagged with a parse warning; got: {}",
+        item.body_markdown,
+    );
+}
+
+#[tokio::test]
+async fn effort_escalation_and_deferred_scope_also_survive_a_non_claude_transcript() {
+    // The blocked marker is not a special case: every Stop-boundary marker
+    // scan reads through the same transcript reader, so all of them were
+    // Claude-only together and must be driver-agnostic together.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    set_work_item_driver(&db, &chore_id, "codex");
+    write_codex_rollout_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "[effort-escalation] requested_level=large reason=\"multi-subsystem race\"\n\
+         [deferred-scope] summary=\"the third data source\" reason=\"needs a new ingestion pipeline\"",
+    );
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector);
+
+    handler.on_stop(&execution_id).await;
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == worker_escalation::WORKER_ESCALATION_ATTENTION_KIND)
+            .count(),
+        1,
+        "the [effort-escalation] marker must be filed on a non-Claude driver; got {items:?}",
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|i| i.kind == crate::deferred_scope::DEFERRED_SCOPE_ATTENTION_KIND)
+            .count(),
+        1,
+        "the [deferred-scope] marker must be recorded on a non-Claude driver; got {items:?}",
+    );
+}
+
+#[tokio::test]
 async fn blocked_marker_files_attention_even_while_execution_still_running() {
     // A worker can emit the sanctioned `[blocked]` marker while
     // `execution.status` is still `running` — briefly between

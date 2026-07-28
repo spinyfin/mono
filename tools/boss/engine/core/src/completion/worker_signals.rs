@@ -34,7 +34,22 @@ impl WorkerCompletionHandler {
     /// deleting the parser. With the flag off, the marker parsers run
     /// unconditionally and nothing is counted or skipped.
     pub(super) async fn detect_and_file_worker_signals(&self, execution: &crate::work::WorkExecution) {
-        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+        let transcript = self.read_final_triage_message(&execution.id).await;
+        let Some(text) = transcript.into_message() else {
+            // Never a silent return: with no readable prose the engine cannot
+            // tell "the worker escalated" from "the worker said nothing", and
+            // the nudge/redispatch path downstream will assume the latter. A
+            // transcript this scan could not read is the exact state that hid
+            // the field incident (a Codex rollout parsed to zero assistant
+            // turns), so it is logged as an unresolved ambiguity, attributable
+            // to the execution, rather than passing quietly.
+            tracing::warn!(
+                execution_id = %execution.id,
+                work_item_id = %execution.work_item_id,
+                "worker escalation: no readable final message on this terminal Stop — cannot tell a \
+                 [blocked]/[effort-escalation] marker from a worker that emitted nothing; no signal \
+                 filed (see the transcript-read warning above for which state the read ended in)",
+            );
             return;
         };
         let mut signals = worker_escalation::detect_worker_signals(&text);

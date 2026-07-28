@@ -953,6 +953,14 @@ impl WorkerCompletionHandler {
     /// `detail` so a `failed_will_retry` triage row is diagnosable instead of
     /// collapsing to a bare "no decision marker".
     ///
+    /// Every entry is normalized through the run's own driver before parsing
+    /// (see [`crate::driver_transcript`]) — this reader is what the
+    /// Stop-boundary marker scans (`[blocked]`, `[effort-escalation]`,
+    /// `[deferred-scope]`, `NO_CHANGES_NEEDED`), the triage-decision fallback
+    /// and the PR-URL prose fallback all read through, so parsing the file as
+    /// if every agent wrote Claude's dialect made all of them silently
+    /// Claude-only. For Claude the normalization is the identity.
+    ///
     /// Retries the read with a short bounded backoff (see
     /// [`TRIAGE_TRANSCRIPT_READ_ATTEMPTS`]) when the transcript parses but
     /// yields no assistant text. This closes a Stop-boundary flush race: the
@@ -983,6 +991,9 @@ impl WorkerCompletionHandler {
             }
         };
 
+        // Resolved once, outside the retry loop: the run's driver cannot
+        // change between attempts, and the lookup is a DB round trip.
+        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, execution_id);
         let mut last_event_count = 0usize;
         let mut last_content_len = 0usize;
         for attempt in 1..=TRIAGE_TRANSCRIPT_READ_ATTEMPTS {
@@ -997,7 +1008,7 @@ impl WorkerCompletionHandler {
                     return TriageTranscript::Unreadable;
                 }
             };
-            let events = crate::transcript_markdown::parse_transcript(&content);
+            let events = crate::driver_transcript::parse_transcript_with_driver(driver.as_deref(), &content);
             // Collect ALL assistant text turns, not just the last one.
             //
             // The triage agent emits its decision marker in the turn AFTER the
@@ -1044,8 +1055,17 @@ impl WorkerCompletionHandler {
                 .await;
             }
         }
+        // `driver` names which normalizer ran: a non-empty transcript that
+        // still yields no assistant turn is the shape of a dialect the parse
+        // path does not understand, and that is indistinguishable at every
+        // downstream marker scan from "the worker said nothing". Log which
+        // driver wrote it so the ambiguity is attributable rather than silent.
         tracing::warn!(
             execution_id,
+            driver = driver
+                .as_ref()
+                .map(|driver| driver.descriptor().name)
+                .unwrap_or("(unresolved)"),
             transcript_bytes = last_content_len,
             event_count = last_event_count,
             attempts = TRIAGE_TRANSCRIPT_READ_ATTEMPTS,
