@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
-use super::{AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver};
+use super::{AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver};
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
 ///
@@ -45,6 +45,7 @@ impl Default for DriverRegistry {
         let mut drivers: HashMap<&'static str, Arc<dyn AgentDriver>> = HashMap::new();
         drivers.insert("claude", Arc::new(ClaudeDriver));
         drivers.insert("codex", Arc::new(CodexDriver::default()));
+        drivers.insert("grok", Arc::new(GrokDriver::default()));
         Self { drivers }
     }
 }
@@ -111,6 +112,17 @@ mod tests {
         assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
     }
 
+    #[test]
+    fn default_registry_contains_grok() {
+        let reg = DriverRegistry::default();
+        let driver = reg.require("grok").expect("default registry must contain 'grok'");
+        assert_eq!(driver.descriptor().name, "grok");
+        assert_eq!(driver.descriptor().config_dir, ".grok");
+        assert_eq!(driver.descriptor().agent_rules_filename, "AGENTS.md");
+        assert_eq!(driver.descriptor().binary, "grok");
+        assert_eq!(driver.descriptor().model_menu.engine_default, "grok-4.5");
+    }
+
     /// Acceptance: `--driver codex` resolves in the registry and the
     /// dispatch capability gate evaluates against Codex's real `CapabilitySet`
     /// — not a registry-lookup failure.
@@ -148,6 +160,43 @@ mod tests {
             .expect("Codex provides ToolUseInterception + StructuredOutput for Design");
     }
 
+    /// Acceptance: `--driver grok` resolves in the registry and the
+    /// dispatch capability gate evaluates against Grok's real `CapabilitySet`
+    /// — not a registry-lookup failure.
+    #[test]
+    fn grok_dispatch_gate_uses_declared_capability_set() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let resolver = reg.resolver("grok").expect("grok is registered");
+        // Chore is phase-1 eligible; gate must succeed (no Refuse) against
+        // Grok's declared set.
+        let plan = resolver
+            .check_dispatch(&TaskKind::Chore)
+            .expect("Grok CapabilitySet must clear the chore dispatch gate");
+        assert_eq!(plan.driver_name, "grok");
+        assert!(
+            plan.provided.contains(&Capability::Spawn),
+            "gate must see Grok's declared Spawn, not an empty set: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.provided.contains(&Capability::ToolUseInterception),
+            "ToolUseInterception is declared deny-only: {:?}",
+            plan.provided
+        );
+        assert!(
+            plan.degraded.contains(&Capability::ToolProvisioning)
+                || !plan.provided.contains(&Capability::ToolProvisioning),
+            "ToolProvisioning must be absent/degraded for Grok: {plan:?}"
+        );
+        // Design tasks still require-strict ToolUseInterception + StructuredOutput;
+        // Grok provides both, so Design must also clear the gate.
+        resolver
+            .check_dispatch(&TaskKind::Design)
+            .expect("Grok provides ToolUseInterception + StructuredOutput for Design");
+    }
+
     #[test]
     fn unknown_slug_returns_none() {
         let reg = DriverRegistry::default();
@@ -168,6 +217,13 @@ mod tests {
         let reg = DriverRegistry::default();
         assert!(reg.resolver("codex").is_some());
         assert!(reg.require("codex").is_ok());
+    }
+
+    #[test]
+    fn resolver_for_grok_succeeds() {
+        let reg = DriverRegistry::default();
+        assert!(reg.resolver("grok").is_some());
+        assert!(reg.require("grok").is_ok());
     }
 
     /// Acceptance for the call-site cutover: a second registered driver
