@@ -473,6 +473,7 @@ mod tests {
             change_id: None,
             repository: None,
             base_files: vec![],
+            whole_repo: false,
         }
     }
 

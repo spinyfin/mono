@@ -9,6 +9,7 @@ This page describes bypass support for checks that opt into bypass.
 - In the current default config, bypass is enabled for:
   - `file/size`
   - `file/ifchange`
+  - `change/file-count` (directive name: `BYPASS_CHANGE_FILE_COUNT`)
   - `no-usfa-typo` (directive name: `BYPASS_NO_USFA_TYPO`)
 
 ```toml
@@ -20,6 +21,12 @@ allow_bypass = true
 
 [[checks]]
 id = "file/size"
+
+[checks.policy]
+allow_bypass = true
+
+[[checks]]
+id = "change/file-count"
 
 [checks.policy]
 allow_bypass = true
@@ -46,6 +53,7 @@ The bypass name is derived from the check id by uppercasing and replacing all no
 | Check id             | Bypass name                 |
 | -------------------- | --------------------------- |
 | `file/size`          | `BYPASS_FILE_SIZE`          |
+| `change/file-count`  | `BYPASS_CHANGE_FILE_COUNT`  |
 | `format/rust`        | `BYPASS_FORMAT_RUST`        |
 | `format/bazel`       | `BYPASS_FORMAT_BAZEL`       |
 | `lint/rust`          | `BYPASS_LINT_RUST`          |
@@ -63,6 +71,12 @@ For `file/size`:
 
 ```text
 BYPASS_FILE_SIZE=Generated file mirrors upstream source and cannot be split safely.
+```
+
+For `change/file-count`:
+
+```text
+BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.
 ```
 
 For `no-usfa-typo`:

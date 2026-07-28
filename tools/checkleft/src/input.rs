@@ -36,6 +36,15 @@ pub struct ChangeSet {
     pub change_id: Option<String>,
     #[serde(default)]
     pub repository: Option<String>,
+    /// True when this changeset is the full tracked-tree scan produced by
+    /// `checkleft run --all` / [`crate::vcs::Vcs::all_files_changeset`].
+    ///
+    /// In that mode every tracked file is listed as `ChangeKind::Modified`
+    /// with no diff hunks — it is not a real PR-sized change. Checks that
+    /// gate on change *size* (e.g. `change/file-count`) must treat this as a
+    /// no-op; integrity pipelines use `--all` and would otherwise always fail.
+    #[serde(default)]
+    pub whole_repo: bool,
 }
 
 impl ChangeSet {
@@ -49,6 +58,7 @@ impl ChangeSet {
             pr_description: None,
             change_id: None,
             repository: None,
+            whole_repo: false,
         }
     }
 
@@ -78,6 +88,13 @@ impl ChangeSet {
 
     pub fn with_repository(mut self, repository: Option<String>) -> Self {
         self.repository = repository;
+        self
+    }
+
+    /// Mark this changeset as a whole-repo (`--all`) scan rather than a
+    /// scoped PR/diff change. See [`Self::whole_repo`].
+    pub fn with_whole_repo(mut self, whole_repo: bool) -> Self {
+        self.whole_repo = whole_repo;
         self
     }
 

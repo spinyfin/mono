@@ -1292,6 +1292,7 @@ impl Runner {
                 pr_description: changeset.pr_description.clone(),
                 change_id: changeset.change_id.clone(),
                 repository: changeset.repository.clone(),
+                whole_repo: changeset.whole_repo,
             },
             exclusion_matcher,
         }

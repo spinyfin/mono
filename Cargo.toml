@@ -65,6 +65,7 @@ members = [
   "tools/checkleft/sdk",
   "tools/checkleft/sdk-macro",
   "tools/checkleft/sdk/examples/trivial-check",
+  "tools/checkleft/checks/change/file-count",
   "tools/checkleft/checks/file/forbidden-path",
   "tools/checkleft/checks/file/ifchange",
   "tools/checkleft/checks/file/size",

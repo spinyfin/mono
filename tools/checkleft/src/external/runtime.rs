@@ -1436,6 +1436,7 @@ fn lower_changeset(changeset: &ChangeSet, source_tree: &dyn SourceTree) -> wit_t
         change_id: changeset.change_id.clone(),
         repository: changeset.repository.clone(),
         base_files,
+        whole_repo: changeset.whole_repo,
     }
 }
 

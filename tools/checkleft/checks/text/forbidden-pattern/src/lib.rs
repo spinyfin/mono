@@ -374,6 +374,7 @@ mod tests {
                 change_id: None,
                 repository: None,
                 base_files: vec![],
+                whole_repo: false,
             },
             config_json.to_owned(),
         )
@@ -393,6 +394,7 @@ mod tests {
                 change_id: None,
                 repository: None,
                 base_files: vec![],
+                whole_repo: false,
             },
             config_json.to_owned(),
         )

@@ -1123,6 +1123,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "checkleft-change-file-count"
+version = "0.1.0"
+dependencies = [
+ "checkleft-check-sdk",
+ "serde",
+]
+
+[[package]]
 name = "checkleft-check-sdk"
 version = "0.1.0"
 dependencies = [
@@ -1194,6 +1202,7 @@ dependencies = [
 name = "checkleft-preinstalled-bundle"
 version = "0.1.0"
 dependencies = [
+ "checkleft-change-file-count",
  "checkleft-check-sdk",
  "checkleft-file-forbidden-path",
  "checkleft-file-ifchange",

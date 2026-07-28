@@ -105,6 +105,11 @@ pub struct ChangeSet {
     /// Empty when no base revision is available (e.g. `--all` mode). Checks
     /// should handle the absent case by skipping base-revision enforcement.
     pub base_files: Vec<BaseFile>,
+    /// True when this changeset is the full tracked-tree scan produced by
+    /// `checkleft run --all`. Every tracked file is listed as Modified with no
+    /// diff hunks — not a real PR-sized change. Checks that gate on change
+    /// *size* (e.g. `change/file-count`) must treat this as a no-op.
+    pub whole_repo: bool,
 }
 
 impl ChangeSet {
@@ -438,6 +443,7 @@ mod tests {
                 change_id: None,
                 repository: None,
                 base_files: vec![],
+                whole_repo: false,
             },
             config_json: "{}".to_owned(),
         }

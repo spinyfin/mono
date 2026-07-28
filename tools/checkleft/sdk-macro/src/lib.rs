@@ -663,6 +663,7 @@ fn expand_export_checks(input: ExportChecksInput) -> syn::Result<TokenStream2> {
                         path: bf.path,
                         content: bf.content,
                     }).collect(),
+                    whole_repo: cs.whole_repo,
                 }
             }
 

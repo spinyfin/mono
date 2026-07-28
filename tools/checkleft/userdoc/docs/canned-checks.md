@@ -533,6 +533,40 @@ Notes:
 - There is only one bundled check for file size. The `check: file/size` field in CHECKS config lets you create a named instance (e.g. `id: my-size-limit`) of the same underlying implementation — this is the aliasing feature, not a separate check.
 - For new configuration, prefer the framework-level `exclude` key (sibling to `config:`) over `exclude_files` inside `config:`. Both are equivalent and enforced by the framework; see [Excluding files from checks](checks-config.md#excluding-files-from-checks).
 
+## `change/file-count`
+
+Purpose:
+
+- Flags a changeset when it touches more **non-deleted** files than `max_files`.
+- Complements `file/size` (per-file line limits): this check limits **how many files** a single change may touch, not how large any one file is.
+
+Config keys:
+
+- `max_files` (optional integer, default `50`)
+
+Example:
+
+```yaml
+checks:
+  - id: change/file-count
+    config:
+      max_files: 30
+    policy:
+      severity: error
+      allow_bypass: true
+```
+
+Notes:
+
+- Runs as an embedded WASM check (preinstalled bundle), same packaging path as `file/size`.
+- Counts only non-deleted changed files (`added` / `modified` / `renamed`). Pure deletions do not inflate the count.
+- Uses the same changed-file universe checkleft already builds for change detection — not a separate `git`/`gh` integration.
+- Emits a single locationless finding with the actual count, configured max, a recommendation to break the work into smaller tasks/PRs, and a pointer to the legitimate bypass when the large surface is intentional.
+- Findings default to `error`. Override per instance with `[checks.policy].severity`.
+- Enable bypass per instance with `[checks.policy].allow_bypass`. Directive name: `BYPASS_CHANGE_FILE_COUNT`.
+- Bypass is for rare, intentional large surfaces (coordinated renames, unsplittable generated trees). Do not raise the silent default or use bypass for convenience dumps.
+- **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified (no real PR-sized change), so a file-count ceiling would always fire on any real tree. Like `policy.changed_lines_only` under `--all`, this check skips when the changeset is a full-repo scan (`ChangeSet.whole_repo`). PR-scoped / base-ref runs still enforce `max_files`.
+
 ## `forbidden-imports-deps`
 
 Purpose:

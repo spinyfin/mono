@@ -193,6 +193,10 @@ mod tests {
             bypass_name_for_check_id("rust/giant-structs"),
             "BYPASS_RUST_GIANT_STRUCTS"
         );
+        assert_eq!(
+            bypass_name_for_check_id("change/file-count"),
+            "BYPASS_CHANGE_FILE_COUNT"
+        );
     }
 
     #[test]

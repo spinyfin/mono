@@ -13,6 +13,7 @@ description = "Aggregates every preinstalled checkleft wasm check into a single 
 crate-type = ["cdylib"]
 
 [dependencies]
+checkleft-change-file-count = { path = "../checks/change/file-count" }
 checkleft-check-sdk = { path = "../sdk" }
 checkleft-file-forbidden-path = { path = "../checks/file/forbidden-path" }
 checkleft-file-ifchange = { path = "../checks/file/ifchange" }
