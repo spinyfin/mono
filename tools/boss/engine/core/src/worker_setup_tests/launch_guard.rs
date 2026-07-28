@@ -162,7 +162,56 @@ fn launch_guard_allows_build_test_and_inspection() {
     }
 }
 
-/// The reason has to hand the worker the supported command; a refusal
+/// Isolated capture instance: non-production `BOSS_SOCKET_PATH` plus
+/// `BOSS_ENGINE_AUTOSTART=0`. Mirrors the engine exemption — workers can
+/// screenshot the real UI without seizing production.
+#[test]
+fn launch_guard_allows_isolated_app_macos_capture() {
+    for command in [
+        "BOSS_SOCKET_PATH=/tmp/boss-shot-9d3f.sock BOSS_ENGINE_AUTOSTART=0 bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png",
+        "BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-shot-abc.sock bazel run //tools/boss/app-macos:Boss",
+        // multi-line assignment then bazel run (same pattern as the open incident)
+        concat!(
+            "SOCK=/tmp/boss-shot-xyz.sock\n",
+            "BOSS_SOCKET_PATH=$SOCK BOSS_ENGINE_AUTOSTART=0 bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/x.png\n",
+        ),
+    ] {
+        assert_eq!(launch_decision(command), "approve", "must allow: {command}");
+    }
+}
+
+/// app-macos without both isolation signals stays blocked — missing
+/// socket, production socket, Application Support path, or autostart
+/// left enabled.
+#[test]
+fn launch_guard_blocks_app_macos_without_full_isolation() {
+    for command in [
+        "bazel run //tools/boss/app-macos:Boss",
+        "BOSS_SOCKET_PATH=/tmp/boss-shot.sock bazel run //tools/boss/app-macos:Boss",
+        "BOSS_ENGINE_AUTOSTART=0 bazel run //tools/boss/app-macos:Boss",
+        "BOSS_SOCKET_PATH=/tmp/boss-engine.sock BOSS_ENGINE_AUTOSTART=0 bazel run //tools/boss/app-macos:Boss",
+        "BOSS_SOCKET_PATH='/Users/x/Library/Application Support/Boss/x.sock' BOSS_ENGINE_AUTOSTART=0 bazel run //tools/boss/app-macos:Boss",
+        "BOSS_SOCKET_PATH=/tmp/boss-shot.sock BOSS_ENGINE_AUTOSTART=1 bazel run //tools/boss/app-macos:Boss",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+}
+
+/// Direct binary / open of Boss.app remains unconditionally blocked —
+/// the narrowing applies only to the `bazel run app-macos` case.
+#[test]
+fn launch_guard_still_blocks_direct_boss_app_binary() {
+    for command in [
+        "/Applications/Boss.app/Contents/MacOS/Boss",
+        "open /Applications/Boss.app",
+        "open -a Boss",
+        "open -b dev.spinyfin.bossmacapp",
+    ] {
+        assert_eq!(launch_decision(command), "block", "must block: {command}");
+    }
+}
+
+/// The reason has to hand the worker the supported commands; a refusal
 /// with no alternative produces a worker that finds its own.
 #[test]
 fn launch_guard_reason_names_the_isolated_alternative() {
@@ -174,6 +223,10 @@ fn launch_guard_reason_names_the_isolated_alternative() {
         "BOSS_EVENTS_SOCKET",
         "bazel build",
         "bazel test",
+        "--capture-to",
+        "BOSS_SOCKET_PATH",
+        "BOSS_ENGINE_AUTOSTART=0",
+        "//tools/boss/app-macos:Boss",
     ] {
         assert!(reason.contains(expected), "reason must mention {expected}: {reason}");
     }

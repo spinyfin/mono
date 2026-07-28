@@ -23,6 +23,13 @@
     <string>15.0</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <!-- Capture instances run with .accessory + no visible windows ordered
+         front. Automatic Termination's documented trigger is exactly that
+         scenario; leave it off so macOS cannot kill a capture mid-run.
+         Do not set LSUIElement / LSBackgroundOnly — activation policy is
+         conditional on the isolation signal at runtime. -->
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
     <!-- net.daringfireball.markdown is already a system-declared UTI on
          macOS 15+ (imported by Notes/Xcode), but the *active* owner of
          that declaration (Notes) only tags .md/.markdown — the

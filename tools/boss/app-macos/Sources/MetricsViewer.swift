@@ -9,7 +9,7 @@ import SwiftUI
 /// only the engine increments them.
 struct MetricsViewer: View {
     @EnvironmentObject private var chatModel: ChatViewModel
-    @AppStorage("boss.metricsViewer.visible") private var isOpen = false
+    @AppStorage("boss.metricsViewer.visible", store: BossDefaults.store) private var isOpen = false
     @State private var searchText: String = ""
     /// Rolling sample buffer per metric name: (sample time, value).
     /// Capped at 60 samples (~5 min at the 5s poll cadence). Session-only;

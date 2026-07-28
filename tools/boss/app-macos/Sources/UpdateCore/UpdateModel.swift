@@ -172,11 +172,18 @@ public final class UpdateModel: ObservableObject {
 
     /// Convenience factory that reads version info from the running bundle and wires
     /// the live downloader so automatic mode can stage updates.
-    public static func fromBundle() -> UpdateModel? {
+    ///
+    /// Pass the app's isolation-aware defaults store (e.g. `BossDefaults.store`)
+    /// so capture instances never write update prefs into `UserDefaults.standard`.
+    public static func fromBundle(defaults: UserDefaults = .standard) -> UpdateModel? {
         guard let checker = UpdateChecker.fromBundle() else { return nil }
         let current = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String)
             .flatMap(VersionTuple.parse) ?? VersionTuple(major: 0, minor: 0, patch: 0)
-        return UpdateModel(checker: checker, stager: .live(currentVersion: current))
+        return UpdateModel(
+            checker: checker,
+            defaults: defaults,
+            stager: .live(currentVersion: current)
+        )
     }
 
     /// Returns a no-op model used when the bundle is unavailable (e.g. SwiftUI previews).
@@ -222,8 +229,11 @@ public final class UpdateModel: ObservableObject {
 
     /// Factory that always returns a model. Falls back to a version-less dev build if
     /// the bundle's `CFBundleShortVersionString` is unavailable (e.g. `swift run` without plist).
-    public static func makeForApp() -> UpdateModel {
-        if let model = fromBundle() { return model }
+    ///
+    /// Callers in the macOS app must pass `BossDefaults.store` so isolated capture
+    /// instances keep update prefs out of the operator's production defaults suite.
+    public static func makeForApp(defaults: UserDefaults = .standard) -> UpdateModel {
+        if let model = fromBundle(defaults: defaults) { return model }
         // No `.app` bundle (e.g. `swift run` / bazel-run local dev). This is always a
         // dev build, which never auto-stages, so a `.noop` stager is correct.
         return UpdateModel(
@@ -232,6 +242,7 @@ public final class UpdateModel: ObservableObject {
                 fullVersionString: "0.0.0-dev-local",
                 fetcher: .live
             ),
+            defaults: defaults,
             stager: .noop
         )
     }

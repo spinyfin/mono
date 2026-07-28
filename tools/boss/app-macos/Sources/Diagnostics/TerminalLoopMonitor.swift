@@ -154,7 +154,7 @@ final class TerminalLoopMonitor: @unchecked Sendable {
 
     @MainActor
     private func sample() {
-        guard UserDefaults.standard.object(forKey: Self.samplingEnabledKey) as? Bool ?? true else {
+        guard BossDefaults.store.object(forKey: Self.samplingEnabledKey) as? Bool ?? true else {
             return
         }
 
@@ -168,7 +168,7 @@ final class TerminalLoopMonitor: @unchecked Sendable {
         lastWakeups = wakeupsNow
         lastTicks = ticksNow
 
-        let deep = UserDefaults.standard.bool(forKey: Self.deepContentKey)
+        let deep = BossDefaults.store.bool(forKey: Self.deepContentKey)
         var paneSamples: [PaneLoopSample] = []
         panes.removeAll { $0.probe == nil }
         for box in panes {

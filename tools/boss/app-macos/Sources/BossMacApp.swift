@@ -18,12 +18,30 @@ struct BossMacApp: App {
                 .task {
                     appDelegate.liveWorkerStates = chatModel.liveWorkerStates
                     appDelegate.chatModel = chatModel
-                    appDelegate.updateModel.startPollingIfNeeded()
+                    // Capture instances do not poll for updates — keep the
+                    // quiet background launch free of network activity.
+                    if !BossEnginePaths.isIsolatedInstance {
+                        appDelegate.updateModel.startPollingIfNeeded()
+                    }
+                    if BossEnginePaths.isIsolatedInstance {
+                        // Window title is invisible in-window under
+                        // `.unified(showsTitle: false)` but shows in
+                        // Mission Control and the Window menu.
+                        for window in NSApp.windows where window.contentView != nil {
+                            window.title = "Boss [agent capture]"
+                        }
+                    }
                 }
         }
         .environmentObject(chatModel)
         .environmentObject(appDelegate.updateModel)
         .windowToolbarStyle(.unified(showsTitle: false))
+        // Deterministic window creation for agent capture and cold launch.
+        // `.presented` (not `.suppressed`) so the window exists to capture;
+        // restoration off so a prior session frame cannot move the operator's
+        // live window via the shared bundle id before defaults isolation kicks in.
+        .defaultLaunchBehavior(.presented)
+        .restorationBehavior(.disabled)
         .defaultSize(width: 1060, height: 680)
         .commands {
             TextEditingCommands()
@@ -217,7 +235,7 @@ private struct OpenMarkdownFileCommand: View {
 private struct LogViewerCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.activity.visible") private var isOpen = false
+    @AppStorage("boss.activity.visible", store: BossDefaults.store) private var isOpen = false
 
     var body: some View {
         Button("Show Activity") {
@@ -234,7 +252,7 @@ private struct LogViewerCommand: View {
 }
 
 private struct ActivityView: View {
-    @AppStorage("boss.activity.visible") private var isOpen = false
+    @AppStorage("boss.activity.visible", store: BossDefaults.store) private var isOpen = false
 
     var body: some View {
         TabView {
@@ -251,7 +269,7 @@ private struct ActivityView: View {
 private struct MetricsCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.metricsViewer.visible") private var isOpen = false
+    @AppStorage("boss.metricsViewer.visible", store: BossDefaults.store) private var isOpen = false
 
     var body: some View {
         Button("Metrics") {
@@ -270,7 +288,7 @@ private struct MetricsCommand: View {
 private struct UIStallsCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.uiStalls.visible") private var isOpen = false
+    @AppStorage("boss.uiStalls.visible", store: BossDefaults.store) private var isOpen = false
 
     var body: some View {
         Button("UI Stalls") {
@@ -289,7 +307,7 @@ private struct UIStallsCommand: View {
 private struct TerminalLoopCommand: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
-    @AppStorage("boss.terminalLoopViewer.visible") private var isOpen = false
+    @AppStorage("boss.terminalLoopViewer.visible", store: BossDefaults.store) private var isOpen = false
 
     var body: some View {
         Button("Terminal Loop") {
@@ -313,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var liveWorkerStates: LiveWorkerStateStore?
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
-    let updateModel: UpdateModel = UpdateModel.makeForApp()
+    let updateModel: UpdateModel = UpdateModel.makeForApp(defaults: BossDefaults.store)
 
     /// Set by `BossMacApp.task` once `ContentView` has appeared. The
     /// flush that matters is gated on
@@ -406,20 +424,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stall watchdog live (no relaunch).
     private var stallMonitorDefaultsObserver: NSObjectProtocol?
 
+    /// Quiet-launch policy for isolated / agent-capture instances.
+    ///
+    /// Must run in `applicationWillFinishLaunching` (not `didFinishLaunching`)
+    /// and must never be toggled later — policy transitions are not reliably
+    /// reversible on Sonoma+. `.accessory` returns true, gives no Dock icon
+    /// and no focus theft, and still creates/renders the `WindowGroup` window.
+    /// Never use `.prohibited` (may prevent window creation entirely).
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        if BossEnginePaths.isIsolatedInstance {
+            NSApp.setActivationPolicy(.accessory)
+        }
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         appNapOptOutToken = ProcessInfo.processInfo.beginActivity(
             options: [.userInitiatedAllowingIdleSystemSleep],
             reason: "Keep engine RPC handling and diagnostics sampling prompt during display sleep"
         )
 
-        // When launched outside a regular .app bundle (e.g. `swift run`
-        // for local dev), macOS does not auto-promote the process to a
-        // foreground UI app — the window opens but never becomes key,
-        // so keystrokes go to whichever app was active before launch.
-        // Forcing .regular + activate restores key-window status without
-        // bringing back the manual NSWindow setup #417 removed.
-        NSApp.setActivationPolicy(.regular)
-        NSApp.activate(ignoringOtherApps: true)
+        // Isolated / capture instances: policy was already set to `.accessory`
+        // in `applicationWillFinishLaunching`. Do **not** call
+        // `NSApp.activate` at all — since macOS 14 the `ignoringOtherApps`
+        // parameter is ignored (WWDC23 session 10054), so flipping it to
+        // false changes nothing; the call itself must be skipped or the
+        // app becomes frontmost and un-hides itself (measured).
+        //
+        // Interactive launches outside a regular .app bundle (e.g. `swift run`
+        // for local dev) still need `.regular` + activate so the window becomes
+        // key without the manual NSWindow setup #417 removed.
+        if !BossEnginePaths.isIsolatedInstance {
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+        }
 
         // Self-updater: complete any pending bundle swap and write this version's
         // first-launch-OK flag (which the relaunch watchdog polls for). Runs before
@@ -428,7 +465,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // *fallback* (applying a not-yet-installed staged update) runs later, at the
         // engine-launch chokepoint in ChatViewModel.startIfNeeded(). See
         // [[UpdateLifecycle]] and design doc §4.
-        UpdateLifecycle.reconcileAtLaunch()
+        if !BossEnginePaths.isIsolatedInstance {
+            UpdateLifecycle.reconcileAtLaunch()
+        }
 
         // Main-thread hang watchdog — gated on Settings (default off).
         // When off: no timers, no watchdog queue (zero cost). Apply once
@@ -436,13 +475,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Feature Flags toggle takes effect without a relaunch. Surfaced
         // via the "UI Stalls" window (Cmd-Shift-U). See
         // [[MainThreadStallMonitor]].
-        MainThreadStallMonitor.shared.applyEnabledFromDefaults()
+        MainThreadStallMonitor.shared.applyEnabledFromDefaults(BossDefaults.store)
         stallMonitorDefaultsObserver = NotificationCenter.default.addObserver(
             forName: UserDefaults.didChangeNotification,
-            object: UserDefaults.standard,
+            object: BossDefaults.store,
             queue: .main
         ) { _ in
-            MainThreadStallMonitor.shared.applyEnabledFromDefaults()
+            MainThreadStallMonitor.shared.applyEnabledFromDefaults(BossDefaults.store)
         }
 
         // Start the terminal event-loop diagnostics sampler (1 Hz). Counts
@@ -450,21 +489,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // liveness to verify/refute the busy-spin high-CPU hypothesis.
         // Surfaced via the "Terminal Loop" window (Cmd-Shift-T). See
         // [[TerminalLoopMonitor]].
-        TerminalLoopMonitor.shared.start()
+        if !BossEnginePaths.isIsolatedInstance {
+            TerminalLoopMonitor.shared.start()
+            // Record display sleep/wake transitions into the same diagnostics
+            // JSONL mirror (App Nap incident, 2026-07-15) — see
+            // [[DisplayPowerMonitor]].
+            DisplayPowerMonitor.shared.start()
+            // 1 Hz flush of board fan-out counters (applyWorkTree, incremental
+            // task updates, main-actor engine deliveries, card body evals).
+            // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
+            // the population signposter. See [[UIUpdateCounters]].
+            UIUpdateCounters.shared.start()
+        }
 
-        // Record display sleep/wake transitions into the same diagnostics
-        // JSONL mirror (App Nap incident, 2026-07-15) — see
-        // [[DisplayPowerMonitor]].
-        DisplayPowerMonitor.shared.start()
-
-        // 1 Hz flush of board fan-out counters (applyWorkTree, incremental
-        // task updates, main-actor engine deliveries, card body evals).
-        // Idle ticks are free; non-idle flushes emit `ui-update-rates` on
-        // the population signposter. See [[UIUpdateCounters]].
-        UIUpdateCounters.shared.start()
+        // Agent-capture path: self-render via cacheDisplay and exit.
+        // Never ordered front, never takes focus, no screen-recording grant.
+        if let path = BossCaptureArgs.shared.captureTo {
+            BossWindowCapture.scheduleCapture(
+                to: path,
+                after: BossCaptureArgs.shared.captureAfter
+            )
+        }
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        // Capture runs always exit cleanly — no agent-running prompt.
+        if BossCaptureArgs.shared.isCaptureMode {
+            return .terminateNow
+        }
         let count = liveWorkerStates?.activeAgentCount ?? 0
         guard count > 0 else { return .terminateNow }
 
@@ -526,7 +578,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 /// View > Board Style: single-choice menu items that persist the selection
 /// in UserDefaults and sync with the kanban board's @AppStorage binding.
 private struct BoardStyleMenuItems: View {
-    @AppStorage("boss.kanban.boardStyle") private var style: KanbanBoardStyle = .classic
+    @AppStorage("boss.kanban.boardStyle", store: BossDefaults.store) private var style: KanbanBoardStyle = .classic
 
     var body: some View {
         ForEach(KanbanBoardStyle.allCases) { boardStyle in

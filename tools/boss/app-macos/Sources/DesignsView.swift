@@ -30,7 +30,7 @@ final class DesignsViewModel: ObservableObject {
     /// collapse/expand choices intact.
     private var seededTreeKey: String?
 
-    private let defaults = UserDefaults.standard
+    private let defaults = BossDefaults.store
     private let selectedProductDefaultsKey = "boss.designs.selectedProductID"
 
     init() {

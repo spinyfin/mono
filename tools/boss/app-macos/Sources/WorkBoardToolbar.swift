@@ -36,7 +36,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.banner = banner
         self.accessory = accessory
         self.content = content
-        let stored = UserDefaults.standard.object(
+        let stored = BossDefaults.store.object(
             forKey: "boss.kanban.section.\(sectionID).userToggled"
         ) as? Bool
         self._userToggled = State(initialValue: stored ?? false)
@@ -52,7 +52,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
                 Button {
                     let next = !userToggled
                     userToggled = next
-                    UserDefaults.standard.set(
+                    BossDefaults.store.set(
                         next, forKey: "boss.kanban.section.\(sectionID).userToggled"
                     )
                 } label: {

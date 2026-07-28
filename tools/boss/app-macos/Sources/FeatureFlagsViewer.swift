@@ -100,11 +100,11 @@ struct FeatureFlagsViewer: View {
 /// Section for app-local feature flags (stored in UserDefaults via @AppStorage,
 /// not engine state). These take effect immediately without a restart.
 private struct AppFeatureFlagsSection: View {
-    @AppStorage("boss.ui.standardSearch") private var standardSearch: Bool = false
+    @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var standardSearch: Bool = false
     /// Master switch for [[MainThreadStallMonitor]]. Default off = zero cost
     /// (no timers, no watchdog queue). Live start/stop is applied by
     /// AppDelegate's UserDefaults observer — no relaunch required.
-    @AppStorage(MainThreadStallMonitor.enabledKey) private var stallMonitoring: Bool = false
+    @AppStorage(MainThreadStallMonitor.enabledKey, store: BossDefaults.store) private var stallMonitoring: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

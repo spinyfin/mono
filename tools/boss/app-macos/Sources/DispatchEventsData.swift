@@ -90,9 +90,19 @@ enum DispatchEventDecoder {
 // MARK: - Filesystem paths
 
 enum DispatchEventsPaths {
-    /// Boss state root — `~/Library/Application Support/Boss`. The
-    /// engine code in `engine/src/main.rs` resolves the same path.
+    /// Boss state root — `~/Library/Application Support/Boss` in production.
+    ///
+    /// Isolated / capture instances (`BossEnginePaths.isIsolatedInstance`)
+    /// use the socket's parent directory, matching engine-side
+    /// `IsolationPaths::state_root`, so a capture instance does not tail
+    /// production `dispatch-events/current.jsonl`.
     static func stateRoot() -> URL {
+        if BossEnginePaths.isIsolatedInstance,
+           let sock = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"],
+           !sock.isEmpty
+        {
+            return URL(fileURLWithPath: sock).deletingLastPathComponent()
+        }
         let fm = FileManager.default
         let appSupport = fm
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
