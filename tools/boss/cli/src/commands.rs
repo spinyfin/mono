@@ -1817,6 +1817,13 @@ pub(crate) struct ProjectPlanArgs {
     /// or claiming the project's planner-run idempotency gate.
     #[arg(long)]
     pub(crate) dry_run: bool,
+
+    /// Override the planner task-count cap (default: 30). Proposals that
+    /// exceed the cap are rejected whole — nothing is silently truncated.
+    /// Use this after a `rejected_too_many` outcome to re-run with room for
+    /// the full proposal, or split the project instead.
+    #[arg(long)]
+    pub(crate) cap: Option<usize>,
 }
 
 #[derive(Debug, Clone, Args)]

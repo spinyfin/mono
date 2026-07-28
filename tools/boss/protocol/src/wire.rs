@@ -1494,7 +1494,9 @@ pub enum FrontendRequest {
     /// preview of what a real run would do. `force` bypasses the
     /// pre-seeded refusal (a project that already has implementation
     /// tasks); the Materializer's `(name, project_id)` dedup makes a
-    /// forced re-populate additive, never destructive. Replies with
+    /// forced re-populate additive, never destructive. `cap` overrides
+    /// the planner's task-count guardrail (`None` keeps the engine
+    /// default); proposals over the cap are rejected whole. Replies with
     /// [`FrontendEvent::PlanProjectResult`].
     PlanProject {
         project_id: String,
@@ -1502,6 +1504,10 @@ pub enum FrontendRequest {
         force: bool,
         #[serde(default)]
         dry_run: bool,
+        /// Override the planner task cap. `None` (or omitted) uses the
+        /// engine default (`DEFAULT_MAX_TASKS`). Maps from CLI `--cap`.
+        #[serde(default)]
+        cap: Option<usize>,
     },
 
     /// Boss-tier RPC: queue a probe prompt for `run_id`. By default

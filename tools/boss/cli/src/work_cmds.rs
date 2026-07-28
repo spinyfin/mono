@@ -547,7 +547,7 @@ pub(crate) async fn run_project_command(command: ProjectCommand, ctx: &RunContex
         ProjectCommand::Plan(args) => {
             let product = resolve_product_inferable(&mut client, args.product, Some(&args.selector), ctx).await?;
             let project = resolve_project(&mut client, &product.id, Some(args.selector), ctx).await?;
-            let result = plan_project(&mut client, &project.id, args.force, args.dry_run).await?;
+            let result = plan_project(&mut client, &project.id, args.force, args.dry_run, args.cap).await?;
             print_entity(ctx, &result, || print_plan_project_result(&result))
         }
         ProjectCommand::Release(args) => {

@@ -263,6 +263,7 @@ pub(crate) async fn plan_project(
     project_id: &str,
     force: bool,
     dry_run: bool,
+    cap: Option<usize>,
 ) -> Result<PlanProjectResult, CliError> {
     rpc_call!(
         client,
@@ -270,6 +271,7 @@ pub(crate) async fn plan_project(
             project_id: project_id.to_owned(),
             force,
             dry_run,
+            cap,
         },
         "plan project",
         FrontendEvent::PlanProjectResult {
