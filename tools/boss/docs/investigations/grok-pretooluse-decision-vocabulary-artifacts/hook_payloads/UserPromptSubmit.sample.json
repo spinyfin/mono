@@ -1,0 +1,14 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=user_prompt_submit\nGROK_HOOK_NAME=global/dump-all:user_prompt_submit[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "stdin": {
+    "hookEventName": "user_prompt_submit",
+    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
+    "cwd": "/private/tmp/grok-t02-vocab/cwd",
+    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
+    "timestamp": "2026-07-28T00:54:05.041011+00:00",
+    "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
+    "promptId": "54c84245-f157-43cf-8439-bdf624d1f965",
+    "permissionMode": "bypassPermissions",
+    "prompt": "<user_query>\nDo these three things in order, then reply with only the word TOOLMAP_DONE:\n1) Create a new file named toolmap_write.txt containing exactly the single line WRITE_OK using your file-write tool (not shell).\n2) Edit toolmap_write.txt with your file-edit/search-replace tool to change WRITE_OK to WRITE_EDITED_OK.\n3) Run this exact shell command via your terminal/shell tool: echo SHELL_OK > toolmap_shell.txt && which git jj gh || true\nDo not skip tools; use the dedicated tools for write and edit, and shell only for step 3.\n</user_query>"
+  }
+}

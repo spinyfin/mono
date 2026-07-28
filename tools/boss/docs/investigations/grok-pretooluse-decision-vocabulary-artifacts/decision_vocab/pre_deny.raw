@@ -1,0 +1,11 @@
+===DECISION=deny===
+===ENV===
+CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd
+GROK_AGENT=1
+GROK_HOME=/tmp/grok-t02-vocab/home
+GROK_HOOK_EVENT=pre_tool_use
+GROK_HOOK_NAME=global/decision-probe:pre_tool_use[0].hooks[0]
+GROK_SESSION_ID=bcee6ea9-c72d-4064-91f1-b4aa806797d6
+GROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd
+===STDIN===
+{"hookEventName":"pre_tool_use","sessionId":"bcee6ea9-c72d-4064-91f1-b4aa806797d6","cwd":"/private/tmp/grok-t02-vocab/cwd","workspaceRoot":"/private/tmp/grok-t02-vocab/cwd","timestamp":"2026-07-28T00:52:18.267135+00:00","transcriptPath":"/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/bcee6ea9-c72d-4064-91f1-b4aa806797d6/updates.jsonl","permissionMode":"bypassPermissions","toolName":"write","toolUseId":"call-b5d102da-a0e8-4a79-8fb8-5c3cbfb4a5bd-0","toolInput":{"file_path":"/private/tmp/grok-t02-vocab/cwd/ATTACK_deny.txt","content":"ATTACK_deny_OK\n"},"toolInputTruncated":false}

@@ -1,0 +1,19 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=pre_tool_use\nGROK_HOOK_NAME=global/dump-all:pre_tool_use[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "stdin": {
+    "hookEventName": "pre_tool_use",
+    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
+    "cwd": "/private/tmp/grok-t02-vocab/cwd",
+    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
+    "timestamp": "2026-07-28T00:54:10.620294+00:00",
+    "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
+    "permissionMode": "bypassPermissions",
+    "toolName": "run_terminal_command",
+    "toolUseId": "call-dc370b15-b37d-49fb-a6a7-77142a8c1dd1-2",
+    "toolInput": {
+      "command": "echo SHELL_OK > toolmap_shell.txt && which git jj gh || true",
+      "description": "Write SHELL_OK and locate git/jj/gh"
+    },
+    "toolInputTruncated": false
+  }
+}

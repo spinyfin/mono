@@ -1,0 +1,40 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=post_tool_use\nGROK_HOOK_NAME=global/dump-all:post_tool_use[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "stdin": {
+    "hookEventName": "post_tool_use",
+    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
+    "cwd": "/private/tmp/grok-t02-vocab/cwd",
+    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
+    "timestamp": "2026-07-28T00:54:11.161240+00:00",
+    "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
+    "permissionMode": "bypassPermissions",
+    "toolName": "run_terminal_command",
+    "toolUseId": "call-dc370b15-b37d-49fb-a6a7-77142a8c1dd1-2",
+    "toolInput": {
+      "command": "echo SHELL_OK > toolmap_shell.txt && which git jj gh || true",
+      "description": "Write SHELL_OK and locate git/jj/gh"
+    },
+    "toolResult": {
+      "type": "Bash",
+      "output": [
+        47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98, 105, 110, 47, 103,
+        105, 116, 10, 47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98, 105,
+        110, 47, 106, 106, 10, 47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98,
+        105, 110, 47, 103, 104, 10
+      ],
+      "output_for_prompt": "exit: 0\n/opt/homebrew/bin/git\n/opt/homebrew/bin/jj\n/opt/homebrew/bin/gh\n",
+      "exit_code": 0,
+      "command": "echo SHELL_OK > toolmap_shell.txt && which git jj gh || true",
+      "truncated": false,
+      "signal": null,
+      "timed_out": false,
+      "description": "Write SHELL_OK and locate git/jj/gh",
+      "current_dir": "/private/tmp/grok-t02-vocab/cwd",
+      "output_file": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/terminal/call-dc370b15-b37d-49fb-a6a7-77142a8c1dd1-2.log",
+      "total_bytes": 64
+    },
+    "toolInputTruncated": false,
+    "toolResultTruncated": false,
+    "isBackgrounded": false
+  }
+}

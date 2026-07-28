@@ -1,0 +1,18 @@
+{
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=stop\nGROK_HOOK_NAME=global/dump-all:stop[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "stdin": {
+    "hookEventName": "stop",
+    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
+    "cwd": "/private/tmp/grok-t02-vocab/cwd",
+    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
+    "timestamp": "2026-07-28T00:54:12.157117+00:00",
+    "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
+    "promptId": "54c84245-f157-43cf-8439-bdf624d1f965",
+    "permissionMode": "bypassPermissions",
+    "reason": "end_turn",
+    "stopHookActive": false,
+    "lastAssistantMessage": "TOOLMAP_DONE",
+    "backgroundTasks": [],
+    "sessionCrons": []
+  }
+}
