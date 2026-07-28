@@ -1789,7 +1789,7 @@ fn resolve_project_design_doc_same_product_inherits_repo_and_default_branch() {
     );
     assert_eq!(
         raw_content_url.as_deref(),
-        Some("https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=main"),
+        Some("https://raw.githubusercontent.com/spinyfin/mono/main/tools/boss/docs/designs/foo.md"),
     );
 
     let _ = std::fs::remove_file(path);
@@ -1834,7 +1834,7 @@ fn resolve_project_design_doc_classifies_other_product() {
     assert_eq!(web_url, "https://github.com/myorg/wiki/blob/docs/designs/foo.md",);
     assert_eq!(
         raw_content_url.as_deref(),
-        Some("https://raw.githubusercontent.com/myorg/wiki/designs/foo.md?ref=docs"),
+        Some("https://raw.githubusercontent.com/myorg/wiki/docs/designs/foo.md"),
     );
 
     let _ = std::fs::remove_file(path);
@@ -1898,9 +1898,7 @@ fn resolve_project_design_doc_raw_content_url_built_for_ssh_remote_on_pr_branch(
 
     assert_eq!(
         raw_content_url.as_deref(),
-        Some(
-            "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=design-boss-ci-buildkite"
-        ),
+        Some("https://raw.githubusercontent.com/spinyfin/mono/design-boss-ci-buildkite/tools/boss/docs/designs/foo.md"),
         "SSH remote URL must produce a raw_content_url on a non-main branch"
     );
     assert_eq!(
@@ -1911,12 +1909,12 @@ fn resolve_project_design_doc_raw_content_url_built_for_ssh_remote_on_pr_branch(
     let _ = std::fs::remove_file(path);
 }
 
-/// Regression for the root cause of the unmerged-PR rendering failure:
-/// `boss/exec_*` branch names contain `/`, which URL path-component
-/// splitting in the Swift app would split into separate segments,
-/// causing the `gh api` call to resolve `ref=boss` (not the full
-/// `boss/exec_*`) and return 404. The fix encodes `/` as `%2F` in
-/// the `?ref=` query param so the full branch name is preserved.
+/// Regression for the root cause of the raw-content 404: `boss/exec_*`
+/// branch names contain `/`, which would otherwise split into separate
+/// path segments when placed directly in the raw URL, causing GitHub to
+/// resolve the ref as just `boss` (not the full `boss/exec_*`) and 404.
+/// The fix encodes `/` as `%2F` in the branch's own path segment so the
+/// full branch name is preserved and GitHub decodes it back correctly.
 #[test]
 fn resolve_project_design_doc_raw_content_url_encodes_slashed_branch() {
     let path = temp_db_path("resolve-raw-content-slashed-branch");
@@ -1940,9 +1938,9 @@ fn resolve_project_design_doc_raw_content_url_encodes_slashed_branch() {
     assert_eq!(
         raw_content_url.as_deref(),
         Some(
-            "https://raw.githubusercontent.com/spinyfin/mono/tools/boss/docs/designs/foo.md?ref=boss%2Fexec_18b07a506d2518d0_1b"
+            "https://raw.githubusercontent.com/spinyfin/mono/boss%2Fexec_18b07a506d2518d0_1b/tools/boss/docs/designs/foo.md"
         ),
-        "slashed branch must be %2F-encoded in the ?ref= query param"
+        "slashed branch must be %2F-encoded as its own path segment"
     );
 
     let _ = std::fs::remove_file(path);
@@ -2041,7 +2039,7 @@ fn resolve_project_design_doc_returns_pr_head_branch_for_non_boss_product_path()
     assert_eq!(
         raw_content_url.as_deref(),
         Some(
-            "https://raw.githubusercontent.com/spinyfin/mono/tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md?ref=boss%2Fexec_18b3fffb232a8060_ec"
+            "https://raw.githubusercontent.com/spinyfin/mono/boss%2Fexec_18b3fffb232a8060_ec/tools/checkleft/docs/designs/robust-change-detection-in-checkleft.md"
         ),
     );
     assert_eq!(

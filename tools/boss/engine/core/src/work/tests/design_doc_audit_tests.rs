@@ -437,12 +437,10 @@ fn resolve_task_doc_pointer_builds_same_product_urls() {
                 web_url,
                 "https://github.com/spinyfin/mono/blob/boss/exec_abc_1/docs/investigations/foo.md"
             );
-            // The PR-head branch's `/` must be %2F-encoded in the ?ref= query.
+            // The PR-head branch's `/` must be %2F-encoded in its own path segment.
             assert_eq!(
                 raw_content_url.as_deref(),
-                Some(
-                    "https://raw.githubusercontent.com/spinyfin/mono/docs/investigations/foo.md?ref=boss%2Fexec_abc_1"
-                )
+                Some("https://raw.githubusercontent.com/spinyfin/mono/boss%2Fexec_abc_1/docs/investigations/foo.md")
             );
             assert!(workspace_path.is_none(), "the |_| None lookup yields no workspace");
         }
