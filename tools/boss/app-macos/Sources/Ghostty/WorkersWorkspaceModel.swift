@@ -173,7 +173,8 @@ final class WorkersWorkspaceModel: ObservableObject {
         let session = TerminalPaneSession(
             id: "run-\(request.runId)",
             role: .worker(slot: slotId),
-            launchSpec: launchSpec
+            launchSpec: launchSpec,
+            paneMonitorSpec: request.paneMonitor ?? .claudeDefault
         )
         if isReview {
             reviewSlots[index].session = session

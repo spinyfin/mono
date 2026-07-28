@@ -140,6 +140,7 @@ mod tests {
                     env: vec![],
                     summary: None,
                     task_title: None,
+                    pane_monitor: None,
                 }),
                 "spawn_worker_pane",
             ),

@@ -1142,6 +1142,25 @@ mod pane_spawn_tests {
     }
 
     #[tokio::test]
+    async fn spawn_request_carries_claude_pane_monitor_spec() {
+        // Claude is the default driver for these fixtures; the app's
+        // pre-hook status pill must receive Claude's historical markers
+        // on the wire rather than relying only on the app-side default.
+        let workspace = TempDir::new().unwrap();
+        let spawner = run_once(&workspace, None).await.unwrap();
+        let input = spawner.spawn_input();
+        let spec = input.pane_monitor.expect("Claude spawn must populate pane_monitor");
+        assert_eq!(spec.agent_markers, vec!["Claude Code", "auto mode on", "/effort"]);
+        assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
+        assert_eq!(
+            spec.starting_markers,
+            vec!["Accessing workspace:", "Quick safety check:"]
+        );
+        assert_eq!(spec.prompt_prefixes, vec!["❯"]);
+        assert_eq!(spec.idle_debounce_polls, 2);
+    }
+
+    #[tokio::test]
     async fn initial_input_reads_prompt_from_disk() {
         let workspace = TempDir::new().unwrap();
         let spawner = run_once(&workspace, None).await.unwrap();

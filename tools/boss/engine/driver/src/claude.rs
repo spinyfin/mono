@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_engine_transient_error::ErrorClass;
-use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, normalize_hook_event};
+use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, WorkerEvent, normalize_hook_event};
 use boss_ssh_transport::shell_quote;
 
 use super::{
@@ -455,6 +455,21 @@ impl AgentDriver for ClaudeDriver {
             Capability::PromptComposition,
             Capability::AwaitingInputSignal,
         ])
+    }
+
+    fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        // Exact reproduction of the pre-spec literals in
+        // `GhosttyTerminalView.makeClaudeSnapshot` / the tracker's
+        // two-poll idle debounce. Shipping them on the wire keeps the
+        // app's Claude-default fallback and the engine-supplied path
+        // behaviour-identical for Claude workers.
+        Some(PaneMonitorSpec {
+            agent_markers: vec!["Claude Code".into(), "auto mode on".into(), "/effort".into()],
+            busy_markers: vec!["esc to interrupt".into()],
+            starting_markers: vec!["Accessing workspace:".into(), "Quick safety check:".into()],
+            prompt_prefixes: vec!["❯".into()],
+            idle_debounce_polls: 2,
+        })
     }
 
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
@@ -989,6 +1004,21 @@ mod tests {
         assert_eq!(driver.descriptor().config_dir, ".claude");
         assert_eq!(driver.descriptor().agent_rules_filename, "CLAUDE.md");
         assert_eq!(driver.descriptor().binary, "claude");
+    }
+
+    #[test]
+    fn claude_pane_monitor_spec_reproduces_historical_literals() {
+        let spec = ClaudeDriver
+            .pane_monitor_spec()
+            .expect("ClaudeDriver supplies pane-monitor markers");
+        assert_eq!(spec.agent_markers, vec!["Claude Code", "auto mode on", "/effort"]);
+        assert_eq!(spec.busy_markers, vec!["esc to interrupt"]);
+        assert_eq!(
+            spec.starting_markers,
+            vec!["Accessing workspace:", "Quick safety check:"]
+        );
+        assert_eq!(spec.prompt_prefixes, vec!["❯"]);
+        assert_eq!(spec.idle_debounce_polls, 2);
     }
 
     fn sample_config() -> ProgressObservationConfig {

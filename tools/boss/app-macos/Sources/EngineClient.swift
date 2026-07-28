@@ -383,6 +383,12 @@ final class EngineClient: @unchecked Sendable {
                     }
                     let summary = request["summary"] as? String
                     let taskTitle = request["task_title"] as? String
+                    let paneMonitorDict = request["pane_monitor"] as? [String: Any]
+                    // Parse only when the engine actually sent a dict;
+                    // absent/null keeps the app-side Claude default.
+                    let paneMonitor: PaneMonitorSpec? = paneMonitorDict.map {
+                        PaneMonitorSpec.fromWire($0)
+                    }
                     let spawn = EngineSpawnRequest(
                         runId: runId,
                         workspacePath: workspacePath,
@@ -390,7 +396,8 @@ final class EngineClient: @unchecked Sendable {
                         initialInput: initialInput,
                         env: env,
                         summary: summary,
-                        taskTitle: taskTitle
+                        taskTitle: taskTitle,
+                        paneMonitor: paneMonitor
                     )
                     emit(.engineRequest(requestId: requestId, request: .spawnWorkerPane(spawn)))
                 case "release_worker_pane":

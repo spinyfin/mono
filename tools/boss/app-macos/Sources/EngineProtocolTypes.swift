@@ -21,6 +21,11 @@ struct EngineSpawnRequest: Sendable {
     /// fallback display label when `summary` is nil — rendered as
     /// `"<AgentName>: <taskTitle>"` rather than with a gerund "is".
     let taskTitle: String?
+    /// Driver-supplied pane-monitor markers (agent/busy/starting/
+    /// prompt prefixes + idle debounce). Nil when the engine omits
+    /// the field — the app falls back to Claude's historical
+    /// literals via `PaneMonitorSpec.claudeDefault`.
+    let paneMonitor: PaneMonitorSpec?
 }
 
 enum EngineSpawnError: Sendable {

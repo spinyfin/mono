@@ -26,6 +26,7 @@ async fn spawn_worker_pane_requests_are_serialized() {
             env: vec![],
             summary: None,
             task_title: None,
+            pane_monitor: None,
         })
     };
 

@@ -13,6 +13,7 @@ async fn send_to_app_returns_not_registered_when_no_app() {
                 env: vec![],
                 summary: None,
                 task_title: None,
+                pane_monitor: None,
             }),
             Duration::from_millis(50),
         )
@@ -40,6 +41,7 @@ async fn send_to_app_round_trips_via_deliver_response() {
                     env: vec![],
                     summary: None,
                     task_title: None,
+                    pane_monitor: None,
                 }),
                 Duration::from_secs(2),
             )
@@ -135,6 +137,7 @@ async fn send_to_app_times_out_when_app_silent() {
                 env: vec![],
                 summary: None,
                 task_title: None,
+                pane_monitor: None,
             }),
             Duration::from_millis(50),
         )
@@ -180,6 +183,7 @@ async fn send_to_app_reports_session_wedged_when_priority_lane_saturated() {
                 env: vec![],
                 summary: None,
                 task_title: None,
+                pane_monitor: None,
             }),
             Duration::from_secs(30),
         )
@@ -237,6 +241,7 @@ async fn send_to_app_admitted_when_only_bulk_lane_saturated() {
                     env: vec![],
                     summary: None,
                     task_title: None,
+                    pane_monitor: None,
                 }),
                 Duration::from_secs(5),
             )
@@ -361,6 +366,7 @@ async fn second_register_invalidates_first() {
                     env: vec![],
                     summary: None,
                     task_title: None,
+                    pane_monitor: None,
                 }),
                 Duration::from_secs(5),
             )

@@ -271,15 +271,15 @@ private struct WorkerSlotView: View {
 
             // Prefer engine-supplied LiveWorkerState — its activity is
             // driven by hook events rather than a screen-scrape that
-            // always rendered "Claude Unknown". Fall back to the legacy
-            // claudeState pill until the worker's first hook fires.
+            // always rendered "Agent Unknown". Fall back to the legacy
+            // paneMonitorState pill until the worker's first hook fires.
             if let live = liveState {
                 statusPill(
                     live.activity.label,
                     color: liveActivityColor(live.activity)
                 )
-            } else if let state = slot.session?.claudeState {
-                statusPill(state.label, color: claudeStateColor(state))
+            } else if let state = slot.session?.paneMonitorState {
+                statusPill(state.label, color: paneMonitorStateColor(state))
             }
 
             liveStatusToggle
@@ -450,7 +450,7 @@ private struct WorkerSlotView: View {
             .clipShape(Capsule())
     }
 
-    private func claudeStateColor(_ state: ClaudeMonitorState) -> Color {
+    private func paneMonitorStateColor(_ state: PaneMonitorState) -> Color {
         switch state {
         case .working: .blue
         case .ready: .green
@@ -479,7 +479,7 @@ private struct WorkerPaneTerminalView: View {
             runtime: runtime,
             session: session,
             launchSpec: session.launchSpec,
-            claudeMonitorEnabled: liveState == nil
+            paneMonitorEnabled: liveState == nil
         )
         .background(Color(nsColor: .black))
     }

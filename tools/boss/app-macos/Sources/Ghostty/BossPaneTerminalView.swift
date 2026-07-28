@@ -22,9 +22,9 @@ private struct BossTerminalSurface: View {
             runtime: runtime,
             session: session,
             launchSpec: session.launchSpec,
-            // Boss panes never display `claudeState`, so the screen
+            // Boss panes never display `paneMonitorState`, so the screen
             // scrape stays off.
-            claudeMonitorEnabled: false
+            paneMonitorEnabled: false
         )
     }
 }

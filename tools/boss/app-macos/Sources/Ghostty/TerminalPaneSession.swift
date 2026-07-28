@@ -1,7 +1,58 @@
 import Foundation
 import GhosttyKit
 
-enum ClaudeMonitorState: Equatable {
+/// Driver-supplied (or Claude-default) substrings the pane monitor uses
+/// to screen-scrape a GhosttyKit viewport. Mirrors
+/// `boss_protocol::PaneMonitorSpec` on the spawn RPC.
+struct PaneMonitorSpec: Equatable, Sendable {
+    let agentMarkers: [String]
+    let busyMarkers: [String]
+    let startingMarkers: [String]
+    let promptPrefixes: [String]
+    let idleDebouncePolls: Int
+
+    /// Historical Claude literals from the pre-spec app. Used when the
+    /// spawn message carries no `pane_monitor` (older engine, or a
+    /// driver that declares no spec) so existing paths stay identical.
+    static let claudeDefault = PaneMonitorSpec(
+        agentMarkers: ["Claude Code", "auto mode on", "/effort"],
+        busyMarkers: ["esc to interrupt"],
+        startingMarkers: ["Accessing workspace:", "Quick safety check:"],
+        promptPrefixes: ["❯"],
+        idleDebouncePolls: 2
+    )
+
+    /// Parse a wire dict from `SpawnWorkerPaneInput.pane_monitor`, or
+    /// return `claudeDefault` when the field is absent/malformed.
+    static func fromWire(_ dict: [String: Any]?) -> PaneMonitorSpec {
+        guard let dict else { return .claudeDefault }
+        let agent = dict["agent_markers"] as? [String] ?? []
+        let busy = dict["busy_markers"] as? [String] ?? []
+        let starting = dict["starting_markers"] as? [String] ?? []
+        let prompts = dict["prompt_prefixes"] as? [String] ?? []
+        let debounceRaw = dict["idle_debounce_polls"]
+        let debounce: Int
+        if let n = debounceRaw as? Int {
+            debounce = n
+        } else if let n = debounceRaw as? NSNumber {
+            debounce = n.intValue
+        } else {
+            debounce = claudeDefault.idleDebouncePolls
+        }
+        // An empty agent-marker list would permanently pin notDetected;
+        // treat a hollow payload the same as absent.
+        guard !agent.isEmpty else { return .claudeDefault }
+        return PaneMonitorSpec(
+            agentMarkers: agent,
+            busyMarkers: busy,
+            startingMarkers: starting,
+            promptPrefixes: prompts.isEmpty ? claudeDefault.promptPrefixes : prompts,
+            idleDebouncePolls: max(1, debounce)
+        )
+    }
+}
+
+enum PaneMonitorState: Equatable {
     case unavailable
     case notDetected
     case ready
@@ -10,13 +61,13 @@ enum ClaudeMonitorState: Equatable {
     var label: String {
         switch self {
         case .unavailable:
-            "Claude Unknown"
+            "Agent Unknown"
         case .notDetected:
-            "Claude Not Detected"
+            "Not Detected"
         case .ready:
-            "Claude Ready"
+            "Ready"
         case .working:
-            "Claude Is Working"
+            "Working"
         }
     }
 }
@@ -46,21 +97,27 @@ struct TerminalLaunchSpec {
     }
 }
 
-struct ClaudeMonitorSnapshot {
+struct PaneMonitorSnapshot {
     let tail: String
-    let claudeVisible: Bool
+    let agentVisible: Bool
     let busy: Bool
     let promptVisible: Bool
     let promptLine: String?
     let starting: Bool
 }
 
-struct ClaudeMonitorTracker {
-    private let idleDebouncePolls = 2
+struct PaneMonitorTracker {
+    private let idleDebouncePolls: Int
+    private let promptPrefixes: [String]
     private var lastTail: String?
     private var lastPromptLine: String?
     private var turnInFlight = false
     private var stablePromptPolls = 0
+
+    init(spec: PaneMonitorSpec = .claudeDefault) {
+        self.idleDebouncePolls = max(1, spec.idleDebouncePolls)
+        self.promptPrefixes = spec.promptPrefixes
+    }
 
     mutating func reset() {
         lastTail = nil
@@ -69,13 +126,13 @@ struct ClaudeMonitorTracker {
         stablePromptPolls = 0
     }
 
-    mutating func evaluate(_ snapshot: ClaudeMonitorSnapshot?) -> ClaudeMonitorState {
+    mutating func evaluate(_ snapshot: PaneMonitorSnapshot?) -> PaneMonitorState {
         guard let snapshot else {
             reset()
             return .unavailable
         }
 
-        guard snapshot.claudeVisible else {
+        guard snapshot.agentVisible else {
             reset()
             return .notDetected
         }
@@ -128,8 +185,13 @@ struct ClaudeMonitorTracker {
     private func promptHasInput(_ promptLine: String?) -> Bool {
         guard let promptLine else { return false }
         let trimmed = promptLine.trimmingCharacters(in: .whitespaces)
-        guard trimmed.hasPrefix("❯") else { return false }
-        return !trimmed.dropFirst().trimmingCharacters(in: .whitespaces).isEmpty
+        for prefix in promptPrefixes {
+            if trimmed.hasPrefix(prefix) {
+                let remainder = trimmed.dropFirst(prefix.count)
+                return !remainder.trimmingCharacters(in: .whitespaces).isEmpty
+            }
+        }
+        return false
     }
 }
 
@@ -150,13 +212,17 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     let id: String
     let role: PaneRole
     let launchSpec: TerminalLaunchSpec
+    /// Driver-supplied (or Claude-default) markers for the pre-hook
+    /// viewport screen-scrape. Set at spawn from
+    /// `SpawnWorkerPaneInput.pane_monitor`.
+    let paneMonitorSpec: PaneMonitorSpec
 
     @Published var displayTitle: String
     @Published var workingDirectory: String
     @Published var rendererHealthy = false
     @Published var statusMessage: String?
     @Published var terminalReady = false
-    @Published var claudeState: ClaudeMonitorState = .unavailable
+    @Published var paneMonitorState: PaneMonitorState = .unavailable
 
     weak var hostView: GhosttyTerminalHostView?
     /// The foreground pid of this pane's PTY, or 0 when the surface is not
@@ -175,7 +241,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     func markReleased() {
         isReleased = true
     }
-    private var claudeMonitorTracker = ClaudeMonitorTracker()
+    private var paneMonitorTracker: PaneMonitorTracker
     /// Called on the main actor when the pane's child process exits.
     /// Boss pane sets this to a restart closure; worker panes leave it nil.
     var onChildExited: (() -> Void)?
@@ -203,10 +269,17 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     var onSurfaceCreationFailed: ((_ reason: String) -> Void)?
 
 
-    init(id: String, role: PaneRole, launchSpec: TerminalLaunchSpec) {
+    init(
+        id: String,
+        role: PaneRole,
+        launchSpec: TerminalLaunchSpec,
+        paneMonitorSpec: PaneMonitorSpec = .claudeDefault
+    ) {
         self.id = id
         self.role = role
         self.launchSpec = launchSpec
+        self.paneMonitorSpec = paneMonitorSpec
+        self.paneMonitorTracker = PaneMonitorTracker(spec: paneMonitorSpec)
         self.displayTitle = role.defaultTitle
         self.workingDirectory = launchSpec.workingDirectory
     }
@@ -221,7 +294,7 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
         onSurfaceAttached?()
     }
 
-    func updateClaudeMonitor(snapshot: ClaudeMonitorSnapshot?) {
-        claudeState = claudeMonitorTracker.evaluate(snapshot)
+    func updatePaneMonitor(snapshot: PaneMonitorSnapshot?) {
+        paneMonitorState = paneMonitorTracker.evaluate(snapshot)
     }
 }

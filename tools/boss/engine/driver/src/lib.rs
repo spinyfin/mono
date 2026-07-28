@@ -14,7 +14,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, StopReason, TaskKind, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, StopReason, TaskKind, WorkerEvent};
 
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
@@ -1468,6 +1468,19 @@ pub trait AgentDriver: Send + Sync {
     /// answer agent to guarantee `dontAsk` (deny-by-default allowlist), which
     /// must not be downgradable. `None` keeps the default per-model behaviour.
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan;
+
+    /// Substrings the app uses to screen-scrape this driver's GhosttyKit
+    /// pane for a fallback status pill until the first hook-driven
+    /// `LiveWorkerState` arrives. Populated onto
+    /// [`boss_protocol::SpawnWorkerPaneInput::pane_monitor`] at spawn.
+    ///
+    /// Default `None` — the app falls back to Claude's historical
+    /// literals, so an older driver (or a headless one with no TUI
+    /// chrome) keeps today's behaviour. Interactive drivers that own
+    /// a distinctive surface override this with their own markers.
+    fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        None
+    }
 
     // ── WorkspaceProvisioning capability ────────────────────────────────────
 
