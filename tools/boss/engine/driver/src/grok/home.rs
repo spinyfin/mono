@@ -167,28 +167,44 @@ impl GrokRuntimeState {
 // Config / trust / hooks rendering
 // ---------------------------------------------------------------------------
 
+/// Official externalCompat surfaces for Claude/Cursor (T-01 matrix).
+/// There is **no** `plugins` cell — inspect reports `mcps` and `sessions`.
+/// Writing `plugins = false` is a no-op that left mcps/sessions at
+/// `enabled: true, source: default` under live `grok inspect`.
+pub const COMPAT_VENDORS: &[&str] = &["claude", "cursor"];
+
+/// Surfaces Boss must disable and fail-closed-assert for every vendor in
+/// [`COMPAT_VENDORS`]. Order matches common inspect output; set membership
+/// is what matters for posture checks.
+pub const COMPAT_SURFACES: &[&str] = &["hooks", "agents", "skills", "mcps", "rules", "sessions"];
+
 /// Full `[compat.claude]` + `[compat.cursor]` disable block (design posture +
 /// T-01 findings). There is no effectual `permissions = false` cell; HOME
-/// scoping is the permission-isolation lever.
+/// scoping is the permission-isolation lever. Official cells are
+/// hooks/agents/skills/mcps/rules/sessions — not `plugins`.
 pub fn render_base_config_toml() -> String {
     // Keep this byte-stable for tests and for `grok inspect` assertions.
     r#"# Boss-owned Grok config. Written every provision (idempotent overwrite).
 # Compat surfaces off so reused cube workspaces that still contain
 # `.claude/CLAUDE.md` / `.claude/settings.json` do not load under Grok.
+# Official externalCompat cells: hooks/agents/skills/mcps/rules/sessions
+# (no plugins surface — writing plugins=false is a silent no-op).
 
 [compat.claude]
 hooks = false
 agents = false
 skills = false
-plugins = false
+mcps = false
 rules = false
+sessions = false
 
 [compat.cursor]
 hooks = false
 agents = false
 skills = false
-plugins = false
+mcps = false
 rules = false
+sessions = false
 "#
     .to_owned()
 }
@@ -509,6 +525,26 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
         )
     })?;
 
+    assert_inspect_json_posture(&inspect, grok_home, process_home, workspace)
+}
+
+/// Validate a captured / live `grok inspect --json` document against the
+/// Boss-required posture. Pure over the JSON so unit tests pin fail-closed
+/// behaviour without a live `grok` binary.
+///
+/// Fail-closed rules:
+/// - `grokVersion` must start with [`PINNED_GROK_VERSION`]
+/// - `projectTrusted` must be true
+/// - every (`COMPAT_VENDORS` × `COMPAT_SURFACES`) cell must be present with
+///   `enabled == false` (missing cell = failure; schema drift is not silent)
+/// - hooks inventory must be non-empty (canary or full T-09 set)
+/// - operator-home Claude permission sources must not appear under scoped HOME
+pub fn assert_inspect_json_posture(
+    inspect: &serde_json::Value,
+    grok_home: &Path,
+    process_home: &Path,
+    workspace: &Path,
+) -> anyhow::Result<()> {
     // Version pin.
     let version = inspect.get("grokVersion").and_then(|v| v.as_str()).unwrap_or("");
     // Accept exact pin or a longer inspect string that starts with the pin
@@ -530,18 +566,19 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
         );
     }
 
-    // Compat: hooks/agents/skills/plugins/rules for claude + cursor must be off.
+    // Compat: full known set for claude + cursor must be present and off.
+    // Missing cell fails closed (inspect schema drift is not "pass").
     let cells = inspect
         .pointer("/externalCompat/cells")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    for vendor in ["claude", "cursor"] {
-        for surface in ["hooks", "agents", "skills", "plugins", "rules"] {
+    for vendor in COMPAT_VENDORS {
+        for surface in COMPAT_SURFACES {
             let enabled = cells.iter().find_map(|cell| {
                 let v = cell.get("vendor")?.as_str()?;
                 let s = cell.get("surface")?.as_str()?;
-                if v == vendor && s == surface {
+                if v == *vendor && s == *surface {
                     cell.get("enabled")?.as_bool()
                 } else {
                     None
@@ -552,18 +589,24 @@ pub fn assert_grok_posture(grok_home: &Path, process_home: &Path, workspace: &Pa
                 Some(true) => {
                     bail!(
                         "grok inspect reports externalCompat {vendor}/{surface} still enabled; \
-                         Boss config.toml must disable the full compat block"
+                         Boss config.toml must disable the full compat block \
+                         (hooks/agents/skills/mcps/rules/sessions)"
                     );
                 }
                 None => {
-                    // Surface absent from the matrix is acceptable (unknown
-                    // vendor cell); only an explicit true is a failure.
+                    bail!(
+                        "grok inspect missing externalCompat cell {vendor}/{surface}; \
+                         expected enabled=false (fail-closed on schema drift). \
+                         Official surfaces: hooks/agents/skills/mcps/rules/sessions"
+                    );
                 }
             }
         }
     }
 
     // Hooks must be registered (provisional canary or T-09 full set).
+    // Progress observation remains follow-on; the canary only proves the
+    // inventory path works so inspect does not report empty hooks.
     let hooks = inspect
         .get("hooks")
         .and_then(|v| v.as_array())
@@ -681,7 +724,7 @@ mod tests {
         let cfg = render_base_config_toml();
         assert!(cfg.contains("[compat.claude]"));
         assert!(cfg.contains("[compat.cursor]"));
-        for surface in ["hooks", "agents", "skills", "plugins", "rules"] {
+        for surface in COMPAT_SURFACES {
             // Each surface appears false under both vendors (count >= 2).
             let needle = format!("{surface} = false");
             assert!(
@@ -689,8 +732,163 @@ mod tests {
                 "expected {needle} under both vendors: {cfg}"
             );
         }
+        // Official matrix has no plugins cell — writing `plugins = false` is a
+        // silent no-op that previously left mcps/sessions enabled under live
+        // inspect. Comments may mention the word; the assignment must not.
+        assert!(
+            !cfg.lines().any(|l| {
+                let t = l.trim();
+                !t.starts_with('#') && t.contains("plugins")
+            }),
+            "must not write plugins= assignment (not an official cell): {cfg}"
+        );
         // Forbidden: undocumented permissions cell that has no effect.
-        assert!(!cfg.contains("permissions"));
+        assert!(!cfg.lines().any(|l| {
+            let t = l.trim();
+            !t.starts_with('#') && t.contains("permissions")
+        }));
+    }
+
+    /// Minimal inspect JSON with every expected compat cell disabled and a
+    /// canary hook entry — shape captured from grok 0.2.112.
+    fn good_inspect_fixture() -> serde_json::Value {
+        let mut cells = Vec::new();
+        for vendor in COMPAT_VENDORS {
+            for surface in COMPAT_SURFACES {
+                cells.push(serde_json::json!({
+                    "vendor": vendor,
+                    "surface": surface,
+                    "enabled": false,
+                    "source": "config",
+                }));
+            }
+        }
+        // Codex sessions default cell is present in live inspect; we do not
+        // assert on it (Boss only suppresses claude/cursor).
+        cells.push(serde_json::json!({
+            "vendor": "codex",
+            "surface": "sessions",
+            "enabled": true,
+            "source": "default",
+        }));
+        serde_json::json!({
+            "grokVersion": PINNED_GROK_VERSION,
+            "projectTrusted": true,
+            "hooks": [{
+                "event": "session_start",
+                "hookType": "command",
+                "target": "true",
+                "matcher": "*",
+            }],
+            "externalCompat": { "cells": cells },
+            "permissions": { "sources": [], "loaded": 0 },
+        })
+    }
+
+    #[test]
+    fn assert_inspect_json_accepts_full_disabled_matrix() {
+        let inspect = good_inspect_fixture();
+        assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/boss-grok-homes/r/grok-home"),
+            Path::new("/tmp/boss-grok-homes/r/process-home"),
+            Path::new("/tmp/ws"),
+        )
+        .expect("good fixture must pass");
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_when_mcps_still_enabled() {
+        let mut inspect = good_inspect_fixture();
+        // Flip claude/mcps to enabled — the bug plugins=false left open.
+        for cell in inspect["externalCompat"]["cells"].as_array_mut().unwrap() {
+            if cell["vendor"] == "claude" && cell["surface"] == "mcps" {
+                cell["enabled"] = serde_json::json!(true);
+                cell["source"] = serde_json::json!("default");
+            }
+        }
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/h"),
+            Path::new("/tmp/ph"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("claude/mcps") && msg.contains("enabled"),
+            "expected enabled-cell failure, got {msg}"
+        );
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_closed_when_sessions_cell_missing() {
+        let mut inspect = good_inspect_fixture();
+        let cells = inspect["externalCompat"]["cells"].as_array_mut().unwrap();
+        cells.retain(|c| !(c["vendor"] == "claude" && c["surface"] == "sessions"));
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/h"),
+            Path::new("/tmp/ph"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing") && msg.contains("claude/sessions"),
+            "expected missing-cell fail-closed, got {msg}"
+        );
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_on_empty_hooks() {
+        let mut inspect = good_inspect_fixture();
+        inspect["hooks"] = serde_json::json!([]);
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/h"),
+            Path::new("/tmp/ph"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("empty hooks"),
+            "expected empty-hooks failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_on_version_mismatch() {
+        let mut inspect = good_inspect_fixture();
+        inspect["grokVersion"] = serde_json::json!("0.0.0-not-the-pin");
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/h"),
+            Path::new("/tmp/ph"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("version pin"),
+            "expected version failure, got {err}"
+        );
+    }
+
+    #[test]
+    fn assert_inspect_json_fails_when_untrusted() {
+        let mut inspect = good_inspect_fixture();
+        inspect["projectTrusted"] = serde_json::json!(false);
+        let err = assert_inspect_json_posture(
+            &inspect,
+            Path::new("/tmp/h"),
+            Path::new("/tmp/ph"),
+            Path::new("/tmp/ws"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("projectTrusted"),
+            "expected trust failure, got {err}"
+        );
     }
 
     #[test]

@@ -24,9 +24,9 @@ mod home;
 mod model_menu;
 
 pub use home::{
-    GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, GROK_SKIP_POSTURE_ASSERT_ENV,
-    GrokRuntimeState, PINNED_GROK_VERSION, grok_home_for_run, grok_homes_root, process_home_for_run,
-    render_base_config_toml, trust_path_variants,
+    COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
+    GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, PINNED_GROK_VERSION, assert_inspect_json_posture,
+    grok_home_for_run, grok_homes_root, process_home_for_run, render_base_config_toml, trust_path_variants,
 };
 
 use home::{assert_grok_home_safe_to_delete, provision_grok_home, read_session_id, read_workspace_path_stamp};
@@ -111,9 +111,10 @@ pub struct GrokDriver {
 ///      "$(cat .grok/initial-prompt.txt)"
 /// ```
 ///
-/// `GROK_HOME` / scoped `HOME` are env directives on the [`SpawnPlan`], not
-/// flags. Never emits `-w` / `--worktree` / `--worktree-ref`. Never sets
-/// `GROK_FOLDER_TRUST=0`.
+/// `GROK_HOME` / scoped `HOME` / `Unset(GROK_FOLDER_TRUST)` are env
+/// directives on the [`SpawnPlan`], not flags. Never emits `-w` /
+/// `--worktree` / `--worktree-ref`. Never *sets* `GROK_FOLDER_TRUST=0`
+/// (spawn unsets the var so a host export cannot ungate project hooks/MCP).
 pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, session_id: &str) -> String {
     let SpawnRequest {
         model,
@@ -249,8 +250,19 @@ impl AgentDriver for GrokDriver {
                 EnvDirective::Set("GROK_HOME".to_owned(), grok_home.display().to_string()),
                 // T-01: scope HOME so operator ~/.claude settings cannot load.
                 // Auth stays under GROK_HOME (symlink), not under this HOME.
+                //
+                // Deferred (seeded first-turn scope): scoped HOME also hides
+                // operator ~/.ssh, ~/.config/gh, and git credential helpers
+                // from the worker after the first turn. Full credential-tree
+                // bridging (selective symlink/copy of gh/ssh/git material into
+                // process-home) is out of scope for this provision/spawn
+                // slice — track as a follow-on before multi-turn Grok workers
+                // that need authenticated network/VCS.
                 EnvDirective::Set("HOME".to_owned(), process_home.display().to_string()),
-                // Forbidden by name: GROK_FOLDER_TRUST=0 ungates project hooks/MCP.
+                // Never inherit host GROK_FOLDER_TRUST=0 — that value ungates
+                // project hooks/MCP and undoes the config.toml disable block.
+                // Mirror the inspect path's env_remove on the pane shell.
+                EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()),
             ],
             command,
         }
@@ -724,6 +736,13 @@ mod tests {
             plan.env
         );
         assert!(
+            plan.env
+                .iter()
+                .any(|d| matches!(d, EnvDirective::Unset(k) if k == "GROK_FOLDER_TRUST")),
+            "must Unset GROK_FOLDER_TRUST so ambient host=0 cannot ungate hooks/MCP: {:?}",
+            plan.env
+        );
+        assert!(
             !plan.env.iter().any(|d| matches!(
                 d,
                 EnvDirective::Set(k, v) if k == "GROK_FOLDER_TRUST" && v == "0"
@@ -799,6 +818,15 @@ mod tests {
         assert!(config.contains("[compat.claude]"));
         assert!(config.contains("[compat.cursor]"));
         assert!(config.contains("hooks = false"));
+        assert!(config.contains("mcps = false"));
+        assert!(config.contains("sessions = false"));
+        assert!(
+            !config.lines().any(|l| {
+                let t = l.trim();
+                !t.starts_with('#') && t.contains("plugins")
+            }),
+            "plugins is not an official compat cell assignment: {config}"
+        );
 
         let trust = fs::read_to_string(runtime.grok_home.join("trusted_folders.toml")).unwrap();
         assert!(trust.contains("trusted = true"));
