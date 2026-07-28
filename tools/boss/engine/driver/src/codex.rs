@@ -409,7 +409,7 @@ impl CodexRuntimeState {
 pub fn render_base_config_toml(workspace: &Path) -> String {
     // TOML basic-string escape for paths that may contain backslashes or quotes.
     let workspace_key = toml_basic_string(&workspace.display().to_string());
-    let sandbox_workspace_write = render_sandbox_workspace_write_toml();
+    let sandbox_workspace_write = render_sandbox_workspace_write_toml(workspace);
     format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
@@ -461,12 +461,25 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// under which Codex does not consult `sandbox_workspace_write` at all, so no
 /// worker-kind branch is needed here — reviewers don't run build gates and
 /// stay fully denied.
-fn render_sandbox_workspace_write_toml() -> String {
+fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     let mut out = String::from(
         "[sandbox_workspace_write]\n\
          network_access = true\n",
     );
-    let roots = bazel_writable_roots();
+    let mut roots = bazel_writable_roots();
+    match cube_repo_store_root(workspace) {
+        Some(root) => roots.push(root),
+        None if workspace.join(".jj").join("repo").is_file() => {
+            tracing::warn!(
+                workspace = %workspace.display(),
+                "workspace has a .jj/repo pointer file but it did not resolve to a cube \
+                 store root; the sandbox writable-roots grant will omit the shared jj/git \
+                 store, which can reproduce 'Operation not permitted' failures on jj/git \
+                 commands"
+            );
+        }
+        None => {}
+    }
     if !roots.is_empty() {
         let quoted: Vec<String> = roots
             .iter()
@@ -536,6 +549,70 @@ fn bazel_writable_roots_impl(
         Some(xdg) if !xdg.is_empty() => vec![PathBuf::from(xdg).join("bazel")],
         _ => vec![home.join(".cache/bazel")],
     }
+}
+
+/// Resolve the shared cube jj store root for `workspace`, if it is a cube
+/// secondary jj workspace.
+///
+/// Every cube-leased workspace's `.jj/repo` is not a directory but jj's own
+/// *pointer file* for a secondary workspace: its entire contents are the
+/// path (jj writes it absolute) to the shared store, e.g.
+/// `~/.local/share/cube/repos/<repo>/.jj/repo`. The pointer is written by
+/// `jj workspace add` when cube attaches the workspace to the canonical
+/// store, so the path is read from cube's actual layout rather than
+/// assembled from a fixed prefix.
+///
+/// `jj commit`/`describe`/`bookmark create`/`git fetch` all write into this
+/// shared store (table-store locks, refs, `FETCH_HEAD`) even though the
+/// command runs from the leased workspace directory, which is a different
+/// path entirely — see "Bazel under the Codex sandbox" in
+/// `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md`. This
+/// returns the checkout root that owns the store (`<repos>/<repo>`, i.e.
+/// `.jj`'s parent), not just `.jj/repo` itself, because a colocated `.git/`
+/// sits alongside `.jj/` at that same level and needs the same write access
+/// (e.g. `.git/FETCH_HEAD` on `jj git fetch`).
+///
+/// Returns `None` when `workspace` is not a cube secondary jj workspace: no
+/// `.jj/repo` pointer file, or its contents don't have the expected
+/// `.jj/repo` shape (plain/colocated dev checkouts, most test fixtures).
+fn cube_repo_store_root(workspace: &Path) -> Option<PathBuf> {
+    let jj_dir = workspace.join(".jj");
+    let pointer = fs::read_to_string(jj_dir.join("repo")).ok()?;
+    let pointer_path = PathBuf::from(pointer.trim());
+    // jj resolves a relative `.jj/repo` pointer relative to the workspace's
+    // own `.jj` directory, not the workspace root — mirror that here so a
+    // relative pointer still yields an absolute, sandbox-usable root.
+    let store_repo_dir = if pointer_path.is_absolute() {
+        pointer_path
+    } else {
+        jj_dir.join(pointer_path)
+    };
+    if store_repo_dir.file_name()?.to_str()? != "repo" {
+        return None;
+    }
+    let store_jj_dir = store_repo_dir.parent()?;
+    if store_jj_dir.file_name()?.to_str()? != ".jj" {
+        return None;
+    }
+    Some(normalize_lexically(store_jj_dir.parent()?))
+}
+
+/// Lexically collapse `.`/`..` components without touching the filesystem
+/// (no symlink resolution, unlike [`Path::canonicalize`]), so a writable
+/// root derived from a relative `.jj/repo` pointer comes out as a clean
+/// absolute path rather than one still carrying `..` segments.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn toml_basic_string(s: &str) -> String {
@@ -1782,6 +1859,84 @@ else:
     fn bazel_writable_roots_empty_without_home_or_test_tmpdir() {
         assert_eq!(bazel_writable_roots_impl(None, None, None), Vec::<PathBuf>::new());
         assert_eq!(bazel_writable_roots_impl(Some(""), None, None), Vec::<PathBuf>::new());
+    }
+
+    /// Lay out a fake cube secondary jj workspace: `<workspace>/.jj/repo`
+    /// pointing at `<repos_root>/<repo>/.jj/repo`, mirroring what `jj` itself
+    /// writes for a real cube-leased checkout.
+    fn write_cube_jj_pointer(workspace: &Path, repo_root: &Path) {
+        fs::create_dir_all(workspace.join(".jj")).unwrap();
+        fs::write(
+            workspace.join(".jj").join("repo"),
+            repo_root.join(".jj").join("repo").display().to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cube_repo_store_root_reads_the_jj_pointer_file() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        write_cube_jj_pointer(&workspace, &repo_root);
+
+        assert_eq!(cube_repo_store_root(&workspace), Some(repo_root));
+    }
+
+    #[test]
+    fn cube_repo_store_root_none_without_pointer_file() {
+        let tmp = TempDir::new().unwrap();
+        // Plain checkout: no .jj at all.
+        assert_eq!(cube_repo_store_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn cube_repo_store_root_none_for_unexpected_pointer_shape() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(workspace.join(".jj")).unwrap();
+        fs::write(workspace.join(".jj").join("repo"), "/not/a/jj/store/path").unwrap();
+        assert_eq!(cube_repo_store_root(&workspace), None);
+    }
+
+    #[test]
+    fn cube_repo_store_root_resolves_relative_pointer_against_workspace_jj_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        fs::create_dir_all(workspace.join(".jj")).unwrap();
+        // jj itself resolves a relative pointer relative to the workspace's
+        // own `.jj` directory (tmp/workspaces/mono-agent-1/.jj here), so
+        // reaching tmp/repos/mono/.jj/repo takes three `..` hops up to `tmp`.
+        let relative_pointer = Path::new("../../../repos/mono/.jj/repo");
+        fs::write(
+            workspace.join(".jj").join("repo"),
+            relative_pointer.display().to_string(),
+        )
+        .unwrap();
+
+        let resolved = cube_repo_store_root(&workspace).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, repo_root);
+    }
+
+    /// The regression this task exists for: a Codex worker in a cube
+    /// workspace must be granted write access to the shared jj store, or
+    /// every `jj describe`/`jj git fetch` in the sandbox dies with
+    /// `Operation not permitted` on the store's lock files.
+    #[test]
+    fn codex_config_grants_cube_shared_store_as_writable_root() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        write_cube_jj_pointer(&workspace, &repo_root);
+
+        let toml = render_base_config_toml(&workspace);
+        let quoted_repo_root = toml_basic_string(&repo_root.display().to_string());
+        assert!(
+            toml.contains(&quoted_repo_root),
+            "writable_roots must include the cube shared repo store: {toml}"
+        );
     }
 
     #[test]
