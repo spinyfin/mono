@@ -256,12 +256,30 @@ pub enum FrontendRequest {
         window_days: Option<u32>,
     },
 
-    /// Cancel a queued or running execution. Marks the execution row
+    /// Cancel a non-terminal execution. Marks the execution row
     /// `cancelled`, releases any cube workspace lease it still holds,
     /// and tears down the libghostty pane (if one was allocated).
-    /// Idempotent on already-terminal rows (returns `WorkError`).
+    /// Already-terminal rows return `WorkError` (not a silent no-op).
+    ///
+    /// When `queued_only` is true (used by `bossctl executions cancel`),
+    /// only never-started rows (`queued` / `ready` / `waiting_dependency`)
+    /// are accepted. Live or mid-flight rows are refused with a message
+    /// that points at `bossctl agents stop` (or `work cancel` for the
+    /// broader non-terminal case). Operator-supplied `reason` is recorded
+    /// in the engine audit trail and the terminalization log line so the
+    /// cancellation is distinct from `orphaned` (engine lost the run) and
+    /// `abandoned`.
     CancelExecution {
         execution_id: String,
+        /// Operator-supplied reason for the audit trail. Optional; when
+        /// absent the engine records a default of `explicit cancel`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        /// Restrict cancellation to never-started executions. Used by
+        /// `bossctl executions cancel`; `bossctl work cancel` leaves this
+        /// false so it can still tear down a running row.
+        #[serde(default)]
+        queued_only: bool,
     },
 
     /// Worker → engine marker (Phase 9 #30): record the worker's

@@ -883,10 +883,175 @@ pub(crate) async fn work_start(
 }
 
 pub(crate) async fn work_cancel(socket_path: &Option<String>, json: bool, execution_id: String) -> Result<()> {
+    // Broad cancel: any non-terminal row (including running). For
+    // never-started rows only, prefer `executions_cancel` /
+    // `bossctl executions cancel`, which refuses live workers and
+    // records an operator reason.
+    cancel_execution_rpc(
+        socket_path,
+        json,
+        execution_id,
+        /* reason */ None,
+        /* queued_only */ false,
+        "work cancel",
+    )
+    .await
+}
+
+/// `bossctl executions cancel` — cancel never-started (`queued` /
+/// `ready` / `waiting_dependency`) executions only. Refuses live /
+/// mid-flight rows so operators don't confuse this with `agents stop`.
+///
+/// `execution_id` and `work_item_id` are mutually exclusive selectors:
+/// by work item cancels every never-started execution currently on that
+/// row (the usual "this item's queued work is moot" operator path).
+pub(crate) async fn executions_cancel(
+    socket_path: &Option<String>,
+    json: bool,
+    execution_id: Option<String>,
+    work_item_id: Option<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    match (execution_id, work_item_id) {
+        (Some(execution_id), None) => {
+            cancel_execution_rpc(
+                socket_path,
+                json,
+                execution_id,
+                reason,
+                /* queued_only */ true,
+                "executions cancel",
+            )
+            .await
+        }
+        (None, Some(work_item_id)) => executions_cancel_for_work_item(socket_path, json, work_item_id, reason).await,
+        (Some(_), Some(_)) => {
+            bail!("pass either an execution id or --work-item, not both")
+        }
+        (None, None) => {
+            bail!("pass an execution id or --work-item <id>")
+        }
+    }
+}
+
+async fn executions_cancel_for_work_item(
+    socket_path: &Option<String>,
+    json: bool,
+    work_item_id: String,
+    reason: Option<String>,
+) -> Result<()> {
+    let mut client = connect(socket_path).await?;
+    // Resolve friendly short ids (`T42`) to the canonical task id —
+    // `ListExecutions` filters on the primary key and does not do this
+    // itself. Mirrors `GetWorkItem`'s resolving contract.
+    let resolved_work_item_id = {
+        let response = client
+            .send_request(&FrontendRequest::GetWorkItem {
+                id: work_item_id.clone(),
+            })
+            .await
+            .context("sending GetWorkItem")?;
+        match response {
+            FrontendEvent::WorkItemResult { item } => item.primary_id().to_owned(),
+            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+                bail!("engine rejected work-item lookup for {work_item_id}: {message}")
+            }
+            other => bail!("engine returned unexpected response: {other:?}"),
+        }
+    };
+    let response = client
+        .send_request(&FrontendRequest::ListExecutions {
+            work_item_id: Some(resolved_work_item_id.clone()),
+            include_revision_chain: false,
+        })
+        .await
+        .context("sending ListExecutions")?;
+    let executions = match response {
+        FrontendEvent::ExecutionsList { executions, .. } => executions,
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected list executions: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    };
+    // Prefer the operator-supplied label in user-facing output, but use
+    // the resolved id for RPC filters above.
+    let work_item_id = resolved_work_item_id;
+    // Never-started only — same gate the engine enforces under
+    // `queued_only`. Filter client-side so we don't spam WorkErrors for
+    // every historical terminal/running row on the item.
+    let candidates: Vec<_> = executions.into_iter().filter(|e| e.status.can_reconcile()).collect();
+    if candidates.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "work_item_id": work_item_id,
+                    "cancelled": [],
+                    "count": 0,
+                })
+            );
+        } else {
+            println!("no never-started (queued/ready/waiting_dependency) executions for {work_item_id}");
+        }
+        return Ok(());
+    }
+
+    let mut cancelled = Vec::new();
+    for exec in candidates {
+        let response = client
+            .send_request(&FrontendRequest::CancelExecution {
+                execution_id: exec.id.clone(),
+                reason: reason.clone(),
+                queued_only: true,
+            })
+            .await
+            .with_context(|| format!("sending CancelExecution for {}", exec.id))?;
+        match response {
+            FrontendEvent::ExecutionCancelled { execution } => {
+                cancelled.push(execution);
+            }
+            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+                bail!("engine rejected executions cancel for {}: {message}", exec.id)
+            }
+            other => bail!("engine returned unexpected response: {other:?}"),
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "work_item_id": work_item_id,
+                "cancelled": cancelled,
+                "count": cancelled.len(),
+            })
+        );
+    } else {
+        println!(
+            "cancelled {} never-started execution(s) for {work_item_id}:",
+            cancelled.len()
+        );
+        for execution in &cancelled {
+            println!("  {} ({})", execution.id, execution.status);
+        }
+    }
+    Ok(())
+}
+
+async fn cancel_execution_rpc(
+    socket_path: &Option<String>,
+    json: bool,
+    execution_id: String,
+    reason: Option<String>,
+    queued_only: bool,
+    verb_label: &str,
+) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let response = client
         .send_request(&FrontendRequest::CancelExecution {
             execution_id: execution_id.clone(),
+            reason,
+            queued_only,
         })
         .await
         .context("sending CancelExecution")?;
@@ -907,7 +1072,7 @@ pub(crate) async fn work_cancel(socket_path: &Option<String>, json: bool, execut
             Ok(())
         }
         FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected work cancel: {message}")
+            bail!("engine rejected {verb_label}: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
     }

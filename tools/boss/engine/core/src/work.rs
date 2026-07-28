@@ -514,6 +514,7 @@ pub use execution_retention::{
     DEFAULT_RETENTION_KEEP_PER_WORK_ITEM, DEFAULT_RETENTION_MAX_AGE_SECS, ExecutionPruneOutcome,
     ExecutionRetentionPolicy,
 };
+pub use executions_runs::CancelExecutionOpts;
 pub use github_api_usage_db::{GithubApiCallRow, GithubApiUsageBucket};
 pub use mappers::CiInFlightObservation;
 pub use mappers::CiRemediationInsertInput;

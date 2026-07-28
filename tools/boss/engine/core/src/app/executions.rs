@@ -673,7 +673,12 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::CancelExecution { execution_id } = req else {
+    let FrontendRequest::CancelExecution {
+        execution_id,
+        reason,
+        queued_only,
+    } = req
+    else {
         unreachable!()
     };
     {
@@ -692,16 +697,49 @@ pub(super) async fn handle_cancel_execution(ctx: Dispatch, req: FrontendRequest)
             );
             return;
         }
-        match server_state.work_db.cancel_execution(&execution_id) {
+        // Snapshot from_status before the write so the audit event can
+        // record what the operator cancelled (the returned row is already
+        // `cancelled`).
+        let from_status = server_state
+            .work_db
+            .get_execution(&execution_id)
+            .ok()
+            .map(|e| e.status.as_str().to_owned());
+        let opts = crate::work::CancelExecutionOpts {
+            reason: reason.clone(),
+            queued_only,
+        };
+        match server_state.work_db.cancel_execution_with(&execution_id, opts) {
             Ok(execution) => {
                 tracing::info!(
                     execution_id = %execution_id,
+                    queued_only,
+                    reason = reason.as_deref().unwrap_or("explicit cancel"),
                     "cancel_execution: marked cancelled",
+                );
+                // Durable operator-facing audit trail: status `cancelled`
+                // already distinguishes deliberate cancel from `orphaned`
+                // / `abandoned`; the reason + from_status make the
+                // decision reconstructible months later from
+                // engine-audit.log alone.
+                crate::audit::record_event(
+                    "execution_cancelled",
+                    &serde_json::json!({
+                        "execution_id": &execution.id,
+                        "work_item_id": &execution.work_item_id,
+                        "from_status": from_status,
+                        "reason": reason.as_deref().unwrap_or("explicit cancel"),
+                        "queued_only": queued_only,
+                        "peer_pid": peer_pid,
+                    }),
                 );
                 // Pane releases are keyed by run_id (the slot
                 // registry's key), not by execution_id — so
                 // walk the execution's still-active runs and
                 // release each. Idempotent on the registry side.
+                // Never-started (queued_only) rows typically have no
+                // active run and no lease; force_release is still
+                // harmless and keeps this path uniform with work cancel.
                 let active_runs = server_state
                     .work_db
                     .active_run_ids_for_execution(&execution_id)

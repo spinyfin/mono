@@ -1,5 +1,22 @@
 use super::*;
 
+/// Options for [`WorkDb::cancel_execution_with`].
+///
+/// Defaults match the historical `cancel_execution` contract: any
+/// non-terminal row may be cancelled, with reason `"explicit cancel"`.
+#[derive(Debug, Clone, Default)]
+pub struct CancelExecutionOpts {
+    /// Operator- or engine-supplied reason written into the
+    /// terminalization log line (and, at the RPC layer, the engine
+    /// audit trail). Empty/whitespace is treated as unset.
+    pub reason: Option<String>,
+    /// When true, refuse any execution that is not never-started
+    /// (`queued` / `ready` / `waiting_dependency` — see
+    /// [`ExecutionStatus::can_reconcile`]). Live workers must be
+    /// stopped via `bossctl agents stop` instead.
+    pub queued_only: bool,
+}
+
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status
@@ -18,7 +35,16 @@ impl WorkDb {
     /// lease ownership atomically by clearing the columns itself
     /// before talking to the cube CLI. Trying to clear them inside
     /// this transaction would race the same release path.
+    ///
+    /// Equivalent to [`Self::cancel_execution_with`] with
+    /// [`CancelExecutionOpts::default`].
     pub fn cancel_execution(&self, execution_id: &str) -> Result<WorkExecution> {
+        self.cancel_execution_with(execution_id, CancelExecutionOpts::default())
+    }
+
+    /// Like [`Self::cancel_execution`], but accepts a reason and the
+    /// `queued_only` gate used by `bossctl executions cancel`.
+    pub fn cancel_execution_with(&self, execution_id: &str, opts: CancelExecutionOpts) -> Result<WorkExecution> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
@@ -28,6 +54,25 @@ impl WorkDb {
                 existing.status
             );
         }
+        if opts.queued_only && !existing.status.can_reconcile() {
+            if existing.status.is_live() {
+                bail!(
+                    "execution {execution_id} is `{}` (already started); \
+                     use `bossctl agents stop {execution_id}` to stop a live worker — \
+                     `executions cancel` only accepts never-started \
+                     (queued/ready/waiting_dependency) rows",
+                    existing.status
+                );
+            }
+            bail!(
+                "execution {execution_id} is `{}` and has already left the \
+                 never-started set (queued/ready/waiting_dependency); \
+                 use `bossctl work cancel {execution_id}` for any non-terminal \
+                 row, or `bossctl agents stop` if a live worker still backs it",
+                existing.status
+            );
+        }
+        let reason = normalize_optional_text(opts.reason).unwrap_or_else(|| "explicit cancel".to_owned());
         let now = now_string();
         tx.execute(
             "UPDATE work_executions
@@ -55,12 +100,17 @@ impl WorkDb {
         // of the ack-timeout / stale-reap contradiction (a live worker whose
         // execution the engine already terminalized) must be attributable
         // regardless of which site actually fired.
+        //
+        // `reason` is the operator- or engine-supplied cancel reason so the
+        // audit trail distinguishes deliberate cancellation from
+        // `orphaned` (engine lost the run) and `abandoned`.
         tracing::warn!(
             execution_id = %execution_id,
             work_item_id = %updated.work_item_id,
             from_status = %existing.status,
             to_status = %updated.status,
-            reason = "explicit cancel",
+            reason = %reason,
+            queued_only = opts.queued_only,
             "execution terminalized: cancel",
         );
         let mut pending = PendingEvents::new();

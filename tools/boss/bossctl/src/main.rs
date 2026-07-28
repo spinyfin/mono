@@ -203,15 +203,14 @@ enum Command {
         #[command(subcommand)]
         action: HostsAction,
     },
-    /// Inspect and prune terminal `work_executions` rows (retention).
+    /// Cancel never-started executions, or prune terminal ones (retention).
     ///
-    /// A running engine already prunes this on a recurring background
-    /// sweep (see `crate::execution_retention_sweep`); this verb is for
-    /// on-demand cleanup between sweeps or while the engine is stopped.
-    /// Reads/writes `state.db` directly, scoped to this install's state
-    /// root (`--state-root`, `BOSS_DB_PATH`, or
-    /// `$HOME/Library/Application Support/Boss` — same resolution as
-    /// `metrics`/`hosts`) — never a cross-install sweep.
+    /// `cancel` talks to the running engine and marks `queued` /
+    /// `ready` / `waiting_dependency` rows `cancelled` so dispatch will
+    /// not spawn workers for moot work. `prune` is retention cleanup of
+    /// already-terminal rows and reads/writes `state.db` directly
+    /// (scoped to this install's state root — `--state-root`,
+    /// `BOSS_DB_PATH`, or `$HOME/Library/Application Support/Boss`).
     Executions {
         #[command(subcommand)]
         action: ExecutionsAction,
@@ -763,7 +762,11 @@ enum WorkAction {
         #[arg(long)]
         preferred_workspace_id: Option<String>,
     },
-    /// Cancel a queued or running execution.
+    /// Cancel a queued or running execution (any non-terminal status).
+    ///
+    /// For never-started rows only, prefer `bossctl executions cancel`,
+    /// which refuses live workers (pointing at `agents stop`) and
+    /// records an operator reason in the audit trail.
     Cancel { execution_id: String },
     /// Full execution history for a work item — every `work_executions`
     /// row regardless of status, oldest first, with the host each one
@@ -980,11 +983,43 @@ enum HostsTagAction {
 
 #[derive(Subcommand, Debug)]
 enum ExecutionsAction {
+    /// Cancel a never-started (`queued` / `ready` / `waiting_dependency`)
+    /// execution so dispatch will not spawn a worker for it.
+    ///
+    /// This is the verb for "this queued work is moot" — e.g. the work
+    /// was finished by other means and a ready successor would only
+    /// re-do it. Marks the row `cancelled` (distinct from `orphaned`,
+    /// which means the engine lost a once-live run).
+    ///
+    /// Refuses executions that have already started. Stopping a live
+    /// worker is a different operation: use `bossctl agents stop`.
+    /// For any non-terminal row including running, use
+    /// `bossctl work cancel`.
+    ///
+    /// Select either by execution id or by `--work-item` (cancels every
+    /// never-started execution currently on that item). Optional
+    /// `--reason` is recorded in the engine audit trail.
+    Cancel {
+        /// Execution id to cancel (e.g. `exec_…`). Mutually exclusive
+        /// with `--work-item`.
+        execution_id: Option<String>,
+        /// Cancel every never-started execution for this work item
+        /// (canonical id or short id as accepted by the engine).
+        #[arg(long)]
+        work_item: Option<String>,
+        /// Operator reason recorded in `engine-audit.log` and the
+        /// terminalization log line.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Delete terminal (`abandoned` / `failed` / `orphaned` / `cancelled`)
     /// `work_executions` rows past the retention bound. `completed`
     /// executions are never touched. Always keeps the most recent
     /// `--keep-per-work-item` eligible rows per work item regardless of
     /// age, so recent diagnostics survive.
+    ///
+    /// Does **not** cancel live or queued work — only deletes rows that
+    /// are already terminal. Use `executions cancel` for moot ready rows.
     Prune {
         /// Only prune rows whose `created_at` is more than this many days
         /// old.
@@ -1293,6 +1328,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Hosts {
             action: HostsAction::Remove { id, state_root },
         } => hosts::hosts_remove(cli.json, state_root, id),
+        Command::Executions {
+            action:
+                ExecutionsAction::Cancel {
+                    execution_id,
+                    work_item,
+                    reason,
+                },
+        } => agents::executions_cancel(&cli.socket_path, cli.json, execution_id, work_item, reason).await,
         Command::Executions {
             action:
                 ExecutionsAction::Prune {
