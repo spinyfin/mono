@@ -1919,6 +1919,54 @@ impl WorkDb {
         Ok(updated > 0)
     }
 
+    /// Stamp `at` (ISO-8601 UTC) as the moment this execution's current run
+    /// delivered a turn boundary — the durable "the worker produced a terminal
+    /// result" record read by [`crate::worker_process_exit`].
+    ///
+    /// Last-write-wins on purpose: for a driver that serves several turns from
+    /// one process the newest boundary is the interesting one, and for a
+    /// one-turn-per-process driver there is only ever one. Targets the same
+    /// [`resolve_run_id_for_execution_hooks`] row every other hook-driven write
+    /// uses, so the record is scoped to the process currently attached to the
+    /// run and a resumed execution starts from NULL again.
+    ///
+    /// Returns `true` when a row was updated, `false` when no run exists yet
+    /// (benign — a boundary cannot precede the run row, which is inserted
+    /// synchronously at dispatch).
+    pub fn record_run_turn_boundary_for_execution(&self, execution_id: &str, at: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs SET turn_boundary_at = ?2 WHERE id = ?1",
+            params![run_id, at],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// The turn boundary this execution's current run delivered, if any.
+    ///
+    /// `None` means no terminal result has ever been observed for the process
+    /// currently attached to the run — which is exactly the case where a
+    /// one-turn-per-process worker's exit must still be treated as a death.
+    /// Keyed on the same row [`Self::record_run_turn_boundary_for_execution`]
+    /// writes, so a prior run's boundary can never vouch for a later process.
+    pub fn latest_run_turn_boundary_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        conn.query_row(
+            "SELECT turn_boundary_at FROM work_runs WHERE id = ?1",
+            params![run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
     /// The shell pid of the **latest** `work_runs` row for `execution_id`,
     /// returned only when that latest run ran locally and recorded a pid;
     /// `None` when the latest run ran on a remote host, has no pid yet, or no
@@ -2313,5 +2361,59 @@ mod event_bus_tests {
         tokio::time::timeout(std::time::Duration::from_millis(50), sub.recv())
             .await
             .expect_err("no ExecutionTerminal should be published when cancel_execution errors");
+    }
+
+    /// A run that has not delivered a turn boundary reads back as `None` —
+    /// the state [`crate::worker_process_exit`] treats as "no evidence", and
+    /// therefore as a death when the worker's process is gone.
+    #[test]
+    fn turn_boundary_is_absent_until_one_is_recorded() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        db.start_execution_run(&execution.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+
+        assert_eq!(db.latest_run_turn_boundary_for_execution(&execution.id).unwrap(), None);
+    }
+
+    /// Last-write-wins: a driver that serves several turns from one process
+    /// leaves the newest boundary, which is the one that matters.
+    #[test]
+    fn recording_a_turn_boundary_round_trips_and_overwrites() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+        db.start_execution_run(&execution.id, "agent", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+
+        assert!(
+            db.record_run_turn_boundary_for_execution(&execution.id, "2026-07-28T00:10:00Z")
+                .unwrap()
+        );
+        assert_eq!(
+            db.latest_run_turn_boundary_for_execution(&execution.id).unwrap(),
+            Some("2026-07-28T00:10:00Z".to_owned()),
+        );
+
+        db.record_run_turn_boundary_for_execution(&execution.id, "2026-07-28T00:16:58Z")
+            .unwrap();
+        assert_eq!(
+            db.latest_run_turn_boundary_for_execution(&execution.id).unwrap(),
+            Some("2026-07-28T00:16:58Z".to_owned()),
+        );
+    }
+
+    /// A boundary reported before any run row exists cannot be attributed to a
+    /// process, so it is dropped rather than misfiled — reported as `false`,
+    /// not an error, since a hook racing the run insert is benign.
+    #[test]
+    fn recording_a_turn_boundary_with_no_run_row_is_a_benign_no_op() {
+        let (_dir, db) = open_db();
+        let execution = ready_execution(&db);
+
+        assert!(
+            !db.record_run_turn_boundary_for_execution(&execution.id, "2026-07-28T00:16:58Z")
+                .unwrap()
+        );
+        assert_eq!(db.latest_run_turn_boundary_for_execution(&execution.id).unwrap(), None);
     }
 }

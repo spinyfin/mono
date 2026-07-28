@@ -731,6 +731,61 @@ pub enum ReapDelivery {
     ProcessGroup,
 }
 
+/// How long a driver's worker **process** is expected to live relative to the
+/// turns it serves — the property that decides whether "the OS process is
+/// gone" is evidence of a *death*.
+///
+/// Boss's process-liveness reapers ([`crate`]'s consumers: the engine's
+/// dead-pid sweep, the app's pane-death report, and the durable-pid dead-pane
+/// sweep) were all written against Claude Code, whose CLI is a long-lived
+/// interactive session: it outlives every turn, so its exit can only ever mean
+/// the worker died mid-run. That inference is *false* for a driver whose CLI
+/// runs one turn per process — `codex exec` writes `turn.completed` and then
+/// exits, by design. Reading that exit as a crash is what reaped a cleanly
+/// finished Codex run 160 ms after it succeeded, orphaned it, and redispatched
+/// the same work item ~20 times.
+///
+/// This is deliberately a *driver* property rather than something the engine
+/// infers from the pane or the process table, for the same reason
+/// [`MidTurnPaneInput`] is: only the driver knows what its foreground process
+/// is contracted to do. It is **not** a licence to skip the liveness check —
+/// see [`Self::OneTurnPerProcess`] for the evidence a one-shot exit must still
+/// produce before it is believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WorkerProcessLifetime {
+    /// The foreground process is expected to outlive every turn it serves and
+    /// to stay attached until Boss tears it down (Claude Code's interactive
+    /// TUI). Its exit is therefore always unexpected: a crash, an OOM, a
+    /// kill-9, or the host app dying and taking the pane with it.
+    ///
+    /// The safe default for any driver that has not established otherwise —
+    /// under it every reaper behaves exactly as it did before this property
+    /// existed.
+    #[default]
+    Persistent,
+    /// The foreground process serves exactly one turn and then exits (`codex
+    /// exec`; verified codex-cli 0.145.0 — see
+    /// `tools/boss/docs/investigations/ghostty-codex-pane-viability.md` §"one
+    /// turn then process exit"). Exit *after* the driver has delivered a turn
+    /// boundary is the process's normal end of life, not a death.
+    ///
+    /// Exit *without* one still is a death. This variant does not weaken the
+    /// liveness check; it only says the check must be paired with the run's
+    /// own terminal-result evidence instead of standing alone. The engine
+    /// resolves that pairing causally — the process's exit is what makes its
+    /// progress stream final, so the stream is drained to end-of-file before
+    /// the verdict is taken — never by widening a timing window.
+    OneTurnPerProcess,
+}
+
+impl WorkerProcessLifetime {
+    /// True when this driver's process exiting after a delivered turn
+    /// boundary is expected rather than a death.
+    pub fn exits_after_each_turn(self) -> bool {
+        matches!(self, Self::OneTurnPerProcess)
+    }
+}
+
 /// Fidelity tier of the [`WorkerEvent`] stream a driver's
 /// [`Capability::ProgressObservation`] produces (design §Capabilities).
 ///
@@ -1750,6 +1805,18 @@ pub trait AgentDriver: Send + Sync {
         MidTurnPaneInput::Rejects
     }
 
+    /// How long this driver's foreground worker process lives relative to the
+    /// turns it serves — consulted by every engine reaper that keys on process
+    /// liveness before it concludes a vanished process means a dead worker.
+    ///
+    /// Defaults to [`WorkerProcessLifetime::Persistent`], which reproduces the
+    /// pre-existing behaviour exactly: any exit is a death and is reaped. A
+    /// driver whose CLI is one-turn-per-process must say so, and must be able
+    /// to point at the evidence — see [`WorkerProcessLifetime::OneTurnPerProcess`].
+    fn worker_process_lifetime(&self) -> WorkerProcessLifetime {
+        WorkerProcessLifetime::Persistent
+    }
+
     // ── StructuredOutput capability ─────────────────────────────────────────
 
     /// Primary-channel wiring for [`Capability::StructuredOutput`]: turn a
@@ -2060,6 +2127,18 @@ mod tests {
         let wiring = ProgressObservationWiring::default();
         assert_eq!(wiring.destination, HookWiringDestination::WorkerSettingsFile);
         assert!(wiring.hooks.is_empty());
+    }
+
+    /// The trait default must reproduce the behaviour every process-liveness
+    /// reaper had before this property existed: a vanished process is a dead
+    /// worker. A driver only escapes that by declaring one-turn-per-process
+    /// deliberately — silence must never buy an exemption from being reaped.
+    #[test]
+    fn worker_process_lifetime_defaults_to_persistent() {
+        let stub = test_support::StubDriver::new(test_support::stub_descriptor(), CapabilitySet::new([]));
+        assert_eq!(stub.worker_process_lifetime(), WorkerProcessLifetime::Persistent);
+        assert!(!WorkerProcessLifetime::Persistent.exits_after_each_turn());
+        assert!(WorkerProcessLifetime::OneTurnPerProcess.exits_after_each_turn());
     }
 
     #[test]

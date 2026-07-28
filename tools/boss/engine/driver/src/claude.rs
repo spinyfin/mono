@@ -1735,4 +1735,19 @@ mod tests {
         let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
         assert_eq!(wiring.destination, HookWiringDestination::WorkerSettingsFile);
     }
+
+    /// Claude's process outlives every turn, so its exit is *always* a death
+    /// and every process-liveness reaper must keep firing on it unchanged.
+    /// Pinned here rather than left implicit in the trait default: the
+    /// one-turn-per-process exemption exists for `codex exec`, and Claude must
+    /// never drift into it.
+    #[test]
+    fn claude_worker_process_is_persistent() {
+        use super::super::WorkerProcessLifetime;
+        assert_eq!(
+            ClaudeDriver.worker_process_lifetime(),
+            WorkerProcessLifetime::Persistent
+        );
+        assert!(!ClaudeDriver.worker_process_lifetime().exits_after_each_turn());
+    }
 }

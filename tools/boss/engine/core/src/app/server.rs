@@ -990,6 +990,7 @@ pub async fn serve_with_merge_probe(
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
+        server_state.clone() as Arc<dyn crate::worker_process_exit::ProgressDrain>,
         Duration::from_secs(60),
     );
 

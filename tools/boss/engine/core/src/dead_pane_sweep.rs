@@ -66,6 +66,11 @@
 //!   never touched here.
 //! - **No pid → skip**: an execution whose pid was never reported (surface
 //!   never attached, or a pre-fix spawn) yields `None` and is left alone.
+//! - **Expected one-shot exit → skip**: a driver declaring
+//!   `WorkerProcessLifetime::OneTurnPerProcess` (`codex exec`) exits by design
+//!   once its turn is delivered, so a dead pid there is not a dead worker. See
+//!   [`crate::worker_process_exit`]; a one-shot run that exited *without*
+//!   delivering a turn boundary is still reaped here.
 //! - **Alive / not-ours / probe-error → skip**: only `Dead` (ESRCH) reaps;
 //!   `EPERM` (alive, not ours) and any other errno are treated conservatively
 //!   as alive. Pid recycling can therefore only ever cause a *missed* reap
@@ -237,6 +242,22 @@ pub async fn reconcile_if_pane_dead(
         Err(_) => return false,
     };
     if !matches!(probe_pid(probe_pid_i32), PidStatus::Dead) {
+        return false;
+    }
+
+    // A dead pid is only a dead *worker* when the driver's process was
+    // supposed to outlive its turns. `codex exec` serves one turn per process
+    // and exits, so its pid is dead by design once the turn is delivered —
+    // this sweep is restart-robust and DB-driven, which means without this
+    // check it would re-orphan a cleanly finished one-shot run on its next
+    // 60s pass even after the pane-death path correctly spared it. No drain
+    // here: this sweep only ever sees exits that happened at least
+    // `PANE_DEATH_GRACE_SECS` ago, by which time the run's progress stream has
+    // long since been read, so the durable record is settled.
+    if !crate::worker_process_exit::classify_worker_process_exit(work_db, None, &execution.id)
+        .await
+        .is_death()
+    {
         return false;
     }
 
@@ -649,5 +670,78 @@ mod tests {
 
         let sink = NoopDispatchEventSink;
         assert!(!reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await);
+    }
+
+    /// Create a `waiting_human` chore execution on the `codex` driver whose
+    /// durable shell pid is dead — a one-turn-per-process worker that
+    /// delivered its turn and exited.
+    fn parked_codex_execution(db: &WorkDb, boundary: Option<&str>) -> WorkExecution {
+        let product = create_product(db);
+        let work_item_id = create_active_chore(db, &product, "codex chore");
+        db.update_work_item(
+            &work_item_id,
+            crate::work::WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution_id = create_old_execution(db, &work_item_id);
+        let (_exec, run) = db
+            .start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws-codex")
+            .unwrap();
+        db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
+            .unwrap();
+        if let Some(at) = boundary {
+            db.record_run_turn_boundary_for_execution(&execution_id, at).unwrap();
+        }
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution_id)
+                .run_id(&run.id)
+                .execution_status(ExecutionStatus::WaitingHuman)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        db.force_started_at_for_test(&execution_id, now_epoch_secs() - PANE_DEATH_GRACE_SECS - 300)
+            .unwrap();
+        db.get_execution(&execution_id).unwrap()
+    }
+
+    /// This sweep is the restart-robust one, so it is the one that would keep
+    /// the redispatch loop alive even after the pane-death path was fixed: 60s
+    /// after a Codex worker finished cleanly it would find a dead durable pid
+    /// on a `waiting_human` row and orphan it. A delivered turn boundary means
+    /// that pid is dead *by design*.
+    #[tokio::test]
+    async fn a_finished_one_shot_worker_is_not_reconciled_as_a_dead_pane() {
+        let (_d, db) = open_db();
+        let exec = parked_codex_execution(&db, Some("2026-07-28T00:16:58Z"));
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            "a one-shot worker that delivered its turn is not a dead-pane zombie",
+        );
+        assert_eq!(
+            db.get_execution(&exec.id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+        );
+    }
+
+    /// The counterpart: no delivered turn boundary means the one-shot process
+    /// died before finishing, and this sweep must still recover its workspace.
+    #[tokio::test]
+    async fn a_one_shot_worker_that_never_finished_is_still_reconciled() {
+        let (_d, db) = open_db();
+        let exec = parked_codex_execution(&db, None);
+
+        let sink = NoopDispatchEventSink;
+        assert!(
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            "a one-shot worker with no delivered turn is a genuine dead pane",
+        );
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
     }
 }

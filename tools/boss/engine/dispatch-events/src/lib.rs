@@ -515,6 +515,21 @@ pub enum Stage {
     /// means the branch has nothing to open a PR for (never pushed, or no
     /// commits ahead of the default branch — `details.action="nothing_to_create"`).
     AbandonedBranchPrRecovery,
+    /// A worker process that was *supposed* to exit did: a driver declaring
+    /// `WorkerProcessLifetime::OneTurnPerProcess` (`codex exec`) delivered its
+    /// turn boundary and then terminated, so the engine released its pane and
+    /// pool slot **without** marking the execution orphaned. `details` carries
+    /// `turn_boundary_at`, the `driver`, the `execution_status` the completion
+    /// handler left behind, and how the exit was observed (`source`).
+    ///
+    /// Emitted where `dead_pid_reconcile` / `pane_death_reconcile` would have
+    /// fired before, and deliberately its own stage: the two mean opposite
+    /// things about the run. A reconcile line says "this worker died, its work
+    /// is being redispatched"; this one says "this worker finished, do not
+    /// redispatch it." Reading the first when the second was true is what
+    /// produced 19 orphaned executions and 26 churn-guard parks for a single
+    /// chore that had, in fact, completed its turn every time.
+    OneShotWorkerExit,
 }
 
 impl Stage {
@@ -564,6 +579,7 @@ impl Stage {
             Stage::AutomationPreempted => "automation_preempted",
             Stage::WorkspaceRecovery => "workspace_recovery",
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",
+            Stage::OneShotWorkerExit => "one_shot_worker_exit",
         }
     }
 }
