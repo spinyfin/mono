@@ -42,6 +42,9 @@ final class TitlebarAccessoryHostTests: XCTestCase {
         let controller = try XCTUnwrap(host.installedController)
         XCTAssertEqual(controller.layoutAttribute, .bottom)
         XCTAssertFalse(controller.isHidden)
+        // Must size from measured content; the system default clips expanded
+        // multi-issue banners and is what left the sticky fullscreen band.
+        XCTAssertFalse(controller.automaticallyAdjustsSize)
     }
 
     func testRepeatedUpdatesReuseTheSameAccessory() {
@@ -108,14 +111,54 @@ final class TitlebarAccessoryHostTests: XCTestCase {
         XCTAssertEqual(host.installedController?.fullScreenMinHeight, 92)
     }
 
-    func testIgnoresUnmeasuredContentHeight() throws {
+    /// Windowed mode sizes the accessory from the view frame (with
+    /// `automaticallyAdjustsSize == false`). Without this signal the slot
+    /// keeps the collapsed height and an expanded multi-issue banner is
+    /// clipped by AppKit's internal clip view.
+    func testTracksContentHeightForWindowedFrame() throws {
+        let window = makeWindow()
+        let host = TitlebarAccessoryHost()
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 36)
+        let container = try XCTUnwrap(host.installedContainerView)
+        XCTAssertEqual(container.frame.height, 36, accuracy: 0.5)
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 92)
+        XCTAssertEqual(container.frame.height, 92, accuracy: 0.5)
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 92)
+    }
+
+    /// Height is not sticky. A drop back to 0 (banner dismissed, or geometry
+    /// not yet measured) must clear both the fullscreen reservation and the
+    /// windowed frame so a window that once showed a banner does not keep a
+    /// black menubar band forever.
+    func testClearsHeightWhenUnmeasured() throws {
         let window = makeWindow()
         let host = TitlebarAccessoryHost()
 
         host.update(window: window, content: banner, isPresented: true, contentHeight: 36)
         host.update(window: window, content: banner, isPresented: true, contentHeight: 0)
 
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 0)
+        let cleared = try XCTUnwrap(host.installedContainerView)
+        XCTAssertEqual(cleared.frame.height, 0, accuracy: 0.5)
+    }
+
+    /// Hiding the accessory must also drop `fullScreenMinHeight` even if the
+    /// last measured content height is still non-zero — otherwise a dismissed
+    /// banner leaves a reserved fullscreen band.
+    func testClearsFullScreenMinHeightWhenHidden() throws {
+        let window = makeWindow()
+        let host = TitlebarAccessoryHost()
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 36)
         XCTAssertEqual(host.installedController?.fullScreenMinHeight, 36)
+
+        host.update(window: window, content: banner, isPresented: false, contentHeight: 36)
+        XCTAssertEqual(host.installedController?.isHidden, true)
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 0)
+        let hidden = try XCTUnwrap(host.installedContainerView)
+        XCTAssertEqual(hidden.frame.height, 0, accuracy: 0.5)
     }
 
     func testIgnoresUpdatesBeforeTheViewHasAWindow() {
@@ -124,5 +167,33 @@ final class TitlebarAccessoryHostTests: XCTestCase {
         host.update(window: nil, content: banner, isPresented: true)
 
         XCTAssertNil(host.installedController)
+    }
+
+    /// The container places the hosted banner at the window leading edge with
+    /// full window width so the bar covers the band above a full-height
+    /// sidebar, not only the content segment AppKit assigned the accessory.
+    ///
+    /// Exercised outside `NSTitlebarAccessoryViewController` because AppKit
+    /// asserts if a live accessory view's origin is mutated directly.
+    func testContainerSpansFullWindowWidthOnLayout() throws {
+        let window = makeWindow()
+        window.setFrame(NSRect(x: 100, y: 100, width: 900, height: 600), display: false)
+        window.contentView?.frame = NSRect(x: 0, y: 0, width: 900, height: 600)
+
+        let hosting = NSHostingView(rootView: banner)
+        let container = TitlebarAccessoryContainer(hosting: hosting)
+        // Simulate AppKit placing the accessory in the content segment (to the
+        // right of a ~280pt sidebar).
+        window.contentView?.addSubview(container)
+        container.frame = NSRect(x: 280, y: 500, width: 620, height: 36)
+        container.layoutSubtreeIfNeeded()
+
+        // Leading edge of hosting should map to the window's leading edge.
+        let hostingOriginInWindow = container.convert(hosting.frame.origin, to: nil)
+        XCTAssertEqual(hostingOriginInWindow.x, 0, accuracy: 1.0)
+        XCTAssertEqual(hosting.frame.width, window.frame.width, accuracy: 1.0)
+        XCTAssertEqual(hosting.frame.height, 36, accuracy: 0.5)
+
+        container.removeFromSuperview()
     }
 }
