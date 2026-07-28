@@ -1,3 +1,0 @@
-pane_mode=default
-mode_flag=
-sid=60a42899-aee9-415d-a877-0f8ee81affee

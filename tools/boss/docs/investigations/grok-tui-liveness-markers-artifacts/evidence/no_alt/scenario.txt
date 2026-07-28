@@ -1,3 +1,0 @@
-pane_mode=no_alt
-mode_flag=--no-alt-screen
-sid=11eb0dd3-9ca9-45b1-8de7-5d7d086bcfb5

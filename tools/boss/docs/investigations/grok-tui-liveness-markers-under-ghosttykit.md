@@ -95,7 +95,7 @@ Per mode (`SPIKE_PANE_MODE=no_alt|minimal|default`):
 3. Host polls `ghostty_surface_read_text(VIEWPORT|SCREEN)` every ~0.35 s, writes every changed viewport to `snaps/snap_NNN_tT_phase.txt`, and tallies candidate substrings into start / busy / idle buckets using chrome-based phase classification (not canary tokens alone — those also appear inside the still-running user prompt).
 4. After true idle (`Worked for` + no `Esc:cancel`), injects a short follow-up turn, then `/quit`.
 
-Evidence: [`grok-tui-liveness-markers-artifacts/evidence/{no_alt,minimal,default}/`](./grok-tui-liveness-markers-artifacts/evidence/). In-repo `snaps/` holds four representative viewports per mode (starting / busy / idle / post_exit); the full high-frequency series is regenerated locally (see [Appendix: regenerating full snap series](#appendix-regenerating-full-snap-series)). Stability counts in this doc come from the full poll stream (`marker_stability.tsv`, `phases.tsv`, `SUMMARY.txt`), not from the curated snaps alone.
+Evidence: [`grok-tui-liveness-markers-artifacts/evidence/{no_alt,minimal,default}/`](./grok-tui-liveness-markers-artifacts/evidence/). In-repo evidence is intentionally minimal: per-mode `SUMMARY.txt` + `marker_stability.tsv`, plus one optional no_alt busy viewport. Full high-frequency snaps and companion logs regenerate under `/tmp` (see [Appendix: regenerating full snap series](#appendix-regenerating-full-snap-series)). Stability counts in this doc come from the full poll stream (`marker_stability.tsv` / `SUMMARY.txt`), not from committed viewports alone.
 
 ## Per-mode results
 
@@ -199,56 +199,42 @@ Live-session markers match `--no-alt-screen` within noise (`Esc:cancel` 59/59 bu
 
 ## Artifacts
 
-| Path                                                                                             | Contents                                                                                                                 |
-| ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------ |
-| [`grok-tui-liveness-markers-artifacts/PINS.txt`](./grok-tui-liveness-markers-artifacts/PINS.txt) | GhosttyKit + grok pins                                                                                                   |
-| [`…/ghosttykit_host/`](./grok-tui-liveness-markers-artifacts/ghosttykit_host/)                   | Throwaway AppKit host source + `run.sh`                                                                                  |
-| [`…/evidence/no_alt/`](./grok-tui-liveness-markers-artifacts/evidence/no_alt/)                   | SUMMARY, PINS, phases.tsv, marker_stability.tsv, host.log, screen_final/viewport_final, timeline, 4 representative snaps |
-| [`…/evidence/minimal/`](./grok-tui-liveness-markers-artifacts/evidence/minimal/)                 | same structure                                                                                                           |
-| [`…/evidence/default/`](./grok-tui-liveness-markers-artifacts/evidence/default/)                 | same structure                                                                                                           |
+| Path                                                                                             | Contents                                                                                      |
+| ------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------- |
+| [`grok-tui-liveness-markers-artifacts/PINS.txt`](./grok-tui-liveness-markers-artifacts/PINS.txt) | GhosttyKit + grok pins (single root file; no per-mode PINS)                                   |
+| [`…/ghosttykit_host/`](./grok-tui-liveness-markers-artifacts/ghosttykit_host/)                   | Throwaway AppKit host source + `run.sh`                                                       |
+| [`…/evidence/no_alt/`](./grok-tui-liveness-markers-artifacts/evidence/no_alt/)                   | `SUMMARY.txt`, `marker_stability.tsv`, optional `viewport_busy.txt` (recommended-mode chrome) |
+| [`…/evidence/minimal/`](./grok-tui-liveness-markers-artifacts/evidence/minimal/)                 | `SUMMARY.txt`, `marker_stability.tsv`                                                         |
+| [`…/evidence/default/`](./grok-tui-liveness-markers-artifacts/evidence/default/)                 | `SUMMARY.txt`, `marker_stability.tsv`                                                         |
 
 ### Per-mode evidence index (committed)
 
-Each of `evidence/{no_alt,minimal,default}/` keeps:
+Each of `evidence/{no_alt,minimal,default}/` keeps only:
 
-| File / path            | Role                                                                                          |
-| ---------------------- | --------------------------------------------------------------------------------------------- |
-| `SUMMARY.txt`          | poll/snap counts, canaries, exit code, pins                                                   |
-| `PINS.txt`             | mode-local pin echo                                                                           |
-| `phases.tsv`           | phase transitions with wall-clock + viewport size                                             |
-| `marker_stability.tsv` | candidate × start/busy/idle hit rates (full poll stream)                                      |
-| `host.log`             | host inject / poll log                                                                        |
-| `screen_final.txt`     | full screen scrape at end of run                                                              |
-| `viewport_final.txt`   | viewport scrape at end of run (post-`/quit` chrome retention difference)                      |
-| `timeline.txt`         | wall-clock event timeline                                                                     |
-| `pane_script.sh`       | script the surface shell ran                                                                  |
-| `snaps/`               | **four** representative viewports only (starting, busy/mid-tool, idle, post_exit) — see below |
+| File / path            | Role                                                                     |
+| ---------------------- | ------------------------------------------------------------------------ |
+| `SUMMARY.txt`          | poll/snap counts, canaries, exit code, pins                              |
+| `marker_stability.tsv` | candidate × start/busy/idle hit rates (full poll stream)                 |
+| `viewport_busy.txt`    | **no_alt only** — one mid-tool busy viewport showing `Esc:cancel` footer |
 
-**Representative snaps retained (not the full high-frequency series):**
+Everything else the harness emits (`snaps/`, `host.log`, inject/scenario/screen dumps, phases, timeline, per-mode PINS, pid/session metadata) stays out of the tree. Regenerate under `/tmp` when you need the full series.
 
-| Mode    | starting                       | busy / mid-tool                                       | idle                              | post_exit                   |
-| ------- | ------------------------------ | ----------------------------------------------------- | --------------------------------- | --------------------------- |
-| no_alt  | `snap_004_t003.2_starting_tui` | `snap_044_t017.2_busy_seed`                           | `snap_064_t024.2_idle_after_seed` | `snap_069_t028.4_post_exit` |
-| default | `snap_004_t001.8_starting_tui` | `snap_036_t013.0_busy_seed`                           | `snap_064_t022.8_idle_after_seed` | `snap_069_t027.0_post_exit` |
-| minimal | `snap_003_t002.6_starting_tui` | `snap_036_t014.1_idle_or_early` (mid-tool mis-bucket) | `snap_061_t022.9_idle_after_seed` | `snap_066_t026.7_post_exit` |
-
-For minimal, the mid-tool row is labeled `idle_or_early` because chrome-based classification fell through without `Esc:cancel` — that mis-bucket is itself evidence for rejecting `--minimal`.
-
-Reproduce (also regenerates the full snap series under each mode's `snaps/`):
+Reproduce / full capture (writes under `/tmp`, not into the repo tree):
 
 ```sh
-# link ghosttykit-5659cef → ghosttykit_host/.local-GhosttyKit.xcframework
+cd tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts
+# Ensure GhosttyKit pin matches PINS.txt / MODULE.bazel @ghostty_kit
+#   ln -sfn /path/to/ghosttykit-5659cef.xcframework ghosttykit_host/.local-GhosttyKit.xcframework
 export GROK_HOME=/tmp/grok-liveness-spike/home   # isolated home with auth + trust
 export SPIKE_CWD=/tmp/grok-liveness-spike/cwd
 export SPIKE_PANE_MODE=no_alt                    # or minimal | default
 ./ghosttykit_host/run.sh
+# host dumps to run_out/; copy into /tmp/grok-liveness-evidence/<mode>/ if desired
 ```
 
 ## Appendix: regenerating full snap series
 
-The committed tree intentionally omits the ~60–70 high-frequency `snaps/snap_*.txt` dumps per mode (~9k LOC of near-duplicate viewports). Stability arithmetic in the verdict tables was computed over the full poll stream and is preserved in `marker_stability.tsv`, `phases.tsv`, and `SUMMARY.txt`.
-
-To re-materialize the full series for a mode (overwrites that mode's `snaps/` and companion logs under `evidence/<mode>/`):
+The committed tree keeps only stability arithmetic (`marker_stability.tsv` + `SUMMARY.txt` per mode) and one no_alt busy viewport. Full high-frequency `snaps/`, host logs, and companion dumps are **not** committed — regenerate under `/tmp` when needed. Stability numbers in the verdict tables were computed over the full poll stream and are preserved in the committed TSVs/SUMMARYs.
 
 ```sh
 cd tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts
@@ -256,12 +242,17 @@ cd tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts
 #   ln -sfn /path/to/ghosttykit-5659cef.xcframework ghosttykit_host/.local-GhosttyKit.xcframework
 export GROK_HOME=/tmp/grok-liveness-spike/home   # auth + trusted_folders only; never real ~/.grok
 export SPIKE_CWD=/tmp/grok-liveness-spike/cwd
+OUT=/tmp/grok-liveness-evidence
+mkdir -p "$OUT"
 for mode in no_alt minimal default; do
   export SPIKE_PANE_MODE=$mode
   ./ghosttykit_host/run.sh
+  # Host writes under run_out/ (or evidence/$mode depending on host version).
+  # Copy the full series somewhere under $OUT — do not re-commit bulk snaps.
+  mkdir -p "$OUT/$mode"
+  cp -R run_out/. "$OUT/$mode/" 2>/dev/null || true
+  cp -R "evidence/$mode/." "$OUT/$mode/" 2>/dev/null || true
 done
 ```
-
-`run.sh` writes under `evidence/$SPIKE_PANE_MODE/` (including every changed viewport as `snaps/snap_NNN_tT_phase.txt`). After regenerating, re-curate the four representatives if desired, or keep the full series only locally — do not re-commit bulk snaps without a reviewability plan.
 
 Host details: [`ghosttykit_host/README.md`](./grok-tui-liveness-markers-artifacts/ghosttykit_host/README.md).

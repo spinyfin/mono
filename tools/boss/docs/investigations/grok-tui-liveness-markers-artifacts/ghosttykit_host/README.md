@@ -25,5 +25,8 @@ export GROK_HOME=/tmp/grok-liveness-spike/home
 export SPIKE_CWD=/tmp/grok-liveness-spike/cwd
 export SPIKE_PANE_MODE=no_alt    # or minimal | default
 ./run.sh
-# evidence lands in run_out/; copy into ../evidence/<mode>/
+# Full capture lands in run_out/ (snaps, host.log, phases, …).
+# Keep bulk dumps under /tmp — committed tree only holds SUMMARY +
+# marker_stability.tsv per mode (plus one optional no_alt viewport).
+cp -R run_out "/tmp/grok-liveness-evidence/${SPIKE_PANE_MODE}"
 ```

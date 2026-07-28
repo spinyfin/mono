@@ -1,6 +1,0 @@
-ghosttykit: ghosttykit-5659cef
-sha256: 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
-grok: grok 0.2.112 (9bbd559437aa) [stable]
-pane_mode: no_alt
-session_id: 11eb0dd3-9ca9-45b1-8de7-5d7d086bcfb5
-apparatus: GhosttyKit embed host (not standalone Ghostty.app)
