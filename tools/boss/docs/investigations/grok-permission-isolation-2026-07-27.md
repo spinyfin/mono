@@ -26,14 +26,14 @@ Two open empirical questions for a Grok-as-first-class-driver posture:
 
 ### (a) Claude permission rules are **in force**, not decorative
 
-| Observation                                                                            | Result                                                                                                                   |
-| -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| Isolated `GROK_HOME` + full `[compat.claude]` disable                                  | `inspect` still lists `~/.claude/settings.local.json` when `HOME` is the operator home                                   |
-| Restrictive deny in throwaway `~/.claude/settings.local.json` under `--always-approve` | **Enforced.** Write/shell blocked; denial text `Denied by permission policy: deny rule on edit`                          |
-| `[compat.claude] permissions = false` (undocumented)                                   | **No effect.** Sources still load; there is **no** permissions cell in the compat matrix                                 |
-| Scope out via throwaway `HOME`                                                         | **Works** for user-global `~/.claude/**` (sources → `loaded: 0`)                                                         |
-| Project `<cwd>/.claude/settings.json`                                                  | Still loaded when the project is trusted, **even with scoped `HOME`**                                                    |
-| Managed settings path                                                                  | Always absolute `/Library/Application Support/ClaudeCode/managed-settings.json` (not under `HOME`); inactive when absent |
+| Observation                                                                            | Result                                                                                                                                 |
+| -------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| Isolated `GROK_HOME` + full `[compat.claude]` disable                                  | `inspect` still lists `~/.claude/settings.local.json` when `HOME` is the operator home                                                 |
+| Restrictive deny in throwaway `~/.claude/settings.local.json` under `--always-approve` | **Enforced.** A4: model `A4_BLOCKED`, target file absent. A7 quotes the pipeline text `Denied by permission policy: deny rule on edit` |
+| `[compat.claude] permissions = false` (undocumented)                                   | **No effect.** Sources still load; there is **no** permissions cell in the compat matrix                                               |
+| Scope out via throwaway `HOME`                                                         | **Works** for user-global `~/.claude/**` (sources → `loaded: 0`)                                                                       |
+| Project `<cwd>/.claude/settings.json`                                                  | Still loaded when the project is trusted, **even with scoped `HOME`**                                                                  |
+| Managed settings path                                                                  | Always absolute `/Library/Application Support/ClaudeCode/managed-settings.json` (not under `HOME`); inactive when absent               |
 
 **Boss implication:** `GROK_HOME` isolation alone is **not** sufficient to drop the operator's Claude permission rules. Pair it with a **scoped `HOME`** (or an empty `~/.claude` tree the worker can see), and treat project `.claude/settings.json` as an independent load path that survives home scoping.
 
@@ -136,7 +136,7 @@ Throwaway `HOME` + `~/.claude/settings.local.json`:
 
 - `inspect`: `loaded: 6`, source path under the throwaway home.
 - Control (A3, empty HOME): write of `probe_a3_write.txt` succeeds (`A3_DONE`, file contains `A3_OK`).
-- Deny (A4): model replies `A4_BLOCKED`; **file absent**.
+- Deny (A4): model replies `A4_BLOCKED`; **file absent**. Committed A4 JSON records only the model reply (and thought "write was blocked by permissions") — not a verbatim denial string. The explicit tool-denial quote appears in A7 (`Tool denied: Denied by permission policy: deny rule on edit`).
 
 So the inspect `sources` list is not a curiosity: those rules participate in the same permission pipeline that docs describe as surviving always-approve (`deny` > mode pass-through).
 
@@ -308,12 +308,12 @@ cd tools/boss/docs/investigations/grok-permission-isolation-artifacts
 ./scripts/run_probes.sh c        # sandbox (requires non-/tmp PROBE_ROOT; default is ~/.cache/…)
 ```
 
-Environment overrides: `GROK_BIN`, `MODEL` (must not be `grok-code-fast-1`), `PROBE_ROOT`, `AUTH_SRC`.
+Environment overrides: `GROK_BIN`, `MODEL` (must not be `grok-code-fast-1`), `PROBE_ROOT`, `AUTH_SRC`, `REAL_HOME` (operator home for A5/A6; defaults to `$HOME` at script start, before probes rewrite `HOME`).
 
 ## Appendix C — Evidence index
 
-| Group          | Paths under `grok-permission-isolation-artifacts/evidence/`                                                                                                                                       |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Claude leakage | `a_claude/a1_inspect_scoped_home.json`, `a2_inspect_deny.json`, `a3_control.json`, `a4_claude_deny.json`, `a5_real_home_inspect.json`, `a6_compat_perms.json`, `a7c_inspect.json`, `a7c_run.json` |
-| Rule grammar   | `b_rules/b1_*.json`, `b3_*.json`, `b4_*.json`, `b5_malformed.err` (`malformed rule…`), `b5c_unrecognized.err`, `b5c2.json`                                                                        |
-| Sandbox        | `c_sandbox/sb_ro_nontmp.json`, `sb_ws_nontmp.json`, `sb_strict_nontmp.json`, `sb_ro_tmp_ok.json`, `sb_custom.json`, `sb_hook.json`, `sb_bad.err`, `sb_badglob.err`, `sandbox_events_merged.jsonl` |
+| Group          | Paths under `grok-permission-isolation-artifacts/evidence/`                                                                                                                                                                                                        |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Claude leakage | `a_claude/a1_inspect_scoped_home.json`, `a2_inspect_deny.json`, `a3_control.json`, `a4_claude_deny.json`, `a5_real_home_inspect.json`, `a6_compat_perms.json`, `a7c_inspect.json`, `a7c_run.json`                                                                  |
+| Rule grammar   | `b_rules/b1_*.json`, `b2_cli_deny_edit.*` (`Edit` deny), `b3_*.json`, `b4_*.json`, `b4b_native_cmd.*` (`run_terminal_cmd` fail-open), `b5_malformed.err` (`malformed rule…`), `b5c_unrecognized.err`, `b5c2.json` — all harness-reproducible via `run_probes.sh b` |
+| Sandbox        | `c_sandbox/sb_ro_nontmp.json`, `sb_ws_nontmp.json`, `sb_strict_nontmp.json`, `sb_ro_tmp_ok.json`, `sb_custom.json`, `sb_hook.json`, `sb_bad.err`, `sb_badglob.err`, `sandbox_events_merged.jsonl`                                                                  |
