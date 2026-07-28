@@ -1,0 +1,26 @@
+{
+  "text": "I'll run the three shell writes and report each exit code.**Results**\n\n| # | Command | Exit code |\n|---|---------|-----------|\n| (1) | `echo HACKED > .../hooks/probe.json` | **1** (operation not permitted) |\n| (2) | `echo HACKED > .../hooks-paths` | **1** (operation not permitted) |\n| (3) | `echo OK > .../session_write_test.txt` | **0** |\n\nHOOK_DONE",
+  "stopReason": "EndTurn",
+  "sessionId": "1c885b61-fb8c-48c5-8900-97ca4cbbd1ef",
+  "requestId": "a35ba4cf-cb4c-4442-ae4f-6cd6ccb8b47a",
+  "thought": "The user wants me to run three shell commands and report each exit code, then end with \"HOOK_DONE\". Let me execute these commands.The results are clear:\n1. First command failed with exit code 1 (operation not permitted)",
+  "usage": {
+    "input_tokens": 10862,
+    "cache_read_input_tokens": 12160,
+    "output_tokens": 360,
+    "reasoning_tokens": 96,
+    "total_tokens": 23382
+  },
+  "num_turns": 2,
+  "total_cost_usd": 0.027532,
+  "total_cost_usd_ticks": 275320000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 10862,
+      "outputTokens": 360,
+      "cacheReadInputTokens": 12160,
+      "modelCalls": 2,
+      "costUSD": 0.027532
+    }
+  }
+}

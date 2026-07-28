@@ -1,0 +1,18 @@
+# Isolated GROK_HOME config: always-approve + full Claude/Cursor surface disable.
+# Note: Claude *permission rules* are NOT gated by [compat.claude] — see findings.
+[ui]
+permission_mode = "always-approve"
+
+[compat.claude]
+hooks = false
+agents = false
+skills = false
+plugins = false
+rules = false
+
+[compat.cursor]
+hooks = false
+agents = false
+skills = false
+plugins = false
+rules = false

@@ -1,0 +1,2 @@
+[profiles.bad]
+extends = "off"

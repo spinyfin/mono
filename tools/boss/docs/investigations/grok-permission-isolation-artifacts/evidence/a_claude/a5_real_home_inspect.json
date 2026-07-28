@@ -1,0 +1,154 @@
+{
+  "grokVersion": "0.2.112",
+  "channel": "unknown",
+  "cwd": "/Users/brianduff/.cache/grok-perm-isolation-probe/cwd",
+  "projectRoot": null,
+  "projectTrusted": true,
+  "projectInstructions": [
+    {
+      "path": "/Users/brianduff/.claude/Claude.md",
+      "scope": "global",
+      "fileType": "agents_md",
+      "sizeBytes": 5749,
+      "approxTokens": 1437,
+      "vendor": "claude",
+      "disabled": true,
+      "compatibilityStatus": "disabled"
+    }
+  ],
+  "permissions": {
+    "sources": ["/Users/brianduff/.claude/settings.local.json (settings)"],
+    "loaded": 1,
+    "skipped": [],
+    "mcpServerAllowlist": [],
+    "marketplaceAllowlist": [],
+    "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+    "managedSettingsExists": false,
+    "managedSettingsActive": false
+  },
+  "loginPolicy": {
+    "disableApiKeyAuth": null,
+    "forceLoginTeamUuid": null,
+    "apiKeyAuthDisabled": false
+  },
+  "hooks": [],
+  "skills": [],
+  "agents": [
+    {
+      "name": "general-purpose",
+      "description": "General purpose agent for multi-step tasks.",
+      "source": {
+        "type": "builtin"
+      }
+    },
+    {
+      "name": "explore",
+      "description": "Fast, read-only agent specialized for codebase exploration.",
+      "source": {
+        "type": "builtin"
+      }
+    },
+    {
+      "name": "plan",
+      "description": "Software architect for planning implementation strategies.",
+      "source": {
+        "type": "builtin"
+      }
+    }
+  ],
+  "plugins": [],
+  "marketplaces": [],
+  "mcpServers": [],
+  "lspServers": [],
+  "configSources": {
+    "layers": [
+      {
+        "role": "user",
+        "path": "/Users/brianduff/.cache/grok-perm-isolation-probe/homes/a5_real_home/config.toml"
+      }
+    ]
+  },
+  "externalCompat": {
+    "remoteSettingsLoaded": false,
+    "cells": [
+      {
+        "vendor": "cursor",
+        "surface": "skills",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "cursor",
+        "surface": "rules",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "cursor",
+        "surface": "agents",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "cursor",
+        "surface": "mcps",
+        "enabled": true,
+        "source": "default"
+      },
+      {
+        "vendor": "cursor",
+        "surface": "hooks",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "cursor",
+        "surface": "sessions",
+        "enabled": true,
+        "source": "default"
+      },
+      {
+        "vendor": "claude",
+        "surface": "skills",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "claude",
+        "surface": "rules",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "claude",
+        "surface": "agents",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "claude",
+        "surface": "mcps",
+        "enabled": true,
+        "source": "default"
+      },
+      {
+        "vendor": "claude",
+        "surface": "hooks",
+        "enabled": false,
+        "source": "config"
+      },
+      {
+        "vendor": "claude",
+        "surface": "sessions",
+        "enabled": true,
+        "source": "default"
+      },
+      {
+        "vendor": "codex",
+        "surface": "sessions",
+        "enabled": true,
+        "source": "default"
+      }
+    ]
+  }
+}

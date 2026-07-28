@@ -1,0 +1,2 @@
+warning: sandbox could not be applied: deny glob "*.{pem,key}" uses unsupported metacharacter '{' (brace alternation and backslash-escapes are not supported; use separate deny entries)
+error: could not apply the 'badglob' sandbox profile (including direct global-hook write protection); refusing to start.
