@@ -90,6 +90,45 @@ pub(crate) fn publish_execution_terminal(
     Ok(())
 }
 
+/// Demote a work item from `active` → `todo` only when it is still
+/// `active` **and** `execution_id` is still its current (latest)
+/// execution. Stamps `last_status_actor = 'engine'` so the kanban does
+/// not attribute the bounce to the human who last touched the card.
+///
+/// Shared by [`WorkDb::cancel_execution_with`] (live-cancel path) and
+/// [`WorkDb::cancel_running_execution_and_demote_task`] so the latest-
+/// execution guard and actor stamp cannot drift between the two.
+///
+/// Superseded-execution cancels are a no-op for row status (defect 4):
+/// after redispatch, stopping the OLD execution must not yank the live
+/// replacement's card back to Backlog.
+///
+/// Returns `true` if a row was demoted.
+pub(crate) fn demote_active_if_latest_execution(
+    conn: &Connection,
+    work_item_id: &str,
+    execution_id: &str,
+    now: &str,
+) -> Result<bool> {
+    let affected = conn.execute(
+        "UPDATE tasks
+         SET status             = 'todo',
+             last_status_actor  = 'engine',
+             updated_at         = ?2
+         WHERE id              = ?1
+           AND status          = 'active'
+           AND deleted_at      IS NULL
+           AND ?3 = (
+               SELECT id FROM work_executions
+               WHERE work_item_id = ?1
+               ORDER BY created_at DESC, id DESC
+               LIMIT 1
+           )",
+        params![work_item_id, now, execution_id],
+    )?;
+    Ok(affected > 0)
+}
+
 pub(crate) fn update_execution_status(
     conn: &Connection,
     execution_id: &str,

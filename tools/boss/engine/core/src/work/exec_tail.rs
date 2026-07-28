@@ -126,25 +126,10 @@ impl WorkDb {
         // newer created_at. A stop targeting a superseded execution finds
         // the subquery no longer equal to `execution_id` and leaves the
         // row (and the live replacement) untouched.
-        let task_demoted = {
-            let affected = tx.execute(
-                "UPDATE tasks
-                 SET status             = 'todo',
-                     last_status_actor  = 'engine',
-                     updated_at         = ?2
-                 WHERE id              = ?1
-                   AND status          = 'active'
-                   AND deleted_at      IS NULL
-                   AND ?3 = (
-                       SELECT id FROM work_executions
-                       WHERE work_item_id = ?1
-                       ORDER BY created_at DESC, id DESC
-                       LIMIT 1
-                   )",
-                params![execution.work_item_id, now, execution_id],
-            )?;
-            affected > 0
-        };
+        //
+        // Shared with `cancel_execution_with`'s live path so the guard
+        // and `last_status_actor = 'engine'` stamp cannot drift.
+        let task_demoted = demote_active_if_latest_execution(&tx, &execution.work_item_id, execution_id, &now)?;
         let mut pending = PendingEvents::new();
         if exec_cancelled {
             stage_execution_terminal(&mut pending, &tx, execution_id, &execution.work_item_id)?;
