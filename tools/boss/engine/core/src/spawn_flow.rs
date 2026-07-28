@@ -59,6 +59,12 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     // / followups) and the PR URL. See `crate::structured_output`.
     "BOSS_PR_URL_OUTPUT",
     "BOSS_STRUCTURED_OUTPUT",
+    // Engine-owned directory holding this workspace's `boss` launcher
+    // (and nothing else — notably not `bossctl`). Prepended to the
+    // worker's PATH so a bare `boss` runs the CLI shipped with this
+    // engine rather than a build-from-source shim in the user's `~/bin`.
+    // See `boss_engine_worker_bin`.
+    boss_engine_worker_bin::WORKER_BIN_DIR_ENV,
     "CUBE_LEASE_ID",
     "CUBE_REPO",
 ];
@@ -371,6 +377,22 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         if let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH") {
             path_entry.value = format!("{boss_bin_dir}:{}", path_entry.value);
         }
+    }
+
+    // The per-workspace launcher dir goes ahead of everything, including
+    // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
+    // is the one entry that stays correct in dev mode (no bundle) as
+    // well as installed mode. Applied after the BOSS_BIN_DIR prepend
+    // above so it lands in front of it, mirroring the ordering of the
+    // pane's first shell line in `pane_spawn`.
+    let worker_bin_dir = env
+        .iter()
+        .find(|e| e.key == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+        .map(|e| e.value.clone());
+    if let Some(worker_bin_dir) = worker_bin_dir.filter(|dir| !dir.is_empty())
+        && let Some(path_entry) = env.iter_mut().find(|e| e.key == "PATH")
+    {
+        path_entry.value = format!("{worker_bin_dir}:{}", path_entry.value);
     }
 
     let claimed_slot = input.slot_id;
@@ -1123,6 +1145,85 @@ mod tests {
         assert_eq!(
             env.iter().find(|(k, _)| k == "BOSS_LEASE_ID").map(|(_, v)| v.as_str()),
             Some("lease-test"),
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_bin_dir_is_prepended_ahead_of_the_sanitized_path() {
+        // The launcher dir holds a `boss` pinned to an absolute path. It
+        // has to win over every other PATH entry, otherwise a bare `boss`
+        // can still land on a build-from-source shim.
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        let mut input = sample_input(&workspace);
+        input.extra_env = vec![(
+            boss_engine_worker_bin::WORKER_BIN_DIR_ENV.into(),
+            "/tmp/boss-worker-settings/bin".into(),
+        )];
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        let env = spawner.last_spawn_env();
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .expect("PATH is always set")
+            .1
+            .clone();
+        // Asserted positionally rather than by equality: BOSS_BIN_DIR may
+        // or may not be set in the ambient env (installed vs dev mode),
+        // and it inserts its own entry. What must hold either way is that
+        // the launcher dir is first and the sanitized PATH still trails.
+        assert_eq!(
+            path.split(':').next(),
+            Some("/tmp/boss-worker-settings/bin"),
+            "launcher dir must be the first PATH entry, got {path}",
+        );
+        assert!(
+            path.ends_with(WORKER_SANITIZED_PATH),
+            "sanitized PATH must still be the tail, got {path}",
+        );
+        assert_eq!(
+            env.iter()
+                .find(|(k, _)| k == boss_engine_worker_bin::WORKER_BIN_DIR_ENV)
+                .map(|(_, v)| v.as_str()),
+            Some("/tmp/boss-worker-settings/bin"),
+            "the dir must also be exported so the pane's first shell line can re-prepend it",
+        );
+    }
+
+    #[tokio::test]
+    async fn path_is_untouched_when_no_worker_bin_dir_is_supplied() {
+        // The launcher dir is best-effort: a temp-dir failure must not
+        // corrupt PATH with an empty leading entry (which `sh` reads as
+        // the current directory).
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let env = spawner.last_spawn_env();
+        let path = env
+            .iter()
+            .find(|(k, _)| k == "PATH")
+            .expect("PATH is always set")
+            .1
+            .clone();
+        assert!(
+            path.ends_with(WORKER_SANITIZED_PATH),
+            "sanitized PATH must be intact, got {path}",
+        );
+        assert!(!path.starts_with(':'), "PATH must not gain an empty leading entry");
+        assert!(
+            !path.contains("::"),
+            "PATH must not gain an empty entry (`::` is the current directory to sh), got {path}",
+        );
+        assert!(
+            !env.iter().any(|(k, _)| k == boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+            "no launcher dir supplied means no launcher dir exported",
         );
     }
 

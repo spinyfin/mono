@@ -82,6 +82,13 @@ null. Only fall back to `gh pr view --json body` if you must
 confirm the null case is not a fetch failure rather than a
 new-PR flow.
 
+If a `boss` command fails to run at all — not found, or it exits
+non-zero without answering — that is a finding, not noise. Say so
+explicitly in your final response and name the command. Do NOT
+quietly drop the step and carry on: a create-vs-update decision
+made without `boss pr status` is a decision made blind, and
+nobody downstream can tell that from a clean transcript.
+
 ## Your workspace
 
 - Workspace path: `/Users/brianduff/Documents/dev/workspaces/mono-agent-007`
