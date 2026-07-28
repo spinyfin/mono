@@ -31,108 +31,81 @@ struct ContentView: View {
     @AppStorage("boss.kanban.boardStyle") private var kanbanBoardStyle: KanbanBoardStyle = .classic
 
     var body: some View {
-        // Banners sit in the layout flow above the main chrome so they
-        // displace the sidebar and detail rather than overlay them.
-        // `safeAreaInset(edge: .top)` on a NavigationSplitView ZStack does
-        // not reliably reserve space for the sidebar column on macOS — the
-        // PRODUCT heading and kanban top edge were painted under the bar.
-        // A sibling VStack measures the banner's real height (Dynamic Type,
-        // multi-line wrap) with no magic top-padding constant. The window
-        // titlebar/toolbar is outside this tree, so this does not
-        // double-count chrome above the content area.
-        VStack(spacing: 0) {
-            // Persistent chrome-level signal that the engine socket is
-            // down. Only shown after we've connected at least once so
-            // the banner doesn't flash on launch during the normal
-            // initial-connect window. Replaces the previous behavior
-            // where every reconnect attempt re-popped a "Work Error"
-            // modal (#698) — transport errors are now routed away from
-            // `workErrorMessage` in `ChatViewModel.handle`. Also gated on
-            // `showConnectionLostBanner` rather than the raw `isConnected`
-            // flag: a drop that self-heals within `connectionLostBannerDelay`
-            // (reconnect backoff starts at 0.5s) never surfaces this at
-            // all, so a brief blip reads as silent self-healing rather than
-            // a user-visible connection error.
-            if model.showConnectionLostBanner {
-                EngineUnreachableBanner(
-                    isRestarting: model.isRestartingEngine,
-                    onRestart: { model.restartEngine() }
+        // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
+        // doesn't tear down the libghostty NSViews on tab switches (teardown
+        // would force ghostty_surface_new and restart every claude session).
+        // DesignsView is structurally conditional because it contains its own
+        // NavigationSplitView: two NSVs mounted concurrently share the same
+        // NSWindow toolbar namespace and AppKit deduplicates their toggle
+        // items, causing position thrash and a missing Designs sidebar. Only
+        // one NSV may live in the tree at a time. Designs remounts cheaply
+        // (filesystem reads only) so structural conditional is safe here.
+        //
+        // This ZStack must stay the root of the window's content: SwiftUI only
+        // promotes a NavigationSplitView to the window's content view
+        // controller when it is the root, and only then does the sidebar get
+        // its native full-height material and column geometry. Chrome that
+        // needs to sit above it goes in the titlebar accessory slot
+        // (`windowTitlebarAccessory` below), never in a wrapping VStack.
+        ZStack {
+            // boss.ui.standardSearch OFF (default): custom WorkSearchToolbarItem below.
+            // boss.ui.standardSearch ON: SwiftUI .searchable() owns placement/focus/clear.
+            // Both branches keep the same opacity/hitTesting treatment so navigation-mode
+            // switching never tears down NSViews in agentsView (see comment above).
+            if useStandardSearch {
+                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                    sidebar
+                } detail: {
+                    detail
+                }
+                // Remove the system sidebarToggle only on non-Work tabs. On the Work
+                // tab, the system-provided toggle handles both expanded and collapsed
+                // states natively, giving exactly one toggle button in either state
+                // without a state-conditional custom button (suppressing one button
+                // in one collapse state always left the other button visible in the
+                // opposite state).
+                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+                .opacity(model.navigationMode == .work ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .work)
+                .searchable(
+                    text: $model.workSearchText,
+                    placement: .toolbar,
+                    prompt: "Search tasks…"
                 )
-                .transition(.move(edge: .top).combined(with: .opacity))
-            }
-            // Connection is up but the engine reports a degraded
-            // condition (missing ANTHROPIC_API_KEY, dispatch paused,
-            // syspolicyd wedged, etc.). Surface as a first-class
-            // affordance so operators can't miss it (#699).
-            if model.isConnected, !model.engineHealthIssues.isEmpty {
-                EngineHealthBanner(
-                    issues: model.engineHealthIssues,
-                    onUnpauseDispatch: { model.resumeDispatch() }
-                )
-                .transition(.move(edge: .top).combined(with: .opacity))
+            } else {
+                NavigationSplitView(columnVisibility: $workColumnVisibility) {
+                    sidebar
+                } detail: {
+                    detail
+                }
+                .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
+                .opacity(model.navigationMode == .work ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .work)
             }
 
-            // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
-            // doesn't tear down the libghostty NSViews on tab switches (teardown
-            // would force ghostty_surface_new and restart every claude session).
-            // DesignsView is structurally conditional because it contains its own
-            // NavigationSplitView: two NSVs mounted concurrently share the same
-            // NSWindow toolbar namespace and AppKit deduplicates their toggle
-            // items, causing position thrash and a missing Designs sidebar. Only
-            // one NSV may live in the tree at a time. Designs remounts cheaply
-            // (filesystem reads only) so structural conditional is safe here.
-            ZStack {
-                // boss.ui.standardSearch OFF (default): custom WorkSearchToolbarItem below.
-                // boss.ui.standardSearch ON: SwiftUI .searchable() owns placement/focus/clear.
-                // Both branches keep the same opacity/hitTesting treatment so navigation-mode
-                // switching never tears down NSViews in agentsView (see comment above).
-                if useStandardSearch {
-                    NavigationSplitView(columnVisibility: $workColumnVisibility) {
-                        sidebar
-                    } detail: {
-                        detail
-                    }
-                    // Remove the system sidebarToggle only on non-Work tabs. On the Work
-                    // tab, the system-provided toggle handles both expanded and collapsed
-                    // states natively, giving exactly one toggle button in either state
-                    // without a state-conditional custom button (suppressing one button
-                    // in one collapse state always left the other button visible in the
-                    // opposite state).
-                    .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                    .opacity(model.navigationMode == .work ? 1 : 0)
-                    .allowsHitTesting(model.navigationMode == .work)
-                    .searchable(
-                        text: $model.workSearchText,
-                        placement: .toolbar,
-                        prompt: "Search tasks…"
-                    )
-                } else {
-                    NavigationSplitView(columnVisibility: $workColumnVisibility) {
-                        sidebar
-                    } detail: {
-                        detail
-                    }
-                    .toolbar(removing: model.navigationMode == .work ? nil : .sidebarToggle)
-                    .opacity(model.navigationMode == .work ? 1 : 0)
-                    .allowsHitTesting(model.navigationMode == .work)
-                }
+            agentsView
+                .opacity(model.navigationMode == .agents ? 1 : 0)
+                .allowsHitTesting(model.navigationMode == .agents)
 
-                agentsView
-                    .opacity(model.navigationMode == .agents ? 1 : 0)
-                    .allowsHitTesting(model.navigationMode == .agents)
+            if model.navigationMode == .designs {
+                DesignsView(chat: model)
+            }
 
-                if model.navigationMode == .designs {
-                    DesignsView(chat: model)
-                }
-
-                if model.navigationMode == .automations {
-                    AutomationsView(model: model)
-                        .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
-                }
+            if model.navigationMode == .automations {
+                AutomationsView(model: model)
+                    .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
             }
         }
-        .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
-        .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
+        // Chrome banners live in the window's titlebar-accessory slot: below
+        // the toolbar, above the content, with AppKit shrinking
+        // `contentLayoutRect` by the bar's own measured height. That reserves
+        // real space for both split-view columns — the PRODUCT heading and the
+        // kanban top edge are no longer painted under the bar — without
+        // demoting the NavigationSplitView out of the window root, which is
+        // what made the sidebar render as a floating inset panel (#2459).
+        .windowTitlebarAccessory(isPresented: hasChromeBanners) {
+            chromeBanners
+        }
         #if canImport(GhosttyKit)
         .task {
             // Wire the SwiftPM-only pane allocator into ChatViewModel
@@ -426,6 +399,58 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: updateModel.manualCheckFeedback)
+    }
+
+    /// Whether any chrome banner has something to say right now. Drives
+    /// whether the titlebar accessory is installed/visible at all, so a
+    /// healthy window's titlebar is untouched.
+    private var hasChromeBanners: Bool {
+        model.showConnectionLostBanner
+            || (model.isConnected && !model.engineHealthIssues.isEmpty)
+    }
+
+    /// Full-width chrome banners rendered in the titlebar accessory slot.
+    /// Height is content-driven (Dynamic Type, multi-line wrap); the accessory
+    /// reports it to AppKit, which reserves that much space above the content.
+    @ViewBuilder
+    private var chromeBanners: some View {
+        VStack(spacing: 0) {
+            // Persistent chrome-level signal that the engine socket is
+            // down. Only shown after we've connected at least once so
+            // the banner doesn't flash on launch during the normal
+            // initial-connect window. Replaces the previous behavior
+            // where every reconnect attempt re-popped a "Work Error"
+            // modal (#698) — transport errors are now routed away from
+            // `workErrorMessage` in `ChatViewModel.handle`. Also gated on
+            // `showConnectionLostBanner` rather than the raw `isConnected`
+            // flag: a drop that self-heals within `connectionLostBannerDelay`
+            // (reconnect backoff starts at 0.5s) never surfaces this at
+            // all, so a brief blip reads as silent self-healing rather than
+            // a user-visible connection error.
+            if model.showConnectionLostBanner {
+                EngineUnreachableBanner(
+                    isRestarting: model.isRestartingEngine,
+                    onRestart: { model.restartEngine() }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            // Connection is up but the engine reports a degraded
+            // condition (missing ANTHROPIC_API_KEY, dispatch paused,
+            // syspolicyd wedged, etc.). Surface as a first-class
+            // affordance so operators can't miss it (#699).
+            if model.isConnected, !model.engineHealthIssues.isEmpty {
+                EngineHealthBanner(
+                    issues: model.engineHealthIssues,
+                    onUnpauseDispatch: { model.resumeDispatch() }
+                )
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        // Scoped to the banner stack rather than applied to the whole body:
+        // animating the body meant every health report re-animated the
+        // AppKit-backed split view subtree, not just the bar.
+        .animation(.easeInOut(duration: 0.15), value: model.showConnectionLostBanner)
+        .animation(.easeInOut(duration: 0.15), value: model.engineHealthIssues)
     }
 
     private var sidebar: some View {
