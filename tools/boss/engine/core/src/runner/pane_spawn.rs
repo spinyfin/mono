@@ -285,6 +285,78 @@ pub(crate) fn resolve_boss_event_binary(
     None
 }
 
+/// One `PATH`-prepend clause for the worker's first shell line, e.g.
+/// `[ -n "$BOSS_BIN_DIR" ] && export PATH="$BOSS_BIN_DIR:$PATH"; `.
+///
+/// The `[ -n … ]` guard makes an unset var a no-op, so the clause is
+/// safe to emit unconditionally. Clauses compose left to right: the
+/// *last* one emitted ends up first on `PATH`.
+fn path_prepend_clause(var: &str) -> String {
+    format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
+}
+
+/// Materialize the per-worker launcher directory and return it, so the
+/// caller can put it on the worker's `PATH`.
+///
+/// The directory holds exactly one executable — `boss` — which `exec`s
+/// the already-built CLI belonging to this engine, resolved by absolute
+/// path via [`boss_engine_worker_bin::resolve_boss_cli`]. That resolver
+/// never searches `PATH`; when it comes up empty the launcher is still
+/// written, and running `boss` then fails immediately with a named
+/// diagnostic instead of falling through to a repobin shim that spends
+/// ~30 seconds on `bazel build` before reporting anything.
+///
+/// `bossctl` is deliberately absent: this directory is prepended to the
+/// worker's `PATH`, and the Boss-tier control surface stays Boss-tier.
+///
+/// Returns `None` if the directory could not be written at all. That is
+/// logged, not fatal — the worker simply keeps today's `PATH` behaviour
+/// rather than losing its spawn over a temp-dir failure.
+fn ensure_worker_bin_dir(settings_dir: &Path) -> Option<PathBuf> {
+    let engine_path = std::env::current_exe().unwrap_or_default();
+    let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
+    let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
+    let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
+    let stable_bin_dir = boss_log_files::default_state_root().map(|root| root.join("bin"));
+
+    let resolved = boss_engine_worker_bin::resolve_boss_cli(
+        &engine_path,
+        workspace_dir.as_deref(),
+        env_override.as_deref(),
+        boss_bin_dir.as_deref(),
+        stable_bin_dir.as_deref(),
+    );
+    if resolved.is_none() {
+        tracing::warn!(
+            "no already-built `boss` CLI found (checked BOSS_CLI_BIN, BOSS_BIN_DIR, the stable \
+             bin dir, engine runfiles, bazel-bin, and the engine sibling). Workers will get a \
+             launcher that fails loudly on `boss` rather than a build-from-source shim. Build it \
+             with `bazel build //tools/boss/cli:boss` or set BOSS_CLI_BIN.",
+        );
+    }
+
+    let dir = settings_dir.join(boss_engine_worker_bin::WORKER_BIN_SUBDIR);
+    match boss_engine_worker_bin::write_boss_launcher(&dir, resolved.as_deref()) {
+        Ok(launcher) => {
+            tracing::debug!(
+                launcher = %launcher.display(),
+                target = %resolved.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "<unresolved>".to_owned()),
+                "worker `boss` launcher written",
+            );
+            Some(dir)
+        }
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                dir = %dir.display(),
+                "could not write the worker `boss` launcher; the worker's PATH is unchanged and \
+                 a bare `boss` may resolve to a build-from-source shim",
+            );
+            None
+        }
+    }
+}
+
 /// Copy the boss-event shim binary to a stable location in the Boss
 /// support directory. Called at engine startup so the path baked into
 /// new worker settings.json files remains valid after a `bazel clean`.
@@ -593,9 +665,18 @@ impl ExecutionRunner for PaneSpawnRunner {
         // any driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
+        // The per-worker launcher dir goes on *after* the BOSS_BIN_DIR
+        // prepend so it ends up ahead of it. Its `boss` is pinned to an
+        // absolute path, which is the only form that survives a login
+        // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
+        // directory and is a no-op in dev mode, where the user's `~/bin`
+        // repobin shim was winning.
+        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
-            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; {env_prefix}{}",
+            "{}{}{env_prefix}{}",
+            path_prepend_clause("BOSS_BIN_DIR"),
+            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
         );
 
@@ -640,7 +721,16 @@ impl ExecutionRunner for PaneSpawnRunner {
                 events_socket_path: self.events_socket_path(),
                 boss_event_path: self.boss_event_binary(),
                 initial_input,
-                extra_env: structured_output_env,
+                extra_env: {
+                    let mut env = structured_output_env;
+                    if let Some(dir) = worker_bin_dir.as_ref() {
+                        env.push((
+                            boss_engine_worker_bin::WORKER_BIN_DIR_ENV.to_owned(),
+                            dir.display().to_string(),
+                        ));
+                    }
+                    env
+                },
                 title_summary,
                 task_title: Some(work_item_name(work_item).to_owned()),
                 work_item_binding,
@@ -1125,14 +1215,20 @@ mod pane_spawn_tests {
             input.initial_input
         );
         // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
-        // bundled `cube`/`boss`/`bossctl` win over any `~/bin` repobin
-        // shim the login-shell init re-prepends), then unsets the API key
-        // and invokes claude. See the comment at the construction site.
+        // bundled `cube`/`boss` win over any `~/bin` repobin shim the
+        // login-shell init re-prepends), then the per-worker launcher dir
+        // on top of that (so `boss` is pinned to an absolute path even in
+        // dev mode, where BOSS_BIN_DIR is unset and the clause is a
+        // no-op), then unsets the API key and invokes claude. See the
+        // comment at the construction site.
         assert!(
             input.initial_input.starts_with(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude"
+                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                 [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
+                 unset ANTHROPIC_API_KEY; claude"
             ),
-            "expected initial_input to re-prepend BOSS_BIN_DIR, unset ANTHROPIC_API_KEY, and invoke claude, got: {:?}",
+            "expected initial_input to re-prepend BOSS_BIN_DIR then the worker launcher dir, \
+             unset ANTHROPIC_API_KEY, and invoke claude, got: {:?}",
             input.initial_input
         );
     }
@@ -1259,11 +1355,13 @@ mod pane_spawn_tests {
         assert_eq!(
             input.initial_input,
             format!(
-                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
+                "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+                 [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
+                 unset ANTHROPIC_API_KEY; claude --model {} --permission-mode auto --settings '{}' \"$(cat .claude/initial-prompt.txt)\"\n",
                 crate::driver::ClaudeDriver.descriptor().model_menu.engine_default,
                 settings_path.display(),
             ),
-            "untagged row should re-prepend BOSS_BIN_DIR to PATH, then spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
+            "untagged row should re-prepend BOSS_BIN_DIR then the worker launcher dir to PATH, then spawn with the engine default model, --permission-mode auto (Opus), --settings <worker file>, and no --effort",
         );
 
         // No addendum prepended — the existing implementation framing
@@ -2380,6 +2478,68 @@ mod pane_spawn_tests {
 
         let resolved = resolve_boss_event_binary(&engine, Some(&workspace), None, None, None);
         assert_eq!(resolved, Some(shim));
+    }
+
+    /// The `PATH`-prepend clauses compose so that the clause emitted
+    /// LAST ends up FIRST on `PATH`. The worker launcher dir has to be
+    /// last for that reason, and each clause must no-op on an unset var.
+    #[test]
+    fn path_prepend_clauses_compose_with_the_last_one_winning() {
+        let line = format!(
+            "{}{}",
+            path_prepend_clause("BOSS_BIN_DIR"),
+            path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
+        );
+        assert_eq!(
+            line,
+            "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
+             [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; "
+        );
+
+        // Both vars set: the launcher dir must be the first PATH entry.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{line}printf '%s' \"$PATH\""))
+            .env("PATH", "/usr/bin")
+            .env("BOSS_BIN_DIR", "/bundle/bin")
+            .env("BOSS_WORKER_BIN_DIR", "/worker/bin")
+            .output()
+            .expect("sh must be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/worker/bin:/bundle/bin:/usr/bin");
+
+        // Neither set (dev mode, launcher write failed): PATH unchanged,
+        // and in particular no empty leading entry.
+        let out = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("{line}printf '%s' \"$PATH\""))
+            .env("PATH", "/usr/bin")
+            .env_remove("BOSS_BIN_DIR")
+            .env_remove("BOSS_WORKER_BIN_DIR")
+            .output()
+            .expect("sh must be available");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "/usr/bin");
+    }
+
+    /// `ensure_worker_bin_dir` always leaves a usable `boss` behind, even
+    /// when nothing resolves — an unresolved launcher that fails loudly
+    /// beats letting the worker PATH-resolve a build-from-source shim.
+    /// And it writes `boss` only: `bossctl` stays Boss-tier.
+    #[test]
+    fn ensure_worker_bin_dir_writes_only_boss() {
+        let dir = TempDir::new().unwrap();
+        let bin_dir = ensure_worker_bin_dir(dir.path()).expect("launcher dir must be written");
+        assert_eq!(bin_dir, dir.path().join("bin"));
+
+        let mut entries: Vec<String> = std::fs::read_dir(&bin_dir)
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["boss".to_owned()],
+            "only `boss` may be handed to a worker; `bossctl` is Boss-tier",
+        );
     }
 
     /// When nothing resolves the function returns `None` — the caller

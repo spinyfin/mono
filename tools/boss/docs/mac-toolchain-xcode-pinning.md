@@ -143,6 +143,80 @@ Applied on hosts `anaplian` and `skaffen`:
 
    (Substitute the pinned version string you need.)
 
+## Failure mode 3 — a live Bazel server that can no longer reach LaunchServices
+
+### Symptom
+
+Every action in one output base fails while `xcode-locator` works
+perfectly from the shell:
+
+```text
+ERROR: .../BUILD.bazel:36:12: Compiling Rust bin boss (16 files) failed:
+I/O exception during sandboxed execution: Running
+'~/Library/Caches/bazel/_bazel_<user>/install/<hash>/xcode-locator 26.6.0.17F113'
+failed with code 1.
+This most likely indicates that Xcode version 26.6.0.17F113 is not available
+on the host machine.
+stderr: error: Error Domain=NSOSStatusErrorDomain Code=-10661
+"kLSExecutableIncorrectFormat: No compatible executable was found"
+```
+
+**Take the "Xcode … is not available" line as a hypothesis, not a
+diagnosis.** It is Bazel's generic wording for "the locator subprocess
+exited non-zero", and it is emitted verbatim whether Xcode is genuinely
+missing or the locator merely could not reach LaunchServices this time.
+
+`-10661` is a LaunchServices error, not a filesystem one. Bazel spawns
+`xcode-locator` from the **server** process (`XcodeLocalEnvProvider`),
+so the LaunchServices context that matters is the server's, not the
+client's — and a server can outlive whatever context it was started in.
+Once a server lands in that state it poisons every build in its output
+base for **every** client, including a healthy interactive shell.
+
+### Diagnose
+
+Run the locator directly, with the exact version string from the error:
+
+```sh
+~/Library/Caches/bazel/_bazel_*/install/*/xcode-locator 26.6.0.17F113
+```
+
+Exit 0 with a `…/Contents/Developer` path means Xcode is present and
+registered — this is **not** failure mode 1 or 2, and neither `lsregister
+-f` nor a re-pin will change anything. It is the live server.
+
+### Fix
+
+```sh
+cd <the affected checkout>
+bazel shutdown     # then re-run the build
+```
+
+Verified on this host against `~/.cache/repobin/repos/mono-*/checkout`:
+`//tools/boss/cli:boss` failed as above (exit 36), `bazel shutdown`
+followed by the identical command succeeded, with no Xcode change, no
+config change, and no cache wipe.
+
+### Do not reach for `clean --expunge` first
+
+The repo's Bazel rules prescribe `bazel clean --expunge` for an
+Xcode-pin mismatch, and that is right for failure modes 1 and 2. It is
+the wrong first move here: it discards the whole output base to
+accomplish, as a side effect, the server restart that `bazel shutdown`
+does in a second. Confirm with the direct locator probe above before
+spending a full rebuild.
+
+### Why this bites repobin especially
+
+repobin builds tools from its own private checkout
+(`~/.cache/repobin/repos/<repo>-<hash>/checkout`), which has its own
+output base and therefore its own long-lived server. That server is
+started by whichever process first invoked a repobin tool — frequently an
+agent session — and nothing routinely restarts it. So a repobin checkout
+can sit wedged long after the workspace checkouts next to it are building
+fine, which reads as "Bazel is broken for tool X only". Check the server
+before you check the toolchain.
+
 ## Buildkite agent maintenance notes
 
 When pausing an agent for host repair:

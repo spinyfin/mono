@@ -379,7 +379,7 @@ new file mode 100644
 index 0000000..e05970b
 --- /dev/null
 +++ b/rust/private/test_sharding_wrapper.sh
-@@ -0,0 +1,65 @@
+@@ -0,0 +1,86 @@
 +#!/usr/bin/env bash
 +# Copyright 2024 The Bazel Authors. All rights reserved.
 +#
@@ -429,17 +429,38 @@ index 0000000..e05970b
 +
 +# Filter tests for this shard
 +# test_index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX
++# Split on newlines via IFS word-splitting, NOT a `<<<` here-string. bash
++# implements a here-string by writing a temp file under $TMPDIR, and a Bazel
++# test action on macOS is not always permitted to create one ("cannot create
++# temp file for here document: Operation not permitted"). When that happens the
++# loop body never runs, shard_tests stays empty, and the shard exits 0 -- every
++# shard reports PASSED without executing a single test. Same defect and same
++# remedy as //third_party/patches:rules_apple-4.5.1-no-test-env-heredoc.patch.
++# Globbing is disabled for the split so a test name is never expanded against
++# the working directory.
 +shard_tests=()
 +index=0
-+while IFS= read -r test_name; do
++saved_ifs="$IFS"
++IFS=$'\n'
++set -f
++for test_name in $test_list; do
 +    if (( index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX )); then
 +        shard_tests+=("$test_name")
 +    fi
 +    ((index++)) || true
-+done <<< "$test_list"
++done
++set +f
++IFS="$saved_ifs"
 +
-+# If no tests for this shard, exit successfully
++# Partitioning is `index % TEST_TOTAL_SHARDS == TEST_SHARD_INDEX`, so a shard is
++# legitimately empty only when there are fewer tests than shards. Empty with
++# tests available means the partition step itself broke -- fail loudly instead
++# of reporting the green that used to mask exactly that.
 +if [[ ${#shard_tests[@]} -eq 0 ]]; then
++    if (( index > TEST_SHARD_INDEX )); then
++        echo "test_sharding_wrapper: partitioned 0 of ${index} enumerated tests into shard ${TEST_SHARD_INDEX} of ${TEST_TOTAL_SHARDS}; refusing to report success" >&2
++        exit 1
++    fi
 +    exit 0
 +fi
 +

@@ -41,6 +41,13 @@ Boss already stores most of what you'd otherwise ask GitHub for.
 These read your own PR only — never another run's — and cost one
 local round trip against the engine, not a GitHub API call:
 
+If a `boss` command fails to run at all — not found, or it exits
+non-zero without answering — that is a finding, not noise. Say so
+explicitly in your final response and name the command. Do NOT
+quietly drop the step and carry on: a create-vs-update decision
+made without `boss pr status` is a decision made blind, and
+nobody downstream can tell that from a clean transcript.
+
 - `boss pr status` — includes your resolved `pr_url`, the
 cheapest way to answer "do I already have a PR?" before
 deciding between `cube pr create` and `cube pr update`. Prefer

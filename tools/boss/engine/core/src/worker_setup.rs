@@ -308,6 +308,13 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          These read your own PR only — never another run's — and cost one\n\
          local round trip against the engine, not a GitHub API call:\n\
          \n\
+         If a `boss` command fails to run at all — not found, or it exits\n\
+         non-zero without answering — that is a finding, not noise. Say so\n\
+         explicitly in your final response and name the command. Do NOT\n\
+         quietly drop the step and carry on: a create-vs-update decision\n\
+         made without `boss pr status` is a decision made blind, and\n\
+         nobody downstream can tell that from a clean transcript.\n\
+         \n\
          - `boss pr status` — includes your resolved `pr_url`, the\n\
            cheapest way to answer \"do I already have a PR?\" before\n\
            deciding between `cube pr create` and `cube pr update`. Prefer\n\

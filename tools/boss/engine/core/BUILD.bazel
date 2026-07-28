@@ -86,6 +86,7 @@ rust_library(
         "//tools/boss/engine/transient-error",
         "//tools/boss/engine/utility-model",
         "//tools/boss/engine/utils",
+        "//tools/boss/engine/worker-bin",
         "//tools/boss/engine/worker-policy",
         "//tools/boss/gh_telemetry",
         "//tools/boss/github",
@@ -106,7 +107,18 @@ rust_binary(
     # the engine and worker `settings.json` ends up referencing
     # `boss-event` as a bare name that isn't on the worker's
     # sanitized PATH — every hook fires `command not found`.
-    data = ["//tools/boss/event-shim:boss-event"],
+    #
+    # The `boss` CLI rides along for the same reason, one level up: the
+    # engine writes each worker a launcher that execs an already-built
+    # `boss` by absolute path (see //tools/boss/engine/worker-bin).
+    # Without this dep a dev-mode engine has no `boss` to point that
+    # launcher at, and the worker's bare `boss pr status` falls through
+    # to whatever the user's dotfiles put on PATH — typically a repobin
+    # shim that builds the CLI from source on every cold cache.
+    data = [
+        "//tools/boss/cli:boss",
+        "//tools/boss/event-shim:boss-event",
+    ],
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     visibility = [

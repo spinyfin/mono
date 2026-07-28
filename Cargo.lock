@@ -439,6 +439,7 @@ dependencies = [
  "boss-engine-transient-error",
  "boss-engine-utility-model",
  "boss-engine-utils",
+ "boss-engine-worker-bin",
  "boss-engine-worker-policy",
  "boss-event-bus",
  "boss-feature-flags",
@@ -691,6 +692,13 @@ name = "boss-engine-utils"
 version = "0.1.0"
 dependencies = [
  "chrono",
+]
+
+[[package]]
+name = "boss-engine-worker-bin"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]

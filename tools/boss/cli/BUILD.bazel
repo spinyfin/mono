@@ -56,6 +56,9 @@ rust_binary(
     },
     visibility = [
         "//tools/boss/app-macos:__pkg__",
+        # Runfiles-only: the engine ships the CLI so dev-mode workers get
+        # an already-built `boss` instead of a build-from-source shim.
+        "//tools/boss/engine/core:__pkg__",
         "//tools/boss/installer:__pkg__",
     ],
     deps = [
