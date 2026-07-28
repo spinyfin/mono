@@ -331,7 +331,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var liveWorkerStates: LiveWorkerStateStore?
     /// Owned here so the App struct can inject it into CheckForUpdatesCommand and
     /// environment objects before any view renders or menu fires.
-    let updateModel: UpdateModel = UpdateModel.makeForApp()
+    let updateModel: UpdateModel = UpdateModel.makeForApp(defaults: BossDefaults.store)
 
     /// Set by `BossMacApp.task` once `ContentView` has appeared. The
     /// flush that matters is gated on

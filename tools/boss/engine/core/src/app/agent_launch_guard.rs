@@ -175,10 +175,13 @@ impl std::fmt::Display for AgentLaunchRefusal {
         write!(
             f,
             "Building and testing are unaffected: `bazel build //tools/boss/...` and `bazel test \
-             //tools/boss/...` start no production engine. Launching the Boss app has the same \
-             effect as launching an engine — the app terminates the running engine and starts its \
-             own — so it is not a way around this. Verifying the GUI is not something an agent \
-             session can do; hand that to a human."
+             //tools/boss/...` start no production engine. Launching the Boss app against \
+             production paths has the same effect as launching an engine — the app terminates the \
+             running engine and starts its own — so it is not a way around this. To screenshot \
+             the real Boss UI quietly, launch an isolated capture instance instead: \
+             BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel run \
+             //tools/boss/app-macos:Boss -- --capture-to <path>.png (never-ordered window, no \
+             focus theft, no screen-recording permission)."
         )
     }
 }
@@ -693,6 +696,9 @@ mod tests {
             "BOSS_RUN_ID",
             "events socket",
             "bazel test",
+            "--capture-to",
+            "BOSS_ENGINE_AUTOSTART=0",
+            "//tools/boss/app-macos:Boss",
         ] {
             assert!(message.contains(expected), "message must mention {expected}: {message}");
         }
