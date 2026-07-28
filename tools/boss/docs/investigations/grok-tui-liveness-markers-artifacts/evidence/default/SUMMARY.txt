@@ -1,0 +1,22 @@
+reason: script_finished
+pane_mode: default
+session_id: 60a42899-aee9-415d-a877-0f8ee81affee
+saw_LIVE_SEED_DONE: true
+saw_LIVE_FOLLOW_OK: true
+poll_count: 81
+start_polls: 8
+busy_polls: 59
+idle_polls: 9
+snap_count: 69
+viewport_final_bytes: 663
+screen_final_bytes: 663
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 68568
+foreground_pid_at_end: 68229
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)
+ghosttykit_pin: ghosttykit-5659cef
+ghosttykit_sha256: 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
+GROK_HOME: /tmp/grok-liveness-spike/home
+SPIKE_CWD: /tmp/grok-liveness-spike/cwd

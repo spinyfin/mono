@@ -1,0 +1,6 @@
+.local-GhosttyKit.xcframework
+.build/
+.swiftpm/
+build.log
+run_console.log
+run_out/

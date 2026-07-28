@@ -1,0 +1,19 @@
+candidate	total_hits/80	start_hits/10	busy_hits/11	idle_hits/54
+/ 500K	70	0	11	54
+Grok	74	4	11	54
+Grok 4	74	4	11	54
+Grok 4.5	74	4	11	54
+K / 500K	70	0	11	54
+LIVE_FOLLOW_OK	15	0	2	8
+LIVE_SEED_DONE	70	0	11	54
+Resume this session	5	0	0	0
+Starting session	4	4	0	0
+Starting session…	4	4	0	0
+Thinking	3	0	0	3
+Thought for	62	0	4	53
+Waiting for response	11	0	11	0
+Waiting for response…	11	0	11	0
+Worked for	16	0	2	9
+always-approve	74	4	11	54
+◆	63	0	4	54
+❯	74	4	11	54
