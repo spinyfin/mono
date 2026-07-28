@@ -16,6 +16,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use boss_engine_codex_rollout::{
+    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call, extract_text_blocks,
+    is_rollout_tool_output,
+};
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
 
@@ -29,39 +33,18 @@ pub(super) struct RolloutToolCall {
     tool_input: Value,
 }
 
+/// Thin adapter over [`boss_engine_codex_rollout::canonical_rollout_tool_call`].
+/// Progress tracking requires a `call_id`; transcript rendering does not.
+/// Shared pure reshape (exec → Bash, argv coerce) lives in the lower crate so
+/// `transcript-markdown` can reuse it without depending on this driver module.
 fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>) -> Option<(String, RolloutToolCall)> {
-    if !matches!(item_type, "custom_tool_call" | "function_call") {
-        return None;
-    }
-    let call_id = payload.get("call_id")?.as_str()?.to_owned();
-    let provider_name = payload.get("name")?.as_str()?;
-    let raw_input = payload
-        .get("input")
-        .or_else(|| payload.get("arguments"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let parsed_input = match raw_input {
-        Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
-        other => other,
-    };
-
-    let (tool_name, tool_input) = match provider_name {
-        "exec" | "exec_command" => {
-            let command = parsed_input
-                .get("cmd")
-                .or_else(|| parsed_input.get("command"))
-                .cloned()
-                .or_else(|| parsed_input.as_str().map(|value| Value::String(value.to_owned())))
-                .unwrap_or(parsed_input);
-            ("Bash".to_owned(), json!({"command": command}))
-        }
-        other => (other.to_owned(), parsed_input),
-    };
+    let CanonicalRolloutToolCall {
+        call_id,
+        tool_name,
+        tool_input,
+    } = shared_canonical_rollout_tool_call(item_type, payload)?;
+    let call_id = call_id?;
     Some((call_id, RolloutToolCall { tool_name, tool_input }))
-}
-
-fn is_rollout_tool_output(item_type: &str) -> bool {
-    matches!(item_type, "custom_tool_call_output" | "function_call_output")
 }
 
 /// Mutable state owned by one stdout reader.
@@ -891,18 +874,9 @@ fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value
 fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
     let role = payload.get("role")?.as_str()?;
     let content = payload.get("content")?.as_array()?;
-    let text = content
-        .iter()
-        .filter_map(|block| {
-            let block_type = block.get("type").and_then(Value::as_str)?;
-            if matches!(block_type, "output_text" | "input_text" | "text") {
-                block.get("text").and_then(Value::as_str)
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    // Text-block extraction is shared with transcript-markdown via
+    // `boss_engine_codex_rollout::extract_text_blocks`.
+    let text = extract_text_blocks(content);
     match role {
         "assistant" => Some(assistant_text(&text)),
         "user" => Some(json!({"type":"user","text":text})),

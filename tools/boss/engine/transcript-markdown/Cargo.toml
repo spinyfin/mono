@@ -5,6 +5,7 @@ edition.workspace = true
 workspace = "../../../.."
 
 [dependencies]
+boss-engine-codex-rollout = { path = "../codex-rollout" }
 boss-engine-utils = { path = "../utils" }
 bon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

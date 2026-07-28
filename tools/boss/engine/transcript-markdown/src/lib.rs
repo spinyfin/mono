@@ -18,6 +18,9 @@
 //! - [`segments_to_markdown`] — flat document from segments (CLI / single-blob)
 //! - [`render_text`] — plain-text rendering for the CLI transcript command
 
+use boss_engine_codex_rollout::{
+    canonical_rollout_tool_call, canonical_rollout_tool_output, extract_text_blocks as extract_codex_text_blocks,
+};
 use serde_json::Value;
 
 // ── Public types ──────────────────────────────────────────────────────────────
@@ -131,24 +134,32 @@ impl std::error::Error for UnrecognizedTranscriptSchema {}
 fn detect_schema(jsonl_content: &str) -> Result<Option<TranscriptSchema>, UnrecognizedTranscriptSchema> {
     let mut claude_hits = 0u32;
     let mut codex_hits = 0u32;
-    let mut saw_any_line = false;
+    let mut non_empty_lines = 0u32;
+    let mut json_objects = 0u32;
+    let mut typed_records = 0u32;
+    let mut unknown_types = 0u32;
 
     for line in jsonl_content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        saw_any_line = true;
+        non_empty_lines += 1;
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        if !value.is_object() {
+            continue;
+        }
+        json_objects += 1;
         let Some(type_str) = value.get("type").and_then(|v| v.as_str()) else {
             continue;
         };
+        typed_records += 1;
         match type_str {
             "user" | "assistant" | "tool_result" | "system" => claude_hits += 1,
             "session_meta" | "turn_context" | "world_state" | "event_msg" | "response_item" => codex_hits += 1,
-            _ => {}
+            _ => unknown_types += 1,
         }
     }
 
@@ -156,17 +167,48 @@ fn detect_schema(jsonl_content: &str) -> Result<Option<TranscriptSchema>, Unreco
         (true, false) => Ok(Some(TranscriptSchema::ClaudeCode)),
         (false, true) => Ok(Some(TranscriptSchema::CodexRollout)),
         (false, false) => {
-            if saw_any_line {
-                Err(UnrecognizedTranscriptSchema {
-                    message: "transcript does not match a known schema (Claude Code or Codex rollout)".to_owned(),
-                })
-            } else {
+            if non_empty_lines == 0 {
                 Ok(None)
+            } else {
+                Err(UnrecognizedTranscriptSchema {
+                    message: unrecognized_schema_message(non_empty_lines, json_objects, typed_records, unknown_types),
+                })
             }
         }
         (true, true) => Err(UnrecognizedTranscriptSchema {
             message: "transcript mixes Claude Code and Codex rollout record types; cannot determine schema".to_owned(),
         }),
+    }
+}
+
+fn unrecognized_schema_message(
+    non_empty_lines: u32,
+    json_objects: u32,
+    typed_records: u32,
+    unknown_types: u32,
+) -> String {
+    // `bossctl agents transcript` often feeds only the last N lines. When that
+    // window contains parseable JSON but no Claude/Codex record types, say so
+    // explicitly rather than implying the whole file is an unknown dialect.
+    if typed_records > 0 {
+        format!(
+            "parsed {typed_records} JSON record(s) with a `type` field in the supplied content \
+             ({unknown_types} unrecognised type(s)), but none match a known schema \
+             (Claude Code: user/assistant/tool_result/system; Codex rollout: session_meta/\
+             turn_context/world_state/event_msg/response_item). If this is a tail of a larger \
+             transcript, try a larger --lines window so schema-identifying records are included"
+        )
+    } else if json_objects > 0 {
+        format!(
+            "parsed {json_objects} JSON object(s) in the supplied content, but none had a \
+             recognised schema `type` field (Claude Code or Codex rollout). If this is a tail \
+             of a larger transcript, try a larger --lines window"
+        )
+    } else {
+        format!(
+            "transcript content has {non_empty_lines} non-empty line(s) but none were \
+             parseable JSON objects matching a known schema (Claude Code or Codex rollout)"
+        )
     }
 }
 
@@ -335,25 +377,10 @@ fn parse_codex_response_item(
     match item_type {
         "message" => parse_codex_message(payload, timestamp, model, seq, events),
         "reasoning" => parse_codex_reasoning(payload, timestamp, model, seq, events),
-        "custom_tool_call" | "function_call" => parse_codex_tool_call(payload, timestamp, seq, events),
+        "custom_tool_call" | "function_call" => parse_codex_tool_call(item_type, payload, timestamp, seq, events),
         "custom_tool_call_output" | "function_call_output" => parse_codex_tool_output(payload, timestamp, seq, events),
         _ => {}
     }
-}
-
-fn extract_codex_text_blocks(content: &[Value]) -> String {
-    content
-        .iter()
-        .filter_map(|block| {
-            let bt = block.get("type").and_then(|v| v.as_str())?;
-            if matches!(bt, "output_text" | "input_text" | "text") {
-                block.get("text").and_then(|v| v.as_str())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn parse_codex_message(
@@ -371,6 +398,7 @@ fn parse_codex_message(
     let Some(content) = payload.get("content").and_then(|v| v.as_array()) else {
         return;
     };
+    // Shared with driver progress via `boss_engine_codex_rollout`.
     let text = extract_codex_text_blocks(content);
     if text.is_empty() {
         return;
@@ -414,41 +442,23 @@ fn parse_codex_reasoning(
 }
 
 fn parse_codex_tool_call(
+    item_type: &str,
     payload: &serde_json::Map<String, Value>,
     timestamp: Option<String>,
     seq: &mut u64,
     events: &mut Vec<TranscriptEvent>,
 ) {
-    let Some(name) = payload.get("name").and_then(|v| v.as_str()) else {
+    // Shared reshape (exec/exec_command → Bash, argv coerce) with
+    // `boss_engine_driver::codex::progress` via `boss_engine_codex_rollout`.
+    let Some(call) = canonical_rollout_tool_call(item_type, payload) else {
         return;
-    };
-    let raw_input = payload
-        .get("input")
-        .or_else(|| payload.get("arguments"))
-        .cloned()
-        .unwrap_or(Value::Null);
-    let parsed_input = match raw_input {
-        Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
-        other => other,
-    };
-    let (tool_name, tool_input) = match name {
-        "exec" | "exec_command" => {
-            let command = parsed_input
-                .get("cmd")
-                .or_else(|| parsed_input.get("command"))
-                .cloned()
-                .or_else(|| parsed_input.as_str().map(|s| Value::String(s.to_owned())))
-                .unwrap_or(parsed_input);
-            ("Bash".to_owned(), serde_json::json!({ "command": command }))
-        }
-        other => (other.to_owned(), parsed_input),
     };
     push_codex_event(
         events,
         seq,
         TranscriptEventKind::ToolUse {
-            name: tool_name,
-            input: tool_input,
+            name: call.tool_name,
+            input: call.tool_input,
         },
         timestamp,
         None,
@@ -461,21 +471,20 @@ fn parse_codex_tool_output(
     seq: &mut u64,
     events: &mut Vec<TranscriptEvent>,
 ) {
-    let output = match payload.get("output") {
-        Some(Value::Array(arr)) => extract_codex_text_blocks(arr),
-        Some(Value::String(s)) => s.clone(),
-        _ => String::new(),
-    };
-    // The rollout dialect does not carry an explicit success/error flag for
-    // tool outputs the way Claude's `isError` does, so this is always
-    // reported as non-error; a genuinely failed command still shows its
-    // output (e.g. "aborted by user after 0.1s").
+    // Shared with the lower crate: plain string / content-block array / JSON
+    // string `{"output","metadata.exit_code"}` (Codex shell tool dialect).
+    let parsed = payload.get("output").map(canonical_rollout_tool_output).unwrap_or(
+        boss_engine_codex_rollout::CanonicalRolloutToolOutput {
+            body: String::new(),
+            is_error: false,
+        },
+    );
     push_codex_event(
         events,
         seq,
         TranscriptEventKind::ToolResult {
-            output,
-            is_error: false,
+            output: parsed.body,
+            is_error: parsed.is_error,
         },
         timestamp,
         None,
@@ -1671,6 +1680,159 @@ mod tests {
     fn parse_transcript_falls_back_to_empty_on_unrecognized_schema() {
         let jsonl = r#"{"type":"something_else","data":1}"#;
         assert!(parse_transcript(jsonl).is_empty());
+    }
+
+    #[test]
+    fn unrecognized_schema_message_mentions_tail_window_when_types_present() {
+        let jsonl = r#"{"type":"something_else","data":1}"#;
+        let err = parse_transcript_checked(jsonl).expect_err("unknown type");
+        assert!(
+            err.message.contains("unrecognised type") || err.message.contains("try a larger --lines"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // ── Codex parse arms (table-driven) ───────────────────────────────────────
+
+    #[test]
+    fn codex_parse_arms_table() {
+        // Each case is one or more rollout JSONL lines and a predicate over events.
+        struct Case {
+            name: &'static str,
+            jsonl: &'static str,
+            check: fn(&[TranscriptEvent]),
+        }
+
+        let cases = [
+            Case {
+                name: "reasoning summary → Thinking",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"plan the fix"}]}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1, "expected one thinking event");
+                    match &events[0].kind {
+                        TranscriptEventKind::Thinking(t) => assert_eq!(t, "plan the fix"),
+                        other => panic!("expected Thinking, got {other:?}"),
+                    }
+                },
+            },
+            Case {
+                name: "turn_aborted → System",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"event_msg","payload":{"type":"turn_aborted","reason":"user_interrupt"}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    match &events[0].kind {
+                        TranscriptEventKind::System { subtype, body } => {
+                            assert_eq!(subtype.as_deref(), Some("turn_aborted"));
+                            assert_eq!(body, "user_interrupt");
+                        }
+                        other => panic!("expected System, got {other:?}"),
+                    }
+                },
+            },
+            Case {
+                name: "function_call exec_command string args → Bash",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"c1","arguments":"{\"cmd\":\"echo hi\"}"}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    match &events[0].kind {
+                        TranscriptEventKind::ToolUse { name, input } => {
+                            assert_eq!(name, "Bash");
+                            assert_eq!(input.get("command").and_then(|v| v.as_str()), Some("echo hi"));
+                        }
+                        other => panic!("expected ToolUse, got {other:?}"),
+                    }
+                },
+            },
+            Case {
+                name: "exec cmd array → Bash command string for markdown",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c2","input":{"cmd":["echo","hi"]}}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    let segs = events_to_segments(events, &RenderOpts::default());
+                    assert_eq!(segs.len(), 1);
+                    assert!(
+                        segs[0].markdown.contains("echo hi"),
+                        "expected command in fence, got: {}",
+                        segs[0].markdown
+                    );
+                    assert!(segs[0].markdown.contains("```sh"), "got: {}", segs[0].markdown);
+                },
+            },
+            Case {
+                name: "turn_context.model attaches to subsequent assistant",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"turn_context","payload":{"model":"gpt-test-model"}}"#,
+                    "\n",
+                    r#"{"timestamp":"t1","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello model"}]}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    match &events[0].kind {
+                        TranscriptEventKind::AssistantText(t) => assert_eq!(t, "hello model"),
+                        other => panic!("expected AssistantText, got {other:?}"),
+                    }
+                    assert_eq!(events[0].model.as_deref(), Some("gpt-test-model"));
+                },
+            },
+            Case {
+                name: "function_call_output JSON string with exit_code → is_error",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"response_item","payload":{"type":"function_call_output","call_id":"c3","output":"{\"output\":\"boom\\n\",\"metadata\":{\"exit_code\":1}}"}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    match &events[0].kind {
+                        TranscriptEventKind::ToolResult { output, is_error } => {
+                            assert_eq!(output, "boom\n");
+                            assert!(*is_error);
+                        }
+                        other => panic!("expected ToolResult, got {other:?}"),
+                    }
+                },
+            },
+            Case {
+                name: "function_call_output plain string stays non-error",
+                jsonl: concat!(
+                    r#"{"timestamp":"t0","type":"response_item","payload":{"type":"function_call_output","call_id":"c4","output":"https://example.com/pr/1\n"}}"#,
+                    "\n"
+                ),
+                check: |events| {
+                    assert_eq!(events.len(), 1);
+                    match &events[0].kind {
+                        TranscriptEventKind::ToolResult { output, is_error } => {
+                            assert!(output.contains("example.com"));
+                            assert!(!*is_error);
+                        }
+                        other => panic!("expected ToolResult, got {other:?}"),
+                    }
+                },
+            },
+        ];
+
+        for case in cases {
+            let events = parse_transcript(case.jsonl);
+            (case.check)(&events);
+            // Also exercise markdown for the Bash cases so empty fences fail loudly.
+            if case.name.contains("Bash") || case.name.contains("cmd array") {
+                let md = segments_to_markdown(&events_to_segments(&events, &RenderOpts::default()));
+                assert!(md.contains("echo hi"), "{}: markdown missing command: {md}", case.name);
+            }
+        }
     }
 
     // ── char-boundary truncation ──────────────────────────────────────────────

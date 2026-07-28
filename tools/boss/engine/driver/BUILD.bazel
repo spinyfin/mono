@@ -18,6 +18,7 @@ rust_library(
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",
@@ -38,6 +39,7 @@ rust_test(
     deps = [
         "//tools/boss/codex_auth",
         "//tools/boss/engine/codex-hook-trust",
+        "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/ssh-transport",
         "//tools/boss/engine/structured-output",
         "//tools/boss/engine/transient-error",

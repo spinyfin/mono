@@ -502,6 +502,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "boss-engine-codex-rollout"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "boss-engine-codex-rollout-retention"
 version = "0.1.0"
 dependencies = [
@@ -560,6 +567,7 @@ dependencies = [
  "bon",
  "boss-codex-auth",
  "boss-engine-codex-hook-trust",
+ "boss-engine-codex-rollout",
  "boss-engine-structured-output",
  "boss-engine-transient-error",
  "boss-engine-utils",
@@ -867,6 +875,7 @@ name = "boss-transcript-markdown"
 version = "0.1.0"
 dependencies = [
  "bon",
+ "boss-engine-codex-rollout",
  "boss-engine-utils",
  "serde",
  "serde_json",
