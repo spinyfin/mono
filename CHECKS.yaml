@@ -43,6 +43,20 @@ checks:
       severity: error
       allow_bypass: true
 
+  # Caps how many non-deleted files a single changeset may touch. Threshold
+  # (30) sits just above p95 of the last 100 mono PRs; the generic check
+  # default is 50 for unconfigured consumers. Legitimate large surfaces
+  # (coordinated renames, unsplittable generated trees) use
+  # BYPASS_CHANGE_FILE_COUNT=<specific legitimate reason> in the PR/commit
+  # description — not a silent higher default. Distinct from file/size, which
+  # limits lines per file, not file count.
+  - id: change/file-count
+    config:
+      max_files: 30
+    policy:
+      severity: error
+      allow_bypass: true
+
   - id: format/bazel
     policy:
       severity: error

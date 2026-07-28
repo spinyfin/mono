@@ -354,6 +354,98 @@ allow_bypass = true
     assert!(results[0].findings[0].message.contains("unknown implementation"));
 }
 
+#[tokio::test]
+async fn runner_change_file_count_fails_above_max_and_bypasses_with_directive() {
+    let temp = tempdir().expect("create temp dir");
+    for i in 0..4 {
+        let path = temp.path().join(format!("f{i}.txt"));
+        fs::write(&path, format!("content {i}\n")).expect("write file");
+    }
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "change/file-count"
+
+[checks.config]
+max_files = 3
+
+[checks.policy]
+severity = "error"
+allow_bypass = true
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register built-ins");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let oversized = ChangeSet::new(
+        (0..4)
+            .map(|i| ChangedFile {
+                path: Path::new(&format!("f{i}.txt")).to_path_buf(),
+                kind: ChangeKind::Added,
+                old_path: None,
+            })
+            .collect(),
+    );
+
+    let fail_results = runner.run_changeset(&oversized).await.expect("run without bypass");
+    let file_count_result = fail_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran");
+    assert_eq!(file_count_result.findings.len(), 1);
+    assert_eq!(file_count_result.findings[0].severity, Severity::Error);
+    assert!(
+        file_count_result.findings[0].message.contains("max_files=3"),
+        "message was: {}",
+        file_count_result.findings[0].message
+    );
+    assert!(
+        file_count_result.findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT")),
+        "failure remediations should mention bypass guidance; got {:?}",
+        file_count_result.findings[0].remediations
+    );
+
+    let bypass_results = runner
+        .run_changeset(
+            &oversized.with_commit_description(Some(
+                "BYPASS_CHANGE_FILE_COUNT=Coordinated rename of the protocol surface; splitting would leave the tree unbuildable mid-stack.".to_owned(),
+            )),
+        )
+        .await
+        .expect("run with bypass");
+    let bypassed = bypass_results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran with bypass");
+    assert_eq!(bypassed.findings.len(), 1);
+    assert_eq!(bypassed.findings[0].severity, Severity::Warning);
+    assert!(
+        bypassed.findings[0].message.contains("BYPASS_CHANGE_FILE_COUNT"),
+        "message was: {}",
+        bypassed.findings[0].message
+    );
+    assert!(
+        bypassed.findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains("Coordinated rename")),
+        "bypass reason should be recorded; got {:?}",
+        bypassed.findings[0].remediations
+    );
+}
+
 // ── `changed_lines_only` line-level finding filter ──────────────────────────
 //
 // `super::scope_findings_to_changed_lines` is exercised directly here (same
