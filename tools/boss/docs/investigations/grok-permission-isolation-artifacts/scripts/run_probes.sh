@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Reproducible Grok permission-isolation + sandbox probe harness.
 #
-# Verified against: grok 0.2.112 (see ../grok_version.txt)
+# Verified against: grok 0.2.112 (see findings doc).
+# Fixtures are written into a throwaway dir at runtime (not committed).
 #
 # HARD RULES:
 #   - Never set GROK_HOME to the operator's real ~/.grok
@@ -22,7 +23,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ART_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-FIXTURES="$ART_DIR/fixtures"
 
 # Capture the operator home BEFORE any probe mutates HOME.
 # A5/A6 must use this only — never `eval echo ~` after HOME is rewritten
@@ -54,10 +54,72 @@ OUTSIDE="$PROBE_ROOT/outside"
 RESULTS="$PROBE_ROOT/results"
 HOMES="$PROBE_ROOT/homes"
 CLAUDE_THROW="$PROBE_ROOT/claude_throwaway"
+FIXTURES="$PROBE_ROOT/fixtures"
 
-mkdir -p "$CWD" "$OUTSIDE" "$RESULTS" "$HOMES" "$CLAUDE_THROW"
+mkdir -p "$CWD" "$OUTSIDE" "$RESULTS" "$HOMES" "$CLAUDE_THROW" "$FIXTURES"
 echo "probe marker" >"$CWD/README.md"
 echo "outside_secret" >"$OUTSIDE/secret.txt"
+
+# Runtime fixtures (kept out of the PR tree to stay under packaging limits).
+cat >"$FIXTURES/config.compat_disabled.toml" <<'EOF'
+# Isolated GROK_HOME config: always-approve + full Claude/Cursor surface disable.
+# Note: Claude *permission rules* are NOT gated by [compat.claude] — see findings.
+[ui]
+permission_mode = "always-approve"
+
+[compat.claude]
+hooks = false
+agents = false
+skills = false
+plugins = false
+rules = false
+
+[compat.cursor]
+hooks = false
+agents = false
+skills = false
+plugins = false
+rules = false
+EOF
+
+cat >"$FIXTURES/claude_settings.deny_write.json" <<'EOF'
+{
+  "permissions": {
+    "deny": ["Bash", "Edit", "Write", "Bash(*)"],
+    "allow": ["Read", "Grep"]
+  }
+}
+EOF
+
+cat >"$FIXTURES/claude_settings.project_deny.json" <<'EOF'
+{
+  "permissions": {
+    "deny": ["Bash", "Edit", "Write"]
+  }
+}
+EOF
+
+cat >"$FIXTURES/sandbox.probe_custom.toml" <<'EOF'
+# Place under $GROK_HOME/sandbox.toml (or project .grok/sandbox.toml).
+# Paths below are placeholders; the harness rewrites them to the live probe tree.
+[profiles.probe_custom]
+extends = "workspace"
+restrict_network = true
+read_only = ["__OUTSIDE__"]
+deny = ["__OUTSIDE__/secret.txt"]
+read_write = ["__CWD__/extra_rw"]
+EOF
+
+cat >"$FIXTURES/sandbox.bad_extends.toml" <<'EOF'
+[profiles.bad]
+extends = "off"
+EOF
+
+cat >"$FIXTURES/sandbox.bad_glob.toml" <<'EOF'
+[profiles.badglob]
+extends = "workspace"
+deny = ["*.{pem,key}"]
+EOF
 
 if [[ ! -f "$AUTH_SRC" ]]; then
   echo "error: auth source not found at $AUTH_SRC (login once interactively, then re-run)" >&2

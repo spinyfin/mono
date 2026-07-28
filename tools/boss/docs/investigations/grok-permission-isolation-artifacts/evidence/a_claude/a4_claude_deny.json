@@ -1,26 +1,6 @@
 {
   "text": "A4_BLOCKED",
   "stopReason": "EndTurn",
-  "sessionId": "e07ebd49-e865-4695-b8f9-382a60a844d5",
-  "requestId": "583144d2-158a-4a84-8404-cc0c48342512",
-  "thought": "The user wants me to create a file called probe_a4_write.txt in the cwd with the exact single line \"A4_SHOULD_NOT_EXIST\". If blocked by permissions, I should reply with exactly \"A4_BLOCKED\". If succes...The write was blocked by permissions. I should reply with exactly: A4_BLOCKED",
-  "usage": {
-    "input_tokens": 322,
-    "cache_read_input_tokens": 22400,
-    "output_tokens": 150,
-    "reasoning_tokens": 138,
-    "total_tokens": 22872
-  },
   "num_turns": 2,
-  "total_cost_usd": 0.008264,
-  "total_cost_usd_ticks": 82640000,
-  "modelUsage": {
-    "grok-4.5-build": {
-      "inputTokens": 322,
-      "outputTokens": 150,
-      "cacheReadInputTokens": 22400,
-      "modelCalls": 2,
-      "costUSD": 0.008264
-    }
-  }
+  "thought": "The user wants me to create a file called probe_a4_write.txt in the cwd with the exact single line \"A4_SHOULD_NOT_EXIST\". If blocked by permissions, I should reply with exactly \"A4_BLOCKED\". If succes...The write was blocked by permissions. I should reply with exactly: A4_BLOCKED"
 }

@@ -1,0 +1,5 @@
+{
+  "text": "B4_WROTE",
+  "stopReason": "EndTurn",
+  "note": "deny run_terminal_command (bare): session starts; shell write succeeds (fail-open for shell intent)"
+}

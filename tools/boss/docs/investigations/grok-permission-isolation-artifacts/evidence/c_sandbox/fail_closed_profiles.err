@@ -1,2 +1,7 @@
+# extends_off
+warning: sandbox could not be applied: Profile 'bad' extends 'off', but 'off'/'none' is not a valid base profile
+error: could not apply the 'bad' sandbox profile (including direct global-hook write protection); refusing to start.
+
+# brace_glob_deny
 warning: sandbox could not be applied: deny glob "*.{pem,key}" uses unsupported metacharacter '{' (brace alternation and backslash-escapes are not supported; use separate deny entries)
 error: could not apply the 'badglob' sandbox profile (including direct global-hook write protection); refusing to start.

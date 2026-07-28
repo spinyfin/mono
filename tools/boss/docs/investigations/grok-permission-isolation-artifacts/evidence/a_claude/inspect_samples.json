@@ -1,0 +1,205 @@
+{
+  "a1_scoped_empty_home": {
+    "grokVersion": "0.2.112",
+    "projectTrusted": true,
+    "permissions": {
+      "sources": [],
+      "loaded": 0,
+      "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+      "managedSettingsExists": false,
+      "managedSettingsActive": false
+    },
+    "projectInstructions": [],
+    "configSources": {
+      "layers": [
+        {
+          "role": "user",
+          "path": "/tmp/grok-perm-isolation/homes/a1_home_scoped/config.toml"
+        }
+      ]
+    }
+  },
+  "a2_throwaway_deny_settings": {
+    "grokVersion": "0.2.112",
+    "projectTrusted": true,
+    "permissions": {
+      "sources": [
+        "/tmp/grok-perm-isolation/claude_throwaway/home_a2/.claude/settings.local.json (settings)"
+      ],
+      "loaded": 6,
+      "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+      "managedSettingsExists": false,
+      "managedSettingsActive": false
+    },
+    "projectInstructions": [],
+    "configSources": {
+      "layers": [
+        {
+          "role": "user",
+          "path": "/tmp/grok-perm-isolation/homes/a2_claude_deny/config.toml"
+        }
+      ]
+    }
+  },
+  "a5_real_home_isolated_grok_home": {
+    "grokVersion": "0.2.112",
+    "projectTrusted": true,
+    "permissions": {
+      "sources": ["/Users/brianduff/.claude/settings.local.json (settings)"],
+      "loaded": 1,
+      "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+      "managedSettingsExists": false,
+      "managedSettingsActive": false
+    },
+    "projectInstructions": [
+      {
+        "path": "/Users/brianduff/.claude/Claude.md",
+        "scope": "global",
+        "vendor": "claude",
+        "disabled": true,
+        "compatibilityStatus": "disabled"
+      }
+    ],
+    "configSources": {
+      "layers": [
+        {
+          "role": "user",
+          "path": "/Users/brianduff/.cache/grok-perm-isolation-probe/homes/a5_real_home/config.toml"
+        }
+      ]
+    }
+  },
+  "a6_compat_permissions_false": {
+    "grokVersion": "0.2.112",
+    "projectTrusted": true,
+    "permissions": {
+      "sources": ["/Users/brianduff/.claude/settings.local.json (settings)"],
+      "loaded": 1,
+      "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+      "managedSettingsExists": false,
+      "managedSettingsActive": false
+    },
+    "projectInstructions": [
+      {
+        "path": "/Users/brianduff/.claude/Claude.md",
+        "scope": "global",
+        "vendor": "claude",
+        "disabled": true,
+        "compatibilityStatus": "disabled"
+      }
+    ],
+    "configSources": {
+      "layers": [
+        {
+          "role": "user",
+          "path": "/Users/brianduff/.cache/grok-perm-isolation-probe/homes/a6_compat_try/config.toml"
+        }
+      ]
+    },
+    "externalCompat": {
+      "cells": [
+        {
+          "vendor": "cursor",
+          "surface": "skills",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "cursor",
+          "surface": "rules",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "cursor",
+          "surface": "agents",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "cursor",
+          "surface": "mcps",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "cursor",
+          "surface": "hooks",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "cursor",
+          "surface": "sessions",
+          "enabled": true,
+          "source": "default"
+        },
+        {
+          "vendor": "claude",
+          "surface": "skills",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "claude",
+          "surface": "rules",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "claude",
+          "surface": "agents",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "claude",
+          "surface": "mcps",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "claude",
+          "surface": "hooks",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "claude",
+          "surface": "sessions",
+          "enabled": false,
+          "source": "config"
+        },
+        {
+          "vendor": "codex",
+          "surface": "sessions",
+          "enabled": true,
+          "source": "default"
+        }
+      ]
+    },
+    "note": "Claude cells present: agents, hooks, mcps, rules, sessions, skills; no \"permissions\" surface (permissions=false is inert / not a cell)."
+  },
+  "a7c_project_settings_scoped_home": {
+    "grokVersion": "0.2.112",
+    "projectTrusted": true,
+    "permissions": {
+      "sources": [
+        "/Users/brianduff/.cache/grok-perm-isolation-probe/cwd/.claude/settings.json (settings)"
+      ],
+      "loaded": 3,
+      "managedSettingsPath": "/Library/Application Support/ClaudeCode/managed-settings.json",
+      "managedSettingsExists": false,
+      "managedSettingsActive": false
+    },
+    "projectInstructions": [],
+    "configSources": {
+      "layers": [
+        {
+          "role": "user",
+          "path": "/Users/brianduff/.cache/grok-perm-isolation-probe/homes/a7c/config.toml"
+        }
+      ]
+    }
+  }
+}

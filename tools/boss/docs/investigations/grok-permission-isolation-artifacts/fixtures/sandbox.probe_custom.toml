@@ -1,8 +1,0 @@
-# Place under $GROK_HOME/sandbox.toml (or project .grok/sandbox.toml).
-# Paths below are placeholders; the harness rewrites them to the live probe tree.
-[profiles.probe_custom]
-extends = "workspace"
-restrict_network = true
-read_only = ["__OUTSIDE__"]
-deny = ["__OUTSIDE__/secret.txt"]
-read_write = ["__CWD__/extra_rw"]

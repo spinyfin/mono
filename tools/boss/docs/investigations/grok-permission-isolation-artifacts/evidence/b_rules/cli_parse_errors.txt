@@ -1,0 +1,5 @@
+# malformed_rule
+Error: --deny "((((": malformed rule: missing closing parenthesis
+
+# unknown_prefix_Agent
+Error: --deny "Agent(model:opus)": unknown tool prefix: Agent

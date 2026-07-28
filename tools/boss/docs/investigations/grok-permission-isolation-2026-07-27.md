@@ -295,7 +295,7 @@ These are findings-driven recommendations, not implemented in this PR.
 | --------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | `~/.cache/grok-perm-isolation-probe/`                                 | Primary non-`/tmp` probe root (homes, cwd, outside, results)                               |
 | `/tmp/grok-perm-isolation/`                                           | Early probes (valid for permission rules; **invalid** alone for sandbox write conclusions) |
-| `tools/boss/docs/investigations/grok-permission-isolation-artifacts/` | Committed fixtures, harness, sample evidence                                               |
+| `tools/boss/docs/investigations/grok-permission-isolation-artifacts/` | Harness + curated redacted samples (fixtures written at runtime by the harness)            |
 
 ## Appendix B — How to re-run
 
@@ -312,8 +312,11 @@ Environment overrides: `GROK_BIN`, `MODEL` (must not be `grok-code-fast-1`), `PR
 
 ## Appendix C — Evidence index
 
-| Group          | Paths under `grok-permission-isolation-artifacts/evidence/`                                                                                                                                                                                                        |
-| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Claude leakage | `a_claude/a1_inspect_scoped_home.json`, `a2_inspect_deny.json`, `a3_control.json`, `a4_claude_deny.json`, `a5_real_home_inspect.json`, `a6_compat_perms.json`, `a7c_inspect.json`, `a7c_run.json`                                                                  |
-| Rule grammar   | `b_rules/b1_*.json`, `b2_cli_deny_edit.*` (`Edit` deny), `b3_*.json`, `b4_*.json`, `b4b_native_cmd.*` (`run_terminal_cmd` fail-open), `b5_malformed.err` (`malformed rule…`), `b5c_unrecognized.err`, `b5c2.json` — all harness-reproducible via `run_probes.sh b` |
-| Sandbox        | `c_sandbox/sb_ro_nontmp.json`, `sb_ws_nontmp.json`, `sb_strict_nontmp.json`, `sb_ro_tmp_ok.json`, `sb_custom.json`, `sb_hook.json`, `sb_bad.err`, `sb_badglob.err`, `sandbox_events_merged.jsonl`                                                                  |
+Committed samples are redacted / trimmed to the fields the claims need. Full probe matrices are **not** checked in; re-run `scripts/run_probes.sh` to regenerate under `$PROBE_ROOT/results/`.
+
+| Group          | Paths under `grok-permission-isolation-artifacts/evidence/`                   | What they prove                                                                                                                                                             |
+| -------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Claude leakage | `a_claude/inspect_samples.json`                                               | A1 empty sources; A2 throwaway deny `loaded: 6`; A5 real-HOME leak; A6 `permissions=false` still loads + no permissions compat cell; A7c project settings under scoped HOME |
+| Claude leakage | `a_claude/a4_claude_deny.json`, `a_claude/a7c_run.json`                       | Runtime enforce under always-approve (`A4_BLOCKED`; `Denied by permission policy: deny rule on edit`)                                                                       |
+| Rule grammar   | `b_rules/cli_parse_errors.txt`, `b_rules/b4_native_failopen.json`             | Fail-closed `((((` / `Agent(…)`; bare `run_terminal_command` fail-open for shell. Other spellings (Bash/Edit/rm, `NotARealTool`) via harness group `b` / `parse`            |
+| Sandbox        | `c_sandbox/sandbox_events_merged.jsonl`, `c_sandbox/fail_closed_profiles.err` | Seatbelt `ProfileApplied` + `FsViolation` (read-only write, strict/custom read); refuse-to-start for `extends=off` and brace-glob deny                                      |
