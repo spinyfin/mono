@@ -93,6 +93,31 @@ final class TitlebarAccessoryHostTests: XCTestCase {
         XCTAssertNil(host.installedController)
     }
 
+    /// The accessory hides with the titlebar in fullscreen unless it declares a
+    /// minimum height, so every reported content height must land on the
+    /// controller — including one the banner produces on its own (expanding to
+    /// list every health issue) with no other state change alongside it.
+    func testTracksContentHeightForFullScreen() throws {
+        let window = makeWindow()
+        let host = TitlebarAccessoryHost()
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 36)
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 36)
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 92)
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 92)
+    }
+
+    func testIgnoresUnmeasuredContentHeight() throws {
+        let window = makeWindow()
+        let host = TitlebarAccessoryHost()
+
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 36)
+        host.update(window: window, content: banner, isPresented: true, contentHeight: 0)
+
+        XCTAssertEqual(host.installedController?.fullScreenMinHeight, 36)
+    }
+
     func testIgnoresUpdatesBeforeTheViewHasAWindow() {
         let host = TitlebarAccessoryHost()
 

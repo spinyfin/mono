@@ -31,25 +31,17 @@ import SwiftUI
 /// `NSTitlebarAccessoryViewController.isHidden`, which collapses it out of the
 /// titlebar layout entirely, so a hidden banner costs no height.
 ///
-/// ## Measured
+/// ## The bar spans the content area, not the whole window
 ///
-/// The three candidate shapes were compared in a standalone AppKit harness
-/// (same window style: `.titled + .fullSizeContentView`, unified toolbar, root
-/// `NavigationSplitView` with a `.sidebar`-styled `List`), probing where the
-/// sidebar's first section header actually lands in window coordinates against
-/// a 52pt titlebar:
-///
-/// | shape | sidebar header y | split view |
-/// | --- | --- | --- |
-/// | `safeAreaInset` on the root (pre-#2459) | 55 — under a banner spanning 52…83 | promoted, full window height |
-/// | `VStack { banner; split view }` (#2459) | 94 — clear of the banner | demoted: sidebar becomes an 8pt-inset floating panel |
-/// | titlebar accessory (this) | 91 — clear of the 36pt accessory ending at 88 | promoted, full window height |
-///
-/// Only the accessory gets both right at once. One deliberate consequence:
-/// with a full-height sidebar, AppKit lays the accessory out in the titlebar
-/// segment *beside* the sidebar (measured origin x = the sidebar's trailing
-/// edge), so the bar spans the content area rather than the whole window —
-/// the same placement Xcode and Mail use for their titlebar accessories.
+/// With a full-height sidebar, AppKit splits the titlebar into a sidebar
+/// segment and a content segment, and lays a `.bottom` accessory out in the
+/// content segment only — its origin x is the sidebar's trailing edge. So the
+/// bar starts where the content starts, the same placement Xcode and Mail use.
+/// This is deliberate: reaching the window's left edge would mean giving up
+/// full-height sidebar layout, which is exactly the sidebar styling this whole
+/// arrangement exists to preserve. Note that the Work `NavigationSplitView`
+/// stays mounted (at opacity 0) on the Agents / Designs / Automations tabs, so
+/// the inset is present there too even though no sidebar is drawn.
 @MainActor
 final class TitlebarAccessoryHost {
     private var controller: NSTitlebarAccessoryViewController?
@@ -62,7 +54,15 @@ final class TitlebarAccessoryHost {
 
     /// Installs (on first presentation), refreshes, and shows/hides the
     /// accessory. Safe to call on every SwiftUI layout pass.
-    func update(window: NSWindow?, content: AnyView, isPresented: Bool) {
+    ///
+    /// `contentHeight` is the height `content` measured at inside the hosted
+    /// SwiftUI tree; pass 0 when it is not known yet.
+    func update(
+        window: NSWindow?,
+        content: AnyView,
+        isPresented: Bool,
+        contentHeight: CGFloat = 0
+    ) {
         guard let window else { return }
         // AppKit can reparent a hosting view into a different window (tab
         // detachment); move the accessory rather than leaving it behind.
@@ -79,17 +79,15 @@ final class TitlebarAccessoryHost {
         controller.isHidden = !isPresented
 
         // A titlebar accessory hides with the titlebar in fullscreen unless it
-        // declares a minimum height. Report the height the banner actually laid
-        // out at so a health warning does not vanish when the operator
-        // fullscreens the window. Deferred a runloop tick because the accessory
-        // has no resolved width — and so no wrapped-text height — until AppKit
-        // has laid the titlebar out once.
-        DispatchQueue.main.async { [weak controller, weak hosting] in
-            guard let controller, let hosting, !controller.isHidden else { return }
-            let height = hosting.frame.height
-            if height > 0, height != controller.fullScreenMinHeight {
-                controller.fullScreenMinHeight = height
-            }
+        // declares a minimum height, so report the height the banner actually
+        // laid out at — otherwise a health warning vanishes when the window is
+        // fullscreened. The measurement comes from inside the hosted SwiftUI
+        // tree, so it tracks every height change: Dynamic Type, a live resize
+        // that rewraps the text, and changes the banner makes on its own (the
+        // health banner grows to list every issue when its chevron is tapped,
+        // which never re-runs this view's body).
+        if contentHeight > 0, contentHeight != controller.fullScreenMinHeight {
+            controller.fullScreenMinHeight = contentHeight
         }
     }
 
@@ -137,6 +135,7 @@ final class TitlebarAccessoryHost {
 /// deferred one runloop tick.
 private struct TitlebarAccessoryInstaller: NSViewRepresentable {
     let isPresented: Bool
+    let contentHeight: CGFloat
     let content: AnyView
 
     func makeCoordinator() -> TitlebarAccessoryHost {
@@ -148,18 +147,60 @@ private struct TitlebarAccessoryInstaller: NSViewRepresentable {
         let host = context.coordinator
         let content = content
         let isPresented = isPresented
+        let contentHeight = contentHeight
         DispatchQueue.main.async {
-            host.update(window: view.window, content: content, isPresented: isPresented)
+            host.update(
+                window: view.window,
+                content: content,
+                isPresented: isPresented,
+                contentHeight: contentHeight
+            )
         }
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.update(window: nsView.window, content: content, isPresented: isPresented)
+        context.coordinator.update(
+            window: nsView.window,
+            content: content,
+            isPresented: isPresented,
+            contentHeight: contentHeight
+        )
     }
 
     static func dismantleNSView(_ nsView: NSView, coordinator: TitlebarAccessoryHost) {
         coordinator.detach()
+    }
+}
+
+/// Measures the accessory content's height from inside the hosted SwiftUI tree
+/// and feeds it back to the host, so `fullScreenMinHeight` tracks height
+/// changes the enclosing view's body never sees.
+private struct WindowTitlebarAccessoryModifier<Accessory: View>: ViewModifier {
+    let isPresented: Bool
+    @ViewBuilder let accessory: () -> Accessory
+
+    @State private var contentHeight: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        content.background(
+            TitlebarAccessoryInstaller(
+                isPresented: isPresented,
+                contentHeight: contentHeight,
+                content: AnyView(measuredAccessory)
+            )
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+        )
+    }
+
+    private var measuredAccessory: some View {
+        accessory()
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { height in
+                contentHeight = height
+            }
     }
 }
 
@@ -173,12 +214,8 @@ extension View {
     /// `TitlebarAccessoryHost` for why that demotion breaks sidebar rendering.
     func windowTitlebarAccessory<Accessory: View>(
         isPresented: Bool,
-        @ViewBuilder content: () -> Accessory
+        @ViewBuilder content: @escaping () -> Accessory
     ) -> some View {
-        background(
-            TitlebarAccessoryInstaller(isPresented: isPresented, content: AnyView(content()))
-                .frame(width: 0, height: 0)
-                .allowsHitTesting(false)
-        )
+        modifier(WindowTitlebarAccessoryModifier(isPresented: isPresented, accessory: content))
     }
 }

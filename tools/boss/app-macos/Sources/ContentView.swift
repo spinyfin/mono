@@ -409,7 +409,16 @@ struct ContentView: View {
             || (model.isConnected && !model.engineHealthIssues.isEmpty)
     }
 
-    /// Full-width chrome banners rendered in the titlebar accessory slot.
+    /// Insertion-only: a banner slides down into the gap AppKit has just
+    /// reserved. There is no removal half because there is nothing to play it
+    /// in — when the last banner goes away the accessory is hidden in the same
+    /// pass, collapsing the slot instantly.
+    private var bannerTransition: AnyTransition {
+        .asymmetric(insertion: .move(edge: .top).combined(with: .opacity), removal: .identity)
+    }
+
+    /// Chrome banners rendered in the titlebar accessory slot; they span the
+    /// window's content area (see `TitlebarAccessoryHost`).
     /// Height is content-driven (Dynamic Type, multi-line wrap); the accessory
     /// reports it to AppKit, which reserves that much space above the content.
     @ViewBuilder
@@ -432,7 +441,7 @@ struct ContentView: View {
                     isRestarting: model.isRestartingEngine,
                     onRestart: { model.restartEngine() }
                 )
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .transition(bannerTransition)
             }
             // Connection is up but the engine reports a degraded
             // condition (missing ANTHROPIC_API_KEY, dispatch paused,
@@ -443,7 +452,7 @@ struct ContentView: View {
                     issues: model.engineHealthIssues,
                     onUnpauseDispatch: { model.resumeDispatch() }
                 )
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .transition(bannerTransition)
             }
         }
         // Scoped to the banner stack rather than applied to the whole body:
