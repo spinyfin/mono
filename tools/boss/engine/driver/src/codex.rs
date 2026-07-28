@@ -462,6 +462,15 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// under which Codex does not consult `sandbox_workspace_write` at all, so no
 /// worker-kind branch is needed here — reviewers don't run build gates and
 /// stay fully denied.
+///
+/// `workspace` itself is granted write access by Codex's own cwd default,
+/// separate from this function's `writable_roots` list, and does not need a
+/// paired `workspace/.git` grant: cube workspaces are non-colocated secondary
+/// jj workspaces (`.jj` pointer file, no `.git`) by construction — the same
+/// invariant `--skip-git-repo-check` exists to work around (see
+/// `build_codex_exec_command`) — so there is no colocated `.git` under
+/// `workspace` for the sandbox's auto-exclusion to bite. Only the shared
+/// store root resolved by [`cube_repo_store_root`] carries a real `.git`.
 fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     let mut out = String::from(
         "[sandbox_workspace_write]\n\
@@ -469,7 +478,21 @@ fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     );
     let mut roots = bazel_writable_roots();
     match cube_repo_store_root(workspace) {
-        Some(root) => roots.push(root),
+        Some(root) => {
+            // Codex's workspace-write sandbox name-excludes `.git` from every
+            // writable root it renders (verified against codex-cli 0.145.0's
+            // seatbelt template: each granted root gets a paired
+            // `require-not (subpath ..._EXCLUDED_...)` clause covering its own
+            // `.git`). Granting `root` alone lets `jj`/git-backend writes
+            // under `.jj` succeed but leaves `root/.git/FETCH_HEAD` and
+            // `root/.git/objects/*` denied with `Operation not permitted`,
+            // which is exactly where `jj git fetch` and `jj new` write. An
+            // explicit `root/.git` entry is its own top-level writable root,
+            // so it is not subject to the auto-exclusion applied to `root`.
+            let git_dir = root.join(".git");
+            roots.push(root);
+            roots.push(git_dir);
+        }
         None if workspace.join(".jj").join("repo").is_file() => {
             tracing::warn!(
                 workspace = %workspace.display(),
@@ -1977,6 +2000,34 @@ else:
         assert!(
             toml.contains(&quoted_repo_root),
             "writable_roots must include the cube shared repo store: {toml}"
+        );
+    }
+
+    /// Codex's workspace-write sandbox name-excludes `.git` from every
+    /// writable root it is granted, so granting the cube store root alone is
+    /// not enough: `jj git fetch`'s `FETCH_HEAD` write and `jj new`'s loose
+    /// object writes both land under `<store root>/.git` and get denied with
+    /// `Operation not permitted` even though the store root itself is
+    /// writable. An explicit `<store root>/.git` entry is its own top-level
+    /// writable root and is not subject to that auto-exclusion.
+    #[test]
+    fn render_sandbox_workspace_write_toml_grants_store_root_git_dir() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        write_cube_jj_pointer(&workspace, &repo_root);
+
+        let toml = render_sandbox_workspace_write_toml(&workspace);
+        let quoted_repo_root = toml_basic_string(&repo_root.display().to_string());
+        let quoted_git_dir = toml_basic_string(&repo_root.join(".git").display().to_string());
+        assert!(
+            toml.contains(&quoted_repo_root),
+            "writable_roots must include the cube shared repo store root: {toml}"
+        );
+        assert!(
+            toml.contains(&quoted_git_dir),
+            "writable_roots must include the store root's .git dir explicitly, since Codex \
+             auto-excludes .git from every granted root: {toml}"
         );
     }
 
