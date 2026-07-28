@@ -1,18 +1,18 @@
 {
-  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=pre_tool_use\nGROK_HOOK_NAME=global/dump-all:pre_tool_use[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-pane-spike/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=pre_tool_use\nGROK_HOOK_NAME=global/dump-all:pre_tool_use[0].hooks[0]\nGROK_SESSION_ID=7727264c-bc7d-4419-b201-4e4b13fd3d03\nGROK_WORKSPACE_ROOT=/private/tmp/grok-pane-spike/cwd",
   "stdin": {
     "hookEventName": "pre_tool_use",
-    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
-    "cwd": "/private/tmp/grok-t02-vocab/cwd",
-    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
-    "timestamp": "2026-07-28T00:54:07.192549+00:00",
-    "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
+    "sessionId": "7727264c-bc7d-4419-b201-4e4b13fd3d03",
+    "cwd": "/private/tmp/grok-pane-spike/cwd",
+    "workspaceRoot": "/private/tmp/grok-pane-spike/cwd",
+    "timestamp": "2026-07-27T22:56:09.311609+00:00",
+    "transcriptPath": "/tmp/grok-pane-spike/home/sessions/%2Fprivate%2Ftmp%2Fgrok-pane-spike%2Fcwd/7727264c-bc7d-4419-b201-4e4b13fd3d03/updates.jsonl",
     "permissionMode": "bypassPermissions",
     "toolName": "write",
-    "toolUseId": "call-ef95d1a0-f372-4c75-a667-77187c00ed2e-0",
+    "toolUseId": "call-b8e62e24-8073-4514-92c9-ad0e8e29b6a7-0",
     "toolInput": {
-      "file_path": "/private/tmp/grok-t02-vocab/cwd/toolmap_write.txt",
-      "content": "WRITE_OK\n"
+      "file_path": "/private/tmp/grok-pane-spike/cwd/tool_probe.txt",
+      "content": "TOOL_PROBE_OK\n"
     },
     "toolInputTruncated": false
   }

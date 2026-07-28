@@ -1,0 +1,10 @@
+tag|hook_exit|agent_exit|attack|content
+deny|0|0|absent|
+block|0|0|present|ATTACK_block_OK
+approve|0|0|present|ATTACK_approve_OK
+allow|0|0|present|ATTACK_allow_OK
+empty|0|0|present|ATTACK_empty_OK
+no_decision_key|0|0|present|ATTACK_no_decision_key_OK
+exit2|2|0|absent|
+foobar|0|0|present|ATTACK_foobar_OK
+permit|0|0|present|ATTACK_permit_OK

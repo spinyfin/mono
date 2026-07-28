@@ -1,11 +1,11 @@
 {
-  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-t02-vocab/home\nGROK_HOOK_EVENT=session_start\nGROK_HOOK_NAME=global/dump-all:session_start[0].hooks[0]\nGROK_SESSION_ID=0c4c0914-5e64-432c-90fa-dcdad9ff5957\nGROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd",
+  "env_excerpt": "CLAUDE_PROJECT_DIR=/private/tmp\nGROK_AGENT=1\nGROK_HOME=/tmp/grok-pane-spike/home\nGROK_HOOK_EVENT=session_start\nGROK_HOOK_NAME=global/dump-all:session_start[0].hooks[0]\nGROK_SESSION_ID=019fa5ca-e48f-7801-b7f8-eae8e35f4de4\nGROK_WORKSPACE_ROOT=/private/tmp",
   "stdin": {
     "hookEventName": "session_start",
-    "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
-    "cwd": "/private/tmp/grok-t02-vocab/cwd",
-    "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
-    "timestamp": "2026-07-28T00:54:03.902740+00:00",
+    "sessionId": "019fa5ca-e48f-7801-b7f8-eae8e35f4de4",
+    "cwd": "/private/tmp",
+    "workspaceRoot": "/private/tmp",
+    "timestamp": "2026-07-27T22:56:06.506940+00:00",
     "permissionMode": "bypassPermissions",
     "source": "new"
   }

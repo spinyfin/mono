@@ -16,3 +16,10 @@ permit|present|allows (unrecognised decision — fail-open)
 
 Official doc (bundled 10-hooks.md): PreToolUse accepts decision=allow|deny only.
 decision=block is documented for Stop/SubagentStop stop-gate, NOT PreToolUse.
+
+Committed raw PreToolUse stdin (hook-ran proof for the two critical cells only):
+  pre_block.raw  — fail-open Boss vocabulary
+  pre_deny.raw   — documented blocking deny
+Full matrix rows: matrix.tsv (columns: tag|hook_exit|agent_exit|attack|content).
+To regenerate every pre_*/agent_* pair, see the Appendix in
+tools/boss/docs/investigations/grok-pretooluse-decision-vocabulary-and-tool-name-map.md

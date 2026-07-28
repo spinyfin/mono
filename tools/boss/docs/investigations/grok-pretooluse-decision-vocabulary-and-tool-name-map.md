@@ -4,7 +4,8 @@
 - **Kind:** empirical investigation — findings + fixtures only; no engine / driver code
 - **Pinned CLI:** `grok 0.2.112 (9bbd559437aa) [stable]` (`~/.grok/bin/grok`)
 - **Isolation:** throwaway `GROK_HOME=/tmp/grok-t02-vocab/home` (never `~/.grok`); auth.json copied once; `[compat.claude]` / `[compat.cursor]` hooks disabled; model `grok-4.5` (not `grok-code-fast-1`)
-- **Related:** [ghostty-grok-pane-viability.md](./ghostty-grok-pane-viability.md) Q5–Q6; design doc T-02 / OQ-2; fixtures under [`ghostty-grok-pane-viability-artifacts/cli/`](./ghostty-grok-pane-viability-artifacts/cli/)
+- **Related:** [ghostty-grok-pane-viability.md](./ghostty-grok-pane-viability.md) Q5–Q6; design doc T-02 / OQ-2
+- **Fixtures:** [`grok-pretooluse-decision-vocabulary-artifacts/`](./grok-pretooluse-decision-vocabulary-artifacts/) (not nested under the pane-viability spike tree)
 
 ## Why this investigation exists
 
@@ -47,7 +48,7 @@ Second question: which `toolName` values Grok actually puts on the wire for the 
 3. Pass criterion: attack file **absent** ⇒ blocked; **present** with expected contents ⇒ allowed. Hook stdin was always captured to prove the hook ran (so "allowed" is not "hook skipped").
 4. Separate run with a dump-all hook set to capture real payloads for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification`, while forcing write + search_replace + shell (including `which git jj gh`) and a background `sleep` (to fire `Notification` / `get_command_or_subagent_output`).
 
-Evidence: [`cli/decision_vocab/`](./ghostty-grok-pane-viability-artifacts/cli/decision_vocab/), [`cli/hook_payloads/`](./ghostty-grok-pane-viability-artifacts/cli/hook_payloads/).
+Evidence (trimmed fixtures): [`decision_vocab/`](./grok-pretooluse-decision-vocabulary-artifacts/decision_vocab/), [`hook_payloads/`](./grok-pretooluse-decision-vocabulary-artifacts/hook_payloads/). See [Appendix: regenerating the full matrix](#appendix-regenerating-the-full-matrix) to reproduce every cell with raw/agent dumps.
 
 ---
 
@@ -88,7 +89,11 @@ Probe target: create `ATTACK_<tag>.txt` via the **write** tool (not shell).
 | `{"decision":"foobar",…}`                  | **present**                   | fail-open (unrecognised)                            |
 | `{"decision":"permit",…}`                  | **present**                   | fail-open (unrecognised)                            |
 
-Raw stdin captures proving each hook fired: `cli/decision_vocab/pre_<tag>.raw`. Agent JSON: `cli/decision_vocab/agent_*.json`. Table: `cli/decision_vocab/matrix.tsv`.
+Committed evidence (trimmed for review):
+
+- Full row outcomes: [`decision_vocab/matrix.tsv`](./grok-pretooluse-decision-vocabulary-artifacts/decision_vocab/matrix.tsv) — columns `tag|hook_exit|agent_exit|attack|content` (`hook_exit` is the probe hook process exit; `agent_exit` is the `grok -p` process exit, which was `0` for every cell including blocks).
+- Narrative summary: [`decision_vocab/SUMMARY.txt`](./grok-pretooluse-decision-vocabulary-artifacts/decision_vocab/SUMMARY.txt).
+- Raw PreToolUse stdin proving the hook fired for the two critical cells only: [`pre_block.raw`](./grok-pretooluse-decision-vocabulary-artifacts/decision_vocab/pre_block.raw) (fail-open) and [`pre_deny.raw`](./grok-pretooluse-decision-vocabulary-artifacts/decision_vocab/pre_deny.raw) (blocks). Other cells were measured the same way; regenerate full `pre_*` / `agent_*` pairs via the Appendix if needed.
 
 ### What this means for Boss
 
@@ -115,7 +120,7 @@ Raw stdin captures proving each hook fired: `cli/decision_vocab/pre_<tag>.raw`. 
 | `search_replace`                 | `Edit`                    | `file_path`, `old_string`, `new_string`         | In-place edit.                                     |
 | `get_command_or_subagent_output` | _(none in Boss guards)_   | `task_ids`, `timeout_ms`                        | Background-task poll; not a VCS surface.           |
 
-Fixtures: `PreToolUse.<toolName>.sample.json` and matching `PostToolUse.<toolName>.sample.json`.
+Fixtures (one PreToolUse per map toolName): `PreToolUse.write.sample.json`, `PreToolUse.search_replace.sample.json`, `PreToolUse.run_terminal_command.sample.json`.
 
 ### Matcher aliases (bundled docs — for hook **matchers**, not payload fields)
 
@@ -170,24 +175,27 @@ arrived as a single `run_terminal_command` PreToolUse with that full string in `
 | `search_replace`       | `SearchReplace`            |
 | `run_terminal_command` | `Bash`                     |
 
-Useful for progress normalisers; not a substitute for PreToolUse `toolName` when gating.
+Useful for progress normalisers; not a substitute for PreToolUse `toolName` when gating. Fixtures: one PostToolUse event sample (`PostToolUse.sample.json` = write / `SearchReplace` shape) plus `PostToolUse.run_terminal_command.sample.json` for the distinct `Bash` result shape. Redundant `search_replace` / `write` PostToolUse twins were dropped.
 
 ---
 
 ## Part 3 — Hook payload fixtures
 
-Refreshed real captures (isolated home, grok 0.2.112) for every event the original spike observed:
+Real captures (isolated home, grok 0.2.112), one sample per event type plus PreToolUse per map tool:
 
-| Event                                             | Fixture                                                                                           |
-| ------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `SessionStart`                                    | `cli/hook_payloads/SessionStart.sample.json`                                                      |
-| `UserPromptSubmit`                                | `cli/hook_payloads/UserPromptSubmit.sample.json`                                                  |
-| `PreToolUse` (generic = `write`)                  | `cli/hook_payloads/PreToolUse.sample.json`                                                        |
-| `PreToolUse` per tool                             | `PreToolUse.write`, `.search_replace`, `.run_terminal_command`, `.get_command_or_subagent_output` |
-| `PostToolUse` (generic = `write`)                 | `cli/hook_payloads/PostToolUse.sample.json`                                                       |
-| `PostToolUse` per tool                            | matching `PostToolUse.<tool>.sample.json`                                                         |
-| `Stop`                                            | `cli/hook_payloads/Stop.sample.json`                                                              |
-| `Notification` (`notificationType=task_complete`) | `cli/hook_payloads/Notification.sample.json`                                                      |
+| Event                                             | Fixture                                                      |
+| ------------------------------------------------- | ------------------------------------------------------------ |
+| `SessionStart`                                    | `hook_payloads/SessionStart.sample.json`                     |
+| `UserPromptSubmit`                                | `hook_payloads/UserPromptSubmit.sample.json`                 |
+| `PreToolUse` (`write`)                            | `hook_payloads/PreToolUse.write.sample.json`                 |
+| `PreToolUse` (`search_replace`)                   | `hook_payloads/PreToolUse.search_replace.sample.json`        |
+| `PreToolUse` (`run_terminal_command`)             | `hook_payloads/PreToolUse.run_terminal_command.sample.json`  |
+| `PostToolUse` (`write` / SearchReplace shape)     | `hook_payloads/PostToolUse.sample.json`                      |
+| `PostToolUse` (`run_terminal_command` / Bash)     | `hook_payloads/PostToolUse.run_terminal_command.sample.json` |
+| `Stop`                                            | `hook_payloads/Stop.sample.json`                             |
+| `Notification` (`notificationType=task_complete`) | `hook_payloads/Notification.sample.json`                     |
+
+All paths under [`grok-pretooluse-decision-vocabulary-artifacts/`](./grok-pretooluse-decision-vocabulary-artifacts/).
 
 Common stdin shape (all events): camelCase keys; `hookEventName` is **snake_case** (`pre_tool_use`, `session_start`, …); env carries `GROK_HOOK_EVENT` (snake), `GROK_SESSION_ID`, `GROK_HOME`, `GROK_WORKSPACE_ROOT`, `CLAUDE_PROJECT_DIR`.
 
@@ -218,6 +226,7 @@ Minimum behaviour the driver-owned canonicalisation adapter must implement for g
 - Did not characterise Stop-hook `block` empirically (docs are clear; out of PreToolUse scope).
 - Did not exhaust every built-in tool name (`read_file`, `grep`, MCP `server__tool`, …). Matcher alias table covers the documented set; only Boss-guard-relevant tools were forced on the wire.
 - Headless `-p` was used for decision probes (same hook runner as interactive; payload shape matches the earlier interactive spike dumps).
+- `get_command_or_subagent_output` was observed on the wire (background-task poll) but is not committed as a fixture — not a Boss guard surface.
 
 ---
 
@@ -226,3 +235,54 @@ Minimum behaviour the driver-owned canonicalisation adapter must implement for g
 1. Should the adapter also accept Claude-shaped guard output `hookSpecificOutput.permissionDecision` if any future guard emits it? (None of Boss's five do today.)
 2. Is there any Grok version flag / config that enables Claude PreToolUse vocabulary (`block`/`approve`) natively? Not observed; not required if the adapter translates.
 3. `write` vs matcher alias `Write`→`search_replace`: confirm on the next CLI release whether create-file ever collapses to `search_replace` only.
+
+---
+
+## Appendix: regenerating the full matrix
+
+Committed fixtures keep the matrix outcomes plus two critical raw PreToolUse captures (`block` fail-open, `deny` blocks). To re-materialise every cell's `pre_<tag>.raw` and `agent_<tag>.json` (or to re-pin against a newer `grok`):
+
+1. **Isolate home** (never touch `~/.grok`):
+
+   ```sh
+   ROOT=/tmp/grok-t02-vocab
+   rm -rf "$ROOT" && mkdir -p "$ROOT/home" "$ROOT/cwd" "$ROOT/decision_vocab"
+   # copy auth only:
+   cp ~/.grok/auth.json "$ROOT/home/auth.json"   # or equivalent token source
+   GROK_HOME="$ROOT/home"
+   # disable compat hook layers in $GROK_HOME/config.toml if present:
+   # [compat.claude] / [compat.cursor] hooks off
+   ```
+
+2. **Decision probe hook** — for each `TAG` in
+   `deny block approve allow empty no_decision_key exit2 foobar permit`,
+   install a single global PreToolUse command hook under `$GROK_HOME/hooks/` that:
+
+   - captures env + stdin to `$ROOT/decision_vocab/pre_${TAG}.raw` (prefix with `===DECISION=${TAG}===` / `===ENV===` / `===STDIN===` as in the committed raws);
+   - then emits the candidate:
+     - JSON decisions: `printf '%s\n' "{\"decision\":\"${TAG}\",\"reason\":\"probe ${TAG}\"}"` (for `empty`: print nothing; for `no_decision_key`: `{"ok":true}`; for `exit2`: `echo "denied by exit2" >&2; exit 2`);
+     - exit 0 for all JSON / empty cases.
+
+3. **Run headless probe** (pin model + flags used in this investigation):
+
+   ```sh
+   GROK_HOME="$ROOT/home" grok -p \
+     "Using the write tool (not shell), create ATTACK_${TAG}.txt containing exactly one line: ATTACK_${TAG}_OK. Then reply with only: DONE" \
+     --always-approve --trust \
+     --session-id "$(uuidgen | tr '[:upper:]' '[:lower:]')" \
+     --cwd "$ROOT/cwd" \
+     --output-format json \
+     --model grok-4.5 \
+     --no-subagents --no-memory \
+     > "$ROOT/decision_vocab/agent_${TAG}.json"
+   ```
+
+4. **Score the cell:**
+
+   - attack file absent under `$ROOT/cwd/ATTACK_${TAG}.txt` ⇒ blocked;
+   - present with expected contents ⇒ allowed;
+   - record `hook_exit` (from the probe hook) and `agent_exit` (from `grok -p`) into `matrix.tsv` as `tag|hook_exit|agent_exit|attack|content`.
+
+5. **Payload dump run** (tool-name map + event samples): register dump-all hooks for `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop`, `Notification` that write env excerpt + parsed stdin JSON per event/tool; force write + search_replace + shell (`which git jj gh`) and a background `sleep` so `Notification` / background poll fire. Keep one sample per event type and one PreToolUse per map toolName.
+
+6. **Pin:** `grok --version` into the findings header before trusting adapter behaviour on a new CLI.
