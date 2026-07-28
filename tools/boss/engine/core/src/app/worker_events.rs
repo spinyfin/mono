@@ -122,9 +122,52 @@ pub(super) async fn dispatch_worker_event_fanout(
     // so they are delivered on the *same* Stop that
     // triggered them rather than stalling until the
     // next Stop (which never comes for an idle worker).
+    // Durably record the boundary BEFORE anything reacts to it. This is the
+    // evidence `worker_process_exit` reads to tell a one-turn-per-process
+    // worker's expected exit from a death, so it must survive a completion
+    // handler that errors, an engine restart, and the pane going away
+    // milliseconds later — which for `codex exec` it always does.
+    record_turn_boundary_on_stop(server_state, incoming);
     dispatch_probe_reply_on_stop(server_state, incoming).await;
     dispatch_completion_on_stop(server_state, incoming).await;
     dispatch_probe_on_stop(server_state, incoming).await;
+}
+
+/// Stamp `work_runs.turn_boundary_at` for the run whose driver just reported a
+/// turn boundary.
+///
+/// Keyed on [`crate::events_socket::IncomingHookEvent::is_turn_boundary`] —
+/// the driver-resolved signal — not on the `Stop` variant, so a driver whose
+/// turn ends some other way records it too.
+///
+/// Best-effort by design: a failed write only ever costs the *exemption* (the
+/// exit is then read as a death and reaped, which is the pre-existing
+/// behaviour), never the reverse. That asymmetry is deliberate — the record is
+/// permission to skip a reap, so its absence must fail safe.
+pub(super) fn record_turn_boundary_on_stop(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    if !incoming.is_turn_boundary() {
+        return;
+    }
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    let at = crate::live_worker_state::iso8601_utc(boss_engine_utils::epoch_time::now_epoch_secs());
+    match server_state.work_db.record_run_turn_boundary_for_execution(run_id, &at) {
+        Ok(true) => tracing::debug!(run_id, at = %at, "recorded turn boundary on run"),
+        Ok(false) => tracing::debug!(
+            run_id,
+            "turn boundary observed before any run row existed; not recorded"
+        ),
+        Err(err) => tracing::warn!(
+            run_id,
+            ?err,
+            "failed to record turn boundary on run; a one-shot worker's clean exit \
+             will now be reaped as a death (fail-safe direction)",
+        ),
+    }
 }
 
 pub(super) async fn dispatch_live_worker_state(

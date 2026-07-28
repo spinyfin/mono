@@ -343,6 +343,38 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
 }
 
 #[async_trait]
+impl crate::worker_process_exit::ProgressDrain for ServerState {
+    /// Make the exited worker's rollout stream final and let the engine's
+    /// normal fan-out consume what is left of it.
+    ///
+    /// This is the ordering guarantee the one-shot exit check rests on: when
+    /// this returns, every envelope the run ever produced has been through
+    /// `dispatch_worker_event_fanout`, so a `turn.completed` sitting unread in
+    /// the file at exit time has already reached completion detection and
+    /// stamped `work_runs.turn_boundary_at`. Without it the reaper reads a
+    /// record the tailer has not caught up to yet — the 160 ms race that
+    /// orphaned a successful Codex run.
+    ///
+    /// A run with no file ingress (Claude's hook-callback transport, an
+    /// ingress that already ended) has nothing to drain and returns at once.
+    /// Task-level errors are swallowed: a panicked ingress leaves the durable
+    /// record exactly as it was, which the caller reads as "no evidence".
+    async fn drain_progress_for_exited_worker(&self, run_id: &str) {
+        let Some(join) = self.agent_jsonl_progress_manager.finish_run(run_id) else {
+            return;
+        };
+        if let Err(err) = join.await {
+            tracing::warn!(
+                run_id,
+                %err,
+                "progress drain: file ingress task ended abnormally; \
+                 the run's turn-boundary record stands as-is",
+            );
+        }
+    }
+}
+
+#[async_trait]
 impl crate::stale_worker_sweep::StaleWorkerReaper for ServerState {
     /// Route the stale-worker reconcile through the exact teardown
     /// `bossctl agents stop` performs: `release_worker_pane` tears down

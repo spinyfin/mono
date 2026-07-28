@@ -685,6 +685,10 @@ impl WorkDb {
         // Raw provider usage on the run row. Captured on hook delivery rather
         // than finalization so orphaned executions retain their observed cost.
         migrate_work_runs_cost_columns(conn)?;
+        // `work_runs.turn_boundary_at`: durable proof that THIS run's process
+        // delivered a terminal result, so a one-turn-per-process worker's exit
+        // can be told apart from a death across an engine restart.
+        migrate_work_runs_turn_boundary_at(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

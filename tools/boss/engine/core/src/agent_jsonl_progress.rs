@@ -132,10 +132,33 @@ impl PreparedSource {
     }
 }
 
+/// How an in-flight file ingress is being brought to an end.
+///
+/// The two endings are not interchangeable, which is why this is a tri-state
+/// rather than the boolean it replaced. [`Self::Cancel`] is teardown: the
+/// engine is releasing the pane and unread bytes are forfeit. [`Self::Drain`]
+/// is the *writer* ending: the agent process has exited, so the file can never
+/// grow again and every byte it holds is part of this run's record — including,
+/// for a one-turn-per-process driver, the `turn.completed` envelope that says
+/// the run finished cleanly. Cancelling there would discard exactly the
+/// evidence [`crate::worker_process_exit`] needs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StreamHalt {
+    /// Normal operation: keep tailing the growing file.
+    #[default]
+    Running,
+    /// The writer process has exited. Read to end of file, publish everything
+    /// that is there, then close the stream. Bounded by the file's own size —
+    /// there is nothing to wait for, so this terminates without a timer.
+    Drain,
+    /// Tear down now. Anything unread is dropped.
+    Cancel,
+}
+
 struct RunHandle {
     activate: Option<oneshot::Sender<()>>,
-    cancel: watch::Sender<bool>,
-    _join: tokio::task::JoinHandle<()>,
+    halt: watch::Sender<StreamHalt>,
+    join: tokio::task::JoinHandle<()>,
 }
 
 /// Owns at most one prepared/active file ingress per execution id.
@@ -172,17 +195,17 @@ impl AgentJsonlProgressManager {
 
         let prepared = PreparedSource::new(ingress)?;
         let (activate_tx, activate_rx) = oneshot::channel();
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         let join = tokio::spawn(async move {
-            run_prepared(task_run_id, driver, prepared, sink, activate_rx, cancel_rx).await;
+            run_prepared(task_run_id, driver, prepared, sink, activate_rx, halt_rx).await;
         });
         runs.insert(
             run_id.to_owned(),
             RunHandle {
                 activate: Some(activate_tx),
-                cancel: cancel_tx,
-                _join: join,
+                halt: halt_tx,
+                join,
             },
         );
         Ok(())
@@ -205,15 +228,51 @@ impl AgentJsonlProgressManager {
 
     /// Close the source stream. The shared JSONL reader then flushes any
     /// unterminated final fragment and drains its ordered dispatch queue.
+    ///
+    /// Teardown, not completion: bytes the tail had not read yet are dropped.
+    /// A caller that is reacting to the *writer* exiting wants
+    /// [`Self::finish_run`] instead.
     pub fn stop_run(&self, run_id: &str) {
         let Ok(mut runs) = self.runs.lock() else {
             tracing::warn!(run_id, "agent JSONL progress: manager mutex poisoned during stop");
             return;
         };
         if let Some(handle) = runs.remove(run_id) {
-            let _ = handle.cancel.send(true);
+            let _ = handle.halt.send(StreamHalt::Cancel);
             drop(handle.activate);
         }
+    }
+
+    /// Signal that the run's **writer has exited**, so the source file is
+    /// final: read it to end of file, dispatch every remaining event through
+    /// the sink, then close. Returns the ingress task's join handle so the
+    /// caller can await that completion.
+    ///
+    /// This is the ordering primitive behind the one-turn-per-process exit
+    /// check. It is causal, not temporal: the agent process exiting is what
+    /// makes the file final, so "read to EOF" terminates on the file's own
+    /// size with nothing to wait for — it is not a grace window that hopes a
+    /// racing event turns up. When the returned handle resolves, every event
+    /// the run ever produced has been through the engine's fan-out, so
+    /// `turn.completed` has already reached the completion handler and the
+    /// durable turn-boundary record is written.
+    ///
+    /// Returns `None` when no ingress is registered for `run_id` — a driver
+    /// with a different progress transport (Claude's hook callback), a run
+    /// whose ingress already ended, or one that never started. Callers must
+    /// treat `None` as "nothing to drain", never as "the run delivered
+    /// nothing": the verdict comes from the durable record, not from here.
+    pub fn finish_run(&self, run_id: &str) -> Option<tokio::task::JoinHandle<()>> {
+        let Ok(mut runs) = self.runs.lock() else {
+            tracing::warn!(run_id, "agent JSONL progress: manager mutex poisoned during finish");
+            return None;
+        };
+        let handle = runs.remove(run_id)?;
+        let _ = handle.halt.send(StreamHalt::Drain);
+        // Dropping the activate sender makes a never-activated ingress return
+        // immediately rather than block the caller until its discovery timeout.
+        drop(handle.activate);
+        Some(handle.join)
     }
 }
 
@@ -223,7 +282,7 @@ async fn run_prepared<S>(
     prepared: PreparedSource,
     sink: S,
     mut activate: oneshot::Receiver<()>,
-    mut cancel: watch::Receiver<bool>,
+    mut halt: watch::Receiver<StreamHalt>,
 ) where
     S: WorkerEventSink + Send + Sync + 'static,
 {
@@ -233,13 +292,13 @@ async fn run_prepared<S>(
                 return;
             }
         }
-        changed = cancel.changed() => {
+        changed = halt.changed() => {
             let _ = changed;
             return;
         }
     }
 
-    let candidate = match discover_candidate(&prepared, &mut cancel).await {
+    let candidate = match discover_candidate(&prepared, &mut halt).await {
         Ok(Some(candidate)) => candidate,
         Ok(None) => return,
         Err(err) => {
@@ -256,10 +315,10 @@ async fn run_prepared<S>(
     let transcript_path = candidate.path.clone();
 
     let (reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-    let tail_cancel = cancel.clone();
+    let tail_halt = halt.clone();
     let tail_source = prepared.clone();
     let tail = tokio::spawn(async move {
-        if let Err(err) = stream_file_bytes(tail_source, candidate, writer, tail_cancel).await {
+        if let Err(err) = stream_file_bytes(tail_source, candidate, writer, tail_halt).await {
             tracing::warn!(%err, "agent JSONL progress: file tail ended with error");
         }
     });
@@ -294,11 +353,15 @@ struct Candidate {
 
 async fn discover_candidate(
     prepared: &PreparedSource,
-    cancel: &mut watch::Receiver<bool>,
+    halt: &mut watch::Receiver<StreamHalt>,
 ) -> Result<Option<Candidate>, String> {
     let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
     loop {
-        if *cancel.borrow() {
+        // Either ending stops discovery. A `Drain` here means the writer
+        // exited before it ever created a correlated rollout — there is
+        // nothing to read to EOF, and the absent turn-boundary record is
+        // exactly what makes that exit a death.
+        if *halt.borrow() != StreamHalt::Running {
             return Ok(None);
         }
         prepared.root.revalidate()?;
@@ -326,7 +389,7 @@ async fn discover_candidate(
         }
         tokio::select! {
             _ = tokio::time::sleep(DISCOVERY_POLL) => {}
-            changed = cancel.changed() => {
+            changed = halt.changed() => {
                 let _ = changed;
                 return Ok(None);
             }
@@ -609,9 +672,9 @@ async fn stream_file_bytes(
     prepared: PreparedSource,
     candidate: Candidate,
     writer: tokio::io::DuplexStream,
-    cancel: watch::Receiver<bool>,
+    halt: watch::Receiver<StreamHalt>,
 ) -> Result<(), String> {
-    stream_file_bytes_with_test_hooks(prepared, candidate, writer, cancel, |_| Ok(()), |_| Ok(())).await
+    stream_file_bytes_with_test_hooks(prepared, candidate, writer, halt, |_| Ok(()), |_| Ok(())).await
 }
 
 /// Stream only descriptors returned by [`validate_candidate`].
@@ -624,7 +687,7 @@ async fn stream_file_bytes_with_test_hooks<F, G>(
     prepared: PreparedSource,
     candidate: Candidate,
     mut writer: tokio::io::DuplexStream,
-    mut cancel: watch::Receiver<bool>,
+    mut halt: watch::Receiver<StreamHalt>,
     mut before_descriptor_read: G,
     mut after_rotation_validation: F,
 ) -> Result<(), String>
@@ -642,7 +705,7 @@ where
     let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
 
     loop {
-        if *cancel.borrow() {
+        if *halt.borrow() == StreamHalt::Cancel {
             return Ok(());
         }
         prepared.root.revalidate()?;
@@ -660,7 +723,7 @@ where
             // Revalidate the restarted logical stream on this exact
             // descriptor before publishing either its prefix or a delimiter.
             revalidate_truncated_stream(&prepared, &path, &session_id, &mut file, opened_identity)?;
-            write_or_cancel(&mut writer, b"\n", &mut cancel).await?;
+            write_or_halt(&mut writer, b"\n", &mut halt).await?;
             offset = 0;
             continue;
         }
@@ -684,9 +747,19 @@ where
                 }
                 validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
                 offset += count as u64;
-                write_or_cancel(&mut writer, &buffer[..count], &mut cancel).await?;
+                write_or_halt(&mut writer, &buffer[..count], &mut halt).await?;
                 continue;
             }
+        }
+
+        // Everything the file held up to `size` has now been published. Under
+        // `Drain` the writer process has already exited, so the file cannot
+        // grow again and this is genuinely end-of-stream: close it rather than
+        // poll a file nobody is writing. Placed AFTER the read above so a
+        // drain can never truncate the run's own terminal envelope — which is
+        // the whole point of draining instead of cancelling.
+        if *halt.borrow() == StreamHalt::Drain {
+            return Ok(());
         }
 
         let path_metadata = match fs::symlink_metadata(&path) {
@@ -694,9 +767,15 @@ where
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 tokio::select! {
                     _ = tokio::time::sleep(FILE_POLL) => continue,
-                    changed = cancel.changed() => {
-                        let _ = changed;
-                        return Ok(());
+                    changed = halt.changed() => {
+                        // Every sender dropped: nothing can ever halt us. End
+                        // cleanly rather than spinning the poll loop forever.
+                        // A prior `Drain`/`Cancel` still reaches us via
+                        // `changed()`'s last Ok (version bumps before close).
+                        if changed.is_err() {
+                            return Ok(());
+                        }
+                        continue;
                     }
                 }
             }
@@ -717,7 +796,7 @@ where
                 .filter(|new| new.session_id == session_id)
                 .ok_or_else(|| format!("rotated rollout {} lost run correlation", path.display()))?;
             after_rotation_validation(&rotated)?;
-            write_or_cancel(&mut writer, b"\n", &mut cancel).await?;
+            write_or_halt(&mut writer, b"\n", &mut halt).await?;
             // Transfer the exact descriptor whose session/cwd/filename/link
             // and inode evidence was just validated. Never reopen `path`.
             file = rotated.file;
@@ -727,24 +806,56 @@ where
         }
         tokio::select! {
             _ = tokio::time::sleep(FILE_POLL) => {}
-            changed = cancel.changed() => {
-                let _ = changed;
-                return Ok(());
+            changed = halt.changed() => {
+                // Re-run the loop so a `Drain` re-reads the file (picking up
+                // bytes written between the last poll and the writer's exit)
+                // before the drain check above closes the stream; the
+                // top-of-loop check handles `Cancel`. Every sender dropped
+                // is terminal: end cleanly rather than busy-looping the poll.
+                // A prior `Drain` still arrives as Ok first (version before
+                // the closed flag).
+                if changed.is_err() {
+                    return Ok(());
+                }
             }
         }
     }
 }
 
-async fn write_or_cancel(
+/// Publish `bytes` to the reader, abandoning the write only on
+/// [`StreamHalt::Cancel`].
+///
+/// A `Drain` transition deliberately does **not** cancel an in-flight write:
+/// these bytes have already been read off the run's now-final file, and
+/// `write_all` is not cancellation-safe — dropping it mid-write would lose a
+/// partial chunk, corrupting the very envelope the drain exists to deliver.
+/// The consumer is actively reading to EOF during a drain, so the await
+/// completes rather than hangs.
+async fn write_or_halt(
     writer: &mut tokio::io::DuplexStream,
     bytes: &[u8],
-    cancel: &mut watch::Receiver<bool>,
+    halt: &mut watch::Receiver<StreamHalt>,
 ) -> Result<(), String> {
+    if *halt.borrow() == StreamHalt::Cancel {
+        return Ok(());
+    }
     tokio::select! {
         result = writer.write_all(bytes) => result.map_err(|err| format!("write JSONL stream: {err}")),
-        changed = cancel.changed() => {
-            let _ = changed;
-            Ok(())
+        () = wait_for_cancel(halt) => Ok(()),
+    }
+}
+
+/// Resolve only once the halt state reaches [`StreamHalt::Cancel`], so a
+/// `Running` → `Drain` transition never wins a `select!` against a write.
+async fn wait_for_cancel(halt: &mut watch::Receiver<StreamHalt>) {
+    loop {
+        if *halt.borrow() == StreamHalt::Cancel {
+            return;
+        }
+        if halt.changed().await.is_err() {
+            // Every sender dropped: nothing can ever cancel now. Park forever
+            // so the sibling write branch decides the select.
+            std::future::pending::<()>().await;
         }
     }
 }
@@ -816,6 +927,30 @@ mod tests {
         .map(|record| serde_json::to_string(&record).unwrap())
         .collect::<Vec<_>>()
         .join("\n")
+            + "\n"
+    }
+
+    /// [`rollout_text`] minus its final `task_complete` record — the state of
+    /// a rollout mid-turn, before the envelope that ends it.
+    fn rollout_text_without_task_complete(workspace: &Path, thread_id: &str) -> String {
+        let full = rollout_text(workspace, thread_id);
+        let mut lines: Vec<&str> = full.lines().collect();
+        lines.pop();
+        lines.join("\n") + "\n"
+    }
+
+    /// Just the `task_complete` line — appended to simulate `codex exec`
+    /// writing its terminal envelope immediately before the process exits.
+    fn task_complete_line() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"task_complete",
+                "turn_id":"turn-live",
+                "last_agent_message":"done"
+            }
+        }))
+        .unwrap()
             + "\n"
     }
 
@@ -965,6 +1100,100 @@ mod tests {
         manager.stop_run("run-live");
     }
 
+    /// The ordering guarantee `worker_process_exit` rests on: when the agent
+    /// process exits its rollout is final, so `finish_run` must read whatever
+    /// is left of it and put every remaining event through the fan-out before
+    /// its handle resolves.
+    ///
+    /// The terminal envelope is appended and the drain requested with no wait
+    /// in between — exactly the shape of the live failure, where `codex exec`
+    /// wrote `task_complete` and exited 160 ms before anything read it. Under
+    /// `stop_run`'s cancel those bytes would simply be dropped.
+    #[tokio::test]
+    async fn finish_run_drains_the_final_envelope_before_its_handle_resolves() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+
+        let manager = AgentJsonlProgressManager::new();
+        let sink = CaptureSink::default();
+        manager
+            .prepare_run(
+                "run-drain",
+                Arc::new(crate::driver::CodexDriver::default()),
+                AgentJsonlFileIngress {
+                    directory: sessions.clone(),
+                    filename_prefix: "rollout-".into(),
+                    filename_suffix: ".jsonl".into(),
+                    workspace_path: workspace.clone(),
+                },
+                sink.clone(),
+            )
+            .unwrap();
+
+        let path = sessions.join("rollout-new-thread-drain.jsonl");
+        fs::write(&path, rollout_text_without_task_complete(&workspace, "thread-drain")).unwrap();
+        manager.activate_run("run-drain");
+
+        // Let the tail attach and consume the mid-turn records, so the only
+        // thing the drain can be responsible for is the terminal envelope.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink.events.lock().unwrap().len() >= 4 {
+                    break;
+                }
+                sink.notify.notified().await;
+            }
+        })
+        .await
+        .expect("mid-turn rollout events should reach the fanout");
+        assert!(
+            !sink
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event.event, WorkerEvent::Stop { .. })),
+            "precondition: no turn boundary has been observed yet",
+        );
+
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(task_complete_line().as_bytes()).unwrap();
+        }
+
+        let join = manager.finish_run("run-drain").expect("an active ingress to drain");
+        tokio::time::timeout(Duration::from_secs(5), join)
+            .await
+            .expect("draining a final file must terminate on the file's own size")
+            .unwrap();
+
+        let events = sink.events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                WorkerEvent::Stop {
+                    stop_reason: StopReason::Completed,
+                    ..
+                }
+            )),
+            "the terminal envelope must have been fanned out by the time the drain resolved; got: {:?}",
+            events.iter().map(|e| &e.event).collect::<Vec<_>>(),
+        );
+    }
+
+    /// `finish_run` is keyed on a live ingress, and returning `None` must mean
+    /// "nothing to drain" — never "the run delivered nothing". Callers read
+    /// the durable turn-boundary record for that.
+    #[tokio::test]
+    async fn finish_run_is_none_for_an_unknown_run() {
+        let manager = AgentJsonlProgressManager::new();
+        assert!(manager.finish_run("run-never-prepared").is_none());
+    }
+
     async fn read_until_contains(reader: &mut tokio::io::DuplexStream, observed: &mut Vec<u8>, needle: &[u8]) {
         tokio::time::timeout(Duration::from_secs(3), async {
             let mut chunk = [0u8; 4096];
@@ -1003,7 +1232,7 @@ mod tests {
         let candidate = validate_candidate(&prepared, &path).unwrap().unwrap();
 
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let tail = tokio::spawn(stream_file_bytes(prepared.clone(), candidate, writer, cancel_rx));
         let mut observed = Vec::new();
         read_until_contains(&mut reader, &mut observed, b"partial").await;
@@ -1030,7 +1259,7 @@ mod tests {
             write!(file, "{{\"final\":true").unwrap();
         }
         read_until_contains(&mut reader, &mut observed, b"final").await;
-        cancel_tx.send(true).unwrap();
+        cancel_tx.send(StreamHalt::Cancel).unwrap();
         reader.read_to_end(&mut observed).await.unwrap();
         tail.await.unwrap().unwrap();
         assert!(observed.ends_with(b"{\"final\":true"));
@@ -1072,7 +1301,7 @@ mod tests {
         fs::rename(&attacker, &path).unwrap();
 
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let result = stream_file_bytes(prepared, candidate, writer, cancel_rx).await;
         let mut observed = Vec::new();
         reader.read_to_end(&mut observed).await.unwrap();
@@ -1127,7 +1356,7 @@ mod tests {
         let hook_ran = Arc::new(AtomicBool::new(false));
         let hook_ran_for_tail = hook_ran.clone();
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let result = stream_file_bytes_with_test_hooks(
             prepared,
             candidate,
@@ -1167,7 +1396,7 @@ mod tests {
         let attack_ran = Arc::new(AtomicBool::new(false));
         let attack_ran_in_loop = attack_ran.clone();
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let result = stream_file_bytes_with_test_hooks(
             fixture.prepared,
             fixture.candidate,
@@ -1203,7 +1432,7 @@ mod tests {
     async fn wrong_workspace_truncation_is_rejected_before_prefix_publication() {
         let fixture = tail_fixture("thread-truncate-cwd");
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let tail = tokio::spawn(stream_file_bytes(
             fixture.prepared,
             fixture.candidate,
@@ -1231,7 +1460,7 @@ mod tests {
     async fn wrong_session_truncation_is_rejected_before_prefix_publication() {
         let fixture = tail_fixture("thread-truncate-session");
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        let (_cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let tail = tokio::spawn(stream_file_bytes(
             fixture.prepared,
             fixture.candidate,
@@ -1259,7 +1488,7 @@ mod tests {
     async fn valid_same_session_truncation_restarts_after_revalidation() {
         let fixture = tail_fixture("thread-truncate-valid");
         let (mut reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (cancel_tx, cancel_rx) = watch::channel(StreamHalt::Running);
         let tail = tokio::spawn(stream_file_bytes(
             fixture.prepared,
             fixture.candidate,
@@ -1275,7 +1504,7 @@ mod tests {
         )
         .unwrap();
         read_until_contains(&mut reader, &mut observed, b"valid-truncated-stream").await;
-        cancel_tx.send(true).unwrap();
+        cancel_tx.send(StreamHalt::Cancel).unwrap();
         reader.read_to_end(&mut observed).await.unwrap();
         tail.await.unwrap().unwrap();
 

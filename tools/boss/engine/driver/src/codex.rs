@@ -38,7 +38,8 @@ use super::{
     ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressSessionConfig,
     ProgressSessionNormalizer, ProgressStreamSource, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
     StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-    TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind, WorkerProcessLifetime,
+    default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -1445,6 +1446,21 @@ impl AgentDriver for CodexDriver {
         MidTurnPaneInput::Rejects
     }
 
+    /// `codex exec` serves exactly one turn and then exits — the same
+    /// one-turn-per-process shape the mid-turn guard above exists for, seen
+    /// from the other end of the run. `turn.completed` is followed by process
+    /// exit within milliseconds, so a reaper that reads "the foreground
+    /// process is gone" as "the worker died" reaps a successful run before its
+    /// completion handler can finish. Declaring the lifetime here is what lets
+    /// the engine pair that exit with the run's own delivered turn boundary
+    /// instead of guessing.
+    ///
+    /// This is not an exemption from the liveness sweeps: an exit with no
+    /// delivered turn boundary is still reaped as a death.
+    fn worker_process_lifetime(&self) -> WorkerProcessLifetime {
+        WorkerProcessLifetime::OneTurnPerProcess
+    }
+
     fn structured_output_wiring(
         &self,
         request: &StructuredOutputRequest<'_>,
@@ -2219,5 +2235,18 @@ else:
         assert_eq!(driver.interrupt(), InterruptDelivery::PaneEsc);
         assert_eq!(driver.stop(), StopDelivery::ProcessOnly);
         assert_eq!(driver.reap(), ReapDelivery::ProcessGroup);
+    }
+
+    /// The declaration the engine's process-liveness reapers key off. Without
+    /// it a clean `codex exec` termination reads as a pane death and the run
+    /// is orphaned milliseconds after it succeeded.
+    #[test]
+    fn codex_declares_one_turn_per_process_lifetime() {
+        let driver = CodexDriver::default();
+        assert_eq!(
+            driver.worker_process_lifetime(),
+            WorkerProcessLifetime::OneTurnPerProcess
+        );
+        assert!(driver.worker_process_lifetime().exits_after_each_turn());
     }
 }
