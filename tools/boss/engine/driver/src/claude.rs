@@ -15,10 +15,11 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent, nor
 use boss_ssh_transport::shell_quote;
 
 use super::{
-    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, MidTurnPaneInput, ModelMenu,
-    PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
-    ProgressObservationWiring, SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest,
-    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
+    AgentDriver, Capability, CapabilitySet, DriverDescriptor, EnvDirective, HookWiringDestination, InterruptDelivery,
+    MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, ProbeDelivery, ProgressFidelity,
+    ProgressIngress, ProgressObservationConfig, ProgressObservationWiring, ReapDelivery, SpawnPlan, SpawnRequest,
+    StopDelivery, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, default_structured_output_wiring,
 };
 
 pub mod structured_output;
@@ -605,7 +606,12 @@ impl AgentDriver for ClaudeDriver {
         for event in CLAUDE_HOOK_EVENTS {
             hooks.insert((*event).to_owned(), serde_json::json!([forward_hook.clone()]));
         }
-        ProgressIngress::HookCallback(ProgressObservationWiring { hooks })
+        ProgressIngress::HookCallback(ProgressObservationWiring {
+            hooks,
+            // Claude reads hooks from the engine-rendered `--settings` file;
+            // the spawn flow merges this map (and interception guards) there.
+            destination: HookWiringDestination::WorkerSettingsFile,
+        })
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
@@ -737,6 +743,29 @@ impl AgentDriver for ClaudeDriver {
             ErrorClass::Permanent => WorkerErrorClass::Permanent,
             ErrorClass::Indeterminate => WorkerErrorClass::Indeterminate,
         }
+    }
+
+    /// Probe is typed pane input (`SendToPane`) — Claude's interactive TUI
+    /// reads stdin as the next user message.
+    fn probe(&self) -> ProbeDelivery {
+        ProbeDelivery::PaneText
+    }
+
+    /// Interrupt is Esc into the pane (`InterruptWorkerPane`) — cancels the
+    /// in-flight turn; the process survives.
+    fn interrupt(&self) -> InterruptDelivery {
+        InterruptDelivery::PaneEsc
+    }
+
+    /// Stop is process-level only: `agents stop` cancels the execution and
+    /// reaps the pane without typing a quit command into Claude.
+    fn stop(&self) -> StopDelivery {
+        StopDelivery::ProcessOnly
+    }
+
+    /// Reap is the universal SIGTERM→SIGKILL process-group ladder.
+    fn reap(&self) -> ReapDelivery {
+        ReapDelivery::ProcessGroup
     }
 
     /// Claude Code runs as a long-lived interactive TUI that reads stdin for
@@ -1691,5 +1720,19 @@ mod tests {
     fn claude_buffers_mid_turn_pane_input() {
         assert_eq!(ClaudeDriver.mid_turn_pane_input(), MidTurnPaneInput::Buffers);
         assert!(ClaudeDriver.mid_turn_pane_input().buffers());
+    }
+
+    #[test]
+    fn claude_control_verbs_match_existing_pane_behaviour() {
+        assert_eq!(ClaudeDriver.probe(), ProbeDelivery::PaneText);
+        assert_eq!(ClaudeDriver.interrupt(), InterruptDelivery::PaneEsc);
+        assert_eq!(ClaudeDriver.stop(), StopDelivery::ProcessOnly);
+        assert_eq!(ClaudeDriver.reap(), ReapDelivery::ProcessGroup);
+    }
+
+    #[test]
+    fn claude_hook_wiring_destination_is_worker_settings_file() {
+        let wiring = expect_hook_callback(ClaudeDriver.progress_observation_wiring(&sample_config()));
+        assert_eq!(wiring.destination, HookWiringDestination::WorkerSettingsFile);
     }
 }
