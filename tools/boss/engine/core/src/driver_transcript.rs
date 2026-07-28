@@ -96,23 +96,23 @@ pub fn parse_transcript_with_driver(driver: Option<&dyn AgentDriver>, content: &
     // call with its output across two records), the stateless entry point
     // otherwise — the same two-tier selection `live_status_loop::normalize_lines`
     // makes for the live tail.
+    // Stream line → normalize → parse without materialising a whole-transcript
+    // `Vec<Value>`: a multi-turn Codex rollout can be large, and the only
+    // consumer of the intermediate form is the next parse step.
     let mut session = driver.and_then(|driver| driver.transcript_session());
-    let values: Vec<Value> = content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            serde_json::from_str::<Value>(trimmed).ok()
-        })
-        .map(|raw| match (session.as_mut(), driver) {
+    let normalized = content.lines().filter_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let raw = serde_json::from_str::<Value>(trimmed).ok()?;
+        Some(match (session.as_mut(), driver) {
             (Some(session), _) => session.normalize_transcript_entry(raw),
             (None, Some(driver)) => driver.normalize_transcript_entry(raw),
             (None, None) => raw,
         })
-        .collect();
-    crate::transcript_markdown::parse_transcript_values(&values)
+    });
+    crate::transcript_markdown::parse_transcript_values(normalized)
 }
 
 /// Resolve `execution_id`'s driver and parse `content` through it — the
@@ -180,6 +180,33 @@ mod tests {
         assert!(
             assistant_texts(&crate::transcript_markdown::parse_transcript(&jsonl)).is_empty(),
             "raw Claude-dialect parse of a Codex rollout must find no assistant text",
+        );
+    }
+
+    #[test]
+    fn codex_lifecycle_fillers_are_not_assistant_text_after_normalize() {
+        // session_meta + task_started alone used to produce AssistantText
+        // ("turn started") and short-circuit the flush-race retry. Lifecycle
+        // fillers must land as system events so all_text stays empty until
+        // real agent_message prose arrives.
+        let partial = concat!(
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+        );
+        let driver = DriverRegistry::default().require("codex").unwrap();
+        let events = parse_transcript_with_driver(Some(driver.as_ref()), partial);
+        assert!(
+            assistant_texts(&events).is_empty(),
+            "lifecycle-only partial rollout must yield no assistant text; got {events:?}",
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                &e.kind,
+                TranscriptEventKind::System { subtype: Some(s), .. } if s == "task_started"
+            )),
+            "task_started must surface as a system event; got {events:?}",
         );
     }
 

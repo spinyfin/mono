@@ -1135,13 +1135,15 @@ async fn blocked_marker_files_attention_on_a_codex_worker_native_rollout() {
 }
 
 #[tokio::test]
-async fn blocked_marker_files_attention_for_every_registered_driver() {
-    // The driver-agnostic half of the coverage: the same well-formed marker,
-    // in the canonical entry shape every driver's `normalize_transcript_entry`
+async fn blocked_marker_in_canonical_shape_files_attention_for_every_registered_driver() {
+    // Post-normalize half of the coverage: the same well-formed marker, already
+    // in the *canonical* entry shape every driver's `normalize_transcript_entry`
     // is contracted to produce, must file a blocked attention item under EVERY
-    // slug in the registry — including any driver added after this test was
-    // written. A fix that only works for one hardcoded second backend fails
-    // here the moment a third is registered.
+    // slug in the registry. This deliberately does **not** exercise each
+    // driver's native dialect — that lives in the conformance harness
+    // (`conformance::native_transcript`), which fails closed when a registered
+    // slug has no native-dialect fixture. Together the two tests cover
+    // "normalization works" and "the post-hoc read path is driver-agnostic".
     let marker = "[blocked] reason=\"ambiguous requirement; need a coordinator decision\"";
     for slug in crate::driver::DriverRegistry::default().slugs() {
         let workspace = tempdir().unwrap();
@@ -1170,6 +1172,89 @@ async fn blocked_marker_files_attention_for_every_registered_driver() {
             "driver {slug}: exactly one worker_blocked attention item must be filed; got {items:?}",
         );
     }
+}
+
+#[tokio::test]
+async fn blocked_marker_survives_codex_stop_boundary_flush_race_past_lifecycle_filler() {
+    // Codex-specific flush race: when Stop fires the rollout on disk may only
+    // have session_meta + task_started. The driver used to synthesize
+    // AssistantText("turn started") for that lifecycle event, which made
+    // `read_final_triage_message`'s all_text non-empty and disabled the
+    // flush-race retry — so a late-flushed `[blocked]` agent_message was
+    // permanently missed. Lifecycle fillers are now system events; the retry
+    // waits, the marker lands, and attention is still filed.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    set_work_item_driver(&db, &chore_id, "codex");
+
+    let transcript_path = workspace.path().join(format!("rollout-{execution_id}.jsonl"));
+    let partial = [
+        serde_json::json!({"type": "session_meta", "payload": {"id": "session-1"}}),
+        serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}}),
+    ]
+    .iter()
+    .map(|line| format!("{line}\n"))
+    .collect::<String>();
+    std::fs::write(&transcript_path, partial.as_bytes()).unwrap();
+    db.set_run_transcript_path_if_unset(&execution_id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let marker = "[blocked] reason=\"jj describe cannot create the .jj store lock\"";
+    let flush_path = transcript_path.clone();
+    let flush_handle = tokio::spawn(async move {
+        use tokio::io::AsyncWriteExt;
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        let late_lines = [
+            serde_json::json!({"type": "event_msg", "payload": {"type": "agent_message", "message": marker}}),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": marker}],
+                }
+            }),
+        ]
+        .iter()
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&flush_path)
+            .await
+            .unwrap();
+        file.write_all(late_lines.as_bytes()).await.unwrap();
+    });
+
+    let detector = StubPrDetector::ok(None);
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let outcome = handler.on_stop(&execution_id).await;
+    flush_handle.await.unwrap();
+
+    assert!(
+        matches!(outcome, StopOutcome::EscalationPending { .. }),
+        "a [blocked] marker that lands after the first partial read must still suppress the auto-nudge; got {outcome:?}",
+    );
+    assert!(
+        probes.snapshot().is_empty(),
+        "the produce-a-PR nudge must NOT fire while the blocker is unresolved; got {:?}",
+        probes.snapshot(),
+    );
+    let items = db.list_attention_items(&execution_id).unwrap();
+    let blocked: Vec<_> = items
+        .iter()
+        .filter(|i| i.kind == worker_escalation::WORKER_BLOCKED_ATTENTION_KIND)
+        .collect();
+    assert_eq!(
+        blocked.len(),
+        1,
+        "exactly one worker_blocked attention item must be filed after the flush-race retry; got {items:?}",
+    );
+    assert!(
+        blocked[0].body_markdown.contains("[blocked] reason="),
+        "the attention body must carry the marker verbatim; got: {}",
+        blocked[0].body_markdown,
+    );
 }
 
 #[tokio::test]

@@ -16,6 +16,11 @@
 //!    its own, so this harness is the only defence against silent drift.
 //!    Live `codex --version` is soft-skip without the binary; set
 //!    `BOSS_REQUIRE_CODEX_CLI=1` to require it.
+//! 5. **Native-dialect transcript normalize** — every registry slug has a
+//!    fixture in that driver's on-disk dialect, and normalizing it surfaces a
+//!    `[blocked]` marker. Fails closed when a driver is registered without a
+//!    fixture (the all-drivers completion test only exercises the post-normalize
+//!    canonical shape).
 //!
 //! Tolerance policy (Codex stream): tolerate additive fields and unknown enum
 //! variants (forward-compatible). Fail loudly on removals and on semantic
@@ -27,4 +32,5 @@ mod boundary_equivalence;
 mod claude_goldens;
 mod fixtures;
 mod ingress_equivalence;
+mod native_transcript;
 mod version_pin;

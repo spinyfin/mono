@@ -281,7 +281,21 @@ fn render_entry(line: &Value) -> String {
                 .unwrap_or_else(|| "user: prompt".to_owned())
         }
         "assistant" => render_assistant(line),
-        "system" => String::new(),
+        // Codex lifecycle fillers (`task_started` / bare `task_complete` /
+        // `turn_aborted`) are normalized as system so they don't masquerade as
+        // worker prose for marker scans. Still surface a short line so the
+        // live-status summary keeps turn-boundary breadcrumbs.
+        "system" => line
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|msg| {
+                let one_line = msg.trim().replace('\n', " ");
+                format!(
+                    "system: {}",
+                    boss_engine_utils::string_clip::clip_to_bytes(&one_line, 200)
+                )
+            })
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
