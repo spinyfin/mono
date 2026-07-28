@@ -1,0 +1,118 @@
+[0.0] === ghosttykit_liveness start 2026-07-28T00:56:05Z ===
+[0.1] ghostty_init ok
+[0.1] ghostty_app_new ok
+[0.2] pane_mode=minimal mode_flag=--minimal sid=6b6aabd4-20c9-4768-9eca-61b64ab830b4
+[0.2] initial_input=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh
+[0.2] ghostty_surface_new ok
+[0.2] timers armed; capturing liveness markers
+[0.5] PHASE boot → starting_shell t=0.5 bytes=213
+[0.5] snap=1 phase=starting_shell bytes=213 fg=63390 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast log
+[1.6] snap=2 phase=starting_shell bytes=418 fg=64037 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast log
+[2.6] PHASE starting_shell → starting_tui t=2.6 bytes=2031
+[2.6] snap=3 phase=starting_tui bytes=2031 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[3.0] snap=4 phase=starting_tui bytes=2031 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[3.3] snap=5 phase=starting_tui bytes=2031 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[3.7] snap=6 phase=starting_tui bytes=2031 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[4.0] PHASE starting_tui → busy_seed t=4.0 bytes=2557
+[4.1] snap=7 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[4.4] snap=8 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[4.8] snap=9 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[5.1] snap=10 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[5.4] snap=11 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[5.8] snap=12 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[6.2] snap=13 phase=busy_seed bytes=2557 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[6.5] PHASE busy_seed → idle_or_early t=6.4 bytes=2676
+[6.5] snap=14 phase=idle_or_early bytes=2676 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[6.9] snap=15 phase=idle_or_early bytes=2993 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[7.2] snap=16 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[7.6] snap=17 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[7.9] snap=18 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[8.3] snap=19 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[8.6] snap=20 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[9.0] snap=21 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[9.3] snap=22 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[9.7] snap=23 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[10.0] snap=24 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[10.4] snap=25 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[10.7] snap=26 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[11.0] snap=27 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[11.4] snap=28 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[11.7] snap=29 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[12.1] snap=30 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[12.4] snap=31 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[12.8] snap=32 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[13.1] snap=33 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[13.5] snap=34 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[13.8] snap=35 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[14.2] snap=36 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[14.5] snap=37 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[14.9] snap=38 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[15.2] snap=39 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[15.6] snap=40 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[15.9] snap=41 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[16.3] snap=42 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[16.6] snap=43 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[17.0] snap=44 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[17.3] snap=45 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[17.7] snap=46 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[18.0] snap=47 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[18.4] snap=48 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[18.7] snap=49 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[19.1] snap=50 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[19.4] snap=51 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[19.8] snap=52 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[20.1] snap=53 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[20.5] snap=54 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[20.8] snap=55 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[21.2] snap=56 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[21.5] snap=57 phase=idle_or_early bytes=3159 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[21.9] PHASE idle_or_early → busy_seed t=21.8 bytes=3384
+[21.9] snap=58 phase=busy_seed bytes=3384 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[22.2] snap=59 phase=busy_seed bytes=3384 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[22.6] PHASE busy_seed → idle_or_early t=22.5 bytes=3476
+[22.6] snap=60 phase=idle_or_early bytes=3476 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[22.9] PHASE idle_or_early → idle_after_seed t=22.8 bytes=4074
+[23.0] snap=61 phase=idle_after_seed bytes=4074 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[23.0] OBSERVED seed turn complete (Worked for + LIVE_SEED_DONE)
+[23.0] INJECT followup body=reply with exactly the single token: LIVE_FOLLOW_OK. no tools.
+[23.0] INJECT followup Return sent
+[23.3] PHASE idle_after_seed → busy_followup t=23.2 bytes=4488
+[23.3] snap=62 phase=busy_followup bytes=4488 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[23.3] OBSERVED follow-up complete
+[23.6] snap=63 phase=busy_followup bytes=4488 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[24.0] PHASE busy_followup → idle_after_followup t=23.9 bytes=4510
+[24.0] snap=64 phase=idle_after_followup bytes=4510 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[24.4] snap=65 phase=idle_after_followup bytes=5178 fg=64037 exited=false preview=╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮\n│                                        
+[26.5] INJECT quit body=/quit
+[26.5] INJECT quit Return sent
+[26.8] PHASE idle_after_followup → post_exit t=26.7 bytes=4626
+[26.8] snap=66 phase=post_exit bytes=4626 fg=63390 exited=false preview=│                                                              ⠀⢈⠗⢀⣀⣀⣠⡾⠃⠀                                                               │\n│                                        
+[26.8] pane script finished (grok exited)
+[27.1] pane script finished (grok exited)
+[27.5] pane script finished (grok exited)
+[27.8] pane script finished (grok exited)
+[28.2] pane script finished (grok exited)
+[28.3] finish reason=script_finished
+[28.3] SUMMARY written; exiting
+[28.3] reason: script_finished
+pane_mode: minimal
+session_id: 6b6aabd4-20c9-4768-9eca-61b64ab830b4
+saw_LIVE_SEED_DONE: true
+saw_LIVE_FOLLOW_OK: true
+poll_count: 80
+start_polls: 10
+busy_polls: 11
+idle_polls: 54
+snap_count: 66
+viewport_final_bytes: 4626
+screen_final_bytes: 5316
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 64037
+foreground_pid_at_end: 63390
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)
+ghosttykit_pin: ghosttykit-5659cef
+ghosttykit_sha256: 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
+GROK_HOME: /tmp/grok-liveness-spike/home
+SPIKE_CWD: /tmp/grok-liveness-spike/cwd

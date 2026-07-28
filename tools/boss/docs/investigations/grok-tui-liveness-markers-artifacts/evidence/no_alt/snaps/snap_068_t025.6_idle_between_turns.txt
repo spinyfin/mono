@@ -1,0 +1,39 @@
+
+  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K
+
+
+     ❯ reply with exactly the single token: LIVE_FOLLOW_OK. no tools.                                                         5:55 PM
+                      
+
+  ❙  ◆ Thought for 0.1s                                                                                                          
+                                                                                                                                 
+     LIVE_FOLLOW_OK                                                                                                           5:55 PM
+                                                                                                                                 
+     Worked for 1.1s                                                                                                             
+                                                                                                                                     
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                
+
+                                                                                                                                       
+
+  ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                 │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Ctrl+.:shortcuts                                                                                                  

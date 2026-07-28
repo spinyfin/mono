@@ -1,0 +1,11 @@
+t	phase	notes
+0.5	starting_shell	bytes=213
+2.6	starting_tui	bytes=2031
+4.0	busy_seed	bytes=2557
+6.4	idle_or_early	bytes=2676
+21.8	busy_seed	bytes=3384
+22.5	idle_or_early	bytes=3476
+22.8	idle_after_seed	bytes=4074
+23.2	busy_followup	bytes=4488
+23.9	idle_after_followup	bytes=4510
+26.7	post_exit	bytes=4626

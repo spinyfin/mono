@@ -1,0 +1,39 @@
+
+  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K
+
+
+     ❯ reply with exactly the single token: LIVE_FOLLOW_OK. no tools.                                                         5:55 PM
+                      
+
+  ┃  ◆ Thinking…                                                                                                                 
+  ┃                                                                                                                              
+  ┃  The user wants me to reply with exactly the single token LIVE_FOLLOW_OK and use no tools                                    
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                     
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+                                                                                                                                 
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                
+
+    ⠴ Thinking… 0.0s                                                                                                 1.0s ⇣15.1k [stop]
+
+  ╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                                 │
+  ╰──────────────────────────────────────────────────────────────────────────────────────────────── Grok 4.5 (high) · always-approve ─╯
+
+  Shift+Tab:mode  │  Esc:cancel  │  Ctrl+.:shortcuts                                                                                   

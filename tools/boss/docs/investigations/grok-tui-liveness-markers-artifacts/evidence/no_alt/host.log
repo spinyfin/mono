@@ -1,0 +1,119 @@
+[0.0] === ghosttykit_liveness start 2026-07-28T00:55:33Z ===
+[0.3] ghostty_init ok
+[0.3] ghostty_app_new ok
+[0.6] pane_mode=no_alt mode_flag=--no-alt-screen sid=11eb0dd3-9ca9-45b1-8de7-5d7d086bcfb5
+[0.6] initial_input=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh
+[0.6] ghostty_surface_new ok
+[0.6] timers armed; capturing liveness markers
+[0.9] PHASE boot → starting_shell t=0.7 bytes=170
+[0.9] snap=1 phase=starting_shell bytes=170 fg=59284 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh
+[1.3] snap=2 phase=starting_shell bytes=213 fg=59295 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast log
+[2.3] snap=3 phase=starting_shell bytes=418 fg=59639 exited=false preview=zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh\nLast log
+[3.4] PHASE starting_shell → starting_tui t=3.2 bytes=2577
+[3.4] snap=4 phase=starting_tui bytes=2577 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                               +1\n\n\n\n\n\n                               
+[3.7] snap=5 phase=starting_tui bytes=2577 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                               +1\n\n\n\n\n\n                               
+[4.1] snap=6 phase=starting_tui bytes=2577 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                               +1\n\n\n\n\n\n                               
+[4.4] snap=7 phase=starting_tui bytes=2577 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                               +1\n\n\n\n\n\n                               
+[4.8] PHASE starting_tui → busy_seed t=4.6 bytes=2808
+[4.8] snap=8 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[5.1] snap=9 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[5.5] snap=10 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[5.8] snap=11 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[6.2] snap=12 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[6.5] snap=13 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[7.2] snap=14 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[7.2] snap=15 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[7.6] snap=16 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      3.1K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[7.9] snap=17 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                      4.8K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[8.4] snap=18 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       14K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[8.6] snap=19 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[9.0] snap=20 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[9.3] snap=21 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[9.7] snap=22 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[10.0] snap=23 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[10.4] snap=24 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[10.7] snap=25 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[11.1] snap=26 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[11.4] snap=27 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[11.8] snap=28 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[12.1] snap=29 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[12.5] snap=30 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[12.8] snap=31 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[13.2] snap=32 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[13.5] snap=33 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[13.9] snap=34 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[14.2] snap=35 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[14.6] snap=36 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[14.9] snap=37 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[15.3] snap=38 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[15.6] snap=39 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[16.0] snap=40 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[16.3] snap=41 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[16.7] snap=42 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[17.0] snap=43 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[17.5] snap=44 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[17.7] snap=45 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[18.1] snap=46 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[18.4] snap=47 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[18.8] snap=48 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[19.1] snap=49 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[19.4] snap=50 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[19.8] snap=51 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[20.1] snap=52 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[20.5] snap=53 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[20.8] snap=54 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[21.2] snap=55 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[21.5] snap=56 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[21.9] snap=57 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[22.2] snap=58 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[22.6] snap=59 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[22.9] snap=60 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[23.3] snap=61 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[23.6] snap=62 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[24.0] snap=63 phase=busy_seed bytes=2808 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[24.3] PHASE busy_seed → idle_after_seed t=24.2 bytes=2812
+[24.3] snap=64 phase=idle_after_seed bytes=2812 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       14K / 500K\n\n\n     ❯ Use the shell tool to run exac
+[24.3] OBSERVED seed turn complete (Worked for + LIVE_SEED_DONE)
+[24.3] INJECT followup body=reply with exactly the single token: LIVE_FOLLOW_OK. no tools.
+[24.3] INJECT followup Return sent
+[24.7] PHASE idle_after_seed → busy_followup t=24.5 bytes=2812
+[24.7] snap=65 phase=busy_followup bytes=2812 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       14K / 500K\n\n\n     ❯ reply with exactly the single 
+[25.0] snap=66 phase=busy_followup bytes=2812 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       14K / 500K\n\n\n     ❯ reply with exactly the single 
+[25.4] snap=67 phase=busy_followup bytes=2812 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ reply with exactly the single 
+[25.7] PHASE busy_followup → idle_between_turns t=25.6 bytes=2816
+[25.7] snap=68 phase=idle_between_turns bytes=2816 fg=59639 exited=false preview=\n  /private/tmp/grok-liveness-spike/cwd                                                                                       15K / 500K\n\n\n     ❯ reply with exactly the single 
+[25.7] OBSERVED follow-up complete
+[26.1] PHASE idle_between_turns → idle_after_followup t=25.9 bytes=2816
+[28.2] INJECT quit body=/quit
+[28.2] INJECT quit Return sent
+[28.5] PHASE idle_after_followup → post_exit t=28.4 bytes=2941
+[28.5] snap=69 phase=post_exit bytes=2941 fg=59295 exited=false preview=                      \n\n     ◆ Thought for 0.1s                                                                                                          \n                       
+[28.5] pane script finished (grok exited)
+[28.9] pane script finished (grok exited)
+[29.2] pane script finished (grok exited)
+[29.6] pane script finished (grok exited)
+[29.9] pane script finished (grok exited)
+[30.0] finish reason=script_finished
+[30.0] SUMMARY written; exiting
+[30.0] reason: script_finished
+pane_mode: no_alt
+session_id: 11eb0dd3-9ca9-45b1-8de7-5d7d086bcfb5
+saw_LIVE_SEED_DONE: true
+saw_LIVE_FOLLOW_OK: true
+poll_count: 84
+start_polls: 11
+busy_polls: 59
+idle_polls: 9
+snap_count: 69
+viewport_final_bytes: 2941
+screen_final_bytes: 3633
+grok_exit: 0
+grok_version: grok 0.2.112 (9bbd559437aa) [stable]
+shell_pid_file: 59639
+foreground_pid_at_end: 59295
+observe_api: ghostty_surface_read_text(GHOSTTY_POINT_VIEWPORT|SCREEN)
+inject_api: ghostty_surface_text + ghostty_surface_key(Return)
+ghosttykit_pin: ghosttykit-5659cef
+ghosttykit_sha256: 82b8d947484a21e1a9d186628b8af5e3f2e81dc96925f3cdbc1766ececa814a1
+GROK_HOME: /tmp/grok-liveness-spike/home
+SPIKE_CWD: /tmp/grok-liveness-spike/cwd

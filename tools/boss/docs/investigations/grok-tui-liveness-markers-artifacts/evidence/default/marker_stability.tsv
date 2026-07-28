@@ -1,0 +1,26 @@
+candidate	total_hits/81	start_hits/8	busy_hits/59	idle_hits/9
+/ 500K	68	0	59	9
+Ctrl+.:shortcuts	72	4	59	9
+Ctrl+;:queue	4	4	0	0
+Ctrl+b:send to bg	43	0	43	0
+Esc:cancel	59	0	59	0
+Grok	72	4	59	9
+Grok 4	72	4	59	9
+Grok 4.5	72	4	59	9
+K / 500K	68	0	59	9
+LIVE_FOLLOW_OK	16	0	3	8
+LIVE_SEED_DONE	61	4	56	1
+Resume this session	5	0	0	0
+Shift+Tab:mode	72	4	59	9
+Starting session	4	4	0	0
+Starting session…	4	4	0	0
+Thinking	2	0	2	0
+Thought for	57	0	48	9
+Waiting for response	12	0	12	0
+Waiting for response…	12	0	12	0
+Worked for	9	0	0	9
+[stop]	59	0	59	0
+always-approve	72	4	59	9
+│ ❯	72	4	59	9
+◆	59	0	50	9
+❯	72	4	59	9

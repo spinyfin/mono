@@ -1,0 +1,3 @@
+zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh
+Last login: Mon Jul 27 17:53:54 on ttys008
+brianduff@brians-laptop run_out % zsh /Users/brianduff/.local/share/cube/workspaces/mono-agent-187/tools/boss/docs/investigations/grok-tui-liveness-markers-artifacts/ghosttykit_host/run_out/pane_script.sh

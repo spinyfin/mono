@@ -1,0 +1,26 @@
+╭───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                                                                       │
+│                                                              ⠀⠀⠀⣀⣤⣤⣀⠀⠀⡠                                                               │
+│                                                              ⠀⢀⡾⠋⠁⠀⢁⢴⡎⠀                                                               │
+│                                                              ⠀⢸⡇⠀⠀⠐⠁⢀⣿⠀                                                               │
+│                                                              ⠀⢈⠗⢀⣀⣀⣠⡾⠃⠀                                                               │
+│                                                              ⠐⠁⠀⠈⠉⠉⠉⠀⠀⠀                                                               │
+│                                                                                                                                       │
+│ Grok Build  v0.2.112                                                                                                                  │
+│ /private/tmp/grok-liveness-spike/cwd                                                                                                  │
+│ Model · Grok 4.5                                                                                                                      │
+│ /help for commands                                                                                                                    │
+│                                                                                                                                       │
+╰───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+                                                                                                                                         
+❯ Use the shell tool to run exactly: sleep 14. Do not skip the sleep. After it finishes reply with exactly: LIVE_SEED_DONE.              
+                                                                                                                                         
+◆ Thought for 0.2s                                                                                                                       
+                                                                                                                                         
+The user wants me to run exactly sleep 14 using the shell tool, and after it finishes, reply with exactly LIVE_SEED_DONE.                
+Running sleep 14 now.                                                                                                                    
+◆ Run Sleep for 14 seconds as requested
+$ sleep 14
+⠙ Sleep for 14 seconds as requested… 13s                                                                                       16s ⇣15.0k
+❯
+Grok 4.5 (high) · always-approve · 15K / 500K (3%) · ctrl+o transcript
