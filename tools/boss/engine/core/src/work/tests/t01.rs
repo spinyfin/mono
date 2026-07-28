@@ -1758,7 +1758,7 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
     let execution = create_ready_chore_execution(&db, chore.id.clone());
     // Drive the chore into the Doing column by starting the run —
-    // this is the state cancel is supposed to undo.
+    // live cancel is the demote path (stop/abandon semantics).
     db.start_execution_run(
         &execution.id,
         "worker-1",
@@ -1768,8 +1768,14 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
         "/tmp/mono-agent-001",
     )
     .unwrap();
+    // Simulate a prior human status touch so we can assert the demote
+    // re-attributes the bounce to the engine (not the human).
+    db.force_last_status_actor_for_test(&chore.id, "human").unwrap();
     match db.get_work_item(&chore.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Active),
+        WorkItem::Chore(t) | WorkItem::Task(t) => {
+            assert_eq!(t.status, TaskStatus::Active);
+            assert_eq!(t.last_status_actor, "human");
+        }
         other => panic!("expected chore/task, got {other:?}"),
     }
 
@@ -1777,9 +1783,131 @@ fn cancel_execution_marks_row_and_resets_active_chore_to_todo() {
     assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
     assert!(cancelled.finished_at.is_some());
 
-    // Active → todo so the kanban card returns to the To-Do lane.
+    // Live cancel of the current execution: active → todo + engine actor
+    // so the kanban card returns to Backlog without looking random.
     match db.get_work_item(&chore.id).unwrap() {
-        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(t.status, TaskStatus::Todo),
+        WorkItem::Chore(t) | WorkItem::Task(t) => {
+            assert_eq!(t.status, TaskStatus::Todo);
+            assert_eq!(t.last_status_actor, "engine");
+        }
+        other => panic!("expected chore/task, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Cancelling a never-started (`ready`) execution must not yank an
+/// `active` card to Backlog. Observed: human moved Doing, then
+/// `bossctl work cancel` on the ready row bounced the card; same for
+/// short-lived ready rows cancelled before spawn.
+#[test]
+fn cancel_execution_ready_does_not_demote_active_task() {
+    let path = temp_db_path("cancel-ready-keeps-active");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Doing with ready");
+    // Card is already Doing (human drag or prior lifecycle); a ready
+    // execution is pending dispatch — cancel must clear only the row.
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    db.force_last_status_actor_for_test(&chore.id, "human").unwrap();
+    let ready = create_ready_chore_execution(&db, chore.id.clone());
+
+    let cancelled = db.cancel_execution(&ready.id).unwrap();
+    assert_eq!(cancelled.status, ExecutionStatus::Cancelled);
+    assert!(cancelled.finished_at.is_some());
+
+    match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::Active,
+                "cancelling never-started ready must not demote active"
+            );
+            assert_eq!(
+                t.last_status_actor, "human",
+                "ready cancel must not re-stamp last_status_actor"
+            );
+        }
+        other => panic!("expected chore/task, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_file(path);
+}
+
+/// Cancelling a superseded (non-latest) live execution must not demote
+/// the row — same supersession guard as
+/// `cancel_running_execution_and_demote_task`.
+#[test]
+fn cancel_execution_superseded_live_does_not_demote() {
+    let path = temp_db_path("cancel-superseded-via-cancel-execution");
+    let db = WorkDb::open(path.clone()).unwrap();
+
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Redispatched");
+    db.update_work_item(
+        &chore.id,
+        WorkItemPatch {
+            status: Some("active".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let exec_old = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    let exec_new = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::ChoreImplementation)
+                .status(ExecutionStatus::Running)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(
+        db.latest_execution_for_work_item(&chore.id).unwrap().unwrap().id,
+        exec_new.id
+    );
+
+    db.cancel_execution(&exec_old.id).unwrap();
+    assert_eq!(
+        db.get_execution(&exec_old.id).unwrap().status,
+        ExecutionStatus::Cancelled
+    );
+    match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::Active,
+                "cancelling a superseded live execution must not demote"
+            );
+        }
+        other => panic!("expected chore/task, got {other:?}"),
+    }
+    assert_eq!(db.get_execution(&exec_new.id).unwrap().status, ExecutionStatus::Running);
+
+    // Control: cancelling the current live execution still demotes.
+    db.cancel_execution(&exec_new.id).unwrap();
+    match db.get_work_item(&chore.id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => {
+            assert_eq!(t.status, TaskStatus::Todo);
+            assert_eq!(t.last_status_actor, "engine");
+        }
         other => panic!("expected chore/task, got {other:?}"),
     }
 

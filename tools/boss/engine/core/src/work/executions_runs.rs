@@ -22,12 +22,24 @@ impl WorkDb {
     /// when the execution is unknown or already in a terminal status
     /// — callers shouldn't try to cancel a row that's already done.
     ///
-    /// If the backing work item is currently `active` (the kanban
-    /// Doing column), it's reset to `todo` so the card returns to the
-    /// To-Do lane. `in_review`, `done`, and `archived` are preserved:
-    /// `in_review` means a PR exists and cancel doesn't retract that
-    /// PR, and `done`/`archived` are explicit human transitions that
-    /// the auto-dispatch path is forbidden from downgrading.
+    /// **Kanban demote policy** (aligned with
+    /// [`Self::cancel_running_execution_and_demote_task`]):
+    ///
+    /// - Cancelling a **live** execution (`running` / `waiting_human`)
+    ///   demotes an `active` work item back to `todo` **only when this
+    ///   execution is still the work item's latest**, and stamps
+    ///   `last_status_actor = 'engine'`. That is the explicit
+    ///   stop/abandon path: tear down the current worker and return the
+    ///   card to Backlog so the orphan-active sweep does not redispatch
+    ///   a ghost-active row.
+    /// - Cancelling a **never-started** row (`ready` / `queued` /
+    ///   `waiting_dependency`) does **not** touch task status. A human
+    ///   (or another execution) may have the card in Doing; yanks from
+    ///   cancel of a stale never-started row are the observed bug.
+    /// - `in_review`, `done`, and `archived` are always preserved:
+    ///   `in_review` means a PR exists and cancel doesn't retract that
+    ///   PR, and `done`/`archived` are explicit human transitions that
+    ///   the auto-dispatch path is forbidden from downgrading.
     ///
     /// Workspace lease columns are intentionally left intact so the
     /// caller can hand the execution id to
@@ -81,18 +93,12 @@ impl WorkDb {
              WHERE id = ?1",
             params![execution_id, now.as_str()],
         )?;
-        // Move the kanban card back to To-Do for tasks/chores that
-        // were `active` (Doing). Scoped to `active` only so we don't
-        // clobber a `done`/`archived`/`in_review` transition.
-        tx.execute(
-            "UPDATE tasks
-             SET status = 'todo',
-                 updated_at = ?2
-             WHERE id = ?1
-               AND deleted_at IS NULL
-               AND status = 'active'",
-            params![existing.work_item_id, now.as_str()],
-        )?;
+        // Live cancel only: demote active → todo when this execution is
+        // still the work item's latest. Never-started cancels leave the
+        // kanban alone (shared helper with cancel_running_execution_and_demote_task).
+        if existing.status.is_live() {
+            demote_active_if_latest_execution(&tx, &existing.work_item_id, execution_id, &now)?;
+        }
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after cancel: {execution_id}"))?;
         // Canonical terminalization trace — see `mark_execution_orphaned` for
