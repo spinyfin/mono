@@ -58,6 +58,62 @@ ANTHROPIC_API_KEY=... bazel run //tools/boss/engine:engine -- --socket-path /tmp
 BOSS_ENGINE_AUTOSTART=0 BOSS_SOCKET_PATH=/tmp/boss-engine.sock bazel run //tools/boss/app-macos:Boss
 ```
 
+## Agent capture (isolated UI screenshot)
+
+Workers can screenshot the real Boss UI from a quiet isolated instance.
+The capture path is in-process (`cacheDisplay` on a window that is never
+ordered front) — no ScreenCaptureKit, no `screencapture`, no TCC grant,
+no window on the operator's screen, no focus theft.
+
+**Signal:** `BOSS_SOCKET_PATH` set to any path other than
+`/tmp/boss-engine.sock`. That one env var drives the toolbar
+`AGENT CAPTURE — isolated instance` badge, `.accessory` activation
+policy (set in `applicationWillFinishLaunching`, never toggled), and a
+per-instance `UserDefaults` suite (`dev.spinyfin.bossmacapp.capture`) so
+window frames do not bleed into the operator's live app.
+
+**Mode 1 — chrome / layout only (no engine):**
+
+```bash
+BOSS_SOCKET_PATH=/tmp/boss-shot-$ID.sock BOSS_ENGINE_AUTOSTART=0 \
+  bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png
+```
+
+The app renders disconnected (`EngineUnreachableBanner` shows; board empty),
+writes the PNG, and exits. Optional `--capture-after <seconds>` delays the
+grab (default ~0.6s) so SwiftUI can finish first layout.
+
+**Mode 2 — realistic UI with fixture state:** start an isolated engine first
+(already permitted by the launch guard), seed a **fixture** DB (never copy
+the operator's `state.db`), then capture:
+
+```bash
+env -u BOSS_EVENTS_SOCKET BOSS_WORKER_POOL_SIZE=0 \
+  bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-shot-$ID.sock
+# seed fixture rows via the boss CLI against that socket, then:
+BOSS_SOCKET_PATH=/tmp/boss-shot-$ID.sock BOSS_ENGINE_AUTOSTART=0 \
+  bazel run //tools/boss/app-macos:Boss -- --capture-to /tmp/shot.png --capture-after 3
+```
+
+**Launch-guard contract:** `bazel run` of an `app-macos` target is allowed
+only when both `BOSS_SOCKET_PATH` is non-production and
+`BOSS_ENGINE_AUTOSTART=0`. Direct `/Applications/Boss.app`, `open -a Boss`,
+and bare binary launches remain blocked. The hard gate in
+`agent_launch_guard.rs` is unchanged.
+
+**Known capture limits (measured on macOS 26):**
+
+- `NavigationSplitView` sidebar with `.listStyle(.sidebar)` loses **row text**
+  under `cacheDisplay` (solid flat background). Detail pane, toolbar badge,
+  and chrome survive. Sidebar layout bugs need a different verification path.
+- Glass toolbar controls (FB20272917) may blank; the capture badge is a custom
+  capsule so it stays legible.
+- Agents-mode libghostty surfaces stay mounted at opacity 0 in Work mode;
+  opacity-0 Metal layers do not blank the rest of the capture (measured).
+
+Do not commit capture PNGs to the branch. Read the image back and state in
+the PR body what you verified and what you could not.
+
 ## Overrides
 
 - `BOSS_SOCKET_PATH`: unix socket path (default `/tmp/boss-engine.sock`)

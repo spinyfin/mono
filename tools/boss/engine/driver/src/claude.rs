@@ -183,11 +183,15 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 ///
 /// Blocked: any program whose basename is `Boss` or `engine`, any program path
 /// containing `Boss.app`, `open` of a Boss bundle / `-a Boss` / the bundle id,
-/// `bazel run` of an `app-macos` target, `bazel run` of an engine target
-/// without an isolating `--socket-path`, and `swift run`.
+/// `bazel run` of an `app-macos` target without an isolating
+/// `BOSS_SOCKET_PATH` + `BOSS_ENGINE_AUTOSTART=0`, `bazel run` of an engine
+/// target without an isolating `--socket-path`, and `swift run`.
 ///
-/// Allowed: `bazel build`, `bazel test`, unpacking or inspecting a bundle, and
-/// `bazel run //tools/boss/engine:engine -- --socket-path <non-production>`.
+/// Allowed: `bazel build`, `bazel test`, unpacking or inspecting a bundle,
+/// `bazel run //tools/boss/engine:engine -- --socket-path <non-production>`,
+/// and isolated capture launches of the app
+/// (`BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel
+/// run //tools/boss/app-macos:Boss -- --capture-to <path>.png`).
 pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
     "python3 -c \"\n",
     "import json,os,sys,re,shlex\n",
@@ -265,8 +269,12 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
     "    if base in ('bazel','bazelisk') and len(rest)>1 and rest[1]=='run':\n",
     "        joined=' '.join(rest)\n",
     "        if 'tools/boss/app-macos' in joined:\n",
-    "            matched='bazel run of an app-macos target'\n",
-    "            break\n",
+    "            sock=vars.get('BOSS_SOCKET_PATH')\n",
+    "            auto=vars.get('BOSS_ENGINE_AUTOSTART')\n",
+    "            if (sock is None or os.path.normpath(sock)==PROD\n",
+    "                    or 'Library/Application Support/Boss' in sock or auto!='0'):\n",
+    "                matched='bazel run of an app-macos target without an isolating BOSS_SOCKET_PATH and BOSS_ENGINE_AUTOSTART=0'\n",
+    "                break\n",
     "        if 'tools/boss/engine' in joined:\n",
     "            sp=socket_arg(rest)\n",
     "            if sp is None or os.path.normpath(sp)==PROD or 'Library/Application Support/Boss' in sp:\n",
@@ -277,14 +285,18 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
     "        break\n",
     "if matched:\n",
     "    msg=('Blocked: this would start Boss itself (matched: '+matched+'). Workers must not launch ",
-    "the Boss macOS app or an engine that can reach production state on this machine -- the app ",
-    "puts a window on the user screen while they are working, and it terminates the running engine ",
-    "and starts its own in its place. To exercise a real engine, start an isolated one: env -u ",
+    "the installed /Applications/Boss.app or an engine that can reach production state on this ",
+    "machine -- the live app seizes the running engine, and an unisolated launch puts a window ",
+    "on the operator screen. To exercise a real engine, start an isolated one: env -u ",
     "BOSS_EVENTS_SOCKET bazel run //tools/boss/engine:engine -- --socket-path /tmp/boss-test-<id>.sock. ",
     "Any --socket-path other than /tmp/boss-engine.sock derives its own db, events socket, pid file ",
     "and control token; unsetting BOSS_EVENTS_SOCKET matters because every worker pane inherits one ",
-    "pointing at production. Building and testing are unaffected (bazel build, bazel test). GUI ",
-    "verification is not something a worker can do -- say so in the PR and leave it to a human.')\n",
+    "pointing at production. To screenshot the real Boss UI quietly, launch an isolated capture ",
+    "instance: BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel run ",
+    "//tools/boss/app-macos:Boss -- --capture-to <path>.png. The instance renders itself in-process ",
+    "via cacheDisplay and exits; it never shows a window, never takes focus, and needs no ",
+    "screen-recording permission. Read the PNG back and state in the PR what you verified. ",
+    "Building and testing are unaffected (bazel build, bazel test).')\n",
     "    print(json.dumps({'decision':'block','reason':msg}))\n",
     "else:\n",
     "    print(json.dumps({'decision':'approve'}))\n",

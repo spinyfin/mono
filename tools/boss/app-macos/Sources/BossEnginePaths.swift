@@ -58,13 +58,45 @@ struct BossEnginePaths {
         )
     }
 
+    /// Canonical production control socket. Matches the engine's
+    /// `IsolationPaths::DEFAULT_SOCKET_PATH` — any other
+    /// `BOSS_SOCKET_PATH` marks an isolated / capture instance.
+    static let defaultProductionSocket = "/tmp/boss-engine.sock"
+
     /// Production socket path. Honours `BOSS_SOCKET_PATH` env override;
     /// otherwise resolves to the canonical `/tmp/boss-engine.sock`.
     /// Triggers a `fatalError` in test context — see `forTest(...)`.
     static func productionSocketPath() -> String {
         refuseFromTestContext("productionSocketPath()")
         return ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"]
-            ?? "/tmp/boss-engine.sock"
+            ?? defaultProductionSocket
+    }
+
+    /// `true` when `BOSS_SOCKET_PATH` points at a non-production socket.
+    ///
+    /// One signal drives three capture-instance behaviours: the toolbar
+    /// badge, quiet (`.accessory` + no-activate) launch, and the
+    /// per-instance `UserDefaults` suite. Mirrors engine-side
+    /// `is_test_fixture_socket` — no new env var.
+    ///
+    /// Safe to call from tests (reads the process environment only; does
+    /// not go through `productionSocketPath()`'s test-context refusal).
+    static var isIsolatedInstance: Bool {
+        guard let sock = ProcessInfo.processInfo.environment["BOSS_SOCKET_PATH"],
+              !sock.isEmpty
+        else {
+            return false
+        }
+        let normalized = URL(fileURLWithPath: sock).standardizedFileURL.path
+        let production = URL(fileURLWithPath: defaultProductionSocket).standardizedFileURL.path
+        if normalized == production {
+            return false
+        }
+        // Production-shaped Application Support paths are not isolation.
+        if sock.contains("Library/Application Support/Boss") {
+            return false
+        }
+        return true
     }
 
     /// Production pid-file path. Honours `BOSS_ENGINE_PID_PATH`;

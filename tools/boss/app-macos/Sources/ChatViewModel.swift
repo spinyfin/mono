@@ -985,7 +985,7 @@ final class ChatViewModel: ObservableObject {
     static let connectionLostBannerDelay: TimeInterval = 2.0 // grace period before a disconnect may raise the banner
     var connectionGeneration = 0 // bumped on connect/disconnect; supersedes a stale banner-reveal
     var subscribedWorkTopics: Set<String> = []
-    private let defaults = UserDefaults.standard
+    private let defaults = BossDefaults.store
 
     /// Notification manager for Review-lane transitions. Fires a system
     /// banner when a task reaches `in_review` while the app is backgrounded.

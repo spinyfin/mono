@@ -11,9 +11,9 @@ import SwiftUI
 /// rather than an `ObservableObject`, so this view polls a snapshot on a
 /// timer (the approach [[MetricsViewer]] uses for engine counters).
 struct TerminalLoopViewer: View {
-    @AppStorage("boss.terminalLoopViewer.visible") private var isOpen = false
-    @AppStorage("boss.terminalLoop.sampling") private var samplingEnabled = true
-    @AppStorage("boss.terminalLoop.deepContent") private var deepContent = false
+    @AppStorage("boss.terminalLoopViewer.visible", store: BossDefaults.store) private var isOpen = false
+    @AppStorage("boss.terminalLoop.sampling", store: BossDefaults.store) private var samplingEnabled = true
+    @AppStorage("boss.terminalLoop.deepContent", store: BossDefaults.store) private var deepContent = false
 
     @State private var latest: LoopSample?
     @State private var tabSwitches: [TabSwitchSample] = []

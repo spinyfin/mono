@@ -14,7 +14,7 @@ import SwiftUI
 /// Backtraces are stored as raw addresses on each [[StallRecord]] and
 /// symbolicated lazily here (and on export) — never on the capture path.
 struct UIStallsViewer: View {
-    @AppStorage("boss.uiStalls.visible") private var isOpen = false
+    @AppStorage("boss.uiStalls.visible", store: BossDefaults.store) private var isOpen = false
     @State private var records: [StallRecord] = []
     @State private var window: SinceWindow = .fiveMinutes
     @State private var expanded: Set<UUID> = []

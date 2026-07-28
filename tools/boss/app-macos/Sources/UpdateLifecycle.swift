@@ -87,7 +87,7 @@ enum UpdateLifecycle {
     // MARK: Environment probes
 
     static var isAutomaticMode: Bool {
-        (UserDefaults.standard.string(forKey: modeKey) ?? "notify") == UpdateMode.automatic.rawValue
+        (BossDefaults.store.string(forKey: modeKey) ?? "notify") == UpdateMode.automatic.rawValue
     }
 
     /// A build whose `BossFullVersion` contains `-dev-` is local/unreleased and must

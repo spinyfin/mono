@@ -27,8 +27,8 @@ struct ContentView: View {
     @State private var isSearchExpanded: Bool = false
     @State private var workColumnVisibility: NavigationSplitViewVisibility = .all
     @Environment(\.openWindow) private var openWindow
-    @AppStorage("boss.ui.standardSearch") private var useStandardSearch: Bool = false
-    @AppStorage("boss.kanban.boardStyle") private var kanbanBoardStyle: KanbanBoardStyle = .classic
+    @AppStorage("boss.ui.standardSearch", store: BossDefaults.store) private var useStandardSearch: Bool = false
+    @AppStorage("boss.kanban.boardStyle", store: BossDefaults.store) private var kanbanBoardStyle: KanbanBoardStyle = .classic
 
     var body: some View {
         // Work and Agents are kept alive via opacity + hit-testing so SwiftUI
@@ -223,6 +223,25 @@ struct ContentView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(width: 360)
+            }
+
+            // Agent-capture badge: isolation signal only
+            // (`BossEnginePaths.isIsolatedInstance`). Lives in the toolbar
+            // next to the mode picker — never in the banner stack
+            // (ContentView chrome / ContentViewChrome), which is an active
+            // merge-conflict surface. Custom Text+Capsule (not a glass
+            // NSBezelStyle control) so it survives cacheDisplay under the
+            // open FB20272917 glass-control blanking bug.
+            if BossEnginePaths.isIsolatedInstance {
+                ToolbarItem(placement: .navigation) {
+                    Text("AGENT CAPTURE — isolated instance")
+                        .font(.caption.weight(.semibold))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color.orange.opacity(0.9)))
+                        .foregroundStyle(.white)
+                        .accessibilityIdentifier("boss.agentCaptureBadge")
+                }
             }
 
             ToolbarItem {

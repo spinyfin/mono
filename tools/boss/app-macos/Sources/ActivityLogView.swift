@@ -198,10 +198,10 @@ struct ActivityLogView: View {
     @EnvironmentObject private var chat: ChatViewModel
     @StateObject private var model = ActivityLogModel()
 
-    @AppStorage("boss.activityLog.sourceFilter") private var sourceFilterRaw =
+    @AppStorage("boss.activityLog.sourceFilter", store: BossDefaults.store) private var sourceFilterRaw =
         ActivitySourceFilter.all.rawValue
-    @AppStorage("boss.activityLog.outcomeFilter") private var outcomeFilterRaw = ""
-    @AppStorage("boss.activityLog.searchText") private var searchText = ""
+    @AppStorage("boss.activityLog.outcomeFilter", store: BossDefaults.store) private var outcomeFilterRaw = ""
+    @AppStorage("boss.activityLog.searchText", store: BossDefaults.store) private var searchText = ""
 
     @State private var selectedRowId: String?
 
