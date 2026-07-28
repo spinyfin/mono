@@ -1014,3 +1014,38 @@ pub(super) async fn handle_create_revision(ctx: Dispatch, req: FrontendRequest) 
     )
     .await;
 }
+
+/// Set (or clear) a task's per-task doc pointer — operator CLI
+/// (`boss task set-doc`) and the investigation/project-less-design
+/// manual-override path when the doc detector cannot auto-populate.
+pub(super) async fn handle_set_task_doc_pointer(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        server_state,
+        work_db,
+        sink,
+        session_id,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetTaskDocPointer { input } = req else {
+        unreachable!()
+    };
+    match work_db.set_task_doc(input) {
+        Ok(task) => {
+            let item = WorkItem::Task(task);
+            let product_id = item.product_id().to_string();
+            let revision = publish_work_invalidation(
+                &server_state,
+                &session_id,
+                &request_id,
+                vec![work_product_topic(&product_id)],
+                "task_doc_pointer_set",
+                Some(product_id),
+                vec![work_item_id(&item)],
+            )
+            .await;
+            send_response_with_revision(&sink, &request_id, revision, FrontendEvent::WorkItemUpdated { item });
+        }
+        Err(err) => send_work_error(&sink, &request_id, &err),
+    }
+}

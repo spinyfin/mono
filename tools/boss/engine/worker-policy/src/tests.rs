@@ -147,6 +147,21 @@ fn design_worker_design_doc_pointer_stays_allowed() {
 }
 
 #[test]
+fn investigation_worker_task_doc_pointer_stays_allowed() {
+    // `boss task set-doc` — task-level analogue of set-design-doc for
+    // investigations / project-less designs when the detector misses.
+    assert_allowed(FrontendRequest::SetTaskDocPointer {
+        input: boss_protocol::SetTaskDocPointerInput {
+            task_id: "task_1".into(),
+            unset: false,
+            doc_branch: None,
+            doc_path: Some("docs/investigations/thing.md".into()),
+            doc_repo_remote_url: None,
+        },
+    });
+}
+
+#[test]
 fn product_design_doc_browsing_stays_allowed() {
     // The Designs-tab reads. Read-only against the product's own repo,
     // and equivalent to a `gh api` call the worker can already make from

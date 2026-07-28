@@ -127,6 +127,38 @@ fn set_project_design_doc_input_unset_decodes_without_optional_fields() {
 }
 
 #[test]
+fn set_task_doc_pointer_input_roundtrips() {
+    let input = SetTaskDocPointerInput {
+        task_id: "task_1".into(),
+        doc_repo_remote_url: None,
+        doc_branch: Some("main".into()),
+        doc_path: Some("docs/investigations/foo.md".into()),
+        unset: false,
+    };
+    let raw = serde_json::to_value(&input).unwrap();
+    let obj = raw.as_object().unwrap();
+    assert!(!obj.contains_key("doc_repo_remote_url"));
+    assert_eq!(obj.get("unset"), Some(&Value::Bool(false)));
+    let back: SetTaskDocPointerInput = serde_json::from_value(raw).unwrap();
+    assert_eq!(back.task_id, input.task_id);
+    assert_eq!(back.doc_path, input.doc_path);
+    assert_eq!(back.doc_branch, input.doc_branch);
+    assert_eq!(back.unset, input.unset);
+}
+
+#[test]
+fn set_task_doc_pointer_input_unset_decodes_without_optional_fields() {
+    let raw = json!({
+        "task_id": "task_1",
+        "unset": true,
+    });
+    let parsed: SetTaskDocPointerInput = serde_json::from_value(raw).unwrap();
+    assert_eq!(parsed.task_id, "task_1");
+    assert!(parsed.unset);
+    assert!(parsed.doc_path.is_none());
+}
+
+#[test]
 fn resolved_design_doc_kind_serializes_as_internally_tagged() {
     let same = ResolvedDesignDocKind::SameProduct {
         product_id: "prod_1".into(),

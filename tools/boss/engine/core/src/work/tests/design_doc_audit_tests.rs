@@ -396,6 +396,82 @@ fn set_task_doc_pointer_branch_only_keeps_path() {
     }
 }
 
+/// Operator CLI path (`boss task set-doc`): set via `set_task_doc`,
+/// assert `get_work_tree` surfaces a resolved `doc_link_state`, then
+/// `--unset` clears the affordance. Round-trips the same write path
+/// the detector uses (`set_task_doc_pointer`) under a structured input.
+#[test]
+fn set_task_doc_round_trip_exposes_doc_link_in_work_tree() {
+    let db = WorkDb::open(temp_db_path("task-doc-cli-roundtrip")).unwrap();
+    let (product, task) = seed_investigation_for_doc(&db);
+
+    let updated = db
+        .set_task_doc(SetTaskDocPointerInput {
+            task_id: task.id.clone(),
+            doc_path: Some("docs/investigations/manual.md".to_owned()),
+            doc_branch: Some("boss/exec_manual_1".to_owned()),
+            doc_repo_remote_url: None,
+            unset: false,
+        })
+        .unwrap();
+    assert_eq!(updated.id, task.id);
+    assert_eq!(
+        db.task_doc_path(&task.id).unwrap().as_deref(),
+        Some("docs/investigations/manual.md"),
+    );
+
+    let tree = db.get_work_tree(&product.id).unwrap();
+    let found = tree
+        .tasks
+        .iter()
+        .find(|t| t.id == task.id)
+        .expect("investigation must appear in work tree");
+    match found
+        .doc_link_state
+        .as_ref()
+        .expect("set_task_doc must surface resolved doc_link_state via get_work_tree")
+    {
+        ProjectDesignDocState::Resolved { resolved, .. } => {
+            assert_eq!(resolved.path, "docs/investigations/manual.md");
+            assert_eq!(resolved.branch, "boss/exec_manual_1");
+        }
+        other => panic!("expected Resolved, got {other:?}"),
+    }
+
+    // Path validation matches project design docs (Q8).
+    let err = db
+        .set_task_doc(SetTaskDocPointerInput {
+            task_id: task.id.clone(),
+            doc_path: Some("/absolute/path.md".to_owned()),
+            unset: false,
+            ..SetTaskDocPointerInput::default()
+        })
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("repo-relative"), "got: {err}");
+
+    // --unset clears all three columns and hides the affordance.
+    let cleared = db
+        .set_task_doc(SetTaskDocPointerInput {
+            task_id: task.id.clone(),
+            unset: true,
+            ..SetTaskDocPointerInput::default()
+        })
+        .unwrap();
+    assert_eq!(cleared.id, task.id);
+    assert!(db.task_doc_path(&task.id).unwrap().is_none());
+    let tree_cleared = db.get_work_tree(&product.id).unwrap();
+    let found_cleared = tree_cleared
+        .tasks
+        .iter()
+        .find(|t| t.id == task.id)
+        .expect("investigation still in tree");
+    assert!(
+        found_cleared.doc_link_state.is_none(),
+        "unset must hide the doc-link affordance",
+    );
+}
+
 #[test]
 fn resolve_task_doc_pointer_none_when_unset() {
     let db = WorkDb::open(temp_db_path("task-doc-resolve-unset")).unwrap();

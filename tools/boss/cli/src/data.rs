@@ -214,6 +214,18 @@ pub(crate) async fn set_project_design_doc(
     )
 }
 
+pub(crate) async fn set_task_doc_pointer(
+    client: &mut BossClient,
+    input: SetTaskDocPointerInput,
+) -> Result<Task, CliError> {
+    rpc_call!(
+        try client,
+        FrontendRequest::SetTaskDocPointer { input },
+        "set task doc pointer",
+        FrontendEvent::WorkItemUpdated { item } => expect_task(item),
+    )
+}
+
 pub(crate) async fn resolve_project_design_doc(
     client: &mut BossClient,
     project_id: &str,
@@ -917,6 +929,93 @@ pub(crate) fn classify_bind_pr<'a>(prior: Option<&'a str>, new: &str) -> BindPrA
         Some(p) => BindPrAction::Overwrite { previous: p },
         None => BindPrAction::FirstTime,
     }
+}
+
+/// Args for `boss task set-doc`. Either `--path` (with optional
+/// `--repo` / `--branch`) or `--unset` must be supplied; clap enforces
+/// mutual exclusion for the conflict cases and the handler rejects the
+/// empty case at runtime. Mirrors [`ProjectSetDesignDocArgs`].
+#[derive(Debug, Clone, Args)]
+pub(crate) struct TaskSetDocArgs {
+    /// Task id. Accepts primary id (`task_…`), friendly short id
+    /// (e.g. `42` / `#42`), or cross-product form (`boss/42`).
+    pub(crate) id: String,
+
+    /// Resolve a friendly short id against this product (slug or id).
+    /// Ignored for primary ids and product-qualified selectors.
+    #[arg(long)]
+    pub(crate) product: Option<String>,
+
+    /// Repo-relative path to the doc (e.g. `docs/investigations/foo.md`).
+    /// Must end in `.md` / `.markdown`; absolute paths and `..` segments
+    /// are rejected engine-side.
+    #[arg(long, conflicts_with = "unset")]
+    pub(crate) path: Option<String>,
+
+    /// Override the repo URL the doc lives in. Omit to inherit from
+    /// the task's product (the same-repo case).
+    #[arg(long, requires = "path", conflicts_with = "unset")]
+    pub(crate) repo: Option<String>,
+
+    /// Override the branch the doc lives on. Omit to inherit from
+    /// the product's docs branch (or `main`).
+    #[arg(long, requires = "path", conflicts_with = "unset")]
+    pub(crate) branch: Option<String>,
+
+    /// Clear all three pointer columns. Mutually exclusive with
+    /// `--path` / `--repo` / `--branch`.
+    #[arg(long)]
+    pub(crate) unset: bool,
+}
+
+/// Shared handler for `boss task set-doc`. Mirrors
+/// `boss project set-design-doc`: validates path-or-unset, resolves
+/// short/primary ids, and writes via the dedicated RPC (which reuses
+/// the same `set_task_doc_pointer` path the detector uses).
+pub(crate) async fn run_task_set_doc(
+    client: &mut BossClient,
+    ctx: &RunContext,
+    args: TaskSetDocArgs,
+) -> Result<(), CliError> {
+    if !args.unset && args.path.is_none() {
+        return Err(CliError::usage(
+            "provide --path <p> (with optional --repo/--branch) or --unset",
+        ));
+    }
+    let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, args.product).await?;
+    let input = if args.unset {
+        SetTaskDocPointerInput {
+            task_id: resolved_id.clone(),
+            unset: true,
+            ..SetTaskDocPointerInput::default()
+        }
+    } else {
+        SetTaskDocPointerInput {
+            task_id: resolved_id.clone(),
+            doc_repo_remote_url: args.repo,
+            doc_branch: args.branch,
+            doc_path: args.path.clone(),
+            unset: false,
+        }
+    };
+    let updated = set_task_doc_pointer(client, input).await?;
+    let updated = with_display_status(updated);
+    print_entity(
+        ctx,
+        &serde_json::json!({
+            "task": updated,
+            "unset": args.unset,
+            "doc_path": args.path,
+        }),
+        || {
+            print_task_details("Updated task", &updated, None, false);
+            if args.unset {
+                println!("Doc pointer: (cleared)");
+            } else if let Some(path) = &args.path {
+                println!("Doc pointer: {path}");
+            }
+        },
+    )
 }
 
 /// Shared handler for `boss task bind-pr` and `boss chore bind-pr`.

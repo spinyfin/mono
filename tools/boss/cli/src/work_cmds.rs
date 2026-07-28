@@ -769,6 +769,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         }
         TaskCommand::Depend { command } => run_depend_command(command, &mut client, ctx).await,
         TaskCommand::BindPr(args) => run_bind_pr(&mut client, ctx, args).await,
+        TaskCommand::SetDoc(args) => run_task_set_doc(&mut client, ctx, args).await,
         TaskCommand::LinkExternal(args) => run_link_external(&mut client, ctx, args).await,
         TaskCommand::UnlinkExternal(args) => run_unlink_external(&mut client, ctx, args).await,
         TaskCommand::CreateMany(args) => run_task_create_many(&mut client, ctx, args).await,

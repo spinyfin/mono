@@ -19,9 +19,10 @@ use crate::types::{
     PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project,
     ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
     ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem,
-    WorkComment, WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView,
-    WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal, WorkerTierDenial,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
+    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
+    WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -2001,6 +2002,18 @@ pub enum FrontendRequest {
     SetSetting {
         key: String,
         enabled: bool,
+    },
+
+    /// Set (or clear) a task's per-task doc pointer (investigations and
+    /// project-less designs). Persists the three `tasks.doc_*` columns
+    /// per [`SetTaskDocPointerInput`]'s semantics and replies with the
+    /// updated `Task` row wrapped in a `WorkItemUpdated` event — same
+    /// shape `UpdateWorkItem` returns. Publishes a `work_invalidated`
+    /// topic event on the task's product so other connected clients
+    /// see the change (and `get_work_tree` re-resolves `doc_link_state`).
+    SetTaskDocPointer {
+        #[serde(flatten)]
+        input: SetTaskDocPointerInput,
     },
 
     /// Token-authenticated shutdown. The engine writes a random token
