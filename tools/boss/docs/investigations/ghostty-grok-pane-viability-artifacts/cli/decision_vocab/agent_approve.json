@@ -1,0 +1,26 @@
+{
+  "text": "DONE",
+  "stopReason": "EndTurn",
+  "sessionId": "1da90884-d4c9-4dd2-a2b4-bf9f072e04cc",
+  "requestId": "e021b17d-d8a8-48d0-8a59-fca9503a92a6",
+  "thought": "The user wants me to write a file named ATTACK_approve.txt with the exact single line \"ATTACK_approve_OK\" using the write tool (not shell), then reply with only the word DONE.The file has been written successfully. The user asked me to reply with only the word DONE.",
+  "usage": {
+    "input_tokens": 2365,
+    "cache_read_input_tokens": 24448,
+    "output_tokens": 110,
+    "reasoning_tokens": 102,
+    "total_tokens": 26923
+  },
+  "num_turns": 2,
+  "total_cost_usd": 0.0127244,
+  "total_cost_usd_ticks": 127244000,
+  "modelUsage": {
+    "grok-4.5-build": {
+      "inputTokens": 2365,
+      "outputTokens": 110,
+      "cacheReadInputTokens": 24448,
+      "modelCalls": 2,
+      "costUSD": 0.0127244
+    }
+  }
+}

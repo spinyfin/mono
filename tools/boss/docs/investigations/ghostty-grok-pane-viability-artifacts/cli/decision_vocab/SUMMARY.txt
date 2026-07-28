@@ -1,0 +1,18 @@
+PreToolUse decision vocabulary matrix
+grok 0.2.112 (9bbd559437aa) [stable]
+Isolated GROK_HOME=/tmp/grok-t02-vocab/home
+Probe: headless write of ATTACK_<tag>.txt via write tool; attack file present => allowed, absent => blocked.
+
+tag|attack|interpretation
+deny|absent|BLOCKS (documented PreToolUse deny)
+block|present|FAILS OPEN — Boss guard vocabulary NOT recognised as PreToolUse deny
+approve|present|allows (non-blocking; not a special allow token, same as unknown)
+allow|present|allows (documented allow)
+empty|present|allows (exit 0, empty stdout)
+no_decision_key|present|allows (JSON without decision key — fail-open)
+exit2|absent|BLOCKS (Claude-compatible exit 2 + stderr)
+foobar|present|allows (unrecognised decision — fail-open)
+permit|present|allows (unrecognised decision — fail-open)
+
+Official doc (bundled 10-hooks.md): PreToolUse accepts decision=allow|deny only.
+decision=block is documented for Stop/SubagentStop stop-gate, NOT PreToolUse.

@@ -5,14 +5,15 @@
     "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
     "cwd": "/private/tmp/grok-t02-vocab/cwd",
     "workspaceRoot": "/private/tmp/grok-t02-vocab/cwd",
-    "timestamp": "2026-07-28T00:54:07.192549+00:00",
+    "timestamp": "2026-07-28T00:54:09.166419+00:00",
     "transcriptPath": "/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/0c4c0914-5e64-432c-90fa-dcdad9ff5957/updates.jsonl",
     "permissionMode": "bypassPermissions",
-    "toolName": "write",
-    "toolUseId": "call-ef95d1a0-f372-4c75-a667-77187c00ed2e-0",
+    "toolName": "search_replace",
+    "toolUseId": "call-6292e2ff-4041-4ae0-96d0-9219ea253f1a-1",
     "toolInput": {
       "file_path": "/private/tmp/grok-t02-vocab/cwd/toolmap_write.txt",
-      "content": "WRITE_OK\n"
+      "old_string": "WRITE_OK",
+      "new_string": "WRITE_EDITED_OK"
     },
     "toolInputTruncated": false
   }

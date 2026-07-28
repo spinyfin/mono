@@ -1,0 +1,11 @@
+===DECISION=permit===
+===ENV===
+CLAUDE_PROJECT_DIR=/private/tmp/grok-t02-vocab/cwd
+GROK_AGENT=1
+GROK_HOME=/tmp/grok-t02-vocab/home
+GROK_HOOK_EVENT=pre_tool_use
+GROK_HOOK_NAME=global/decision-probe:pre_tool_use[0].hooks[0]
+GROK_SESSION_ID=6837e776-bce3-4966-80b7-b0ee7656ce25
+GROK_WORKSPACE_ROOT=/private/tmp/grok-t02-vocab/cwd
+===STDIN===
+{"hookEventName":"pre_tool_use","sessionId":"6837e776-bce3-4966-80b7-b0ee7656ce25","cwd":"/private/tmp/grok-t02-vocab/cwd","workspaceRoot":"/private/tmp/grok-t02-vocab/cwd","timestamp":"2026-07-28T00:53:28.624392+00:00","transcriptPath":"/tmp/grok-t02-vocab/home/sessions/%2Fprivate%2Ftmp%2Fgrok-t02-vocab%2Fcwd/6837e776-bce3-4966-80b7-b0ee7656ce25/updates.jsonl","permissionMode":"bypassPermissions","toolName":"write","toolUseId":"call-5402dfc0-ff62-48f6-8321-a46b542d1938-0","toolInput":{"file_path":"/private/tmp/grok-t02-vocab/cwd/ATTACK_permit.txt","content":"ATTACK_permit_OK\n"},"toolInputTruncated":false}
