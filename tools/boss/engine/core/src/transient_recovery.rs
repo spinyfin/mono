@@ -37,8 +37,8 @@
 //!      recovered on its own and we leave it alone). We never trust the
 //!      `Idle` hook alone — it can't distinguish "finished cleanly" from
 //!      "wedged on an error."
-//!   2. Classify the error
-//!      ([`crate::transient_error::classify_claude_error`]) and apply
+//!   2. Classify the error through the resolved driver's
+//!      [`crate::driver::AgentDriver::classify_error`] and apply
 //!      the bounded-retry policy
 //!      ([`crate::transient_error::RecoveryPolicy`]).
 //!   3. **Nudge** (transient, under cap, worker alive and idle, not
@@ -115,10 +115,10 @@ use boss_protocol::WorkerActivity;
 
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
+use crate::driver::{DriverRegistry, WorkerErrorClass};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::transient_error::{
-    ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, classify_claude_error, extract_worker_error,
-    transcript_shows_no_activity,
+    ErrorClass, EscalateReason, RecoveryDecision, RecoveryPolicy, extract_worker_error, transcript_shows_no_activity,
 };
 use crate::work::{ATTENTION_KIND_RECOVERY_EXHAUSTED, ATTENTION_KIND_RECOVERY_PERMANENT, WorkDb};
 
@@ -336,7 +336,12 @@ pub async fn run_one_pass(
         //     parked is exactly the bug this closes.
         let (error_text, class, stall_reason) = match extract_worker_error(&lines) {
             Some(text) => {
-                let class = classify_claude_error(&text);
+                // Route through the resolved driver's ControlVerbs
+                // classifier — never call a provider-specific helper
+                // directly. An unresolvable driver fails closed to
+                // Indeterminate (bounded retry, then escalate) rather
+                // than inventing Claude's table for every backend.
+                let class = classify_error_for_execution(work_db, &execution_id, &text);
                 (text, class, "api_error")
             }
             None if prior_attempts > 0 && transcript_shows_no_activity(&lines) => (
@@ -586,6 +591,50 @@ pub async fn run_one_pass(
 
 /// True for slot states a stalled-on-error worker can be in. A
 /// `Working`/`Spawning` slot is actively progressing (or not yet up).
+/// Resolve the execution's driver and ask it to classify `text`.
+///
+/// Falls closed to [`ErrorClass::Indeterminate`] when the driver slug is
+/// unknown or unregistered — never invents a provider-specific table.
+fn classify_error_for_execution(work_db: &WorkDb, execution_id: &str, text: &str) -> ErrorClass {
+    let slug = match work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => slug,
+        Ok(None) => {
+            tracing::debug!(
+                execution_id,
+                "transient-recovery: no driver recorded for execution; treating error as indeterminate",
+            );
+            return ErrorClass::Indeterminate;
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                ?err,
+                "transient-recovery: driver lookup failed; treating error as indeterminate",
+            );
+            return ErrorClass::Indeterminate;
+        }
+    };
+    match DriverRegistry::default().get(&slug) {
+        Some(driver) => worker_error_class_to_policy(driver.classify_error(text)),
+        None => {
+            tracing::warn!(
+                execution_id,
+                driver = %slug,
+                "transient-recovery: driver slug not in registry; treating error as indeterminate",
+            );
+            ErrorClass::Indeterminate
+        }
+    }
+}
+
+fn worker_error_class_to_policy(class: WorkerErrorClass) -> ErrorClass {
+    match class {
+        WorkerErrorClass::Transient => ErrorClass::Transient,
+        WorkerErrorClass::Permanent => ErrorClass::Permanent,
+        WorkerErrorClass::Indeterminate => ErrorClass::Indeterminate,
+    }
+}
+
 fn should_inspect(activity: WorkerActivity) -> bool {
     matches!(
         activity,

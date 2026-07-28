@@ -671,6 +671,66 @@ impl MidTurnPaneInput {
     }
 }
 
+// ── ControlVerbs delivery plans ──────────────────────────────────────────────
+//
+// Declarative answers the engine asks a driver when it needs to act on a live
+// worker. The methods on [`AgentDriver`] return these plans; the engine owns
+// the transport (pane RPCs, process signals). A driver that has not proven a
+// verb returns the safe/unsupported arm so the worker is fire-and-forget for
+// that verb rather than silently inheriting another driver's mechanism.
+
+/// How the engine should deliver a probe (inject text) into a live worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeDelivery {
+    /// Write text into the worker pane as typed input — the interactive-TUI
+    /// path used by Claude today (`SendToPane`).
+    PaneText,
+    /// Driver does not support probing; the worker is fire-and-forget for
+    /// this verb. Safe default for any driver that has not established a
+    /// delivery mechanism.
+    Unsupported,
+}
+
+/// How the engine should interrupt an in-flight turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptDelivery {
+    /// Deliver an Esc keystroke into the pane (`InterruptWorkerPane`) —
+    /// Claude's interactive-TUI path today.
+    PaneEsc,
+    /// Driver does not support interrupt; the in-flight turn cannot be
+    /// cancelled short of a full stop/reap. Safe default.
+    Unsupported,
+}
+
+/// How the engine should stop a worker (graceful path before process kill).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopDelivery {
+    /// No graceful quit string; tear the worker down at the process level
+    /// only. Claude and Codex today both use this — `agents stop` cancels
+    /// the execution and reaps the pane/process without typing a quit
+    /// command into the agent.
+    ProcessOnly,
+    /// Type `command` into the pane (as a full line), then release. A future
+    /// interactive driver may use this for a graceful `/quit`-style exit
+    /// before process kill.
+    PaneCommand { command: &'static str },
+    /// Driver has no stop verb of its own; fall through to reap.
+    Unsupported,
+}
+
+/// How the engine should reap a worker process.
+///
+/// Reap is the one ControlVerbs verb that always works: every driver is a
+/// process the engine can signal. The plan names the ladder so a future
+/// driver with a different cleanup order can diverge without the engine
+/// inventing it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReapDelivery {
+    /// SIGTERM, then SIGKILL on the process group after a grace window —
+    /// today's universal ladder (`reap_worker_process_tree`).
+    ProcessGroup,
+}
+
 /// Fidelity tier of the [`WorkerEvent`] stream a driver's
 /// [`Capability::ProgressObservation`] produces (design §Capabilities).
 ///
@@ -774,19 +834,47 @@ pub struct ProgressObservationConfig {
     pub forwarder_binary: PathBuf,
 }
 
+/// Where a driver's hook-callback wiring is written so the agent actually
+/// reads it.
+///
+/// [`ProgressIngress::HookCallback`] carries a hooks map but does not, by
+/// itself, say *where* that map goes. The engine's settings-file renderer
+/// used to merge every hook-callback map into the Claude worker settings
+/// file — correct for Claude, silently wrong for a driver whose agent
+/// reads hooks from its own home (the forwarder and the interception
+/// guards would both land in a file the agent never opens). The
+/// destination makes the engine's merge conditional on a declared property
+/// rather than on the variant alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HookWiringDestination {
+    /// Merge the hooks map (and any interception guards layered onto
+    /// `PreToolUse`) into the worker settings file the engine renders
+    /// (Claude's `settings.json` via `--settings`).
+    #[default]
+    WorkerSettingsFile,
+    /// The driver writes the wiring itself (e.g. into a per-run home the
+    /// agent reads). The engine must not merge hooks or interception
+    /// guards into the settings file.
+    DriverOwned,
+}
+
 /// A driver's event-source wiring for [`Capability::ProgressObservation`]
 /// when that source is [`ProgressIngress::HookCallback`].
 ///
-/// `hooks` is the settings-file `hooks` map that routes every lifecycle +
-/// tool hook event to the `boss-event` shim, which forwards each payload to
-/// the engine events socket; the spawn flow merges this fragment into the
-/// worker settings file.
+/// `hooks` is the hooks map that routes every lifecycle + tool hook event
+/// to the `boss-event` shim, which forwards each payload to the engine
+/// events socket. [`Self::destination`] declares where that map is written
+/// so the engine's settings-file merge is conditional on the declaration
+/// rather than on the variant alone.
 #[derive(Debug, Clone, Default)]
 pub struct ProgressObservationWiring {
     /// Hook-event name → array of hook entries. Claude wires all seven
     /// lifecycle events to the forwarder; the caller may extend the
-    /// `PreToolUse` entry with interception guards (a separate capability).
+    /// `PreToolUse` entry with interception guards (a separate capability)
+    /// when [`Self::destination`] is [`HookWiringDestination::WorkerSettingsFile`].
     pub hooks: serde_json::Map<String, serde_json::Value>,
+    /// Where this wiring is written so the agent reads it.
+    pub destination: HookWiringDestination,
 }
 
 /// A run-correlated JSONL file source owned by the engine.
@@ -810,7 +898,9 @@ pub struct AgentJsonlFileIngress {
 ///
 /// - Claude wires a hooks map ([`ProgressObservationWiring`]) that fans every
 ///   lifecycle/tool event out to the `boss-event` shim, which forwards each
-///   payload to the engine's events-socket ingress.
+///   payload to the engine's events-socket ingress. The wiring's
+///   [`HookWiringDestination`] declares whether the engine merges that map
+///   into the worker settings file or the driver writes it itself.
 /// - Codex has no equally robust hook signal for *progress*: its hook trust
 ///   model fails open and silently on an untrusted/misconfigured hook (no
 ///   error, no log line — reproduction 2 in the decision doc), which is
@@ -825,7 +915,10 @@ pub struct AgentJsonlFileIngress {
 /// of hooks is a distinct, named transport, not a degenerate hook case.
 #[derive(Debug, Clone)]
 pub enum ProgressIngress {
-    /// Claude-style: a hooks map merged into the worker settings file.
+    /// Hook-callback transport. Where the hooks map is written is declared
+    /// by [`ProgressObservationWiring::destination`] — the engine merges
+    /// into the worker settings file only when that is
+    /// [`HookWiringDestination::WorkerSettingsFile`].
     HookCallback(ProgressObservationWiring),
     /// Engine-owned process: parse the worker's stdout JSONL stream; no
     /// settings-file wiring is produced.
@@ -1607,10 +1700,42 @@ pub trait AgentDriver: Send + Sync {
     fn extract_error_from_transcript(&self, lines: &[serde_json::Value]) -> Option<String>;
 
     // ── ControlVerbs capability ─────────────────────────────────────────────
+    //
+    // probe / interrupt / stop / reap / classify-error. Each verb is a
+    // declarative plan the engine executes over its own transport (pane
+    // RPCs, process signals). Defaults are the safe answers: unsupported
+    // for probe/interrupt (fire-and-forget), process-only stop, process-
+    // group reap. Override only with evidence about the actual process.
 
     /// Classify a raw error string from the worker's output for
-    /// transient-recovery decisions.
+    /// transient-recovery decisions. Provider-specific: must not route
+    /// through another driver's classifier.
     fn classify_error(&self, raw_output: &str) -> WorkerErrorClass;
+
+    /// How the engine should deliver a probe (inject text) into a live
+    /// worker of this driver. Defaults to [`ProbeDelivery::Unsupported`].
+    fn probe(&self) -> ProbeDelivery {
+        ProbeDelivery::Unsupported
+    }
+
+    /// How the engine should interrupt an in-flight turn. Defaults to
+    /// [`InterruptDelivery::Unsupported`].
+    fn interrupt(&self) -> InterruptDelivery {
+        InterruptDelivery::Unsupported
+    }
+
+    /// How the engine should stop a worker before process kill. Defaults to
+    /// [`StopDelivery::ProcessOnly`] — process-level teardown always works.
+    fn stop(&self) -> StopDelivery {
+        StopDelivery::ProcessOnly
+    }
+
+    /// How the engine should reap a worker process. Defaults to
+    /// [`ReapDelivery::ProcessGroup`] — every driver is a process the
+    /// engine can signal.
+    fn reap(&self) -> ReapDelivery {
+        ReapDelivery::ProcessGroup
+    }
 
     /// What this driver's foreground process does with pty bytes that arrive
     /// while it is **mid-turn** — the `probe --urgent` / `SendToPane`
@@ -1913,6 +2038,28 @@ mod tests {
         assert_eq!(stub.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
         assert!(!MidTurnPaneInput::Rejects.buffers());
         assert!(MidTurnPaneInput::Buffers.buffers());
+    }
+
+    /// ControlVerbs defaults are the safe answers: probe/interrupt absent
+    /// (fire-and-forget), stop/reap always available at the process level.
+    #[test]
+    fn control_verbs_default_to_safe_answers() {
+        let stub = test_support::StubDriver::new(test_support::stub_descriptor(), CapabilitySet::new([]));
+        assert_eq!(stub.probe(), ProbeDelivery::Unsupported);
+        assert_eq!(stub.interrupt(), InterruptDelivery::Unsupported);
+        assert_eq!(stub.stop(), StopDelivery::ProcessOnly);
+        assert_eq!(stub.reap(), ReapDelivery::ProcessGroup);
+    }
+
+    #[test]
+    fn hook_wiring_destination_defaults_to_worker_settings_file() {
+        assert_eq!(
+            HookWiringDestination::default(),
+            HookWiringDestination::WorkerSettingsFile,
+        );
+        let wiring = ProgressObservationWiring::default();
+        assert_eq!(wiring.destination, HookWiringDestination::WorkerSettingsFile);
+        assert!(wiring.hooks.is_empty());
     }
 
     #[test]

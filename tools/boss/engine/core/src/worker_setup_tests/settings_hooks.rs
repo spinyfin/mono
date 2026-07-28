@@ -119,6 +119,66 @@ fn settings_json_pins_permissions_default_mode_to_auto() {
     );
 }
 
+/// Claude's rendered settings must stay byte-identical after the
+/// `HookWiringDestination` field was added: destination is
+/// `WorkerSettingsFile`, so the merge path (hooks map + interception
+/// guards into the settings file) is the same as before the field
+/// existed. Pin the full pretty-printed body so a future destination
+/// default flip or accidental gate change fails loudly.
+#[test]
+fn claude_settings_json_is_byte_identical_with_worker_settings_destination() {
+    let input = sample_input();
+    let rendered = render_settings_json(&input, &ClaudeDriver);
+    let wiring = ClaudeDriver.progress_observation_wiring(&crate::driver::ProgressObservationConfig {
+        events_socket_path: input.events_socket_path.clone(),
+        lease_id: input.lease_id.clone(),
+        run_id: input.run_id.clone(),
+        workspace_path: input.workspace_path.clone(),
+        forwarder_binary: input.boss_event_path.clone(),
+    });
+    match wiring {
+        crate::driver::ProgressIngress::HookCallback(w) => {
+            assert_eq!(
+                w.destination,
+                crate::driver::HookWiringDestination::WorkerSettingsFile,
+                "Claude must declare WorkerSettingsFile so the merge stays live",
+            );
+        }
+        other => panic!("Claude must produce HookCallback, got {other:?}"),
+    }
+
+    // Structural pin: every lifecycle event present, PreToolUse carries
+    // shim + interception guards, permissions.defaultMode is auto. A
+    // byte-level re-render is deterministic for a fixed sample_input.
+    let re_rendered = render_settings_json(&input, &ClaudeDriver);
+    assert_eq!(
+        rendered, re_rendered,
+        "Claude settings render must be deterministic (byte-identical across calls)",
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let hooks = parsed["hooks"].as_object().expect("hooks object");
+    for name in [
+        "SessionStart",
+        "UserPromptSubmit",
+        "PreToolUse",
+        "PostToolUse",
+        "Stop",
+        "Notification",
+        "SessionEnd",
+    ] {
+        assert!(hooks.contains_key(name), "missing hook after destination field: {name}");
+    }
+    let pre = hooks["PreToolUse"].as_array().expect("PreToolUse array");
+    // sample_input is a standard local chore: shim + path guard + boss-launch
+    // + PR redirect + checkleft push = 5 PreToolUse entries.
+    assert_eq!(
+        pre.len(),
+        5,
+        "Claude PreToolUse composition must be unchanged after destination field: {pre:?}",
+    );
+    assert_eq!(parsed["permissions"]["defaultMode"], "auto");
+}
+
 #[test]
 fn shell_escape_quotes_paths_with_spaces() {
     let input = sample_input();

@@ -34,11 +34,11 @@ use progress::{
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
-    MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity,
-    ProgressIngress, ProgressObservationConfig, ProgressSessionConfig, ProgressSessionNormalizer, ProgressStreamSource,
-    SpawnPlan, SpawnRequest, StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind,
-    default_structured_output_wiring,
+    InterruptDelivery, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
+    ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressSessionConfig,
+    ProgressSessionNormalizer, ProgressStreamSource, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
+    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
+    TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -1409,6 +1409,31 @@ impl AgentDriver for CodexDriver {
         WorkerErrorClass::Indeterminate
     }
 
+    /// Existing engine path: probes still go through `SendToPane` at a turn
+    /// boundary (or are refused mid-turn via [`Self::mid_turn_pane_input`]).
+    /// Resume-as-new-process probing is a follow-on; this declares today's
+    /// behaviour so the seam is real without changing delivery.
+    fn probe(&self) -> ProbeDelivery {
+        ProbeDelivery::PaneText
+    }
+
+    /// Existing engine path: Esc via `InterruptWorkerPane`. Esc semantics on
+    /// non-interactive `codex exec` are unvalidated; this declares the
+    /// transport the engine uses today rather than inventing a signal path.
+    fn interrupt(&self) -> InterruptDelivery {
+        InterruptDelivery::PaneEsc
+    }
+
+    /// Stop is process-level only — same as Claude today.
+    fn stop(&self) -> StopDelivery {
+        StopDelivery::ProcessOnly
+    }
+
+    /// Reap is the universal SIGTERM→SIGKILL process-group ladder.
+    fn reap(&self) -> ReapDelivery {
+        ReapDelivery::ProcessGroup
+    }
+
     /// `codex exec` is the driver the mid-turn injection guard exists for.
     /// It runs one turn per process with stdin on `/dev/null`, so bytes
     /// written into the pane mid-turn are never read by the agent, survive in
@@ -2185,5 +2210,14 @@ else:
         let driver = CodexDriver::default();
         assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
         assert!(!driver.mid_turn_pane_input().buffers());
+    }
+
+    #[test]
+    fn codex_control_verbs_match_existing_engine_paths() {
+        let driver = CodexDriver::default();
+        assert_eq!(driver.probe(), ProbeDelivery::PaneText);
+        assert_eq!(driver.interrupt(), InterruptDelivery::PaneEsc);
+        assert_eq!(driver.stop(), StopDelivery::ProcessOnly);
+        assert_eq!(driver.reap(), ReapDelivery::ProcessGroup);
     }
 }

@@ -63,7 +63,9 @@ use serde_json;
 use boss_protocol::ExecutionKind;
 
 use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
-use crate::driver::{AgentDriver, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig};
+use crate::driver::{
+    AgentDriver, HookWiringDestination, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
+};
 use crate::ssh_transport::shell_quote;
 
 // Re-export guard command constants so the test module (which uses `use
@@ -74,7 +76,10 @@ pub(crate) use crate::driver::claude::{
     BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND,
 };
 // Only constructed directly by tests (`ProgressIngress::HookCallback(..)`
-// fixtures) — production code only destructures it via `hooks_map_for_ingress`.
+// fixtures) — production code only destructures it via
+// `hooks_map_for_ingress` / `merges_hooks_into_worker_settings`.
+// `HookWiringDestination` is already imported above for production use;
+// re-export only the wiring struct tests construct by hand.
 #[cfg(test)]
 pub(crate) use crate::driver::ProgressObservationWiring;
 
@@ -584,50 +589,59 @@ fn settings_value(
         workspace_path: input.workspace_path.clone(),
         forwarder_binary: input.boss_event_path.clone(),
     });
+    // Only merge hooks (and layer interception guards) into the settings
+    // file when the driver declared that destination. A DriverOwned
+    // hook-callback writes its own wiring; stuffing both the forwarder
+    // and the guards into an unread settings file would be silent
+    // guardrail loss.
+    let layer_into_settings = merges_hooks_into_worker_settings(&ingress);
     let mut hooks = hooks_map_for_ingress(ingress);
 
-    // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
-    // All interception guards are appended to the forwarder hook the driver
-    // wired, which stays the first `PreToolUse` entry so the live-status
-    // machine sees every tool call before any guard can block it. A
-    // `StdoutJsonl` driver's ingress carries no hooks at all (`hooks` is
-    // empty — the documented, supported no-hooks case), so `PreToolUse` may
-    // not exist yet; `pre_tool_use_array` inserts it fresh rather than
-    // assuming a `HookCallback` driver already populated it.
-    let pre_tool_use_hooks = pre_tool_use_array(&mut hooks);
+    if layer_into_settings {
+        // ToolUseInterception (design §1.5): delegate guard wiring to the driver.
+        // All interception guards are appended to the forwarder hook the driver
+        // wired, which stays the first `PreToolUse` entry so the live-status
+        // machine sees every tool call before any guard can block it. A
+        // `StdoutJsonl` driver's ingress carries no hooks at all (`hooks` is
+        // empty — the documented, supported no-hooks case), so `PreToolUse` may
+        // not exist yet; `pre_tool_use_array` inserts it fresh rather than
+        // assuming a `HookCallback` driver already populated it.
+        let pre_tool_use_hooks = pre_tool_use_array(&mut hooks);
 
-    let is_revision =
-        input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
-    let interception_wiring = driver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
-        data_dir: if sandbox == EngineDataDirSandbox::Enabled {
-            input.events_socket_path.parent().map(|p| p.to_path_buf())
-        } else {
-            None
-        },
-        path_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
-            Some(path_guard_script_path())
-        } else {
-            None
-        },
-        checkleft_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
-            Some(checkleft_push_guard_script_path())
-        } else {
-            None
-        },
-        is_revision,
-        is_standard_worker: input.worker_kind == WorkerKind::Standard,
-        run_id: Some(input.run_id.clone()),
-        workspace_path: Some(input.workspace_path.clone()),
-    });
-    pre_tool_use_hooks.extend(interception_wiring.pre_tool_use_hooks);
+        let is_revision =
+            input.execution_kind == "revision_implementation" || input.task_kind.as_deref() == Some("revision");
+        let interception_wiring = driver.tool_use_interception_wiring(&ToolUseInterceptionConfig {
+            data_dir: if sandbox == EngineDataDirSandbox::Enabled {
+                input.events_socket_path.parent().map(|p| p.to_path_buf())
+            } else {
+                None
+            },
+            path_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+                Some(path_guard_script_path())
+            } else {
+                None
+            },
+            checkleft_guard_script: if sandbox == EngineDataDirSandbox::Enabled {
+                Some(checkleft_push_guard_script_path())
+            } else {
+                None
+            },
+            is_revision,
+            is_standard_worker: input.worker_kind == WorkerKind::Standard,
+            run_id: Some(input.run_id.clone()),
+            workspace_path: Some(input.workspace_path.clone()),
+        });
+        pre_tool_use_hooks.extend(interception_wiring.pre_tool_use_hooks);
+    }
 
     let mut value = serde_json::json!({
         "permissions": permissions_value(input, sandbox),
     });
     // `hooks` is the driver-produced map (all seven lifecycle events wired to
     // the forwarder), with the interception guards layered onto `PreToolUse`
-    // above. Assigned after the `permissions` block so the borrow of `hooks`
-    // held by `pre_tool_use_hooks` has ended.
+    // above when the destination is the settings file. Assigned after the
+    // `permissions` block so the borrow of `hooks` held by
+    // `pre_tool_use_hooks` has ended.
     value["hooks"] = serde_json::Value::Object(hooks);
 
     // Reviewer sessions are latency-sensitive review passes: fast mode
@@ -640,14 +654,36 @@ fn settings_value(
     value
 }
 
+/// Whether the engine should merge hook wiring (and interception guards)
+/// into the worker settings file for this ingress.
+///
+/// True for [`ProgressIngress::HookCallback`] only when the driver declared
+/// [`HookWiringDestination::WorkerSettingsFile`]. Byte-stream ingresses
+/// (`StdoutJsonl`, `AgentJsonlFile`) have no settings-file hook wiring —
+/// their interception path (when any) lives elsewhere (e.g. Codex arms
+/// PreToolUse guards inside `write_permission_config`). Returning false for
+/// those arms keeps an empty `hooks` map in the settings file rather than
+/// inventing a `PreToolUse` array the agent never reads.
+fn merges_hooks_into_worker_settings(ingress: &ProgressIngress) -> bool {
+    match ingress {
+        ProgressIngress::HookCallback(wiring) => wiring.destination == HookWiringDestination::WorkerSettingsFile,
+        ProgressIngress::StdoutJsonl | ProgressIngress::AgentJsonlFile(_) => false,
+    }
+}
+
 /// Resolve a driver's [`ProgressIngress`] into the settings-file `hooks`
-/// map. Byte-stream drivers (`StdoutJsonl` and `AgentJsonlFile`) have no
-/// hook-callback wiring at all, so this returns an empty map for those arms
-/// instead of assuming a `HookCallback` that was never produced.
+/// map. Only a [`ProgressIngress::HookCallback`] whose destination is
+/// [`HookWiringDestination::WorkerSettingsFile`] contributes hooks; a
+/// DriverOwned hook-callback and both byte-stream arms return an empty map
+/// so the engine does not write wiring into a file the agent never opens.
 fn hooks_map_for_ingress(ingress: ProgressIngress) -> serde_json::Map<String, serde_json::Value> {
     match ingress {
-        ProgressIngress::HookCallback(wiring) => wiring.hooks,
-        ProgressIngress::StdoutJsonl | ProgressIngress::AgentJsonlFile(_) => serde_json::Map::new(),
+        ProgressIngress::HookCallback(wiring) if wiring.destination == HookWiringDestination::WorkerSettingsFile => {
+            wiring.hooks
+        }
+        ProgressIngress::HookCallback(_) | ProgressIngress::StdoutJsonl | ProgressIngress::AgentJsonlFile(_) => {
+            serde_json::Map::new()
+        }
     }
 }
 
