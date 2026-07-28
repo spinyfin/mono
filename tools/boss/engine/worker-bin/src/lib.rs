@@ -1,4 +1,4 @@
-//! Deterministic resolution of the `boss` CLI a worker will actually run.
+//! Deterministic resolution of engine-owned binaries a worker will actually run.
 //!
 //! # The problem this exists to solve
 //!
@@ -30,7 +30,7 @@
 //! itself in installed mode, and in its own runfiles in dev mode. This
 //! crate resolves that binary by absolute path — deliberately **without
 //! ever searching `PATH`**, since a `PATH` search is precisely how the
-//! repobin shim wins — and materializes a tiny worker-owned launcher
+//! repobin shim wins — and materializes a tiny per-workspace launcher
 //! directory containing exactly one executable, `boss`, that `exec`s it.
 //!
 //! Two properties are load-bearing:
@@ -54,6 +54,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Basename of the launcher the engine writes for workers.
 const BOSS_LAUNCHER_NAME: &str = "boss";
@@ -63,8 +64,15 @@ const BOSS_LAUNCHER_NAME: &str = "boss";
 /// [`is_build_from_source_shim`].
 const REPOBIN_NAME: &str = "repobin";
 
+/// Workspace-relative path of the `boss` CLI under runfiles / bazel-bin.
+const BOSS_CLI_RUNFILES_REL: &str = "tools/boss/cli/boss";
+
+/// Workspace-relative path of the `boss-event` shim under runfiles / bazel-bin.
+const BOSS_EVENT_RUNFILES_REL: &str = "tools/boss/event-shim/boss-event";
+
 /// Directory name, relative to the worker settings dir, that holds the
-/// generated launcher(s).
+/// generated launcher(s). Each workspace gets its own subdirectory under
+/// this (keyed by workspace name, same scheme as worker settings files).
 pub const WORKER_BIN_SUBDIR: &str = "bin";
 
 /// Name of the env var carrying the launcher dir to the worker. The
@@ -89,27 +97,101 @@ pub fn launcher_names() -> &'static [&'static str] {
     &[BOSS_LAUNCHER_NAME]
 }
 
+/// Path / env inputs shared by every engine-binary resolution.
+///
+/// Grouped so [`resolve_engine_binary`] stays under the clippy argument
+/// limit while still exposing the full candidate set (bundle, stable,
+/// runfiles, bazel-bin, sibling) to both `boss` and `boss-event`.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvePaths<'a> {
+    pub engine_path: &'a Path,
+    pub workspace_dir: Option<&'a Path>,
+    pub env_override: Option<&'a Path>,
+    pub boss_bin_dir: Option<&'a Path>,
+    /// Engine-installed stable bin dir. Pass `None` for binaries that
+    /// are never installed there (notably `boss`); pass `Some` for
+    /// `boss-event`, which the engine copies on startup.
+    pub stable_bin_dir: Option<&'a Path>,
+}
+
+/// Shared resolution of an engine-owned binary by absolute path.
+///
+/// Order (no `PATH` search):
+///
+/// 1. `paths.env_override` (caller-controlled; used as-is, including shims).
+/// 2. `$boss_bin_dir/<basename>` — installed-mode bundle directory.
+/// 3. `$stable_bin_dir/<basename>` when provided (engine-installed copy
+///    under the Boss state root; used for `boss-event`, not for `boss`).
+/// 4. Bazel runfiles beside the engine binary
+///    (`<engine>.runfiles/_main/<runfiles_relpath>`).
+/// 5. `<workspace>/bazel-bin/<runfiles_relpath>` when
+///    `workspace_dir` is set (engine launched via `bazel run`).
+/// 6. Engine-sibling `<engine_dir>/<basename>`.
+///
+/// When `reject_build_from_source_shim` is true, candidates whose
+/// basename (or canonical target basename) is `repobin` are skipped —
+/// see [`is_build_from_source_shim`]. Env overrides are never rejected.
+pub fn resolve_engine_binary(
+    basename: &str,
+    runfiles_relpath: &str,
+    paths: ResolvePaths<'_>,
+    reject_build_from_source_shim: bool,
+) -> Option<PathBuf> {
+    if let Some(override_path) = paths.env_override {
+        // Used as-is: an explicit operator/test override outranks every
+        // heuristic, including the shim check.
+        return Some(override_path.to_path_buf());
+    }
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    if let Some(bin_dir) = paths.boss_bin_dir {
+        candidates.push(bin_dir.join(basename));
+    }
+    if let Some(bin_dir) = paths.stable_bin_dir {
+        candidates.push(bin_dir.join(basename));
+    }
+
+    let mut runfiles_root = paths.engine_path.as_os_str().to_owned();
+    runfiles_root.push(".runfiles");
+    candidates.push(PathBuf::from(runfiles_root).join("_main").join(runfiles_relpath));
+
+    if let Some(workspace) = paths.workspace_dir {
+        candidates.push(workspace.join("bazel-bin").join(runfiles_relpath));
+    }
+    if let Some(engine_dir) = paths.engine_path.parent() {
+        candidates.push(engine_dir.join(basename));
+    }
+
+    candidates.into_iter().find(|candidate| {
+        candidate.exists() && !(reject_build_from_source_shim && is_build_from_source_shim(candidate))
+    })
+}
+
 /// Resolve the absolute path of the `boss` CLI that belongs to the
 /// running engine.
 ///
-/// Mirrors the resolution order of the engine's `boss-event` resolver so
-/// the two shims cannot disagree about which build is current:
+/// Thin wrapper over [`resolve_engine_binary`] with the `boss` basename
+/// and runfiles path. Deliberately does **not** consult a stable-bin-dir
+/// candidate: nothing installs `boss` there (only `boss-event` is copied
+/// at engine startup), so including it would prefer a stale leftover
+/// over a current runfiles / bazel-bin build.
+///
+/// Resolution order:
 ///
 /// 1. `BOSS_CLI_BIN` env override (caller-controlled; used as-is).
 /// 2. `$BOSS_BIN_DIR/boss` — installed mode. The macOS app sets
 ///    `BOSS_BIN_DIR` to `Boss.app/Contents/Resources/bin`, where every
 ///    bundled CLI lives. Checked ahead of the dev-mode candidates so an
 ///    installed bundle never falls through to a workspace clone.
-/// 3. `stable_bin_dir/boss` — the engine-installed copy under the Boss
-///    state root, stable across `bazel clean` and workspace re-leases.
-/// 4. Bazel runfiles beside the engine binary
+/// 3. Bazel runfiles beside the engine binary
 ///    (`<engine>.runfiles/_main/tools/boss/cli/boss`). Requires the
 ///    engine `rust_binary` to carry a `data` dep on
 ///    `//tools/boss/cli:boss`.
-/// 5. `<workspace>/bazel-bin/tools/boss/cli/boss` when
+/// 4. `<workspace>/bazel-bin/tools/boss/cli/boss` when
 ///    `BUILD_WORKSPACE_DIRECTORY` is set (engine launched via
 ///    `bazel run` from a checkout).
-/// 6. Engine-sibling `<engine_dir>/boss` (hand-built / cargo layout).
+/// 5. Engine-sibling `<engine_dir>/boss` (hand-built / cargo layout).
 ///
 /// There is deliberately **no `PATH` fallback**. A `PATH` search is what
 /// produced the bug: it finds the user's `~/bin/boss` repobin shim,
@@ -125,40 +207,68 @@ pub fn resolve_boss_cli(
     workspace_dir: Option<&Path>,
     env_override: Option<&Path>,
     boss_bin_dir: Option<&Path>,
-    stable_bin_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(override_path) = env_override {
-        // Used as-is: an explicit operator/test override outranks every
-        // heuristic, including the shim check.
-        return Some(override_path.to_path_buf());
-    }
-
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    if let Some(bin_dir) = boss_bin_dir {
-        candidates.push(bin_dir.join(BOSS_LAUNCHER_NAME));
-    }
-    if let Some(bin_dir) = stable_bin_dir {
-        candidates.push(bin_dir.join(BOSS_LAUNCHER_NAME));
-    }
-
-    let mut runfiles_root = engine_path.as_os_str().to_owned();
-    runfiles_root.push(".runfiles");
-    candidates.push(PathBuf::from(runfiles_root).join("_main").join("tools/boss/cli/boss"));
-
-    if let Some(workspace) = workspace_dir {
-        candidates.push(workspace.join("bazel-bin/tools/boss/cli/boss"));
-    }
-    if let Some(engine_dir) = engine_path.parent() {
-        candidates.push(engine_dir.join(BOSS_LAUNCHER_NAME));
-    }
-
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.exists() && !is_build_from_source_shim(candidate))
+    resolve_engine_binary(
+        BOSS_LAUNCHER_NAME,
+        BOSS_CLI_RUNFILES_REL,
+        ResolvePaths {
+            engine_path,
+            workspace_dir,
+            env_override,
+            boss_bin_dir,
+            stable_bin_dir: None,
+        },
+        true,
+    )
 }
 
-/// Is `path` a repobin multiplexer rather than a built `boss` binary?
+/// Resolve the absolute path of the `boss-event` shim that belongs to
+/// the running engine.
+///
+/// Thin wrapper over [`resolve_engine_binary`] with the `boss-event`
+/// basename and runfiles path. Keeps the same order as the historical
+/// in-engine resolver, including the engine-installed stable bin dir
+/// (copied at startup so hook paths baked into worker settings.json
+/// survive `bazel clean`).
+///
+/// Resolution order:
+///
+/// 1. `BOSS_EVENT_BIN` env override (caller-controlled; used as-is).
+/// 2. `$BOSS_BIN_DIR/boss-event` — installed-mode path.
+/// 3. `stable_bin_dir/boss-event` — the copy installed by the engine at
+///    startup into the Boss state root.
+/// 4. Bazel runfiles
+///    (`<engine>.runfiles/_main/tools/boss/event-shim/boss-event`).
+/// 5. `<workspace>/bazel-bin/tools/boss/event-shim/boss-event`.
+/// 6. Engine-sibling `<engine_dir>/boss-event`.
+///
+/// Returns `None` when no candidate resolves. Callers that bake the path
+/// into hook commands treat `None` as a hard error (typically panic) —
+/// a bare `boss-event` name fails silently under a sanitized PATH.
+pub fn resolve_boss_event_binary(
+    engine_path: &Path,
+    workspace_dir: Option<&Path>,
+    env_override: Option<&Path>,
+    boss_bin_dir: Option<&Path>,
+    stable_bin_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    resolve_engine_binary(
+        "boss-event",
+        BOSS_EVENT_RUNFILES_REL,
+        ResolvePaths {
+            engine_path,
+            workspace_dir,
+            env_override,
+            boss_bin_dir,
+            stable_bin_dir,
+        },
+        // Same shim rejection as `boss`: a repobin-backed boss-event is
+        // not a usable hook binary either.
+        true,
+    )
+}
+
+/// Is `path` a repobin multiplexer rather than a built binary?
 ///
 /// repobin installs its tools as symlinks whose target basename is
 /// `repobin`; invoked under any of those names it looks the name up in
@@ -191,9 +301,10 @@ pub fn launcher_script(resolved: Option<&Path>) -> String {
     match resolved {
         Some(target) => format!(
             "#!/bin/sh\n\
-             # Generated by the Boss engine for one worker session. Do not edit.\n\
-             # Pins `boss` to the CLI shipped with the engine that spawned this\n\
-             # worker, so a build-from-source shim on PATH can never shadow it.\n\
+             # Generated by the Boss engine for this workspace's worker session.\n\
+             # Do not edit. Pins `boss` to the CLI shipped with the engine that\n\
+             # spawned this worker, so a build-from-source shim on PATH can never\n\
+             # shadow it.\n\
              exec {} \"$@\"\n",
             sh_quote(&target.to_string_lossy())
         ),
@@ -205,7 +316,8 @@ pub fn launcher_script(resolved: Option<&Path>) -> String {
             let lines: Vec<String> = UNRESOLVED_MESSAGE.lines().map(sh_quote).collect();
             format!(
                 "#!/bin/sh\n\
-                 # Generated by the Boss engine for one worker session. Do not edit.\n\
+                 # Generated by the Boss engine for this workspace's worker session.\n\
+                 # Do not edit.\n\
                  printf '%s\\n' {} >&2\n\
                  exit 127\n",
                 lines.join(" ")
@@ -238,22 +350,44 @@ run. If you were about to run `boss pr status` to decide between
 being made without it.
 
 For whoever is reading this in an engine log: the engine looked for
-$BOSS_CLI_BIN, $BOSS_BIN_DIR/boss, the stable bin dir, its own runfiles,
+$BOSS_CLI_BIN, $BOSS_BIN_DIR/boss, its own runfiles,
 $BUILD_WORKSPACE_DIRECTORY/bazel-bin/tools/boss/cli/boss, and its own
 sibling directory, and found none of them. Build it
 (`bazel build //tools/boss/cli:boss`) or set BOSS_CLI_BIN.";
 
-/// Write the worker launcher dir: create `dir`, then write `<dir>/boss`
-/// with mode 0755. Returns the launcher's absolute path.
+/// Write the per-workspace launcher dir: create `dir`, then atomically
+/// replace `<dir>/boss` with mode 0755. Returns the launcher's absolute
+/// path.
 ///
 /// Rewritten unconditionally on every spawn so a worker never inherits a
-/// launcher pointing at a previous engine's binary.
+/// launcher pointing at a previous engine's binary. The write is atomic
+/// (temp sibling + `rename`) so a concurrent reader/`exec` of `boss`
+/// never observes a truncated file.
 pub fn write_boss_launcher(dir: &Path, resolved: Option<&Path>) -> io::Result<PathBuf> {
     std::fs::create_dir_all(dir)?;
     let path = dir.join(BOSS_LAUNCHER_NAME);
-    std::fs::write(&path, launcher_script(resolved))?;
-    set_executable(&path)?;
-    Ok(path)
+
+    // Unique sibling so concurrent writers (different pids / threads)
+    // do not clobber each other's temp files before rename.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", BOSS_LAUNCHER_NAME, std::process::id(), nanos));
+
+    let result = (|| {
+        std::fs::write(&tmp, launcher_script(resolved))?;
+        set_executable(&tmp)?;
+        // rename is atomic on the same filesystem; replaces an existing
+        // `boss` without an O_TRUNC window that concurrent execs could see.
+        std::fs::rename(&tmp, &path)?;
+        Ok(path.clone())
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 #[cfg(unix)]
@@ -303,7 +437,6 @@ mod tests {
             None,
             Some(override_path.as_path()),
             Some(bundle.as_path()),
-            None,
         );
         assert_eq!(
             resolved.as_deref(),
@@ -326,7 +459,6 @@ mod tests {
             Some(workspace.as_path()),
             None,
             Some(bundle.as_path()),
-            None,
         );
         assert_eq!(resolved, Some(bundle.join("boss")));
     }
@@ -342,7 +474,7 @@ mod tests {
         let runfiles = tmp.path().join("engine.runfiles/_main/tools/boss/cli/boss");
         touch_exe(&runfiles);
 
-        assert_eq!(resolve_boss_cli(&engine, None, None, None, None), Some(runfiles));
+        assert_eq!(resolve_boss_cli(&engine, None, None, None), Some(runfiles));
     }
 
     #[test]
@@ -353,7 +485,7 @@ mod tests {
         touch_exe(&built);
 
         assert_eq!(
-            resolve_boss_cli(&tmp.path().join("engine"), Some(workspace.as_path()), None, None, None),
+            resolve_boss_cli(&tmp.path().join("engine"), Some(workspace.as_path()), None, None),
             Some(built)
         );
     }
@@ -366,7 +498,7 @@ mod tests {
         let sibling = tmp.path().join("bin/boss");
         touch_exe(&sibling);
 
-        assert_eq!(resolve_boss_cli(&engine, None, None, None, None), Some(sibling));
+        assert_eq!(resolve_boss_cli(&engine, None, None, None), Some(sibling));
     }
 
     #[test]
@@ -375,9 +507,52 @@ mod tests {
         // candidate on disk the answer must be None so the caller writes
         // a loudly-failing launcher.
         let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(resolve_boss_cli(&tmp.path().join("engine"), None, None, None), None);
+    }
+
+    #[test]
+    fn does_not_consult_stable_bin_dir() {
+        // Nothing installs boss into the stable bin dir; a leftover
+        // there must not win over a current runfiles build (and must
+        // not be the only candidate that makes resolution "succeed").
+        let tmp = tempfile::tempdir().unwrap();
+        let stable = tmp.path().join("stable");
+        touch_exe(&stable.join("boss"));
+        let engine = tmp.path().join("engine");
+        touch_exe(&engine);
+        let runfiles = tmp.path().join("engine.runfiles/_main/tools/boss/cli/boss");
+        touch_exe(&runfiles);
+
+        // resolve_boss_cli has no stable_bin_dir parameter — even with a
+        // real file sitting under a stable-like path it is invisible.
         assert_eq!(
-            resolve_boss_cli(&tmp.path().join("engine"), None, None, None, None),
-            None
+            resolve_boss_cli(&engine, None, None, None),
+            Some(runfiles),
+            "runfiles must win; stable_bin is not a candidate for boss"
+        );
+        // And with only a stable-like leftover and no real candidates:
+        let empty_engine = tmp.path().join("other-engine");
+        touch_exe(&empty_engine);
+        assert_eq!(
+            resolve_boss_cli(&empty_engine, None, None, None),
+            None,
+            "a leftover under some other bin dir is not consulted"
+        );
+        // Shared helper with stable_bin still finds it (boss-event path).
+        assert_eq!(
+            resolve_engine_binary(
+                "boss",
+                BOSS_CLI_RUNFILES_REL,
+                ResolvePaths {
+                    engine_path: &empty_engine,
+                    workspace_dir: None,
+                    env_override: None,
+                    boss_bin_dir: None,
+                    stable_bin_dir: Some(stable.as_path()),
+                },
+                true,
+            ),
+            Some(stable.join("boss")),
         );
     }
 
@@ -391,19 +566,15 @@ mod tests {
         touch_exe(&shimmed.join("repobin"));
         std::os::unix::fs::symlink(shimmed.join("repobin"), shimmed.join("boss")).expect("symlink");
 
-        let real = tmp.path().join("stable");
-        touch_exe(&real.join("boss"));
+        let engine = tmp.path().join("engine");
+        touch_exe(&engine);
+        let runfiles = tmp.path().join("engine.runfiles/_main/tools/boss/cli/boss");
+        touch_exe(&runfiles);
 
-        let resolved = resolve_boss_cli(
-            &tmp.path().join("engine"),
-            None,
-            None,
-            Some(shimmed.as_path()),
-            Some(real.as_path()),
-        );
+        let resolved = resolve_boss_cli(&engine, None, None, Some(shimmed.as_path()));
         assert_eq!(
             resolved,
-            Some(real.join("boss")),
+            Some(runfiles),
             "a repobin symlink must be skipped in favour of a real build"
         );
     }
@@ -417,9 +588,47 @@ mod tests {
         std::os::unix::fs::symlink(shimmed.join("repobin"), shimmed.join("boss")).expect("symlink");
 
         assert_eq!(
-            resolve_boss_cli(&tmp.path().join("engine"), None, None, Some(shimmed.as_path()), None),
+            resolve_boss_cli(&tmp.path().join("engine"), None, None, Some(shimmed.as_path())),
             None,
             "resolution must fail rather than return a build-from-source shim"
+        );
+    }
+
+    // ── resolve_boss_event_binary ───────────────────────────────────────────
+
+    #[test]
+    fn boss_event_prefers_stable_bin_over_runfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = tmp.path().join("engine");
+        touch_exe(&engine);
+        let stable = tmp.path().join("stable");
+        touch_exe(&stable.join("boss-event"));
+        let runfiles = tmp
+            .path()
+            .join("engine.runfiles/_main/tools/boss/event-shim/boss-event");
+        touch_exe(&runfiles);
+
+        assert_eq!(
+            resolve_boss_event_binary(&engine, None, None, None, Some(stable.as_path())),
+            Some(stable.join("boss-event")),
+        );
+    }
+
+    #[test]
+    fn boss_event_and_boss_share_resolution_order() {
+        // Same candidate classes, different basename/runfiles path.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("bundle");
+        touch_exe(&bundle.join("boss"));
+        touch_exe(&bundle.join("boss-event"));
+
+        assert_eq!(
+            resolve_boss_cli(&tmp.path().join("engine"), None, None, Some(bundle.as_path())),
+            Some(bundle.join("boss")),
+        );
+        assert_eq!(
+            resolve_boss_event_binary(&tmp.path().join("engine"), None, None, Some(bundle.as_path()), None,),
+            Some(bundle.join("boss-event")),
         );
     }
 
@@ -489,6 +698,15 @@ mod tests {
         assert!(
             !script.contains("repobin exec"),
             "must not suggest dispatching through repobin: {script}"
+        );
+    }
+
+    #[test]
+    fn unresolved_message_does_not_claim_stable_bin_is_checked() {
+        let script = launcher_script(None);
+        assert!(
+            !script.contains("stable bin"),
+            "boss resolution no longer consults the stable bin dir: {script}"
         );
     }
 
@@ -591,5 +809,24 @@ mod tests {
         let body = std::fs::read_to_string(&launcher).expect("read");
         assert!(body.contains("'/new/boss'"), "{body}");
         assert!(!body.contains("'/old/boss'"), "{body}");
+    }
+
+    #[test]
+    fn atomic_rewrite_leaves_no_temp_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("bin");
+        write_boss_launcher(&dir, Some(Path::new("/opt/boss"))).expect("write");
+        write_boss_launcher(&dir, Some(Path::new("/opt/boss-v2"))).expect("rewrite");
+
+        let mut entries: Vec<String> = std::fs::read_dir(&dir)
+            .expect("readdir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec!["boss".to_owned()],
+            "temp siblings from atomic write must be cleaned up / renamed away"
+        );
     }
 }

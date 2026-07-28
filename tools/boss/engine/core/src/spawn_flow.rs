@@ -59,11 +59,11 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
     // / followups) and the PR URL. See `crate::structured_output`.
     "BOSS_PR_URL_OUTPUT",
     "BOSS_STRUCTURED_OUTPUT",
-    // Engine-owned directory holding the per-worker `boss` launcher (and
-    // nothing else — notably not `bossctl`). Prepended to the worker's
-    // PATH so a bare `boss` runs the CLI shipped with this engine rather
-    // than a build-from-source shim in the user's `~/bin`. See
-    // `boss_engine_worker_bin`.
+    // Engine-owned directory holding this workspace's `boss` launcher
+    // (and nothing else — notably not `bossctl`). Prepended to the
+    // worker's PATH so a bare `boss` runs the CLI shipped with this
+    // engine rather than a build-from-source shim in the user's `~/bin`.
+    // See `boss_engine_worker_bin`.
     boss_engine_worker_bin::WORKER_BIN_DIR_ENV,
     "CUBE_LEASE_ID",
     "CUBE_REPO",
@@ -379,7 +379,7 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         }
     }
 
-    // The per-worker launcher dir goes ahead of everything, including
+    // The per-workspace launcher dir goes ahead of everything, including
     // BOSS_BIN_DIR: it holds a `boss` pinned to an absolute path, so it
     // is the one entry that stays correct in dev mode (no bundle) as
     // well as installed mode. Applied after the BOSS_BIN_DIR prepend

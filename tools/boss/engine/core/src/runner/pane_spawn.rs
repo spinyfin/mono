@@ -196,39 +196,12 @@ impl PaneSpawnRunner {
     }
 }
 
-/// Pure resolver for the absolute path of the `boss-event` shim
-/// that the worker pane invokes from `settings.json`. Pulled out
-/// as a free function so tests can pass synthetic `engine_path` /
-/// `workspace_dir` / env values without monkey-patching globals.
-///
-/// Returns `Some(path)` when a candidate exists on disk, `None` when no
-/// candidate resolves. The caller is responsible for treating `None` as a
-/// hard error — a bare `boss-event` in hook commands causes silent
-/// event-emission failures because the worker's sanitized PATH does not
-/// include bazel-out or other non-standard directories.
-///
-/// Resolution order:
-///   1. `BOSS_EVENT_BIN` env override (caller-controlled).
-///   2. `$BOSS_BIN_DIR/boss-event` — installed-mode path. The app
-///      sets `BOSS_BIN_DIR` to `Boss.app/Contents/Resources/bin/` and
-///      passes it to the engine; all bundled CLIs and the shim live
-///      there. This is checked ahead of the dev-mode paths so an
-///      installed bundle never falls through to a workspace clone.
-///   3. `stable_bin_dir/boss-event` — the copy installed by the engine
-///      at startup into `~/Library/Application Support/Boss/bin/`. In
-///      dev mode the engine copies boss-event there on every startup so
-///      the path baked into worker settings.json is stable across
-///      `bazel clean` and workspace re-leases.
-///   4. Bazel runfiles next to the engine binary
-///      (`<engine_path>.runfiles/_main/tools/boss/event-shim/boss-event`).
-///      Requires the engine `rust_binary` to declare a `data` dep
-///      on `//tools/boss/event-shim:boss-event` — without it bazel
-///      doesn't include the shim in the engine's runfiles.
-///   5. Workspace `bazel-bin` symlink
-///      (`<workspace>/bazel-bin/tools/boss/event-shim/boss-event`)
-///      when `BUILD_WORKSPACE_DIRECTORY` is set (i.e., the engine
-///      was launched via `bazel run` from a checkout).
-///   6. Cargo / hand-built sibling: `<engine_dir>/boss-event`.
+/// Resolve the absolute path of the `boss-event` shim. Thin re-export of
+/// [`boss_engine_worker_bin::resolve_boss_event_binary`] so existing
+/// `crate::runner::resolve_boss_event_binary` call sites (and the
+/// hard-panic contract in [`PaneSpawnRunner::boss_event_binary`]) stay
+/// put. Shared with `resolve_boss_cli` via
+/// [`boss_engine_worker_bin::resolve_engine_binary`].
 pub(crate) fn resolve_boss_event_binary(
     engine_path: &Path,
     workspace_dir: Option<&Path>,
@@ -236,53 +209,13 @@ pub(crate) fn resolve_boss_event_binary(
     boss_bin_dir: Option<&Path>,
     stable_bin_dir: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(override_path) = env_override {
-        return Some(override_path.to_path_buf());
-    }
-
-    // Installed mode: BOSS_BIN_DIR is Boss.app/Contents/Resources/bin/.
-    if let Some(bin_dir) = boss_bin_dir {
-        let candidate = bin_dir.join("boss-event");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    // Stable dev-mode location. The engine copies boss-event here at
-    // startup so hook paths baked into worker settings.json survive
-    // `bazel clean` and workspace re-leases.
-    if let Some(bin_dir) = stable_bin_dir {
-        let candidate = bin_dir.join("boss-event");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    // Bazel constructs runfiles at `<binary>.runfiles/_main/<workspace_relative_path>`.
-    let mut runfiles_root = engine_path.as_os_str().to_owned();
-    runfiles_root.push(".runfiles");
-    let runfiles_candidate = PathBuf::from(runfiles_root)
-        .join("_main")
-        .join("tools/boss/event-shim/boss-event");
-    if runfiles_candidate.exists() {
-        return Some(runfiles_candidate);
-    }
-
-    if let Some(workspace) = workspace_dir {
-        let candidate = workspace.join("bazel-bin/tools/boss/event-shim/boss-event");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    if let Some(engine_dir) = engine_path.parent() {
-        let sibling = engine_dir.join("boss-event");
-        if sibling.exists() {
-            return Some(sibling);
-        }
-    }
-
-    None
+    boss_engine_worker_bin::resolve_boss_event_binary(
+        engine_path,
+        workspace_dir,
+        env_override,
+        boss_bin_dir,
+        stable_bin_dir,
+    )
 }
 
 /// One `PATH`-prepend clause for the worker's first shell line, e.g.
@@ -295,8 +228,14 @@ fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
 }
 
-/// Materialize the per-worker launcher directory and return it, so the
+/// Materialize the per-workspace launcher directory and return it, so the
 /// caller can put it on the worker's `PATH`.
+///
+/// Keyed like [`crate::worker_setup::worker_settings_path`]: under
+/// `<settings_dir>/bin/<workspace-name>/`, so concurrent spawns for
+/// different workspaces never rewrite each other's `boss` launcher.
+/// The write itself is atomic (temp sibling + rename) via
+/// [`boss_engine_worker_bin::write_boss_launcher`].
 ///
 /// The directory holds exactly one executable — `boss` — which `exec`s
 /// the already-built CLI belonging to this engine, resolved by absolute
@@ -312,30 +251,34 @@ fn path_prepend_clause(var: &str) -> String {
 /// Returns `None` if the directory could not be written at all. That is
 /// logged, not fatal — the worker simply keeps today's `PATH` behaviour
 /// rather than losing its spawn over a temp-dir failure.
-fn ensure_worker_bin_dir(settings_dir: &Path) -> Option<PathBuf> {
+fn ensure_worker_bin_dir(settings_dir: &Path, workspace_path: &Path) -> Option<PathBuf> {
     let engine_path = std::env::current_exe().unwrap_or_default();
     let workspace_dir = std::env::var_os("BUILD_WORKSPACE_DIRECTORY").map(PathBuf::from);
     let env_override = std::env::var_os(boss_engine_worker_bin::BOSS_CLI_BIN_ENV).map(PathBuf::from);
     let boss_bin_dir = std::env::var_os("BOSS_BIN_DIR").map(PathBuf::from);
-    let stable_bin_dir = boss_log_files::default_state_root().map(|root| root.join("bin"));
 
     let resolved = boss_engine_worker_bin::resolve_boss_cli(
         &engine_path,
         workspace_dir.as_deref(),
         env_override.as_deref(),
         boss_bin_dir.as_deref(),
-        stable_bin_dir.as_deref(),
     );
     if resolved.is_none() {
         tracing::warn!(
-            "no already-built `boss` CLI found (checked BOSS_CLI_BIN, BOSS_BIN_DIR, the stable \
-             bin dir, engine runfiles, bazel-bin, and the engine sibling). Workers will get a \
-             launcher that fails loudly on `boss` rather than a build-from-source shim. Build it \
-             with `bazel build //tools/boss/cli:boss` or set BOSS_CLI_BIN.",
+            "no already-built `boss` CLI found (checked BOSS_CLI_BIN, BOSS_BIN_DIR, engine \
+             runfiles, bazel-bin, and the engine sibling). Workers will get a launcher that \
+             fails loudly on `boss` rather than a build-from-source shim. Build it with \
+             `bazel build //tools/boss/cli:boss` or set BOSS_CLI_BIN.",
         );
     }
 
-    let dir = settings_dir.join(boss_engine_worker_bin::WORKER_BIN_SUBDIR);
+    // Per-workspace subdirectory — same key as worker_settings_path — so
+    // two concurrent spawns cannot truncate a shared `bin/boss`.
+    let key = workspace_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "worker".to_owned());
+    let dir = settings_dir.join(boss_engine_worker_bin::WORKER_BIN_SUBDIR).join(key);
     match boss_engine_worker_bin::write_boss_launcher(&dir, resolved.as_deref()) {
         Ok(launcher) => {
             tracing::debug!(
@@ -665,13 +608,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // any driver default flags rather than being ignored.
         spawn_plan.command =
             crate::driver::apply_permission_extra_args(&spawn_plan.command, &permission_artifacts.extra_args);
-        // The per-worker launcher dir goes on *after* the BOSS_BIN_DIR
+        // The per-workspace launcher dir goes on *after* the BOSS_BIN_DIR
         // prepend so it ends up ahead of it. Its `boss` is pinned to an
         // absolute path, which is the only form that survives a login
         // shell rebuilding PATH; BOSS_BIN_DIR's own prepend is a bare
         // directory and is a no-op in dev mode, where the user's `~/bin`
         // repobin shim was winning.
-        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir);
+        let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
         let initial_input = format!(
             "{}{}{env_prefix}{}",
@@ -1216,9 +1159,9 @@ mod pane_spawn_tests {
         );
         // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
         // bundled `cube`/`boss` win over any `~/bin` repobin shim the
-        // login-shell init re-prepends), then the per-worker launcher dir
-        // on top of that (so `boss` is pinned to an absolute path even in
-        // dev mode, where BOSS_BIN_DIR is unset and the clause is a
+        // login-shell init re-prepends), then the per-workspace launcher
+        // dir on top of that (so `boss` is pinned to an absolute path even
+        // in dev mode, where BOSS_BIN_DIR is unset and the clause is a
         // no-op), then unsets the API key and invokes claude. See the
         // comment at the construction site.
         assert!(
@@ -2523,12 +2466,15 @@ mod pane_spawn_tests {
     /// `ensure_worker_bin_dir` always leaves a usable `boss` behind, even
     /// when nothing resolves — an unresolved launcher that fails loudly
     /// beats letting the worker PATH-resolve a build-from-source shim.
-    /// And it writes `boss` only: `bossctl` stays Boss-tier.
+    /// And it writes `boss` only: `bossctl` stays Boss-tier. The dir is
+    /// keyed by workspace name so concurrent spawns do not share a path.
     #[test]
     fn ensure_worker_bin_dir_writes_only_boss() {
         let dir = TempDir::new().unwrap();
-        let bin_dir = ensure_worker_bin_dir(dir.path()).expect("launcher dir must be written");
-        assert_eq!(bin_dir, dir.path().join("bin"));
+        let workspace = dir.path().join("workspaces/mono-agent-007");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let bin_dir = ensure_worker_bin_dir(dir.path(), &workspace).expect("launcher dir must be written");
+        assert_eq!(bin_dir, dir.path().join("bin").join("mono-agent-007"));
 
         let mut entries: Vec<String> = std::fs::read_dir(&bin_dir)
             .expect("readdir")
@@ -2540,6 +2486,25 @@ mod pane_spawn_tests {
             vec!["boss".to_owned()],
             "only `boss` may be handed to a worker; `bossctl` is Boss-tier",
         );
+    }
+
+    /// Distinct workspaces get distinct launcher dirs under the shared
+    /// settings root — never a single host-wide `bin/boss`.
+    #[test]
+    fn ensure_worker_bin_dir_is_per_workspace() {
+        let dir = TempDir::new().unwrap();
+        let ws_a = dir.path().join("workspaces/mono-agent-a");
+        let ws_b = dir.path().join("workspaces/mono-agent-b");
+        std::fs::create_dir_all(&ws_a).unwrap();
+        std::fs::create_dir_all(&ws_b).unwrap();
+
+        let a = ensure_worker_bin_dir(dir.path(), &ws_a).expect("a");
+        let b = ensure_worker_bin_dir(dir.path(), &ws_b).expect("b");
+        assert_ne!(a, b);
+        assert!(a.ends_with("bin/mono-agent-a"));
+        assert!(b.ends_with("bin/mono-agent-b"));
+        assert!(a.join("boss").exists());
+        assert!(b.join("boss").exists());
     }
 
     /// When nothing resolves the function returns `None` — the caller
