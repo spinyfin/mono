@@ -35,10 +35,10 @@
 //!
 //! ## Why this is not a grace period
 //!
-//! The chore this fixes explicitly rules out widening the race with a sleep,
-//! and rightly: the two signals ride different transports (the app's pane-death
-//! RPC vs. the engine tailing the run's rollout JSONL), so no fixed delay is
-//! ever provably long enough.
+//! A sleep cannot close the race. The two signals ride different transports
+//! (the app's pane-death RPC vs. the engine tailing the run's rollout JSONL),
+//! so no fixed delay is ever provably long enough — and this path must not
+//! sleep to "wait for" a terminal result that may never arrive.
 //!
 //! The ordering here is **causal** instead. The agent process exiting is
 //! precisely what makes its rollout file final — nothing can append to it
@@ -99,8 +99,10 @@ impl ProcessExitVerdict {
 ///
 /// Implemented by `ServerState` over
 /// [`crate::agent_jsonl_progress::AgentJsonlProgressManager::finish_run`].
-/// Sweeps that have no ingress to reach (the periodic DB-driven passes, and
-/// every test that isn't exercising the drain) pass `None` and fall straight
+/// Callers that can reach the ingress (the app's pane-death report, and
+/// [`crate::dead_pid_sweep`]'s periodic / re-attach passes) pass `Some`.
+/// Callers with no ingress — [`crate::dead_pane_sweep`]'s durable-pid pass,
+/// and tests that aren't exercising the drain — pass `None` and fall straight
 /// through to the durable record.
 #[async_trait::async_trait]
 pub trait ProgressDrain: Send + Sync {
@@ -117,10 +119,14 @@ pub trait ProgressDrain: Send + Sync {
 
 /// Classify a worker process that is gone, for `execution_id`.
 ///
-/// Callers pass `drain = Some(..)` when they are reacting to a *fresh* exit and
-/// an ingress may still hold unread bytes (the app's pane-death report). The
-/// periodic sweeps pass `None`: by the time they run, any drain has long since
-/// happened, and their job is to read the settled record.
+/// Callers pass `drain = Some(..)` whenever an ingress may still hold unread
+/// bytes for the run that just exited: the app's pane-death report, and
+/// [`crate::dead_pid_sweep`]'s periodic / re-attach passes (which discover a
+/// vanished process and must drain its rollout before reading the durable
+/// record). Pass `None` only when there is no ingress to reach —
+/// [`crate::dead_pane_sweep`]'s durable-pid pass, and tests that are not
+/// exercising the drain — so classification falls straight through to the
+/// durable turn-boundary record.
 ///
 /// Never returns [`ProcessExitVerdict::ExpectedTurnExit`] on missing or
 /// ambiguous information. Every failure path — unknown execution, unregistered

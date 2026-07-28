@@ -768,7 +768,13 @@ where
                 tokio::select! {
                     _ = tokio::time::sleep(FILE_POLL) => continue,
                     changed = halt.changed() => {
-                        let _ = changed;
+                        // Every sender dropped: nothing can ever halt us. End
+                        // cleanly rather than spinning the poll loop forever.
+                        // A prior `Drain`/`Cancel` still reaches us via
+                        // `changed()`'s last Ok (version bumps before close).
+                        if changed.is_err() {
+                            return Ok(());
+                        }
                         continue;
                     }
                 }
@@ -804,8 +810,13 @@ where
                 // Re-run the loop so a `Drain` re-reads the file (picking up
                 // bytes written between the last poll and the writer's exit)
                 // before the drain check above closes the stream; the
-                // top-of-loop check handles `Cancel`.
-                let _ = changed;
+                // top-of-loop check handles `Cancel`. Every sender dropped
+                // is terminal: end cleanly rather than busy-looping the poll.
+                // A prior `Drain` still arrives as Ok first (version before
+                // the closed flag).
+                if changed.is_err() {
+                    return Ok(());
+                }
             }
         }
     }

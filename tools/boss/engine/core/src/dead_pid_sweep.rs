@@ -198,8 +198,9 @@ pub struct DeadPidSweepOutcome {
     pub grace_skipped: usize,
     /// Slots whose pid probed `Dead` but whose recent in-execution hook
     /// activity (or in-flight tool) contradicted the probe — the tracked
-    /// pid was the wrong identity and the (live) worker was spared. This
-    /// is the T2450 false-reap that would otherwise have fired.
+    /// pid was the wrong identity and the (live) worker was spared. Without
+    /// this guard a live worker mid-tool-call would be falsely reaped when
+    /// its registered shell pid was a transient or reused identity.
     pub live_corroborated_skipped: usize,
     /// Slots whose worker process is genuinely gone but whose driver serves
     /// one turn per process and had already delivered its turn boundary —
@@ -428,7 +429,8 @@ pub async fn run_one_pass(
         // worker emitted a hook within DEAD_PID_CORROBORATION_SECS or has
         // a tool in flight (attributed to THIS execution), it is
         // demonstrably alive and the reap is skipped. See module docs;
-        // this is the T2450 false-reap fix.
+        // this is the false-reap guard for a live worker whose shell pid
+        // was a transient or reused identity.
         if mode.corroborate_liveness()
             && let Some(activity) = corroborating_liveness(&state, started_epoch, now_epoch_secs)
         {
@@ -441,7 +443,7 @@ pub async fn run_one_pass(
                 corroborating_activity = %activity,
                 "dead-pid sweep: pid probed dead but worker is demonstrably alive for this \
                  execution; the tracked shell pid was a transient/reused identity — NOT reaping \
-                 (T2450 false-reap guard)",
+                 (live-event false-reap guard)",
             );
             outcome.live_corroborated_skipped += 1;
             continue;
@@ -450,9 +452,18 @@ pub async fn run_one_pass(
         // The process is gone — but "gone" is only a *death* for a driver
         // whose process was supposed to outlive its turns. Ask before
         // reaping; a one-turn-per-process worker that already delivered its
-        // turn boundary exited on purpose.
+        // turn boundary exited on purpose. The classifier may drain progress
+        // first, and that drain can terminalize the execution via completion
+        // detection — so both arms below re-read before acting on a stale
+        // pre-drain snapshot (shared with [`reap_reported_pane_death`]).
         match crate::worker_process_exit::classify_worker_process_exit(work_db, progress_drain, execution_id).await {
             crate::worker_process_exit::ProcessExitVerdict::ExpectedTurnExit { turn_boundary_at } => {
+                let execution = reread_execution_after_drain(
+                    work_db,
+                    execution_id,
+                    execution,
+                    "dead-pid sweep: failed to re-read execution after drain; using pre-drain snapshot",
+                );
                 finalize_expected_turn_exit(
                     work_db,
                     live_states,
@@ -469,38 +480,51 @@ pub async fn run_one_pass(
                 outcome.expected_turn_exits += 1;
                 continue;
             }
-            crate::worker_process_exit::ProcessExitVerdict::Death => {}
-        }
+            crate::worker_process_exit::ProcessExitVerdict::Death => {
+                // Drain may have finalized the run (e.g. completion raced in
+                // while envelopes were published). Skip the reap if so —
+                // otherwise a stale non-terminal snapshot is overwritten with
+                // `orphaned`.
+                let Some(execution) = execution_after_drain_if_not_terminal(
+                    work_db,
+                    execution_id,
+                    execution,
+                    "dead-pid sweep: failed to re-read execution before reap; using pre-drain snapshot",
+                ) else {
+                    continue;
+                };
 
-        // No corroborating activity: the worker is presumed genuinely
-        // dead. Capture what the probe and live-state actually observed so
-        // the reap is explainable from the run's record and the dispatch
-        // tail (the operator's "a transcript must never just stop with no
-        // reason" ask).
-        let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
-        let reason = format!(
-            "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
-             no live-event corroboration within {DEAD_PID_CORROBORATION_SECS}s — process presumed dead",
-            state.shell_pid,
-            observation.activity_summary(),
-        );
-        let reaped = reap_dead_execution(
-            work_db,
-            live_states,
-            coordinator.clone(),
-            dispatch_events,
-            &state,
-            &execution,
-            ReapOptions {
-                reason: &reason,
-                now_epoch_secs,
-                file_pane_death_attention,
-                probe_observation: Some(&observation),
-            },
-        )
-        .await;
-        if reaped {
-            outcome.reaped += 1;
+                // No corroborating activity: the worker is presumed genuinely
+                // dead. Capture what the probe and live-state actually observed so
+                // the reap is explainable from the run's record and the dispatch
+                // tail (the operator's "a transcript must never just stop with no
+                // reason" ask).
+                let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
+                let reason = format!(
+                    "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
+                     no live-event corroboration within {DEAD_PID_CORROBORATION_SECS}s — process presumed dead",
+                    state.shell_pid,
+                    observation.activity_summary(),
+                );
+                let reaped = reap_dead_execution(
+                    work_db,
+                    live_states,
+                    coordinator.clone(),
+                    dispatch_events,
+                    &state,
+                    &execution,
+                    ReapOptions {
+                        reason: &reason,
+                        now_epoch_secs,
+                        file_pane_death_attention,
+                        probe_observation: Some(&observation),
+                    },
+                )
+                .await;
+                if reaped {
+                    outcome.reaped += 1;
+                }
+            }
         }
     }
 
@@ -626,12 +650,12 @@ pub async fn reap_reported_pane_death(
             // Re-read: the drain above may have terminalized the execution
             // through the completion handler (PR found → in_review), which is
             // the outcome the reap used to destroy.
-            let execution = crate::sweep_loop::lookup_execution_or_warn(
+            let execution = reread_execution_after_drain(
                 work_db,
                 run_id,
+                execution,
                 "worker_pane_died: failed to re-read execution after drain; using pre-drain snapshot",
-            )
-            .unwrap_or(execution);
+            );
             finalize_expected_turn_exit(
                 work_db,
                 live_states,
@@ -645,40 +669,71 @@ pub async fn reap_reported_pane_death(
                 },
             )
             .await;
-            return false;
+            false
         }
-        crate::worker_process_exit::ProcessExitVerdict::Death => {}
+        crate::worker_process_exit::ProcessExitVerdict::Death => {
+            // The drain can also have finalized the run on the *death* path (a
+            // worker that crashed after its turn boundary was already consumed).
+            // Re-check before orphaning so a terminal execution is never
+            // overwritten — shared with [`run_one_pass`].
+            let Some(execution) = execution_after_drain_if_not_terminal(
+                work_db,
+                run_id,
+                execution,
+                "worker_pane_died: failed to re-read execution before reap; using pre-drain snapshot",
+            ) else {
+                return false;
+            };
+
+            let reason = format!("worker-pane-died: {detail}");
+            reap_dead_execution(
+                work_db,
+                live_states,
+                coordinator,
+                dispatch_events,
+                &state,
+                &execution,
+                ReapOptions {
+                    reason: &reason,
+                    now_epoch_secs,
+                    file_pane_death_attention: false,
+                    probe_observation: None,
+                },
+            )
+            .await
+        }
     }
+}
 
-    // The drain can also have finalized the run on the *death* path (a worker
-    // that crashed after its turn boundary was already consumed). Re-check
-    // before orphaning so a terminal execution is never overwritten.
-    let execution = match crate::sweep_loop::lookup_execution_or_warn(
-        work_db,
-        run_id,
-        "worker_pane_died: failed to re-read execution before reap; using pre-drain snapshot",
-    ) {
-        Some(refreshed) if refreshed.status.is_terminal() => return false,
-        Some(refreshed) => refreshed,
-        None => execution,
-    };
+/// Re-read `execution_id` after [`crate::worker_process_exit::classify_worker_process_exit`]
+/// may have drained progress. Used by every path that acts on a post-classify
+/// snapshot so a completion handler that ran mid-drain cannot be overwritten
+/// by a stale pre-drain row. Falls back to `fallback` only when the lookup
+/// itself fails.
+fn reread_execution_after_drain(
+    work_db: &WorkDb,
+    execution_id: &str,
+    fallback: WorkExecution,
+    warn_msg: &str,
+) -> WorkExecution {
+    crate::sweep_loop::lookup_execution_or_warn(work_db, execution_id, warn_msg).unwrap_or(fallback)
+}
 
-    let reason = format!("worker-pane-died: {detail}");
-    reap_dead_execution(
-        work_db,
-        live_states,
-        coordinator,
-        dispatch_events,
-        &state,
-        &execution,
-        ReapOptions {
-            reason: &reason,
-            now_epoch_secs,
-            file_pane_death_attention: false,
-            probe_observation: None,
-        },
-    )
-    .await
+/// Like [`reread_execution_after_drain`], but returns `None` when the refreshed
+/// execution is already terminal — the caller must skip the reap rather than
+/// overwrite a real outcome with `orphaned`. Shared by [`run_one_pass`] and
+/// [`reap_reported_pane_death`] so the two Death arms cannot drift.
+fn execution_after_drain_if_not_terminal(
+    work_db: &WorkDb,
+    execution_id: &str,
+    fallback: WorkExecution,
+    warn_msg: &str,
+) -> Option<WorkExecution> {
+    match crate::sweep_loop::lookup_execution_or_warn(work_db, execution_id, warn_msg) {
+        Some(refreshed) if refreshed.status.is_terminal() => None,
+        Some(refreshed) => Some(refreshed),
+        None => Some(fallback),
+    }
 }
 
 /// What was observed about an expected one-shot exit — the evidence that
@@ -2449,5 +2504,74 @@ mod tests {
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
         );
+    }
+
+    /// A progress drain can terminalize the execution (completion detection
+    /// ran on the drained envelopes) while the classifier still returns
+    /// `Death` — e.g. a one-shot worker with no turn boundary, or a drain that
+    /// finalized the run on a path other than the boundary record. After
+    /// `Death`, the periodic sweep must re-read and skip the reap; otherwise a
+    /// stale pre-drain snapshot is overwritten with `orphaned`.
+    #[tokio::test]
+    async fn periodic_sweep_does_not_orphan_after_drain_terminalizes() {
+        let (_dir, db) = open_db();
+        let (work_item_id, execution_id) = create_codex_run(&db);
+        // No turn boundary: classify returns Death after draining. The drain
+        // itself terminalizes the execution (models completion racing in).
+        let drain = TerminalizingDrain {
+            db: db.clone(),
+            work_item_id: work_item_id.clone(),
+        };
+        let db = Arc::new(db);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let outcome = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            Some(&drain),
+            DeadPidSweepMode::PeriodicSpeculative,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.reaped, 0,
+            "a drain that terminalized the execution must not be followed by a reap",
+        );
+        assert_eq!(
+            outcome.expected_turn_exits, 0,
+            "no turn boundary was recorded, so this is not an expected-exit path",
+        );
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Completed,
+            "completion's outcome must survive the Death-path re-read",
+        );
+        assert!(
+            sink.events().await.is_empty(),
+            "no dead-pid reconcile event for an already-terminal execution",
+        );
+    }
+
+    /// Progress drain that terminalizes the run mid-classify — the race
+    /// [`execution_after_drain_if_not_terminal`] exists to close.
+    struct TerminalizingDrain {
+        db: WorkDb,
+        work_item_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProgressDrain for TerminalizingDrain {
+        async fn drain_progress_for_exited_worker(&self, _run_id: &str) {
+            self.db
+                .force_execution_status_for_test(&self.work_item_id, ExecutionStatus::Completed)
+                .unwrap();
+        }
     }
 }
