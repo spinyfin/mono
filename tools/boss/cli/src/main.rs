@@ -18,8 +18,8 @@ pub(crate) use boss_protocol::{
     LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product,
     Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput, ResolveProjectDesignDocOutput,
     ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    Task, TaskRuntime, UnpopulatePreservedTask, WorkAttentionItem, WorkComment, WorkExecution, WorkItem,
-    WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    SetTaskDocPointerInput, Task, TaskRuntime, UnpopulatePreservedTask, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
@@ -111,6 +111,8 @@ pub(crate) use output::*;
 pub(crate) use status_args::*;
 pub(crate) use work_cmds::*;
 
+#[cfg(test)]
+mod set_doc_parse_tests;
 #[cfg(test)]
 mod tests;
 

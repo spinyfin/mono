@@ -483,6 +483,11 @@ pub(crate) enum TaskCommand {
     /// if needed.
     #[command(name = "bind-pr")]
     BindPr(BindPrArgs),
+    /// Set or clear a task's per-task doc pointer (investigations /
+    /// project-less designs). Mirrors `boss project set-design-doc`.
+    /// Use when the doc detector fails to auto-populate from a bound PR.
+    #[command(name = "set-doc")]
+    SetDoc(TaskSetDocArgs),
     /// Manually link a work item to a specific upstream tracker issue.
     ///
     /// The engine stores `kind`/`id` on the row. The `raw` blob and

@@ -379,7 +379,8 @@ pub async fn on_task_doc_pr_detected(work_db: &WorkDb, task_id: &str, product_id
             task_id,
             "\n[doc-detector] no doc pointer auto-populated for this PR — zero or ambiguous \
              docs/designs/*.md, docs/design-docs/*.md, or docs/investigations/*.md matches among \
-             the changed files. Add/rename the doc file and re-push.",
+             the changed files. Add/rename the doc file and re-push, or set the pointer manually \
+             with `boss task set-doc`.",
         ) {
             tracing::warn!(
                 task_id,

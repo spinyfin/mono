@@ -535,6 +535,10 @@ impl WorkDb {
     /// with the project path, `repo = None` clears `doc_repo_remote_url`
     /// so resolution re-inherits the task's product repo, and a `None`
     /// branch clears `doc_branch` so it re-defaults to `"main"`.
+    ///
+    /// Operator-facing CLI / RPC callers should use
+    /// [`Self::set_task_doc`] instead, which also supports `--unset` and
+    /// returns the updated task row.
     pub fn set_task_doc_pointer(
         &self,
         task_id: &str,
@@ -574,6 +578,52 @@ impl WorkDb {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set or clear a task's per-task doc pointer — operator-facing
+    /// analogue of [`Self::set_project_design_doc`]. Reuses
+    /// [`Self::set_task_doc_pointer`] for the write path (same
+    /// validation / canonicalisation / column writes the detector
+    /// uses); `unset = true` clears all three columns.
+    ///
+    /// Returns the updated `Task` so callers can refresh without a
+    /// second round-trip. Does not attach `doc_link_state` (that is a
+    /// `get_work_tree` projection); CLI / tests re-resolve via the
+    /// work tree when they need the affordance state.
+    pub fn set_task_doc(&self, input: SetTaskDocPointerInput) -> Result<Task> {
+        let conn = self.connect()?;
+        let _ = query_task(&conn, &input.task_id).require("task", &input.task_id)?;
+        // Drop the connection before the nested write methods open their
+        // own; sqlite's default busy timeout covers the brief gap.
+        drop(conn);
+
+        if input.unset {
+            let now = now_string();
+            let mut conn = self.connect()?;
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE tasks
+                 SET doc_repo_remote_url = NULL,
+                     doc_branch = NULL,
+                     doc_path = NULL,
+                     updated_at = ?2
+                 WHERE id = ?1",
+                params![input.task_id, now],
+            )?;
+            tx.commit()?;
+        } else {
+            // Same write path the detector uses — last-writer-wins, path
+            // validated when Some, repo/branch inheritance when None.
+            self.set_task_doc_pointer(
+                &input.task_id,
+                input.doc_repo_remote_url.as_deref(),
+                input.doc_branch.as_deref(),
+                input.doc_path.as_deref(),
+            )?;
+        }
+
+        let conn = self.connect()?;
+        query_task(&conn, &input.task_id).require("task", &input.task_id)
     }
 
     /// Read a task's stored `doc_path` (the load-bearing pointer field).

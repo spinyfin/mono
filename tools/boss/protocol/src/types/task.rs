@@ -1118,6 +1118,46 @@ pub struct TaskRuntime {
     pub dispatch_wait_since: Option<String>,
 }
 
+/// Input to the `SetTaskDocPointer` RPC: point a project-less docs-backed
+/// task (investigation, or design without a project) at its deliverable
+/// markdown doc. Three optional fields (mirroring the three `tasks.doc_*`
+/// columns), plus an `unset` switch that clears the pointer.
+///
+/// Resolution semantics (also enforced engine-side; mirror
+/// [`crate::SetProjectDesignDocInput`]):
+/// - `doc_path = Some(p)` with non-empty `p` → set the pointer;
+///   `repo_remote_url` / `branch` are best-effort overrides (any `None`
+///   falls back to the product's defaults at resolve time).
+/// - `doc_path = None` with `unset = false` → only the non-path fields
+///   are updated; the existing path stays put (detector branch-only
+///   advance).
+/// - `unset = true` → clear all three columns. Any explicit field
+///   values supplied alongside are ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SetTaskDocPointerInput {
+    pub task_id: String,
+    /// When `true`, clear the pointer entirely (all three columns set
+    /// to NULL). Takes precedence over any explicit field values.
+    #[serde(default)]
+    pub unset: bool,
+
+    /// `None` means "inherit from product defaults, falling back to
+    /// `"main"`" at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_branch: Option<String>,
+
+    /// Repo-relative path. Setting `Some("")` is rejected by the
+    /// engine (use `unset = true` to clear). `None` leaves the
+    /// existing path unchanged unless `unset` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_path: Option<String>,
+
+    /// `None` means "inherit from `product.repo_remote_url`" (the
+    /// in-repo case) at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_repo_remote_url: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
