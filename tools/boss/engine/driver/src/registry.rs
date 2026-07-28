@@ -213,7 +213,7 @@ mod tests {
         let reg = DriverRegistry::default();
         let mut slugs: Vec<&str> = reg.slugs().collect();
         slugs.sort_unstable();
-        assert_eq!(slugs, vec!["claude", "codex"]);
+        assert_eq!(slugs, vec!["claude", "codex", "grok"]);
         for slug in reg.slugs() {
             assert!(reg.require(slug).is_ok(), "enumerated slug must resolve: {slug}");
         }
