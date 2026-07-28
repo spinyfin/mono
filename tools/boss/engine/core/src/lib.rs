@@ -47,6 +47,7 @@ pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_inflight;
 pub mod dispatch_metrics;
 pub mod driver_teardown;
+pub mod driver_transcript;
 pub use boss_dispatch_reader as dispatch_reader;
 pub use boss_engine_codex_rollout_retention as codex_rollout_retention;
 pub(crate) mod dispatch_spillover;

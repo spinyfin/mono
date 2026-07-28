@@ -2442,7 +2442,8 @@ async fn execution_transcript_normal_case() {
         .expect("transcript path must be set");
 
     let content = tokio::fs::read_to_string(&path).await.unwrap();
-    let events = crate::transcript_markdown::parse_transcript(&content);
+    // Same entry point the viewer RPC uses (driver-aware).
+    let events = crate::driver_transcript::parse_execution_transcript(&server_state.work_db, &execution.id, &content);
     assert!(!events.is_empty(), "must parse at least one event");
 
     let segments = crate::transcript_markdown::events_to_segments(&events, &Default::default());

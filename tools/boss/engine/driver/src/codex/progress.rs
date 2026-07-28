@@ -855,20 +855,40 @@ fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value
             "type":"user",
             "text": payload.get("message")?.as_str()?,
         })),
+        // Lifecycle fillers are `system`, not assistant text. Emitting them as
+        // AssistantText made every Codex Stop-boundary read that landed on a
+        // partial rollout (session_meta + task_started, final agent_message
+        // not yet flushed) treat the synthetic "turn started" as worker prose,
+        // short-circuit the flush-race retry, and permanently miss markers.
         "turn_aborted" => {
             let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
-            Some(assistant_text(&format!("turn aborted: {reason}")))
+            Some(lifecycle_system("turn_aborted", &format!("turn aborted: {reason}")))
         }
-        "task_started" => Some(assistant_text("turn started")),
+        "task_started" => Some(lifecycle_system("task_started", "turn started")),
         "task_complete" => {
-            let message = payload
-                .get("last_agent_message")
-                .and_then(Value::as_str)
-                .unwrap_or("turn completed");
-            Some(assistant_text(message))
+            // Real final prose stays AssistantText so marker scans can see it.
+            // The bare "turn completed" filler is lifecycle-only.
+            match payload.get("last_agent_message").and_then(Value::as_str) {
+                Some(message) => Some(assistant_text(message)),
+                None => Some(lifecycle_system("task_complete", "turn completed")),
+            }
         }
         _ => None,
     }
+}
+
+/// Codex turn-boundary filler, tagged as system so it is not worker prose.
+///
+/// Marker scans and the Stop-boundary flush-race retry gate on
+/// `AssistantText`. Lifecycle placeholders must not count: a synthetic
+/// "turn started" on a partial rollout used to make `all_text` non-empty and
+/// disable the retry, permanently dropping a late-flushed `[blocked]` marker.
+fn lifecycle_system(subtype: &str, message: &str) -> Value {
+    json!({
+        "type": "system",
+        "subtype": subtype,
+        "message": message,
+    })
 }
 
 fn normalize_rollout_message(payload: &Map<String, Value>) -> Option<Value> {
@@ -1197,8 +1217,40 @@ mod tests {
             "type":"event_msg",
             "payload":{"type":"turn_aborted","turn_id":"turn-1","reason":"interrupted"}
         }));
-        assert_eq!(aborted["type"], "assistant");
-        assert_eq!(aborted["content"][0]["text"], "turn aborted: interrupted");
+        // Lifecycle fillers are system (not assistant) so they don't count as
+        // worker prose for marker scans / flush-race retries.
+        assert_eq!(aborted["type"], "system");
+        assert_eq!(aborted["subtype"], "turn_aborted");
+        assert_eq!(aborted["message"], "turn aborted: interrupted");
+
+        let started = normalize_rollout(json!({
+            "type":"event_msg",
+            "payload":{"type":"task_started","turn_id":"turn-1"}
+        }));
+        assert_eq!(started["type"], "system");
+        assert_eq!(started["subtype"], "task_started");
+        assert_eq!(started["message"], "turn started");
+
+        let bare_complete = normalize_rollout(json!({
+            "type":"event_msg",
+            "payload":{"type":"task_complete","turn_id":"turn-1"}
+        }));
+        assert_eq!(bare_complete["type"], "system");
+        assert_eq!(bare_complete["message"], "turn completed");
+
+        let complete_with_prose = normalize_rollout(json!({
+            "type":"event_msg",
+            "payload":{
+                "type":"task_complete",
+                "turn_id":"turn-1",
+                "last_agent_message":"[blocked] reason=\"needs a decision\""
+            }
+        }));
+        assert_eq!(complete_with_prose["type"], "assistant");
+        assert_eq!(
+            complete_with_prose["content"][0]["text"],
+            "[blocked] reason=\"needs a decision\""
+        );
 
         let mut session = CodexTranscriptSession::default();
         let call = session.normalize(json!({

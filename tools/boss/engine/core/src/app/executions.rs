@@ -1051,7 +1051,11 @@ pub(super) async fn handle_execution_transcript(ctx: Dispatch, req: FrontendRequ
         };
         match tokio::fs::read_to_string(&transcript_path).await {
             Ok(content) => {
-                let events = crate::transcript_markdown::parse_transcript(&content);
+                // Same driver-aware path as Stop-boundary marker scans: a Codex
+                // rollout is unreadable by the Claude dialect parser, so a raw
+                // parse here would show the viewer an empty transcript for any
+                // non-Claude run even when the worker spoke.
+                let events = crate::driver_transcript::parse_execution_transcript(&work_db, &execution_id, &content);
                 let segments = crate::transcript_markdown::events_to_segments(&events, &Default::default());
                 let wire_segments: Vec<boss_protocol::TranscriptSegment> =
                     segments.into_iter().map(segment_to_wire).collect();
