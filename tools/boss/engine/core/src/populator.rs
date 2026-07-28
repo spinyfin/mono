@@ -785,11 +785,17 @@ impl Populator {
                     .result_summary(format!("rejected: proposed {count} tasks, cap is {max}"))
                     .build(),
                 title: "Auto-populate rejected: too many tasks",
+                // Both the merge-trigger attention item and the operator
+                // CLI (including `--dry-run`) share this body. Naming the
+                // real `--cap` flag makes the remedy copy-pasteable; the
+                // merge trigger cannot take a flag itself, but a manual
+                // re-run after a terminal rejection works because
+                // `rejected_too_many` does not hold the live gate.
                 body: format!(
                     "The planner proposed {count} tasks, over the cap of {max}. The whole \
                      proposal was rejected (nothing is silently truncated) and no tasks were \
-                     created. Split the project, or re-run `boss project plan <project>` with a \
-                     higher cap."
+                     created. Split the project, or re-run `boss project plan <project> --cap \
+                     {count}` (or higher)."
                 ),
             }),
             ValidationResult::RejectedDuplicateHandle { handle } => {
@@ -1769,6 +1775,93 @@ mod tests {
         assert_eq!(outcome, PopulateOutcome::RejectedTooMany { count: 3, max: 2 });
         assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
         assert_eq!(open_attention_count(&db, &product_id, &design_id), 1);
+
+        // Attention body names the real `--cap` flag (merge-trigger path
+        // and operator dry-run share this text) so the remedy is followable.
+        let attention = populate_attention_member(&db, &product_id, &design_id);
+        let body = attention.proposed_description.as_deref().unwrap_or("");
+        assert!(
+            body.contains("--cap 3"),
+            "rejection attention must name --cap with proposed count: {body}"
+        );
+        // Terminal rejection must not hold the live gate — operator re-run
+        // with a higher cap is the other half of the remedy.
+        assert!(db.live_planner_run_for_project(&project_id).unwrap().is_none());
+    }
+
+    /// Default cap rejects an over-size proposal wholesale; raising the cap
+    /// (the operator `--cap` override) admits the same proposal.
+    #[tokio::test]
+    async fn default_cap_rejects_and_override_admits() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        // One more task than the default guardrail.
+        let n = DEFAULT_MAX_TASKS + 1;
+        let tasks: Vec<_> = (0..n).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
+        let output = plan_output(tasks, vec![], Confidence::High, true);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+        let ctx = ctx(&product_id, &project_id, &design_id);
+
+        let rejected = Populator::run(&db, &steps, &ctx, DEFAULT_MAX_TASKS, &RecordingPublisher::default()).await;
+        assert_eq!(
+            rejected,
+            PopulateOutcome::RejectedTooMany {
+                count: n,
+                max: DEFAULT_MAX_TASKS,
+            }
+        );
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
+
+        // Same proposal, operator override at the proposed count — stages.
+        let admitted = Populator::run_operator(&db, &steps, &project_id, n, false, &RecordingPublisher::default())
+            .await
+            .expect("operator re-run after terminal rejection");
+        assert_eq!(
+            admitted,
+            PopulateOutcome::Staged {
+                created: n,
+                edges: 0,
+                skipped: 0,
+                low_confidence: false,
+            }
+        );
+        assert_eq!(project_task_count(&db, &product_id, &project_id), n);
+    }
+
+    /// Dry-run preview surfaces the same `--cap` remedy as a real run.
+    #[tokio::test]
+    async fn preview_over_cap_message_names_cap_flag() {
+        let db = open();
+        let (_product_id, project_id, _design_id) = seed(&db);
+        let tasks: Vec<_> = (0..3).map(|i| ptask(&format!("h{i}"), &format!("Task {i}"))).collect();
+        let output = plan_output(tasks, vec![], Confidence::High, true);
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content("# doc".to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+        let preview = Populator::preview(&db, &steps, &project_id, 2, false)
+            .await
+            .expect("preview");
+        match preview {
+            PreviewOutcome::Terminal {
+                outcome: PopulateOutcome::RejectedTooMany { count: 3, max: 2 },
+                message,
+            } => {
+                assert!(
+                    message.contains("--cap 3"),
+                    "dry-run rejection must name --cap: {message}"
+                );
+                // Keep the "not truncated" guarantee visible in the remedy text.
+                assert!(
+                    message.contains("silently truncated"),
+                    "message must still stress whole-proposal rejection: {message}"
+                );
+            }
+            other => panic!("expected RejectedTooMany terminal preview, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -43,17 +43,22 @@ pub(super) async fn handle_plan_project(ctx: Dispatch, req: FrontendRequest) {
         project_id,
         force,
         dry_run,
+        cap,
     } = req
     else {
         unreachable!()
     };
+
+    // Operator `--cap` overrides the default guardrail; absent keeps the
+    // engine constant so behaviour is unchanged when the flag is omitted.
+    let max_tasks = cap.unwrap_or(DEFAULT_MAX_TASKS);
 
     let steps = LivePopulatorSteps {
         utility: server_state.utility_model.clone(),
     };
 
     if dry_run {
-        match Populator::preview(&work_db, &steps, &project_id, DEFAULT_MAX_TASKS, force).await {
+        match Populator::preview(&work_db, &steps, &project_id, max_tasks, force).await {
             Ok(preview) => send_response(&sink, &request_id, preview_to_event(project_id, preview)),
             Err(err) => send_work_error(&sink, &request_id, &err),
         }
@@ -64,7 +69,7 @@ pub(super) async fn handle_plan_project(ctx: Dispatch, req: FrontendRequest) {
         &work_db,
         &steps,
         &project_id,
-        DEFAULT_MAX_TASKS,
+        max_tasks,
         force,
         server_state.publisher.as_ref(),
     )
@@ -411,7 +416,10 @@ fn describe_populate_outcome(outcome: &PopulateOutcome) -> (String, String) {
         ),
         PopulateOutcome::RejectedTooMany { count, max } => (
             outcome.tag().to_owned(),
-            format!("The planner proposed {count} tasks, over the cap of {max}. The whole proposal was rejected."),
+            format!(
+                "The planner proposed {count} tasks, over the cap of {max}. The whole proposal was \
+                 rejected. Split the project, or re-run with --cap {count} (or higher)."
+            ),
         ),
         PopulateOutcome::RejectedBadGraph => (
             outcome.tag().to_owned(),
@@ -636,6 +644,11 @@ mod tests {
         assert_eq!(tag, "rejected_too_many");
         assert!(message.contains("42"), "message missing proposed count: {message}");
         assert!(message.contains("25"), "message missing cap: {message}");
+        // Remedy must name the real CLI flag so an operator can copy it.
+        assert!(
+            message.contains("--cap 42"),
+            "message must name --cap with the proposed count: {message}"
+        );
     }
 
     #[test]

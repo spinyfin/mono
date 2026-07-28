@@ -288,6 +288,7 @@ fn coordinator_verbs_stay_closed() {
             project_id: "proj_1".into(),
             dry_run: false,
             force: false,
+            cap: None,
         },
         FrontendRequest::MergeWhenReady {
             work_item_id: "task_1".into(),
