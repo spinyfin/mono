@@ -1127,7 +1127,9 @@ pub(crate) async fn agents_transcript(
             };
             if format == TranscriptFormat::Text || format == TranscriptFormat::Markdown {
                 let joined = tail.join("\n");
-                let events = boss_engine::transcript_markdown::parse_transcript(&joined);
+                let events = boss_engine::transcript_markdown::parse_transcript_checked(&joined)
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+                    .with_context(|| format!("rendering transcript {transcript_path}"))?;
                 let rendered = if format == TranscriptFormat::Markdown {
                     let segments = boss_engine::transcript_markdown::events_to_segments(&events, &render_opts);
                     boss_engine::transcript_markdown::segments_to_markdown(&segments)

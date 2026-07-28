@@ -20,6 +20,7 @@ members = [
   "tools/boss/engine/ci-log-reader",
   "tools/boss/engine/comment-classifier",
   "tools/boss/engine/codex-hook-trust",
+  "tools/boss/engine/codex-rollout",
   "tools/boss/engine/codex-rollout-retention",
   "tools/boss/engine/conflict-diagnosis",
   "tools/boss/engine/deterministic-resolvers",

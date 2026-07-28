@@ -4,6 +4,7 @@ load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
 rust_library(
     name = "transcript_markdown",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/testdata/**"]),
     crate_name = "boss_transcript_markdown",
     crate_root = "src/lib.rs",
     edition = "2024",
@@ -12,6 +13,7 @@ rust_library(
         "//tools/boss/engine/core:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(normal = True),
 )
@@ -19,6 +21,7 @@ rust_library(
 rust_test(
     name = "transcript_markdown_test",
     size = "small",
+    compile_data = glob(["src/testdata/**"]),
     crate = ":transcript_markdown",
     edition = "2024",
     proc_macro_deps = all_crate_deps(
@@ -26,6 +29,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/codex-rollout",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(
         normal = True,
