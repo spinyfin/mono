@@ -37,6 +37,7 @@
 use checkleft_check_sdk::export_checks;
 
 export_checks!(
+    checkleft_change_file_count::change_file_count_check,
     checkleft_file_forbidden_path::forbidden_path_check,
     checkleft_file_size::file_size_check,
     checkleft_file_ifchange::file_ifchange_check,

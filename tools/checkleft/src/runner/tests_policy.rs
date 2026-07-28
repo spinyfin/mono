@@ -356,6 +356,9 @@ allow_bypass = true
 
 #[tokio::test]
 async fn runner_change_file_count_fails_above_max_and_bypasses_with_directive() {
+    use crate::external::BundledExternalCheckPackageProvider;
+    use crate::external::test_support::executor_with_precompiled_cache;
+
     let temp = tempdir().expect("create temp dir");
     for i in 0..4 {
         let path = temp.path().join(format!("f{i}.txt"));
@@ -377,13 +380,15 @@ allow_bypass = true
     )
     .expect("write config");
 
+    // change/file-count is a preinstalled wasm check, not a legacy built-in.
     let mut registry = CheckRegistry::new();
     register_builtin_checks(&mut registry).expect("register built-ins");
-
-    let runner = Runner::new(
+    let runner = Runner::with_external(
         Arc::new(registry),
         Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
         Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(BundledExternalCheckPackageProvider),
+        Arc::new(executor_with_precompiled_cache(temp.path())),
     );
 
     let oversized = ChangeSet::new(
@@ -443,6 +448,64 @@ allow_bypass = true
             .any(|r| r.contains("Coordinated rename")),
         "bypass reason should be recorded; got {:?}",
         bypassed.findings[0].remediations
+    );
+}
+
+#[tokio::test]
+async fn runner_change_file_count_whole_repo_is_noop() {
+    use crate::external::BundledExternalCheckPackageProvider;
+    use crate::external::test_support::executor_with_precompiled_cache;
+
+    let temp = tempdir().expect("create temp dir");
+    for i in 0..40 {
+        let path = temp.path().join(format!("tracked{i}.txt"));
+        fs::write(&path, format!("content {i}\n")).expect("write file");
+    }
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "change/file-count"
+
+[checks.config]
+max_files = 5
+
+[checks.policy]
+severity = "error"
+"#,
+    )
+    .expect("write config");
+
+    let mut registry = CheckRegistry::new();
+    register_builtin_checks(&mut registry).expect("register built-ins");
+    let runner = Runner::with_external(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+        Arc::new(BundledExternalCheckPackageProvider),
+        Arc::new(executor_with_precompiled_cache(temp.path())),
+    );
+
+    let whole_repo = ChangeSet::new(
+        (0..40)
+            .map(|i| ChangedFile {
+                path: Path::new(&format!("tracked{i}.txt")).to_path_buf(),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            })
+            .collect(),
+    )
+    .with_whole_repo(true);
+
+    let results = runner.run_changeset(&whole_repo).await.expect("run --all-style");
+    let file_count_result = results
+        .iter()
+        .find(|r| r.check_id == "change/file-count")
+        .expect("change/file-count ran");
+    assert!(
+        file_count_result.findings.is_empty(),
+        "whole_repo / --all must no-op change/file-count; findings: {:?}",
+        file_count_result.findings
     );
 }
 

@@ -909,6 +909,7 @@ mod tests {
                     content: content.to_owned(),
                 })
                 .collect(),
+            whole_repo: false,
         }
     }
 

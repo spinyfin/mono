@@ -1034,6 +1034,72 @@ fn giant_structs_qualified_exclusion_exempts_only_the_named_file() {
     );
 }
 
+/// Host + preinstalled wasm path for `change/file-count`: oversized scoped
+/// changesets fail, whole-repo (`--all`) changesets no-op.
+#[test]
+fn bundled_change_file_count_flags_oversized_and_noops_whole_repo() {
+    let temp = tempdir().expect("temp dir");
+    for i in 0..6 {
+        write_file(temp.path(), &format!("f{i}.txt"), "x\n");
+    }
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let oversized = ChangeSet::new(
+        (0..6)
+            .map(|i| ChangedFile {
+                path: PathBuf::from(format!("f{i}.txt")),
+                kind: ChangeKind::Added,
+                old_path: None,
+            })
+            .collect(),
+    );
+    let config = toml::Value::Table(toml::toml! { max_files = 3 });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let fail = executor
+        .execute(
+            &bundled_package("change/file-count"),
+            &oversized,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+            None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
+        )
+        .expect("execute");
+    assert_eq!(fail.findings.len(), 1);
+    assert!(
+        fail.findings[0].message.contains("max_files=3"),
+        "message was: {}",
+        fail.findings[0].message
+    );
+    assert!(
+        fail.findings[0]
+            .remediations
+            .iter()
+            .any(|r| r.contains("BYPASS_CHANGE_FILE_COUNT")),
+        "remediations: {:?}",
+        fail.findings[0].remediations
+    );
+
+    let whole_repo = oversized.clone().with_whole_repo(true);
+    let noop = executor
+        .execute(
+            &bundled_package("change/file-count"),
+            &whole_repo,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+            None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
+        )
+        .expect("execute whole_repo");
+    assert!(
+        noop.findings.is_empty(),
+        "whole_repo must no-op; findings: {:?}",
+        noop.findings
+    );
+}
+
 /// Task 4: the host lowers an exclusion-filtered changeset into a real bundled
 /// component, so an excluded file produces no findings even though it would
 /// otherwise violate the check. Proven against the real `file/size` component
