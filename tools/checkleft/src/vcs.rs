@@ -525,7 +525,11 @@ pub fn parse_tracked_file_list(output: &str) -> ChangeSet {
         })
         .collect();
 
-    ChangeSet::new(changed_files)
+    // Whole-repo scan: every tracked path is listed as Modified with no
+    // hunks. Change-size gates (change/file-count) no-op on this flag so
+    // `checkleft run --all` integrity pipelines are not hard-failed by the
+    // full tree length.
+    ChangeSet::new(changed_files).with_whole_repo(true)
 }
 
 /// Parse `git status --porcelain` (v1) output into a set of repo-relative paths
@@ -851,6 +855,10 @@ R docs/old.md => docs/new.md
         assert_eq!(parsed.changed_files.len(), 2);
         assert_eq!(parsed.changed_files[0].path, PathBuf::from("checks/src/lib.rs"));
         assert_eq!(parsed.changed_files[0].kind, ChangeKind::Modified);
+        assert!(
+            parsed.whole_repo,
+            "all-files list from --all must mark whole_repo so change-size gates no-op"
+        );
     }
 
     #[test]

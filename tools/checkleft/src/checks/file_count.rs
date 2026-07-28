@@ -11,6 +11,12 @@
 //! also filters them explicitly so direct unit tests and future schedulers
 //! stay consistent.
 //!
+//! Under `checkleft run --all` the framework builds a whole-repo changeset
+//! ([`ChangeSet::whole_repo`]) that lists every tracked file as Modified.
+//! Counting that tree against `max_files` would always fail on any real
+//! repository, so this check is a documented no-op in whole-repo mode — the
+//! same class of caveat as `policy.changed_lines_only` under `--all`.
+//!
 //! ## Configuration
 //!
 //! ```toml
@@ -92,6 +98,10 @@ pub fn count_non_deleted_files(changeset: &ChangeSet) -> usize {
 #[async_trait]
 impl ConfiguredCheck for CompiledFileCountConfig {
     fn applicable_file_count(&self, changeset: &ChangeSet) -> usize {
+        // Whole-repo (`--all`) scans are a no-op for this change-size gate.
+        if changeset.whole_repo {
+            return 0;
+        }
         // One unit of work: the whole-changeset count, not a per-file scan.
         // Returning 1 keeps the progress UI honest for this non-iterating check.
         if changeset.changed_files.is_empty() { 0 } else { 1 }
@@ -103,6 +113,18 @@ impl ConfiguredCheck for CompiledFileCountConfig {
         _tree: &dyn SourceTree,
         on_file_processed: Arc<dyn Fn(usize) + Send + Sync>,
     ) -> Result<CheckResult> {
+        // Integrity / `checkleft run --all` builds a whole-repo changeset that
+        // marks every tracked file Modified. A max_files gate is only meaningful
+        // for scoped PR/diff changes; under --all it would always fire on any
+        // real tree. Same class of documented no-op as `changed_lines_only`.
+        if changeset.whole_repo {
+            on_file_processed(0);
+            return Ok(CheckResult {
+                check_id: "change/file-count".to_owned(),
+                findings: Vec::new(),
+            });
+        }
+
         let count = count_non_deleted_files(changeset);
         on_file_processed(if count == 0 { 0 } else { 1 });
 
@@ -286,6 +308,48 @@ mod tests {
                 .contains(&format!("max_files={DEFAULT_MAX_FILES}")),
             "message was: {}",
             over_result.findings[0].message
+        );
+    }
+
+    /// Synthetic stand-in for `Vcs::all_files_changeset` / `checkleft run --all`:
+    /// every tracked path is Modified, count far exceeds max_files, but
+    /// `whole_repo` makes the gate a no-op so integrity pipelines stay green.
+    #[tokio::test]
+    async fn whole_repo_all_files_changeset_is_noop_even_when_count_exceeds_max() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let tree = LocalSourceTree::new(temp.path()).expect("tree");
+        let check = FileCountCheck;
+
+        let files: Vec<_> = (0..200)
+            .map(|i| file(&format!("tracked{i}.rs"), ChangeKind::Modified))
+            .collect();
+        let all_files = ChangeSet::new(files).with_whole_repo(true);
+
+        // Without the flag the same surface would hard-fail max_files=30.
+        let without_flag = ChangeSet::new(
+            (0..200)
+                .map(|i| file(&format!("tracked{i}.rs"), ChangeKind::Modified))
+                .collect(),
+        );
+        let fail = check.run(&without_flag, &tree, &config(30)).await.expect("run");
+        assert_eq!(
+            fail.findings.len(),
+            1,
+            "control: scoped oversized changeset must still fail"
+        );
+
+        let result = check.run(&all_files, &tree, &config(30)).await.expect("run");
+        assert!(
+            result.findings.is_empty(),
+            "whole_repo / --all changeset must no-op change/file-count; findings: {:?}",
+            result.findings
+        );
+
+        let configured = check.configure(&config(30)).expect("configure");
+        assert_eq!(
+            configured.applicable_file_count(&all_files),
+            0,
+            "progress should report no work for whole_repo file-count"
         );
     }
 }

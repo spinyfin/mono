@@ -564,6 +564,7 @@ Notes:
 - Findings default to `error` under the runner's policy layer. Override per instance with `[checks.policy].severity`.
 - Enable bypass per instance with `[checks.policy].allow_bypass`. Directive name: `BYPASS_CHANGE_FILE_COUNT`.
 - Bypass is for rare, intentional large surfaces (coordinated renames, unsplittable generated trees). Do not raise the silent default or use bypass for convenience dumps.
+- **No-op under `checkleft run --all`.** Whole-repo mode lists every tracked file as modified (no real PR-sized change), so a file-count ceiling would always fire on any real tree. Like `policy.changed_lines_only` under `--all`, this check skips when the changeset is a full-repo scan (`ChangeSet.whole_repo`). PR-scoped / base-ref runs still enforce `max_files`.
 
 ## `forbidden-imports-deps`
 
