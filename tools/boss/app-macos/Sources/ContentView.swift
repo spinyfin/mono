@@ -437,9 +437,11 @@ struct ContentView: View {
     }
 
     /// Chrome banners rendered in the titlebar accessory slot; they span the
-    /// window's content area (see `TitlebarAccessoryHost`).
-    /// Height is content-driven (Dynamic Type, multi-line wrap); the accessory
-    /// reports it to AppKit, which reserves that much space above the content.
+    /// full window width (see `TitlebarAccessoryHost`), covering the band
+    /// above both the sidebar and the detail column.
+    /// Height is content-driven (Dynamic Type, multi-line wrap, expand); the
+    /// accessory reports it to AppKit for both the windowed frame and
+    /// `fullScreenMinHeight`, which reserves that much space above the content.
     @ViewBuilder
     private var chromeBanners: some View {
         VStack(spacing: 0) {
