@@ -409,7 +409,7 @@ impl CodexRuntimeState {
 pub fn render_base_config_toml(workspace: &Path) -> String {
     // TOML basic-string escape for paths that may contain backslashes or quotes.
     let workspace_key = toml_basic_string(&workspace.display().to_string());
-    let sandbox_workspace_write = render_sandbox_workspace_write_toml();
+    let sandbox_workspace_write = render_sandbox_workspace_write_toml(workspace);
     format!(
         "# Boss-owned per-run Codex config. Do not hand-edit; regenerated every dispatch.\n\
          \n\
@@ -461,12 +461,13 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// under which Codex does not consult `sandbox_workspace_write` at all, so no
 /// worker-kind branch is needed here — reviewers don't run build gates and
 /// stay fully denied.
-fn render_sandbox_workspace_write_toml() -> String {
+fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     let mut out = String::from(
         "[sandbox_workspace_write]\n\
          network_access = true\n",
     );
-    let roots = bazel_writable_roots();
+    let mut roots = bazel_writable_roots();
+    roots.extend(cube_repo_store_root(workspace));
     if !roots.is_empty() {
         let quoted: Vec<String> = roots
             .iter()
@@ -536,6 +537,42 @@ fn bazel_writable_roots_impl(
         Some(xdg) if !xdg.is_empty() => vec![PathBuf::from(xdg).join("bazel")],
         _ => vec![home.join(".cache/bazel")],
     }
+}
+
+/// Resolve the shared cube jj store root for `workspace`, if it is a cube
+/// secondary jj workspace.
+///
+/// Every cube-leased workspace's `.jj/repo` is not a directory but jj's own
+/// *pointer file* for a secondary workspace: its entire contents are the
+/// absolute path to the shared store, e.g.
+/// `~/.local/share/cube/repos/<repo>/.jj/repo`. Reading it back is "cube's
+/// own reported path" rather than a guessed `~/.local/share/cube` prefix —
+/// jj already wrote the pointer, and cube owns that layout, so there is
+/// nothing to hardcode or string-build.
+///
+/// `jj commit`/`describe`/`bookmark create`/`git fetch` all write into this
+/// shared store (table-store locks, refs, `FETCH_HEAD`) even though the
+/// command runs from the leased workspace directory, which is a different
+/// path entirely — see the Codex-sandbox writable-roots investigation. This
+/// returns the checkout root that owns the store (`<repos>/<repo>`, i.e.
+/// `.jj`'s parent), not just `.jj/repo` itself, because a colocated `.git/`
+/// sits alongside `.jj/` at that same level and needs the same write access
+/// (e.g. `.git/FETCH_HEAD` on `jj git fetch`).
+///
+/// Returns `None` when `workspace` is not a cube secondary jj workspace: no
+/// `.jj/repo` pointer file, or its contents don't have the expected
+/// `.jj/repo` shape (plain/colocated dev checkouts, most test fixtures).
+fn cube_repo_store_root(workspace: &Path) -> Option<PathBuf> {
+    let pointer = fs::read_to_string(workspace.join(".jj").join("repo")).ok()?;
+    let store_repo_dir = PathBuf::from(pointer.trim());
+    if store_repo_dir.file_name()?.to_str()? != "repo" {
+        return None;
+    }
+    let jj_dir = store_repo_dir.parent()?;
+    if jj_dir.file_name()?.to_str()? != ".jj" {
+        return None;
+    }
+    Some(jj_dir.parent()?.to_path_buf())
 }
 
 fn toml_basic_string(s: &str) -> String {
@@ -1782,6 +1819,63 @@ else:
     fn bazel_writable_roots_empty_without_home_or_test_tmpdir() {
         assert_eq!(bazel_writable_roots_impl(None, None, None), Vec::<PathBuf>::new());
         assert_eq!(bazel_writable_roots_impl(Some(""), None, None), Vec::<PathBuf>::new());
+    }
+
+    /// Lay out a fake cube secondary jj workspace: `<workspace>/.jj/repo`
+    /// pointing at `<repos_root>/<repo>/.jj/repo`, mirroring what `jj` itself
+    /// writes for a real cube-leased checkout.
+    fn write_cube_jj_pointer(workspace: &Path, repo_root: &Path) {
+        fs::create_dir_all(workspace.join(".jj")).unwrap();
+        fs::write(
+            workspace.join(".jj").join("repo"),
+            repo_root.join(".jj").join("repo").display().to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cube_repo_store_root_reads_the_jj_pointer_file() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        write_cube_jj_pointer(&workspace, &repo_root);
+
+        assert_eq!(cube_repo_store_root(&workspace), Some(repo_root));
+    }
+
+    #[test]
+    fn cube_repo_store_root_none_without_pointer_file() {
+        let tmp = TempDir::new().unwrap();
+        // Plain checkout: no .jj at all.
+        assert_eq!(cube_repo_store_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn cube_repo_store_root_none_for_unexpected_pointer_shape() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(workspace.join(".jj")).unwrap();
+        fs::write(workspace.join(".jj").join("repo"), "/not/a/jj/store/path").unwrap();
+        assert_eq!(cube_repo_store_root(&workspace), None);
+    }
+
+    /// The regression this task exists for: a Codex worker in a cube
+    /// workspace must be granted write access to the shared jj store, or
+    /// every `jj describe`/`jj git fetch` in the sandbox dies with
+    /// `Operation not permitted` on the store's lock files.
+    #[test]
+    fn codex_config_grants_cube_shared_store_as_writable_root() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspaces").join("mono-agent-1");
+        let repo_root = tmp.path().join("repos").join("mono");
+        write_cube_jj_pointer(&workspace, &repo_root);
+
+        let toml = render_base_config_toml(&workspace);
+        let quoted_repo_root = toml_basic_string(&repo_root.display().to_string());
+        assert!(
+            toml.contains(&quoted_repo_root),
+            "writable_roots must include the cube shared repo store: {toml}"
+        );
     }
 
     #[test]
