@@ -173,13 +173,24 @@ mod tests {
 
     #[test]
     fn codex_rollout_yields_no_assistant_text_without_driver_normalization() {
-        // The defect this module exists to fix, pinned: parsing the rollout as
-        // written finds nothing, which is why the marker scans saw an empty
-        // transcript and filed no attention item.
+        // Pin the path this module actually uses after normalize: raw rollout
+        // records fed to the Claude-family values parser (no driver reshape)
+        // yield zero assistant turns. Schema-aware `parse_transcript` can
+        // recover Codex on its own after the shared Codex rollout path landed,
+        // but Stop-boundary reads go through `parse_transcript_with_driver` →
+        // `parse_transcript_values`, which still needs the driver's normalizer
+        // for non-Claude dialects.
         let jsonl = codex_rollout_with("[blocked] reason=\"cannot write the jj lock file\"");
+        let raw_values = jsonl.lines().filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<Value>(trimmed).ok()
+        });
         assert!(
-            assistant_texts(&crate::transcript_markdown::parse_transcript(&jsonl)).is_empty(),
-            "raw Claude-dialect parse of a Codex rollout must find no assistant text",
+            assistant_texts(&crate::transcript_markdown::parse_transcript_values(raw_values)).is_empty(),
+            "Claude-family values parse of raw Codex rollout records must find no assistant text",
         );
     }
 

@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{NormalizeError, WorkerEvent};
+use serde_json::{Value, json};
 
 mod model_menu;
 
@@ -220,9 +221,14 @@ impl AgentDriver for GrokDriver {
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-        // Identity until a Grok ACP sessionUpdate normaliser lands. Safe on
-        // the live-status hot path (must not panic).
-        raw
+        // Minimal ACP updates.jsonl → canonical reshape so Stop-boundary
+        // marker scans can read Grok transcripts once `transcript_path`
+        // points at `$GROK_HOME/sessions/…/updates.jsonl`. Full multi-chunk
+        // accumulation and tool_call correlation remain follow-on work
+        // (TranscriptSessionNormalizer); a single final `agent_message_chunk`
+        // is the common shape for short `[blocked]` answers and is enough
+        // for the conformance fixture.
+        normalize_acp_updates_entry(raw)
     }
 
     fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {
@@ -251,6 +257,62 @@ impl AgentDriver for GrokDriver {
 }
 
 // ---------------------------------------------------------------------------
+// ACP updates.jsonl → canonical entry reshape
+// ---------------------------------------------------------------------------
+//
+// Spike samples (ghostty-grok-pane-viability-artifacts) write records like:
+//   {"method":"session/update","params":{"update":{
+//     "sessionUpdate":"agent_message_chunk",
+//     "content":{"type":"text","text":"…"}
+//   }}}
+// Unrecognised / non-prose records pass through unchanged so the Claude-family
+// values parser skips them; this must never panic on the live-status path.
+
+fn normalize_acp_updates_entry(raw: Value) -> Value {
+    let Some(update) = raw
+        .get("params")
+        .and_then(|params| params.get("update"))
+        .and_then(|update| update.as_object())
+    else {
+        return raw;
+    };
+    let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return raw;
+    };
+    match kind {
+        "agent_message_chunk" => {
+            let Some(text) = update
+                .get("content")
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+            else {
+                return raw;
+            };
+            json!({
+                "type": "assistant",
+                "content": [{"type": "text", "text": text}],
+            })
+        }
+        "user_message_chunk" => {
+            let Some(text) = update
+                .get("content")
+                .and_then(|content| content.get("text"))
+                .and_then(Value::as_str)
+            else {
+                return raw;
+            };
+            json!({
+                "type": "user",
+                "text": text,
+            })
+        }
+        // Non-prose ACP records (tool_call, turn_completed, hook_execution, …)
+        // stay opaque until the full session normalizer lands.
+        _ => raw,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -259,6 +321,34 @@ mod tests {
     use super::*;
     use crate::{AbsenceDisposition, Capability, MidTurnPaneInput};
     use boss_protocol::{EffortLevel, ReasoningMode};
+
+    #[test]
+    fn normalize_transcript_entry_surfaces_agent_message_chunk() {
+        let raw = json!({
+            "timestamp": 1,
+            "method": "session/update",
+            "params": {
+                "sessionId": "s1",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "[blocked] reason=\"need a decision\""}
+                }
+            }
+        });
+        assert_eq!(
+            GrokDriver::default().normalize_transcript_entry(raw),
+            json!({
+                "type": "assistant",
+                "content": [{"type": "text", "text": "[blocked] reason=\"need a decision\""}],
+            }),
+        );
+    }
+
+    #[test]
+    fn normalize_transcript_entry_passes_through_non_acp_records() {
+        let raw = json!({"type": "assistant", "content": [{"type": "text", "text": "already canonical"}]});
+        assert_eq!(GrokDriver::default().normalize_transcript_entry(raw.clone()), raw);
+    }
 
     #[test]
     fn grok_descriptor_matches_design() {

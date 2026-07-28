@@ -50,6 +50,19 @@ fn native_blocked_marker_jsonl(slug: &str) -> Option<String> {
             ),
             marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
         )),
+        // Grok writes ACP `session/update` records to updates.jsonl (the path
+        // stamped on every hook payload as `transcriptPath`). Shape matches
+        // the pane-viability spike samples under
+        // tools/boss/docs/investigations/ghostty-grok-pane-viability-artifacts/.
+        "grok" => Some(format!(
+            concat!(
+                r#"{{"timestamp":0,"method":"session/update","params":{{"sessionId":"fixture","update":{{"sessionUpdate":"user_message_chunk","content":{{"type":"text","text":"do the work"}}}}}}}}"#,
+                "\n",
+                r#"{{"timestamp":1,"method":"session/update","params":{{"sessionId":"fixture","update":{{"sessionUpdate":"agent_message_chunk","content":{{"type":"text","text":{marker}}}}}}}}}"#,
+                "\n",
+            ),
+            marker = serde_json::to_string(BLOCKED_MARKER).unwrap(),
+        )),
         _ => None,
     }
 }
