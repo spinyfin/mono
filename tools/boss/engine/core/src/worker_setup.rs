@@ -486,7 +486,7 @@ pub fn render_claude_md(input: &WorkerSetupInput, preamble: &str, config_dir: &s
          ## Boundaries\n\
          \n\
          - Do not modify files outside this workspace. Sibling workspaces\n\
-           under `~/Documents/dev/workspaces/` belong to other workers.\n\
+           belong to other workers.\n\
          - Do not modify cube's database, lease state, or workspace registry.\n\
          - `~/Library/Application Support/Boss/` is coordinator/engine-only.\n\
            Never read, write, or touch it. Ask the coordinator for\n\
@@ -860,7 +860,8 @@ fn deny_rules(input: &WorkerSetupInput, sandbox: EngineDataDirSandbox) -> Vec<St
 ///
 /// Instead the file-write deny is scoped to the **worker-workspaces root** —
 /// the parent of `workspace_path`, under which every per-worker checkout lives
-/// (`~/Documents/dev/workspaces/<repo>-agent-NNN`). That keeps the reviewer
+/// (cube decides the actual layout; this code only relies on it being
+/// `workspace_path`'s parent, never a hardcoded path). That keeps the reviewer
 /// unable to write to its own PR/repo *or* any sibling worker's workspace
 /// (preserving the cross-worker isolation boundary the blanket deny gave),
 /// while permitting the out-of-tree artifact write in `$TMPDIR`. Writing

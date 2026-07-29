@@ -101,10 +101,11 @@ fn claude_md_mandates_jj_first_vcs() {
 }
 
 /// The sibling-workspace boundary is a containment property, not prose polish:
-/// every worker shares `~/Documents/dev/workspaces/` with other live workers,
-/// and an edit that strays outside this workspace corrupts someone else's
-/// in-flight task. The deny rules fence this at the permission layer; this
-/// assertion pins the matching instruction the worker actually reads.
+/// every worker shares a workspaces root (cube decides where — its layout is
+/// an implementation detail the prompt must not hardcode) with other live
+/// workers, and an edit that strays outside this workspace corrupts someone
+/// else's in-flight task. The deny rules fence this at the permission layer;
+/// this assertion pins the matching instruction the worker actually reads.
 #[test]
 fn claude_md_forbids_touching_sibling_workspaces() {
     let input = sample_input();
