@@ -71,6 +71,7 @@ pub mod host_reconcile;
 pub mod host_registry;
 pub mod host_scheduling;
 pub mod husk_pane_sweep;
+pub mod interrupt_recovery;
 pub mod ipc_log;
 pub mod ladder_lease_heartbeat;
 pub mod ladder_lease_reap;
