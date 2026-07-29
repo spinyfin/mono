@@ -20,7 +20,7 @@
 //! # Output contract
 //!
 //! The reviewer **writes** exactly one `ReviewResult` JSON object to the
-//! engine-owned artifact path it is handed, using the `Write` tool. The
+//! engine-owned artifact path it is handed. The
 //! completion handler reads + schema-validates that file at the Stop
 //! boundary. As a **transitional fallback** (and to keep remote/SSH reviewers
 //! working until the artifact is fetched cross-host), the reviewer also ends

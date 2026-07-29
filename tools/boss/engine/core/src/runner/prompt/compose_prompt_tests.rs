@@ -73,6 +73,12 @@ fn acceptance_criterion_names_the_pr_url_artifact_and_keeps_the_final_line() {
             prompt.contains("Print the PR URL on its own line"),
             "the final-message fallback convention must survive:\n{prompt}",
         );
+        for banned in ["`Write` tool", "run_in_background", "subagent"] {
+            assert!(
+                !prompt.contains(banned),
+                "prompt must stay driver-agnostic: {banned} is Claude Code-specific:\n{prompt}",
+            );
+        }
     }
 }
 
