@@ -238,17 +238,11 @@ struct WorkCardPopoverView: View {
 
             if shouldOfferFullDescription {
                 Button {
-                    openWindow(
-                        id: "markdown-viewer",
-                        value: MarkdownViewerContent(
-                            title: task.name,
-                            markdown: task.description,
-                            // Engine-back this description's comments (P529 Phase 2)
-                            // on the work-item artifact.
-                            artifactKind: WireArtifactKind.workItem,
-                            artifactId: task.id
-                        )
-                    )
+                    // Routes through the singleton design-doc viewer window
+                    // (not a value-keyed WindowGroup) so this affordance gets
+                    // the same NSWindow behaviour as the design-doc icon path
+                    // under a fullscreen main window.
+                    model.openTaskDescription(task)
                 } label: {
                     Label("Read full description", systemImage: "doc.text.magnifyingglass")
                         .font(.callout)

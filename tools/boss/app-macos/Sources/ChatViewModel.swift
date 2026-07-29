@@ -471,23 +471,12 @@ final class ChatViewModel: ObservableObject {
     /// `chatModel` assignment.
     var onDesignRendererWired: (() -> Void)?
 
-    /// Indirection for opening the markdown-viewer window with fetched
-    /// content. Installed by [[ContentView]] using
-    /// `@Environment(\.openWindow)` — same boundary-crossing pattern as
-    /// [[designRendererOpener]]. Used when the design doc lives on a PR
-    /// branch (not yet on `main`) and no leased workspace is available:
-    /// the dispatcher fetches the raw content via [[rawContentFetcher]]
-    /// and hands the rendered string to this opener. `nil` (tests and
-    /// headless contexts) falls back to `urlOpener`.
-    var markdownViewerOpener: ((MarkdownViewerContent) -> Void)?
-
     /// Indirection for opening the `"async-markdown-viewer"` Window
     /// immediately, before the design doc has been fetched. Installed by
     /// [[ContentView]] via `@Environment(\.openWindow)`. When set, the
     /// raw-content path opens the window first (loading state) then
     /// resolves content into [[asyncMarkdownViewerVM]]. `nil` (tests and
-    /// headless) falls back to the legacy fetch-then-open path via
-    /// [[markdownViewerOpener]].
+    /// headless) falls back to [[openDesignDocFallback]].
     var asyncMarkdownViewerOpener: (() -> Void)?
 
     /// Shared state for the `"async-markdown-viewer"` Window scene.
@@ -1887,16 +1876,8 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
                 } else {
-                    // Headless / test path: fetch first, then open via the
-                    // legacy markdownViewerOpener (or fall back to urlOpener).
-                    Task { @MainActor in
-                        await self.fetchAndOpenDesignDoc(
-                            projectName: projectName,
-                            rawURL: rawURL,
-                            webURL: webURL,
-                            projectShortID: shortID
-                        )
-                    }
+                    // Headless / test path: no in-app viewer wired.
+                    openDesignDocFallback(webURL: webURL)
                 }
                 return
             }
@@ -1967,35 +1948,44 @@ final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// Fetch raw markdown from `rawURL` and open it in the
-    /// [[markdownViewerOpener]] window. Falls back to `urlOpener(webURL)`
-    /// if the fetch fails or [[markdownViewerOpener]] is not wired.
+    /// Headless / test fallback for the doc-fetch dispatch in
+    /// [[openProjectDesignDoc]] / [[openTaskDoc]], taken only when
+    /// [[asyncMarkdownViewerOpener]] isn't wired (no `ContentView` in-graph
+    /// to own the singleton viewer window) — production always wires it.
+    /// Hands the doc straight to `urlOpener` rather than fetching content
+    /// there's no viewer to show it in.
     @MainActor
-    func fetchAndOpenDesignDoc(
-        projectName: String,
-        rawURL: URL,
-        webURL: String,
-        projectShortID: String
-    ) async {
-        do {
-            let fetchStart = Date()
-            designDocTimingLog.info("phase=fetch_start project=\(projectShortID, privacy: .public) url=\(rawURL.absoluteString, privacy: .public)")
-            let markdown = try await rawContentFetcher(rawURL)
-            let fetchMs = Int(Date().timeIntervalSince(fetchStart) * 1000)
-            designDocTimingLog.info("phase=fetch_end project=\(projectShortID, privacy: .public) duration_ms=\(fetchMs, privacy: .public) bytes=\(markdown.utf8.count, privacy: .public)")
-            if let opener = markdownViewerOpener {
-                let title = projectName.isEmpty ? rawURL.lastPathComponent : projectName
-                opener(MarkdownViewerContent(title: title, markdown: markdown))
-            } else if let url = URL(string: webURL) {
-                urlOpener(url)
-            }
-        } catch {
-            if let url = URL(string: webURL) {
-                urlOpener(url)
-            } else {
-                workErrorMessage = "Failed to fetch design doc: \(error.localizedDescription)"
-            }
+    func openDesignDocFallback(webURL: String) {
+        if let url = URL(string: webURL) {
+            urlOpener(url)
+        } else {
+            workErrorMessage = "Design doc URL could not be parsed: \(webURL)"
         }
+    }
+
+    /// Loads `task.description` — already in memory, no fetch — into the
+    /// singleton design-doc viewer and opens it. Used by "Read full
+    /// description" (see [[WorkCardPopoverView]]) so that affordance shares
+    /// the same `Window` scene, and therefore the same NSWindow behaviour
+    /// under a fullscreen main window, as the design-doc icon path.
+    ///
+    /// `pendingRenderProjectShortID` is left `nil` so
+    /// [[MarkdownDocumentChrome]]'s design-doc `phase=parse` /
+    /// `phase=interactive` timing — gated on a non-empty `projectShortID` —
+    /// never fires for a task-description open; that instrumentation is
+    /// scoped to the design-doc click-to-first-paint journey.
+    @MainActor
+    func openTaskDescription(_ task: WorkTask) {
+        asyncMarkdownViewerVM.pendingRenderProjectShortID = nil
+        asyncMarkdownViewerVM.renderStartTime = nil
+        asyncMarkdownViewerVM.clickStartTime = nil
+        asyncMarkdownViewerVM.renderContentID = UUID()
+        asyncMarkdownViewerVM.state = .loaded(
+            title: task.name,
+            markdown: task.description,
+            artifact: .workItem(id: task.id)
+        )
+        asyncMarkdownViewerOpener?()
     }
 
     /// Fetch raw markdown from `rawURL` and update [[asyncMarkdownViewerVM]]

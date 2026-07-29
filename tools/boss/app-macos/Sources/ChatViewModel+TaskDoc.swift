@@ -42,16 +42,8 @@ extension ChatViewModel {
                         )
                     }
                 } else {
-                    // Headless / test path: fetch first, then open via the
-                    // legacy markdownViewerOpener (or fall back to urlOpener).
-                    Task { @MainActor in
-                        await self.fetchAndOpenDesignDoc(
-                            projectName: displayName,
-                            rawURL: rawURL,
-                            webURL: webURL,
-                            projectShortID: shortID
-                        )
-                    }
+                    // Headless / test path: no in-app viewer wired.
+                    openDesignDocFallback(webURL: webURL)
                 }
                 return
             }

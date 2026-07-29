@@ -34,10 +34,10 @@ private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "De
 /// - **Timing**: `phase=parse` / `phase=interactive` os_log, emitted only when
 ///   `projectShortID` is non-empty (the async design-doc click journey).
 ///
-/// The chrome is a plain view, not a scene: the three window scenes
-/// (`markdown-viewer`, `async-markdown-viewer`, `design-renderer`) survive as-is
-/// because they encode genuinely different open-semantics (per-doc value payload
-/// vs. open-immediately-then-fill singleton). Only the drifted view code is
+/// The chrome is a plain view, not a scene: the window scenes
+/// (`async-markdown-viewer`, `design-renderer`) survive as-is because they
+/// encode genuinely different open-semantics (open-immediately-then-fill
+/// singleton vs. per-doc value payload). Only the drifted view code is
 /// unified here.
 struct MarkdownDocumentChrome: View {
     /// Title shown in the header row.
