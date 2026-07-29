@@ -384,9 +384,8 @@ for an operator to review. End your final message instead with:\n\n\
 ## Single-shot mandate — no sub-agents, no deferral\n\n\
 This run is **single-shot**: the investigation AND the decision marker must both \
 happen within this session. The session ends the moment you stop responding.\n\n\
-- **Do NOT spawn a sub-agent or delegate this investigation to another \
-session.** That provides no resume mechanism — the session will hang waiting \
-for a result that never returns.\n\
+- **Do NOT use the `Agent` tool.** Spawning a sub-agent provides no resume \
+mechanism — the session will hang waiting for a result that never returns.\n\
 - **Do NOT end any turn with deferred intent** such as \"I'll create the task \
 next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
 If you state an intent like \"Let me create the task\", you must follow through \
