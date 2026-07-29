@@ -104,7 +104,7 @@ mod apply_permission_extra_args_tests {
             "default sandbox must be replaced: {merged}"
         );
         // Required contract flags survive the rewrite.
-        assert!(merged.contains("--json"), "{merged}");
+        assert!(merged.contains("--color always"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
     }
 
@@ -133,7 +133,7 @@ mod apply_permission_extra_args_tests {
             "default sandbox must be replaced: {merged}"
         );
         // Required contract flags survive the rewrite.
-        assert!(merged.contains("--json"), "{merged}");
+        assert!(merged.contains("--color always"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
     }
 }
