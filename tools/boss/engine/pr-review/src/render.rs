@@ -173,7 +173,7 @@ pub fn render_reviewer_claude_md(lease_id: &str, workspace_path: &str, boundarie
          - Running `cube pr create`/`cube pr update` or any Boss PR helper.\n\
          \n\
          **The one permitted write** is your `ReviewResult` JSON, which you\n\
-         write with the `Write` tool to the engine-owned artifact path given in\n\
+         write to the engine-owned artifact path given in\n\
          your task prompt (also exported as `$BOSS_STRUCTURED_OUTPUT`). That\n\
          path is OUTSIDE every worker workspace, so it is not part of the PR or\n\
          repo — writing it does not violate the read-only mandate. Do not write\n\
@@ -422,8 +422,8 @@ pub fn render_reviewer_initial_prompt(
          4. Read changed files and surrounding context using `Read`, `cat`, \
             `grep`, `jj show`, etc. — no writes to repo files.\n\
          5. Produce the `ReviewResult` JSON (schema below) and deliver it as \
-            described in **Required output** — write it to the artifact file \
-            with the `Write` tool, and also include it as a fenced \
+            described in **Required output** — write it to the artifact file, \
+            and also include it as a fenced \
             ` ```json ` block at the end of your final message.\n\
          \n\
          {embedded_diff_section}\
@@ -441,7 +441,7 @@ pub fn render_reviewer_initial_prompt(
          ## Required output — CRITICAL\n\
          \n\
          **Primary (required):** write your single `ReviewResult` JSON object \
-         to this exact file using the `Write` tool — nothing else, just the \
+         to this exact file — nothing else, just the \
          JSON:\n\
          \n\
          `{output_path}`\n\
@@ -1565,8 +1565,8 @@ mod tests {
             "prompt must reference the env var fallback"
         );
         assert!(
-            prompt.contains("`Write` tool"),
-            "prompt must instruct using the Write tool"
+            !prompt.contains("`Write` tool"),
+            "prompt must stay driver-agnostic: not every worker driver has a Write tool"
         );
         // Fenced JSON is kept as a transitional fallback, not the primary.
         assert!(

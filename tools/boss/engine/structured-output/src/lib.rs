@@ -48,7 +48,7 @@ pub mod pr_url;
 /// implementer's followups, a triage agent's decision).
 ///
 /// The operative instruction is the literal absolute path embedded in the
-/// worker prompt (a model writes via the `Write` tool, not by expanding env
+/// worker prompt (the worker writes that file directly, not by expanding env
 /// vars); this var surfaces the same value so a worker can also resolve it
 /// programmatically and so the convention is self-documenting in the pane env.
 pub const STRUCTURED_OUTPUT_ENV: &str = "BOSS_STRUCTURED_OUTPUT";

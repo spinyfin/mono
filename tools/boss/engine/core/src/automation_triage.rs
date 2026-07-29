@@ -294,7 +294,7 @@ exists — that is a normal, expected outcome on most runs.\n\n\
 {context_block}\
 ## You MUST report exactly one decision\n\n\
 Report it **both ways**, and make them agree:\n\n\
-1. **Write it to `{decision_artifact_path}`** with the `Write` tool — one JSON \
+1. **Write it to `{decision_artifact_path}`** — one JSON \
 object, either `{{\"decision\": \"task\", \"task_id\": \"T42\"}}` or \
 `{{\"decision\": \"skip\", \"reason\": \"<one line>\"}}`. That path is outside \
 the repo, so it never pollutes anything, and it is the channel the engine reads \
@@ -324,15 +324,17 @@ for an operator to review. End your final message instead with:\n\n\
 ## Single-shot mandate — no sub-agents, no deferral\n\n\
 This run is **single-shot**: the investigation AND the decision marker must both \
 happen within this session. The session ends the moment you stop responding.\n\n\
-- **Do NOT use the `Agent` tool.** Spawning a sub-agent provides no resume \
-mechanism — the session will hang waiting for a result that never returns.\n\
+- **Do NOT spawn a sub-agent or delegate this investigation to another \
+session.** That provides no resume mechanism — the session will hang waiting \
+for a result that never returns.\n\
 - **Do NOT end any turn with deferred intent** such as \"I'll create the task \
 next\", \"Let me investigate further\", or \"I'll wait for the agent to finish\". \
 If you state an intent like \"Let me create the task\", you must follow through \
 immediately in that same turn — do not stop before you do.\n\
 - **Do NOT wait for any external process or event.** All investigation must \
-happen inline using read-only tool calls (`grep`/`find`/`cat`, `Bash`, `Read`, \
-`WebSearch`). Finish the investigation before you make your decision.\n\
+happen inline using read-only actions (shell commands like `grep`/`find`/`cat`, \
+file reads, web searches). Finish the investigation before you make your \
+decision.\n\
 - **If you create a task** with `boss task create --automation`, emit the \
 `automation: task <id>` marker **in the same response**, immediately after the \
 tool call returns with the task id. Do not stop between the tool call and the \
@@ -477,8 +479,9 @@ pub fn render_triage_claude_md(lease_id: &str) -> String {
          This run is **single-shot**: investigation AND the decision marker must\n\
          both happen within this session. The session ends the moment you stop.\n\
          \n\
-         - **Do NOT use the `Agent` tool.** Sub-agents provide no resume\n\
-           mechanism — spawning one will hang the session indefinitely.\n\
+         - **Do NOT spawn a sub-agent or delegate this investigation to\n\
+           another session.** That provides no resume mechanism — it will\n\
+           hang the session indefinitely.\n\
          - **Do NOT defer to a later turn.** If you say \"I'll create the task\n\
            next\" or \"Let me wait for the agent\", you must complete that action\n\
            immediately in the same turn — the session will NOT give you another.\n\
@@ -824,11 +827,11 @@ mod tests {
     #[test]
     fn triage_claude_md_forbids_sub_agents_and_deferral() {
         let md = render_triage_claude_md("lease_xyz");
-        // Must explicitly name the Agent tool and explain why it is forbidden
-        // (the hang mode: no resume mechanism once a sub-agent is spawned).
+        // Must explicitly forbid spawning a sub-agent and explain why
+        // (the hang mode: no resume mechanism once one is spawned).
         assert!(
-            md.contains("Agent"),
-            "triage CLAUDE.md must mention the Agent tool to tell the worker not to use it",
+            md.contains("sub-agent") || md.contains("sub agent"),
+            "triage CLAUDE.md must forbid spawning a sub-agent",
         );
         // Must warn against deferring intent to a later turn.
         assert!(
@@ -936,15 +939,11 @@ mod tests {
             .updated_at("2026-01-01")
             .build();
         let preamble = render_triage_preamble(&automation, "My Product", &[], &TriageContext::default(), ARTIFACT_PATH);
-        // Must explicitly name the Agent tool and explain the hang risk.
-        assert!(
-            preamble.contains("Agent"),
-            "preamble must name the Agent tool to tell the worker not to use it",
-        );
-        // Must name the failure mode (sub-agent hang) so the worker understands why.
+        // Must explicitly forbid spawning a sub-agent and name the hang risk
+        // (no resume mechanism once one is spawned) so the worker understands why.
         assert!(
             preamble.contains("sub-agent") || preamble.contains("sub agent"),
-            "preamble must mention sub-agents",
+            "preamble must forbid spawning a sub-agent",
         );
         // Must require the marker to be emitted in the same response as the task
         // creation — the premature-end failure mode in the field evidence.
