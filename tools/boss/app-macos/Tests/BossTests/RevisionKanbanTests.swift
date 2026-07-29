@@ -132,9 +132,10 @@ final class RevisionKanbanTests: XCTestCase {
 
     // MARK: project grouping
 
-    /// Chore-parented revisions (nil projectID) must appear under the "Chores"
-    /// section in project-grouped mode, not under "No Project".
-    func testChoreParentedRevisionGroupsUnderChores() {
+    /// Chore-parented revisions (nil projectID) must appear under the "No
+    /// Project" section in project-grouped mode, alongside other
+    /// un-projected work — kind is not a grouping axis.
+    func testChoreParentedRevisionGroupsUnderNoProject() {
         let model = makeModel()
         model.workBoardGrouping = .project
         let chore = makeChore(id: "chore_c19", status: "active")
@@ -145,19 +146,17 @@ final class RevisionKanbanTests: XCTestCase {
 
         let sections = model.workSections(in: .doing)
         let titles = sections.map(\.title)
-        XCTAssertFalse(titles.contains("No Project"),
-                       "chore-parented revision must NOT appear in a 'No Project' section")
-        XCTAssertTrue(titles.contains("Chores"),
-                      "chore-parented revision must appear in the 'Chores' section")
-        let choreSection = sections.first { $0.title == "Chores" }
+        XCTAssertTrue(titles.contains("No Project"),
+                      "chore-parented revision must appear in the 'No Project' section")
+        let noProjectSection = sections.first { $0.title == "No Project" }
         XCTAssertTrue(
-            choreSection?.items.contains { $0.id == revision.id } ?? false,
-            "revision must be in the Chores section"
+            noProjectSection?.items.contains { $0.id == revision.id } ?? false,
+            "revision must be in the No Project section"
         )
     }
 
     /// Project-task-parented revisions (with a projectID) must appear under
-    /// their project's section, not under "Chores" or "No Project".
+    /// their project's section, not under "No Project".
     func testProjectTaskParentedRevisionGroupsUnderProject() {
         let model = makeModel()
         model.workBoardGrouping = .project
@@ -168,8 +167,6 @@ final class RevisionKanbanTests: XCTestCase {
         let titles = sections.map(\.title)
         XCTAssertFalse(titles.contains("No Project"),
                        "project-task-parented revision must NOT land in 'No Project'")
-        XCTAssertFalse(titles.contains("Chores"),
-                       "project-task-parented revision must NOT land in 'Chores'")
         XCTAssertTrue(titles.contains("Test Project"),
                       "revision must appear under its parent project's section")
     }

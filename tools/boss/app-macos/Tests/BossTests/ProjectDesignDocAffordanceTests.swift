@@ -557,8 +557,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertTrue(section.defaultExpanded)
     }
 
-    /// The Chores section is a project-grouped section too — it must be
-    /// collapsible on the same terms as project sections, not just
+    /// The No Project section is a project-grouped section too — it must
+    /// be collapsible on the same terms as project sections, not just
     /// exempt from the affordance icon.
     func testChoreSectionIsCollapsible() {
         let model = makeModelWithProject()
@@ -581,8 +581,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         model.choresByProductID[productID] = [chore]
         model.workBoardGrouping = .project
         let sections = model.workSections(in: .backlog)
-        guard let chores = sections.first(where: { $0.title == "Chores" }) else {
-            XCTFail("expected a Chores section"); return
+        guard let chores = sections.first(where: { $0.title == "No Project" }) else {
+            XCTFail("expected a No Project section"); return
         }
         XCTAssertTrue(chores.isCollapsible)
     }
@@ -598,10 +598,10 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         XCTAssertFalse(sections[0].isCollapsible)
     }
 
-    /// Chores live in their own section titled "Chores" — they have no
-    /// project, so the section must carry `projectID == nil` and the
-    /// view code must skip the affordance entirely (the design's "one
-    /// project, one pointer" rule).
+    /// Chores live in the shared "No Project" section alongside other
+    /// un-projected work — they have no project, so the section must
+    /// carry `projectID == nil` and the view code must skip the
+    /// affordance entirely (the design's "one project, one pointer" rule).
     func testChoreSectionCarriesNilProjectID() {
         let model = makeModelWithProject()
         let productID = model.products.first!.id
@@ -623,8 +623,8 @@ final class ProjectDesignDocAffordanceTests: XCTestCase {
         model.choresByProductID[productID] = [chore]
         model.workBoardGrouping = .project
         let sections = model.workSections(in: .backlog)
-        guard let chores = sections.first(where: { $0.title == "Chores" }) else {
-            XCTFail("expected a Chores section"); return
+        guard let chores = sections.first(where: { $0.title == "No Project" }) else {
+            XCTFail("expected a No Project section"); return
         }
         XCTAssertNil(chores.projectID)
     }
