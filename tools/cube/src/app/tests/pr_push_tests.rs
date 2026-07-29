@@ -23,8 +23,8 @@ fn pr_push_happy_path_advance() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(
@@ -91,8 +91,8 @@ fn pr_push_noop_idempotency() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         // @ is empty
         ExpectedCommand::ok(
@@ -138,8 +138,8 @@ fn pr_push_empty_at_nothing_to_land() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -184,8 +184,8 @@ fn pr_push_detached_refusal() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -235,8 +235,8 @@ fn pr_push_stale_push_error() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -286,8 +286,8 @@ fn pr_push_merged_pr_hard_error() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"MERGED"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"closed","merged":true}"#,
         ),
     ]);
 
@@ -309,8 +309,8 @@ fn pr_push_closed_pr_hard_error() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"CLOSED"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"closed","merged":false}"#,
         ),
     ]);
 
@@ -332,8 +332,8 @@ fn pr_push_force_with_lease_happy_path() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(
@@ -418,8 +418,8 @@ fn pr_push_force_with_lease_concurrent_advance_refusal() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -492,8 +492,8 @@ fn pr_push_infers_from_ancestry() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "42", "-R", "spinyfin/mono", "--json", "state"],
-            r#"{"state":"OPEN"}"#,
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"open","merged":false}"#,
         ),
         // @ is not empty
         ExpectedCommand::ok(

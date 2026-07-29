@@ -90,8 +90,8 @@ fn workspace_push_pr_arg_resolves_head_branch_from_github() {
         ExpectedCommand::ok(
             cwd.clone(),
             "gh",
-            &["pr", "view", "9", "-R", "spinyfin/mono", "--json", "headRefName"],
-            r#"{"headRefName":"boss/exec_pr9"}"#,
+            &["api", "repos/spinyfin/mono/pulls/9"],
+            r#"{"head":{"ref":"boss/exec_pr9"}}"#,
         ),
         ExpectedCommand::ok(
             cwd.clone(),

@@ -13,6 +13,7 @@ use crate::command_runner::{CommandRunner, RealCommandRunner};
 use crate::app::change::resolve_body_file;
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
+use crate::app::gh_pr;
 use crate::app::jj::run_jj_push;
 use crate::app::stage::run_stage;
 
@@ -180,28 +181,8 @@ fn push_branch_to_github(ctx: &PrContext, runner: &dyn CommandRunner, pr_descrip
 /// Return the URL of the single open PR for `ctx.branch`, or `None` when
 /// there is no open PR. Errors when more than one open PR matches.
 fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<String>> {
-    // Using --state open is explicit: gh pr list defaults to open-only, but
-    // being explicit guards against any default drift.
-    let list_json = runner
-        .run(&RealCommandRunner::invocation(
-            &ctx.cwd,
-            "gh",
-            &[
-                "pr",
-                "list",
-                "-R",
-                &ctx.owner_repo,
-                "--head",
-                &ctx.branch,
-                "--state",
-                "open",
-                "--json",
-                "url",
-            ],
-        ))
+    let prs = gh_pr::list_open_prs_for_branch(runner, &ctx.cwd, &ctx.owner_repo, &ctx.branch)
         .map_err(|e| CubeError::InvalidArgument(format!("failed to check for existing PR: {e}")))?;
-
-    let prs = serde_json::from_str::<Vec<serde_json::Value>>(&list_json).unwrap_or_default();
 
     if prs.len() > 1 {
         return Err(CubeError::InvalidArgument(format!(
@@ -214,7 +195,7 @@ fn list_open_pr(ctx: &PrContext, runner: &dyn CommandRunner) -> Result<Option<St
 
     Ok(prs
         .first()
-        .and_then(|pr| pr.get("url"))
+        .and_then(|pr| pr.get("html_url"))
         .and_then(|v| v.as_str())
         .map(str::to_string))
 }
@@ -754,23 +735,13 @@ fn resolve_pr_push_target(
 
         (None, Some(b)) => {
             // Have branch; find PR number from GitHub.
-            let list_json = runner
-                .run(&RealCommandRunner::invocation(
-                    cwd,
-                    "gh",
-                    &[
-                        "pr", "list", "-R", owner_repo, "--head", b, "--state", "open", "--json", "number",
-                    ],
-                ))
-                .map_err(|e| CubeError::InvalidArgument(format!("failed to look up open PR for branch `{b}`: {e}")))?;
-            let prs: Vec<serde_json::Value> = serde_json::from_str(&list_json).map_err(|e| {
-                CubeError::InvalidArgument(format!("unexpected response from `gh pr list` for branch `{b}`: {e}"))
-            })?;
-            let number = prs.first().and_then(|pr| pr["number"].as_u64()).ok_or_else(|| {
-                CubeError::InvalidArgument(format!(
-                    "no open PR found for branch `{b}`; create a PR with `cube pr create` first"
-                ))
-            })?;
+            let number = gh_pr::find_open_pr_for_branch(runner, cwd, owner_repo, b)
+                .map_err(|e| CubeError::InvalidArgument(format!("failed to look up open PR for branch `{b}`: {e}")))?
+                .ok_or_else(|| {
+                    CubeError::InvalidArgument(format!(
+                        "no open PR found for branch `{b}`; create a PR with `cube pr create` first"
+                    ))
+                })?;
             Ok((number, b.to_string()))
         }
 
@@ -830,24 +801,9 @@ fn resolve_pr_push_target(
 
 /// Verify the PR identified by `pr_number` is open on GitHub; error if merged/closed.
 fn check_pr_open(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str, pr_number: u64) -> Result<()> {
-    let state_json = runner
-        .run(&RealCommandRunner::invocation(
-            cwd,
-            "gh",
-            &[
-                "pr",
-                "view",
-                &pr_number.to_string(),
-                "-R",
-                owner_repo,
-                "--json",
-                "state",
-            ],
-        ))
+    let pr_info = gh_pr::fetch_pr_json(runner, cwd, owner_repo, pr_number)
         .map_err(|e| CubeError::InvalidArgument(format!("failed to check state of PR #{pr_number}: {e}")))?;
-    let state: serde_json::Value = serde_json::from_str(&state_json)
-        .map_err(|e| CubeError::InvalidArgument(format!("unexpected response from `gh pr view {pr_number}`: {e}")))?;
-    let state_str = state["state"].as_str().unwrap_or("UNKNOWN");
+    let state_str = gh_pr::state(&pr_info);
     if state_str != "OPEN" {
         return Err(CubeError::InvalidArgument(format!(
             "PR #{pr_number} is {state_str} — refusing to push onto a non-open PR. \

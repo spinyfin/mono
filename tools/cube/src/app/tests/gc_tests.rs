@@ -212,18 +212,8 @@ fn gc_forgets_closed_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &[
-                "pr",
-                "view",
-                "42",
-                "-R",
-                "spinyfin/mono",
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ],
-            "CLOSED",
+            &["api", "repos/spinyfin/mono/pulls/42"],
+            r#"{"state":"closed","merged":false}"#,
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
     ]);
@@ -298,18 +288,8 @@ fn gc_forgets_merged_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &[
-                "pr",
-                "view",
-                "99",
-                "-R",
-                "spinyfin/mono",
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ],
-            "MERGED",
+            &["api", "repos/spinyfin/mono/pulls/99"],
+            r#"{"state":"closed","merged":true}"#,
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/99"], ""),
     ]);
@@ -385,18 +365,8 @@ fn gc_retains_open_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &[
-                "pr",
-                "view",
-                "7",
-                "-R",
-                "spinyfin/mono",
-                "--json",
-                "state",
-                "--jq",
-                ".state",
-            ],
-            "OPEN",
+            &["api", "repos/spinyfin/mono/pulls/7"],
+            r#"{"state":"open","merged":false}"#,
         ),
         // No bookmark forget — pr/7 is still open.
     ]);

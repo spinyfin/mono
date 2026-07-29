@@ -354,8 +354,8 @@ fn rebase_pr_arg_resolves_head_branch_from_github() {
         ExpectedCommand::ok(
             rebase_cwd(),
             "gh",
-            &["pr", "view", "7", "-R", REBASE_OWNER_REPO, "--json", "headRefName"],
-            r#"{"headRefName":"boss/exec_pr7"}"#,
+            &["api", &format!("repos/{REBASE_OWNER_REPO}/pulls/7")],
+            r#"{"head":{"ref":"boss/exec_pr7"}}"#,
         ),
         remote_exists_cmd(branch, "e1"),
         positioned_cmd(branch, "e1"),

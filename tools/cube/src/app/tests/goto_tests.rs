@@ -128,8 +128,8 @@ fn goto_pr_resolves_branch_and_sets_pr_bookmark() {
         ExpectedCommand::ok(
             goto_cwd(),
             "gh",
-            &["pr", "view", "42", "-R", GOTO_OWNER_REPO, "--json", "headRefName,state"],
-            &format!(r#"{{"headRefName":"{branch}","state":"OPEN"}}"#),
+            &["api", &format!("repos/{GOTO_OWNER_REPO}/pulls/42")],
+            &format!(r#"{{"head":{{"ref":"{branch}"}},"state":"open","merged":false}}"#),
         ),
         goto_exists_cmd(branch, "e42"),
         goto_set_bookmark_cmd(branch),
