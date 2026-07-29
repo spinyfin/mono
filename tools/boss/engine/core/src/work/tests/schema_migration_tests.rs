@@ -535,3 +535,105 @@ fn migration_re_adds_reasoning_column_and_leaves_existing_rows_null() {
         "size signal survives intact"
     );
 }
+
+/// One-time backfill (mono#… "merge-conflict/CI-fix rows should be
+/// tombstoned automatically once their underlying PR merges"): a
+/// `merge-conflict:*` revision that a human cancelled while its chain
+/// root's PR was still open, then the PR going on to merge *before* this
+/// backfill existed, left the revision stuck at `status = 'cancelled'`
+/// with no tombstone forever — `mark_chore_pr_merged` only reconciles a
+/// chain at the moment its own PR transitions to merged, and that moment
+/// had already passed. Re-opening the DB must sweep it in.
+#[test]
+fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_merge() {
+    // disk_db_path required: the test re-opens the DB to trigger the migration.
+    let (_dir, path) = disk_db_path("migration-backfill-cancelled-moot");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Backfill", Some("git@example.com:backfill.git"));
+
+    let conn = db.connect().unwrap();
+    let now = now_string();
+
+    // Chain root: already `done` (its PR merged).
+    let root_id = next_id("task");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, pr_url, created_at, updated_at, autostart, priority, created_via)
+         VALUES (?1, ?2, 'chore', 'root', '', 'done', 'https://github.com/spinyfin/mono/pull/2473', ?3, ?3, 0, 'medium', 'test')",
+        params![root_id, product.id, now],
+    ).unwrap();
+
+    // Stuck revision: cancelled by a human, moot kind, never tombstoned.
+    let stuck_id = next_id("task");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Resolve merge conflict against main', '', 'cancelled', ?3, ?3, 0, 'medium', ?4, ?5)",
+        params![stuck_id, product.id, now, format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_stuck"), root_id],
+    ).unwrap();
+
+    // Control 1: cancelled moot revision whose chain root is still open —
+    // no merge signal yet, must be left alone.
+    let open_root_id = next_id("task");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, pr_url, created_at, updated_at, autostart, priority, created_via)
+         VALUES (?1, ?2, 'chore', 'open root', '', 'in_review', 'https://github.com/spinyfin/mono/pull/2500', ?3, ?3, 0, 'medium', 'test')",
+        params![open_root_id, product.id, now],
+    ).unwrap();
+    let not_yet_id = next_id("task");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Resolve merge conflict against main', '', 'cancelled', ?3, ?3, 0, 'medium', ?4, ?5)",
+        params![not_yet_id, product.id, now, format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_open"), open_root_id],
+    ).unwrap();
+
+    // Control 2: cancelled *non-moot* revision under the merged root — real
+    // review feedback, must never be swept regardless of the merge signal.
+    let non_moot_id = next_id("task");
+    conn.execute(
+        "INSERT INTO tasks (id, product_id, kind, name, description, status, created_at, updated_at, autostart, priority, created_via, parent_task_id)
+         VALUES (?1, ?2, 'revision', 'Address review feedback', '', 'cancelled', ?3, ?3, 0, 'medium', ?4, ?5)",
+        params![non_moot_id, product.id, now, format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_feedback"), root_id],
+    ).unwrap();
+
+    drop(conn);
+    drop(db);
+
+    // Re-open the DB to trigger the migration.
+    let db2 = WorkDb::open(path.clone()).unwrap();
+    let conn2 = db2.connect().unwrap();
+
+    let (stuck_status, stuck_deleted_at): (String, Option<String>) = conn2
+        .query_row(
+            "SELECT status, deleted_at FROM tasks WHERE id = ?1",
+            [&stuck_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stuck_status, "cancelled", "status must remain the human's real record");
+    assert!(
+        stuck_deleted_at.is_some(),
+        "a cancelled moot revision whose chain root already merged must be tombstoned by the backfill"
+    );
+
+    let not_yet_deleted_at: Option<String> = conn2
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&not_yet_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        not_yet_deleted_at.is_none(),
+        "a cancelled moot revision whose chain root is still open must not be touched"
+    );
+
+    let non_moot_deleted_at: Option<String> = conn2
+        .query_row("SELECT deleted_at FROM tasks WHERE id = ?1", [&non_moot_id], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        non_moot_deleted_at.is_none(),
+        "a cancelled non-moot (review-feedback) revision must never be swept by the backfill"
+    );
+
+    drop(conn2);
+    let _ = std::fs::remove_file(path);
+}

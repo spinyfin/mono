@@ -395,25 +395,40 @@ impl WorkDb {
         finish_attempt_update(tx, rows, attempt_id, query_conflict_resolution)
     }
 
-    /// Close the revision task a resolved merge-conflict attempt spawned,
-    /// so a retired `conflict_resolutions` row never leaves a stale
-    /// `todo`/`active`/`blocked` revision behind it. Without this, the
-    /// parent's "in revision" badge (driven by
+    /// Close the revision task a conflict-resolution or CI-fix attempt
+    /// spawned, so a retired `conflict_resolutions` / `ci_remediations` row
+    /// never leaves a stale `todo`/`active`/`blocked` revision behind it.
+    /// Without this, the parent's "in revision" badge (driven by
     /// [`find_latest_active_revision_in_chain`]'s "status != done" rule)
     /// persists until the chain root's PR *actually* merges — the only
     /// other point a stale revision gets closed
     /// ([`block_pending_revisions_on_parent_close`]) — which can be long
-    /// after the conflict that spawned it was resolved, or, if the
-    /// revision task never advances on its own, permanently.
+    /// after the attempt that spawned it retired, or, if the revision task
+    /// never advances on its own, permanently.
+    ///
+    /// Callers reach this from two kinds of terminal transition on the
+    /// spawning attempt, both meaning the same thing to the revision: its
+    /// job is done and it should vanish from the board rather than
+    /// accumulate.
+    /// * **Resolved** — the conflict cleared / CI went green
+    ///   (`conflict_watch::on_resolved`, `ci_watch::on_ci_resolved`).
+    /// * **Superseded** — a fresh detection cycle is about to (or just did)
+    ///   file a new attempt for the same PR before the old one finished
+    ///   (`conflict_watch::supersede_if_stale`,
+    ///   `conflict_watch::supersede_stale_ci_remediation`,
+    ///   `ci_watch::on_ci_in_flight_supersedes_failure`) — the prior row is
+    ///   moot the moment a newer one takes its place; only the current
+    ///   attempt's revision should survive.
     ///
     /// Every revision this retire path can reach was spawned with
-    /// `created_via = CREATED_VIA_MERGE_CONFLICT_PREFIX…`
-    /// ([`crate::conflict_watch::maybe_spawn_conflict_revision`]) — i.e.
-    /// [`is_moot_revision_kind`] by construction: a conflicting PR cannot
-    /// merge while still conflicted, so by the time the conflict resolved
-    /// the revision's job (if any) was already done. This mirrors
-    /// [`resolve_revision_on_parent_close`]'s moot branch, just triggered
-    /// by "the conflict resolved" instead of "the parent PR merged".
+    /// `created_via` = `CREATED_VIA_MERGE_CONFLICT_PREFIX…` or
+    /// `CREATED_VIA_CI_FIX_PREFIX…` (`maybe_spawn_conflict_revision` /
+    /// `maybe_spawn_ci_revision`) — i.e. [`is_moot_revision_kind`] by
+    /// construction: a conflicting/CI-failing PR cannot merge while it
+    /// stands, so by the time the attempt retires (however it retires) the
+    /// revision's job, if any, was already done. This mirrors
+    /// [`resolve_revision_on_parent_close`]'s moot branch, just triggered by
+    /// "the spawning attempt retired" instead of "the parent PR merged".
     ///
     /// A no-op (`Ok(None)`) when:
     /// - the task can't be found, or
@@ -425,7 +440,7 @@ impl WorkDb {
     ///   live worker is not this function's job; that execution's own
     ///   on-Stop completion advances the task normally when the worker's
     ///   turn ends.
-    pub fn close_resolved_conflict_revision(&self, revision_task_id: &str) -> Result<Option<Task>> {
+    pub fn close_moot_revision_task(&self, revision_task_id: &str, archived_reason: &str) -> Result<Option<Task>> {
         if self.get_live_execution_for_work_item(revision_task_id, "")?.is_some() {
             return Ok(None);
         }
@@ -443,12 +458,7 @@ impl WorkDb {
             return Ok(None);
         }
         let now = now_string();
-        let rows_changed = archive_revision_task(
-            &tx,
-            &rev.id,
-            &now,
-            "merge conflict resolved before parent PR merged; revision moot",
-        )?;
+        let rows_changed = archive_revision_task(&tx, &rev.id, &now, archived_reason)?;
         if rows_changed == 0 {
             return Ok(None);
         }

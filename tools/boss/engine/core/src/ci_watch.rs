@@ -1711,6 +1711,17 @@ pub async fn on_ci_in_flight_supersedes_failure(
                         "ci_watch: failed to abandon stale remediation on head-SHA change",
                     );
                 }
+                // The abandoned attempt's revision (if it spawned one) is
+                // superseded the moment a fresh commit lands — nothing else
+                // closes a merely-superseded revision until the parent PR
+                // eventually merges, which is exactly the "N open rows piled
+                // up on one PR" bug.
+                close_superseded_moot_revision(
+                    work_db,
+                    &candidate.work_item_id,
+                    active.revision_task_id.as_deref(),
+                    "superseded by a fresh commit; CI is re-running at the new head",
+                );
                 // Fall through — treat as no active attempt.
             } else {
                 // Case (b): same head SHA → the fix is running; leave it.
@@ -1795,6 +1806,48 @@ pub async fn on_ci_in_flight_supersedes_failure(
          chore returned to in_review",
     );
     true
+}
+
+/// Close `revision_task_id` (a moot merge-conflict/CI-fix revision) because
+/// its spawning attempt just retired — resolved (CI went green) or
+/// superseded by a fresh detection cycle for the same PR. Mirrors
+/// `conflict_watch::close_superseded_moot_revision`; the
+/// [`is_moot_revision_kind`] discriminator on
+/// [`WorkDb::close_moot_revision_task`] already refuses anything that isn't
+/// an engine-spawned merge-conflict/CI-fix revision, so this is safe to
+/// call unconditionally whenever such an attempt reaches a terminal state.
+/// No-op (logged at debug) when there is no revision, it is already
+/// terminal, or a worker is still live driving it — closing it out from
+/// under that worker is not this function's job.
+fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision_task_id: Option<&str>, reason: &str) {
+    let Some(revision_task_id) = revision_task_id else {
+        return;
+    };
+    match work_db.close_moot_revision_task(revision_task_id, reason) {
+        Ok(Some(_)) => {
+            tracing::info!(
+                work_item_id,
+                revision_task_id,
+                reason,
+                "ci_watch: closed a resolved/superseded revision task",
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                work_item_id,
+                revision_task_id,
+                "ci_watch: revision already terminal/in_review, or a worker is still live",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                revision_task_id,
+                ?err,
+                "ci_watch: failed to close resolved/superseded revision task",
+            );
+        }
+    }
 }
 
 /// Symmetric retire path: flip a `blocked: ci_failure` (or
@@ -1909,6 +1962,17 @@ pub async fn on_ci_resolved(
                         "ci_watch: failed to clear in-flight signal after retire",
                     );
                 }
+                // Close the revision task this attempt spawned so a retired
+                // attempt never leaves a stale todo/active/blocked row
+                // behind — mirrors conflict_watch::on_resolved. No-op for
+                // the trunk-eviction case above: that revision already
+                // reached `done` before this branch was reachable.
+                close_superseded_moot_revision(
+                    work_db,
+                    &candidate.work_item_id,
+                    succeeded.revision_task_id.as_deref(),
+                    "CI resolved before parent PR merged; revision moot",
+                );
                 publisher
                     .publish_frontend_event_on_product(
                         &candidate.product_id,

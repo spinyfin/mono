@@ -2503,3 +2503,66 @@ pub(crate) fn migrate_github_api_calls_table(conn: &Connection) -> Result<()> {
     )?;
     Ok(())
 }
+
+/// One-time backfill for moot revisions that were cancelled by a human
+/// *before* [`block_pending_revisions_on_parent_close`] grew a tombstone
+/// branch for already-`cancelled` rows (see
+/// [`tombstone_cancelled_moot_revision`]): every existing DB may already
+/// hold `merge-conflict:*` / `ci-fix:*` revisions that were cancelled while
+/// their chain root's PR was still open, then never revisited once that PR
+/// went on to merge or close, because the merge-event handler only fires at
+/// the moment of the transition — it never refires for a transition that
+/// already happened.
+///
+/// Unlike a periodic "delete anything cancelled" sweep, this uses the same
+/// merge signal the live reconciler uses (the chain root already reached a
+/// terminal `done`/`archived` status) and the same moot-kind discriminator
+/// (`created_via`, never the row's name) — it just applies that signal
+/// retroactively, once, to rows the live path can no longer reach. Rows
+/// whose chain root is still open, or whose parent link is broken, are left
+/// alone rather than guessed at.
+///
+/// Self-idempotent (no schema change to gate on): the query only ever
+/// matches `cancelled`, non-tombstoned, moot-kind revisions, so after the
+/// first run — which clears every currently-stuck row — subsequent runs on
+/// every engine startup find nothing and are a cheap no-op, exactly like
+/// [`migrate_null_redundant_task_repo_remote_urls`].
+pub(crate) fn migrate_backfill_cancelled_moot_revision_tombstones(conn: &Connection) -> Result<()> {
+    let candidates: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM tasks
+             WHERE kind = 'revision'
+               AND status = 'cancelled'
+               AND deleted_at IS NULL
+               AND (created_via LIKE ?1 OR created_via LIKE ?2)",
+        )?;
+        let pattern = |prefix: &str| format!("{prefix}%");
+        stmt.query_map(
+            params![
+                pattern(CREATED_VIA_MERGE_CONFLICT_PREFIX),
+                pattern(CREATED_VIA_CI_FIX_PREFIX),
+            ],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?
+    };
+    for rev_id in candidates {
+        let root_id = chain_root(conn, &rev_id)?;
+        if root_id == rev_id {
+            // Broken/missing parent link — no resolvable chain root to
+            // check the merge signal against. Leave the row alone.
+            continue;
+        }
+        let root_status: Option<String> = conn
+            .query_row("SELECT status FROM tasks WHERE id = ?1", params![root_id], |r| r.get(0))
+            .optional()?;
+        if !matches!(root_status.as_deref(), Some("done") | Some("archived")) {
+            // Chain root not resolved yet (or itself missing) — no merge
+            // signal to act on.
+            continue;
+        }
+        let now = now_string();
+        tombstone_cancelled_moot_revision(conn, &rev_id, &now)?;
+    }
+    Ok(())
+}

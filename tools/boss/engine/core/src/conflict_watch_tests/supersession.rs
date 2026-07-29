@@ -297,6 +297,153 @@ async fn stale_head_sha_and_base_advance_supersedes_pending_crz() {
 }
 
 #[tokio::test]
+async fn stale_head_sha_supersede_tombstones_the_superseded_revision() {
+    // Mode A regression ("merge-conflict/CI-fix rows should be tombstoned
+    // automatically once their underlying PR merges" — the supersession
+    // half): before this fix, superseding a stale crz abandoned the
+    // *attempt* row but never touched the revision task it had spawned,
+    // so every re-detection cycle on a still-conflicting PR left another
+    // open revision behind (observed: 17 open rows piled up on a single
+    // PR). Only the fresh attempt's revision should survive.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/44";
+    let (product, chore) = make_in_review(&db, "C-supersede-tombstone", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let first = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+    )
+    .await;
+    assert!(first, "first detection must return true");
+
+    let original_crz = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("crz must exist after first detection");
+    let original_revision_id = original_crz.revision_task_id.clone().expect("revision must be spawned");
+
+    let second = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-B"),
+    )
+    .await;
+    assert!(second, "second probe with new head SHA must re-detect (return true)");
+
+    let old_revision = task(&db, &original_revision_id);
+    assert_eq!(
+        old_revision.status,
+        TaskStatus::Archived,
+        "the superseded revision must be archived, not left open"
+    );
+    assert!(
+        old_revision.deleted_at.is_some(),
+        "the superseded revision must be tombstoned so it disappears from the board"
+    );
+
+    // Exactly one live (non-tombstoned) revision remains for this chore.
+    let fresh_crz = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("fresh crz must exist");
+    let fresh_revision_id = fresh_crz
+        .revision_task_id
+        .clone()
+        .expect("fresh revision must be spawned");
+    assert_ne!(
+        fresh_revision_id, original_revision_id,
+        "the fresh crz must own a new revision, not the superseded one"
+    );
+    let fresh_revision = task(&db, &fresh_revision_id);
+    assert!(
+        fresh_revision.deleted_at.is_none(),
+        "the fresh revision must survive untouched"
+    );
+}
+
+#[tokio::test]
+async fn stale_head_sha_supersede_leaves_a_live_worker_alone() {
+    // Race guard: a worker still genuinely running the superseded revision
+    // must not be yanked out from under it — the tombstone waits for the
+    // worker's own on-Stop completion to settle the row instead.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/45";
+    let (product, chore) = make_in_review(&db, "C-supersede-live-worker", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let first = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-A"),
+    )
+    .await;
+    assert!(first, "first detection must return true");
+
+    let original_crz = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("crz must exist after first detection");
+    let original_revision_id = original_crz.revision_task_id.clone().expect("revision must be spawned");
+
+    // Simulate a genuinely live worker still driving the original revision.
+    // A raw connection to the same file (not `db.connect()`'s internal
+    // Mutex) so there is no guard to hold across the `.await` below.
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO work_executions
+             (id, work_item_id, kind, status, repo_remote_url, cube_lease_id,
+              cube_workspace_id, workspace_path, priority, prefer_is_soft,
+              created_at, started_at)
+         VALUES (?1, ?2, 'revision_implementation', 'running',
+                 'git@github.com:foo/bar.git', 'lease-live',
+                 'ws-live', '/tmp/ws', 0, 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z')",
+        rusqlite::params![crate::work::next_id("exec"), original_revision_id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe_with_head(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only()), "head-B"),
+    )
+    .await;
+    assert!(
+        second,
+        "second probe with new head SHA must still re-detect (return true)"
+    );
+
+    let old_revision = task(&db, &original_revision_id);
+    assert_ne!(
+        old_revision.status,
+        TaskStatus::Archived,
+        "a revision with a live worker must not be tombstoned out from under it"
+    );
+    assert!(
+        old_revision.deleted_at.is_none(),
+        "a revision with a live worker must not be tombstoned"
+    );
+}
+
+#[tokio::test]
 async fn live_revision_same_head_sha_remains_no_op() {
     // Idempotency guard: if the crz's head SHA matches the current probe
     // and the revision task is still live, the pre-flight must NOT supersede.

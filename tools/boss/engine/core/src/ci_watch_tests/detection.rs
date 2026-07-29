@@ -264,6 +264,11 @@ async fn full_cycle_detect_then_retire() {
     // In the in_review model the parent stays in_review while the revision runs.
     let (status, _) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::InReview);
+    let ci_fix_revision_id = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .and_then(|a| a.revision_task_id)
+        .expect("detection must spawn a CI-fix revision");
 
     // 2. Retire — CI is back to clean.
     let resolved = on_ci_resolved(&db, pub_.as_ref(), &candidate(&product, &chore, pr), &[]).await;
@@ -271,6 +276,21 @@ async fn full_cycle_detect_then_retire() {
     let (status, reason) = chore_state(&db, &chore);
     assert_eq!(status, TaskStatus::InReview);
     assert!(reason.is_none());
+
+    // Mode A/B parity fix: CI resolving must close the revision it spawned,
+    // mirroring conflict_watch::on_resolved — otherwise it sits open on the
+    // board (parked at `in_review`, not tombstoned) until the parent PR
+    // eventually merges.
+    let closed_revision = task(&db, &ci_fix_revision_id);
+    assert_eq!(
+        closed_revision.status,
+        TaskStatus::Archived,
+        "the resolved CI-fix revision must be archived, not merely settled to in_review"
+    );
+    assert!(
+        closed_revision.deleted_at.is_some(),
+        "the resolved CI-fix revision must be tombstoned so it disappears from the board"
+    );
 
     // Attempt row terminal.
     let attempts: Vec<_> = {
@@ -863,6 +883,65 @@ async fn new_commit_all_inflight_abandons_stale_remediation_and_clears_badge() {
             .iter()
             .any(|(_, ev)| matches!(ev, FrontendEvent::CiFailureCleared { .. })),
         "CiFailureCleared must NOT be emitted when the active remediation is for the same head",
+    );
+}
+
+/// Mode A regression ("merge-conflict/CI-fix rows should be tombstoned
+/// automatically once their underlying PR merges"): superseding a stale
+/// ci_remediations attempt at the attempt-table level used to leave the
+/// CI-fix revision it had already spawned open on the board forever —
+/// nothing else closes it until the parent PR eventually merges. A fresh
+/// commit landing must close the stale row's revision, not just abandon
+/// the attempt.
+#[tokio::test]
+async fn in_flight_supersede_closes_the_stale_remediations_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1161";
+    let (product, chore) = make_in_review(&db, "C-stale-revision", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-A"),
+        &one_failure(),
+    )
+    .await;
+
+    let prior_attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("a pending remediation row must exist after detection");
+    let prior_revision_id = prior_attempt
+        .revision_task_id
+        .clone()
+        .expect("detection must spawn a CI-fix revision");
+
+    let superseded = on_ci_in_flight_supersedes_failure(
+        &db,
+        pub_.as_ref(),
+        &candidate(&product, &chore, pr),
+        &[],
+        Some("head-B"), // new head SHA — DIFFERENT from the pending row's head_sha_at_trigger
+    )
+    .await;
+    assert!(
+        superseded,
+        "InFlight at a new head SHA must supersede the stale remediation"
+    );
+
+    let closed_revision = task(&db, &prior_revision_id);
+    assert_eq!(
+        closed_revision.status,
+        TaskStatus::Archived,
+        "the superseded CI-fix revision must be archived, not left open"
+    );
+    assert!(
+        closed_revision.deleted_at.is_some(),
+        "the superseded CI-fix revision must be tombstoned so it disappears from the board"
     );
 }
 
