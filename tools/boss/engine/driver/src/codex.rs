@@ -1,7 +1,10 @@
 //! `CodexDriver` — OpenAI Codex agent driver.
 //!
 //! Implements spawn + Boss-owned per-run `CODEX_HOME` provisioning and the
-//! native `codex exec --json` progress normaliser.
+//! native rollout-JSONL progress normaliser (`codex exec` writes
+//! `CODEX_HOME/sessions/**/rollout-*.jsonl` unconditionally; the driver
+//! tails that file rather than reading `--json` stdout — see
+//! `progress_observation_wiring`).
 //!
 //! See `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md`
 //! (T-11 / capability declaration) and
@@ -693,10 +696,18 @@ fn toml_basic_string(s: &str) -> String {
 /// Build the `codex exec …` command body (without the leading `exec `).
 ///
 /// Contract (also enforced by `assert_codex_exec_spawn_contract` in core):
-/// - requires `--json`, `--strict-config`, and `--skip-git-repo-check`
+/// - requires `--color always`, `--strict-config`, and `--skip-git-repo-check`
 ///   (cube workspaces are non-colocated jj workspaces with a `.jj` and no
 ///   `.git`, so the git-repo trust check would refuse every dispatch)
-/// - forbids `-a` / `--ask-for-approval` (removed on 0.145.0)
+/// - forbids `-a` / `--ask-for-approval` (removed on 0.145.0) and `--json`
+///   (mono#2303: `--json` makes Codex dump raw JSONL to the pane instead of
+///   the human-readable ANSI transcript `codex exec` renders by default;
+///   `--color always` guarantees that transcript is colorized even when
+///   Codex's own `auto` tty-detection would be unreliable inside a pane
+///   pty. Progress ingress does not read pane stdout at all — see
+///   `progress_observation_wiring` below, which always tails the rollout
+///   JSONL file instead, and that file is written unconditionally
+///   regardless of `--json`)
 /// - redirects stdin from `/dev/null` so Codex does not block on "Reading
 ///   additional input from stdin..."
 ///
@@ -732,7 +743,8 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
     // `codex_sandbox_enforced` feature flag is on, in which case
     // `workspace-write`) applied by the spawn flow — do not hardcode a
     // second source of truth here without also applying extra_args.
-    let mut cmd = String::from("codex exec --json --strict-config --skip-git-repo-check --sandbox workspace-write");
+    let mut cmd =
+        String::from("codex exec --color always --strict-config --skip-git-repo-check --sandbox workspace-write");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
     // shell-quote so a future slug with spaces/metacharacters cannot break
@@ -1298,11 +1310,12 @@ impl AgentDriver for CodexDriver {
     }
 
     fn progress_fidelity(&self) -> ProgressFidelity {
-        // Codex `--json` carries `item.started` / `item.completed` around each
-        // tool call — same per-tool resolution as Claude's hooks (Progress-
-        // Observation gap / ProgressFidelity docs). Tier is about resolution
-        // (cadence), not transport, and it is not a claim about per-command
-        // outcome fidelity — Codex correctly leaves
+        // The rollout JSONL (`CodexRolloutProgressSession::normalize_rollout`)
+        // carries a `response_item` function_call / function_call_output pair
+        // around each tool call — same per-tool resolution as Claude's hooks
+        // (Progress-Observation gap / ProgressFidelity docs). Tier is about
+        // resolution (cadence), not transport, and it is not a claim about
+        // per-command outcome fidelity — Codex correctly leaves
         // `Capability::CommandOutcomeObservation` undeclared above for that.
         ProgressFidelity::Rich
     }
@@ -1739,7 +1752,16 @@ mod tests {
     #[test]
     fn spawn_invocation_meets_codex_exec_contract() {
         let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-spawn-1"));
-        assert!(plan.command.contains("--json"), "requires --json: {}", plan.command);
+        assert!(
+            plan.command.contains("--color always"),
+            "requires --color always: {}",
+            plan.command
+        );
+        assert!(
+            !plan.command.contains("--json"),
+            "forbids --json (mono#2303: raw JSONL in the pane, not the human-readable transcript): {}",
+            plan.command
+        );
         assert!(
             plan.command.contains("--strict-config"),
             "requires --strict-config: {}",

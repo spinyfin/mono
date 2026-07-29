@@ -171,13 +171,24 @@ pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerE
 /// non-colocated jj workspaces (a `.jj`, never a `.git`); without it Codex
 /// refuses every dispatch with "Not inside a trusted directory and
 /// --skip-git-repo-check was not specified."
-pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--json", "--strict-config", "--skip-git-repo-check"];
+///
+/// `--color always` forces the human-readable ANSI transcript Codex prints
+/// by default (see [`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`] for the flag that used
+/// to suppress it). Pane rendering, not transport, is the reason it is
+/// pinned here.
+pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--color always", "--strict-config", "--skip-git-repo-check"];
 
 /// Long-form flags that must never appear on a Codex `exec` spawn line.
 ///
 /// `-a` / `--ask-for-approval` was removed from `codex exec` on 0.145.0 and
 /// produces a hard argument error.
-pub const CODEX_EXEC_FORBIDDEN_LONG_FLAGS: &[&str] = &["--ask-for-approval"];
+///
+/// `--json` switches Codex to JSONL-on-stdout, which is exactly the raw,
+/// unreadable pane output this contract exists to prevent (mono#2303).
+/// Progress ingress does not need it: `CodexDriver::progress_observation_wiring`
+/// always tails the rollout file (`ProgressIngress::AgentJsonlFile`), which
+/// Codex writes unconditionally regardless of `--json`.
+pub const CODEX_EXEC_FORBIDDEN_LONG_FLAGS: &[&str] = &["--ask-for-approval", "--json"];
 
 /// Build the reference `codex exec …` command line that satisfies
 /// [`CODEX_EXEC_REQUIRED_FLAGS`] and omits every forbidden token.
