@@ -61,9 +61,10 @@ pub(super) async fn handle_request_execution(ctx: Dispatch, req: FrontendRequest
         // ready execution straight to
         // `ExecutionCoordinator::force_dispatch` instead of
         // kicking the auto-dispatcher. force_dispatch grows
-        // the worker pool by one slot (bounded by the hard
-        // cap) when every configured slot is busy, so the
-        // launch verb skips the cap-deferral the normal
+        // the execution's home pool (main, automation, or
+        // review) by one slot (bounded by that pool's own
+        // hard cap) when every configured slot is busy, so
+        // the launch verb skips the cap-deferral the normal
         // request path would otherwise hit.
         let force = input.force;
         let live_states = server_state.live_worker_states.clone();

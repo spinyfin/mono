@@ -225,17 +225,36 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Skip-the-queue dispatch for `bossctl agents launch`. Looks the
-    /// execution up directly, claims a worker via
-    /// `WorkerPool::claim_worker_force` (which grows the pool by one
-    /// slot up to the hard cap when every configured slot is busy),
-    /// and runs the same `schedule_execution` path the auto-dispatcher
-    /// uses. Returns the worker id we landed on so callers can echo it
-    /// back to the human.
+    /// Skip-the-queue dispatch for `bossctl agents launch` and the
+    /// spawn-capability breaker's half-open recovery probe
+    /// (`spawn_health::maybe_admit_recovery_probe`). Looks the execution up
+    /// directly, classifies which pool it belongs to exactly as
+    /// `drain_ready_queue` does (via [`Self::pool_for_execution`]), claims a
+    /// worker from THAT pool via `WorkerPool::claim_worker_force` (which
+    /// grows the pool by one slot up to ITS OWN hard cap when every
+    /// configured slot is busy), and runs the same `schedule_execution` path
+    /// the auto-dispatcher uses. Returns the worker id we landed on so
+    /// callers can echo it back to the human.
+    ///
+    /// "Force" bypasses *admission gating* only — the dispatch pause and the
+    /// interactive-pool concurrency cap, which is exactly what both callers
+    /// need (a human explicitly skipping the queue; a probe that must run
+    /// even while dispatch is breaker-paused). It never bypasses *pool
+    /// correctness*: a `pr_review` still claims a `review-` worker id (so it
+    /// resolves the pinned Opus reviewer policy via
+    /// [`pool_dispatch_policy_for_worker_id`] and never counts against the
+    /// interactive pool's `busy_count`), and an automation-sourced row still
+    /// claims an `auto-worker-` id, exactly as the normal path would.
+    ///
+    /// When the execution's home pool has no free slot, force-dispatch grows
+    /// THAT pool by one slot (bounded by its own hard cap) rather than
+    /// falling back to a different pool — the same policy the main pool
+    /// already used for `bossctl agents launch`, now applied uniformly so
+    /// the forced worker always keeps its pool's dispatch policy.
     ///
     /// Errors when the execution is not in `ready` (already claimed by
     /// the auto-dispatcher in a race, terminal, or unknown), or when
-    /// the worker pool is already at the hard cap with no idle slot.
+    /// the target pool is already at its hard cap with no idle slot.
     pub async fn force_dispatch(self: &Arc<Self>, execution_id: &str) -> Result<String> {
         let execution = self
             .work_db
@@ -264,20 +283,19 @@ impl ExecutionCoordinator {
             ));
         };
         let preferred_workspace_id = execution.preferred_workspace_id.clone();
-        let worker_id = self
-            .worker_pool
+        let pool = self.pool_for_execution(&execution);
+        let pool_label = self.attributed_pool_label(&execution);
+        let worker_id = pool
             .claim_worker_force(&execution.id, preferred_workspace_id.as_deref())
             .await
             .ok_or_else(|| {
                 anyhow!(
-                    "worker pool already at hard cap ({MAX_WORKER_POOL_SIZE}); cannot \
-                     force-dispatch {execution_id}"
+                    "{pool_label} pool already at hard cap ({cap}); cannot force-dispatch {execution_id}",
+                    cap = pool.hard_cap(),
                 )
             })?;
         if let Err(err) = self.schedule_execution(&execution, &worker_id).await {
-            self.worker_pool
-                .release_worker(&worker_id, preferred_workspace_id.as_deref())
-                .await;
+            pool.release_worker(&worker_id, preferred_workspace_id.as_deref()).await;
             return Err(err);
         }
         Ok(worker_id)
