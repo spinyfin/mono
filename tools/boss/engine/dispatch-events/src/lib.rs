@@ -26,10 +26,11 @@
 //! once via `tracing::warn!` and is dropped. Dispatch is never
 //! blocked on event emission.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use boss_engine_jsonl_append::JsonlAppender;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
@@ -761,15 +762,23 @@ impl DispatchEventSink for RecordingDispatchEventSink {
 /// `<root>/executions/<execution_id>/dispatch.jsonl` so a
 /// single-execution diagnose verb doesn't need to scan the full
 /// stream. Both writes are best-effort; failures log via `tracing`
-/// and are dropped.
+/// and are dropped. Appends go through [`JsonlAppender`], which
+/// serializes concurrent writers so two events emitted from different
+/// tasks can never interleave into one corrupt line — see that
+/// crate's docs for why a body-then-newline two-write sequence (the
+/// bug this sink used to have) is unsafe under concurrency.
 #[derive(Debug, Clone)]
 pub struct JsonlFileSink {
     root: PathBuf,
+    appender: Arc<JsonlAppender>,
 }
 
 impl JsonlFileSink {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            appender: Arc::new(JsonlAppender::new()),
+        }
     }
 
     fn current_path(&self) -> PathBuf {
@@ -779,37 +788,23 @@ impl JsonlFileSink {
     fn execution_path(&self, execution_id: &str) -> PathBuf {
         self.root.join("executions").join(execution_id).join("dispatch.jsonl")
     }
-
-    fn append_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
-        use std::io::Write;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-        file.write_all(line)?;
-        file.write_all(b"\n")?;
-        Ok(())
-    }
 }
 
 #[async_trait]
 impl DispatchEventSink for JsonlFileSink {
     async fn emit(&self, event: DispatchEvent) {
-        let serialized = match serde_json::to_vec(&event) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                tracing::warn!(
-                    ?err,
-                    stage = %event.stage,
-                    execution_id = %event.execution_id,
-                    "failed to serialize dispatch event; dropping"
-                );
-                return;
-            }
-        };
-
         let current_path = self.current_path();
-        if let Err(err) = Self::append_line(&current_path, &serialized) {
+        let execution_path = self.execution_path(&event.execution_id);
+
+        let mut results = self
+            .appender
+            .append_to_all(&[current_path.as_path(), execution_path.as_path()], &event)
+            .await
+            .into_iter();
+        let current_result = results.next().expect("append_to_all returns one result per input path");
+        let execution_result = results.next().expect("append_to_all returns one result per input path");
+
+        if let Err(err) = current_result {
             tracing::warn!(
                 ?err,
                 path = %current_path.display(),
@@ -819,8 +814,7 @@ impl DispatchEventSink for JsonlFileSink {
             );
         }
 
-        let execution_path = self.execution_path(&event.execution_id);
-        if let Err(err) = Self::append_line(&execution_path, &serialized) {
+        if let Err(err) = execution_result {
             tracing::warn!(
                 ?err,
                 path = %execution_path.display(),

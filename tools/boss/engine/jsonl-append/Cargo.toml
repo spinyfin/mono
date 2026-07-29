@@ -1,0 +1,14 @@
+[package]
+name = "boss-engine-jsonl-append"
+version.workspace = true
+edition.workspace = true
+workspace = "../../../.."
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }

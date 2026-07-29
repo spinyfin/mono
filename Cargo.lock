@@ -371,6 +371,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bon",
+ "boss-engine-jsonl-append",
  "boss-engine-utils",
  "serde",
  "serde_json",
@@ -597,6 +598,16 @@ dependencies = [
  "anyhow",
  "boss-github",
  "regex",
+]
+
+[[package]]
+name = "boss-engine-jsonl-append"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
