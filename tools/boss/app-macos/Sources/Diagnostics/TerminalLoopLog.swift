@@ -420,7 +420,7 @@ final class TerminalLoopLog: @unchecked Sendable {
 
     private func openFile(dateStr: String) {
         guard let directory else { return }
-        fileHandle?.closeFile()
+        DiagnosticWrite.closeQuietly(fileHandle)
         fileHandle = nil
 
         do {
@@ -437,7 +437,7 @@ final class TerminalLoopLog: @unchecked Sendable {
             FileManager.default.createFile(atPath: path, contents: nil)
         }
         guard let handle = FileHandle(forWritingAtPath: path) else { return }
-        handle.seekToEndOfFile()
+        guard DiagnosticWrite.seekToEndQuietly(handle) else { return }
         fileHandle = handle
         currentDate = dateStr
         writeFailureWarned = false

@@ -41,4 +41,34 @@ enum DiagnosticWrite {
             return false
         }
     }
+
+    /// Non-throwing replacement for the legacy `FileHandle` `closeFile` convenience method.
+    ///
+    /// The legacy `closeFile` method raises an `NSException` on a failing `close(2)` (e.g.
+    /// `ENOSPC`/`EIO` flushing buffered writes on close) — the same
+    /// uncatchable-from-Swift crash shape as `write(_:)`. `close()` is the
+    /// Swift-throwing equivalent; a failure here just means the fd is
+    /// already gone, which is fine to ignore.
+    static func closeQuietly(_ handle: FileHandle?) {
+        guard let handle else { return }
+        try? handle.close()
+    }
+
+    /// Non-throwing replacement for the legacy `FileHandle` `seekToEndOfFile` convenience method.
+    ///
+    /// The legacy `seekToEndOfFile` method raises an `NSException` on a failing `lseek(2)`,
+    /// the same uncatchable-from-Swift crash shape as `write(_:)`. On
+    /// failure, this closes `handle` and returns `false` so the caller can
+    /// leave its stored handle `nil` — that rotation's logging degrades off
+    /// instead of raising.
+    @discardableResult
+    static func seekToEndQuietly(_ handle: FileHandle) -> Bool {
+        do {
+            _ = try handle.seekToEnd()
+            return true
+        } catch {
+            try? handle.close()
+            return false
+        }
+    }
 }

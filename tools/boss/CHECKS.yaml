@@ -55,3 +55,46 @@ checks:
     policy:
       severity: error
       allow_bypass: true
+
+  # Durable guard against reintroducing the NSException-raising legacy
+  # `NSFileHandle` convenience APIs into the diagnostic writers under
+  # `app-macos/Sources` (`TerminalLoopLog`, `StallLog`,
+  # `PopulationTimingLog`, `IpcLog`, `SpawnDiagnosticsLog`). All three —
+  # `FileHandle.write(_:)`, `closeFile`, and `seekToEndOfFile` — raise an
+  # uncatchable-from-Swift `NSFileHandleOperationException` on a failing
+  # syscall (e.g. `ENOSPC`/`EIO` on a full disk) instead of throwing, which
+  # is exactly the crash shape behind the terminal-loop livelock incident
+  # (Boss v1.0.427). `DiagnosticWrite` wraps all three with non-throwing,
+  # Swift-error-catching equivalents (`append`, `closeQuietly`,
+  # `seekToEndQuietly`); this check exists so a *new* diagnostic writer (or
+  # a regression in an existing one) reintroducing a raw call is caught at
+  # push time instead of silently reopening the same crash class.
+  #
+  # `closeFile`/`seekToEndOfFile` are unambiguous method names — no other
+  # Swift API in this repo shares them. The `write` pattern is narrower: it
+  # matches only a single *unlabeled* argument (e.g. `write(lineData)`),
+  # which is `FileHandle.write(_:)`'s exact call shape; it does not match a
+  # `write(contentsOf: ...)` call (the safe throwing API this check steers
+  # callers toward) or a `write(to: ...)` call (`Data`'s unrelated,
+  # already-safe throwing API), both of which take a labeled first argument.
+  - id: boss/no-legacy-filehandle-write-api
+    check: text/forbidden-pattern
+    policy:
+      severity: warning
+      changed_lines_only: true
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: filehandle-close-file
+          pattern: '\.closeFile\(\)'
+          message: "The legacy FileHandle closeFile method raises an uncatchable NSException on a failing close(2). Use DiagnosticWrite.closeQuietly(_:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
+          severity: warning
+        - name: filehandle-seek-to-end-of-file
+          pattern: '\.seekToEndOfFile\(\)'
+          message: "The legacy FileHandle seekToEndOfFile method raises an uncatchable NSException on a failing lseek(2). Use DiagnosticWrite.seekToEndQuietly(_:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
+          severity: warning
+        - name: filehandle-write-unlabeled
+          pattern: '\.write\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)'
+          message: "FileHandle.write(_:) raises an uncatchable NSException on a failing write(2). Use DiagnosticWrite.append(_:to:site:warned:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
+          severity: warning
