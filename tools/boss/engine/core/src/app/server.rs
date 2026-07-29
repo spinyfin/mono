@@ -2076,20 +2076,20 @@ async fn run_events_accept_loop(listener: UnixListener, server_state: Arc<Server
     }
     // This socket only ever hears from a `ProgressIngress::HookCallback`
     // driver's `boss-event` shim (a `StdoutJsonl` driver never connects to
-    // it), so the engine default is the correct resolution today. Resolved
-    // through the registry — not a hardcoded `ClaudeDriver` reference — so
-    // per-run resolution (once the dispatch gate selects a driver per run)
-    // only requires changing this lookup.
-    let hook_callback_driver: std::sync::Arc<dyn crate::driver::AgentDriver> = crate::driver::DriverRegistry::default()
-        .require(crate::effort::ENGINE_DEFAULT_DRIVER)
-        .expect("engine default driver is always registered");
+    // it), but different connections carry different workers' drivers
+    // (Claude, Codex, Grok, …) — so the driver is resolved per connection
+    // inside `handle_connection`, from the payload's `_boss_run_id` via
+    // `WorkDb::get_execution_driver_slug`, rather than once here for every
+    // connection. The registry is still built once: it is stateless and
+    // shared read-only across connections.
+    let driver_registry = std::sync::Arc::new(crate::driver::DriverRegistry::default());
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 let server_state = server_state.clone();
-                let driver = hook_callback_driver.clone();
+                let driver_registry = driver_registry.clone();
                 tokio::spawn(async move {
-                    match handle_connection(stream, driver.as_ref()).await {
+                    match handle_connection(stream, &driver_registry, &server_state.work_db).await {
                         Ok(incoming) => {
                             tracing::info!(
                                 peer_pid = ?incoming.peer_pid,
