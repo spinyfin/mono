@@ -373,6 +373,7 @@ dependencies = [
  "bon",
  "boss-engine-jsonl-append",
  "boss-engine-utils",
+ "boss-log-files",
  "serde",
  "serde_json",
  "tempfile",

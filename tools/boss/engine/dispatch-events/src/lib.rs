@@ -17,7 +17,8 @@
 //! ```text
 //! boss-state-root/
 //!   dispatch-events/
-//!     current.jsonl            # source-of-truth flat stream
+//!     current.jsonl                  # live source-of-truth flat stream
+//!     current.jsonl.<unix_seconds>   # rotated segments, oldest first
 //!   executions/<execution-id>/
 //!     dispatch.jsonl           # mirror of just this execution's lines
 //! ```
@@ -25,9 +26,18 @@
 //! Writers are best-effort: a write that fails to land on disk logs
 //! once via `tracing::warn!` and is dropped. Dispatch is never
 //! blocked on event emission.
+//!
+//! `current.jsonl` rotates once it crosses [`JsonlFileSink`]'s size
+//! threshold (`DEFAULT_CURRENT_MAX_BYTES`, overridable via
+//! `BOSS_DISPATCH_EVENTS_MAX_BYTES`); rotated segments beyond
+//! `DEFAULT_CURRENT_MAX_FILES` (`BOSS_DISPATCH_EVENTS_MAX_FILES`) are pruned
+//! oldest-first. The per-execution mirrors are not rotated. Readers that
+//! need the full flat stream (`boss_dispatch_reader::read_current`,
+//! `TimelineIndex`) span rotated segments plus the live file via
+//! `boss_log_files::segments_with_live` / `rotated_segments`.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use boss_engine_jsonl_append::JsonlAppender;
@@ -347,7 +357,7 @@ pub enum Stage {
     /// `orphan_active_redispatch` / `cube_lease_auto_reap`, which only
     /// self-heal failures *after* `run_started`; before this stage existed
     /// a pre-spawn failure that exhausted its retries stayed parked until
-    /// a human ran `bossctl work start` (2026-07-03 T215 incident — sat
+    /// a human ran `bossctl work start` (2026-07-03 incident: sat
     /// undispatched 45+ minutes with free slots available). See
     /// `boss_engine::dispatch_failure_recovery_sweep`.
     DispatchFailureRecoveryRedispatch,
@@ -428,7 +438,7 @@ pub enum Stage {
     /// `dead_pane_sweep` (only ever probes a pid that was actually reported),
     /// and `cube_lease_auto_reap` (the engine's own DB-fallback heartbeat kept
     /// the lease alive, so it never failed) all miss — the 2026-07-03 zombies
-    /// that survived the T2168 fix. A recorded pid that is now dead is a
+    /// that survived the earlier dead-pane-sweep fix. A recorded pid that is now dead is a
     /// separate signal owned exclusively by `dead_pane_sweep`, which emits
     /// `Stage::PaneDeathReconcile` instead. The `details` object carries
     /// `reason` (`pane_never_attached`), `prior_status`, `age_in_status_secs`,
@@ -757,6 +767,34 @@ impl DispatchEventSink for RecordingDispatchEventSink {
     }
 }
 
+/// Env var overriding [`DEFAULT_CURRENT_MAX_BYTES`].
+pub const CURRENT_MAX_BYTES_ENV: &str = "BOSS_DISPATCH_EVENTS_MAX_BYTES";
+/// Env var overriding [`DEFAULT_CURRENT_MAX_FILES`].
+pub const CURRENT_MAX_FILES_ENV: &str = "BOSS_DISPATCH_EVENTS_MAX_FILES";
+
+/// Default maximum size of `current.jsonl` before it is rotated: 100 MiB.
+/// Matches `engine-trace.jsonl`'s threshold (`trace_rotation::DEFAULT_TRACE_MAX_BYTES`)
+/// — `current.jsonl` is the forensic surface of last resort when the engine
+/// is wedged, so retention is generous rather than minimal. At the observed
+/// growth rate of ~1.5 MB/day (116 MB accumulated over 78 days with no
+/// rotation at all), a 100 MiB segment holds roughly two months of history
+/// before rotating.
+pub const DEFAULT_CURRENT_MAX_BYTES: u64 = 100 * 1024 * 1024;
+/// Default number of rotated `current.jsonl` segments to keep, matching
+/// `engine-trace.jsonl`'s retention. Five 100 MiB segments is up to ~500 MiB
+/// / roughly a year of history at the observed growth rate — generous on
+/// purpose for a forensic log, not a tight budget.
+pub const DEFAULT_CURRENT_MAX_FILES: usize = 5;
+
+/// Process-wide lock serializing the stat+rename+prune sequence in
+/// [`JsonlFileSink::maybe_rotate_current`]. Living at crate scope (rather than
+/// as an instance field), like `boss_engine_jsonl_append::APPEND_LOCK`, is
+/// what makes the "two concurrent emits crossing the threshold at once can't
+/// both act on a stale size" guarantee true regardless of how many
+/// `JsonlFileSink` values a caller constructs against the same or different
+/// roots — see that method's doc for the retention-slot bug this closes.
+static ROTATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// Production sink: appends each event as one JSON line to
 /// `<root>/dispatch-events/current.jsonl` and mirrors it into
 /// `<root>/executions/<execution_id>/dispatch.jsonl` so a
@@ -767,17 +805,31 @@ impl DispatchEventSink for RecordingDispatchEventSink {
 /// tasks can never interleave into one corrupt line — see that
 /// crate's docs for why a body-then-newline two-write sequence (the
 /// bug this sink used to have) is unsafe under concurrency.
+///
+/// `current.jsonl` rotates once it crosses `max_bytes`, using the same
+/// `<base>.<unix_seconds>` on-disk scheme as `engine-trace.jsonl`
+/// (`boss_log_files::segments`), so `bossctl` and the engine's
+/// `TimelineIndex` read rotated history through the same helper that
+/// already understands the format. The per-execution mirrors are NOT
+/// rotated here — they are bounded per execution already and rotating
+/// them would fragment the single-execution diagnose view for no benefit.
 #[derive(Debug, Clone)]
 pub struct JsonlFileSink {
     root: PathBuf,
     appender: Arc<JsonlAppender>,
+    max_bytes: u64,
+    max_files: usize,
 }
 
 impl JsonlFileSink {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let max_bytes = boss_engine_utils::env_parse::env_parsed_or(CURRENT_MAX_BYTES_ENV, DEFAULT_CURRENT_MAX_BYTES);
+        let max_files = boss_engine_utils::env_parse::env_parsed_or(CURRENT_MAX_FILES_ENV, DEFAULT_CURRENT_MAX_FILES);
         Self {
             root: root.into(),
             appender: Arc::new(JsonlAppender::new()),
+            max_bytes,
+            max_files,
         }
     }
 
@@ -788,6 +840,94 @@ impl JsonlFileSink {
     fn execution_path(&self, execution_id: &str) -> PathBuf {
         self.root.join("executions").join(execution_id).join("dispatch.jsonl")
     }
+
+    /// Rotate `current.jsonl` if it has crossed `max_bytes`, then prune old
+    /// segments beyond `max_files`. Called after every successful append so
+    /// growth is caught promptly without a separate background sweep.
+    ///
+    /// Best-effort: a `stat`/`rename` failure logs via `tracing` and is
+    /// otherwise ignored — rotation must never turn a dropped write into a
+    /// dropped event. The stat+rename+prune sequence runs under
+    /// `ROTATION_LOCK`, so two concurrent emits that both observe the file
+    /// over threshold no longer race: the loser re-stats after the winner
+    /// has already rotated and recreated the live file, sees it back under
+    /// threshold, and does nothing — it does NOT rotate a near-empty file
+    /// and burn a retention slot the way an unguarded re-check would.
+    ///
+    /// After a successful rename, the live file is immediately recreated so
+    /// `current.jsonl` is never observably absent to a concurrent reader such
+    /// as `TimelineIndex::refresh`. That recreate opens with `create(true)`
+    /// and `append(true)` rather than truncating: `emit`'s append path holds
+    /// only the crate-wide `boss_engine_jsonl_append::APPEND_LOCK`, not
+    /// `ROTATION_LOCK`, so an emit can land between the rename and the
+    /// recreate and write its line into a freshly-created `current.jsonl`
+    /// before this method gets to it — a truncating recreate would silently
+    /// erase that line. Opening non-truncating preserves it; the recreated
+    /// file is empty only in the common case where no such write raced in.
+    ///
+    /// This `stat`s the file on every emit rather than tracking size with an
+    /// in-memory byte counter (as `trace_rotation` does). Deliberate: at
+    /// `DEFAULT_CURRENT_MAX_BYTES`'s ~two-month rotation cadence the extra
+    /// syscall per event is immaterial, and a `stat` is immune to counter
+    /// drift across process restarts — and needs no bookkeeping: an
+    /// in-memory counter would have to be re-seeded from the file length on
+    /// every startup to avoid drift, which is strictly more state than this.
+    async fn maybe_rotate_current(&self, current_path: &Path) {
+        let _guard = ROTATION_LOCK.lock().await;
+
+        let len = match tokio::fs::metadata(current_path).await {
+            Ok(meta) => meta.len(),
+            Err(_) => return,
+        };
+        if len < self.max_bytes {
+            return;
+        }
+
+        let rotated = boss_log_files::next_rotated_path(current_path);
+        if let Err(err) = tokio::fs::rename(current_path, &rotated).await {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    ?err,
+                    path = %current_path.display(),
+                    "failed to rotate dispatch-events current.jsonl"
+                );
+            }
+            return;
+        }
+
+        if let Err(err) = recreate_live_file(current_path).await {
+            tracing::warn!(
+                ?err,
+                path = %current_path.display(),
+                "failed to recreate dispatch-events current.jsonl after rotation"
+            );
+        }
+
+        let to_prune = boss_log_files::rotated_segments(current_path);
+        if to_prune.len() <= self.max_files {
+            return;
+        }
+        for path in &to_prune[..to_prune.len() - self.max_files] {
+            if let Err(err) = tokio::fs::remove_file(path).await {
+                tracing::warn!(?err, path = %path.display(), "failed to prune old dispatch-events segment");
+            }
+        }
+    }
+}
+
+/// Ensures `path` exists without truncating it. Used to recreate the live
+/// file immediately after rotation's rename — non-truncating because an
+/// `emit` can land between that rename and this recreate (it holds only
+/// `boss_engine_jsonl_append::APPEND_LOCK`, not `ROTATION_LOCK`) and write its
+/// line into a freshly-created file before this call runs; a truncating
+/// create (e.g. `tokio::fs::File::create`) would silently erase that line.
+async fn recreate_live_file(path: &Path) -> std::io::Result<()> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -812,6 +952,8 @@ impl DispatchEventSink for JsonlFileSink {
                 execution_id = %event.execution_id,
                 "failed to append dispatch event to current.jsonl; dropping"
             );
+        } else {
+            self.maybe_rotate_current(&current_path).await;
         }
 
         if let Err(err) = execution_result {
@@ -855,6 +997,124 @@ mod tests {
 
         let mirror = fs::read_to_string(dir.path().join("executions/exec-a/dispatch.jsonl")).unwrap();
         assert_eq!(mirror.lines().count(), 2);
+    }
+
+    fn sink_with_rotation(root: impl Into<PathBuf>, max_bytes: u64, max_files: usize) -> JsonlFileSink {
+        JsonlFileSink {
+            root: root.into(),
+            appender: Arc::new(JsonlAppender::new()),
+            max_bytes,
+            max_files,
+        }
+    }
+
+    /// Once `current.jsonl` crosses `max_bytes`, the next emit rotates it to
+    /// a `<unix_seconds>`-suffixed segment and starts a fresh, empty live
+    /// file — the segment plus the live file together contain every emitted
+    /// line, so nothing is lost across the rotation boundary.
+    #[tokio::test]
+    async fn rotates_current_once_threshold_crossed() {
+        let dir = TempDir::new().unwrap();
+        let sink = sink_with_rotation(dir.path(), 10, 5);
+        let current_path = dir.path().join("dispatch-events/current.jsonl");
+
+        sink.emit(DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1"))
+            .await;
+        sink.emit(DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-1"))
+            .await;
+
+        let backups = boss_log_files::rotated_segments(&current_path);
+        assert!(
+            !backups.is_empty(),
+            "10-byte threshold should have triggered at least one rotation"
+        );
+
+        // Every event emitted so far must still be readable across the
+        // rotated segment(s) plus whatever now lives in the fresh current
+        // file — no event may be lost across a rotation boundary.
+        let mut total_lines = 0;
+        for backup in &backups {
+            total_lines += fs::read_to_string(backup).unwrap().lines().count();
+        }
+        if let Ok(current) = fs::read_to_string(&current_path) {
+            total_lines += current.lines().count();
+        }
+        assert_eq!(total_lines, 2, "no event may be lost across rotation");
+    }
+
+    /// Rotation prunes segments beyond `max_files`, keeping only the most
+    /// recent ones — mirrors `trace_rotation::prune_old_rotated`.
+    #[tokio::test]
+    async fn prunes_old_segments_beyond_max_files() {
+        let dir = TempDir::new().unwrap();
+        let sink = sink_with_rotation(dir.path(), 5, 2);
+        let current_path = dir.path().join("dispatch-events/current.jsonl");
+
+        // Pre-populate 2 old rotated segments so the next rotation pushes
+        // the count to 3, one over the max_files=2 limit.
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        for ts in [1_000_u64, 1_001] {
+            fs::write(boss_log_files::rotated_segment_path(&current_path, ts), b"old").unwrap();
+        }
+
+        sink.emit(DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1"))
+            .await;
+        sink.emit(DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-1"))
+            .await;
+
+        let backups = boss_log_files::rotated_segments(&current_path);
+        assert_eq!(backups.len(), 2, "expected exactly 2 rotated segments after prune");
+        // Each emit here crosses the 5-byte threshold on its own, so this
+        // scenario rotates twice: the pre-seeded `.1000` and `.1001` segments
+        // are both pushed out by the two freshly rotated segments, oldest
+        // first. Assert the specific survivors rather than just a count, so
+        // a prune that kept the wrong segments (e.g. newest-N-by-mtime
+        // instead of by parsed suffix) would fail this test.
+        assert!(
+            backups.iter().all(|p| {
+                let suffix = p.extension().and_then(|e| e.to_str());
+                suffix != Some("1000") && suffix != Some("1001")
+            }),
+            "pre-seeded segments should have been pruned, got {backups:?}"
+        );
+    }
+
+    /// If an `emit` writes a line into a freshly-recreated `current.jsonl`
+    /// after rotation's rename but before rotation's recreate step runs (the
+    /// two hold different locks, so this interleaving is reachable), that
+    /// line must survive the recreate — it must not be silently truncated
+    /// away, which is exactly the bug a `File::create`-based recreate had.
+    #[tokio::test]
+    async fn recreate_after_rotation_does_not_truncate_a_raced_write() {
+        let dir = TempDir::new().unwrap();
+        let current_path = dir.path().join("current.jsonl");
+
+        // Simulate emit B: after A's rename moved the old file aside, B's
+        // append_locked ran `OpenOptions::create(true).append(true)` and
+        // wrote a full line into a brand-new current.jsonl.
+        fs::write(&current_path, b"{\"raced\":true}\n").unwrap();
+
+        // A now runs its recreate step.
+        recreate_live_file(&current_path).await.unwrap();
+
+        let content = fs::read_to_string(&current_path).unwrap();
+        assert_eq!(
+            content, "{\"raced\":true}\n",
+            "recreate must not truncate a line written by a concurrent emit"
+        );
+    }
+
+    /// Below the threshold, `current.jsonl` never rotates.
+    #[tokio::test]
+    async fn no_rotation_below_threshold() {
+        let dir = TempDir::new().unwrap();
+        let sink = sink_with_rotation(dir.path(), 1024 * 1024, 5);
+        let current_path = dir.path().join("dispatch-events/current.jsonl");
+
+        sink.emit(DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1"))
+            .await;
+
+        assert!(boss_log_files::rotated_segments(&current_path).is_empty());
     }
 
     #[tokio::test]
