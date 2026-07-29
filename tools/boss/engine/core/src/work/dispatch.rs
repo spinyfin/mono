@@ -1027,9 +1027,10 @@ impl WorkDb {
     }
 
     /// Find the most recent `orphaned` execution for a work item that has
-    /// no `pr_url` set. Used by the runner at spawn time to detect a
-    /// prior mid-flight execution whose branch the new worker should
-    /// attempt to resume (startup recovery path).
+    /// no `pr_url` set. Used by the coordinator's `recovery_patch_for_resume`
+    /// to locate the dead execution whose saved recovery patch (if any)
+    /// should be replayed, or whose workspace should be re-leased dirty for
+    /// in-place recovery.
     ///
     /// Returns `None` when:
     ///   - the work item has no prior executions,

@@ -207,10 +207,10 @@ impl WorkDb {
     ///
     ///   1. If `dead_execution_id` is still non-terminal, mark it
     ///      `orphaned` (and stamp any still-active runs `orphaned` with
-    ///      `reason`). Orphaned — not abandoned — so the runner's
-    ///      startup-recovery path ([`Self::get_prior_orphaned_execution`])
-    ///      finds it and directs the new worker to resume the prior
-    ///      branch instead of starting from `main`.
+    ///      `reason`). Orphaned — not abandoned — so the coordinator's
+    ///      recovery path ([`Self::get_prior_orphaned_execution`]) can find
+    ///      it and replay its saved recovery patch (or re-lease its
+    ///      workspace dirty for in-place recovery) into the new execution.
     ///   2. Insert a fresh `ready` execution for the same work item that
     ///      **prefers the same cube workspace with `allow_dirty = true`**
     ///      (so cube's `--prefer --allow-dirty` re-leases the exact
