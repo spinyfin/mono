@@ -590,8 +590,12 @@ struct MergeQueueBadge: View {
 /// are incoming and the PR should not be merged yet.
 
 struct PrInRevisionIndicator: View {
+    /// Reveals the revision task the badge is reporting on. `nil` renders
+    /// the badge inert (no button chrome, no click affordance).
+    var onTap: (() -> Void)? = nil
+
     var body: some View {
-        HStack(spacing: 3) {
+        let content = HStack(spacing: 3) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.caption2.weight(.semibold))
             Text("in revision")
@@ -604,7 +608,18 @@ struct PrInRevisionIndicator: View {
         .background(Color.orange)
         .clipShape(Capsule())
         .fixedSize()
-        .help("A revision is in progress — do not merge this PR yet")
+
+        Group {
+            if let onTap {
+                Button(action: onTap) { content }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+                    .help("A revision is in progress — click to reveal it")
+            } else {
+                content
+                    .help("A revision is in progress — do not merge this PR yet")
+            }
+        }
         .accessibilityLabel("In revision — do not merge")
     }
 }
