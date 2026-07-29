@@ -31,7 +31,8 @@ mod progress;
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
     GROK_SKIP_POSTURE_ASSERT_ENV, GrokRuntimeState, PINNED_GROK_VERSION, assert_inspect_json_posture,
-    grok_home_for_run, grok_homes_root, process_home_for_run, render_base_config_toml, trust_path_variants,
+    grok_home_for_run, grok_homes_root, process_home_for_run, render_base_config_toml, resolve_gh_config_dir,
+    trust_path_variants,
 };
 
 use home::{assert_grok_home_safe_to_delete, provision_grok_home, read_session_id, read_workspace_path_stamp};
@@ -169,6 +170,16 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     cmd
 }
 
+/// `GH_CONFIG_DIR` env directive pointing at the real host's `gh` config
+/// dir, or empty when it cannot be resolved (no real `HOME` — should not
+/// happen on a Boss host, but a spawn must never panic on it). `gh` honors
+/// this var natively, so no filesystem bridge is needed for it — unlike the
+/// keychain-backed token, which `provision_grok_home` bridges via symlink
+/// (see the `HOME` directive comment in `spawn_invocation`).
+fn gh_config_dir_directive() -> Option<EnvDirective> {
+    resolve_gh_config_dir().map(|dir| EnvDirective::Set("GH_CONFIG_DIR".to_owned(), dir.display().to_string()))
+}
+
 #[async_trait]
 impl AgentDriver for GrokDriver {
     fn descriptor(&self) -> &DriverDescriptor {
@@ -276,19 +287,39 @@ impl AgentDriver for GrokDriver {
                 // T-01: scope HOME so operator ~/.claude settings cannot load.
                 // Auth stays under GROK_HOME (symlink), not under this HOME.
                 //
-                // Deferred (seeded first-turn scope): scoped HOME also hides
-                // operator ~/.ssh, ~/.config/gh, and git credential helpers
-                // from the worker after the first turn. Full credential-tree
-                // bridging (selective symlink/copy of gh/ssh/git material into
-                // process-home) is out of scope for this provision/spawn
-                // slice — track as a follow-on before multi-turn Grok workers
-                // that need authenticated network/VCS.
+                // Scoping HOME also hides ~/.ssh, ~/.config/gh, and the
+                // operator's macOS login keychain from the worker, which
+                // otherwise leaves the sanctioned `cube pr create` push path
+                // unable to authenticate (confirmed empirically — no Grok
+                // worker had ever pushed a PR before this was measured).
+                // ~/.ssh needs no bridge: OpenSSH resolves `~/.ssh/known_hosts`
+                // and identity files from the OS password-database home
+                // (`getpwuid`), not `$HOME`, and the ssh-agent socket is
+                // already reachable via `SSH_AUTH_SOCK` — unaffected by this
+                // override. `gh` is the credential that actually needs
+                // bridging: its non-secret config lives under
+                // `~/.config/gh`, restored via the narrower `GH_CONFIG_DIR`
+                // env var below (gh honors it natively, no filesystem bridge
+                // needed); its OAuth token lives in the macOS login
+                // keychain, restored by symlinking just that one file — see
+                // `home::provision_grok_home` and
+                // `home::resolve_login_keychain_source`. `~/.gitconfig` and
+                // jj's own config are not bridged: neither is needed by the
+                // push path (commit authorship already happened in an
+                // earlier turn), and `~/.local/share/cube` is not bridged
+                // either — `cube pr create` never reads it (verified against
+                // `tools/cube/src/app/pr.rs`), so bridging it would only
+                // widen exposure into cube's own lease/workspace registry
+                // for no benefit.
                 EnvDirective::Set("HOME".to_owned(), process_home.display().to_string()),
                 // Never inherit host GROK_FOLDER_TRUST=0 — that value ungates
                 // project hooks/MCP and undoes the config.toml disable block.
                 // Mirror the inspect path's env_remove on the pane shell.
                 EnvDirective::Unset("GROK_FOLDER_TRUST".to_owned()),
-            ],
+            ]
+            .into_iter()
+            .chain(gh_config_dir_directive())
+            .collect(),
             command,
         }
     }
@@ -1015,6 +1046,130 @@ mod tests {
             fs::read_to_string(workspace.join(".grok/initial-prompt.txt")).unwrap(),
             "second prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_bridges_login_keychain_when_present() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("source-auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        // Fake real HOME with a fake login keychain — the actual macOS
+        // credential store `gh auth login` writes the OAuth token to.
+        let real_home = tmp.path().join("real-home");
+        let keychain_dir = real_home.join("Library").join("Keychains");
+        fs::create_dir_all(&keychain_dir).unwrap();
+        let keychain_file = keychain_dir.join("login.keychain-db");
+        fs::write(&keychain_file, b"fake-keychain-bytes").unwrap();
+        let prior_home = std::env::var_os("HOME");
+        // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
+        unsafe { std::env::set_var("HOME", &real_home) };
+
+        let driver = GrokDriver::default();
+        let state = driver
+            .provision_workspace(&workspace, "hello prompt", "run-keychain-1")
+            .await
+            .expect("provision")
+            .expect("Grok must return runtime state");
+        let runtime = GrokRuntimeState::from_driver_runtime_state(&state).unwrap();
+
+        let bridged = runtime
+            .process_home
+            .join("Library")
+            .join("Keychains")
+            .join("login.keychain-db");
+        let meta = fs::symlink_metadata(&bridged).expect("bridged login keychain must exist");
+        assert!(
+            meta.file_type().is_symlink(),
+            "login.keychain-db must be a symlink, never a copy"
+        );
+        assert_eq!(fs::read_link(&bridged).unwrap(), keychain_file);
+
+        match prior_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_skips_keychain_bridge_when_absent() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("source-auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        // Real HOME exists but has no login keychain (e.g. a non-macOS host).
+        let real_home = tmp.path().join("real-home-no-keychain");
+        fs::create_dir_all(&real_home).unwrap();
+        let prior_home = std::env::var_os("HOME");
+        // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
+        unsafe { std::env::set_var("HOME", &real_home) };
+
+        let driver = GrokDriver::default();
+        let state = driver
+            .provision_workspace(&workspace, "hello prompt", "run-keychain-2")
+            .await
+            .expect("provision")
+            .expect("Grok must return runtime state");
+        let runtime = GrokRuntimeState::from_driver_runtime_state(&state).unwrap();
+
+        assert!(
+            !runtime.process_home.join("Library").exists(),
+            "must not create a Library dir when the host has no login keychain to bridge"
+        );
+
+        match prior_home {
+            Some(v) => unsafe { std::env::set_var("HOME", v) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+
+    #[test]
+    fn spawn_invocation_exports_gh_config_dir_directive() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let run_id = "run-spawn-gh";
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        fs::create_dir_all(&grok_home).unwrap();
+        fs::write(
+            grok_home.join("boss-session-id"),
+            "11111111-2222-4333-8444-555555555555\n",
+        )
+        .unwrap();
+        fs::write(grok_home.join("boss-workspace-path"), "/tmp/ws-spawn-gh\n").unwrap();
+
+        let real_gh_config = tmp.path().join("real-gh-config");
+        fs::create_dir_all(&real_gh_config).unwrap();
+        let prior_gh = std::env::var_os("GH_CONFIG_DIR");
+        // SAFETY: serialised by ENV_LOCK, held via _guard for this test's lifetime.
+        unsafe { std::env::set_var("GH_CONFIG_DIR", &real_gh_config) };
+
+        let plan = GrokDriver::default().spawn_invocation(spawn_request("grok-4.5", run_id));
+
+        let expected = real_gh_config.display().to_string();
+        assert!(
+            plan.env
+                .iter()
+                .any(|d| matches!(d, EnvDirective::Set(k, v) if k == "GH_CONFIG_DIR" && v == &expected)),
+            "must export GH_CONFIG_DIR pointing at the real host gh config: {:?}",
+            plan.env
+        );
+
+        match prior_gh {
+            Some(v) => unsafe { std::env::set_var("GH_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("GH_CONFIG_DIR") },
+        }
     }
 
     #[tokio::test]
