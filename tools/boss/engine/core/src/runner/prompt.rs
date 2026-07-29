@@ -121,12 +121,20 @@ fn startup_recovery_block(report: &boss_engine_recovery::recovery_apply::Recover
     use boss_engine_recovery::recovery_apply::RecoverySource;
 
     let mut block = String::from("## STARTUP RECOVERY\n\n");
-    block.push_str(&format!(
-        "This execution was respawned after execution `{}` was interrupted (engine or UI \
-         crash). The engine recovered its state into this workspace — treat what follows as \
-         a recovered mid-thought, not as a reviewed starting point.\n\n",
-        report.from_execution_id,
-    ));
+    if report.from_execution_id.is_empty() {
+        block.push_str(
+            "This execution was respawned after the previous worker session was interrupted \
+             (engine or UI crash). The engine recovered its state into this workspace — treat \
+             what follows as a recovered mid-thought, not as a reviewed starting point.\n\n",
+        );
+    } else {
+        block.push_str(&format!(
+            "This execution was respawned after execution `{}` was interrupted (engine or UI \
+             crash). The engine recovered its state into this workspace — treat what follows as \
+             a recovered mid-thought, not as a reviewed starting point.\n\n",
+            report.from_execution_id,
+        ));
+    }
 
     if let Some(err) = report.patch_error.as_deref() {
         block.push_str(&format!(
@@ -355,6 +363,20 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         // branch name" / `jj new main` guidance further down is the correct,
         // honest instruction, so no block is rendered at all.
         prompt.push_str(&startup_recovery_block(&report));
+    } else if execution.allow_dirty {
+        // No recovery marker, but the engine recorded this as a dirty
+        // re-lease (see `reconcile_workspace_recovery`): cube handed the
+        // workspace back without a reset, yet no marker was written — e.g.
+        // `dirty_verified` was `None` and no patch was captured, or writing
+        // the marker itself failed. Either way `@` may already hold a prior
+        // worker's uncommitted edits, so the ordinary `jj new main` guidance
+        // further down would silently discard them if followed blind.
+        prompt.push_str(
+            "## WORKSPACE RE-LEASED WITHOUT A RESET\n\n\
+             This workspace was re-leased without a reset. Run `jj status` before `jj new \
+             main` and keep anything you find — it may hold a prior worker's uncommitted \
+             edits.\n\n",
+        );
     }
 
     let expected_branch = crate::completion::expected_branch_name(

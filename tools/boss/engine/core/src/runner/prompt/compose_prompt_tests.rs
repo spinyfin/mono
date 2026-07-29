@@ -305,7 +305,8 @@ fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
 /// No `.boss/recovery-report.json` marker in the workspace means the engine
 /// holds no durable pointer for this run: no block at all, and critically no
 /// speculative `jj edit ...@origin` line naming a branch nobody confirmed
-/// was ever pushed (the T-shape bug this fix closes).
+/// was ever pushed — that line failed with `Revision doesn't exist` whenever
+/// the prior worker died before pushing.
 #[test]
 fn no_recovery_block_when_no_recovery_report() {
     let ws = tempfile::TempDir::new().unwrap();
@@ -328,6 +329,47 @@ fn no_recovery_block_when_no_recovery_report() {
     assert!(
         !prompt.contains("may also have pushed"),
         "no speculative 'may have pushed' language expected without a durable pointer:\n{prompt}",
+    );
+}
+
+/// `reconcile_workspace_recovery` can re-lease a workspace dirty
+/// (`execution.allow_dirty`) without ever writing a recovery-report marker —
+/// e.g. `dirty_verified` came back `None`, or writing the marker itself
+/// failed. In that case `@` may still hold a prior worker's uncommitted
+/// edits, so the prompt must not go silent the way `no_recovery_block_when_no_recovery_report`
+/// pins for the ordinary fresh-dispatch case above.
+#[test]
+fn dirty_reset_warning_when_allow_dirty_and_no_recovery_report() {
+    let ws = tempfile::TempDir::new().unwrap();
+    let execution = WorkExecution::builder()
+        .id("exec_abc123_01")
+        .work_item_id("task-1")
+        .kind(ExecutionKind::ChoreImplementation)
+        .status(ExecutionStatus::Running)
+        .repo_remote_url("git@github.com:org/repo.git")
+        .workspace_path("/tmp/workspace")
+        .created_at("2026-05-15T00:00:00Z")
+        .allow_dirty(true)
+        .build();
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&execution)
+            .work_item(&chore_without_pr())
+            .workspace_path(ws.path())
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        !prompt.contains("STARTUP RECOVERY"),
+        "no recovery report marker was written, so no STARTUP RECOVERY block is expected:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("re-leased without a reset"),
+        "an allow_dirty respawn with no marker must still warn before `jj new main` can discard state:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("jj status"),
+        "the warning must tell the worker how to check before resetting:\n{prompt}",
     );
 }
 
@@ -416,6 +458,31 @@ fn recovery_block_reports_in_place_recovery() {
     assert!(
         !block.contains("@origin"),
         "no speculative branch-resume instruction; the recovery report is the only pointer cited:\n{block}",
+    );
+}
+
+/// The coordinator writes `from_execution_id: String::new()` on the
+/// cube-in-place-with-no-patch path (a crash before any patch capture, with
+/// cube reclaiming the workspace in place). The block must not interpolate
+/// that empty string into a backticked id — it must fall back to prose that
+/// names no execution at all.
+#[test]
+fn recovery_block_handles_empty_from_execution_id() {
+    let report = boss_engine_recovery::recovery_apply::RecoveryReport {
+        for_execution_id: "exec_new".to_owned(),
+        from_execution_id: String::new(),
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+        applied: None,
+        patch_error: None,
+    };
+    let block = startup_recovery_block(&report);
+    assert!(
+        !block.contains("execution ``"),
+        "must not render an empty backticked execution id:\n{block}",
+    );
+    assert!(
+        block.contains("the previous worker session was interrupted"),
+        "should fall back to prose naming no specific execution:\n{block}",
     );
 }
 

@@ -1498,9 +1498,9 @@ impl ExecutionCoordinator {
     /// `execution` is resuming, if the engine captured one.
     ///
     /// Returns `(dead_execution_id, patch_path)`. The dead execution is found
-    /// the same way [`crate::runner`] finds it for the STARTUP RECOVERY
-    /// prompt block — `get_prior_orphaned_execution` — so both halves of the
-    /// recovery story agree on which run is being resumed.
+    /// via `get_prior_orphaned_execution`, the same lookup
+    /// [`reconcile_workspace_recovery`] uses to populate the recovery report
+    /// this resume's STARTUP RECOVERY prompt block reads back.
     ///
     /// Every failure mode (no recovery dir, no prior orphan, no patch on
     /// disk, a DB error) yields `None`: recovery is a precaution layered on
