@@ -153,10 +153,10 @@ crate::stub_cube_client! { ScriptCube {
             *self.marker_seen_during_rebase.lock().await = Some(marker);
         }
         match &self.script {
-            Script::CleanPushed => Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new() }),
-            Script::CleanUnpushed => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new() }),
+            Script::CleanPushed => Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None }),
+            Script::CleanUnpushed => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None }),
             Script::Conflicts(files) => {
-                Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone() })
+                Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone(), linearized_commits: 0, linearize_decline: None })
             }
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
             Script::EnsureRepoErrors => unreachable!("ensure_repo already errored"),

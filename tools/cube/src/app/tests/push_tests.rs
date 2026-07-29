@@ -1,6 +1,6 @@
 use super::checkleft_tests::CheckleftEnvGuard;
 use super::pr_push_tests::remote_list_github;
-use super::rebase_tests::{CONFLICT_TMPL, failing_cmd};
+use super::rebase_tests::{CONFLICT_COMMITS_TMPL, failing_cmd};
 use super::support::ENV_MUTEX;
 use super::support::{ExpectedCommand, FakeRunner};
 
@@ -27,8 +27,8 @@ fn workspace_push_happy_path_advances_and_pushes() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CLEAN",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -96,8 +96,8 @@ fn workspace_push_pr_arg_resolves_head_branch_from_github() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CLEAN",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -169,8 +169,8 @@ fn workspace_push_describes_an_undescribed_working_copy_before_pushing() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CLEAN",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
         ),
         // Blank description (only whitespace) — must still trigger `jj describe`.
         ExpectedCommand::ok(
@@ -239,8 +239,8 @@ fn workspace_push_leaves_an_existing_description_untouched() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CLEAN",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
         ),
         ExpectedCommand::ok(
             cwd.clone(),
@@ -294,8 +294,8 @@ fn workspace_push_refuses_unresolved_conflicts_without_pushing() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CONFLICT",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "conflicted1\n",
         ),
         // No bookmark-set / push commands expected — the conflict check
         // must short-circuit before either.
@@ -317,8 +317,8 @@ fn workspace_push_failure_surfaces_clear_error() {
         ExpectedCommand::ok(
             cwd.clone(),
             "jj",
-            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_TMPL],
-            "CLEAN",
+            &["log", "-r", "@", "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+            "",
         ),
         ExpectedCommand::ok(
             cwd.clone(),

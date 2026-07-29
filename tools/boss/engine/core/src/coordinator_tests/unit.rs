@@ -52,6 +52,64 @@ fn parse_rebase_payload_strips_conflict_descriptors_from_conflicted_files() {
         outcome.conflicted_files,
         vec!["MODULE.bazel.lock".to_owned(), "a b long name.txt".to_owned()],
     );
+    assert_eq!(
+        outcome.linearized_commits, 0,
+        "the conflict path never collapses anything"
+    );
+}
+
+/// `linearized_commits` carries cube's replay-only collapse count through to
+/// the ladder. A clean rebase that only became pushable because cube
+/// collapsed conflicted *ancestors* (after proving the pushed tree
+/// unchanged) is still a rung-1 success, but the trace must be able to tell
+/// the two apart — see `RebaseOutcome::linearized_commits`.
+#[test]
+fn parse_rebase_payload_carries_the_replay_only_collapse_count() {
+    let payload = serde_json::json!({
+        "status": "clean",
+        "pushed": true,
+        "conflicted_files": [],
+        "linearized_commits": 2,
+    });
+    let outcome = parse_rebase_payload(payload).expect("payload parses");
+    assert!(outcome.clean);
+    assert!(outcome.pushed);
+    assert_eq!(outcome.linearized_commits, 2);
+}
+
+/// A cube predating the collapse omits the field entirely; 0 is the correct
+/// reading (that cube never collapsed anything), not a parse failure.
+#[test]
+fn parse_rebase_payload_defaults_the_collapse_count_when_cube_omits_it() {
+    let payload = serde_json::json!({
+        "status": "clean",
+        "pushed": true,
+        "conflicted_files": [],
+    });
+    let outcome = parse_rebase_payload(payload).expect("payload parses");
+    assert!(outcome.clean);
+    assert_eq!(outcome.linearized_commits, 0);
+    assert_eq!(
+        outcome.linearize_decline, None,
+        "an older cube reports no decline reason, which must parse as absent rather than fail"
+    );
+}
+
+/// The decline reason cube stamps on the conflict payload must reach the
+/// ladder: without it every rung-1 fall-through looks alike in the trace and
+/// guard hits cannot be counted.
+#[test]
+fn parse_rebase_payload_carries_the_linearize_decline_reason() {
+    let payload = serde_json::json!({
+        "status": "conflicts",
+        "pushed": false,
+        "conflicted_files": ["src/a.rs"],
+        "linearized_commits": 0,
+        "linearize_decline": "tree_drift",
+    });
+    let outcome = parse_rebase_payload(payload).expect("payload parses");
+    assert!(!outcome.clean);
+    assert_eq!(outcome.linearize_decline.as_deref(), Some("tree_drift"));
 }
 
 /// Lease-time occupancy guard (defect 3, regression test c). The
