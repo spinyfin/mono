@@ -1,9 +1,10 @@
 //! `GrokDriver` — xAI Grok Build agent driver.
 //!
 //! Descriptor, capability set, model menu, Boss-owned `GROK_HOME` provisioning,
-//! and interactive-TUI pane spawn. Progress observation hooks (T-09),
-//! full permission-policy artifacts (T-17), control verbs, and transcript
-//! access are follow-on work — see
+//! interactive-TUI pane spawn, and hook wiring (progress forwarder + the five
+//! `PreToolUse` guards behind a canonicalisation adapter — design T-09, see
+//! [`hooks`]). Full permission-policy artifacts (`--sandbox`/`--allow`/`--deny`,
+//! T-17), control verbs, and transcript access remain follow-on work — see
 //! `tools/boss/docs/designs/grok-as-a-first-class-interactive-agent-driver.md`.
 //!
 //! Behavioural fan-out lives under the `grok/` submodule directory so
@@ -21,6 +22,7 @@ use boss_ssh_transport::shell_quote;
 use serde_json::{Value, json};
 
 mod home;
+mod hooks;
 mod model_menu;
 
 pub use home::{
@@ -307,14 +309,17 @@ impl AgentDriver for GrokDriver {
         Ok(())
     }
 
+    /// Write the `$GROK_HOME` hook wiring (design T-09): the `boss-event`
+    /// progress forwarder on every lifecycle event, plus the five
+    /// `PreToolUse` guards behind [`hooks::write_hooks`]'s canonicalisation
+    /// adapter. Overwrites the provisional canary `provision_workspace`
+    /// wrote. Full `--sandbox`/`--allow`/`--deny` artifacts remain T-17;
+    /// `extra_args` stays empty until that lands.
     async fn write_permission_config(
         &self,
         input: &PermissionInput,
         _dest_dir: &Path,
     ) -> anyhow::Result<PermissionArtifacts> {
-        // Full --sandbox / --allow / --deny artifacts are T-17. For now
-        // surface GROK_HOME so the spawn flow's permission-env merge is
-        // consistent with provision, and leave extra_args empty.
         let grok_home = grok_home_for_run(&input.run_id).with_context(|| {
             format!(
                 "GrokDriver::write_permission_config: resolving GROK_HOME for run_id {:?}",
@@ -328,8 +333,47 @@ impl AgentDriver for GrokDriver {
                 grok_home.display()
             );
         }
+
+        let obs_config = ProgressObservationConfig {
+            events_socket_path: input.events_socket_path.clone(),
+            lease_id: input.lease_id.clone(),
+            run_id: input.run_id.clone(),
+            workspace_path: input.workspace_path.clone(),
+            forwarder_binary: input.boss_event_path.clone(),
+        };
+        // Mirrors CodexDriver::write_permission_config's construction of
+        // ToolUseInterceptionConfig from PermissionInput exactly — remote
+        // workers get no local sandbox/guard scripts (never shipped there).
+        let interception = ToolUseInterceptionConfig {
+            data_dir: if input.is_remote {
+                None
+            } else {
+                input.events_socket_path.parent().map(|p| p.to_path_buf())
+            },
+            path_guard_script: if input.is_remote {
+                None
+            } else {
+                input.path_guard_script.clone()
+            },
+            checkleft_guard_script: if input.is_remote {
+                None
+            } else {
+                input.checkleft_guard_script.clone()
+            },
+            is_revision: input.execution_kind == "revision_implementation"
+                || input.task_kind.as_deref() == Some("revision"),
+            is_standard_worker: input.worker_kind == crate::WorkerKind::Standard,
+            run_id: Some(input.run_id.clone()),
+            workspace_path: Some(input.workspace_path.clone()),
+        };
+
+        let mut config_files = hooks::write_hooks(&grok_home, &obs_config, &interception)
+            .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
+        config_files.push(grok_home.join("config.toml"));
+
         Ok(PermissionArtifacts {
-            config_files: vec![grok_home.join("config.toml")],
+            config_files,
+            // Full --sandbox / --allow / --deny artifacts are T-17.
             extra_args: Vec::new(),
             env: vec![("GROK_HOME".into(), grok_home.display().to_string())],
         })
@@ -342,14 +386,16 @@ impl AgentDriver for GrokDriver {
         ProgressFidelity::Rich
     }
 
-    fn progress_observation_wiring(&self, _config: &ProgressObservationConfig) -> ProgressIngress {
-        // T-09 will write boss-event hooks into `$GROK_HOME/hooks/`. Until
-        // then return HookCallback + DriverOwned with an empty map so the
-        // engine does not merge Claude-shaped hooks into an unread
-        // settings.json (design G-5 destination hazard). Progress is not
-        // yet observed by the engine (acceptance for this task).
+    fn progress_observation_wiring(&self, config: &ProgressObservationConfig) -> ProgressIngress {
+        // Destination is DriverOwned: `write_permission_config` (via
+        // `hooks::write_hooks`) is what actually writes this wiring to
+        // `$GROK_HOME/hooks/` — the engine must never merge it into the
+        // Claude worker settings file the Grok agent never reads (design
+        // G-5 destination hazard). The hooks map returned here mirrors what
+        // gets written so this capability's declared wiring reflects
+        // reality rather than an empty placeholder.
         ProgressIngress::HookCallback(ProgressObservationWiring {
-            hooks: serde_json::Map::new(),
+            hooks: hooks::forwarder_hooks_map(config),
             destination: HookWiringDestination::DriverOwned,
         })
     }
@@ -365,9 +411,17 @@ impl AgentDriver for GrokDriver {
     }
 
     fn tool_use_interception_wiring(&self, _config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
-        // Follow-on: T-09. Must not return Claude guard scripts against a
-        // Grok payload dialect (they would fail open — design §Guardrail
-        // integrity). Empty wiring until the canonicalisation adapter lands.
+        // Dead in practice for Grok: `progress_observation_wiring` declares
+        // `HookWiringDestination::DriverOwned`, so `settings_value`
+        // (`core/src/worker_setup.rs`) never calls this method — it only
+        // layers interception guards into the settings file for
+        // `WorkerSettingsFile`-destination drivers. The real Grok guard
+        // wiring lives in `hooks::write_hooks`, called from
+        // `write_permission_config`, where the materialised
+        // path-guard/checkleft-guard script paths are actually available.
+        // Kept empty (not `unimplemented!()`) so a future refactor that
+        // *does* start calling this generically fails safe rather than
+        // panicking.
         ToolUseInterceptionWiring {
             pre_tool_use_hooks: Vec::new(),
         }
@@ -703,7 +757,15 @@ mod tests {
         match ingress {
             ProgressIngress::HookCallback(w) => {
                 assert_eq!(w.destination, HookWiringDestination::DriverOwned);
-                assert!(w.hooks.is_empty(), "T-09 fills hooks; must not merge Claude defaults");
+                // Destination is DriverOwned, so the engine never merges this
+                // into the settings file regardless of content (see
+                // `merges_hooks_into_worker_settings` in
+                // `core/src/worker_setup.rs`) — but the map itself should
+                // reflect the real forwarder wiring `write_permission_config`
+                // installs, not an empty placeholder.
+                assert!(!w.hooks.is_empty(), "hooks map must mirror the real forwarder wiring");
+                assert!(w.hooks.contains_key("PreToolUse"));
+                assert!(w.hooks.contains_key("Stop"));
             }
             other => panic!("expected HookCallback(DriverOwned), got {other:?}"),
         }
@@ -965,5 +1027,89 @@ mod tests {
             err.to_string().contains("does not exist"),
             "expected missing-home error, got {err:#}"
         );
+    }
+
+    /// End-to-end (design T-09 acceptance, driver-level slice): after
+    /// `provision_workspace`, `write_permission_config` must write the real
+    /// hook wiring — forwarder + adapter-wrapped guards — into
+    /// `$GROK_HOME/hooks/`, not the provisional canary.
+    #[tokio::test]
+    async fn write_permission_config_writes_real_hook_wiring() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-1";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let path_guard_script = tmp.path().join("boss-path-guard.py");
+        fs::write(&path_guard_script, "#!/usr/bin/env python3\n").unwrap();
+        let checkleft_guard_script = tmp.path().join("boss-checkleft-push-guard.py");
+        fs::write(&checkleft_guard_script, "#!/usr/bin/env python3\n").unwrap();
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Standard,
+            workspace_path: workspace.clone(),
+            events_socket_path: tmp.path().join("boss-data").join("events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-1".into(),
+            execution_kind: "task_implementation".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: Some(path_guard_script),
+            checkleft_guard_script: Some(checkleft_guard_script),
+        };
+
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+        assert!(
+            artifacts.env.iter().any(|(k, _)| k == "GROK_HOME"),
+            "must surface GROK_HOME: {:?}",
+            artifacts.env
+        );
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let hooks_path = grok_home.join("hooks").join("boss-provision.json");
+        let adapter_path = grok_home.join("hooks").join("boss-grok-hook-adapter.py");
+        assert!(
+            artifacts.config_files.contains(&hooks_path),
+            "config_files must include the hooks wiring file: {:?}",
+            artifacts.config_files
+        );
+        assert!(
+            artifacts.config_files.contains(&adapter_path),
+            "config_files must include the adapter script: {:?}",
+            artifacts.config_files
+        );
+
+        let hooks_doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let pre_tool_use = hooks_doc["hooks"]["PreToolUse"].as_array().unwrap();
+        // forwarder + path guard + boss-launch guard + pr-redirect guard + checkleft guard.
+        assert_eq!(pre_tool_use.len(), 5, "{pre_tool_use:#?}");
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SessionEnd",
+        ] {
+            assert!(
+                hooks_doc["hooks"][event].as_array().is_some_and(|a| !a.is_empty()),
+                "missing forwarder wiring for {event}: {hooks_doc:#}"
+            );
+        }
+        for entry in pre_tool_use.iter().skip(1) {
+            let command = entry["hooks"][0]["command"].as_str().unwrap();
+            assert!(
+                command.starts_with(&shell_quote(&adapter_path.display().to_string())),
+                "every guard entry must be wrapped by the adapter: {command}"
+            );
+        }
     }
 }

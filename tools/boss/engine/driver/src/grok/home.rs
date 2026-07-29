@@ -53,9 +53,23 @@ const PROCESS_HOME_LEAF: &str = "process-home";
 /// Leaf name of the actual `GROK_HOME` under the run container.
 const GROK_HOME_LEAF: &str = "grok-home";
 
-/// Filename for the provisional global-hooks canary (T-09 replaces with full
-/// boss-event + guard wiring).
-const PROVISION_HOOKS_FILENAME: &str = "boss-provision.json";
+/// Filename under `$GROK_HOME/hooks/` for Boss's global hook wiring.
+///
+/// `provision_grok_home` writes a no-op canary here (a single `SessionStart`
+/// hook that just runs `true`) so `grok inspect --json` reports a non-empty
+/// hooks inventory before the real wiring exists. [`GrokDriver::write_permission_config`]
+/// (`super::super::hooks::write_hooks`) overwrites the same file with the
+/// real boss-event forwarder + adapter-wrapped `PreToolUse` guards once guard
+/// scripts are materialised — never both a stale canary and the real file at
+/// once.
+const HOOKS_FILENAME: &str = "boss-provision.json";
+
+/// Absolute path of the hooks-wiring file under `grok_home`. Shared between
+/// the provisional canary write here and the real wiring
+/// [`super::hooks::write_hooks`] writes once `write_permission_config` runs.
+pub(super) fn hooks_file_path(grok_home: &Path) -> PathBuf {
+    grok_home.join("hooks").join(HOOKS_FILENAME)
+}
 
 // ---------------------------------------------------------------------------
 // Path resolution
@@ -260,8 +274,10 @@ fn push_path_and_symlink_forms(paths: &mut BTreeSet<String>, path: &Path) {
 }
 
 /// Provisional global hooks so `grok inspect` reports a registered inventory
-/// before T-09 lands the real boss-event + guard set. No-op `true` commands —
-/// progress is not yet observed by the engine.
+/// at `provision_workspace` time, before `write_permission_config` (which
+/// runs later in the spawn flow, once guard scripts are materialised)
+/// overwrites this same file with the real boss-event + guard set. No-op
+/// `true` command — progress is not yet observed by the engine at this point.
 fn render_provision_hooks_json() -> String {
     r#"{
   "hooks": {
@@ -414,11 +430,8 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
         render_trusted_folders_toml(workspace),
     )
     .with_context(|| format!("writing {}/trusted_folders.toml", grok_home.display()))?;
-    fs::write(
-        grok_home.join("hooks").join(PROVISION_HOOKS_FILENAME),
-        render_provision_hooks_json(),
-    )
-    .with_context(|| format!("writing provision hooks under {}", grok_home.display()))?;
+    fs::write(hooks_file_path(&grok_home), render_provision_hooks_json())
+        .with_context(|| format!("writing provision hooks under {}", grok_home.display()))?;
 
     // Session id: stable for the run so spawn_invocation and later interrupt
     // observation share one Boss-assigned UUID. Refresh only when missing so
