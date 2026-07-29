@@ -1530,19 +1530,12 @@ mod tests {
     use super::*;
     use crate::{AbsenceDisposition, Capability};
     use boss_protocol::StopReason;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serialise tests that mutate process-global env (`BOSS_CODEX_*`).
-    ///
-    /// Aliased to the crate's public [`CODEX_HOMES_ENV_TEST_LOCK`] rather
-    /// than a second `Mutex`, because these tests set
-    /// [`CODEX_HOMES_ROOT_ENV`] too: a private lock would leave them free
-    /// to race any test going through
-    /// [`crate::test_support::codex_homes_override`], which is the same
-    /// key under a different mutex. `CODEX_AUTH_SOURCE_ENV` rides along on
-    /// the same lock — over-serialising two env tests costs nothing.
-    static ENV_LOCK: &Mutex<()> = &CODEX_HOMES_ENV_TEST_LOCK;
+    // Tests that mutate `BOSS_CODEX_*` go through
+    // [`crate::test_support::codex_homes_override`] (owns
+    // [`CODEX_HOMES_ENV_TEST_LOCK`]). `CODEX_AUTH_SOURCE_ENV` rides on that
+    // same lock — set/restore it only while a homes override is held.
 
     fn sample_auth_json() -> String {
         serde_json::json!({
@@ -1761,8 +1754,17 @@ else:
         );
     }
 
-    #[tokio::test]
-    async fn provision_workspace_creates_owned_home_and_snapshots_auth() {
+    /// Driven by a test-owned current-thread runtime rather than
+    /// `#[tokio::test]`, because the homes-root override must stay held for
+    /// the whole provision → reclaim sequence. Releasing it after the initial
+    /// `set_var` left reclaim reading a root any parallel test in this binary
+    /// could move (or clear) out from under it — CI saw reclaim refuse a home
+    /// under the test temp tree when `codex_homes_root()` had flipped back to
+    /// the default `$TMPDIR/boss-codex-homes`. `block_on` keeps the guard
+    /// inside one blocking call so we never hold a `MutexGuard` across
+    /// `.await` (`clippy::await_holding_lock`).
+    #[test]
+    fn provision_workspace_creates_owned_home_and_snapshots_auth() {
         let tmp = TempDir::new().unwrap();
         let homes = tmp.path().join("homes");
         let workspace = tmp.path().join("ws");
@@ -1774,26 +1776,50 @@ else:
         fs::write(&auth_src, sample_auth_json()).unwrap();
 
         // Point homes + auth source at the temp tree; never touch ~/.codex.
-        // Hold the env lock only around the set/unset + sync work — never
-        // across `.await` (clippy::await_holding_lock).
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            // SAFETY: serialised by ENV_LOCK for the critical section.
-            unsafe {
-                std::env::set_var(CODEX_HOMES_ROOT_ENV, &homes);
-                std::env::set_var(CODEX_AUTH_SOURCE_ENV, &auth_src);
+        // `_homes` owns CODEX_HOMES_ENV_TEST_LOCK for its lifetime; AUTH rides
+        // on the same lock (see module comment above).
+        let _homes = crate::test_support::codex_homes_override(&homes);
+        let prior_auth = std::env::var_os(CODEX_AUTH_SOURCE_ENV);
+        // SAFETY: lock held by `_homes` for the whole function.
+        unsafe {
+            std::env::set_var(CODEX_AUTH_SOURCE_ENV, &auth_src);
+        }
+        // Restore auth before `_homes` drops the lock (field drop order is
+        // reverse declaration order, so this guard is dropped first).
+        struct RestoreAuth(Option<std::ffi::OsString>);
+        impl Drop for RestoreAuth {
+            fn drop(&mut self) {
+                // SAFETY: still under the homes-override lock.
+                match self.0.take() {
+                    Some(v) => unsafe { std::env::set_var(CODEX_AUTH_SOURCE_ENV, v) },
+                    None => unsafe { std::env::remove_var(CODEX_AUTH_SOURCE_ENV) },
+                }
             }
         }
+        let _restore_auth = RestoreAuth(prior_auth);
 
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(provision_workspace_creates_owned_home_and_snapshots_auth_body(
+                &homes, &workspace,
+            ));
+    }
+
+    async fn provision_workspace_creates_owned_home_and_snapshots_auth_body(
+        homes: &std::path::Path,
+        workspace: &std::path::Path,
+    ) {
         let driver = CodexDriver::default();
         let state = driver
-            .provision_workspace(&workspace, "hello prompt", "run-prov-1")
+            .provision_workspace(workspace, "hello prompt", "run-prov-1")
             .await
             .expect("provision")
             .expect("Codex must return runtime state");
 
         let runtime = CodexRuntimeState::from_driver_runtime_state(&state).unwrap();
-        assert!(runtime.codex_home.starts_with(&homes));
+        assert!(runtime.codex_home.starts_with(homes));
         assert!(runtime.codex_home.join("auth.json").is_file());
         assert!(runtime.codex_home.join("config.toml").is_file());
 
@@ -1823,7 +1849,7 @@ else:
 
         // Teardown adopts auth but retains the home for policy-based reclaim.
         driver
-            .teardown_workspace(Some(&workspace), "run-prov-1", Some(&state))
+            .teardown_workspace(Some(workspace), "run-prov-1", Some(&state))
             .await
             .unwrap();
         assert!(
@@ -1832,18 +1858,12 @@ else:
         );
 
         // Explicit reclaim (what the retention sweep does) removes only this root.
+        // Must run while the homes-root override is still held so
+        // `codex_homes_root()` still matches the path provision recorded.
         reclaim_codex_home(&runtime.codex_home).unwrap();
         assert!(!runtime.codex_home.exists(), "reclaim must remove the recorded home");
         // Idempotent.
         reclaim_codex_home(&runtime.codex_home).unwrap();
-
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe {
-                std::env::remove_var(CODEX_HOMES_ROOT_ENV);
-                std::env::remove_var(CODEX_AUTH_SOURCE_ENV);
-            }
-        }
     }
 
     #[test]
@@ -2204,8 +2224,14 @@ else:
         );
     }
 
-    #[tokio::test]
-    async fn teardown_refuses_codex_home_outside_homes_root() {
+    /// Same isolation pattern as
+    /// [`provision_workspace_creates_owned_home_and_snapshots_auth`]: hold
+    /// the homes-root override for the whole check, not only around
+    /// `set_var`. The previous set-then-release shape also always
+    /// `remove_var`'d on cleanup (not restore-prior), which could clear a
+    /// parallel test's override mid-flight.
+    #[test]
+    fn teardown_refuses_codex_home_outside_homes_root() {
         let tmp = TempDir::new().unwrap();
         let homes = tmp.path().join("homes");
         fs::create_dir_all(&homes).unwrap();
@@ -2213,16 +2239,27 @@ else:
         fs::create_dir_all(&outside).unwrap();
         fs::write(outside.join("marker"), "keep").unwrap();
 
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe {
-                std::env::set_var(CODEX_HOMES_ROOT_ENV, &homes);
-            }
-        }
+        let _homes = crate::test_support::codex_homes_override(&homes);
 
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(teardown_refuses_codex_home_outside_homes_root_body(
+                tmp.path(),
+                &homes,
+                &outside,
+            ));
+    }
+
+    async fn teardown_refuses_codex_home_outside_homes_root_body(
+        tmp: &std::path::Path,
+        homes: &std::path::Path,
+        outside: &std::path::Path,
+    ) {
         let state = CodexRuntimeState {
-            codex_home: outside.clone(),
-            auth_source_path: tmp.path().join("auth.json"),
+            codex_home: outside.to_path_buf(),
+            auth_source_path: tmp.join("auth.json"),
             auth_fingerprint: "fp".into(),
             auth_policy: "SnapshotWithRefreshAdoption".into(),
         }
@@ -2243,8 +2280,8 @@ else:
 
         // Homes root itself must never be deleted.
         let root_state = CodexRuntimeState {
-            codex_home: homes.clone(),
-            auth_source_path: tmp.path().join("auth.json"),
+            codex_home: homes.to_path_buf(),
+            auth_source_path: tmp.join("auth.json"),
             auth_fingerprint: "fp".into(),
             auth_policy: "SnapshotWithRefreshAdoption".into(),
         }
@@ -2258,13 +2295,6 @@ else:
             "expected root-equals error, got {err:#}"
         );
         assert!(homes.is_dir(), "homes root must remain");
-
-        {
-            let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-            unsafe {
-                std::env::remove_var(CODEX_HOMES_ROOT_ENV);
-            }
-        }
     }
 
     /// `codex exec` is the motivating case for the mid-turn injection guard:
