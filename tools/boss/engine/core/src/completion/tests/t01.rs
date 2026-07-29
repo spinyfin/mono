@@ -656,6 +656,49 @@ async fn on_stop_recovers_pr_url_from_the_driver_final_message_producer() {
     }
 }
 
+/// The driver's PR-URL fallback used to hardcode `ClaudeDriver`
+/// unconditionally, so a Codex-attributed execution's Claude-shaped "bare
+/// URL on its own line" transcript would still be recovered even though
+/// Codex declares no PR-URL prose convention
+/// (`CodexDriver::structured_output_fallback` always returns `Vec::new()`).
+/// After the fix, the fallback resolves the run's *actual* driver, so a
+/// Codex-attributed chore must fall through to the cold-path detector
+/// instead of parsing the Claude-shaped line.
+#[tokio::test]
+async fn on_stop_ignores_claude_shaped_driver_fallback_for_non_claude_driver() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    db.update_work_item(
+        &chore_id,
+        crate::work::WorkItemPatch {
+            driver: Some("codex".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/999"));
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done. Tests pass.\n\nhttps://github.com/spinyfin/mono/pull/458",
+    );
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/999"),
+        "a Codex-attributed run must fall through to the cold-path detector \
+         instead of Claude's fallback convention; got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        1,
+        "the cold-path detector must be consulted since Codex offers no driver fallback",
+    );
+}
+
 #[tokio::test]
 async fn on_stop_uses_staged_pr_url_and_skips_detector() {
     // Primary path: the worker ran `gh pr create` mid-run, the

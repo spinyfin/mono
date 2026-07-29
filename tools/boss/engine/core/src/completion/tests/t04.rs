@@ -374,6 +374,45 @@ async fn pr_review_pass_clean_advances_to_in_review_without_revision() {
     );
 }
 
+/// The `ReviewResult` fallback used to hardcode `ClaudeDriver`
+/// unconditionally, so a Codex-attributed reviewer's Claude-shaped
+/// fenced-JSON transcript would still be recovered even though Codex
+/// declares no prose-scrape convention
+/// (`CodexDriver::structured_output_fallback` always returns `Vec::new()`).
+/// After the fix, the fallback resolves the run's *actual* driver via
+/// `driver_transcript::driver_for_execution`, so a Codex-attributed
+/// reviewer execution must NOT recover a result from a Claude-shaped
+/// transcript — it falls through to the re-prompt path exactly as if the
+/// reviewer had written nothing at all.
+#[tokio::test]
+async fn pr_review_pass_ignores_claude_shaped_fallback_for_non_claude_driver() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json = clean_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json));
+
+    db.update_work_item(
+        &chore_id,
+        crate::work::WorkItemPatch {
+            driver: Some("codex".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewPassAwaitingResult),
+        "a Codex-attributed reviewer run must not be parsed via Claude's fallback \
+         convention; got {outcome:?}",
+    );
+}
+
 /// A `ReviewResult` with a HIGH severity finding must trigger the engine's
 /// severity gate and create a revision on the producing task with the
 /// correct `created_via` prefix and rendered instructions.

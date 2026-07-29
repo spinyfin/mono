@@ -59,7 +59,6 @@ use crate::build_wait_tracker::{BuildWaitDecision, BuildWaitTracker, DEFAULT_BUI
 use crate::conflict_stop_gate::{self, ConflictClearance};
 use crate::coordinator::{CubeClient, ExecutionPublisher, PreemptOutcome};
 use crate::design_detector;
-use crate::driver::AgentDriver;
 use crate::merge_poller::{
     MergeProbe, NoopMergeProbe, OpenPrCiStatus, OpenPrMergeability, PrLifecycleState, update_pr_poll_state,
 };

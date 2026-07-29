@@ -67,8 +67,9 @@ impl WorkerCompletionHandler {
             TriageTranscript::FinalMessage(text) => Some(text.as_str()),
             TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         };
+        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, &execution.id);
         let decision = crate::automation_triage::resolve_triage_decision(
-            &crate::driver::ClaudeDriver,
+            driver.as_deref().unwrap_or(&crate::driver::ClaudeDriver),
             &self.structured_output_dir,
             &execution.id,
             final_message,
@@ -554,10 +555,14 @@ impl WorkerCompletionHandler {
             None => match self.read_final_triage_message(&execution.id).await.into_message() {
                 None => None,
                 Some(text) => {
-                    let candidates = crate::driver::ClaudeDriver.structured_output_fallback(
-                        crate::structured_output::StructuredOutputKind::ReviewResult,
-                        &text,
-                    );
+                    let driver = crate::driver_transcript::driver_for_execution(&self.work_db, &execution.id);
+                    let candidates = driver
+                        .as_deref()
+                        .unwrap_or(&crate::driver::ClaudeDriver)
+                        .structured_output_fallback(
+                            crate::structured_output::StructuredOutputKind::ReviewResult,
+                            &text,
+                        );
                     let (result, err) = crate::pr_review::review_result_from_candidates(&candidates);
                     if let Some(ref e) = err {
                         tracing::warn!(
