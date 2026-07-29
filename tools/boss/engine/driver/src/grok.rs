@@ -142,22 +142,16 @@ pub fn build_grok_pane_command(request: &SpawnRequest<'_>, workspace: &Path, ses
     cmd.push_str(&shell_quote(session_id));
     cmd.push_str(" --cwd ");
     cmd.push_str(&shell_quote(&workspace.display().to_string()));
-    // Not a pane-usability or process-lifecycle blocker — Boss's
-    // live-descendant-process probe (`background_children.rs`) that keeps a
-    // worker from being false-idle-nudged while a subagent runs is generic
-    // process-tree walking, not Claude-specific, so it would cover a Grok
-    // subagent child exactly the same way. The actual gap is progress
-    // observation (G-5): Grok's hook wiring is proven only for the
-    // top-level session's own lifecycle events firing into
-    // `$GROK_HOME/hooks/`; whether a Grok-spawned subagent process also
-    // picks up those same global hooks (so its tool calls get intercepted
-    // and its turns attributed correctly) is uncharacterised — no spike
-    // evidence either way. Claude's subagents don't need an equivalent flag
-    // because they emit through the exact hook stream Boss already reads
-    // (see `driver/src/claude.rs`, which declares no subagent posture at
-    // all). Until a probe confirms Grok subagent hook attribution,
-    // `--no-subagents` stays on; lifting it is follow-on characterisation
-    // work, not a proportional change here.
+    // Explicit v1 posture, not a pane-usability or lifecycle blocker:
+    // Boss injects none of Grok's MCP/plugin/skill/subagent surface, and
+    // the driver disables what it does not use rather than inheriting
+    // defaults — a subagent is state Boss does not model (design
+    // `grok-as-a-first-class-interactive-agent-driver.md` G-11 / T-07).
+    // Claude declares no equivalent flag because its subagents emit
+    // through the hook stream Boss already reads; whether a Grok subagent
+    // picks up the global `$GROK_HOME/hooks/` set (so its tool calls are
+    // intercepted and its turns attributed) is unmeasured, so lifting
+    // this needs a probe first.
     cmd.push_str(" --no-subagents");
     cmd.push_str(" --no-memory");
     // Prompt from file via command substitution — briefs run to tens of KB.
