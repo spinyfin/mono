@@ -125,7 +125,7 @@ private struct ReviewTerminalSurface: View {
             runtime: GhosttyRuntime.shared,
             session: session,
             launchSpec: session.launchSpec,
-            claudeMonitorEnabled: false
+            paneMonitorEnabled: false
         )
         .background(Color(nsColor: .black))
     }

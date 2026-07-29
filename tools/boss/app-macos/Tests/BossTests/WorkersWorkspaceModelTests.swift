@@ -172,7 +172,8 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
             initialInput: "claude\n",
             env: [],
             summary: nil,
-            taskTitle: nil
+            taskTitle: nil,
+            paneMonitor: nil
         )
     }
 
@@ -319,7 +320,8 @@ final class WorkersWorkspaceModelReleaseTests: XCTestCase {
             initialInput: "claude\n",
             env: [],
             summary: nil,
-            taskTitle: nil
+            taskTitle: nil,
+            paneMonitor: nil
         )
     }
 
@@ -394,7 +396,8 @@ final class WorkersWorkspaceModelPageTests: XCTestCase {
             initialInput: "claude\n",
             env: [],
             summary: nil,
-            taskTitle: nil
+            taskTitle: nil,
+            paneMonitor: nil
         )
     }
 

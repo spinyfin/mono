@@ -406,6 +406,12 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
                 env,
                 summary: input.title_summary,
                 task_title: input.task_title,
+                // Driver-supplied screen-scrape markers for the app's
+                // pre-hook fallback status pill. None keeps Claude
+                // literals on the app side (older drivers / stubs).
+                // Boxed so the optional payload does not bloat the
+                // EngineToAppRequest enum when absent.
+                pane_monitor: input.driver.pane_monitor_spec().map(Box::new),
             }),
             Duration::from_secs(spawn_timeout.as_secs()),
         )

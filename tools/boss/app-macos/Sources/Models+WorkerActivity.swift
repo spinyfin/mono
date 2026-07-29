@@ -50,7 +50,7 @@ enum WorkerActivity: String, Hashable {
     /// Short human-readable label suitable for the pane titlebar pill.
     /// We pair this with the model name (e.g., "claude-opus-4-7") so
     /// the user sees both `Claude Opus 4.7 · Working` rather than
-    /// the legacy "Claude Unknown".
+    /// the legacy "Agent Unknown".
     var label: String {
         switch self {
         case .spawning: "Spawning"

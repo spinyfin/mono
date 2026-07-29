@@ -26,27 +26,27 @@ struct GhosttyTerminalView: NSViewRepresentable {
     let session: TerminalPaneSession
     let launchSpec: TerminalLaunchSpec
     /// Gate for the per-pane 0.5s viewport screen-scrape that drives
-    /// `claudeState`. Flows in as a plain SwiftUI input — `updateNSView`
+    /// `paneMonitorState`. Flows in as a plain SwiftUI input — `updateNSView`
     /// reconciles the timer against it — rather than a `@Published` on
     /// the session that a parent mutates mid-render. Worker panes pass
     /// `liveState == nil` (the scrape is the pre-hook fallback; once the
     /// engine pushes a `LiveWorkerState` the pill renders hook-driven
     /// activity and the scrape is redundant); Boss panes pass `false`
-    /// (they never display `claudeState`).
-    let claudeMonitorEnabled: Bool
+    /// (they never display `paneMonitorState`).
+    let paneMonitorEnabled: Bool
 
     func makeNSView(context: Context) -> GhosttyTerminalHostView {
         GhosttyTerminalHostView(
             runtime: runtime,
             session: session,
             launchSpec: launchSpec,
-            claudeMonitorEnabled: claudeMonitorEnabled
+            paneMonitorEnabled: paneMonitorEnabled
         )
     }
 
     func updateNSView(_ view: GhosttyTerminalHostView, context: Context) {
         view.syncGeometry()
-        view.reconcileClaudeMonitor(enabled: claudeMonitorEnabled)
+        view.reconcilePaneMonitor(enabled: paneMonitorEnabled)
     }
 
     /// SwiftUI removes the representable here — while it still holds a
@@ -74,12 +74,12 @@ final class GhosttyTerminalHostView: NSView {
     private var currentCursor: NSCursor = .iBeam
     private var cursorVisible = true
     private var backgroundColor = NSColor.black
-    private var claudeMonitorTimer: Timer?
-    /// Latest value of the SwiftUI `claudeMonitorEnabled` input. Stored
+    private var paneMonitorTimer: Timer?
+    /// Latest value of the SwiftUI `paneMonitorEnabled` input. Stored
     /// so the internal reconcile callers (surface creation,
     /// `viewDidMoveToWindow`) can converge the timer without a value
     /// argument; `updateNSView` refreshes it whenever the input changes.
-    private var claudeMonitorEnabled: Bool
+    private var paneMonitorEnabled: Bool
     /// Tokens for the display-retry observers installed only while
     /// surface creation has failed. libghostty's `ghostty_surface_new`
     /// returns NULL when the machine has no active display (lid closed
@@ -191,12 +191,12 @@ final class GhosttyTerminalHostView: NSView {
         runtime: GhosttyRuntime,
         session: TerminalPaneSession,
         launchSpec: TerminalLaunchSpec,
-        claudeMonitorEnabled: Bool
+        paneMonitorEnabled: Bool
     ) {
         self.runtime = runtime
         self.session = session
         self.launchSpec = launchSpec
-        self.claudeMonitorEnabled = claudeMonitorEnabled
+        self.paneMonitorEnabled = paneMonitorEnabled
         super.init(frame: NSRect(x: 0, y: 0, width: 320, height: 820))
 
         wantsLayer = true
@@ -263,7 +263,7 @@ final class GhosttyTerminalHostView: NSView {
         // restarts). See [[TerminalLoopMonitor]].
         TerminalLoopMonitor.shared.register(self)
         syncGeometry()
-        reconcileClaudeMonitor()
+        reconcilePaneMonitor()
     }
 
     /// Whether a NULL surface should be reported as a pane death (via
@@ -449,7 +449,7 @@ final class GhosttyTerminalHostView: NSView {
     @MainActor
     deinit {
         pendingGeometrySync?.cancel()
-        claudeMonitorTimer?.invalidate()
+        paneMonitorTimer?.invalidate()
         removeScreenObserver()
         // Stop the event-loop sampler from probing a pane that's going
         // away (the bypass teardown path that skips `tearDown`).
@@ -516,8 +516,8 @@ final class GhosttyTerminalHostView: NSView {
 
         pendingGeometrySync?.cancel()
         pendingGeometrySync = nil
-        claudeMonitorTimer?.invalidate()
-        claudeMonitorTimer = nil
+        paneMonitorTimer?.invalidate()
+        paneMonitorTimer = nil
         removeScreenObserver()
 
         // Drain any in-flight async focus call (focusQueue is serial) before
@@ -591,7 +591,7 @@ final class GhosttyTerminalHostView: NSView {
             attemptSurfaceCreation()
         }
 
-        reconcileClaudeMonitor()
+        reconcilePaneMonitor()
         syncGeometry()
     }
 
@@ -1017,8 +1017,8 @@ final class GhosttyTerminalHostView: NSView {
         NSCursor.setHiddenUntilMouseMoves(!visible)
     }
 
-    /// Converge `claudeMonitorTimer` on the desired state given the
-    /// pane's window attachment and the `claudeMonitorEnabled` gate.
+    /// Converge `paneMonitorTimer` on the desired state given the
+    /// pane's window attachment and the `paneMonitorEnabled` gate.
     /// `updateNSView` passes the latest SwiftUI input via `enabled:`;
     /// the internal callers (surface creation, `viewDidMoveToWindow`)
     /// omit it and reconcile against the last-known value. Idempotent:
@@ -1027,45 +1027,45 @@ final class GhosttyTerminalHostView: NSView {
     /// screen-scrape is the only main-thread cost in this view that runs
     /// on a regular timer, so a worker pane drops to ~zero baseline once
     /// the engine starts pushing `LiveWorkerState`.
-    func reconcileClaudeMonitor(enabled: Bool? = nil) {
+    func reconcilePaneMonitor(enabled: Bool? = nil) {
         if let enabled {
-            claudeMonitorEnabled = enabled
+            paneMonitorEnabled = enabled
         }
-        let shouldRun = window != nil && claudeMonitorEnabled
+        let shouldRun = window != nil && paneMonitorEnabled
         if shouldRun {
-            if claudeMonitorTimer == nil {
-                startClaudeMonitor()
+            if paneMonitorTimer == nil {
+                startPaneMonitor()
             }
-        } else if claudeMonitorTimer != nil {
-            stopClaudeMonitor()
+        } else if paneMonitorTimer != nil {
+            stopPaneMonitor()
         }
     }
 
-    private func startClaudeMonitor() {
-        claudeMonitorTimer?.invalidate()
-        claudeMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+    private func startPaneMonitor() {
+        paneMonitorTimer?.invalidate()
+        paneMonitorTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.updateClaudeMonitorState()
+                self?.updatePaneMonitorState()
             }
         }
-        claudeMonitorTimer?.tolerance = 0.1
-        updateClaudeMonitorState()
+        paneMonitorTimer?.tolerance = 0.1
+        updatePaneMonitorState()
     }
 
-    private func stopClaudeMonitor() {
-        claudeMonitorTimer?.invalidate()
-        claudeMonitorTimer = nil
-        session.updateClaudeMonitor(snapshot: nil)
+    private func stopPaneMonitor() {
+        paneMonitorTimer?.invalidate()
+        paneMonitorTimer = nil
+        session.updatePaneMonitor(snapshot: nil)
     }
 
-    private func updateClaudeMonitorState() {
+    private func updatePaneMonitorState() {
         guard let surface else {
-            session.updateClaudeMonitor(snapshot: nil)
+            session.updatePaneMonitor(snapshot: nil)
             return
         }
 
         let visibleContents = readVisibleContents(from: surface)
-        session.updateClaudeMonitor(snapshot: makeClaudeSnapshot(from: visibleContents))
+        session.updatePaneMonitor(snapshot: makePaneSnapshot(from: visibleContents))
     }
 
     private func readVisibleContents(from surface: ghostty_surface_t) -> String {
@@ -1094,21 +1094,27 @@ final class GhosttyTerminalHostView: NSView {
         return String(cString: text.text)
     }
 
-    private func makeClaudeSnapshot(from visibleContents: String) -> ClaudeMonitorSnapshot? {
+    private func makePaneSnapshot(from visibleContents: String) -> PaneMonitorSnapshot? {
         let trimmedContents = visibleContents.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedContents.isEmpty else { return nil }
 
-        let prompt = promptLine(in: visibleContents)
-        return ClaudeMonitorSnapshot(
+        let spec = session.paneMonitorSpec
+        let prompt = promptLine(in: visibleContents, prefixes: spec.promptPrefixes)
+        // Agent / starting: case-sensitive substring (Claude's historical
+        // behaviour). Busy: case-insensitive so Claude's "esc to interrupt"
+        // still matches regardless of casing; Grok's "Esc:cancel" matches too.
+        let agentVisible = spec.agentMarkers.contains { visibleContents.contains($0) }
+        let busy = spec.busyMarkers.contains {
+            visibleContents.localizedCaseInsensitiveContains($0)
+        }
+        let starting = spec.startingMarkers.contains { visibleContents.contains($0) }
+        return PaneMonitorSnapshot(
             tail: extractTail(from: visibleContents, keepLines: 24),
-            claudeVisible: visibleContents.contains("Claude Code") ||
-                visibleContents.contains("auto mode on") ||
-                visibleContents.contains("/effort"),
-            busy: visibleContents.localizedCaseInsensitiveContains("esc to interrupt"),
+            agentVisible: agentVisible,
+            busy: busy,
             promptVisible: prompt != nil,
             promptLine: prompt,
-            starting: visibleContents.contains("Accessing workspace:") ||
-                visibleContents.contains("Quick safety check:")
+            starting: starting
         )
     }
 
@@ -1122,10 +1128,11 @@ final class GhosttyTerminalHostView: NSView {
         return lines.suffix(keepLines).joined(separator: "\n")
     }
 
-    private func promptLine(in text: String) -> String? {
+    private func promptLine(in text: String, prefixes: [String]) -> String? {
         for line in text.split(whereSeparator: \.isNewline).reversed() {
             let value = String(line)
-            if value.trimmingCharacters(in: .whitespaces).hasPrefix("❯") {
+            let trimmed = value.trimmingCharacters(in: .whitespaces)
+            if prefixes.contains(where: { trimmed.hasPrefix($0) }) {
                 return value
             }
         }

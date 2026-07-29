@@ -16,7 +16,7 @@ use std::path::Path;
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{NormalizeError, WorkerEvent};
+use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use serde_json::{Value, json};
 
 mod model_menu;
@@ -140,6 +140,28 @@ impl AgentDriver for GrokDriver {
             // lower-fidelity channel. A Grok worker shows Working/Idle and
             // never a fabricated WaitingForInput (design G-13 / T-24).
         ])
+    }
+
+    fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        // Measured under GhosttyKit with `--no-alt-screen` (recommended
+        // pane mode). See
+        // `tools/boss/docs/investigations/grok-tui-liveness-markers-under-ghosttykit.md`.
+        // Do NOT merge these into Claude's marker sets — each driver
+        // owns its surface strings.
+        Some(PaneMonitorSpec {
+            // OR-semantics. "always-approve" assumes Boss spawn keeps
+            // --always-approve. "Grok 4" matches footer "Grok 4.5 …"
+            // without pinning the patch model id.
+            agent_markers: vec!["Shift+Tab:mode".into(), "always-approve".into(), "Grok 4".into()],
+            // Footer affordance present on every busy poll, absent idle.
+            busy_markers: vec!["Esc:cancel".into(), "[stop]".into()],
+            // Prefix matches "Starting session…" (unicode ellipsis) too.
+            starting_markers: vec!["Starting session".into()],
+            // Boxed composer only — bare "❯" collides with history
+            // user-message lines (`     ❯ Use the shell…`).
+            prompt_prefixes: vec!["│ ❯".into()],
+            idle_debounce_polls: 2,
+        })
     }
 
     fn spawn_invocation(&self, _request: SpawnRequest<'_>) -> SpawnPlan {
@@ -423,6 +445,22 @@ mod tests {
         let driver = GrokDriver::default();
         assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
         assert!(!driver.mid_turn_pane_input().buffers());
+    }
+
+    #[test]
+    fn grok_pane_monitor_spec_matches_ghosttykit_investigation() {
+        let spec = GrokDriver::default()
+            .pane_monitor_spec()
+            .expect("GrokDriver supplies pane-monitor markers");
+        assert_eq!(spec.agent_markers, vec!["Shift+Tab:mode", "always-approve", "Grok 4"]);
+        assert_eq!(spec.busy_markers, vec!["Esc:cancel", "[stop]"]);
+        assert_eq!(spec.starting_markers, vec!["Starting session"]);
+        // Boxed composer only — bare ❯ collides with history lines.
+        assert_eq!(spec.prompt_prefixes, vec!["│ ❯"]);
+        assert_eq!(spec.idle_debounce_polls, 2);
+        // Guardrail: never smuggle Claude busy chrome into Grok's set.
+        assert!(!spec.busy_markers.iter().any(|m| m.contains("esc to interrupt")));
+        assert!(!spec.agent_markers.iter().any(|m| m.contains("Claude")));
     }
 
     #[test]

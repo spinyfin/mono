@@ -18,6 +18,29 @@ pub struct EnvVar {
     pub value: String,
 }
 
+/// Driver-supplied substrings the app uses to screen-scrape a
+/// GhosttyKit-hosted worker pane for a fallback status pill
+/// (`unavailable` / `notDetected` / `ready` / `working`) until the
+/// engine's first hook-driven [`crate::LiveWorkerState`] arrives.
+///
+/// All marker lists are OR-semantics: any hit means the condition is
+/// true. The app falls back to Claude's historical literals when this
+/// is absent on the wire, so an older engine paired with a newer app
+/// is unaffected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneMonitorSpec {
+    /// Substrings whose presence means "the agent is running in this pane".
+    pub agent_markers: Vec<String>,
+    /// Substrings meaning "a turn is in flight" (Claude: `"esc to interrupt"`).
+    pub busy_markers: Vec<String>,
+    /// Substrings meaning "starting up, not yet at a prompt".
+    pub starting_markers: Vec<String>,
+    /// Line prefixes identifying the agent's input prompt (Claude: `"❯"`).
+    pub prompt_prefixes: Vec<String>,
+    /// Polls of a stable prompt before declaring idle. Claude: 2.
+    pub idle_debounce_polls: u8,
+}
+
 /// Engine asks the app to host a worker pane in a specific slot.
 ///
 /// The engine is the source of truth for which slot a worker lands
@@ -62,6 +85,18 @@ pub struct SpawnWorkerPaneInput {
     /// the task without looking grammatically broken.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_title: Option<String>,
+    /// Driver-supplied pane-monitor markers for the app's pre-hook
+    /// status pill. Sourced from
+    /// `AgentDriver::pane_monitor_spec()` at the engine spawn site.
+    /// `None` (older engine, or a driver that declares no spec) keeps
+    /// the app's Claude-literal fallback so existing paths are
+    /// behaviour-identical.
+    ///
+    /// Boxed so this optional payload does not inflate
+    /// [`EngineToAppRequest`]'s largest variant by the full marker
+    /// struct when absent (the common case for non-spawn verbs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane_monitor: Option<Box<PaneMonitorSpec>>,
 }
 
 /// App's reply when allocation succeeds. The slot is dictated by
@@ -322,6 +357,7 @@ mod tests {
             }],
             summary: Some("fixing the fencer scraper".into()),
             task_title: None,
+            pane_monitor: None,
         });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("\"slot_id\":3"));
@@ -339,12 +375,15 @@ mod tests {
             env: vec![],
             summary: None,
             task_title: None,
+            pane_monitor: None,
         });
         let json = serde_json::to_string(&original).unwrap();
-        // None should not serialize `summary` or `task_title`; they
-        // must be omitted so apps that predate the field continue to parse.
+        // None should not serialize `summary`, `task_title`, or
+        // `pane_monitor`; they must be omitted so apps that predate
+        // the field continue to parse.
         assert!(!json.contains("summary"));
         assert!(!json.contains("task_title"));
+        assert!(!json.contains("pane_monitor"));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
     }
@@ -359,12 +398,59 @@ mod tests {
             env: vec![],
             summary: None,
             task_title: Some("kanban: revision cards render broken".into()),
+            pane_monitor: None,
         });
         let json = serde_json::to_string(&original).unwrap();
         assert!(json.contains("task_title"));
         assert!(!json.contains("\"summary\""));
         let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn spawn_request_with_pane_monitor_round_trips() {
+        let original = EngineToAppRequest::SpawnWorkerPane(SpawnWorkerPaneInput {
+            run_id: "run-3".into(),
+            workspace_path: "/tmp/ws".into(),
+            slot_id: 1,
+            initial_input: "grok\n".into(),
+            env: vec![],
+            summary: None,
+            task_title: None,
+            pane_monitor: Some(Box::new(PaneMonitorSpec {
+                agent_markers: vec!["Grok 4".into(), "Shift+Tab:mode".into()],
+                busy_markers: vec!["Esc:cancel".into()],
+                starting_markers: vec!["Starting session".into()],
+                prompt_prefixes: vec!["│ ❯".into()],
+                idle_debounce_polls: 2,
+            })),
+        });
+        let json = serde_json::to_string(&original).unwrap();
+        assert!(json.contains("pane_monitor"));
+        assert!(json.contains("Esc:cancel"));
+        assert!(json.contains("idle_debounce_polls"));
+        let parsed: EngineToAppRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn spawn_request_absent_pane_monitor_deserialises_as_none() {
+        // Older engine wire shape — no pane_monitor key at all.
+        let json = r#"{
+            "kind":"spawn_worker_pane",
+            "run_id":"run-old",
+            "workspace_path":"/tmp/ws",
+            "slot_id":1,
+            "initial_input":"claude\n",
+            "env":[]
+        }"#;
+        let parsed: EngineToAppRequest = serde_json::from_str(json).unwrap();
+        match parsed {
+            EngineToAppRequest::SpawnWorkerPane(input) => {
+                assert!(input.pane_monitor.is_none());
+            }
+            other => panic!("expected SpawnWorkerPane, got {other:?}"),
+        }
     }
 
     #[test]
