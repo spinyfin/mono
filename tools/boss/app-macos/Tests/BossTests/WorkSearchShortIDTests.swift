@@ -50,6 +50,53 @@ final class WorkSearchShortIDTests: XCTestCase {
         XCTAssertEqual(model.visibleWorkItems.map(\.id), ["task_exact", "task_prefix"])
     }
 
+    func testShortIDMatchOnParentIncludesRevisions() {
+        let model = makeModel()
+        model.applyEventForTest(
+            makeWorkTreeEvent(tasks: [
+                makeTask(id: "task_parent", name: "Parent", shortID: 2801),
+                makeTask(id: "task_revision", name: "Revision", shortID: 2900, kind: "revision", parentTaskId: "task_parent"),
+                makeTask(id: "task_unrelated", name: "Unrelated", shortID: 3000),
+            ])
+        )
+
+        model.workSearchText = "2801"
+        XCTAssertEqual(Set(model.visibleWorkItems.map(\.id)), ["task_parent", "task_revision"])
+    }
+
+    func testShortIDMatchOnRevisionIncludesChainRootAndSiblings() {
+        let model = makeModel()
+        model.applyEventForTest(
+            makeWorkTreeEvent(tasks: [
+                makeTask(id: "task_parent", name: "Parent", shortID: 2801),
+                makeTask(id: "task_revision", name: "Revision", shortID: 2900, kind: "revision", parentTaskId: "task_parent"),
+                makeTask(id: "task_sibling", name: "Sibling revision", shortID: 2901, kind: "revision", parentTaskId: "task_parent"),
+                makeTask(id: "task_unrelated", name: "Unrelated", shortID: 3000),
+            ])
+        )
+
+        model.workSearchText = "2900"
+        XCTAssertEqual(Set(model.visibleWorkItems.map(\.id)), ["task_parent", "task_revision", "task_sibling"])
+    }
+
+    func testShortIDMatchIncludesTransitiveRevisionOfRevision() {
+        let model = makeModel()
+        model.applyEventForTest(
+            makeWorkTreeEvent(tasks: [
+                makeTask(id: "task_parent", name: "Parent", shortID: 2801),
+                makeTask(id: "task_revision", name: "Revision", shortID: 2900, kind: "revision", parentTaskId: "task_parent"),
+                makeTask(id: "task_revision_of_revision", name: "Revision of revision", shortID: 2950, kind: "revision", parentTaskId: "task_revision"),
+                makeTask(id: "task_unrelated", name: "Unrelated", shortID: 3000),
+            ])
+        )
+
+        model.workSearchText = "2801"
+        XCTAssertEqual(
+            Set(model.visibleWorkItems.map(\.id)),
+            ["task_parent", "task_revision", "task_revision_of_revision"]
+        )
+    }
+
     func testPlainTextSearchIsUnaffected() {
         let model = makeModel()
         model.applyEventForTest(
@@ -75,12 +122,18 @@ final class WorkSearchShortIDTests: XCTestCase {
 
     // MARK: - Helpers
 
-    private func makeTask(id: String, name: String, shortID: Int) -> WorkTask {
+    private func makeTask(
+        id: String,
+        name: String,
+        shortID: Int,
+        kind: String = "task",
+        parentTaskId: String? = nil
+    ) -> WorkTask {
         var task = WorkTask(
             id: id,
             productID: "prod_test",
             projectID: "proj_test",
-            kind: "task",
+            kind: kind,
             name: name,
             description: "",
             status: "backlog",
@@ -92,6 +145,7 @@ final class WorkSearchShortIDTests: XCTestCase {
             updatedAt: "2026-05-26T00:00:00Z"
         )
         task.shortID = shortID
+        task.parentTaskId = parentTaskId
         return task
     }
 
