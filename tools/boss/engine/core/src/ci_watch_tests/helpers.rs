@@ -84,6 +84,14 @@ pub(super) fn chore_state(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>)
     }
 }
 
+/// Read a task row back through the public query path — unlike
+/// `WorkDb::get_work_item`, this does not filter out soft-deleted rows, so
+/// it can see an archived (tombstoned) revision after
+/// `close_moot_revision_task` runs.
+pub(super) fn task(db: &WorkDb, id: &str) -> crate::work::Task {
+    crate::work::query_task(&db.connect().unwrap(), id).unwrap().unwrap()
+}
+
 /// The create-time revision gate's PR-state probe for tests. The
 /// production CI producer feeds `StaticPrStateChecker(Open)` (the poller
 /// just observed the PR open at clean mergeability); tests use the fake

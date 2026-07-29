@@ -689,6 +689,13 @@ impl WorkDb {
         // delivered a terminal result, so a one-turn-per-process worker's exit
         // can be told apart from a death across an engine restart.
         migrate_work_runs_turn_boundary_at(conn)?;
+        // Backfill: tombstone `merge-conflict:*` / `ci-fix:*` revisions that
+        // were cancelled by a human before their chain root's PR merged or
+        // closed, and never revisited afterward because
+        // `block_pending_revisions_on_parent_close` used to treat `cancelled`
+        // as already-terminal. Data-only, self-idempotent — see the function
+        // doc comment.
+        migrate_backfill_cancelled_moot_revision_tombstones(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

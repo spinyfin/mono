@@ -1048,7 +1048,59 @@ fn supersede_if_stale(
             "conflict_watch: failed to abandon stale crz (same base); falling through anyway",
         );
     }
+    // The abandoned crz's revision (if it ever spawned one) is superseded by
+    // the fresh detection this function's caller falls through to — a stale
+    // row left open here is exactly the "N open rows piled up on one PR"
+    // bug (mono#… "merge-conflict/CI-fix rows should be tombstoned
+    // automatically"): nothing else closes a merely-superseded revision
+    // until the parent PR eventually merges, which can be arbitrarily far
+    // in the future on a still-conflicting PR.
+    close_superseded_moot_revision(
+        work_db,
+        &candidate.work_item_id,
+        active_crz.revision_task_id.as_deref(),
+        "superseded by a fresh merge-conflict detection cycle",
+    );
     true
+}
+
+/// Close `revision_task_id` (a moot merge-conflict/CI-fix revision) because
+/// its spawning attempt was just superseded by a fresh detection cycle for
+/// the same PR — the [`is_moot_revision_kind`] discriminator on
+/// [`WorkDb::close_moot_revision_task`] already refuses anything else, so
+/// this is safe to call unconditionally whenever an attempt is abandoned
+/// for supersede. No-op (logged at debug) when there is no revision, it is
+/// already terminal, or a worker is still live driving it — closing it out
+/// from under that worker is not this function's job.
+fn close_superseded_moot_revision(work_db: &WorkDb, work_item_id: &str, revision_task_id: Option<&str>, reason: &str) {
+    let Some(revision_task_id) = revision_task_id else {
+        return;
+    };
+    match work_db.close_moot_revision_task(revision_task_id, reason) {
+        Ok(Some(_)) => {
+            tracing::info!(
+                work_item_id,
+                revision_task_id,
+                reason,
+                "conflict_watch: closed a superseded revision task",
+            );
+        }
+        Ok(None) => {
+            tracing::debug!(
+                work_item_id,
+                revision_task_id,
+                "conflict_watch: superseded revision already terminal/in_review, or a worker is still live",
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                work_item_id,
+                revision_task_id,
+                ?err,
+                "conflict_watch: failed to close superseded revision task",
+            );
+        }
+    }
 }
 
 /// Abandon any active `ci_remediations` attempt for this work item and
@@ -1078,6 +1130,12 @@ fn supersede_stale_ci_remediation(work_db: &WorkDb, candidate: &PendingMergeChec
             "conflict_watch: failed to clear stale ci_failure signal superseded by conflict",
         );
     }
+    close_superseded_moot_revision(
+        work_db,
+        &candidate.work_item_id,
+        stale.revision_task_id.as_deref(),
+        "superseded: merge-conflict resolution pre-empts CI-fix for the same PR",
+    );
 }
 
 /// Foreign-bucket takeover (T2381/PR#1861 fix): re-bucket a row that is
@@ -1443,11 +1501,14 @@ pub async fn on_resolved(
                     // Close the revision task this attempt spawned so a
                     // retired attempt never leaves a stale
                     // todo/active/blocked row behind — see
-                    // `WorkDb::close_resolved_conflict_revision`'s doc for
-                    // why this can't just wait for the eventual
-                    // parent-PR-merge sweep to clean it up.
+                    // `WorkDb::close_moot_revision_task`'s doc for why this
+                    // can't just wait for the eventual parent-PR-merge sweep
+                    // to clean it up.
                     if let Some(revision_task_id) = succeeded.revision_task_id.as_deref() {
-                        match work_db.close_resolved_conflict_revision(revision_task_id) {
+                        match work_db.close_moot_revision_task(
+                            revision_task_id,
+                            "merge conflict resolved before parent PR merged; revision moot",
+                        ) {
                             Ok(Some(_)) => {
                                 tracing::info!(
                                     work_item_id = %candidate.work_item_id,

@@ -91,6 +91,85 @@ async fn foreign_bucket_takeover_rebuckets_stuck_ci_failure_row_to_conflict() {
     }
 }
 
+/// Mode A regression: when merge-conflict detection pre-empts an active
+/// `ci_remediations` attempt, the CI-fix revision that attempt had already
+/// spawned must be closed out (archived + tombstoned), not merely
+/// superseded at the attempt-table level — otherwise it sits open on the
+/// board forever once the conflict-resolution revision takes over the slot.
+#[tokio::test]
+async fn conflict_detection_preempting_ci_closes_the_ci_fix_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1863";
+    let (product, chore) = make_in_review(&db, "C-preempt-ci-revision", pr);
+
+    db.mark_chore_blocked_ci_failure(&chore, pr, None).unwrap();
+    let stale_attempt = db
+        .insert_ci_remediation(crate::work::CiRemediationInsertInput {
+            product_id: product.clone(),
+            work_item_id: chore.clone(),
+            pr_url: pr.to_owned(),
+            pr_number: 1863,
+            head_branch: "feature".to_owned(),
+            head_sha_at_trigger: "head-ci".to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("fresh insert");
+
+    // The stale attempt already spawned a CI-fix revision (the normal
+    // in-flight shape once ci_watch has run past the pre-flight gates).
+    let ci_fix_revision = db
+        .create_revision(
+            crate::work::CreateRevisionInput::builder()
+                .parent_task_id(chore.clone())
+                .description("Fix failing CI")
+                .created_via(format!(
+                    "{}{}",
+                    crate::work::CREATED_VIA_CI_FIX_PREFIX,
+                    stale_attempt.id
+                ))
+                .build(),
+            &open_checker(),
+        )
+        .unwrap();
+    db.set_ci_remediation_revision_task_id(&stale_attempt.id, &ci_fix_revision.id)
+        .unwrap();
+
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let took_over = on_conflict_detected(
+        &db,
+        pub_.as_ref(),
+        None,
+        &open_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+    )
+    .await;
+    assert!(took_over, "conflict_watch must take the orphaned row over");
+
+    let refreshed_stale = db
+        .get_ci_remediation(&stale_attempt.id)
+        .unwrap()
+        .expect("row still exists");
+    assert_eq!(refreshed_stale.status, "abandoned");
+
+    let closed_revision = task(&db, &ci_fix_revision.id);
+    assert_eq!(
+        closed_revision.status,
+        TaskStatus::Archived,
+        "the pre-empted CI-fix revision must be archived, not left open"
+    );
+    assert!(
+        closed_revision.deleted_at.is_some(),
+        "the pre-empted CI-fix revision must be tombstoned so it disappears from the board"
+    );
+}
+
 /// A row blocked on a genuinely higher-priority foreign reason (design
 /// §Q2: dependency > review_feedback > merge_conflict > ci_failure) must
 /// NOT be taken over by conflict_watch even when the live probe reports

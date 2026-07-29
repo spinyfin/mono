@@ -40,7 +40,7 @@ pub(super) fn chore_status(db: &WorkDb, id: &str) -> (TaskStatus, Option<String>
 /// Read a task row back through the public query path — unlike
 /// `WorkDb::get_work_item`, this does not filter out soft-deleted rows, so
 /// it can see an archived (tombstoned) revision after
-/// `close_resolved_conflict_revision` runs.
+/// `close_moot_revision_task` runs.
 pub(super) fn task(db: &WorkDb, id: &str) -> crate::work::Task {
     crate::work::query_task(&db.connect().unwrap(), id).unwrap().unwrap()
 }

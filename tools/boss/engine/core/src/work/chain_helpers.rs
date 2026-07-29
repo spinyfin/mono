@@ -275,6 +275,41 @@ pub(crate) fn archive_revision_task(
     Ok(rows_changed)
 }
 
+/// Tombstone a `cancelled` moot revision (`merge-conflict:*` / `ci-fix:*`)
+/// in place, once its chain root's PR has merged or closed.
+///
+/// `boss task cancel` is deliberately non-destructive — per its own help
+/// text it "sets the terminal `Cancelled` status without soft-deleting the
+/// row (unlike `delete`)" — so a human who cancels one of these revisions
+/// (e.g. because they resolved the conflict another way) before the parent
+/// PR merges leaves a row that [`block_pending_revisions_on_parent_close`]
+/// used to treat as already-terminal and never revisit: `cancelled` sat in
+/// the same "nothing to do" bucket as `done`/`archived`/`in_review`, so the
+/// row lingered on the board forever even though it was exactly as moot as
+/// one the engine itself would have archived.
+///
+/// Unlike [`archive_revision_task`], this deliberately leaves `status`
+/// untouched — `cancelled` is the true historical record of what a human
+/// did, and only the tombstone (`deleted_at`) is new. The
+/// `status = 'cancelled' AND deleted_at IS NULL` guard makes this
+/// idempotent, and mirrors [`crate::WorkDb::delete_work_item_as_actor`]'s
+/// tombstone-only write (so `boss task restore` works unmodified).
+pub(crate) fn tombstone_cancelled_moot_revision(conn: &Connection, rev_id: &str, now: &str) -> Result<usize> {
+    let rows_changed = conn.execute(
+        "UPDATE tasks
+         SET deleted_at         = ?2,
+             updated_at         = ?2,
+             merge_queue_state  = NULL,
+             merge_queue_detail = NULL
+         WHERE id = ?1
+           AND kind = 'revision'
+           AND status = 'cancelled'
+           AND deleted_at IS NULL",
+        params![rev_id, now],
+    )?;
+    Ok(rows_changed)
+}
+
 /// Resolve a single pending revision whose chain root's PR has merged or
 /// closed: either archive it as moot, or convert it to a standalone
 /// chore/followup and archive it.
@@ -409,9 +444,12 @@ pub(crate) fn resolve_revision_on_parent_close(
 ///    revision.
 ///
 /// `in_review` revisions are handled by [`flip_in_review_revisions_to_done`]
-/// (their commit rode the PR to merge).  Terminal revisions (`done`,
-/// `archived`, `cancelled`) and revisions already blocked with
-/// `parent_pr_closed` are skipped.
+/// (their commit rode the PR to merge).  `done`/`archived` revisions and
+/// revisions already blocked with `parent_pr_closed` are skipped outright.
+/// `cancelled` revisions get one extra check: a moot-kind one is tombstoned
+/// in place (see [`tombstone_cancelled_moot_revision`]) since cancel never
+/// soft-deletes the row on its own; a non-moot cancelled revision is left
+/// untouched.
 ///
 /// The moot-vs-convert decision itself lives in
 /// [`resolve_revision_on_parent_close`], shared with the dispatch-time
@@ -439,9 +477,28 @@ pub(crate) fn block_pending_revisions_on_parent_close(
         let Some(rev) = query_task(conn, rev_id)? else {
             continue;
         };
+        if rev.status == TaskStatus::Cancelled {
+            // A human-cancelled row is otherwise a dead end for this
+            // reconciler (see `tombstone_cancelled_moot_revision`'s doc
+            // comment for why). Only moot-kind revisions get swept — an
+            // ordinary cancelled revision carrying real review feedback is
+            // left exactly as the human left it.
+            if is_moot_revision_kind(&rev.created_via) {
+                let rows_changed = tombstone_cancelled_moot_revision(conn, rev_id, now)?;
+                if rows_changed > 0 {
+                    tracing::info!(
+                        revision_id = %rev.id,
+                        chain_root_id,
+                        created_via = %rev.created_via,
+                        "block_pending_revisions: cancelled moot revision tombstoned (parent PR merged/closed)",
+                    );
+                }
+            }
+            continue;
+        }
         if matches!(
             rev.status,
-            TaskStatus::Done | TaskStatus::Archived | TaskStatus::Cancelled | TaskStatus::InReview
+            TaskStatus::Done | TaskStatus::Archived | TaskStatus::InReview
         ) {
             continue;
         }
