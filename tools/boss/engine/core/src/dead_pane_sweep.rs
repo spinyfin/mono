@@ -178,6 +178,94 @@ pub async fn run_one_pass(
     outcome
 }
 
+/// Durable, restart-robust evidence that a LOCAL execution's worker shell pid
+/// is dead (`kill(pid, 0) == ESRCH`), gated by `is_live()`, the grace window,
+/// and the one-shot-driver exit guard. Returns `Some(shell_pid)` only on
+/// positive evidence of death; `None` on anything ambiguous (not live, still
+/// within the grace window, no durable pid, alive/EPERM/unexpected errno, or
+/// a one-shot driver's expected post-turn exit).
+///
+/// This is the **exclusive** implementation of the pid-death signal — see the
+/// module doc on "exactly one reaper per death signal". [`reconcile_if_pane_dead`]
+/// and `cube_lease_heartbeat::db_fallback_death_evidence` both call this
+/// rather than re-probing, so a future change to the liveness rules (a wider
+/// grace window, a new one-shot-driver exemption) lands here once instead of
+/// drifting across call sites.
+pub(crate) async fn shell_pid_death_evidence(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    now_epoch_secs: i64,
+) -> Option<i64> {
+    // Only reconcile states where the design expects a LIVE pane to still be
+    // holding the workspace: `running` (a pr_review reviewer pane) and
+    // `waiting_human` (the post-spawn park state) — exactly `is_live()`. A
+    // dead pid in any OTHER non-terminal state is EXPECTED, not a zombie: a
+    // `waiting_review`/`waiting_merge` execution's worker has already finished
+    // its job, created its PR, and exited, so its shell pid is dead by design.
+    // Reaping those would falsely orphan work that is correctly parked awaiting
+    // a human. (Terminal states are covered by `is_live()` being false too.)
+    if !execution.status.is_live() {
+        return None;
+    }
+
+    // Grace guard: skip executions dispatched too recently (or with no
+    // `started_at`) so a worker whose pid is still settling is never raced.
+    let started_epoch = execution.started_epoch();
+    match started_epoch {
+        Some(t) if now_epoch_secs - t >= PANE_DEATH_GRACE_SECS => {}
+        _ => return None,
+    }
+
+    // The durable, restart-robust liveness signal: the shell pid the app
+    // reported, persisted to `work_runs.shell_pid`. This lookup is ALSO the
+    // host-safety gate — it returns a pid only for a `host_id = 'local'` run, so
+    // a remote worker (whose pid lives on another machine, where a local
+    // `kill(pid, 0)` is meaningless) surfaces `None` and is never touched here.
+    // `None` (remote, never reported, or a pre-fix spawn) means we have no
+    // evidence either way → leave it alone.
+    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
+        Ok(Some(pid)) if pid > 0 => pid,
+        Ok(_) => return None,
+        Err(err) => {
+            tracing::debug!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "pane-death reconcile: could not read durable shell pid; skipping conservatively",
+            );
+            return None;
+        }
+    };
+
+    // Only ESRCH ("no such process") is positive evidence of death. Alive,
+    // alive-but-not-ours (EPERM), and any unexpected errno are treated as live
+    // — pid recycling can then only ever cause a missed reap, never a false one.
+    let probe_pid_i32 = match i32::try_from(shell_pid) {
+        Ok(pid) => pid,
+        Err(_) => return None,
+    };
+    if !matches!(probe_pid(probe_pid_i32), PidStatus::Dead) {
+        return None;
+    }
+
+    // A dead pid is only a dead *worker* when the driver's process was
+    // supposed to outlive its turns. `codex exec` serves one turn per process
+    // and exits, so its pid is dead by design once the turn is delivered —
+    // this sweep is restart-robust and DB-driven, which means without this
+    // check it would re-orphan a cleanly finished one-shot run on its next
+    // 60s pass even after the pane-death path correctly spared it. No drain
+    // here: this sweep only ever sees exits that happened at least
+    // `PANE_DEATH_GRACE_SECS` ago, by which time the run's progress stream has
+    // long since been read, so the durable record is settled.
+    if !crate::worker_process_exit::classify_worker_process_exit(work_db, None, &execution.id)
+        .await
+        .is_death()
+    {
+        return None;
+    }
+
+    Some(shell_pid)
+}
+
 /// Finalize `execution` iff it is a non-terminal LOCAL execution whose durable
 /// worker shell pid is provably dead (`kill(pid, 0) == ESRCH`). Returns `true`
 /// when the row was (or already had been) reconciled to a terminal status;
@@ -194,72 +282,9 @@ pub async fn reconcile_if_pane_dead(
     execution: &WorkExecution,
     now_epoch_secs: i64,
 ) -> bool {
-    // Only reconcile states where the design expects a LIVE pane to still be
-    // holding the workspace: `running` (a pr_review reviewer pane) and
-    // `waiting_human` (the post-spawn park state) — exactly `is_live()`. A
-    // dead pid in any OTHER non-terminal state is EXPECTED, not a zombie: a
-    // `waiting_review`/`waiting_merge` execution's worker has already finished
-    // its job, created its PR, and exited, so its shell pid is dead by design.
-    // Reaping those would falsely orphan work that is correctly parked awaiting
-    // a human. (Terminal states are covered by `is_live()` being false too.)
-    if !execution.status.is_live() {
+    let Some(shell_pid) = shell_pid_death_evidence(work_db, execution, now_epoch_secs).await else {
         return false;
-    }
-
-    // Grace guard: skip executions dispatched too recently (or with no
-    // `started_at`) so a worker whose pid is still settling is never raced.
-    let started_epoch = execution.started_epoch();
-    match started_epoch {
-        Some(t) if now_epoch_secs - t >= PANE_DEATH_GRACE_SECS => {}
-        _ => return false,
-    }
-
-    // The durable, restart-robust liveness signal: the shell pid the app
-    // reported, persisted to `work_runs.shell_pid`. This lookup is ALSO the
-    // host-safety gate — it returns a pid only for a `host_id = 'local'` run, so
-    // a remote worker (whose pid lives on another machine, where a local
-    // `kill(pid, 0)` is meaningless) surfaces `None` and is never touched here.
-    // `None` (remote, never reported, or a pre-fix spawn) means we have no
-    // evidence either way → leave it alone.
-    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
-        Ok(Some(pid)) if pid > 0 => pid,
-        Ok(_) => return false,
-        Err(err) => {
-            tracing::debug!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "pane-death reconcile: could not read durable shell pid; skipping conservatively",
-            );
-            return false;
-        }
     };
-
-    // Only ESRCH ("no such process") is positive evidence of death. Alive,
-    // alive-but-not-ours (EPERM), and any unexpected errno are treated as live
-    // — pid recycling can then only ever cause a missed reap, never a false one.
-    let probe_pid_i32 = match i32::try_from(shell_pid) {
-        Ok(pid) => pid,
-        Err(_) => return false,
-    };
-    if !matches!(probe_pid(probe_pid_i32), PidStatus::Dead) {
-        return false;
-    }
-
-    // A dead pid is only a dead *worker* when the driver's process was
-    // supposed to outlive its turns. `codex exec` serves one turn per process
-    // and exits, so its pid is dead by design once the turn is delivered —
-    // this sweep is restart-robust and DB-driven, which means without this
-    // check it would re-orphan a cleanly finished one-shot run on its next
-    // 60s pass even after the pane-death path correctly spared it. No drain
-    // here: this sweep only ever sees exits that happened at least
-    // `PANE_DEATH_GRACE_SECS` ago, by which time the run's progress stream has
-    // long since been read, so the durable record is settled.
-    if !crate::worker_process_exit::classify_worker_process_exit(work_db, None, &execution.id)
-        .await
-        .is_death()
-    {
-        return false;
-    }
 
     let prior_status = execution.status.as_str();
 
