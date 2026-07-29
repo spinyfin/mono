@@ -174,7 +174,12 @@ struct WorkBoardCardItem: View {
                             model.workErrorMessage = "Couldn't find the in-progress revision for \(task.name) — it may have just finished or been deleted."
                             return
                         }
-                        model.revealWorkCard(revision.id, productID: revision.productID)
+                        switch model.revealWorkCard(revision.id, productID: revision.productID) {
+                        case .revealed, .deferred:
+                            break
+                        case .unreachable(let reason):
+                            model.workErrorMessage = "Couldn't reveal the in-progress revision for \(task.name): \(reason)"
+                        }
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,

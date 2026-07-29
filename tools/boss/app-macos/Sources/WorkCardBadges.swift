@@ -614,11 +614,12 @@ struct PrInRevisionIndicator: View {
                 Button(action: onTap) { content }
                     .buttonStyle(.plain)
                     .pointerStyle(.link)
+                    .help("A revision is in progress — click to reveal it")
             } else {
                 content
+                    .help("A revision is in progress — do not merge this PR yet")
             }
         }
-        .help("A revision is in progress — click to reveal it")
         .accessibilityLabel("In revision — do not merge")
     }
 }
