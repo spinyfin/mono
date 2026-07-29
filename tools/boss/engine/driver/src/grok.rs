@@ -1141,6 +1141,7 @@ mod tests {
             is_remote: false,
             path_guard_script: Some(path_guard_script),
             checkleft_guard_script: Some(checkleft_guard_script),
+            codex_sandbox_enforced: false,
         };
 
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
@@ -1221,6 +1222,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
         };
 
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
@@ -1308,6 +1310,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
         };
 
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
@@ -1350,6 +1353,7 @@ mod tests {
             is_remote: true,
             path_guard_script: None,
             checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
         };
 
         let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
@@ -1471,6 +1475,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
         };
         let artifacts = driver
             .write_permission_config(&input, scratch_root.as_path())
