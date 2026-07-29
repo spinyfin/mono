@@ -170,11 +170,7 @@ pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf 
 ///   (`population-timing-*`) day files, merged and sorted by date.
 pub fn resolve_log_source_files(source: LogSource, state_root: &Path) -> Vec<PathBuf> {
     match source {
-        LogSource::EngineTrace | LogSource::Audit => {
-            let base = resolve_log_source_path(source, state_root);
-            crate::segments::segments_with_live(&base)
-        }
-        LogSource::Dispatch => {
+        LogSource::EngineTrace | LogSource::Audit | LogSource::Dispatch => {
             let base = resolve_log_source_path(source, state_root);
             crate::segments::segments_with_live(&base)
         }

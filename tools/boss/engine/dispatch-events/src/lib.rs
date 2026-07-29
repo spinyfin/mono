@@ -37,7 +37,7 @@
 //! `boss_log_files::segments_with_live` / `rotated_segments`.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
 use boss_engine_jsonl_append::JsonlAppender;
@@ -357,7 +357,7 @@ pub enum Stage {
     /// `orphan_active_redispatch` / `cube_lease_auto_reap`, which only
     /// self-heal failures *after* `run_started`; before this stage existed
     /// a pre-spawn failure that exhausted its retries stayed parked until
-    /// a human ran `bossctl work start` (2026-07-03 T215 incident — sat
+    /// a human ran `bossctl work start` (2026-07-03 incident: sat
     /// undispatched 45+ minutes with free slots available). See
     /// `boss_engine::dispatch_failure_recovery_sweep`.
     DispatchFailureRecoveryRedispatch,
@@ -804,16 +804,21 @@ pub const DEFAULT_CURRENT_MAX_FILES: usize = 5;
 /// already understands the format. The per-execution mirrors are NOT
 /// rotated here — they are bounded per execution already and rotating
 /// them would fragment the single-execution diagnose view for no benefit.
+/// Process-wide lock serializing the stat+rename+prune sequence in
+/// [`JsonlFileSink::maybe_rotate_current`]. Living at crate scope (rather than
+/// as an instance field), like `boss_engine_jsonl_append::APPEND_LOCK`, is
+/// what makes the "two concurrent emits crossing the threshold at once can't
+/// both act on a stale size" guarantee true regardless of how many
+/// `JsonlFileSink` values a caller constructs against the same or different
+/// roots — see that method's doc for the retention-slot bug this closes.
+static ROTATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 #[derive(Debug, Clone)]
 pub struct JsonlFileSink {
     root: PathBuf,
     appender: Arc<JsonlAppender>,
     max_bytes: u64,
     max_files: usize,
-    /// Serializes the stat+rename+prune sequence in [`Self::maybe_rotate_current`]
-    /// so two concurrent emits crossing the threshold at once can't both act on
-    /// a stale size — see that method's doc for the retention-slot bug this closes.
-    rotation_lock: Arc<Mutex<()>>,
 }
 
 impl JsonlFileSink {
@@ -825,7 +830,6 @@ impl JsonlFileSink {
             appender: Arc::new(JsonlAppender::new()),
             max_bytes,
             max_files,
-            rotation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -844,25 +848,32 @@ impl JsonlFileSink {
     /// Best-effort: a `stat`/`rename` failure logs via `tracing` and is
     /// otherwise ignored — rotation must never turn a dropped write into a
     /// dropped event. The stat+rename+prune sequence runs under
-    /// `rotation_lock`, so two concurrent emits that both observe the file
+    /// `ROTATION_LOCK`, so two concurrent emits that both observe the file
     /// over threshold no longer race: the loser re-stats after the winner
-    /// has already rotated and recreated an empty live file, sees it back
-    /// under threshold, and does nothing — it does NOT rotate a near-empty
-    /// file and burn a retention slot the way an unguarded re-check would.
-    /// After a successful rename, the live file is immediately recreated
-    /// empty (mirroring `trace_rotation::RotatingJsonlWriter`) so
-    /// `current.jsonl` is never observably absent to a concurrent reader
-    /// such as `TimelineIndex::refresh`.
+    /// has already rotated and recreated the live file, sees it back under
+    /// threshold, and does nothing — it does NOT rotate a near-empty file
+    /// and burn a retention slot the way an unguarded re-check would.
+    ///
+    /// After a successful rename, the live file is immediately recreated so
+    /// `current.jsonl` is never observably absent to a concurrent reader such
+    /// as `TimelineIndex::refresh`. That recreate opens with `create(true)`
+    /// and `append(true)` rather than truncating: `emit`'s append path holds
+    /// only the crate-wide `boss_engine_jsonl_append::APPEND_LOCK`, not
+    /// `ROTATION_LOCK`, so an emit can land between the rename and the
+    /// recreate and write its line into a freshly-created `current.jsonl`
+    /// before this method gets to it — a truncating recreate would silently
+    /// erase that line. Opening non-truncating preserves it; the recreated
+    /// file is empty only in the common case where no such write raced in.
     ///
     /// This `stat`s the file on every emit rather than tracking size with an
     /// in-memory byte counter (as `trace_rotation` does). Deliberate: at
     /// `DEFAULT_CURRENT_MAX_BYTES`'s ~two-month rotation cadence the extra
     /// syscall per event is immaterial, and a `stat` is immune to counter
-    /// drift across process restarts (an in-memory counter re-seeded from
-    /// file length on startup is exactly as much bookkeeping as the current
-    /// approach has none of).
+    /// drift across process restarts — and needs no bookkeeping: an
+    /// in-memory counter would have to be re-seeded from the file length on
+    /// every startup to avoid drift, which is strictly more state than this.
     async fn maybe_rotate_current(&self, current_path: &Path) {
-        let _guard = self.rotation_lock.lock().await;
+        let _guard = ROTATION_LOCK.lock().await;
 
         let len = match tokio::fs::metadata(current_path).await {
             Ok(meta) => meta.len(),
@@ -884,7 +895,7 @@ impl JsonlFileSink {
             return;
         }
 
-        if let Err(err) = tokio::fs::File::create(current_path).await {
+        if let Err(err) = recreate_live_file(current_path).await {
             tracing::warn!(
                 ?err,
                 path = %current_path.display(),
@@ -902,6 +913,21 @@ impl JsonlFileSink {
             }
         }
     }
+}
+
+/// Ensures `path` exists without truncating it. Used to recreate the live
+/// file immediately after rotation's rename — non-truncating because an
+/// `emit` can land between that rename and this recreate (it holds only
+/// `boss_engine_jsonl_append::APPEND_LOCK`, not `ROTATION_LOCK`) and write its
+/// line into a freshly-created file before this call runs; a truncating
+/// create (e.g. `tokio::fs::File::create`) would silently erase that line.
+async fn recreate_live_file(path: &Path) -> std::io::Result<()> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    Ok(())
 }
 
 #[async_trait]
@@ -979,7 +1005,6 @@ mod tests {
             appender: Arc::new(JsonlAppender::new()),
             max_bytes,
             max_files,
-            rotation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1051,6 +1076,31 @@ mod tests {
                 suffix != Some("1000") && suffix != Some("1001")
             }),
             "pre-seeded segments should have been pruned, got {backups:?}"
+        );
+    }
+
+    /// If an `emit` writes a line into a freshly-recreated `current.jsonl`
+    /// after rotation's rename but before rotation's recreate step runs (the
+    /// two hold different locks, so this interleaving is reachable), that
+    /// line must survive the recreate — it must not be silently truncated
+    /// away, which is exactly the bug a `File::create`-based recreate had.
+    #[tokio::test]
+    async fn recreate_after_rotation_does_not_truncate_a_raced_write() {
+        let dir = TempDir::new().unwrap();
+        let current_path = dir.path().join("current.jsonl");
+
+        // Simulate emit B: after A's rename moved the old file aside, B's
+        // append_locked ran `OpenOptions::create(true).append(true)` and
+        // wrote a full line into a brand-new current.jsonl.
+        fs::write(&current_path, b"{\"raced\":true}\n").unwrap();
+
+        // A now runs its recreate step.
+        recreate_live_file(&current_path).await.unwrap();
+
+        let content = fs::read_to_string(&current_path).unwrap();
+        assert_eq!(
+            content, "{\"raced\":true}\n",
+            "recreate must not truncate a line written by a concurrent emit"
         );
     }
 
