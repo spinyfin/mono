@@ -2168,7 +2168,7 @@ mod tests {
                 "INSERT INTO tasks (id, product_id, kind, name, description, status, \
                  created_at, updated_at, parent_task_id, autostart, priority, created_via) \
                  VALUES (?1, ?2, 'revision', 'Rev', \
-                 'Address all findings before finalising this revision.', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
+                 'Address ALL findings before finalising this revision.', 'todo', ?3, ?3, ?4, 1, 'medium', ?5)",
                 params![revision_id, product, now, chore_id, created_via],
             )
             .unwrap();

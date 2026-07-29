@@ -47,7 +47,10 @@ pub use parsing::{
     classify_changed_files, extract_review_result, extract_review_result_verbose, passes_severity_gate,
     review_result_from_candidates,
 };
-pub use render::{render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions};
+pub use render::{
+    ReviewOrigin, render_reviewer_claude_md, render_reviewer_initial_prompt, render_revision_instructions,
+    render_revision_title,
+};
 pub use types::{
     PrReviewContext, RegressionCheck, ReviewFinding, ReviewFindingCategory, ReviewFindingConfidence,
     ReviewFindingSeverity, ReviewResult, ReviewScope,
