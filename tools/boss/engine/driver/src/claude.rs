@@ -454,6 +454,7 @@ impl AgentDriver for ClaudeDriver {
             Capability::ToolProvisioning,
             Capability::PromptComposition,
             Capability::AwaitingInputSignal,
+            Capability::CommandOutcomeObservation,
         ])
     }
 
@@ -1007,6 +1008,7 @@ mod tests {
             Capability::ToolProvisioning,
             Capability::PromptComposition,
             Capability::AwaitingInputSignal,
+            Capability::CommandOutcomeObservation,
         ] {
             assert!(caps.provides(cap), "ClaudeDriver must provide {cap:?}",);
         }

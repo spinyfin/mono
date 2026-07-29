@@ -1016,7 +1016,8 @@ impl AgentDriver for CodexDriver {
         // declaration. Every omission below is deliberate; each notes its
         // absence disposition and why.
         //
-        // Provided (all except ToolProvisioning + AwaitingInputSignal):
+        // Provided (all except ToolProvisioning + AwaitingInputSignal +
+        // CommandOutcomeObservation):
         //   Spawn, WorkspaceProvisioning, PermissionPolicy, ModelAndEffortMenu,
         //   ProgressObservation, ToolUseInterception (deny-only), TurnBoundary,
         //   StructuredOutput, TranscriptAccess, ControlVerbs, PromptComposition.
@@ -1025,6 +1026,19 @@ impl AgentDriver for CodexDriver {
         // `permissionDecision: deny` but rejects `allow` / `ask` / `updatedInput`
         // (verified codex-cli 0.145.0). The trait rewrite path is unreachable;
         // inline-`--body` editorial cases become Deny-with-reason.
+        //
+        // CommandOutcomeObservation — omitted → default Degrade (never
+        // Synthesize). `progress_fidelity()` below declares `Rich` because
+        // Codex's rollout carries a start/end boundary around every tool
+        // call, same cadence as Claude's hooks — but that says nothing about
+        // whether the end-of-command record reliably says the command
+        // succeeded. The rollout's `exit_code`/`status` fields are only
+        // sometimes present, can be dropped by the model's own
+        // result-projection layer before the record is emitted, and become
+        // unparseable once output is truncated. Declaring `Rich` alone would
+        // let a scheduler assume a per-command success/failure guarantee
+        // Codex does not actually carry; this omission is what keeps that
+        // assumption from being made silently.
         CapabilitySet::new([
             Capability::Spawn,
             Capability::WorkspaceProvisioning,
@@ -1253,8 +1267,10 @@ impl AgentDriver for CodexDriver {
     fn progress_fidelity(&self) -> ProgressFidelity {
         // Codex `--json` carries `item.started` / `item.completed` around each
         // tool call — same per-tool resolution as Claude's hooks (Progress-
-        // Observation gap / ProgressFidelity docs). Tier is about resolution,
-        // not transport.
+        // Observation gap / ProgressFidelity docs). Tier is about resolution
+        // (cadence), not transport, and it is not a claim about per-command
+        // outcome fidelity — Codex correctly leaves
+        // `Capability::CommandOutcomeObservation` undeclared above for that.
         ProgressFidelity::Rich
     }
 
@@ -1628,6 +1644,7 @@ mod tests {
         }
         assert!(!caps.provides(Capability::ToolProvisioning));
         assert!(!caps.provides(Capability::AwaitingInputSignal));
+        assert!(!caps.provides(Capability::CommandOutcomeObservation));
         assert_eq!(
             caps.absence_disposition(Capability::ToolProvisioning),
             AbsenceDisposition::Degrade
@@ -1636,6 +1653,24 @@ mod tests {
             caps.absence_disposition(Capability::AwaitingInputSignal),
             AbsenceDisposition::Degrade
         );
+        assert_eq!(
+            caps.absence_disposition(Capability::CommandOutcomeObservation),
+            AbsenceDisposition::Degrade,
+            "Boss must not synthesize a per-command outcome Codex never observed"
+        );
+    }
+
+    #[test]
+    fn codex_declares_rich_progress_fidelity_without_command_outcome_observation() {
+        // Rich cadence (per-tool item.started/item.completed boundaries) is
+        // not the same claim as reliable per-command exit status: Codex's
+        // rollout exit_code/status fields are sometimes absent, can be
+        // dropped by the model's own result-projection layer, and become
+        // unparseable once output is truncated. A scheduler must not infer
+        // outcome observability from the fidelity tier alone.
+        let driver = CodexDriver::default();
+        assert_eq!(driver.progress_fidelity(), ProgressFidelity::Rich);
+        assert!(!driver.capabilities().provides(Capability::CommandOutcomeObservation));
     }
 
     #[test]
