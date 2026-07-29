@@ -5,7 +5,7 @@ import XCTest
 /// is an engine-computed fact (`Task.ready_for_review`) that the view only
 /// reads, never re-derives from badge state. `ChatViewModel.reviewReadyOnly`
 /// is the view-only toggle that narrows `workItems(in: .review)` down to
-/// those cards, and group headers (project groups, the "Chores (N)" group)
+/// those cards, and group headers (project groups, the "No Project (N)" group)
 /// must reflect the filtered counts — a group left with zero ready cards
 /// must not render an empty header.
 @MainActor
@@ -105,7 +105,7 @@ final class ReviewReadyFilterTests: XCTestCase {
         model.setReviewReadyOnly(true)
 
         let sections = model.workSections(in: .review)
-        XCTAssertEqual(sections.map(\.title), ["Chores"], "the empty 'Test Project' group must not render a header")
+        XCTAssertEqual(sections.map(\.title), ["No Project"], "the empty 'Test Project' group must not render a header")
         XCTAssertEqual(sections.first?.items.map(\.id), ["task_ready_chore"])
     }
 

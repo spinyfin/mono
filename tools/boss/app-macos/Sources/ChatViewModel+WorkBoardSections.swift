@@ -256,18 +256,12 @@ extension ChatViewModel {
         }
 
         let grouped = Dictionary(grouping: items) { task in
-            if task.isChore { return "Chores" }
-            // Chore-parented revisions inherit nil projectID from the chain
-            // root (a chore). Group them with chores so they don't land in
-            // a confusing "No Project" section — they are logically part of
-            // the chore world.
-            if task.kind == "revision", task.projectID == nil { return "Chores" }
-            return projectName(for: task.projectID) ?? "No Project"
+            projectName(for: task.projectID) ?? "No Project"
         }
 
         return grouped.keys.sorted().compactMap { key in
             guard let sectionItems = grouped[key], !sectionItems.isEmpty else { return nil }
-            let projectID = sectionItems.first(where: { !$0.isChore })?.projectID
+            let projectID = sectionItems.first?.projectID
             return WorkBoardSection(
                 id: "\(column.rawValue)-\(key)",
                 title: key,
