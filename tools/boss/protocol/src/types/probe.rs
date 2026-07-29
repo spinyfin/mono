@@ -21,17 +21,23 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeDeliveryExpectation {
-    /// The worker is parked at its prompt, so the engine wrote the text into
-    /// the pane during this call. No boundary is needed (and none is coming
-    /// on its own — this is the case a boundary-only design would hang on).
+    /// The engine wrote the text into the pane during this call, because the
+    /// pane would take a write: either the worker is parked at its prompt
+    /// (no boundary is coming on its own — the case a boundary-only design
+    /// hangs on), or it is mid-turn on a driver that buffers pane input, so
+    /// the text sits in the agent's composer and it picks the text up as it
+    /// works. This is the ordinary expectation for a live Claude worker.
     Immediate,
-    /// The worker is mid-turn on a driver that buffers pane input, and the
-    /// probe is urgent: it will be injected at the next `PostToolUse`
-    /// boundary, i.e. as soon as the in-flight tool call returns.
+    /// No write could be issued yet, but the worker's driver buffers mid-turn
+    /// pane input, so the probe is injected at the next `PostToolUse`
+    /// boundary — i.e. as soon as its first/next tool call returns. Reported
+    /// for a worker that is still spawning.
     NextToolBoundary,
     /// The probe waits for the worker's next turn boundary (`Stop`). This is
-    /// the ordinary non-urgent contract; for a worker mid-way through a long
-    /// turn it can be a while, which is exactly why the CLI now says so.
+    /// now the *last-resort* contract, reported only for a worker whose
+    /// driver does not read mid-turn stdin at all (`codex exec`): for such a
+    /// worker there is no earlier opportunity, and for one mid-way through a
+    /// long turn it can be a while, which is exactly why the CLI says so.
     NextTurnBoundary,
 }
 
@@ -48,9 +54,11 @@ impl ProbeDeliveryExpectation {
     /// phrased to be pasted into CLI output after "probe accepted; ".
     pub fn describe(self) -> &'static str {
         match self {
-            Self::Immediate => "written into the worker's pane now (it was parked at its prompt)",
-            Self::NextToolBoundary => "will be injected when the worker's in-flight tool call returns",
-            Self::NextTurnBoundary => "will be injected at the worker's next turn boundary",
+            Self::Immediate => "written into the worker's pane now (parked, or buffered mid-turn by the agent)",
+            Self::NextToolBoundary => "will be injected when the worker's next tool call returns",
+            Self::NextTurnBoundary => {
+                "will be injected at the worker's next turn boundary (its driver takes no mid-turn input)"
+            }
         }
     }
 }
@@ -58,8 +66,8 @@ impl ProbeDeliveryExpectation {
 /// Observable delivery state of one probe, keyed by probe id.
 ///
 /// Queried with `FrontendRequest::ProbeStatus`. The states are ordered by
-/// progress but not all probes visit all of them: an immediate delivery goes
-/// `Queued → Injected → Consumed`, a mid-turn urgent one goes
+/// progress but not all probes visit all of them: a delivery to a parked
+/// worker goes `Queued → Injected → Consumed`, a mid-turn one goes
 /// `Queued → Injected → Buffered`, and either can end at `Replied` once the
 /// worker answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

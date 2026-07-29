@@ -89,10 +89,10 @@ impl WorkerActivity {
     /// after the process exits (ghostty-codex-pane-viability, Q2 Layer D).
     ///
     /// Treating that difference as a property of activity alone is what made
-    /// `probe --urgent` structurally undeliverable: the urgent path fires on
-    /// `PostToolUse`, where the activity is `Working` by construction, so a
-    /// parked-only predicate refuses every urgent probe on every driver. The
-    /// driver half of the decision is
+    /// mid-turn probe delivery structurally impossible: the tool-boundary
+    /// path fires on `PostToolUse`, where the activity is `Working` by
+    /// construction, so a parked-only predicate refuses every probe on every
+    /// driver. The driver half of the decision is
     /// `boss_engine_driver::AgentDriver::mid_turn_pane_input`; the engine
     /// combines both in `PaneInputPosture`.
     pub fn accepts_typed_input(self) -> bool {

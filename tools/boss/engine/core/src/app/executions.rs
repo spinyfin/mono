@@ -332,7 +332,7 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // about to arrive, so the caller cannot tell a healthy worker from an
         // unreachable one. Deciding up front makes the refusal visible in the
         // response rather than only in a `debug!` line inside the engine.
-        let expected_delivery = match probe_delivery_expectation(&server_state, &run_id, urgent) {
+        let expected_delivery = match probe_delivery_expectation(&server_state, &run_id) {
             Ok(expectation) => expectation,
             Err(reason) => {
                 tracing::warn!(run_id = %run_id, urgent, %reason, "probe refused: undeliverable");
@@ -372,15 +372,15 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
                 );
             }
         }
-        // Immediately deliver the probe if the worker is already idle
-        // (between turns). An idle worker has no Stop boundary coming
-        // — `dispatch_probe_on_stop` would never fire — so we push the
-        // text into the pane right now. If the worker is active the
-        // call is a no-op and the probe waits for the next Stop.
-        let server_for_idle = server_state.clone();
-        let run_id_for_idle = run_id.clone();
+        // Deliver the probe right now if the worker's pane will take a
+        // write — parked (no boundary is coming on its own) or mid-turn on
+        // a driver that buffers pane input (the composer takes it while the
+        // worker works). Only a pane that cannot be written to at all leaves
+        // the probe queued for a later `PostToolUse`/`Stop` retry.
+        let server_for_now = server_state.clone();
+        let run_id_for_now = run_id.clone();
         tokio::spawn(async move {
-            dispatch_probe_if_idle(&server_for_idle, &run_id_for_idle).await;
+            dispatch_probe_now(&server_for_now, &run_id_for_now).await;
         });
         send_response(
             &sink,
@@ -408,27 +408,19 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
 /// * no slot mapping, or no live state for the mapped slot — there is no pane
 ///   to write into;
 /// * a terminal worker (`Terminated`/`Errored`) — it will never read anything
-///   again;
-/// * `--urgent` against a worker whose `(activity, driver)` pair has no
-///   mid-turn posture. Urgent's whole contract is tool-boundary delivery, and
-///   at a `PostToolUse` boundary the activity is `Working` by construction, so
-///   a driver that refuses mid-turn input can never honour it. Refusing is
-///   honest; silently downgrading to Stop-boundary delivery under an
-///   `--urgent` flag is not.
+///   again.
 ///
-/// The two `--urgent` refusals have distinct reasons, because they have
-/// distinct causes: a `Spawning` worker has no tool boundary yet (the driver
-/// is never consulted), while a `Working` worker on a non-buffering driver
-/// has boundaries the driver will not read at. Naming the driver in the
-/// former case would assert something false about it.
+/// The `urgent` flag is deliberately **not** an input. It is queue priority,
+/// not transport: where a probe lands is a function of the worker's pane
+/// posture alone, so `--urgent` can no longer promise — or fail to promise —
+/// a boundary of its own. That is why an urgent probe against a driver which
+/// rejects mid-turn input is no longer refused: it waits for the same `Stop`
+/// its non-urgent sibling waits for, and the returned expectation says so
+/// rather than the call failing.
 ///
-/// A `Spawning` worker is *not* refused for a **non-urgent** probe: it has a
-/// pane and will reach a turn boundary, so the probe legitimately waits.
-fn probe_delivery_expectation(
-    server_state: &ServerState,
-    run_id: &str,
-    urgent: bool,
-) -> Result<ProbeDeliveryExpectation, String> {
+/// A `Spawning` worker is not refused either: it has a pane and will reach a
+/// boundary, so the probe legitimately waits.
+fn probe_delivery_expectation(server_state: &ServerState, run_id: &str) -> Result<ProbeDeliveryExpectation, String> {
     let Some(slot_id) = server_state.worker_registry.slot_for_run(run_id) else {
         return Err(format!(
             "run {run_id} has no live worker pane (no slot mapping); there is nothing to inject into"
@@ -447,28 +439,24 @@ fn probe_delivery_expectation(
         ));
     }
     let posture = server_state.pane_input_posture_for_run(run_id, slot_id);
-    match (urgent, posture) {
-        // Parked at its prompt: `dispatch_probe_if_idle` writes during this
-        // call, because no further boundary is coming on its own.
-        (_, PaneInputPosture::Parked) => Ok(ProbeDeliveryExpectation::Immediate),
-        (true, PaneInputPosture::MidTurnBuffered) => Ok(ProbeDeliveryExpectation::NextToolBoundary),
-        (false, _) => Ok(ProbeDeliveryExpectation::NextTurnBoundary),
-        // A non-`Working` activity never consulted the driver, so the reason
-        // must not blame it. The only non-terminal, non-parked activity left
-        // here is `Spawning`: the worker has a pane but has not started a
-        // turn, so there is no tool boundary for `--urgent` to aim at.
-        (true, PaneInputPosture::Refused) if activity != boss_protocol::WorkerActivity::Working => Err(format!(
-            "run {run_id} (slot {slot_id}) is {}; it has not reached a tool boundary yet, so an urgent probe \
-             has nowhere to be delivered. Re-issue without --urgent to wait for the worker's next turn \
-             boundary.",
-            activity.as_str(),
-        )),
-        (true, PaneInputPosture::Refused) => Err(format!(
-            "run {run_id} (slot {slot_id}) is {} and its driver does not accept mid-turn pane input, so an \
-             urgent probe cannot be delivered at a tool boundary. Re-issue without --urgent to wait for the \
-             worker's next turn boundary.",
-            activity.as_str(),
-        )),
+    match posture {
+        // Parked at its prompt, or mid-turn on a driver that buffers pane
+        // input: either way `dispatch_probe_now` writes during this call.
+        PaneInputPosture::Parked | PaneInputPosture::MidTurnBuffered => Ok(ProbeDeliveryExpectation::Immediate),
+        // No write may be issued right now. `Spawning` is the temporary case:
+        // the worker has a pane and its driver buffers mid-turn input, so the
+        // first `PostToolUse` of its first turn delivers.
+        PaneInputPosture::Refused
+            if activity == boss_protocol::WorkerActivity::Spawning
+                && server_state.run_mid_turn_pane_input(run_id).buffers() =>
+        {
+            Ok(ProbeDeliveryExpectation::NextToolBoundary)
+        }
+        // Everything else that is still live waits for a turn boundary: a
+        // driver whose foreground process does not read mid-turn stdin
+        // (`codex exec`) has no earlier opportunity, and neither does a
+        // spawning worker on one.
+        PaneInputPosture::Refused => Ok(ProbeDeliveryExpectation::NextTurnBoundary),
     }
 }
 

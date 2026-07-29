@@ -1,13 +1,14 @@
 //! Probe delivery: the mid-turn injection decision, and honest reporting.
 //!
-//! Two defects are covered here, both from the field report where two probes
-//! (one of them `--urgent`) were reported queued and then never delivered to a
-//! healthy `claude-sonnet-5` worker across ~27 tool boundaries:
+//! Three defects are covered here. The first two come from the field report
+//! where two probes (one of them `--urgent`) were reported queued and then
+//! never delivered to a healthy `claude-sonnet-5` worker across ~27 tool
+//! boundaries:
 //!
-//! 1. The urgent path fires on `PostToolUse`, and the event fan-out sets the
-//!    activity to `Working` before it runs. A parked-only guard is therefore
-//!    false 100% of the time at that boundary, on every driver — `--urgent`
-//!    could not deliver at all. The fix splits the decision into activity ×
+//! 1. The tool-boundary path fires on `PostToolUse`, and the event fan-out
+//!    sets the activity to `Working` before it runs. A parked-only guard is
+//!    therefore false 100% of the time at that boundary, on every driver — so
+//!    it could not deliver at all. The fix splits the decision into activity ×
 //!    driver, so an interactive-TUI driver takes mid-turn input while
 //!    `codex exec` (which leaves unread bytes in the tty for the shell to
 //!    execute) is still refused.
@@ -16,13 +17,19 @@
 //!    distinguish "arriving shortly" from "never going to arrive". The engine
 //!    now evaluates delivery up front, refuses what it cannot deliver, states
 //!    the boundary it committed to, and exposes a per-probe-id state.
+//!
+//! 3. Mid-turn delivery was gated behind the caller's `--urgent` flag, so a
+//!    plain `bossctl probe` still waited for a `Stop` — which, for a worker in
+//!    a long autonomous run, is effectively its terminal one. Transport now
+//!    follows the worker's pane posture and the flag is queue priority only;
+//!    the expectation tests below pin which posture yields which boundary.
 
 use super::*;
 
 use crate::app::executions;
 use crate::protocol::WorkerEvent;
 
-/// A `PostToolUse` hook event for `run_id`, the boundary the urgent probe
+/// A `PostToolUse` hook event for `run_id`, the boundary the mid-turn probe
 /// path fires on.
 fn post_tool_use(run_id: &str) -> crate::events_socket::IncomingHookEvent {
     crate::events_socket::IncomingHookEvent::for_test(
@@ -96,33 +103,35 @@ async fn sole_response(sink: &SessionSink) -> FrontendEvent {
 
 // ── The delivery fix ────────────────────────────────────────────────────────
 
-/// The headline regression: an urgent probe to a **working** Claude worker
-/// must be written into the pane at the tool boundary. Before the fix this
-/// wrote nothing, on every one of the worker's tool boundaries, because the
-/// guard consulted activity alone and the fan-out had just set it to
-/// `Working`.
+/// The headline regression: a probe to a **working** Claude worker must be
+/// written into the pane at the tool boundary. Before the first fix this wrote
+/// nothing, on every one of the worker's tool boundaries, because the guard
+/// consulted activity alone and the fan-out had just set it to `Working`.
+///
+/// Queued here with `urgent: false` deliberately: mid-turn delivery is the
+/// default now, not something the caller opts into.
 #[tokio::test(start_paused = true)]
-async fn urgent_probe_injects_mid_turn_for_a_working_claude_worker() {
+async fn probe_injects_mid_turn_for_a_working_claude_worker() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 3, None);
     let responder = app_session_capturing_one_send(&server_state).await;
 
-    let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), true);
-    dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
     let (slot, text) = responder
         .await
         .expect("app responder task")
-        .expect("an urgent probe to a mid-turn Claude worker must issue a SendToPane");
+        .expect("a probe to a mid-turn Claude worker must issue a SendToPane");
     assert_eq!(slot, 3);
     assert_eq!(
         text, "[coordinator-nudge] re-read the spec",
-        "urgent probes stay marked in the transcript so the worker and human readers can spot them",
+        "mid-turn probes stay marked in the transcript so the worker and human readers can spot them",
     );
     // Popped from the queue (delivered), not left behind for Stop.
     assert!(
         server_state.pop_pending_probe(&run_id).is_none(),
-        "a delivered urgent probe must not remain queued",
+        "a delivered probe must not remain queued",
     );
     // No UserPromptSubmit arrives while the agent is still mid-turn, and
     // there is no transcript to scan — `Buffered` is the honest outcome, and
@@ -138,7 +147,7 @@ async fn urgent_probe_injects_mid_turn_for_a_working_claude_worker() {
 /// `/dev/null`, so injected bytes would survive in the tty and be executed by
 /// the shell after it exits. The probe stays queued for the Stop boundary.
 #[tokio::test]
-async fn urgent_probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
+async fn probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 4, Some("codex"));
     let app_sink = make_session_sink();
@@ -146,8 +155,8 @@ async fn urgent_probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
         .register_app_session("session-app".into(), app_sink.clone())
         .await;
 
-    let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), true);
-    dispatch_urgent_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
 
     assert_eq!(
         app_sink.queue_stats().depth,
@@ -156,7 +165,7 @@ async fn urgent_probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
     );
     let still = server_state
         .pop_pending_probe(&run_id)
-        .expect("refused urgent probe must remain queued for the Stop boundary");
+        .expect("refused probe must remain queued for the Stop boundary");
     assert_eq!(still.probe_id, probe_id);
     assert_eq!(
         server_state.probe_lifecycle_state(&probe_id),
@@ -206,6 +215,144 @@ async fn parked_workers_are_injectable_regardless_of_driver() {
     );
 }
 
+/// End to end, and the point of the whole change: `bossctl probe` against a
+/// worker in the middle of a turn writes into that worker's composer **during
+/// the call**, with no hook event of any kind. No `Stop`, no `PostToolUse` —
+/// the test fires neither. This is the same transport the chore-update notice
+/// uses, and it is what makes a probe able to steer a worker that is 40
+/// minutes into a single autonomous turn instead of reaching it as it exits.
+#[tokio::test(start_paused = true)]
+async fn probe_run_steers_a_mid_turn_worker_without_any_boundary() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let responder = app_session_capturing_one_send(&server_state).await;
+
+    let sink = make_session_sink();
+    executions::handle_probe_run(
+        dispatch_for(&server_state, &sink),
+        FrontendRequest::ProbeRun {
+            run_id: run_id.clone(),
+            text: "stop — you are building the wrong target".into(),
+            urgent: false,
+        },
+    )
+    .await;
+    let probe_id = match sole_response(&sink).await {
+        FrontendEvent::ProbeQueued { probe_id, .. } => probe_id,
+        other => panic!("expected ProbeQueued, got {other:?}"),
+    };
+
+    let (slot, text) = responder
+        .await
+        .expect("app responder task")
+        .expect("a probe to a mid-turn worker must be written during the call, not held for Stop");
+    assert_eq!(slot, 3);
+    assert_eq!(text, "[coordinator-nudge] stop — you are building the wrong target");
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_none(),
+        "a probe written during the call must not also be left queued for a boundary",
+    );
+    // The handler issues the write from a spawned task, so let the
+    // verification window elapse before reading the settled state.
+    let mut settled = None;
+    for _ in 0..20 {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        settled = server_state.probe_lifecycle_state(&probe_id);
+        if settled != Some(ProbeDeliveryState::Injected) {
+            break;
+        }
+    }
+    assert_eq!(
+        settled,
+        Some(ProbeDeliveryState::Buffered),
+        "mid-turn text sits in the composer until the agent picks it up — Buffered, not Consumed",
+    );
+}
+
+/// Ordering: probes drain one per reply cycle. The in-flight slot that carries
+/// a pending `ProbeReplied` is single-valued per run, so a second mid-turn
+/// delivery before the first probe's reply boundary would silently discard it.
+/// The second probe waits instead — and is delivered, in order, once the turn
+/// boundary has taken the first one's reply.
+#[tokio::test(start_paused = true)]
+async fn a_second_probe_waits_for_the_first_probes_reply_cycle() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let responder = app_session_capturing_one_send(&server_state).await;
+
+    let first = server_state.queue_probe(run_id.clone(), "first".into(), false);
+    let second = server_state.queue_probe(run_id.clone(), "second".into(), false);
+
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    let (_, text) = responder
+        .await
+        .expect("app responder task")
+        .expect("the first probe must be written at the tool boundary");
+    assert_eq!(text, "[coordinator-nudge] first");
+
+    // Second tool boundary while the first probe still owes a reply: no write.
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    assert_eq!(
+        server_state.probe_lifecycle_state(&second),
+        Some(ProbeDeliveryState::Queued),
+        "the second probe must not be delivered while the first is in flight",
+    );
+    assert!(server_state.has_pending_probe(&run_id));
+    assert!(server_state.has_in_flight_probe(&run_id));
+
+    // The turn boundary takes the first probe's reply, freeing the slot.
+    let stop = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.clone()),
+        None,
+    );
+    dispatch_probe_reply_on_stop(&server_state, &stop).await;
+    assert!(!server_state.has_in_flight_probe(&run_id));
+    assert_ne!(first, second);
+
+    // Next tool boundary of the following turn delivers the second, in order.
+    let responder = app_session_capturing_one_send(&server_state).await;
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    let (_, text) = responder
+        .await
+        .expect("app responder task")
+        .expect("the second probe must be delivered once the reply cycle completed");
+    assert_eq!(text, "[coordinator-nudge] second");
+}
+
+/// The `[effort-escalation-ack]` protocol must keep working unchanged: a
+/// worker that emitted `[effort-escalation]` in its final response sits parked
+/// at its prompt, producing no further boundary of its own. The ack is written
+/// straight in — verbatim, with no `[coordinator-nudge]` marking, since a
+/// parked write becomes the prompt itself — and recorded as `Consumed`.
+#[tokio::test]
+async fn effort_escalation_ack_reaches_a_parked_worker_immediately() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-escalation-ack";
+    register_idle_worker(&server_state, run_id, 8);
+    let responder = app_session_capturing_one_send(&server_state).await;
+
+    let ack = "[effort-escalation-ack] approved: large. next_dispatch=true";
+    let probe_id = server_state.queue_probe(run_id.to_owned(), ack.to_owned(), false);
+    dispatch_probe_now(&server_state, run_id).await;
+
+    let (slot, text) = responder
+        .await
+        .expect("app responder task")
+        .expect("a parked worker has no boundary coming, so the ack must be written immediately");
+    assert_eq!(slot, 8);
+    assert_eq!(text, ack, "the ack must reach the worker verbatim");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Consumed),
+    );
+}
+
 // ── Honest reporting ────────────────────────────────────────────────────────
 
 /// A probe for a run with no live pane can never be delivered, so it must be
@@ -236,13 +383,13 @@ async fn probe_run_refuses_when_the_run_has_no_live_pane() {
     }
 }
 
-/// `--urgent` promises tool-boundary delivery. Against a driver that cannot
-/// take mid-turn input that promise is unkeepable, so the engine refuses
-/// instead of silently downgrading to Stop-boundary delivery under a flag that
-/// says otherwise — and the reason names the remedy (re-issue without
-/// `--urgent`).
+/// A worker whose driver cannot take mid-turn input is **accepted**, not
+/// refused, even with `--urgent`: the flag is queue priority now, so it never
+/// promises a boundary the driver cannot honour. What the caller gets instead
+/// is an expectation that names the boundary the probe really will wait for.
+/// Refusal stays scoped to probes that will never arrive at all.
 #[tokio::test]
-async fn probe_run_refuses_urgent_for_a_driver_that_rejects_mid_turn_input() {
+async fn probe_run_accepts_urgent_for_a_driver_that_rejects_mid_turn_input() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 2, Some("codex"));
     let sink = make_session_sink();
@@ -256,62 +403,60 @@ async fn probe_run_refuses_urgent_for_a_driver_that_rejects_mid_turn_input() {
     )
     .await;
     match sole_response(&sink).await {
-        FrontendEvent::ProbeRefused { reason, .. } => {
-            assert!(
-                reason.contains("mid-turn") && reason.contains("--urgent"),
-                "refusal must explain why urgent cannot be honoured and what to do: {reason}"
+        FrontendEvent::ProbeQueued {
+            urgent,
+            expected_delivery,
+            ..
+        } => {
+            assert!(urgent, "the priority flag still round-trips");
+            assert_eq!(
+                expected_delivery,
+                Some(ProbeDeliveryExpectation::NextTurnBoundary),
+                "a driver that reads no mid-turn stdin has no earlier boundary to offer",
             );
         }
-        other => panic!("expected ProbeRefused, got {other:?}"),
+        other => panic!("expected ProbeQueued, got {other:?}"),
     }
-    // Nothing was queued: a refused probe must not leave state behind that a
-    // later boundary could deliver.
-    assert!(server_state.pop_pending_probe(&run_id).is_none());
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_some(),
+        "an accepted probe must be queued for the boundary it was promised",
+    );
 }
 
-/// A `Spawning` worker is refused for `--urgent` too — it has no tool
-/// boundary yet — but for a different reason, and the reason must say so.
-/// The driver is never consulted on this path (the posture short-circuits
-/// before the lookup), so blaming it would assert something false: this
-/// fixture's driver is the default `claude`, which *does* take mid-turn
-/// input.
+/// A `Spawning` worker is accepted too, and — because its driver buffers
+/// mid-turn input — promised the *tool* boundary rather than the turn
+/// boundary: the first `PostToolUse` of its first turn can deliver it. This
+/// is the one case where the engine cannot write during the call but still
+/// has something earlier than `Stop` to offer.
 #[tokio::test]
-async fn probe_run_refuses_urgent_for_a_spawning_worker_without_blaming_the_driver() {
+async fn probe_run_promises_the_tool_boundary_for_a_spawning_buffering_worker() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_spawning_worker_with_driver(&server_state, 4, None);
     let sink = make_session_sink();
     executions::handle_probe_run(
         dispatch_for(&server_state, &sink),
         FrontendRequest::ProbeRun {
-            run_id: run_id.clone(),
+            run_id,
             text: "are you up yet".into(),
             urgent: true,
         },
     )
     .await;
     match sole_response(&sink).await {
-        FrontendEvent::ProbeRefused { reason, .. } => {
-            assert!(
-                reason.contains("spawning") && reason.contains("--urgent"),
-                "refusal must name the pre-session state and the flag: {reason}"
-            );
-            assert!(
-                !reason.contains("driver"),
-                "the driver was never consulted for a spawning worker, so the reason must not blame it: {reason}"
-            );
+        FrontendEvent::ProbeQueued { expected_delivery, .. } => {
+            assert_eq!(expected_delivery, Some(ProbeDeliveryExpectation::NextToolBoundary));
         }
-        other => panic!("expected ProbeRefused, got {other:?}"),
+        other => panic!("expected ProbeQueued, got {other:?}"),
     }
-    assert!(server_state.pop_pending_probe(&run_id).is_none());
 }
 
-/// The same `Spawning` worker accepts a *non-urgent* probe: it has a pane and
-/// will reach a turn boundary, so waiting for it is a promise the engine can
-/// keep.
+/// A `Spawning` worker whose driver rejects mid-turn input has no tool
+/// boundary to aim at either, so it is promised the turn boundary. Same
+/// acceptance, honestly weaker promise.
 #[tokio::test]
-async fn probe_run_accepts_a_non_urgent_probe_for_a_spawning_worker() {
+async fn probe_run_promises_the_turn_boundary_for_a_spawning_non_buffering_worker() {
     let (server_state, _dir) = test_server_state();
-    let run_id = register_spawning_worker_with_driver(&server_state, 4, None);
+    let run_id = register_spawning_worker_with_driver(&server_state, 4, Some("codex"));
     let sink = make_session_sink();
     executions::handle_probe_run(
         dispatch_for(&server_state, &sink),
@@ -330,42 +475,12 @@ async fn probe_run_accepts_a_non_urgent_probe_for_a_spawning_worker() {
     }
 }
 
-/// The same worker accepts a *non-urgent* probe, because waiting for the next
-/// turn boundary is a promise the engine can keep. Refusal must be scoped to
-/// genuinely undeliverable probes, not to "the worker is busy".
+/// The headline reporting change: a plain (non-urgent) probe against a
+/// mid-turn Claude worker is promised **immediate** delivery, because the
+/// engine writes into the agent's composer during the call rather than
+/// holding the text for a `Stop` that a long autonomous turn never reaches.
 #[tokio::test]
-async fn probe_run_accepts_non_urgent_against_a_working_worker_with_a_turn_boundary_promise() {
-    let (server_state, _dir) = test_server_state();
-    let run_id = register_working_worker_with_driver(&server_state, 2, Some("codex"));
-    let sink = make_session_sink();
-    executions::handle_probe_run(
-        dispatch_for(&server_state, &sink),
-        FrontendRequest::ProbeRun {
-            run_id: run_id.clone(),
-            text: "check in later".into(),
-            urgent: false,
-        },
-    )
-    .await;
-    match sole_response(&sink).await {
-        FrontendEvent::ProbeQueued {
-            urgent,
-            expected_delivery,
-            ..
-        } => {
-            assert!(!urgent);
-            assert_eq!(expected_delivery, Some(ProbeDeliveryExpectation::NextTurnBoundary));
-        }
-        other => panic!("expected ProbeQueued, got {other:?}"),
-    }
-}
-
-/// An urgent probe to a mid-turn Claude worker is accepted *and* the engine
-/// says which boundary it committed to. The old response carried only the
-/// echoed `urgent` flag, which is what let the CLI print "will inject at next
-/// tool boundary" for a path that could never fire.
-#[tokio::test]
-async fn probe_run_accepts_urgent_against_a_claude_worker_with_a_tool_boundary_promise() {
+async fn probe_run_promises_immediate_delivery_against_a_mid_turn_claude_worker() {
     let (server_state, _dir) = test_server_state();
     let run_id = register_working_worker_with_driver(&server_state, 2, None);
     let sink = make_session_sink();
@@ -374,7 +489,7 @@ async fn probe_run_accepts_urgent_against_a_claude_worker_with_a_tool_boundary_p
         FrontendRequest::ProbeRun {
             run_id: run_id.clone(),
             text: "course-correct now".into(),
-            urgent: true,
+            urgent: false,
         },
     )
     .await;
@@ -385,11 +500,14 @@ async fn probe_run_accepts_urgent_against_a_claude_worker_with_a_tool_boundary_p
             probe_id,
             ..
         } => {
-            assert!(urgent, "urgent probe must echo urgent: true");
-            assert_eq!(expected_delivery, Some(ProbeDeliveryExpectation::NextToolBoundary));
+            assert!(!urgent, "no priority flag was set");
             assert_eq!(
-                server_state.probe_lifecycle_state(&probe_id),
-                Some(ProbeDeliveryState::Queued),
+                expected_delivery,
+                Some(ProbeDeliveryExpectation::Immediate),
+                "a mid-turn worker on a buffering driver is written to during the call",
+            );
+            assert!(
+                server_state.probe_lifecycle_state(&probe_id).is_some(),
                 "an accepted probe must be queryable from the moment it is accepted",
             );
         }

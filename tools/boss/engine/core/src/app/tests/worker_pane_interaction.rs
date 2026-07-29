@@ -313,6 +313,10 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
                 server_state.probe_lifecycle_state(&probe_id),
                 Some(ProbeDeliveryState::Queued),
             );
+            assert!(
+                !server_state.probe_record(&probe_id).expect("probe record").urgent,
+                "chore-update requeue must not jump the run's probe queue",
+            );
         }
         other => panic!("expected NotAcceptingInput(Working), got {other:?}"),
     }
@@ -322,7 +326,6 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
     let queued = server_state
         .pop_pending_probe(run_id)
         .expect("chore-update notice must be re-queued for Stop delivery");
-    assert!(!queued.urgent, "chore-update requeue must be non-urgent (Stop path)");
     assert_eq!(queued.text, msg);
 }
 

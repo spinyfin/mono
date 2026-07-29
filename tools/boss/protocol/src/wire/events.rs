@@ -268,8 +268,9 @@ pub enum FrontendEvent {
         run_id: String,
         probe_id: String,
         /// Echoes the `urgent` flag from the originating `ProbeRun`
-        /// request. When `true`, the probe will be delivered at the
-        /// next `PostToolUse` boundary rather than the next `Stop`.
+        /// request. When `true`, the probe was pushed to the front of the
+        /// run's queue. It does not select a delivery boundary — see
+        /// `expected_delivery` for that.
         #[serde(default)]
         urgent: bool,
         /// Which boundary the engine expects to deliver at, evaluated against
@@ -283,8 +284,10 @@ pub enum FrontendEvent {
     /// Engine **refused** a probe: it evaluated delivery and concluded the
     /// text would never reach the worker, so nothing was queued and no
     /// `probe_id` was minted. `reason` is operator-facing and names the
-    /// blocking condition (no live pane, terminal worker, `--urgent` against
-    /// a driver that cannot take mid-turn input, …).
+    /// blocking condition (no live pane, a terminal worker, …). A probe that
+    /// merely has to wait — a driver that takes no mid-turn input, a worker
+    /// still spawning — is accepted with the matching
+    /// [`ProbeDeliveryExpectation`], not refused: it will arrive.
     ///
     /// Clients must treat this as a failure — a non-zero exit for a CLI. An
     /// accepted-but-undeliverable probe is indistinguishable from one about
@@ -321,7 +324,7 @@ pub enum FrontendEvent {
         probe_id: String,
         text: String,
     },
-    /// Push: an urgent probe write could not be confirmed delivered.
+    /// Push: a mid-turn probe write could not be confirmed delivered.
     /// NOT proof of loss — left `Unconfirmed` (not auto-re-queued, to
     /// avoid duplicate delivery); the observer decides on redelivery.
     ProbeDeliveryEscalated {
