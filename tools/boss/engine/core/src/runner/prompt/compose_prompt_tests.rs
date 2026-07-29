@@ -302,52 +302,76 @@ fn acceptance_criterion_uses_fresh_branch_when_no_pr_url() {
     );
 }
 
+/// No `.boss/recovery-report.json` marker in the workspace means the engine
+/// holds no durable pointer for this run: no block at all, and critically no
+/// speculative `jj edit ...@origin` line naming a branch nobody confirmed
+/// was ever pushed (the T-shape bug this fix closes).
 #[test]
-fn no_recovery_block_when_no_prior_branch() {
+fn no_recovery_block_when_no_recovery_report() {
+    let ws = tempfile::TempDir::new().unwrap();
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
             .work_item(&chore_without_pr())
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .workspace_path(ws.path())
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
     assert!(
         !prompt.contains("STARTUP RECOVERY"),
-        "no recovery block expected when recovery_branch is None:\n{prompt}",
+        "no recovery block expected when no recovery-report marker is present:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("@origin"),
+        "no speculative branch-resume instruction expected without a durable pointer:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("may also have pushed"),
+        "no speculative 'may have pushed' language expected without a durable pointer:\n{prompt}",
     );
 }
 
+/// A recorded recovery marker IS a durable pointer the engine wrote itself —
+/// the block must still fire, and must cite the concrete pointer (the dead
+/// execution's id) rather than a guessed branch name.
 #[test]
-fn recovery_block_injected_when_prior_branch_provided() {
+fn recovery_block_injected_when_recovery_report_present() {
+    let ws = tempfile::TempDir::new().unwrap();
+    boss_engine_recovery::recovery_apply::RecoveryReport {
+        for_execution_id: "exec_abc123_01".to_owned(),
+        from_execution_id: "exec_prior123_09".to_owned(),
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+        applied: None,
+        patch_error: None,
+    }
+    .write(ws.path())
+    .expect("write recovery report");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
             .work_item(&chore_without_pr())
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
-            .recovery_branch("boss/exec_prior123_09")
+            .workspace_path(ws.path())
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
     assert!(
         prompt.contains("## STARTUP RECOVERY"),
-        "recovery block should be present when recovery_branch is Some:\n{prompt}",
+        "recovery block should be present when a recovery report is recorded:\n{prompt}",
     );
     assert!(
-        prompt.contains("boss/exec_prior123_09"),
-        "recovery block should name the prior branch:\n{prompt}",
-    );
-    assert!(
-        prompt.contains("jj edit boss/exec_prior123_09@origin"),
-        "recovery block should instruct jj edit on the remote branch:\n{prompt}",
+        prompt.contains("exec_prior123_09"),
+        "recovery block should name the concrete dead execution it recovered from:\n{prompt}",
     );
 }
 
 // ── STARTUP RECOVERY: recovered working state ──────────────────────────
 //
-// The old block talked only about a *pushed branch* and told the worker
-// to fall back to `jj new main@origin` — which moves `@` off any
-// recovered uncommitted state. These tests pin the fix.
+// The block used to talk about a *pushed branch* nobody ever confirmed was
+// pushed, and told the worker to fall back to `jj new main@origin` — which
+// moves `@` off any recovered uncommitted state. It now fires only on a
+// durable pointer the engine wrote itself (the recovery-report marker); no
+// marker means no block, and the marker's contents are what it cites,
+// never a guessed branch name. These tests pin the fix.
 
 fn apply_report(
     paths: &[&str],
@@ -362,23 +386,9 @@ fn apply_report(
     }
 }
 
-/// With no recovery marker the block must still refuse the unconditional
-/// `jj new main@origin` that used to discard recovered state.
-#[test]
-fn recovery_block_never_tells_the_worker_to_unconditionally_reset() {
-    let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", None);
-    assert!(
-        block.contains("Do NOT run `jj new main@origin`"),
-        "the block must forbid the reset that discards recovered state:\n{block}",
-    );
-    assert!(
-        block.contains("Only if `jj status` shows the working copy is **clean**"),
-        "the reset must be conditional on a clean working copy:\n{block}",
-    );
-}
-
 /// Cube recovered the tree in place: say so, say the jj history came with
-/// it, and tell the worker to look before it leaps.
+/// it, tell the worker to look before it leaps, and never suggest resetting
+/// it.
 #[test]
 fn recovery_block_reports_in_place_recovery() {
     let report = boss_engine_recovery::recovery_apply::RecoveryReport {
@@ -388,7 +398,11 @@ fn recovery_block_reports_in_place_recovery() {
         applied: None,
         patch_error: None,
     };
-    let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+    let block = startup_recovery_block(&report);
+    assert!(
+        block.contains("exec_dead"),
+        "block should cite the concrete recovered-from execution:\n{block}"
+    );
     assert!(block.contains("State recovered IN PLACE"), "{block}");
     assert!(
         block.contains("operation log is intact") || block.contains("operation log"),
@@ -398,6 +412,10 @@ fn recovery_block_reports_in_place_recovery() {
     assert!(
         block.contains("jj diff --stat"),
         "the worker must be told how to inspect before building on it:\n{block}",
+    );
+    assert!(
+        !block.contains("@origin"),
+        "no speculative branch-resume instruction; the recovery report is the only pointer cited:\n{block}",
     );
 }
 
@@ -412,7 +430,7 @@ fn recovery_block_reports_patch_recovery_in_human_terms() {
         applied: Some(apply_report(&["tools/cube/src/app.rs", "docs/x.md"], 120, 14)),
         patch_error: None,
     };
-    let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+    let block = startup_recovery_block(&report);
     assert!(block.contains("State recovered FROM A PATCH"), "{block}");
     assert!(block.contains("2 file(s), +120/-14"), "{block}");
     assert!(block.contains("`tools/cube/src/app.rs`"), "{block}");
@@ -435,7 +453,7 @@ fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
         applied: None,
         patch_error: Some("error: patch does not apply".to_owned()),
     };
-    let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", Some(&report));
+    let block = startup_recovery_block(&report);
     assert!(block.contains("Recovery FAILED"), "{block}");
     assert!(block.contains("error: patch does not apply"), "{block}");
     assert!(
@@ -448,38 +466,28 @@ fn recovery_block_says_so_loudly_when_the_patch_did_not_apply() {
     );
 }
 
-/// The pushed-branch half of the block is preserved in every variant —
-/// the new working-state reporting is additive, not a replacement.
-#[test]
-fn recovery_block_keeps_the_prior_branch_instructions() {
-    for report in [
-        None,
-        Some(boss_engine_recovery::recovery_apply::RecoveryReport {
-            for_execution_id: "e".to_owned(),
-            from_execution_id: "d".to_owned(),
-            source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
-            applied: None,
-            patch_error: None,
-        }),
-    ] {
-        let block = startup_recovery_block("boss/exec_prior_09", "boss/exec_new_01", report.as_ref());
-        assert!(block.contains("jj edit boss/exec_prior_09@origin"), "{block}");
-        assert!(block.contains("boss/exec_new_01"), "{block}");
-    }
-}
-
 #[test]
 fn recovery_block_suppressed_when_pr_url_set() {
     // When the work item already has a PR URL, the existing RESUME
     // EXISTING PR path takes precedence; the recovery block must not
-    // also appear (that would be contradictory).
+    // also appear (that would be contradictory), even if a recovery
+    // report happens to be present in the workspace.
+    let ws = tempfile::TempDir::new().unwrap();
+    boss_engine_recovery::recovery_apply::RecoveryReport {
+        for_execution_id: "exec_abc123_01".to_owned(),
+        from_execution_id: "exec_prior123_09".to_owned(),
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+        applied: None,
+        patch_error: None,
+    }
+    .write(ws.path())
+    .expect("write recovery report");
     let chore = chore_with_pr("https://github.com/org/repo/pull/42");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
             .work_item(&chore)
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
-            .recovery_branch("boss/exec_prior123_09")
+            .workspace_path(ws.path())
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
@@ -495,12 +503,21 @@ fn recovery_block_suppressed_when_pr_url_set() {
 
 #[test]
 fn recovery_block_appears_before_execution_context() {
+    let ws = tempfile::TempDir::new().unwrap();
+    boss_engine_recovery::recovery_apply::RecoveryReport {
+        for_execution_id: "exec_abc123_01".to_owned(),
+        from_execution_id: "exec_prior123_09".to_owned(),
+        source: boss_engine_recovery::recovery_apply::RecoverySource::CubeInPlace,
+        applied: None,
+        patch_error: None,
+    }
+    .write(ws.path())
+    .expect("write recovery report");
     let prompt = compose_execution_prompt(
         ExecutionPromptParams::builder()
             .execution(&base_execution())
             .work_item(&chore_without_pr())
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
-            .recovery_branch("boss/exec_prior123_09")
+            .workspace_path(ws.path())
             .pr_template_set(&crate::pr_template::PrTemplateSet::default())
             .build(),
     );
@@ -509,26 +526,6 @@ fn recovery_block_appears_before_execution_context() {
     assert!(
         recovery_pos < exec_pos,
         "recovery block must appear before execution context:\n{prompt}",
-    );
-}
-
-#[test]
-fn recovery_block_mentions_new_expected_branch() {
-    // The new worker should push under the NEW expected branch name
-    // (derived from the current execution id), not the prior one.
-    let prompt = compose_execution_prompt(
-        ExecutionPromptParams::builder()
-            .execution(&base_execution())
-            .work_item(&chore_without_pr())
-            .workspace_path(std::path::Path::new("/tmp/workspace"))
-            .recovery_branch("boss/exec_prior123_09")
-            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
-            .build(),
-    );
-    // "boss/exec_abc123_01" is the new expected branch
-    assert!(
-        prompt.contains("boss/exec_abc123_01"),
-        "recovery block should mention the new expected branch name:\n{prompt}",
     );
 }
 

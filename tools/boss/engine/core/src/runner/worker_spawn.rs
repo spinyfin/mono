@@ -276,46 +276,6 @@ pub(crate) async fn compose_worker_spawn(
     } else {
         Vec::new()
     };
-    // Detect whether this is a respawn after a crash: if the work item has
-    // no task-level pr_url (handled by the existing RESUME EXISTING PR path)
-    // but has a prior orphaned execution with no pr_url, derive its expected
-    // branch so the new worker can attempt to resume it.
-    let recovery_branch: Option<String> = if work_item_pr_url(work_item).is_none() {
-        match work_db.get_prior_orphaned_execution(&execution.work_item_id, &execution.id) {
-            Ok(Some(prior)) => {
-                let branch = crate::completion::expected_branch_name(
-                    &prior.id,
-                    &prior.branch_naming,
-                    prior.worker_branch_prefix.as_deref(),
-                );
-                tracing::info!(
-                    execution_id = %execution.id,
-                    prior_execution_id = %prior.id,
-                    recovery_branch = %branch,
-                    "startup recovery: prior orphaned execution found; directing worker to attempt branch resume",
-                );
-                Some(branch)
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    execution_id = %execution.id,
-                    "startup recovery: no prior orphaned execution found; worker will start from main",
-                );
-                None
-            }
-            Err(err) => {
-                tracing::warn!(
-                    execution_id = %execution.id,
-                    error = %format!("{err:#}"),
-                    "startup recovery: failed to query prior orphaned execution; worker will start from main",
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
     // For ci_remediation executions (retrigger-kind only after Phase 5),
     // look up the active attempt so the prompt can show the failing checks.
     //
@@ -450,7 +410,6 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_parent_project(parent_project.as_ref())
                         .maybe_cube_change_id(cube_change_id)
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
-                        .maybe_recovery_branch(recovery_branch.as_deref())
                         .maybe_ci_attempt(ci_attempt.as_ref())
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
                         .pr_template_set(&pr_template_set)
@@ -482,7 +441,6 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_parent_project(parent_project.as_ref())
                     .maybe_cube_change_id(cube_change_id)
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
-                    .maybe_recovery_branch(recovery_branch.as_deref())
                     .maybe_ci_attempt(ci_attempt.as_ref())
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
                     .pr_template_set(&pr_template_set)
@@ -602,7 +560,6 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_parent_project(parent_project.as_ref())
                 .maybe_cube_change_id(cube_change_id)
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
-                .maybe_recovery_branch(recovery_branch.as_deref())
                 .maybe_ci_attempt(ci_attempt.as_ref())
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
                 .pr_template_set(&pr_template_set)
