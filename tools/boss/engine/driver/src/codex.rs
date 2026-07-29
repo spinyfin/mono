@@ -45,6 +45,33 @@ use super::{
     default_structured_output_wiring,
 };
 
+/// Marker prefix on a [`WorkerEvent::Notification`] message emitted by this
+/// driver's stdout/rollout progress sessions when a `command_execution` item
+/// started (`item.started` / a rollout `function_call`) but never observed a
+/// completion (`item.completed` / `function_call_output`) before its turn
+/// boundary — reproduced in probe 6 of the exit-code investigation: a shell
+/// command that outlives the model's chosen `yield_time_ms` with no further
+/// polling leaves `turn.completed` firing (and `codex exec` exiting 0) with
+/// no completion record for that command anywhere.
+///
+/// The engine's `codex_unobserved_command` module matches on this literal
+/// prefix to stage the signal for `WorkerCompletionHandler`, which files an
+/// attention item and refuses the worker's `NO_CHANGES_NEEDED` claim for the
+/// rest of the run.
+pub const UNOBSERVED_COMMAND_MARKER: &str = "[codex-unobserved-command]";
+
+/// Render the notification message for one abandoned `command_execution`:
+/// [`UNOBSERVED_COMMAND_MARKER`], a single space, then the bare command
+/// verbatim — nothing else. Deliberately terse (no embedded explanatory
+/// prose) so the engine-side consumer can recover the exact command with a
+/// plain `strip_prefix` + trim; a command can itself contain colons or other
+/// punctuation a more descriptive template might be split on ambiguously.
+/// Shared by both progress-session dialects so the message shape stays in
+/// one place.
+pub(crate) fn unobserved_command_notification(command: &str) -> String {
+    format!("{UNOBSERVED_COMMAND_MARKER} {command}")
+}
+
 // ---------------------------------------------------------------------------
 // Codex model / effort menu
 // ---------------------------------------------------------------------------

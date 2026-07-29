@@ -1083,6 +1083,15 @@ pub struct WorkerCompletionHandler {
     /// which files an attention and increments
     /// `worker_proposals.channel_error`. See [`crate::proposal_channel_error`].
     staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
+    /// In-memory `execution_id → abandoned commands` staging map for Codex
+    /// `command_execution` items whose `item.started` was observed with no
+    /// matching `item.completed` before the turn boundary. Populated by the
+    /// worker-event dispatcher in `app/worker_events.rs`; consulted by
+    /// [`Self::detect_and_file_unobserved_command_signal`] (files an
+    /// attention item) and by `on_stop_inner`'s `NO_CHANGES_NEEDED` gate,
+    /// which refuses the worker's no-op claim when this is non-empty for the
+    /// execution. See [`crate::codex_unobserved_command`].
+    staged_unobserved_commands: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
     /// Toggleable feature flags (incident 001 AI #5). Consulted by
     /// `on_stop_inner` and `recheck_for_pr` to decide whether the
     /// cold-path PR fallback is permitted to run. Defaults to a

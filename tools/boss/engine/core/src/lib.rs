@@ -43,6 +43,7 @@ pub mod design_detector;
 pub use boss_deterministic_resolvers as deterministic_resolvers;
 pub use boss_dispatch_events as dispatch_events;
 pub mod codex_home_retention_sweep;
+pub mod codex_unobserved_command;
 pub mod dispatch_failure_recovery_sweep;
 pub mod dispatch_inflight;
 pub mod dispatch_metrics;

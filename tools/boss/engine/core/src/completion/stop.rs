@@ -581,6 +581,13 @@ impl WorkerCompletionHandler {
         // the running-status gate below.
         self.detect_and_file_proposal_channel_error(&execution).await;
 
+        // Codex unobserved-command detection: a `command_execution` that
+        // started with no observed completion before this turn boundary
+        // (probe 6, exit-code investigation). Read-only against staged
+        // in-memory state, never touches PR state, so — like the three
+        // passes above — it is safe ahead of the running-status gate below.
+        self.detect_and_file_unobserved_command_signal(&execution).await;
+
         // A probe minted on an earlier Stop can still be sitting undelivered in
         // the run's pending-probe queue (e.g. a `PROBE_NO_PR` nudge whose
         // `SendToPane` failed and was requeued for retry on the next
@@ -1087,14 +1094,32 @@ must not be asked to open one",
                 if should_enqueue_reviewer_for_primary(&execution.kind)
                     && self.worker_signalled_no_op(execution_id).await
                 {
-                    tracing::info!(
-                        execution_id,
-                        expected_branch = %expected_branch,
-                        kind = %execution.kind,
-                        "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
-                         work already done; closing task as a no-op (no PR, no nudge)"
-                    );
-                    return self.finalize_no_op_completion(&execution).await;
+                    // "validation passed / nothing to do" is exactly the
+                    // claim an unobserved command undermines: Boss never saw
+                    // whether that command actually succeeded, so it cannot
+                    // trust the worker's verification. Refuse the no-op
+                    // claim and fall through to the normal produce-a-PR
+                    // nudge rather than closing the task as done.
+                    if self.staged_unobserved_commands.has_any(execution_id) {
+                        tracing::warn!(
+                            execution_id,
+                            expected_branch = %expected_branch,
+                            kind = %execution.kind,
+                            "stop event: worker emitted NO_CHANGES_NEEDED but this run left at least \
+                             one Codex command_execution unobserved (item.started with no \
+                             item.completed) — refusing the no-op claim; falling through to the \
+                             produce-a-PR nudge instead",
+                        );
+                    } else {
+                        tracing::info!(
+                            execution_id,
+                            expected_branch = %expected_branch,
+                            kind = %execution.kind,
+                            "stop event: worker emitted NO_CHANGES_NEEDED with no PR produced — \
+                             work already done; closing task as a no-op (no PR, no nudge)"
+                        );
+                        return self.finalize_no_op_completion(&execution).await;
+                    }
                 }
                 tracing::info!(
                     execution_id,

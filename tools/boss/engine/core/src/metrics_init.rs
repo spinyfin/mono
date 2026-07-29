@@ -50,6 +50,9 @@ pub fn init_all(registry: &Registry) {
     crate::app::proposals::register_metrics(registry);
     // Worker-proposal API: proposal_channel_error detection counter.
     crate::proposal_channel_error::register_metrics(registry);
+    // Codex unobserved-command detection counter (item.started with no
+    // item.completed before the turn boundary).
+    crate::codex_unobserved_command::register_metrics(registry);
     // GitHub API usage telemetry: call/points/rate-limit totals and the
     // remaining-quota gauges. The per-caller breakdown is registered
     // dynamically on first use (the caller x bucket axis isn't a
@@ -218,14 +221,19 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Codex unobserved-command detection counter.
+        assert!(
+            names.contains(&"codex.unobserved_command".to_owned()),
+            "init_all must register codex.unobserved_command"
+        );
         assert_eq!(
             names.len(),
-            83,
+            84,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 14 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \
-             5 github_api counters"
+             5 github_api + 1 codex_unobserved_command counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

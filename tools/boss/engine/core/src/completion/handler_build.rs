@@ -29,6 +29,7 @@ impl WorkerCompletionHandler {
             staged_pr_urls: Arc::new(crate::pr_url_capture::StagedPrUrlCache::new()),
             staged_revision_pushes: Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new()),
             staged_proposal_channel_errors: Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new()),
+            staged_unobserved_commands: Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new()),
             feature_flags: Arc::new(crate::feature_flags::FeatureFlagsStore::new(std::path::PathBuf::new())),
             branch_verifier: Arc::new(CommandBranchVerifier::new()),
             metrics: local_metrics,
@@ -75,6 +76,17 @@ impl WorkerCompletionHandler {
         tracker: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
     ) -> Self {
         self.staged_proposal_channel_errors = tracker;
+        self
+    }
+
+    /// Wire an externally-owned [`crate::codex_unobserved_command::UnobservedCommandTracker`]
+    /// into this handler. Called by `app.rs` so the worker-event dispatcher
+    /// and `on_stop`'s unobserved-command pass share the same instance.
+    pub fn with_staged_unobserved_commands(
+        mut self,
+        tracker: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
+    ) -> Self {
+        self.staged_unobserved_commands = tracker;
         self
     }
 

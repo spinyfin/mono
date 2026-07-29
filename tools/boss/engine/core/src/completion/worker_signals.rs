@@ -597,6 +597,58 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// File an attention item for every abandoned Codex command staged for
+    /// `execution` — a `command_execution` whose `item.started` (stdout) /
+    /// `function_call` (rollout) was observed with no matching completion
+    /// before a turn boundary. See [`crate::codex_unobserved_command`].
+    ///
+    /// Content-keyed dedup on the command text, mirroring
+    /// [`Self::file_worker_signal_attention`]: `staged_unobserved_commands`
+    /// never clears, so this runs safely on every terminal Stop of the same
+    /// execution without re-filing a command already surfaced.
+    pub(super) async fn detect_and_file_unobserved_command_signal(&self, execution: &crate::work::WorkExecution) {
+        let kind = crate::codex_unobserved_command::UNOBSERVED_COMMAND_ATTENTION_KIND;
+        for command in self.staged_unobserved_commands.list(&execution.id) {
+            let already_seen = self
+                .work_db
+                .list_attention_items(&execution.id)
+                .map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i.kind == kind && i.body_markdown.contains(&command))
+                })
+                .unwrap_or(false);
+            if already_seen {
+                continue;
+            }
+
+            let body = format!(
+                "Codex started a shell command but Boss never observed its completion before the \
+                 turn boundary (`item.started` with no `item.completed`).\n\n\
+                 - execution: `{execution_id}`\n\
+                 - work item: `{work_item_id}`\n\n\
+                 Command:\n\n```\n{command}\n```\n\n\
+                 Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
+                 run that depends on it — tests passing, a build succeeding, `NO_CHANGES_NEEDED` — \
+                 is treated as unconfirmed: the sanctioned no-op completion is refused for this \
+                 execution as a result, so the worker still gets the normal produce-a-PR nudge.",
+                execution_id = execution.id,
+                work_item_id = execution.work_item_id,
+            );
+            if let Err(err) = self
+                .file_execution_attention(execution, kind, "Codex left a command unobserved", body)
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution.id,
+                    command = %command,
+                    ?err,
+                    "codex_unobserved_command: failed to file attention item (non-fatal)",
+                );
+            }
+        }
+    }
+
     /// `Some(reason)` when `execution` has at least one *unresolved*
     /// (`status != "resolved"`) worker-escalation/blocker attention item —
     /// the condition [`Self::nudge_or_park`] uses to suppress the
