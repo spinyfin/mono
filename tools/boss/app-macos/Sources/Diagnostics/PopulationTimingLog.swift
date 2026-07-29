@@ -6,7 +6,7 @@ import os
 /// start and on product switch, and its four segments — request→reply,
 /// off-main decode, main-thread apply, and render.
 ///
-/// Motivation (see the T2101 investigation,
+/// Motivation (see
 /// `docs/investigations/task-population-latency-on-start-and-product-switch.md`,
 /// remediation R1): before this, there was **no** wall-clock timing
 /// anywhere on this path. `UISignpost` covered only the Ghostty panes and
@@ -200,6 +200,9 @@ final class PopulationTimingLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.PopulationTimingLog")
     private var currentDate = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -241,7 +244,11 @@ final class PopulationTimingLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(
+                    lineData, to: handle, site: "PopulationTimingLog", warned: &writeFailureWarned
+                )
+            }
         }
     }
 
@@ -263,7 +270,7 @@ final class PopulationTimingLog: @unchecked Sendable {
 
     private func openFile(dateStr: String) {
         guard let directory else { return }
-        fileHandle?.closeFile()
+        DiagnosticWrite.closeQuietly(fileHandle)
         fileHandle = nil
 
         do {
@@ -280,9 +287,10 @@ final class PopulationTimingLog: @unchecked Sendable {
             FileManager.default.createFile(atPath: path, contents: nil)
         }
         guard let handle = FileHandle(forWritingAtPath: path) else { return }
-        handle.seekToEndOfFile()
+        guard DiagnosticWrite.seekToEndQuietly(handle) else { return }
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {

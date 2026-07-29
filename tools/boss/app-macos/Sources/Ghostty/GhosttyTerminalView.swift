@@ -352,7 +352,9 @@ final class GhosttyTerminalHostView: NSView {
                 envSummary: envSummary,
                 initialInputCount: launchSpec.initialInput.count
             )
-            FileHandle.standardError.write(Data(diagnostic.utf8))
+            // `write(contentsOf:)`, not the exception-raising `write(_:)` — see
+            // [[DiagnosticWrite]]. A closed/broken stderr must never abort the app.
+            try? FileHandle.standardError.write(contentsOf: Data(diagnostic.utf8))
             return nil
         }
 

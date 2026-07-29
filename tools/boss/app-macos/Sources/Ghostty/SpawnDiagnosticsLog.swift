@@ -41,6 +41,9 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.SpawnDiagnosticsLog")
     private var currentDate = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -97,7 +100,11 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(
+                    lineData, to: handle, site: "SpawnDiagnosticsLog", warned: &writeFailureWarned
+                )
+            }
         }
     }
 
@@ -126,7 +133,7 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
 
     private func openFile(dateStr: String) {
         guard let directory else { return }
-        fileHandle?.closeFile()
+        DiagnosticWrite.closeQuietly(fileHandle)
         fileHandle = nil
 
         do {
@@ -140,9 +147,10 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
             FileManager.default.createFile(atPath: path, contents: nil)
         }
         guard let handle = FileHandle(forWritingAtPath: path) else { return }
-        handle.seekToEndOfFile()
+        guard DiagnosticWrite.seekToEndQuietly(handle) else { return }
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {
