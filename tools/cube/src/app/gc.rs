@@ -13,9 +13,11 @@ use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config, paths};
 
+use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
+use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
 use crate::app::salvage::{
@@ -315,7 +317,15 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     // Skip if a pass completed recently — how recently depends on whether
     // there is known backlog left over from a prior bounded pass.
     if let Some(last_completed) = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)? {
-        let interval = if pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true) {
+        // A free-workspace surplus counts as backlog for exactly the same
+        // reason an aged-unhealthy one does. Trimming needs a `jj git fetch`
+        // per candidate, so a repo well over its mark will not drain inside
+        // one 20s pass; without this the next attempt would be a full day
+        // away and the surplus would sit on disk in the meantime. Both checks
+        // are DB-only.
+        let has_backlog =
+            pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true) || has_free_workspace_surplus(store);
+        let interval = if has_backlog {
             POOL_GC_BACKLOG_RETRY_SECS
         } else {
             AUTO_GC_INTERVAL_SECS
@@ -353,12 +363,48 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     };
     let runner = RealCommandRunner;
 
-    // Run the aged-unhealthy recycler first so it genuinely gets first claim
-    // on the time budget — it is the part that actually reclaims disk space
-    // from stuck-dirty workspaces, and it must not be starved by the
-    // reconcile pass below (which only refreshes cached health labels, a
-    // less time-critical repair). It is bounded by `deadline` itself, so a
-    // large backlog cannot consume more than its share.
+    // Compaction gets first claim on the time budget, because it is the pass
+    // that actually returns the disk. Uncleaned build-artifact trees were 82%
+    // of the entire workspaces tree when the pool filled a 1.8 TiB volume; the
+    // checkouts they sit in are ~600 MB each. It is also the cheapest pass
+    // here — one local jj read plus an unlink per workspace, no network at all
+    // — so putting it first costs the passes below very little, while putting
+    // it last would let a large dirty or unreachable-remote backlog starve it
+    // indefinitely behind their `jj git fetch` calls.
+    //
+    // (This supersedes the aged-unhealthy pass's former claim on going first,
+    // which rested on it being "the part that actually reclaims disk space".
+    // That was true when nothing else reclaimed anything; it only ever reset
+    // working copies and left every byte on disk.)
+    if let Ok(now) = current_epoch_s() {
+        let compacted = compact_free_workspaces(
+            &runner,
+            &store,
+            database_path.as_deref(),
+            None,
+            now,
+            false,
+            Some(deadline),
+        );
+        if !compacted.is_empty() {
+            eprintln!(
+                "cube: auto gc: compacted {} workspace(s), {} build-artifact dir(s), reclaiming {}",
+                compacted.workspaces_compacted,
+                compacted.dirs_removed,
+                human_bytes(compacted.available_delta_bytes),
+            );
+        }
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after compaction, deferring the rest to the next pass");
+        return;
+    }
+
+    // The aged-unhealthy recycler runs next: it salvages and resets workspaces
+    // stuck dirty, which is what makes them eligible for the trim below on a
+    // later pass. Bounded by `deadline` itself, so a large backlog cannot
+    // consume more than its share.
     let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
@@ -402,6 +448,28 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
 
     if Instant::now() >= deadline {
         eprintln!("cube: auto gc: time budget exhausted after reconcile pass, deferring log/bookmark gc");
+        return;
+    }
+
+    // Trim surplus free workspaces down to each repo's high-water mark. This
+    // is the secondary reclamation mechanism and deliberately runs late: it
+    // costs a `jj git fetch` per candidate, and it wants the state the two
+    // passes above have just corrected — the aged-unhealthy recycler resets
+    // stuck-dirty workspaces (making them provably empty of work, hence
+    // eligible here) and reconcile has just relabelled whatever recovered.
+    if let Ok(now) = current_epoch_s() {
+        let trimmed = trim_free_workspaces_to_mark(&runner, &store, database_path.as_deref(), now, Some(deadline));
+        if trimmed.workspaces_removed > 0 {
+            eprintln!(
+                "cube: auto gc: removed {} surplus free workspace(s), reclaiming {}",
+                trimmed.workspaces_removed,
+                human_bytes(trimmed.available_delta_bytes),
+            );
+        }
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after the pool trim, deferring log/bookmark gc");
         return;
     }
 

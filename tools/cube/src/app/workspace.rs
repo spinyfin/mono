@@ -33,6 +33,7 @@ use crate::app::provision::{
     auto_create_workspace, discover_workspaces, find_workspace_record, format_lease_message, format_setup_message,
     gc_broken_empty_workspace, run_setup_for_workspace,
 };
+use crate::app::reclaim::relieve_disk_pressure;
 use crate::app::reconcile::{
     reconcile_free_workspace_health, reconcile_missing_workspaces, reconcile_missing_workspaces_in_repo,
 };
@@ -135,6 +136,28 @@ const LEASE_HEALTH_SCAN_BUDGET: Duration = Duration::from_secs(5);
 /// health scan when nothing usable was found. Its probes each include a
 /// `jj git fetch`, so it is bounded in time as well as in probe count.
 const QUARANTINE_RECLAIM_BUDGET: Duration = Duration::from_secs(5);
+
+/// Wall-clock budget for the compaction pass a lease runs when it finds the
+/// pool's volume below its free-space floor.
+///
+/// Deliberately small, for two reasons that both point the same way.
+///
+/// It runs while this lease holds the repo lock, which is the right call —
+/// nothing can then claim a workspace out from under an `rm -rf` of its build
+/// tree — but holding that lock is exactly what once let a single slow
+/// workspace wedge every other lease and release for the repo, so the window
+/// must stay short.
+///
+/// And the deadline is only consulted *between* workspaces, never inside one:
+/// unlinking a 20 GiB `target/` (the largest observed) is tens of seconds of
+/// syscalls that cannot be interrupted partway. So the budget's real job is to
+/// decide how many trees this lease starts, and ten seconds means
+/// approximately one. That is the correct amount of work for a single lease to
+/// absorb: one big tree is tens of GiB recovered, and the next lease under
+/// pressure picks up where this one stopped. A pass is never *needed* to
+/// complete — it is opportunistic relief, and the periodic pool GC does the
+/// unhurried version.
+const DISK_PRESSURE_RECLAIM_BUDGET: Duration = Duration::from_secs(10);
 
 /// `pool_metadata` key prefix for the per-repo cursor that rotates which
 /// cached-unhealthy workspaces get re-probed. Persisting it (rather than, say,
@@ -241,6 +264,29 @@ pub(super) fn run_workspace(
             // whose lease has aged out are now `free`, and reconcile will
             // forget them too if their directory is also missing.
             reconcile_missing_workspaces_in_repo(&mut store, database_path, &repo, leased_at_epoch_s)?;
+
+            // Free space is an input to this call, not a side effect of it.
+            // Before this existed the lease path had no idea how much disk was
+            // left and minted onto a volume at 100% utilisation exactly as
+            // happily as onto an empty one — the cascade that took a 1.8 TiB
+            // volume to exhaustion and hung the app for ~11.5 hours.
+            //
+            // Reclaim-then-proceed: below the floor, compact every free
+            // workspace for this repo (build output only, no network, bounded)
+            // and re-measure. The lease itself is never refused for this —
+            // reusing a workspace costs no disk. Only growing the pool is, and
+            // only if compaction could not recover the shortfall; that refusal
+            // lives in `auto_create_workspace` so both mint sites below are
+            // covered by construction.
+            let disk_relief = relieve_disk_pressure(
+                runner,
+                &store,
+                database_path,
+                &repo,
+                &repo_record.workspace_root,
+                leased_at_epoch_s,
+                Some(Instant::now() + DISK_PRESSURE_RECLAIM_BUDGET),
+            );
 
             let lease_id = Uuid::new_v4().to_string();
             let holder = holder_identity();
@@ -953,7 +999,16 @@ pub(super) fn run_workspace(
                 // work is preserved for later inspection. The pool is an
                 // optimisation (reuse a known-good checkout), never a hard
                 // cap — a lease for a reachable repo always succeeds.
-                let new_candidate = auto_create_workspace(runner, &repo_record, &candidates)?;
+                //
+                // That still holds, and no count of workspaces can change it.
+                // What bounds the pool's disk is reclamation (the free-workspace
+                // high-water mark and build-artifact compaction in
+                // `crate::app::reclaim`), applied by GC after the fact rather
+                // than by refusing anyone here. The single exception is a
+                // volume below its free-space floor that compaction could not
+                // recover — a fact about the host, not the pool — which
+                // `auto_create_workspace` surfaces loudly.
+                let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &candidates)?;
                 let new_id = new_candidate.workspace_id.clone();
                 candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &candidates)?;
@@ -1093,7 +1148,7 @@ pub(super) fn run_workspace(
                 let retry_lock = RepoLock::acquire(&repo_lock_path(&repo, database_path)?)?;
                 let mut retry_candidates = discover_workspaces(&repo_record)?;
                 store.sync_workspaces(&repo, &retry_candidates)?;
-                let new_candidate = auto_create_workspace(runner, &repo_record, &retry_candidates)?;
+                let new_candidate = auto_create_workspace(runner, database_path, &repo_record, &retry_candidates)?;
                 let new_id = new_candidate.workspace_id.clone();
                 retry_candidates.push(new_candidate);
                 store.sync_workspaces(&repo, &retry_candidates)?;
@@ -1215,6 +1270,10 @@ pub(super) fn run_workspace(
                 "setup": setup_report,
                 "health_check": health_checks,
                 "health_scan": scan_summary,
+                // Present only when this lease found the volume below its
+                // free-space floor and reclaimed. Absent is the normal case
+                // and means "there was nothing to relieve".
+                "disk_pressure": disk_relief,
             });
             RunResult::new(message, payload)
         }
@@ -1400,6 +1459,36 @@ pub(super) fn run_workspace(
             let updated = store
                 .heartbeat_lease(&lease, Some(new_expires_at))?
                 .ok_or_else(|| CubeError::LeaseNotFound(lease.clone()))?;
+
+            // The mechanism that keeps a lease alive was entirely unaudited,
+            // which is what made orphaned leases invisible: a workspace held
+            // for days by a worker that no longer exists looks, in the audit
+            // log, exactly like one being used, because the only trace either
+            // leaves is a single `lease.acquired` at the start.
+            //
+            // `lease_age_secs` is the field that separates them. A lease being
+            // renewed after hours or days — long past any plausible task — is
+            // an orphan being kept alive by a heartbeat with no liveness gate
+            // behind it (a known engine-side defect, tracked separately).
+            // Reclamation honours those leases and always will, so this event
+            // is how the disk they hold becomes accountable.
+            //
+            // One line per heartbeat is affordable at the engine's 5-minute
+            // cadence: ~12/hour per live lease, an order of magnitude below
+            // the per-lease health-check chatter this log used to carry.
+            audit!(
+                database_path,
+                "lease.heartbeat",
+                repo = updated.repo,
+                workspace_id = updated.workspace_id,
+                lease_id = lease,
+                holder = updated.holder.as_deref(),
+                task = updated.task.as_deref(),
+                ttl_secs = ttl,
+                leased_at_epoch_s = updated.leased_at_epoch_s,
+                lease_expires_at_epoch_s = new_expires_at,
+                lease_age_secs = updated.leased_at_epoch_s.map(|at| now.saturating_sub(at)),
+            );
             RunResult::new(
                 format!(
                     "Heartbeat lease {}; new expiry {} (in {}s).",

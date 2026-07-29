@@ -1613,7 +1613,8 @@ fn auto_create_workspace_attaches_real_shared_store() {
         clone_command: None,
     };
 
-    let candidate = crate::app::provision::auto_create_workspace(&runner, &repo_record, &[]).expect("auto-create");
+    let candidate =
+        crate::app::provision::auto_create_workspace(&runner, None, &repo_record, &[]).expect("auto-create");
     assert_eq!(candidate.workspace_id, "mono-agent-001");
     let ws = candidate.workspace_path.clone();
 
@@ -2298,5 +2299,123 @@ fn lease_does_not_skip_unprobed_window_entries_when_the_probe_cap_is_exhausted()
             .unwrap(),
         None,
         "cached-unhealthy ids that were never probed are not rotated past",
+    );
+}
+
+// ── Audit blind spots ───────────────────────────────────────────────────────
+// Pool growth and lease renewal were both entirely unaudited. The growth that
+// reached 520 mono workspaces had to be reconstructed after the fact from
+// `was_auto_created: true` on `lease.acquired`, and the heartbeat that keeps an
+// orphaned lease alive forever left no trace at all.
+
+#[test]
+fn minting_a_workspace_emits_a_creation_event_with_the_pool_size() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    // One existing workspace, currently leased, so the lease under test has to
+    // grow the pool — and the event should say the pool went 1 → 2.
+    let existing = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(existing.join(".jj")).expect("existing workspace");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let hold = lease_runner_for(&existing, "abc1234");
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "hold it"]),
+        Some(&database_path),
+        &hold,
+    )
+    .expect("first lease");
+    hold.assert_exhausted();
+
+    let new_path = workspace_root.join("mono-agent-002");
+    let staging = workspace_root.join(".incoming-mono-agent-002");
+    let runner = FakeRunner::new(vec![
+        ExpectedCommand::workspace_add_mono(&workspace_root, &staging),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["git", "fetch"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(new_path.clone(), "jj", &["new", "main@origin"], ""),
+        ExpectedCommand::ok(
+            new_path.clone(),
+            "jj",
+            &["log", "--no-graph", "-r", "@", "-T", "commit_id.short()"],
+            "beef0002",
+        ),
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "grow the pool"]),
+        Some(&database_path),
+        &runner,
+    )
+    .expect("second lease");
+    runner.assert_exhausted();
+
+    let created = super::support::audit_events(&tempdir)
+        .into_iter()
+        .find(|e| e["event"] == "workspace.created")
+        .expect("workspace.created audit event");
+    assert_eq!(created["repo"], "mono");
+    assert_eq!(created["workspace_id"], "mono-agent-002");
+    // The pool size at mint time is the field that makes the growth curve
+    // readable directly, rather than inferable from lease events.
+    assert_eq!(created["pool_size_before"], 1);
+    assert_eq!(created["pool_size_after"], 2);
+    assert!(
+        created["disk_available_bytes"].is_number(),
+        "the mint should record the disk it landed on",
+    );
+}
+
+#[test]
+fn heartbeating_a_lease_emits_an_event_carrying_its_age() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+    let leased = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "long runner"]),
+        Some(&database_path),
+        &lease_runner,
+    )
+    .expect("lease");
+    let lease_id = leased.payload["workspace"]["lease_id"]
+        .as_str()
+        .expect("lease id")
+        .to_string();
+
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "heartbeat", "--lease", &lease_id]),
+        Some(&database_path),
+        &FakeRunner::default(),
+    )
+    .expect("heartbeat");
+
+    let beat = super::support::audit_events(&tempdir)
+        .into_iter()
+        .find(|e| e["event"] == "lease.heartbeat")
+        .expect("lease.heartbeat audit event");
+    assert_eq!(beat["repo"], "mono");
+    assert_eq!(beat["workspace_id"], "mono-agent-001");
+    assert_eq!(beat["lease_id"], lease_id);
+    assert_eq!(beat["task"], "long runner");
+    assert_eq!(beat["ttl_secs"], DEFAULT_LEASE_TTL_SECS);
+    // `lease_age_secs` is what separates a working lease from an orphan being
+    // kept alive indefinitely by a heartbeat with no liveness gate behind it.
+    assert!(
+        beat["lease_age_secs"].as_i64().expect("lease_age_secs") >= 0,
+        "every heartbeat must record how long the lease has been held",
     );
 }

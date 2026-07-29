@@ -172,6 +172,13 @@ Behavior:
   fails (e.g. clone error from a full disk). Reclaiming a dirty workspace's
   unpushed work (`cube workspace force-release --reason crash`) is a separate
   GC/recovery concern, decoupled from the lease path.
+- Treat free disk as an input. If the volume holding the pool is below its
+  free-space floor, the lease first compacts build-artifact trees out of that
+  repo's free workspaces and re-measures, then carries on. Reusing an existing
+  workspace is never refused for this. Only _growing_ the pool is, and only
+  when compaction could not recover the shortfall — a fact about the host, not
+  about the pool, reported as its own exit code (8) with the volume, the floor
+  and the shortfall in the message. See [Disk Reclamation](#disk-reclamation).
 - Self-heal degraded pool entries on lease. A free workspace whose directory
   has neither `.jj/` nor `.git/` (a "broken-empty" husk, e.g. from a clone
   interrupted before this guarantee landed) holds no recoverable work, so cube
@@ -527,6 +534,54 @@ agent or operator can repair a workspace without releasing and reacquiring it.
 Release should not discard successful setup state unless the reset invalidates
 it. For example, a `pnpm install` cache can remain valid across many leases,
 while decoded secrets may need a shorter lifetime or explicit rotation policy.
+
+## Disk Reclamation
+
+The pool grows on demand and has no cap on total workspaces — that is a design
+decision, not an oversight. What bounds its disk is reclamation, applied by GC
+after the fact rather than by refusing anyone at lease time. Both passes run
+automatically inside the bounded pool-GC pass, and both refuse categorically to
+touch a leased workspace or the shared `repos/` object stores.
+
+**Compaction is the primary mechanism.** Free workspaces have their
+regenerable build-artifact trees removed (`target/`, `.build` by default) and
+keep their checkout, so they stay immediately reusable. This is where nearly
+all the disk is: a pristine workspace is ~600 MB because the jj object store is
+shared, while uncleaned Cargo `target/` trees have been measured at 82% of the
+entire workspaces tree. Four gates precede any deletion — the configured name
+must be a plain child directory (never `.jj`/`.git`), the entry must exist, it
+must not be a **symlink** (bazel's outputs point into one shared output base),
+and jj must not be tracking anything inside it. A routine pass leaves
+workspaces used within `compact-idle-hours` alone so an active rotation keeps
+its build cache; the disk-pressure pass ignores that window.
+
+**Removal is secondary**, and bounded by a per-repo high-water mark on _free_
+workspaces (`max-free-workspaces`, default 20, overridable per repo). Above the
+mark, the most-idle surplus is removed down to it — never below. Each removal
+is gated on the same reuse probe the dirty-reclaim guard uses, so a workspace
+holding anything no remote has is skipped and left to the retention pass, which
+salvages before it resets. A repo whose surplus is entirely unpushed work will
+therefore not reach its mark, which is correct.
+
+Configure under `[pool]` in `cube.toml`:
+
+```toml
+[pool]
+max-free-workspaces = 20
+build-artifact-dirs = ["target", ".build"]
+compact-idle-hours = 6
+min-free-bytes = 21474836480   # 20 GiB
+min-free-percent = 2           # floor = max(bytes, percent-of-total)
+
+[pool.repos.flunge]
+max-free-workspaces = 6
+```
+
+Leases held by a worker that no longer exists are honoured like any other: an
+orphan-held workspace is `leased`, so it is invisible to both passes and its
+disk stays held. That is deliberate — cube does not adjudicate liveness — and
+the `lease.heartbeat` audit event carries `lease_age_secs` so the population is
+greppable.
 
 ## PR Model
 

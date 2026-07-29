@@ -235,7 +235,8 @@ impl Store {
                 health_status,
                 unhealthy_since_epoch_s,
                 last_holder,
-                last_task
+                last_task,
+                last_activity_at_epoch_s
             FROM workspaces
             WHERE 1=1
             "#,
@@ -306,7 +307,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE repo = ?1
                 ORDER BY workspace_id
@@ -466,7 +468,8 @@ impl Store {
                     head_commit = NULL,
                     last_release_reason = NULL,
                     health_status = NULL,
-                    unhealthy_since_epoch_s = NULL
+                    unhealthy_since_epoch_s = NULL,
+                    last_activity_at_epoch_s = ?5
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
                 "#,
                 params![
@@ -501,7 +504,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -637,7 +641,8 @@ impl Store {
                     head_commit = NULL,
                     last_release_reason = NULL,
                     health_status = NULL,
-                    unhealthy_since_epoch_s = NULL
+                    unhealthy_since_epoch_s = NULL,
+                    last_activity_at_epoch_s = ?5
                 WHERE repo = ?7 AND workspace_id = ?8 AND state = ?9
                 "#,
                 params![
@@ -677,7 +682,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -708,7 +714,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE workspace_path = ?1
                 "#,
@@ -738,7 +745,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE lease_id = ?1
                 "#,
@@ -786,6 +794,7 @@ impl Store {
         let Some(record) = before else {
             return Ok(None);
         };
+        let now = now_epoch_s();
 
         self.connection
             .execute(
@@ -803,10 +812,11 @@ impl Store {
                     head_commit = NULL,
                     last_release_reason = ?3,
                     health_status = NULL,
-                    unhealthy_since_epoch_s = NULL
+                    unhealthy_since_epoch_s = NULL,
+                    last_activity_at_epoch_s = ?4
                 WHERE lease_id = ?1
                 "#,
-                params![lease_id, WorkspaceState::Free.as_str(), reason],
+                params![lease_id, WorkspaceState::Free.as_str(), reason, now],
             )
             .map_err(CubeError::Storage)?;
 
@@ -823,6 +833,7 @@ impl Store {
             last_release_reason: reason.map(str::to_string),
             health_status: None,
             unhealthy_since_epoch_s: None,
+            last_activity_at_epoch_s: Some(now),
             ..record
         }))
     }
@@ -872,7 +883,8 @@ impl Store {
                     head_commit = NULL,
                     last_release_reason = ?3,
                     health_status = ?4,
-                    unhealthy_since_epoch_s = COALESCE(unhealthy_since_epoch_s, unixepoch())
+                    unhealthy_since_epoch_s = COALESCE(unhealthy_since_epoch_s, unixepoch()),
+                    last_activity_at_epoch_s = unixepoch()
                 WHERE lease_id = ?1
                 "#,
                 params![
@@ -902,7 +914,8 @@ impl Store {
                     health_status,
                     unhealthy_since_epoch_s,
                     last_holder,
-                    last_task
+                    last_task,
+                    last_activity_at_epoch_s
                 FROM workspaces
                 WHERE repo = ?1 AND workspace_id = ?2
                 "#,
@@ -1131,7 +1144,8 @@ impl Store {
                     leased_at_epoch_s = NULL,
                     lease_expires_at_epoch_s = NULL,
                     head_commit = NULL,
-                    last_release_reason = 'expired'
+                    last_release_reason = 'expired',
+                    last_activity_at_epoch_s = ?4
                 WHERE repo = ?1
                   AND state = ?3
                   AND lease_expires_at_epoch_s IS NOT NULL
@@ -1239,6 +1253,7 @@ impl Store {
                     unhealthy_since_epoch_s INTEGER,
                     last_holder TEXT,
                     last_task TEXT,
+                    last_activity_at_epoch_s INTEGER,
                     PRIMARY KEY(repo, workspace_id),
                     FOREIGN KEY(repo) REFERENCES repos(repo) ON DELETE CASCADE
                 );
@@ -1304,6 +1319,10 @@ impl Store {
         // NULL) can still attribute the work it captures.
         try_add_column(&self.connection, "ALTER TABLE workspaces ADD COLUMN last_holder TEXT")?;
         try_add_column(&self.connection, "ALTER TABLE workspaces ADD COLUMN last_task TEXT")?;
+        try_add_column(
+            &self.connection,
+            "ALTER TABLE workspaces ADD COLUMN last_activity_at_epoch_s INTEGER",
+        )?;
 
         // Created after the ALTERs above so it also lands on a database whose
         // `workspaces` table pre-dates the `health_status` column.
@@ -1369,6 +1388,18 @@ fn row_to_repo_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoRecord> {
     })
 }
 
+/// Wall-clock seconds since the Unix epoch, for the store's own timestamp
+/// columns. A clock that is somehow before the epoch yields 0, which reads as
+/// "maximally stale" — the safe direction for every consumer here, since the
+/// only thing an old timestamp does is make a *free* workspace eligible for a
+/// reclamation pass that independently verifies it holds nothing.
+fn now_epoch_s() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     let state_raw: String = row.get(3)?;
     let health_raw: Option<String> = row.get(11)?;
@@ -1394,6 +1425,7 @@ fn row_to_workspace_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Workspac
         unhealthy_since_epoch_s: row.get(12)?,
         last_holder: row.get(13)?,
         last_task: row.get(14)?,
+        last_activity_at_epoch_s: row.get(15)?,
     })
 }
 
@@ -1422,6 +1454,116 @@ mod tests {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let store = Store::open_at(tempdir.path().join("state.db")).expect("store");
         (tempdir, store)
+    }
+
+    /// The idle clock the reclamation passes key off. It must survive the
+    /// release that ends a lease — unlike `leased_at_epoch_s`, which describes
+    /// the *current* lease and is nulled — or a free workspace would have no
+    /// answer to "how long has this been sitting here?" and every one of them
+    /// would look equally, maximally idle.
+    #[test]
+    fn last_activity_is_stamped_on_claim_and_survives_release() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-001"),
+                }],
+            )
+            .expect("sync");
+
+        // A row adopted from disk has never been leased, so it has no clock.
+        let discovered = store.list_workspaces("mono").expect("list").pop().expect("row");
+        assert_eq!(discovered.last_activity_at_epoch_s, None);
+
+        let claimed = store
+            .claim_specific_workspace("mono", "mono-agent-001", "boss", "task", "lease-1", 1_700_000_000, None)
+            .expect("claim")
+            .expect("claimed");
+        assert_eq!(claimed.last_activity_at_epoch_s, Some(1_700_000_000));
+
+        let released = store
+            .release_workspace("lease-1", Some("done"))
+            .expect("release")
+            .expect("released");
+        assert_eq!(released.state, WorkspaceState::Free);
+        assert_eq!(released.leased_at_epoch_s, None, "the current-lease clock is cleared");
+        let activity = released
+            .last_activity_at_epoch_s
+            .expect("the idle clock must survive the release");
+        assert!(
+            activity >= 1_700_000_000,
+            "release should advance the idle clock, got {activity}",
+        );
+        // And it is durable, not just present on the returned struct.
+        let reread = store.list_workspaces("mono").expect("list").pop().expect("row");
+        assert_eq!(reread.last_activity_at_epoch_s, Some(activity));
+    }
+
+    /// TTL expiry frees a workspace without anyone calling `release`, so it has
+    /// to stamp the idle clock too — otherwise a workspace reclaimed from a
+    /// dead holder would read as never-used and sort first for removal.
+    #[test]
+    fn last_activity_is_stamped_when_a_stale_lease_expires() {
+        let (tempdir, mut store) = open_store();
+        let workspace_root = tempdir.path().join("workspaces");
+        store
+            .upsert_repo(&RepoRecord {
+                repo: "mono".to_string(),
+                origin: "git@github.com:spinyfin/mono.git".to_string(),
+                main_branch: "main".to_string(),
+                workspace_root: workspace_root.clone(),
+                workspace_prefix: "mono-agent-".to_string(),
+                source: None,
+                clone_command: None,
+            })
+            .expect("repo");
+        store
+            .sync_workspaces(
+                "mono",
+                &[WorkspaceCandidate {
+                    workspace_id: "mono-agent-001".to_string(),
+                    workspace_path: workspace_root.join("mono-agent-001"),
+                }],
+            )
+            .expect("sync");
+        store
+            .claim_specific_workspace(
+                "mono",
+                "mono-agent-001",
+                "boss",
+                "task",
+                "lease-1",
+                1_700_000_000,
+                Some(1_700_000_100),
+            )
+            .expect("claim")
+            .expect("claimed");
+
+        let expired = store.expire_stale_leases("mono", 1_700_000_200).expect("expire");
+        assert_eq!(expired.len(), 1);
+
+        let reread = store.list_workspaces("mono").expect("list").pop().expect("row");
+        assert_eq!(reread.state, WorkspaceState::Free);
+        assert_eq!(
+            reread.last_activity_at_epoch_s,
+            Some(1_700_000_200),
+            "expiry stamps the sweep time as the workspace's last activity",
+        );
     }
 
     #[test]

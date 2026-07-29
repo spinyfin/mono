@@ -7,6 +7,7 @@
 
 mod change;
 mod checkleft_gate;
+mod disk;
 mod dispatch;
 mod display;
 mod errors;
@@ -16,6 +17,7 @@ mod health;
 mod jj;
 mod pr;
 mod provision;
+mod reclaim;
 mod reconcile;
 mod repo;
 mod reset;

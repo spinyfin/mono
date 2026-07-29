@@ -445,6 +445,27 @@ impl ExpectedCommand {
         )
     }
 
+    /// Build an expectation for a command that simply fails, with none of the
+    /// wordings `run_jj` recognises and auto-recovers from. Use this when a
+    /// test wants "the subprocess errored" and nothing more — `stale` and
+    /// friends below deliberately trigger recovery paths.
+    pub(super) fn failing(cwd: PathBuf, program: &str, args: &[&str], stderr: &str) -> Self {
+        let args_owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        Self {
+            cwd,
+            program: program.to_string(),
+            args: args_owned.clone(),
+            result: Err(CubeError::CommandFailed {
+                program: program.to_string(),
+                args: args_owned,
+                status: Some(1),
+                stderr: stderr.to_string(),
+            }),
+            creates_dir: None,
+            duration: Duration::ZERO,
+        }
+    }
+
     /// Build an expectation that simulates jj's stale-working-copy
     /// failure. The wording matches what `cube`'s `run_jj` wrapper
     /// looks for via `JJ_STALE_SIGNATURE`.

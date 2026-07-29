@@ -143,6 +143,19 @@ pub struct WorkspaceRecord {
     /// The `task` this workspace had when its last lease ended. See
     /// [`WorkspaceRecord::last_holder`].
     pub last_task: Option<String>,
+    /// Unix timestamp (seconds) of the last time a lease started or ended on
+    /// this workspace — stamped on mint, claim, release, force-release and
+    /// TTL expiry. Unlike [`WorkspaceRecord::leased_at_epoch_s`] (which is
+    /// nulled on release, because it describes the *current* lease) this one
+    /// survives, which is what lets pool GC ask "how long has this been sitting
+    /// idle?" of a free workspace.
+    ///
+    /// `None` means cube has never leased it since discovering the directory —
+    /// a row adopted from disk by `sync_workspaces` and never used. Reclamation
+    /// treats that as maximally idle: it is the strongest possible evidence
+    /// that nobody wants the workspace, and the reuse probe still gates
+    /// anything destructive.
+    pub last_activity_at_epoch_s: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
