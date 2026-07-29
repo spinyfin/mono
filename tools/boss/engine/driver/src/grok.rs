@@ -11,6 +11,7 @@
 //! concurrent follow-on tasks (transcript, control verbs, output capture,
 //! characterisation) do not serialise on this file.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -24,6 +25,7 @@ use serde_json::{Value, json};
 mod home;
 mod hooks;
 mod model_menu;
+mod permissions;
 mod progress;
 
 pub use home::{
@@ -39,7 +41,7 @@ use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, HookWiringDestination,
     ModelMenu, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
     ProgressObservationWiring, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerKind,
 };
 
 // ---------------------------------------------------------------------------
@@ -315,8 +317,18 @@ impl AgentDriver for GrokDriver {
     /// progress forwarder on every lifecycle event, plus the five
     /// `PreToolUse` guards behind [`hooks::write_hooks`]'s canonicalisation
     /// adapter. Overwrites the provisional canary `provision_workspace`
-    /// wrote. Full `--sandbox`/`--allow`/`--deny` artifacts remain T-17;
-    /// `extra_args` stays empty until that lands.
+    /// wrote.
+    ///
+    /// Also writes the full permission-policy artifacts (design T-17): a
+    /// Boss-owned `$GROK_HOME/sandbox.toml` custom profile (kernel-level deny
+    /// of the Boss data dir, layered on the worker kind's built-in
+    /// `workspace`/`read-only` base — omitted for remote workers, which have
+    /// no local data dir to fence), and `extra_args` carrying `--sandbox`,
+    /// one `--deny` per structural rule (Boss data dir, `rm -rf`, `sudo`,
+    /// `bossctl`), and `--permission-mode` when the worker kind forces one.
+    /// See [`permissions`] for the profile/rule rendering and
+    /// `grok-permission-isolation-2026-07-27.md` (T-16) for the grammar this
+    /// relies on.
     async fn write_permission_config(
         &self,
         input: &PermissionInput,
@@ -364,7 +376,7 @@ impl AgentDriver for GrokDriver {
             },
             is_revision: input.execution_kind == "revision_implementation"
                 || input.task_kind.as_deref() == Some("revision"),
-            is_standard_worker: input.worker_kind == crate::WorkerKind::Standard,
+            is_standard_worker: input.worker_kind == WorkerKind::Standard,
             run_id: Some(input.run_id.clone()),
             workspace_path: Some(input.workspace_path.clone()),
         };
@@ -373,10 +385,29 @@ impl AgentDriver for GrokDriver {
             .with_context(|| format!("writing Grok hook wiring under {}", grok_home.display()))?;
         config_files.push(grok_home.join("config.toml"));
 
+        // Boss data dir for the sandbox's kernel-level deny and the CLI
+        // Read/Edit belt — `None` on remote (see `interception.data_dir` above).
+        let boss_data_dir = if input.is_remote {
+            None
+        } else {
+            input.events_socket_path.parent().map(|p| p.to_path_buf())
+        };
+
+        if !input.is_remote {
+            let sandbox_toml_path = grok_home.join("sandbox.toml");
+            fs::write(
+                &sandbox_toml_path,
+                permissions::render_sandbox_toml(input.worker_kind, boss_data_dir.as_deref()),
+            )
+            .with_context(|| format!("writing {}", sandbox_toml_path.display()))?;
+            config_files.push(sandbox_toml_path);
+        }
+
+        let extra_args = permissions::extra_args(input.worker_kind, boss_data_dir.as_deref(), input.is_remote);
+
         Ok(PermissionArtifacts {
             config_files,
-            // Full --sandbox / --allow / --deny artifacts are T-17.
-            extra_args: Vec::new(),
+            extra_args,
             env: vec![("GROK_HOME".into(), grok_home.display().to_string())],
         })
     }
@@ -1133,5 +1164,445 @@ mod tests {
                 "every guard entry must be wrapped by the adapter: {command}"
             );
         }
+    }
+
+    /// design T-17 acceptance: `write_permission_config` must also render the
+    /// permission-policy artifacts — a Boss-owned `sandbox.toml` custom
+    /// profile and `extra_args` carrying `--sandbox` + the structural
+    /// `--deny` rule set — not leave `extra_args` empty.
+    #[tokio::test]
+    async fn write_permission_config_renders_sandbox_and_deny_extra_args() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-t17-standard";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let boss_data_dir = tmp.path().join("boss-data");
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Standard,
+            workspace_path: workspace.clone(),
+            events_socket_path: boss_data_dir.join("events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-1".into(),
+            execution_kind: "task_implementation".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+        };
+
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let sandbox_toml_path = grok_home.join("sandbox.toml");
+        assert!(
+            artifacts.config_files.contains(&sandbox_toml_path),
+            "config_files must include sandbox.toml: {:?}",
+            artifacts.config_files
+        );
+        let sandbox_toml = fs::read_to_string(&sandbox_toml_path).unwrap();
+        assert!(sandbox_toml.contains("[profiles.boss-workspace]"), "{sandbox_toml}");
+        assert!(sandbox_toml.contains("extends = \"workspace\""), "{sandbox_toml}");
+        assert!(
+            sandbox_toml.contains(&boss_data_dir.display().to_string()),
+            "{sandbox_toml}"
+        );
+
+        assert_eq!(artifacts.extra_args[0], "--sandbox");
+        assert_eq!(artifacts.extra_args[1], "boss-workspace");
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == "Bash(rm -rf:*)"),
+            "must deny rm -rf: {:?}",
+            artifacts.extra_args
+        );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == "Bash(sudo)"),
+            "must deny sudo: {:?}",
+            artifacts.extra_args
+        );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == "Bash(bossctl)"),
+            "must deny bossctl: {:?}",
+            artifacts.extra_args
+        );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == format!("Edit({})", boss_data_dir.display())),
+            "must deny the Boss data dir: {:?}",
+            artifacts.extra_args
+        );
+        // Standard worker: no forced --permission-mode (T-31 answer-agent
+        // allowlist is a Grok follow-on, not yet built).
+        assert!(!artifacts.extra_args.contains(&"--permission-mode".to_owned()));
+    }
+
+    /// Reviewer worker kind must select the read-only sandbox posture, both
+    /// on the CLI (`--sandbox boss-read-only`) and in the custom profile's
+    /// `extends`.
+    #[tokio::test]
+    async fn write_permission_config_reviewer_selects_read_only_sandbox() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-t17-reviewer";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Reviewer,
+            workspace_path: workspace.clone(),
+            events_socket_path: tmp.path().join("boss-data").join("events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-1".into(),
+            execution_kind: "pr_review".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+        };
+
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+        assert_eq!(artifacts.extra_args[0], "--sandbox");
+        assert_eq!(artifacts.extra_args[1], "boss-read-only");
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let sandbox_toml = fs::read_to_string(grok_home.join("sandbox.toml")).unwrap();
+        assert!(sandbox_toml.contains("[profiles.boss-read-only]"), "{sandbox_toml}");
+        assert!(sandbox_toml.contains("extends = \"read-only\""), "{sandbox_toml}");
+    }
+
+    /// Remote workers get no local `sandbox.toml` (no Boss data dir to fence)
+    /// and the CLI `--sandbox` value must name a built-in profile, never the
+    /// custom one that was never materialised (which would refuse the
+    /// worker to start on an unresolvable `extends`).
+    #[tokio::test]
+    async fn write_permission_config_remote_omits_sandbox_toml_and_data_dir_deny() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-t17-remote";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Standard,
+            workspace_path: workspace.clone(),
+            events_socket_path: tmp.path().join("forwarded-events.sock"),
+            boss_event_path: tmp.path().join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-1".into(),
+            execution_kind: "task_implementation".into(),
+            task_kind: None,
+            is_remote: true,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+        };
+
+        let artifacts = driver.write_permission_config(&input, tmp.path()).await.unwrap();
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        assert!(
+            !artifacts.config_files.contains(&grok_home.join("sandbox.toml")),
+            "remote must not write sandbox.toml: {:?}",
+            artifacts.config_files
+        );
+        assert!(!grok_home.join("sandbox.toml").exists());
+        assert_eq!(artifacts.extra_args[0], "--sandbox");
+        assert_eq!(
+            artifacts.extra_args[1], "workspace",
+            "remote must use the built-in profile name"
+        );
+        assert!(
+            !artifacts
+                .extra_args
+                .iter()
+                .any(|a| a.starts_with("Read(") || a.starts_with("Edit(")),
+            "remote must omit the Boss data dir deny pair: {:?}",
+            artifacts.extra_args
+        );
+        assert!(
+            artifacts
+                .extra_args
+                .windows(2)
+                .any(|w| w[0] == "--deny" && w[1] == "Bash(bossctl)"),
+            "structural non-path denies still apply on remote: {:?}",
+            artifacts.extra_args
+        );
+    }
+
+    /// Opt-in env var for the live permission-enforcement tests below.
+    ///
+    /// The grammar is unvalidated at *parse* time (`--deny '(((('` is
+    /// accepted silently — investigation §Malformed / unknown rules), so
+    /// this rule set needs a test proving it actually denies at *runtime*,
+    /// not merely that it parses. That requires a real `grok -p` turn
+    /// against xAI's API (billed, network-dependent) — unlike this file's
+    /// other "live" tests, which only shell out to the free, local `grok
+    /// inspect --json` / `--version`. Gating on grok-on-PATH alone would
+    /// make routine `bazel test` on any dev machine with Grok installed
+    /// silently spend real API budget, so this additionally requires an
+    /// explicit opt-in env var on top of the usual soft-skip. Also requires
+    /// `grok` to actually be reachable as a spawned subprocess (Bazel's test
+    /// sandbox blocks this even when `grok --version` above passed via a
+    /// wrapper — run the compiled `driver_test` binary directly, outside
+    /// `bazel test`'s sandboxing, to exercise this for real.
+    const LIVE_ENFORCEMENT_TEST_ENV: &str = "BOSS_GROK_LIVE_PERMISSION_ENFORCEMENT_TEST";
+
+    fn live_enforcement_test_enabled() -> bool {
+        if std::env::var(LIVE_ENFORCEMENT_TEST_ENV).as_deref() != Ok("1") {
+            eprintln!(
+                "{LIVE_ENFORCEMENT_TEST_ENV} not set to 1; skipping live permission-enforcement test \
+                 (set it explicitly to run — this test makes real, billed grok-4.5 API calls)"
+            );
+            return false;
+        }
+        if std::process::Command::new("grok")
+            .arg("--version")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("grok not available; skipping live permission-enforcement test");
+            return false;
+        }
+        if !dirs_home_grok_auth().exists() {
+            eprintln!("no host ~/.grok/auth.json; skipping live permission-enforcement test");
+            return false;
+        }
+        true
+    }
+
+    /// design T-17 acceptance (part 1/2): the `--sandbox boss-read-only`
+    /// profile [`GrokDriver::write_permission_config`] selects for a
+    /// `Reviewer` worker — backed by the real `sandbox.toml` this run writes
+    /// — must kernel-deny a workspace write. Runs the *actual* driver
+    /// output (hooks included, exactly as a real worker spawns), checked by
+    /// real file-presence, not the model's self-report.
+    #[tokio::test]
+    async fn write_permission_config_live_sandbox_denies_workspace_write() {
+        if !live_enforcement_test_enabled() {
+            return;
+        }
+
+        // CWD must NOT be under /tmp or macOS's per-process TempDir
+        // (`/var/folders/...`) — the investigation found every built-in
+        // sandbox profile always grants write access there, which would make
+        // this assertion vacuous (§"/tmp always writable — validation
+        // hazard").
+        let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for this test"));
+        let scratch_root = real_home.join(".cache").join("boss-grok-permcfg-live-sandbox-test");
+        let _cleanup = ScratchCleanup::new(&scratch_root);
+
+        let homes = scratch_root.join("grok-homes");
+        let workspace = scratch_root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes, &dirs_home_grok_auth(), true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-live-sandbox-1";
+        driver
+            .provision_workspace(&workspace, "live sandbox enforcement probe", run_id)
+            .await
+            .expect("provision must succeed");
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Reviewer,
+            workspace_path: workspace.clone(),
+            events_socket_path: scratch_root.join("boss-data").join("events.sock"),
+            boss_event_path: scratch_root.join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-live".into(),
+            execution_kind: "pr_review".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+        };
+        let artifacts = driver
+            .write_permission_config(&input, scratch_root.as_path())
+            .await
+            .expect("write_permission_config must succeed");
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let process_home = process_home_for_run(run_id).unwrap();
+
+        let probe_write = workspace.join("probe_write.txt");
+        let _ = fs::remove_file(&probe_write);
+
+        let output = run_grok_probe(
+            &grok_home,
+            &process_home,
+            &workspace,
+            "Try to create a file named probe_write.txt in the current directory with content \
+             SHOULD_NOT_EXIST, using a write tool or shell. Report the outcome honestly, including any \
+             denial/permission error text. Final line: LIVE_DONE",
+            &artifacts.extra_args,
+        );
+        eprintln!(
+            "live sandbox-write probe stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success(),
+            "live grok invocation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !probe_write.exists(),
+            "workspace write must be denied by the boss-read-only sandbox profile: probe_write.txt was created"
+        );
+    }
+
+    /// design T-17 acceptance (part 2/2): the structural `--deny
+    /// 'Bash(rm -rf:*)'` / `'Bash(rm -rf *)'` rules must refuse `rm -rf` at
+    /// the CLI permission-grammar layer, isolated from every other
+    /// mechanism. Deliberately uses a hooks-free `GROK_HOME` and
+    /// `--sandbox off`: this driver's real `PreToolUse` adapter fails closed
+    /// on any invocation missing Grok's own hook-context env vars (a
+    /// separate, legitimate guardrail — see `hooks.rs`), which otherwise
+    /// denies every tool call and would make this check pass for the wrong
+    /// reason. Isolating removes that confound so this test attributes the
+    /// denial to the `--deny` rule set specifically, not to the hook layer.
+    #[tokio::test]
+    async fn write_permission_config_live_deny_rule_blocks_rm_rf_isolated_from_hooks() {
+        if !live_enforcement_test_enabled() {
+            return;
+        }
+
+        let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for this test"));
+        let scratch_root = real_home.join(".cache").join("boss-grok-permcfg-live-deny-test");
+        let _cleanup = ScratchCleanup::new(&scratch_root);
+
+        let workspace = scratch_root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let grok_home = scratch_root.join("grok-home");
+        fs::create_dir_all(&grok_home).unwrap();
+        let process_home = scratch_root.join("process-home");
+        fs::create_dir_all(&process_home).unwrap();
+
+        // No hooks/, no sandbox.toml: only auth + base config + trust, so
+        // the only lever in play is the `--deny` CLI flag under test.
+        std::os::unix::fs::symlink(dirs_home_grok_auth(), grok_home.join("auth.json")).unwrap();
+        fs::write(grok_home.join("config.toml"), render_base_config_toml()).unwrap();
+        fs::write(
+            grok_home.join("trusted_folders.toml"),
+            home::render_trusted_folders_toml(&workspace),
+        )
+        .unwrap();
+
+        let victim = workspace.join("victim.txt");
+        fs::write(&victim, "victim\n").unwrap();
+
+        // Only the rm -rf rules — `--sandbox off` so the sandbox cannot
+        // contribute to (or confound) this result.
+        let mut extra_args = vec!["--sandbox".to_owned(), "off".to_owned()];
+        for rule in permissions::structural_deny_rules(None) {
+            if rule.starts_with("Bash(rm") {
+                extra_args.push("--deny".to_owned());
+                extra_args.push(rule);
+            }
+        }
+
+        let output = run_grok_probe(
+            &grok_home,
+            &process_home,
+            &workspace,
+            "Using a shell command, run exactly: rm -rf victim.txt . Report the outcome honestly, including \
+             any denial/permission error text. Final line: LIVE_DONE",
+            &extra_args,
+        );
+        eprintln!(
+            "live deny-rule probe stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success(),
+            "live grok invocation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            victim.exists(),
+            "rm -rf must be denied by --deny 'Bash(rm -rf:*)'/'Bash(rm -rf *)': victim.txt was deleted"
+        );
+    }
+
+    struct ScratchCleanup(PathBuf);
+    impl ScratchCleanup {
+        fn new(path: &Path) -> Self {
+            let _ = fs::remove_dir_all(path);
+            fs::create_dir_all(path).unwrap();
+            Self(path.to_path_buf())
+        }
+    }
+    impl Drop for ScratchCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn run_grok_probe(
+        grok_home: &Path,
+        process_home: &Path,
+        workspace: &Path,
+        prompt: &str,
+        extra_args: &[String],
+    ) -> std::process::Output {
+        let session_id = home::new_session_uuid().unwrap();
+        let mut cmd = std::process::Command::new("grok");
+        cmd.env("GROK_HOME", grok_home)
+            .env("HOME", process_home)
+            .env_remove("GROK_FOLDER_TRUST")
+            .arg("-p")
+            .arg(prompt)
+            .arg("--always-approve")
+            .arg("--trust")
+            .arg("--session-id")
+            .arg(&session_id)
+            .arg("--cwd")
+            .arg(workspace)
+            .arg("--output-format")
+            .arg("json")
+            .arg("--max-turns")
+            .arg("6")
+            .arg("--model")
+            .arg("grok-4.5");
+        for arg in extra_args {
+            cmd.arg(arg);
+        }
+        cmd.output().expect("grok -p invocation must spawn")
     }
 }
