@@ -1,6 +1,12 @@
 import AppKit
+import CrashWatchdog
 import Foundation
 import GhosttyKit
+import os.log
+
+private let ghosttyBootstrapLog = Logger(
+    subsystem: "dev.spinyfin.bossmacapp", category: "ghostty-bootstrap"
+)
 
 private func ghosttyRuntimeWakeup(_ userdata: UnsafeMutableRawPointer?) {
     GhosttyRuntime.wakeup(userdata)
@@ -77,6 +83,17 @@ enum GhosttyBootstrap {
         guard result == GHOSTTY_SUCCESS else {
             fatalError("ghostty_init failed with status \(result)")
         }
+
+        // `ghostty_init` is what initializes Sentry (and, through it,
+        // Breakpad's SIGABRT handler). Chaining our bounded-termination
+        // watchdog in *after* that call is what puts it in front of them in
+        // the handler chain — install it earlier and an unbounded spin inside
+        // Sentry never reaches us. See [[CrashWatchdog]] for the 2026-07-29
+        // livelock this closes.
+        let hooked = CrashWatchdog.install()
+        ghosttyBootstrapLog.info(
+            "crash watchdog installed for \(hooked.count, privacy: .public) signal(s)"
+        )
     }()
 
     static func ensureInitialized() {

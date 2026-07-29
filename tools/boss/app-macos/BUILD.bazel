@@ -23,7 +23,13 @@ exports_files([
 
 swift_library(
     name = "boss_mac_app_lib",
-    srcs = glob(["Sources/**/*.swift"]),
+    # CrashWatchdog is excluded so it is only ever compiled as its own module
+    # (matching Package.swift's `exclude:`); leaving it in the glob would give
+    # the app a second, shadowing copy of the type it imports.
+    srcs = glob(
+        ["Sources/**/*.swift"],
+        exclude = ["Sources/CrashWatchdog/**/*.swift"],
+    ),
     copts = [
         # Mirror the swiftSettings define in Package.swift so @inlinable
         # Textual APIs (e.g. .textual.textSelection) expand correctly here.
@@ -40,6 +46,7 @@ swift_library(
     ],
     module_name = "Boss",
     deps = [
+        "//tools/boss/app-macos/Sources/CrashWatchdog",
         "//tools/boss/app-macos/Sources/UpdateCore",
         "@ghostty_kit//:GhosttyKit",
         "@swiftpkg_textual//:Textual",

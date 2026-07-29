@@ -37,6 +37,9 @@ root-cause rule as the section below.
   [`tools/boss/docs/forensic-surfaces.md`](tools/boss/docs/forensic-surfaces.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
+- Crash watchdog (why an abort always kills the app, and
+  `BOSS_CRASH_WATCHDOG_SECONDS`):
+  [`tools/boss/docs/crash-watchdog.md`](tools/boss/docs/crash-watchdog.md)
 - Operator runbooks:
   [`tools/boss/docs/runbooks/`](tools/boss/docs/runbooks/)
 

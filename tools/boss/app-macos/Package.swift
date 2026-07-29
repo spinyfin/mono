@@ -19,15 +19,20 @@ let package = Package(
             name: "UpdateCore",
             path: "Sources/UpdateCore"
         ),
+        .target(
+            name: "CrashWatchdog",
+            path: "Sources/CrashWatchdog"
+        ),
         .executableTarget(
             name: "Boss",
             dependencies: [
                 .product(name: "Textual", package: "textual"),
                 "GhosttyKit",
                 "UpdateCore",
+                "CrashWatchdog",
             ],
             path: "Sources",
-            exclude: ["UpdateCore"],
+            exclude: ["UpdateCore", "CrashWatchdog"],
             resources: [
                 .copy("Resources/TrekIcons"),
             ],
