@@ -17,7 +17,8 @@ use boss_event_bus::{Event, EventBus};
 use boss_protocol::{NormalizeError, WorkerEvent};
 use thiserror::Error;
 
-use crate::driver::{AgentDriver, TurnEnd};
+use crate::driver::{AgentDriver, DriverRegistry, TurnEnd};
+use crate::work::WorkDb;
 use tokio::io::AsyncReadExt;
 use tokio::net::{UnixListener, UnixStream};
 
@@ -155,6 +156,15 @@ pub enum SocketError {
     Json(#[from] serde_json::Error),
     #[error("hook payload normalize: {0}")]
     Normalize(#[from] NormalizeError),
+    /// The connection's driver could not be resolved deterministically —
+    /// either the payload carried no `_boss_run_id`, the run id has no
+    /// matching execution, or the resolved slug is not a registered driver.
+    /// Never guessed around: the caller must log this and drop the
+    /// connection rather than normalise against a fallback driver, since a
+    /// silent fallback here is exactly the "every connection normalises as
+    /// Claude" bug this per-connection resolution replaces.
+    #[error("could not resolve driver for events-socket connection (run_id={run_id:?}): {reason}")]
+    UnresolvedDriver { run_id: Option<String>, reason: String },
 }
 
 /// Bind+listen on the events socket at `path` and chmod the file to
@@ -318,13 +328,20 @@ pub fn peer_pid(_stream: &UnixStream) -> io::Result<libc::pid_t> {
 /// returned with `run_id: None`.
 ///
 /// This socket is inherently a [`crate::driver::ProgressIngress::HookCallback`]
-/// ingress — a `StdoutJsonl` driver never connects to it — but `driver` is
-/// still an injected parameter rather than a hardcoded `ClaudeDriver`
-/// reference: the caller resolves it via [`crate::driver::DriverRegistry`],
-/// so a second hook-callback driver (or per-run resolution once the dispatch
-/// gate selects a driver per run) only requires changing the caller's
-/// resolution, not this function.
-pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> Result<IncomingHookEvent, SocketError> {
+/// ingress — a `StdoutJsonl` driver never connects to it — but every
+/// connection can carry a different worker's driver (Claude, Codex, Grok, …),
+/// so the driver is resolved per connection rather than fixed once for the
+/// whole accept loop. `registry` and `work_db` are injected rather than a
+/// concrete driver: [`resolve_connection_driver`] uses `_boss_run_id` from the
+/// decoded payload plus [`WorkDb::get_execution_driver_slug`] to look up the
+/// run's actual driver slug, then resolves it through `registry` — the same
+/// `tasks.driver` → `products.default_driver` → engine-default precedence
+/// applied at spawn time.
+pub async fn handle_connection(
+    stream: UnixStream,
+    registry: &DriverRegistry,
+    work_db: &WorkDb,
+) -> Result<IncomingHookEvent, SocketError> {
     let peer_pid_value = peer_pid(&stream).ok();
     let mut stream = stream;
     let mut bytes = Vec::new();
@@ -337,6 +354,7 @@ pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> 
     } else {
         payload_run_id
     };
+    let driver = resolve_connection_driver(registry, work_db, run_id.as_deref(), peer_pid_value)?;
     // Decode through the driver's ProgressObservation and TranscriptAccess
     // capabilities. The decoded event drives the (driver-agnostic) activity
     // machine downstream, unchanged. `resolve` additionally asks the driver's
@@ -345,12 +363,76 @@ pub async fn handle_connection(stream: UnixStream, driver: &dyn AgentDriver) -> 
     let transcript_path = driver.transcript_path_for_session(&raw);
     let event = driver.normalize_progress_event(&raw)?;
     Ok(IncomingHookEvent::resolve(
-        driver,
+        driver.as_ref(),
         event,
         run_id,
         transcript_path,
         peer_pid_value,
     ))
+}
+
+/// Resolve the driver that governs `run_id`'s worker, deterministically.
+///
+/// This is the seam that replaces the old "every connection normalises as
+/// the engine default" behaviour: a Grok run's hook events must be decoded by
+/// [`crate::driver::GrokDriver`], not [`crate::driver::ClaudeDriver`], or they
+/// are dropped with `MissingField` before they ever reach progress ingress.
+///
+/// Fails loudly — logging the connection's peer pid and run id — rather than
+/// falling back to a default or retrying against every registered driver,
+/// per the design constraint that a connection whose driver can't be
+/// resolved must never be silently normalised against the wrong dialect.
+fn resolve_connection_driver(
+    registry: &DriverRegistry,
+    work_db: &WorkDb,
+    run_id: Option<&str>,
+    peer_pid: Option<libc::pid_t>,
+) -> Result<std::sync::Arc<dyn AgentDriver>, SocketError> {
+    let Some(run_id) = run_id else {
+        tracing::error!(
+            ?peer_pid,
+            "events socket: cannot resolve a driver for this connection — payload carried no _boss_run_id",
+        );
+        return Err(SocketError::UnresolvedDriver {
+            run_id: None,
+            reason: "connection payload had no _boss_run_id".to_owned(),
+        });
+    };
+    let slug = work_db.get_execution_driver_slug(run_id).map_err(|error| {
+        tracing::error!(
+            run_id,
+            ?peer_pid,
+            %error,
+            "events socket: driver-slug lookup failed for this connection's run_id",
+        );
+        SocketError::UnresolvedDriver {
+            run_id: Some(run_id.to_owned()),
+            reason: format!("driver-slug lookup failed: {error:#}"),
+        }
+    })?;
+    let Some(slug) = slug else {
+        tracing::error!(
+            run_id,
+            ?peer_pid,
+            "events socket: no execution found for this connection's run_id — cannot resolve driver",
+        );
+        return Err(SocketError::UnresolvedDriver {
+            run_id: Some(run_id.to_owned()),
+            reason: "no execution/task row found for run_id".to_owned(),
+        });
+    };
+    registry.require(&slug).map_err(|error| {
+        tracing::error!(
+            run_id,
+            ?peer_pid,
+            driver_slug = %slug,
+            "events socket: resolved driver slug is not registered in this binary",
+        );
+        SocketError::UnresolvedDriver {
+            run_id: Some(run_id.to_owned()),
+            reason: format!("{error}"),
+        }
+    })
 }
 
 /// Publish the two event-bus transitions this hook-ingress path can
@@ -412,11 +494,36 @@ fn extract_run_id_from_payload(raw: &serde_json::Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::ClaudeDriver;
+    use crate::work::WorkItemPatch;
     use std::os::unix::fs::FileTypeExt;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tempfile::TempDir;
+
+    /// Build a `WorkDb` with one ready chore execution whose resolved driver
+    /// slug is `driver_slug` (via `products.default_driver`), or the engine
+    /// default when `None`. Returns the DB's owning `TempDir` (kept alive for
+    /// the caller's scope) alongside the `WorkDb` and the execution id to
+    /// embed as `_boss_run_id` in a test payload — mirroring how
+    /// `resolve_connection_driver` actually looks a connection's driver up in
+    /// production.
+    fn db_with_ready_execution(driver_slug: Option<&str>) -> (TempDir, WorkDb, String) {
+        let (dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        if let Some(slug) = driver_slug {
+            db.update_work_item(
+                &product.id,
+                WorkItemPatch {
+                    default_driver: Some(slug.to_owned()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let chore = crate::test_support::create_test_chore(&db, &product.id, "events-socket test chore");
+        let execution = crate::test_support::create_ready_chore_execution(&db, &chore.id);
+        (dir, db, execution.id)
+    }
 
     /// A socket filename that is unique across every test invocation in this
     /// process, not just across the (already-unique) `TempDir` it lives in.
@@ -577,6 +684,8 @@ mod tests {
 
     #[tokio::test]
     async fn round_trip_hook_payload_through_socket() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("events.sock");
         let listener = bind_events_socket(&path).unwrap();
@@ -586,25 +695,26 @@ mod tests {
         // None depending on scheduling. We assert only on the event
         // payload here; the explicit pid-matching test below holds the
         // client alive for the duration of the lookup.
-        let payload = br#"{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false}"#;
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"sess-1","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+        );
         let path_owned = path.clone();
         let client_task = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(payload).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
         client_task.await.unwrap();
 
         match incoming.event {
             WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "sess-1"),
             other => panic!("expected Stop, got {other:?}"),
         }
-        // Empty registry: no run_id correlation.
-        assert_eq!(incoming.run_id, None);
+        assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
     }
 
     #[tokio::test]
@@ -614,22 +724,25 @@ mod tests {
         // `work_runs` row — without this round-trip, the live-status
         // summarizer's tail watcher has no file to open and the per-slot
         // loop early-outs every tick on "no transcript path yet".
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("events.sock");
         let listener = bind_events_socket(&path).unwrap();
 
         let path_owned = path.clone();
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"/home/u/.claude/projects/foo/sess-1.jsonl","_boss_run_id":"{run_id}"}}"#
+        );
         let client = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(
-                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"/home/u/.claude/projects/foo/sess-1.jsonl"}"#,
-            ).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
         client.await.unwrap();
 
         assert_eq!(
@@ -643,6 +756,367 @@ mod tests {
         // Pre-live-status hook payloads (and the test fixtures still
         // around) won't carry the field. The extractor must surface
         // `None` rather than erroring or stalling the dispatcher.
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+        );
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        client.await.unwrap();
+
+        assert!(incoming.transcript_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_transcript_path_is_none() {
+        // An empty string would round-trip through SQLite into a
+        // path the tail watcher would try (and fail) to open every
+        // tick. Treat empty as missing, matching the `_boss_run_id`
+        // policy.
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":"","_boss_run_id":"{run_id}"}}"#
+        );
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        client.await.unwrap();
+
+        assert!(incoming.transcript_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn run_id_extracted_from_payload_field() {
+        // The `_boss_run_id` field embedded by the shim is the only path by
+        // which the engine resolves a run id (and, per this seam, the
+        // connection's driver) today — it must name a real execution or
+        // resolution fails loudly (see `unresolved_run_id_fails_loudly`).
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+        );
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        client.await.unwrap();
+
+        assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn payload_run_id_wins_over_missing_fallback() {
+        // The `_boss_run_id` field in the payload is the only path for
+        // run correlation. This test confirms it's correctly extracted.
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+        );
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let client = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let _ = close_rx.recv();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db).await.unwrap();
+        assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
+
+        close_tx.send(()).ok();
+        client.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_json_yields_socket_error() {
+        let (_db_dir, db, _run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(b"not json").unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        client.await.unwrap();
+
+        match result {
+            Err(SocketError::Json(_)) => {}
+            other => panic!("expected Json error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn known_event_with_unknown_kind_yields_normalize_error() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let payload = format!(r#"{{"session_id":"x","hook_event_name":"WeirdHook","_boss_run_id":"{run_id}"}}"#);
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        client.await.unwrap();
+
+        match result {
+            Err(SocketError::Normalize(NormalizeError::UnknownEvent(name))) => {
+                assert_eq!(name, "WeirdHook");
+            }
+            other => panic!("expected Normalize/UnknownEvent, got {other:?}"),
+        }
+    }
+
+    // ─── per-connection driver resolution ──────────────────────────────
+
+    /// Minimal driver that decodes Grok's camelCase hook-payload shape
+    /// (`hookEventName` / `sessionId`) instead of Claude's snake_case
+    /// (`hook_event_name` / `session_id`). Stands in for the real
+    /// `GrokDriver::normalize_progress_event` — which is `unimplemented!()`
+    /// pending the separate T-10 dialect work — so this suite can exercise
+    /// per-connection driver *resolution* (this bug) independently of
+    /// Grok's actual dialect decoding (that follow-on).
+    struct CamelCaseTestDriver;
+
+    #[async_trait::async_trait]
+    impl AgentDriver for CamelCaseTestDriver {
+        fn descriptor(&self) -> &crate::driver::DriverDescriptor {
+            static DESCRIPTOR: std::sync::OnceLock<crate::driver::DriverDescriptor> = std::sync::OnceLock::new();
+            DESCRIPTOR.get_or_init(crate::driver::test_support::stub_descriptor)
+        }
+        fn capabilities(&self) -> crate::driver::CapabilitySet {
+            crate::driver::CapabilitySet::new([])
+        }
+        fn spawn_invocation(&self, _request: crate::driver::SpawnRequest<'_>) -> crate::driver::SpawnPlan {
+            unimplemented!()
+        }
+        async fn provision_workspace(
+            &self,
+            _workspace: &Path,
+            _prompt_text: &str,
+            _run_id: &str,
+        ) -> anyhow::Result<Option<crate::driver::DriverRuntimeState>> {
+            unimplemented!()
+        }
+        async fn teardown_workspace(
+            &self,
+            _workspace: Option<&Path>,
+            _run_id: &str,
+            _runtime_state: Option<&crate::driver::DriverRuntimeState>,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_permission_config(
+            &self,
+            _input: &crate::driver::PermissionInput,
+            _dest_dir: &Path,
+        ) -> anyhow::Result<crate::driver::PermissionArtifacts> {
+            unimplemented!()
+        }
+        fn progress_fidelity(&self) -> crate::driver::ProgressFidelity {
+            crate::driver::ProgressFidelity::Minimal
+        }
+        fn progress_observation_wiring(
+            &self,
+            _config: &crate::driver::ProgressObservationConfig,
+        ) -> crate::driver::ProgressIngress {
+            crate::driver::ProgressIngress::StdoutJsonl
+        }
+        fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+            let obj = raw
+                .as_object()
+                .ok_or_else(|| NormalizeError::Malformed("expected JSON object".to_owned()))?;
+            let hook_event_name = obj
+                .get("hookEventName")
+                .and_then(|v| v.as_str())
+                .ok_or(NormalizeError::MissingField("hookEventName"))?;
+            let session_id = obj
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .ok_or(NormalizeError::MissingField("sessionId"))?
+                .to_owned();
+            match hook_event_name {
+                "Stop" => Ok(WorkerEvent::Stop {
+                    session_id,
+                    stop_hook_active: false,
+                    stop_reason: boss_protocol::StopReason::Completed,
+                }),
+                other => Err(NormalizeError::UnknownEvent(other.to_owned())),
+            }
+        }
+        fn turn_boundary(&self, _event: &WorkerEvent) -> Option<TurnEnd> {
+            None
+        }
+        fn tool_use_interception_wiring(
+            &self,
+            _config: &crate::driver::ToolUseInterceptionConfig,
+        ) -> crate::driver::ToolUseInterceptionWiring {
+            crate::driver::ToolUseInterceptionWiring {
+                pre_tool_use_hooks: Vec::new(),
+            }
+        }
+        fn agent_rules_preamble(&self) -> &'static str {
+            "# camelcase test driver preamble\n"
+        }
+        fn transcript_path_for_session(&self, _raw: &serde_json::Value) -> Option<String> {
+            None
+        }
+        fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
+            raw
+        }
+        fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {
+            None
+        }
+        fn classify_error(&self, _raw_output: &str) -> crate::driver::WorkerErrorClass {
+            unimplemented!()
+        }
+        fn structured_output_fallback(
+            &self,
+            _kind: boss_engine_structured_output::StructuredOutputKind,
+            _text: &str,
+        ) -> Vec<boss_engine_structured_output::fallback::FallbackCandidate> {
+            Vec::new()
+        }
+    }
+
+    /// Regression for the bug this seam fixes: a Grok-dialect (camelCase)
+    /// hook payload arriving on the events socket for a run whose execution
+    /// driver is `grok` must be normalised by the driver registered for
+    /// `grok` — not silently normalised (and dropped) as Claude. Before this
+    /// change every connection resolved `ENGINE_DEFAULT_DRIVER` regardless of
+    /// the run, so this payload would have failed
+    /// `ClaudeDriver::normalize_progress_event` with
+    /// `MissingField("session_id")` and never reached progress ingress.
+    #[tokio::test]
+    async fn grok_dialect_payload_is_normalised_by_the_runs_grok_driver_not_the_engine_default() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(Some("grok"));
+        // `GrokDriver::normalize_progress_event` is `unimplemented!()` pending
+        // T-10; substitute a driver with a real camelCase decoder under the
+        // "grok" slug so this test proves *resolution*, not T-10's dialect.
+        let registry = DriverRegistry::default().with_driver("grok", std::sync::Arc::new(CamelCaseTestDriver));
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let payload = format!(r#"{{"hookEventName":"Stop","sessionId":"grok-sess-1","_boss_run_id":"{run_id}"}}"#);
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .expect("camelCase payload must be normalised by the resolved grok driver, not dropped");
+        client.await.unwrap();
+
+        match incoming.event {
+            WorkerEvent::Stop { session_id, .. } => assert_eq!(session_id, "grok-sess-1"),
+            other => panic!("expected Stop, got {other:?}"),
+        }
+    }
+
+    /// Counterpart to the test above: the identical camelCase payload,
+    /// arriving on a run whose execution driver is `claude`, must still be
+    /// rejected by `ClaudeDriver::normalize_progress_event` exactly as it is
+    /// today — per-connection resolution must not change Claude's behaviour.
+    #[tokio::test]
+    async fn same_camelcase_payload_for_a_claude_run_still_fails_normalize_as_today() {
+        let (_db_dir, db, run_id) = db_with_ready_execution(Some("claude"));
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let payload = format!(r#"{{"hookEventName":"Stop","sessionId":"grok-sess-1","_boss_run_id":"{run_id}"}}"#);
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let result = handle_connection(stream, &registry, &db).await;
+        client.await.unwrap();
+
+        match result {
+            Err(SocketError::Normalize(NormalizeError::MissingField(field))) => {
+                assert_eq!(field, "session_id");
+            }
+            other => panic!("expected Normalize/MissingField(\"session_id\"), got {other:?}"),
+        }
+    }
+
+    /// A connection whose payload carries no `_boss_run_id` at all must fail
+    /// loudly rather than silently falling back to a guessed driver.
+    #[tokio::test]
+    async fn missing_run_id_fails_loudly_instead_of_guessing_a_driver() {
+        let (_db_dir, db, _run_id) = db_with_ready_execution(None);
+        let registry = DriverRegistry::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("events.sock");
         let listener = bind_events_socket(&path).unwrap();
@@ -658,143 +1132,44 @@ mod tests {
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
-        client.await.unwrap();
-
-        assert!(incoming.transcript_path.is_none());
-    }
-
-    #[tokio::test]
-    async fn empty_transcript_path_is_none() {
-        // An empty string would round-trip through SQLite into a
-        // path the tail watcher would try (and fail) to open every
-        // tick. Treat empty as missing, matching the `_boss_run_id`
-        // policy.
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream
-                .write_all(
-                    br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"transcript_path":""}"#,
-                )
-                .unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
-        client.await.unwrap();
-
-        assert!(incoming.transcript_path.is_none());
-    }
-
-    #[tokio::test]
-    async fn run_id_extracted_from_payload_field() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        // Empty registry — pid lookup will return None. The
-        // `_boss_run_id` field embedded by the shim is the only path
-        // by which the engine should resolve a run id today.
-        let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(
-                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"run-from-payload"}"#,
-            ).unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
-        client.await.unwrap();
-
-        assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
-    }
-
-    #[tokio::test]
-    async fn payload_run_id_wins_over_missing_fallback() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        // The `_boss_run_id` field in the payload is the only path for
-        // run correlation. This test confirms it's correctly extracted.
-        let path_owned = path.clone();
-        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
-        let client = std::thread::spawn(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(
-                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"run-from-payload"}"#,
-            ).unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-            let _ = close_rx.recv();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let incoming = handle_connection(stream, &ClaudeDriver).await.unwrap();
-        assert_eq!(incoming.run_id.as_deref(), Some("run-from-payload"));
-
-        close_tx.send(()).ok();
-        client.join().unwrap();
-    }
-
-    #[tokio::test]
-    async fn malformed_json_yields_socket_error() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("events.sock");
-        let listener = bind_events_socket(&path).unwrap();
-
-        let path_owned = path.clone();
-        let client = tokio::task::spawn_blocking(move || {
-            use std::io::Write;
-            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(b"not json").unwrap();
-            stream.shutdown(std::net::Shutdown::Write).unwrap();
-        });
-
-        let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream, &ClaudeDriver).await;
+        let result = handle_connection(stream, &registry, &db).await;
         client.await.unwrap();
 
         match result {
-            Err(SocketError::Json(_)) => {}
-            other => panic!("expected Json error, got {other:?}"),
+            Err(SocketError::UnresolvedDriver { run_id: None, .. }) => {}
+            other => panic!("expected UnresolvedDriver{{run_id: None}}, got {other:?}"),
         }
     }
 
+    /// A `_boss_run_id` that names no known execution must also fail loudly
+    /// — never fall back to guessing a driver for an unrecognised run.
     #[tokio::test]
-    async fn known_event_with_unknown_kind_yields_normalize_error() {
+    async fn unknown_run_id_fails_loudly_instead_of_guessing_a_driver() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let registry = DriverRegistry::default();
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("events.sock");
         let listener = bind_events_socket(&path).unwrap();
 
-        let payload = br#"{"session_id":"x","hook_event_name":"WeirdHook"}"#;
         let path_owned = path.clone();
         let client = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let mut stream = StdUnixStream::connect(&path_owned).unwrap();
-            stream.write_all(payload).unwrap();
+            stream.write_all(
+                br#"{"hook_event_name":"Stop","session_id":"s","stop_hook_active":false,"_boss_run_id":"no-such-execution"}"#,
+            ).unwrap();
             stream.shutdown(std::net::Shutdown::Write).unwrap();
         });
 
         let (stream, _) = listener.accept().await.unwrap();
-        let result = handle_connection(stream, &ClaudeDriver).await;
+        let result = handle_connection(stream, &registry, &db).await;
         client.await.unwrap();
 
         match result {
-            Err(SocketError::Normalize(NormalizeError::UnknownEvent(name))) => {
-                assert_eq!(name, "WeirdHook");
+            Err(SocketError::UnresolvedDriver { run_id: Some(id), .. }) => {
+                assert_eq!(id, "no-such-execution");
             }
-            other => panic!("expected Normalize/UnknownEvent, got {other:?}"),
+            other => panic!("expected UnresolvedDriver{{run_id: Some(..)}}, got {other:?}"),
         }
     }
 
