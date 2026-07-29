@@ -17,6 +17,7 @@ rust_library(
     deps = [
         "//tools/boss/engine/jsonl-append",
         "//tools/boss/engine/utils",
+        "//tools/boss/log-files",
     ] + all_crate_deps(normal = True),
 )
 
@@ -32,6 +33,7 @@ rust_test(
     deps = [
         "//tools/boss/engine/jsonl-append",
         "//tools/boss/engine/utils",
+        "//tools/boss/log-files",
     ] + all_crate_deps(
         normal = True,
         normal_dev = True,

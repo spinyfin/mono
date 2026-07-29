@@ -69,11 +69,17 @@ pub fn execution_path(root: &Path, execution_id: &str) -> PathBuf {
     root.join("executions").join(execution_id).join("dispatch.jsonl")
 }
 
-/// Read every event currently in `current.jsonl`, in file order.
-/// Missing file is treated as "no events" so callers can run against
-/// a state root that hasn't been populated yet.
+/// Read every event in the flat dispatch-event stream, in chronological
+/// order: any rotated `current.jsonl.<unix_seconds>` segments oldest-first,
+/// followed by the live `current.jsonl`. A missing file (rotated or live) is
+/// treated as "no events" so callers can run against a state root that
+/// hasn't been populated yet, or that has rotated segments only.
 pub fn read_current(root: &Path) -> Result<Vec<DispatchEvent>> {
-    read_jsonl(&current_path(root))
+    let mut events = Vec::new();
+    for path in boss_log_files::segments_with_live(&current_path(root)) {
+        events.extend(read_jsonl(&path)?);
+    }
+    Ok(events)
 }
 
 /// Read every event in the per-execution mirror for `execution_id`.
@@ -658,6 +664,38 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].stage, "request_recorded");
         assert_eq!(events[2].stage, "pane_spawned");
+    }
+
+    /// Regression test for the rotation "amputated history" risk called out
+    /// in the fix that added rotation to `current.jsonl`: once the live
+    /// stream has rotated, `read_current` must still surface events from the
+    /// rotated segment(s), in chronological order, ahead of whatever the
+    /// live file now holds. `bossctl dispatch tail`/`diagnose` go through
+    /// this exact function.
+    #[tokio::test]
+    async fn read_current_spans_rotated_segments_and_live_file() {
+        let dir = TempDir::new().unwrap();
+        let current_path = current_path(dir.path());
+        fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+
+        let old_event = DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-old");
+        fs::write(
+            boss_log_files::rotated_segment_path(&current_path, 1_000),
+            format!("{}\n", serde_json::to_string(&old_event).unwrap()),
+        )
+        .unwrap();
+
+        let sink = JsonlFileSink::new(dir.path());
+        write(&sink, DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-new")).await;
+
+        let events = read_current(dir.path()).unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "expected one event from the rotated segment and one live"
+        );
+        assert_eq!(events[0].execution_id, "exec-old", "rotated segment must come first");
+        assert_eq!(events[1].execution_id, "exec-new", "live file must come last");
     }
 
     #[tokio::test]

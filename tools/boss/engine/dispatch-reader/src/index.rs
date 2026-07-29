@@ -245,10 +245,12 @@ impl TimelineIndex {
             self.cursor = None;
             self.states.clear();
             self.rebuilds += 1;
-            // Rotated segments are immutable history. They do not exist today
-            // (`current.jsonl` is never rotated) but a reader that spans them
-            // is what any future rotation needs, and enumerating an empty set
-            // costs one `read_dir`.
+            // Rotated segments are immutable history. `current.jsonl` now
+            // rotates once it crosses `JsonlFileSink`'s size threshold
+            // (`boss_dispatch_events::DEFAULT_CURRENT_MAX_BYTES`), which changes
+            // the live file's inode and so triggers exactly this rebuild path
+            // via the identity check in `resume_offset`. Enumerating an empty
+            // set costs one `read_dir` and is a no-op before the first rotation.
             for segment in rotated_segments(&path) {
                 let outcome = fold_file(&segment, 0, &mut self.states)?;
                 stats.absorb(outcome);
