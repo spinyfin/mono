@@ -259,6 +259,41 @@ pub enum Capability {
     /// `codex exec`'s one-turn-per-process model has no live "awaiting
     /// input" state for this signal to attach to at all.
     AwaitingInputSignal,
+    /// The driver's [`Capability::ProgressObservation`] stream can positively
+    /// report each command's exit status (success/failure), as distinct from
+    /// mere activity (a command started, then finished, with some output).
+    /// This is a narrower claim than `ProgressObservation` itself, in the
+    /// same way [`Capability::AwaitingInputSignal`] is: a driver can produce
+    /// a perfectly good activity stream while never actually carrying a
+    /// reliable per-command outcome.
+    ///
+    /// Codex is the reason this exists as its own capability rather than
+    /// being folded into [`ProgressFidelity::Rich`]. Codex's rollout log
+    /// carries `exit_code`/`status` fields alongside the `aggregated_output`
+    /// text Boss's normaliser reads, but that field set is not a reliable
+    /// per-command outcome: the exit code is only sometimes present, can be
+    /// dropped by the model's own result-projection layer before the record
+    /// is ever emitted, and becomes unparseable once output is truncated.
+    /// `Rich` genuinely describes Codex's event *cadence* — it reports a
+    /// start/end boundary around every tool call, same resolution as
+    /// Claude's hooks — but cadence says nothing about whether the
+    /// end-of-command record actually says whether the command succeeded.
+    /// Declaring `Rich` alone would let a scheduler assume that guarantee
+    /// anyway, so the outcome claim needs its own capability rather than
+    /// riding along on the fidelity tier.
+    ///
+    /// Absence is **Degrade, never Synthesize**, for the same reason as
+    /// `AwaitingInputSignal`: Boss must not guess a command's outcome from
+    /// activity alone (e.g. "it kept going, so the last command must have
+    /// succeeded") when the driver never actually observed it.
+    ///
+    /// This is also the seam the eventual cross-driver load-balancing work
+    /// will need: a normalised per-command outcome has to carry an explicit
+    /// "observed" bit rather than assuming every driver's silence means
+    /// success, because Codex's unobserved state has no Claude counterpart —
+    /// collapsing the two would make an absent signal indistinguishable from
+    /// a confirmed pass.
+    CommandOutcomeObservation,
 }
 
 impl Capability {
@@ -282,6 +317,7 @@ impl Capability {
             Self::ToolProvisioning,
             Self::PromptComposition,
             Self::AwaitingInputSignal,
+            Self::CommandOutcomeObservation,
         ]
         .into_iter()
     }
@@ -304,6 +340,7 @@ impl Capability {
             Self::ToolProvisioning => AbsenceDisposition::Degrade,
             Self::PromptComposition => AbsenceDisposition::Refuse,
             Self::AwaitingInputSignal => AbsenceDisposition::Degrade,
+            Self::CommandOutcomeObservation => AbsenceDisposition::Degrade,
         }
     }
 }
@@ -793,13 +830,24 @@ impl WorkerProcessLifetime {
 /// every tier; the tier records how much resolution the driver's event source
 /// actually carries, so degrade decisions (and the staleness sweep) can
 /// account for a driver that observes less than Claude.
+///
+/// This tier is about event **cadence** only — how often the driver reports
+/// a start/end boundary — not about what those boundaries can tell Boss once
+/// a command has run. Whether a driver's stream reliably says *whether a
+/// given command succeeded* is a separate, narrower claim tracked by
+/// [`Capability::CommandOutcomeObservation`]. A driver can legitimately
+/// declare `Rich` here (dense per-tool boundaries) while leaving that
+/// capability undeclared (no reliable per-command outcome) — see that
+/// capability's doc for why Codex is exactly this case.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressFidelity {
     /// Per-tool events plus lifecycle. Claude provides this from its hook
     /// stream — `PreToolUse`/`PostToolUse` give per-tool granularity. A
     /// stdout-JSONL driver whose stream carries the same per-tool-call
     /// boundary (e.g. `item.started`/`item.completed`) also declares this
-    /// tier — the tier is about resolution, not transport.
+    /// tier — the tier is about resolution, not transport. It is *not* a
+    /// claim about per-command outcome fidelity; see
+    /// [`Capability::CommandOutcomeObservation`].
     Rich,
     /// Turn + lifecycle boundaries only, with no per-tool granularity.
     Coarse,
@@ -2294,6 +2342,18 @@ mod tests {
     }
 
     #[test]
+    fn command_outcome_observation_degrades_when_absent_not_synthesizes() {
+        // Must never be Synthesize: Boss must not guess a command's
+        // exit status from activity alone when the driver never observed it
+        // (Codex's rollout `exit_code`/`status` fields are unreliable —
+        // sometimes absent, projection-dropped, or truncated-unparseable).
+        assert_eq!(
+            Capability::CommandOutcomeObservation.default_absence_disposition(),
+            AbsenceDisposition::Degrade,
+        );
+    }
+
+    #[test]
     fn post_hoc_interception_action_variants_are_distinct() {
         assert_eq!(PostHocInterceptionAction::Accept, PostHocInterceptionAction::Accept);
         let edit = PostHocInterceptionAction::RequestEdit {
@@ -2377,7 +2437,7 @@ mod tests {
     fn all_capabilities_covers_every_variant() {
         let all: Vec<_> = Capability::all().collect();
         // Every variant must appear exactly once.
-        assert_eq!(all.len(), 13, "Capability::all() must cover all 13 variants");
+        assert_eq!(all.len(), 14, "Capability::all() must cover all 14 variants");
         // Spot-check a few to ensure the enum and all() stay in sync.
         assert!(all.contains(&Capability::Spawn));
         assert!(all.contains(&Capability::StructuredOutput));

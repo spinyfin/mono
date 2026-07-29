@@ -177,7 +177,8 @@ impl AgentDriver for GrokDriver {
         // §Capability declaration for GrokDriver (v1). Every omission
         // below is deliberate; each notes its absence disposition and why.
         //
-        // Provided (all except ToolProvisioning + AwaitingInputSignal):
+        // Provided (all except ToolProvisioning + AwaitingInputSignal +
+        // CommandOutcomeObservation):
         //   Spawn, WorkspaceProvisioning, PermissionPolicy, ModelAndEffortMenu,
         //   ProgressObservation, ToolUseInterception (deny-only), TurnBoundary,
         //   StructuredOutput, TranscriptAccess, ControlVerbs, PromptComposition.
@@ -215,6 +216,13 @@ impl AgentDriver for GrokDriver {
             // capability's contract forbids guessing this state from a
             // lower-fidelity channel. A Grok worker shows Working/Idle and
             // never a fabricated WaitingForInput (design G-13 / T-24).
+            //
+            // CommandOutcomeObservation — omitted → default Degrade (never
+            // Synthesize). Grok's stdout stream has not been characterised
+            // for a reliable per-command exit-status field the way Codex's
+            // rollout `exit_code`/`status` fields were investigated and
+            // found unreliable; absent that evidence, this stays
+            // undeclared rather than assumed.
         ])
     }
 
@@ -733,6 +741,11 @@ mod tests {
         // and design G-13 both forbid fabricating WaitingForInput.
         assert_ne!(
             caps.absence_disposition(Capability::AwaitingInputSignal),
+            AbsenceDisposition::Synthesize
+        );
+        assert!(!caps.provides(Capability::CommandOutcomeObservation));
+        assert_ne!(
+            caps.absence_disposition(Capability::CommandOutcomeObservation),
             AbsenceDisposition::Synthesize
         );
     }
