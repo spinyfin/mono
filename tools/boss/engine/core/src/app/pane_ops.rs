@@ -249,17 +249,47 @@ impl ServerState {
     /// resolved slot on success so callers (`bossctl agents
     /// interrupt`) can confirm in JSON output which slot received
     /// the interrupt.
+    ///
+    /// For a driver whose interrupt path skips its normal turn-boundary
+    /// channel (Grok's Esc-cancelled turn skips the `Stop` hook entirely —
+    /// design T-12), this also snapshots and spawns the bounded
+    /// interrupt-recovery observer (`crate::interrupt_recovery`) so the run's
+    /// slot does not pin at `Working` forever. The snapshot is taken
+    /// *before* the Esc is sent (see [`crate::driver::InterruptRecoverySnapshot`]
+    /// for why), and the observer itself runs detached in the background —
+    /// it does not delay this call's response. Claude and Codex are
+    /// unaffected: their driver's `prepare_interrupt_recovery` default
+    /// returns `None`, so nothing is spawned for them.
     pub async fn interrupt_worker_pane(&self, run_id: &str) -> Result<u8, InterruptPaneError> {
         let Some(slot_id) = self.worker_registry.slot_for_run(run_id) else {
             return Err(InterruptPaneError::UnknownRun);
         };
+        let recovery_prep = crate::driver_transcript::driver_for_execution(&self.work_db, run_id).and_then(|driver| {
+            driver
+                .prepare_interrupt_recovery(run_id)
+                .map(|snapshot| (driver, snapshot))
+        });
         let request = EngineToAppRequest::InterruptWorkerPane(InterruptWorkerPaneInput { slot_id });
-        match self.send_to_app(request, Duration::from_secs(5)).await {
+        let result = match self.send_to_app(request, Duration::from_secs(5)).await {
             Ok(EngineToAppResponse::InterruptWorkerPane { result: Ok(_) }) => Ok(slot_id),
             Ok(EngineToAppResponse::InterruptWorkerPane { result: Err(err) }) => Err(InterruptPaneError::App(err)),
             Ok(other) => Err(InterruptPaneError::ResponseKindMismatch(format!("{other:?}"))),
             Err(err) => Err(InterruptPaneError::Send(err)),
+        };
+        if result.is_ok()
+            && let Some((driver, snapshot)) = recovery_prep
+        {
+            match self._self_weak.upgrade() {
+                Some(arc_self) => {
+                    let run_id = run_id.to_owned();
+                    tokio::spawn(async move {
+                        crate::interrupt_recovery::run_interrupt_recovery(driver, run_id, snapshot, arc_self).await;
+                    });
+                }
+                None => tracing::debug!(run_id, "interrupt recovery: ServerState already dropped; skipping"),
+            }
         }
+        result
     }
 
     /// Resolve `id` (short-form `T607` or canonical) to a work item

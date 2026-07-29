@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
@@ -788,6 +789,42 @@ pub enum ReapDelivery {
     /// SIGTERM, then SIGKILL on the process group after a grace window —
     /// today's universal ladder (`reap_worker_process_tree`).
     ProcessGroup,
+}
+
+/// Pre-interrupt snapshot for [`AgentDriver::prepare_interrupt_recovery`] /
+/// the engine's bounded interrupt-recovery observer.
+///
+/// Closes the Esc-cancelled-turn-boundary hazard: most drivers' interrupt
+/// path still produces a normal turn boundary through the regular
+/// [`Capability::TurnBoundary`] channel (Claude's Esc-cancelled turn still
+/// fires a `Stop` hook), but a driver whose interrupt path skips that
+/// channel entirely (Grok: Esc-cancelled turns skip the `Stop` hook, see
+/// the ControlVerbs design) needs the engine to watch for — or, failing
+/// that, synthesize — the turn end itself.
+///
+/// `offset` is the byte length already on disk at snapshot time (0 if the
+/// file does not exist yet), captured by [`AgentDriver::prepare_interrupt_recovery`]
+/// **before** the engine delivers the interrupt: a cancellation record
+/// written in the race between "Esc reaches the pty" and "the recovery
+/// observer starts tailing" would otherwise be missed and wrongly treated
+/// as evidence the interrupt never took.
+#[derive(Debug, Clone)]
+pub struct InterruptRecoverySnapshot {
+    /// File to tail for this driver's turn-end evidence.
+    pub events_path: PathBuf,
+    /// Byte offset to start reading new content from.
+    pub offset: u64,
+    /// Session identity to stamp on the synthetic `WorkerEvent::Stop` this
+    /// recovery produces — threaded through rather than re-read after the
+    /// interrupt so the eventual event carries the right identity even if
+    /// driver state has moved on by the time the settle window elapses.
+    pub session_id: String,
+    /// How long to wait for evidence before falling back to a synthesized
+    /// turn end. The fallback is sanctioned and expected to fire
+    /// occasionally — see [`AgentDriver::prepare_interrupt_recovery`] — but
+    /// must be logged distinctly from an observed one so an operator can
+    /// tell the two apart.
+    pub settle_window: Duration,
 }
 
 /// How long a driver's worker **process** is expected to live relative to the
@@ -1912,6 +1949,39 @@ pub trait AgentDriver: Send + Sync {
     /// actual process.
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
         MidTurnPaneInput::Rejects
+    }
+
+    /// Pre-interrupt snapshot for the bounded turn-end recovery the engine
+    /// runs immediately after delivering an interrupt to this driver's
+    /// worker — see [`InterruptRecoverySnapshot`] for why this must be
+    /// captured *before* the interrupt is sent.
+    ///
+    /// Returns `None` when this driver's interrupt already produces a
+    /// normal turn boundary through the regular
+    /// [`Capability::TurnBoundary`] channel and needs no recovery — the
+    /// default, correct for Claude and Codex, whose Esc-cancelled turn
+    /// (or equivalent) still fires the driver's ordinary turn-ended
+    /// signal. `run_id` is the engine's run/execution id, from which a
+    /// driver that needs recovery resolves its own per-run state (Grok:
+    /// `GROK_HOME`, session id, workspace) without the engine knowing
+    /// anything about that shape.
+    fn prepare_interrupt_recovery(&self, _run_id: &str) -> Option<InterruptRecoverySnapshot> {
+        None
+    }
+
+    /// Whether one raw JSONL record from
+    /// [`InterruptRecoverySnapshot::events_path`] is this driver's
+    /// cancelled-turn-end evidence. Called once per new complete line the
+    /// engine's bounded tail reads; a line this driver's recovery format
+    /// does not recognise (noise, an unrelated event type) must return
+    /// `false` rather than be treated as a parse failure, so the tail
+    /// keeps reading up to the settle window.
+    ///
+    /// Only meaningful for a driver that returned `Some` from
+    /// [`Self::prepare_interrupt_recovery`] — the default `false` is
+    /// never consulted for a driver that returns `None` there.
+    fn is_interrupt_recovery_turn_end(&self, _raw: &serde_json::Value) -> bool {
+        false
     }
 
     /// How long this driver's foreground worker process lives relative to the

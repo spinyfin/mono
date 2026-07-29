@@ -195,7 +195,9 @@ pub const COMPAT_SURFACES: &[&str] = &["hooks", "agents", "skills", "mcps", "rul
 /// Full `[compat.claude]` + `[compat.cursor]` disable block (design posture +
 /// T-01 findings). There is no effectual `permissions = false` cell; HOME
 /// scoping is the permission-isolation lever. Official cells are
-/// hooks/agents/skills/mcps/rules/sessions — not `plugins`.
+/// hooks/agents/skills/mcps/rules/sessions — not `plugins`. Also pins
+/// `[ui] vim_mode = false` (design T-12/T-13) so the interrupt control verb
+/// (Esc) is never silently broken by fullscreen vim-scrollback mode.
 pub fn render_base_config_toml() -> String {
     // Keep this byte-stable for tests and for `grok inspect` assertions.
     r#"# Boss-owned Grok config. Written every provision (idempotent overwrite).
@@ -219,6 +221,14 @@ skills = false
 mcps = false
 rules = false
 sessions = false
+
+[ui]
+# Esc-cancel is swallowed as a no-op in fullscreen vim-scrollback mode
+# (design T-12/T-13; user-guide 03-keyboard-shortcuts.md / 05-configuration.md),
+# which would silently break the ControlVerbs interrupt path. `vim_mode`
+# already defaults to false upstream, but Boss owns this explicitly rather
+# than depend on a default that could change.
+vim_mode = false
 "#
     .to_owned()
 }

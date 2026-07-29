@@ -1,15 +1,19 @@
 //! `GrokDriver` — xAI Grok Build agent driver.
 //!
 //! Descriptor, capability set, model menu, Boss-owned `GROK_HOME` provisioning,
-//! interactive-TUI pane spawn, and hook wiring (progress forwarder + the five
+//! interactive-TUI pane spawn, hook wiring (progress forwarder + the five
 //! `PreToolUse` guards behind a canonicalisation adapter — design T-09, see
-//! [`hooks`]). Full permission-policy artifacts (`--sandbox`/`--allow`/`--deny`,
-//! T-17), control verbs, and transcript access remain follow-on work — see
+//! [`hooks`]), the four ControlVerbs and Grok/xAI error classification
+//! (design T-13, see [`classify_error`] and this file's `probe`/`interrupt`/
+//! `stop`/`reap` overrides), and turn-end recovery for Esc-cancelled turns
+//! (design T-12, see [`turn_end_recovery`]). Full permission-policy artifacts
+//! (`--sandbox`/`--allow`/`--deny`, T-17) and transcript access remain
+//! follow-on work — see
 //! `tools/boss/docs/designs/grok-as-a-first-class-interactive-agent-driver.md`.
 //!
 //! Behavioural fan-out lives under the `grok/` submodule directory so
-//! concurrent follow-on tasks (transcript, control verbs, output capture,
-//! characterisation) do not serialise on this file.
+//! concurrent follow-on tasks (transcript, output capture, characterisation)
+//! do not serialise on this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,11 +26,13 @@ use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde_json::{Value, json};
 
+mod classify_error;
 mod home;
 mod hooks;
 mod model_menu;
 mod permissions;
 mod progress;
+mod turn_end_recovery;
 
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
@@ -34,15 +40,18 @@ pub use home::{
     grok_home_for_run, grok_homes_root, process_home_for_run, render_base_config_toml, trust_path_variants,
 };
 
+use classify_error::classify_grok_error;
 use home::{assert_grok_home_safe_to_delete, provision_grok_home, read_session_id, read_workspace_path_stamp};
 use progress::GrokProgressSession;
+use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, HookWiringDestination,
-    ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity, ProgressIngress,
-    ProgressObservationConfig, ProgressObservationWiring, ProgressSessionNormalizer, SpawnPlan, SpawnRequest,
-    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd,
-    WorkerErrorClass, WorkerKind, default_structured_output_wiring,
+    InterruptDelivery, InterruptRecoverySnapshot, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
+    ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
+    ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,9 +109,10 @@ const GROK_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed w
 /// xAI Grok Build CLI driver.
 ///
 /// Registered under the `"grok"` slug. Declares the v1 capability set from
-/// the Grok driver design. Workspace provisioning + pane spawn are live;
-/// progress wiring, full permission artifacts, and control verbs remain
-/// follow-on work.
+/// the Grok driver design. Workspace provisioning, pane spawn, progress
+/// wiring, and the ControlVerbs surface (probe/interrupt/stop/reap,
+/// classify_error, turn-end recovery) are live; full permission artifacts
+/// (`--sandbox`/`--allow`/`--deny`) remain follow-on work.
 #[derive(Default)]
 pub struct GrokDriver {
     // Keep this type non-unit so callers can use `Default` uniformly with
@@ -567,12 +577,58 @@ impl AgentDriver for GrokDriver {
         None
     }
 
-    fn classify_error(&self, _raw_output: &str) -> WorkerErrorClass {
-        // Must not route through `classify_claude_error`. Real Grok/xAI
-        // classification is ControlVerbs follow-on (T-13). Indeterminate is
-        // the documented "recognised as an error but not confidently
-        // bucketed; treat as Permanent" class.
-        WorkerErrorClass::Indeterminate
+    fn classify_error(&self, raw_output: &str) -> WorkerErrorClass {
+        // xAI/Grok-specific classification (design T-13, `grok/classify_error.rs`).
+        // Must not route through `classify_claude_error` — Grok's own
+        // `StopFailure` vocabulary only partially overlaps with Claude's.
+        classify_grok_error(raw_output)
+    }
+
+    /// Probe is typed pane input (`SendToPane`) — Grok's interactive TUI
+    /// reads stdin as the next user message, same as Claude's.
+    fn probe(&self) -> ProbeDelivery {
+        ProbeDelivery::PaneText
+    }
+
+    /// Interrupt is Esc into the pane (`InterruptWorkerPane`) — verified by
+    /// the Q8 spike to cancel the in-flight turn while the process survives
+    /// and accepts a subsequent turn. Esc-cancelled turns skip the `Stop`
+    /// hook entirely (design G-7); [`Self::prepare_interrupt_recovery`] /
+    /// [`Self::is_interrupt_recovery_turn_end`] close that gap (design T-12).
+    fn interrupt(&self) -> InterruptDelivery {
+        InterruptDelivery::PaneEsc
+    }
+
+    /// Stop is `/quit` typed into the pane, then pane release — Grok has no
+    /// documented signal-only graceful-quit path, but its interactive TUI
+    /// accepts `/quit` as a full line and exits cleanly (Q8 spike).
+    fn stop(&self) -> StopDelivery {
+        StopDelivery::PaneCommand { command: "/quit" }
+    }
+
+    /// Reap is the universal SIGTERM→SIGKILL process-group ladder, which
+    /// already covers tool child shells `run_terminal_command` spawns under
+    /// the worker's process group — no Grok-specific reap behaviour is
+    /// needed beyond the trait default.
+    fn reap(&self) -> ReapDelivery {
+        ReapDelivery::ProcessGroup
+    }
+
+    /// Pre-interrupt snapshot for T-12's turn-end recovery: resolves
+    /// `GROK_HOME`, the stamped session id and workspace path, and the
+    /// current length of `events.jsonl` (see `grok/turn_end_recovery.rs`).
+    /// `None` when this run has no resolvable per-run state (never
+    /// provisioned, or already torn down) — interrupt delivery itself is
+    /// unaffected either way.
+    fn prepare_interrupt_recovery(&self, run_id: &str) -> Option<InterruptRecoverySnapshot> {
+        prepare_snapshot(run_id)
+    }
+
+    /// Recognise a cancelled-turn-end `events.jsonl` record — see
+    /// `grok/turn_end_recovery.rs` for the exact match rule and its
+    /// empirical grounding.
+    fn is_interrupt_recovery_turn_end(&self, raw: &serde_json::Value) -> bool {
+        is_cancelled_turn_end(raw)
     }
 
     // mid_turn_pane_input: intentionally NOT overridden. Trait default is
@@ -1192,6 +1248,11 @@ mod tests {
             }),
             "plugins is not an official compat cell assignment: {config}"
         );
+        // T-12/T-13: vim mode must never be enabled — Esc does not cancel
+        // in fullscreen vim-scrollback mode, which would silently break
+        // the interrupt control verb.
+        assert!(config.contains("[ui]"));
+        assert!(config.contains("vim_mode = false"));
 
         let trust = fs::read_to_string(runtime.grok_home.join("trusted_folders.toml")).unwrap();
         assert!(trust.contains("trusted = true"));
@@ -1850,5 +1911,122 @@ mod tests {
             cmd.arg(arg);
         }
         cmd.output().expect("grok -p invocation must spawn")
+    }
+
+    // ── ControlVerbs (design T-13) ──────────────────────────────────────
+
+    #[test]
+    fn control_verb_delivery_plans_match_the_design() {
+        use crate::{InterruptDelivery, ProbeDelivery, ReapDelivery, StopDelivery};
+
+        let driver = GrokDriver::default();
+        assert_eq!(driver.probe(), ProbeDelivery::PaneText);
+        assert_eq!(driver.interrupt(), InterruptDelivery::PaneEsc);
+        assert_eq!(driver.stop(), StopDelivery::PaneCommand { command: "/quit" });
+        assert_eq!(driver.reap(), ReapDelivery::ProcessGroup);
+    }
+
+    #[test]
+    fn classify_error_delegates_to_grok_classifier_not_claude() {
+        let driver = GrokDriver::default();
+        // A Claude-vocabulary-only marker ("overloaded_error", no bare
+        // "overloaded") must not accidentally classify via Claude's
+        // classifier; Grok's own vocabulary is what must match here.
+        assert_eq!(
+            driver.classify_error("authentication_failed: invalid x-api-key"),
+            WorkerErrorClass::Permanent
+        );
+        assert_eq!(
+            driver.classify_error("rate_limit: too many requests"),
+            WorkerErrorClass::Transient
+        );
+        assert_eq!(
+            driver.classify_error("nothing recognisable"),
+            WorkerErrorClass::Indeterminate
+        );
+    }
+
+    // ── Turn-end recovery (design T-12) ─────────────────────────────────
+
+    #[test]
+    fn is_interrupt_recovery_turn_end_delegates_to_turn_end_recovery_module() {
+        let driver = GrokDriver::default();
+        assert!(driver.is_interrupt_recovery_turn_end(&json!({
+            "type": "turn_ended",
+            "outcome": "cancelled",
+            "cancellation_category": "mid_turn_abort",
+        })));
+        assert!(!driver.is_interrupt_recovery_turn_end(&json!({"type": "turn_ended", "outcome": "completed"})));
+    }
+
+    #[tokio::test]
+    async fn prepare_interrupt_recovery_snapshots_offset_zero_for_a_fresh_session() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-interrupt-1";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        let snapshot = driver
+            .prepare_interrupt_recovery(run_id)
+            .expect("a provisioned run must yield a recovery snapshot");
+
+        assert_eq!(snapshot.offset, 0, "events.jsonl does not exist yet; offset must be 0");
+        assert!(!snapshot.session_id.is_empty());
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        assert!(snapshot.events_path.starts_with(grok_home.join("sessions")));
+        assert!(
+            snapshot
+                .events_path
+                .ends_with(format!("{}/events.jsonl", snapshot.session_id))
+        );
+        assert!(snapshot.settle_window > std::time::Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn prepare_interrupt_recovery_snapshots_existing_file_length() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let workspace = tmp.path().join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let auth = tmp.path().join("auth.json");
+        write_fake_auth(&auth);
+        let _guard = env_for_provision(&homes, &auth, true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-interrupt-2";
+        driver.provision_workspace(&workspace, "hello", run_id).await.unwrap();
+
+        // Simulate an in-flight session that has already written some
+        // events.jsonl content before the interrupt is delivered. Build the
+        // path from the *stamped* (canonicalised) workspace path, exactly as
+        // `prepare_snapshot` does internally — the raw `workspace` var may
+        // differ (e.g. a symlinked temp dir), so using it here would make
+        // this test write to a path production code never reads.
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let session_id = read_session_id(&grok_home).unwrap();
+        let stamped_workspace = read_workspace_path_stamp(&grok_home).unwrap();
+        let events_path = turn_end_recovery::events_jsonl_path(&grok_home, &stamped_workspace, &session_id);
+        fs::create_dir_all(events_path.parent().unwrap()).unwrap();
+        let existing = b"{\"type\":\"turn_started\"}\n";
+        fs::write(&events_path, existing).unwrap();
+
+        let snapshot = driver.prepare_interrupt_recovery(run_id).unwrap();
+        assert_eq!(snapshot.offset, existing.len() as u64);
+        assert_eq!(snapshot.events_path, events_path);
+    }
+
+    #[test]
+    fn prepare_interrupt_recovery_returns_none_for_an_unprovisioned_run() {
+        let tmp = TempDir::new().unwrap();
+        let _guard = env_for_provision(tmp.path(), &tmp.path().join("auth.json"), true);
+        let driver = GrokDriver::default();
+        assert!(driver.prepare_interrupt_recovery("never-provisioned-run").is_none());
     }
 }
