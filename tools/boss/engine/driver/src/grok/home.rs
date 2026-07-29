@@ -153,6 +153,54 @@ pub fn resolve_grok_auth_source() -> PathBuf {
     }
 }
 
+/// Default leaf (relative to a real `HOME`) of `gh`'s config directory, used
+/// when neither `GH_CONFIG_DIR` nor `XDG_CONFIG_HOME` is set on the host —
+/// mirrors `gh`'s own resolution order (`gh help environment`).
+const GH_DEFAULT_CONFIG_LEAF: &str = ".config/gh";
+
+/// macOS login keychain leaf, relative to a real `HOME`. `gh auth login`
+/// stores the actual OAuth token here via the OS keyring, not in
+/// `~/.config/gh/hosts.yml` (which holds only non-secret metadata — host,
+/// username, git protocol). Keychain Services resolves this path from
+/// `$HOME`, so it goes dark under a scoped `HOME` the same way `~/.claude`
+/// does — confirmed empirically (`security find-generic-password` fails
+/// under a scoped `HOME` and succeeds once this file is bridged in).
+const LOGIN_KEYCHAIN_LEAF: &str = "Library/Keychains/login.keychain-db";
+
+/// Resolve the real host's `gh` config directory, honoring the exact
+/// precedence `gh` itself documents (`GH_CONFIG_DIR` > `XDG_CONFIG_HOME/gh` >
+/// `$HOME/.config/gh`). The worker's spawn env sets `GH_CONFIG_DIR` to this
+/// value directly — `gh` honors that var natively, so no filesystem bridge
+/// is needed for the config directory itself (only for the keychain-backed
+/// token; see [`resolve_login_keychain_source`]).
+///
+/// Must be called before `HOME` is overridden in the calling process's own
+/// env (i.e. from the engine process, not the spawned worker) so it resolves
+/// the operator's real config, not the scoped one.
+pub fn resolve_gh_config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("GH_CONFIG_DIR").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME").filter(|dir| !dir.is_empty()) {
+        return Some(PathBuf::from(dir).join("gh"));
+    }
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(|home| PathBuf::from(home).join(GH_DEFAULT_CONFIG_LEAF))
+}
+
+/// Resolve the real host's login keychain file, or `None` when it does not
+/// exist — e.g. a non-macOS host, or `gh` was never authenticated there.
+/// Bridging is then skipped rather than treated as fatal: unlike Grok's own
+/// `auth.json` (a hard requirement for the tool to run at all), this only
+/// affects `cube pr create`'s ability to authenticate later, which already
+/// fails loudly on its own when `gh` has no usable credential.
+fn resolve_login_keychain_source() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty())?;
+    let path = PathBuf::from(home).join(LOGIN_KEYCHAIN_LEAF);
+    path.exists().then_some(path)
+}
+
 // ---------------------------------------------------------------------------
 // Runtime state
 // ---------------------------------------------------------------------------
@@ -383,6 +431,36 @@ pub fn provision_grok_home(workspace: &Path, prompt_text: &str, run_id: &str) ->
             format!(
                 "removing stale {} so Claude permission sources cannot load",
                 claude_under_process.display()
+            )
+        })?;
+    }
+
+    // Bridge the operator's real gh credential store into process-home so
+    // `cube pr create`'s `gh` calls (the only sanctioned PR-push path) can
+    // authenticate. `GH_CONFIG_DIR` (set on the worker's spawn env — see
+    // `spawn_invocation`) covers `~/.config/gh`'s non-secret metadata, but
+    // gh's actual OAuth token lives in the macOS login keychain, which
+    // Keychain Services resolves from `$HOME` — so it needs its own bridge.
+    // Symlink only the single keychain file (never copy, matching the
+    // auth.json pattern below), and never the whole `~/Library/Keychains`
+    // directory: that also holds the iCloud-synced "local items" keychain
+    // and other apps' entries unrelated to gh. Best-effort: skipped when
+    // the host has no login keychain (see `resolve_login_keychain_source`).
+    if let Some(keychain_source) = resolve_login_keychain_source() {
+        let keychain_dir = process_home.join("Library").join("Keychains");
+        fs::create_dir_all(&keychain_dir).with_context(|| format!("creating {}", keychain_dir.display()))?;
+        let keychain_dest = keychain_dir.join("login.keychain-db");
+        match fs::symlink_metadata(&keychain_dest) {
+            Ok(_) => fs::remove_file(&keychain_dest)
+                .with_context(|| format!("removing prior keychain link {}", keychain_dest.display()))?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("stat {}", keychain_dest.display())),
+        }
+        std::os::unix::fs::symlink(&keychain_source, &keychain_dest).with_context(|| {
+            format!(
+                "symlinking login keychain from {} → {}",
+                keychain_source.display(),
+                keychain_dest.display()
             )
         })?;
     }
@@ -931,5 +1009,102 @@ mod tests {
             Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
             None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
         }
+    }
+
+    /// Save/restore a set of env vars around a test body, serialised by
+    /// [`GROK_HOMES_ENV_TEST_LOCK`] (shared with every other env-mutating
+    /// test in this crate — env vars are process-global, so anything that
+    /// flips `HOME`/`GH_CONFIG_DIR`/`XDG_CONFIG_HOME` must use the same lock
+    /// the homes/auth-source tests already serialise on).
+    struct MultiEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl MultiEnvGuard {
+        fn set(pairs: &[(&'static str, &Path)]) -> Self {
+            Self::set_and_clear(pairs, &[])
+        }
+
+        /// `set` each `(key, value)` pair, then remove every key in `clear`
+        /// (e.g. to test fallback precedence by ensuring a higher-priority
+        /// var is genuinely absent, not just shadowed).
+        fn set_and_clear(pairs: &[(&'static str, &Path)], clear: &[&'static str]) -> Self {
+            let lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let mut prior = Vec::new();
+            for (key, value) in pairs {
+                prior.push((*key, std::env::var_os(key)));
+                // SAFETY: serialised by GROK_HOMES_ENV_TEST_LOCK.
+                unsafe { std::env::set_var(key, value) };
+            }
+            for key in clear {
+                prior.push((*key, std::env::var_os(key)));
+                // SAFETY: serialised by GROK_HOMES_ENV_TEST_LOCK.
+                unsafe { std::env::remove_var(key) };
+            }
+            Self { _lock: lock, prior }
+        }
+    }
+
+    impl Drop for MultiEnvGuard {
+        fn drop(&mut self) {
+            for (key, prior) in &self.prior {
+                match prior {
+                    // SAFETY: serialised by GROK_HOMES_ENV_TEST_LOCK.
+                    Some(v) => unsafe { std::env::set_var(key, v) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_gh_config_dir_prefers_gh_config_dir_env() {
+        let _guard = MultiEnvGuard::set(&[
+            ("GH_CONFIG_DIR", Path::new("/explicit/gh-config")),
+            ("XDG_CONFIG_HOME", Path::new("/should-be-ignored")),
+            ("HOME", Path::new("/also-ignored")),
+        ]);
+        assert_eq!(resolve_gh_config_dir(), Some(PathBuf::from("/explicit/gh-config")));
+    }
+
+    #[test]
+    fn resolve_gh_config_dir_falls_back_to_xdg_config_home() {
+        let _guard = MultiEnvGuard::set_and_clear(
+            &[
+                ("XDG_CONFIG_HOME", Path::new("/xdg-home")),
+                ("HOME", Path::new("/ignored-home")),
+            ],
+            &["GH_CONFIG_DIR"],
+        );
+        assert_eq!(resolve_gh_config_dir(), Some(PathBuf::from("/xdg-home/gh")));
+    }
+
+    #[test]
+    fn resolve_gh_config_dir_falls_back_to_home_dot_config_gh() {
+        let _guard = MultiEnvGuard::set_and_clear(
+            &[("HOME", Path::new("/plain-home"))],
+            &["GH_CONFIG_DIR", "XDG_CONFIG_HOME"],
+        );
+        assert_eq!(resolve_gh_config_dir(), Some(PathBuf::from("/plain-home/.config/gh")));
+    }
+
+    #[test]
+    fn resolve_login_keychain_source_finds_existing_file() {
+        let tmp = TempDir::new().unwrap();
+        let keychain_dir = tmp.path().join("Library").join("Keychains");
+        fs::create_dir_all(&keychain_dir).unwrap();
+        let keychain_file = keychain_dir.join("login.keychain-db");
+        fs::write(&keychain_file, b"fake").unwrap();
+        let _guard = MultiEnvGuard::set(&[("HOME", tmp.path())]);
+        assert_eq!(resolve_login_keychain_source(), Some(keychain_file));
+    }
+
+    #[test]
+    fn resolve_login_keychain_source_none_when_missing() {
+        let tmp = TempDir::new().unwrap();
+        // No Library/Keychains under this HOME at all.
+        let _guard = MultiEnvGuard::set(&[("HOME", tmp.path())]);
+        assert_eq!(resolve_login_keychain_source(), None);
     }
 }
