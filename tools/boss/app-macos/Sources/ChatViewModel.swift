@@ -934,9 +934,24 @@ final class ChatViewModel: ObservableObject {
         guard let exactShortID = Self.parseShortIDQuery(query) else {
             return matched
         }
+
+        // A short-id match must surface the whole revision chain that id
+        // belongs to — matching a parent also matches every revision
+        // descended from it, and matching a revision also matches its
+        // chain root and siblings — since a revision's own name/description
+        // won't otherwise contain the parent's short id text.
+        var resultIDs = Set(matched.map(\.id))
+        var result = matched
+        if let seed = items.first(where: { $0.shortID == exactShortID }) {
+            let chainIDs = chainMemberIDs(containing: seed)
+            for item in items where chainIDs.contains(item.id) && resultIDs.insert(item.id).inserted {
+                result.append(item)
+            }
+        }
+
         var exact: [WorkTask] = []
         var rest: [WorkTask] = []
-        for item in matched {
+        for item in result {
             if item.shortID == exactShortID {
                 exact.append(item)
             } else {

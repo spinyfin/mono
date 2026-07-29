@@ -86,6 +86,40 @@ extension ChatViewModel {
         revisions(forParentTaskID: parentID, status: nil, includeChoresAndProductTasks: true)
     }
 
+    /// Every task/chore id belonging to the same revision chain as `task`:
+    /// its chain root (walking up `parentTaskId` through any number of
+    /// revision-of-a-revision hops) plus every revision descended from that
+    /// root, transitively. Used by the board search's short-id lookup
+    /// (issue: filtering by a short id hid the very revision that put the
+    /// parent "in revision") so a chain member's short id surfaces the
+    /// whole chain rather than just the one literal row it names.
+    ///
+    /// Membership is derived strictly from the engine's `parent_task_id` /
+    /// `kind == "revision"` graph via `task(withID:)` and
+    /// `allRevisions(forParentTaskID:)` — never from title, PR URL, or
+    /// description text.
+    func chainMemberIDs(containing task: WorkTask) -> Set<String> {
+        var root = task
+        while root.kind == "revision",
+              let parentID = root.parentTaskId,
+              let parent = self.task(withID: parentID) {
+            root = parent
+        }
+
+        var ids: Set<String> = [root.id]
+        var frontier: [WorkTask] = [root]
+        while !frontier.isEmpty {
+            var next: [WorkTask] = []
+            for node in frontier {
+                for child in allRevisions(forParentTaskID: node.id) where ids.insert(child.id).inserted {
+                    next.append(child)
+                }
+            }
+            frontier = next
+        }
+        return ids
+    }
+
     // Shared impl: project-task-parented revisions live under their project; chore-
     // parented ones live in the product-level bucket (issue #789). Pass
     // includeChoresAndProductTasks=true to also search choresByProductID and
