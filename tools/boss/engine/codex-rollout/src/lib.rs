@@ -26,10 +26,12 @@ pub struct CanonicalRolloutToolCall {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalRolloutToolOutput {
     pub body: String,
-    /// `true` when a structured `metadata.exit_code` is present and non-zero.
-    /// Plain string / content-array outputs have no exit code and stay
-    /// non-error (matching the dialect's lack of an explicit `isError` flag
-    /// on those forms).
+    /// `true` only when a structured exit code — top-level `exit_code`
+    /// (codex-cli 0.145.0's exec dialect) or the legacy `metadata.exit_code`
+    /// — is present and non-zero. Plain string / content-array outputs with
+    /// no parseable exit code (including a truncated JSON payload) stay
+    /// `false`: an unobserved exit code is never promoted to an error, but
+    /// it isn't asserted as success either.
     pub is_error: bool,
 }
 
@@ -134,34 +136,51 @@ pub fn extract_text_blocks(content: &[Value]) -> String {
 /// Parse a rollout tool-output `payload.output` value.
 ///
 /// Observed forms:
-/// - content-block array (`custom_tool_call_output`): joined text, non-error
-/// - plain string (`function_call_output`): used as body, non-error
-/// - JSON string `{"output":"…","metadata":{"exit_code":N}}` (shell tool
-///   dialect documented for Codex CLI): body from `output`, `is_error` when
-///   `exit_code != 0`
+/// - content-block array (`custom_tool_call_output`) whose joined text is
+///   itself the JSON string form below (codex-cli 0.145.0's exec dialect):
+///   body from `output`, `is_error` from the embedded top-level `exit_code`
+/// - content-block array whose joined text is plain (not JSON): joined
+///   text as body, non-error
+/// - plain string (`function_call_output`): used as body, non-error, unless
+///   it parses as the JSON string form below
+/// - JSON string `{"output":"…","exit_code":N}` or the legacy
+///   `{"output":"…","metadata":{"exit_code":N}}` shape: body from `output`,
+///   `is_error` when the exit code is present and non-zero
 /// - object with the same shape as the JSON string form
+///
+/// A JSON string form that fails to parse (e.g. a truncated payload) is not
+/// valid JSON, so it falls back to the plain-text case rather than being
+/// treated as a successful (`is_error: false`) structured result — the
+/// truncated exit code is unobserved, not confirmed absent.
 pub fn canonical_rollout_tool_output(output: &Value) -> CanonicalRolloutToolOutput {
     match output {
-        Value::Array(blocks) => CanonicalRolloutToolOutput {
-            body: extract_text_blocks(blocks),
-            is_error: false,
-        },
-        Value::String(text) => match serde_json::from_str::<Value>(text) {
-            Ok(parsed) => structured_tool_output(&parsed).unwrap_or(CanonicalRolloutToolOutput {
-                body: text.clone(),
-                is_error: false,
-            }),
-            Err(_) => CanonicalRolloutToolOutput {
-                body: text.clone(),
-                is_error: false,
-            },
-        },
+        Value::Array(blocks) => {
+            let joined = extract_text_blocks(blocks);
+            parse_possibly_structured_text(joined)
+        }
+        Value::String(text) => parse_possibly_structured_text(text.clone()),
         Value::Object(_) => structured_tool_output(output).unwrap_or(CanonicalRolloutToolOutput {
             body: serde_json::to_string_pretty(output).unwrap_or_default(),
             is_error: false,
         }),
         _ => CanonicalRolloutToolOutput {
             body: String::new(),
+            is_error: false,
+        },
+    }
+}
+
+/// Try to parse `text` as the JSON tool-output shape; fall back to using it
+/// verbatim as a non-error body when it isn't JSON, isn't the expected
+/// shape, or fails to parse (e.g. truncation).
+fn parse_possibly_structured_text(text: String) -> CanonicalRolloutToolOutput {
+    match serde_json::from_str::<Value>(&text) {
+        Ok(parsed) => structured_tool_output(&parsed).unwrap_or(CanonicalRolloutToolOutput {
+            body: text,
+            is_error: false,
+        }),
+        Err(_) => CanonicalRolloutToolOutput {
+            body: text,
             is_error: false,
         },
     }
@@ -176,9 +195,13 @@ fn structured_tool_output(value: &Value) -> Option<CanonicalRolloutToolOutput> {
         other => other.to_string(),
     };
     let is_error = obj
-        .get("metadata")
-        .and_then(|meta| meta.get("exit_code"))
+        .get("exit_code")
         .and_then(exit_code_nonzero)
+        .or_else(|| {
+            obj.get("metadata")
+                .and_then(|meta| meta.get("exit_code"))
+                .and_then(exit_code_nonzero)
+        })
         .unwrap_or(false);
     Some(CanonicalRolloutToolOutput { body, is_error })
 }
@@ -298,5 +321,41 @@ mod tests {
         }));
         assert_eq!(out.body, "fail");
         assert!(out.is_error);
+    }
+
+    #[test]
+    fn tool_output_json_string_with_top_level_exit_code_sets_is_error() {
+        let raw = r#"{"output":"boom\n","exit_code":9}"#;
+        let out = canonical_rollout_tool_output(&Value::String(raw.to_owned()));
+        assert_eq!(out.body, "boom\n");
+        assert!(out.is_error);
+    }
+
+    #[test]
+    fn tool_output_content_block_array_with_embedded_top_level_exit_code() {
+        let raw = r#"{"output":"exited badly\n","exit_code":137}"#;
+        let out = canonical_rollout_tool_output(&json!([{"type": "output_text", "text": raw}]));
+        assert_eq!(out.body, "exited badly\n");
+        assert!(out.is_error);
+    }
+
+    #[test]
+    fn tool_output_content_block_array_with_embedded_zero_exit_code_is_ok() {
+        let raw = r#"{"output":"all good\n","exit_code":0}"#;
+        let out = canonical_rollout_tool_output(&json!([{"type": "output_text", "text": raw}]));
+        assert_eq!(out.body, "all good\n");
+        assert!(!out.is_error);
+    }
+
+    #[test]
+    fn tool_output_truncated_json_degrades_to_non_error_raw_body() {
+        // A truncated payload is not valid JSON: the parser must not
+        // classify it as a confirmed-successful structured result, but it
+        // also must not fabricate an error from an unobserved exit code —
+        // it falls back to the raw text as the body, non-error.
+        let raw = r#"{"output":"partial\n","exit_code":1"#;
+        let out = canonical_rollout_tool_output(&json!([{"type": "output_text", "text": raw}]));
+        assert_eq!(out.body, raw);
+        assert!(!out.is_error);
     }
 }
