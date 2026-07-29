@@ -107,6 +107,35 @@ mod apply_permission_extra_args_tests {
         assert!(merged.contains("--json"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
     }
+
+    #[test]
+    fn standard_sandbox_unenforced_replaces_workspace_write_default_with_danger_full_access() {
+        let plan = CodexDriver::default().spawn_invocation(SpawnRequest {
+            model: "gpt-5.6-terra",
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some("exec-standard-1"),
+        });
+        assert!(
+            plan.command.contains("workspace-write"),
+            "Codex spawn default includes workspace-write: {}",
+            plan.command
+        );
+        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Standard, false));
+        assert!(
+            merged.contains("danger-full-access"),
+            "Standard with codex_sandbox_enforced off must get --sandbox danger-full-access: {merged}"
+        );
+        assert!(
+            !merged.contains("workspace-write"),
+            "default sandbox must be replaced: {merged}"
+        );
+        // Required contract flags survive the rewrite.
+        assert!(merged.contains("--json"), "{merged}");
+        assert!(merged.contains("--strict-config"), "{merged}");
+    }
 }
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the

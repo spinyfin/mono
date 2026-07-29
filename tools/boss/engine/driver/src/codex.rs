@@ -486,11 +486,12 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// pinned `.bazelversion`) bazelisk's own version-resolution call both go out
 /// over the network on a cold cache.
 ///
-/// This table only takes effect under `--sandbox workspace-write`; Reviewer
-/// runs use `--sandbox read-only` (see [`codex_sandbox_for_worker_kind`]),
-/// under which Codex does not consult `sandbox_workspace_write` at all, so no
-/// worker-kind branch is needed here — reviewers don't run build gates and
-/// stay fully denied.
+/// This table only takes effect under `--sandbox workspace-write`, i.e. for
+/// Standard/Triage/AnswerAgent when the `codex_sandbox_enforced` feature flag
+/// is on. Reviewer (`--sandbox read-only`) and the default
+/// `danger-full-access` path both ignore it entirely (see
+/// [`codex_sandbox_for_worker_kind`]), so no worker-kind branch is needed
+/// here.
 ///
 /// `workspace` itself is granted write access by Codex's own cwd default,
 /// separate from this function's `writable_roots` list, and does not need a
