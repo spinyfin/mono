@@ -169,6 +169,13 @@ struct WorkBoardCardItem: View {
                     onRevisionBadgeHover: { hovering in
                         model.setRevisionBadgeHover(hovering ? task.id : nil)
                     },
+                    onRevisionBadgeTap: {
+                        guard let revision = model.mostRecentActiveRevision(forParentID: task.id) else {
+                            model.workErrorMessage = "Couldn't find the in-progress revision for \(task.name) — it may have just finished or been deleted."
+                            return
+                        }
+                        model.revealWorkCard(revision.id, productID: revision.productID)
+                    },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
@@ -349,6 +356,9 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Called with `true` when the pointer enters the "In revision" badge;
     /// `false` on exit.
     var onRevisionBadgeHover: ((Bool) -> Void)? = nil
+    /// Invoked when the user taps the "In revision" badge — reveals the
+    /// revision task the badge is reporting on.
+    var onRevisionBadgeTap: (() -> Void)? = nil
     /// Invoked when the user taps the terminal icon. `nil` hides the
     /// button (also gated by `snapshot.showsTerminalButton`).
     var onOpenTerminal: (() -> Void)? = nil
@@ -402,7 +412,8 @@ struct WorkBoardCardView: View, @MainActor Equatable {
             if !footerSlice.isEmpty {
                 WorkBoardCardFooter(
                     slice: footerSlice,
-                    onRevisionBadgeHover: onRevisionBadgeHover
+                    onRevisionBadgeHover: onRevisionBadgeHover,
+                    onRevisionBadgeTap: onRevisionBadgeTap
                 )
                 .equatable()
             }

@@ -168,6 +168,28 @@ extension ChatViewModel {
         revisionHighlightIDs = ids
     }
 
+    /// The revision task the "In revision" badge should reveal when tapped:
+    /// the most recently created (highest `revisionSeq`) `todo`/`active`
+    /// revision task whose `parentTaskId` matches `taskID` — same
+    /// membership rule as `setRevisionBadgeHover`, since a task can have
+    /// more than one open revision row in flight. `nil` when the badge's
+    /// backing flag is stale and no such row currently resolves.
+    func mostRecentActiveRevision(forParentID taskID: String) -> WorkTask? {
+        let matches: (WorkTask) -> Bool = {
+            $0.kind == "revision"
+                && $0.parentTaskId == taskID
+                && ($0.status == "todo" || $0.status == "active")
+        }
+        var candidates: [WorkTask] = []
+        for tasks in tasksByProjectID.values {
+            candidates.append(contentsOf: tasks.filter(matches))
+        }
+        for revisions in productLevelRevisionsByProductID.values {
+            candidates.append(contentsOf: revisions.filter(matches))
+        }
+        return candidates.max { ($0.revisionSeq ?? 0) < ($1.revisionSeq ?? 0) }
+    }
+
     /// Transitively walks the prerequisite DAG from `taskID` and
     /// returns the IDs of every node that is:
     ///   - reachable (transitively reachable through `blocks` edges),

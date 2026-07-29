@@ -67,6 +67,8 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
     /// Called with `true` when the pointer enters the "In revision" badge;
     /// `false` on exit.
     var onRevisionBadgeHover: ((Bool) -> Void)? = nil
+    /// Invoked when the user taps the "In revision" badge.
+    var onRevisionBadgeTap: (() -> Void)? = nil
 
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.slice == rhs.slice
@@ -98,7 +100,7 @@ struct WorkBoardCardFooter: View, @MainActor Equatable {
                     )
                     .layoutPriority(1)
                     if slice.hasInProgressRevision {
-                        PrInRevisionIndicator()
+                        PrInRevisionIndicator(onTap: onRevisionBadgeTap)
                             .onHover { hovering in
                                 onRevisionBadgeHover?(hovering)
                             }
