@@ -120,6 +120,16 @@ pub const ATTENTION_KIND_RECOVERY_PERMANENT: &str = "worker_recovery_permanent_e
 /// worker because the transient-error retry cap was reached.
 pub const ATTENTION_KIND_RECOVERY_EXHAUSTED: &str = "worker_recovery_exhausted";
 
+/// Attention-item `kind` raised when [`crate::husk_pane_sweep`]'s
+/// mass-retirement circuit breaker declines to retire a burst of confirmed
+/// husk panes. The breaker's refusal is deliberate and must stay — but a
+/// safety valve that declines silently is itself the failure: before this
+/// kind existed a tripped breaker produced only a log line and a `skipped`
+/// dispatch event, and one wedged pool went unnoticed for over an hour.
+/// Filed on every work item whose pane is being held back, and resolved
+/// automatically by the first pass that finds the burst subsided.
+pub const ATTENTION_KIND_HUSK_BREAKER_TRIPPED: &str = "husk_retirement_breaker_tripped";
+
 /// Cooldown after a pre-spawn dispatch failure exhausts
 /// `PRE_START_RETRY_DELAYS` and `bounce_dispatch_failed_to_backlog` parks
 /// the work item in Backlog (`autostart = 0`, `dispatch_failed_reason`

@@ -304,6 +304,96 @@ impl WorkDb {
         self.upsert_external_tracker_attention(work_item_id, DISPATCH_STAGE_STALLED_ATTENTION_KIND, &title, &body)
     }
 
+    /// File (idempotently) the operator-visible attention items raised when
+    /// [`crate::husk_pane_sweep`]'s mass-retirement circuit breaker declines
+    /// to retire a burst of confirmed husk panes — see
+    /// [`crate::work::ATTENTION_KIND_HUSK_BREAKER_TRIPPED`].
+    ///
+    /// `held_back` is `(execution_id, slot_id)` per pane the breaker is
+    /// holding. One item is filed per distinct work item behind those panes:
+    /// those are precisely the cards whose worker cannot be redispatched
+    /// while the slot stays desynced, so that is where an operator will look.
+    /// Panes whose execution row is gone, or whose `work_item_id` is not a
+    /// kanban card (an `auto_…` automation id), are skipped for the same
+    /// reason [`Self::classify_dispatch_stall`] skips them — there is no card
+    /// to surface them on. They remain visible in the aggregate engine-health
+    /// banner and in the `husk_pane_reconcile` dispatch events.
+    ///
+    /// Returns the work item ids actually filed, so the sweep can resolve
+    /// exactly those once a later pass finds the burst subsided. Reuses
+    /// [`Self::upsert_external_tracker_attention`], so re-tripping every 60s
+    /// refreshes the same row (with the current count and slot list) instead
+    /// of piling up duplicates.
+    pub fn file_husk_breaker_attentions(&self, held_back: &[(String, u8)], max_per_pass: usize) -> Result<Vec<String>> {
+        let conn = self.connect()?;
+        let mut work_item_ids: Vec<String> = Vec::new();
+        for (execution_id, _) in held_back {
+            let Some(execution) = query_execution(&conn, execution_id)? else {
+                continue;
+            };
+            if classify_id(&execution.work_item_id).is_err() {
+                continue;
+            }
+            if !work_item_ids.contains(&execution.work_item_id) {
+                work_item_ids.push(execution.work_item_id);
+            }
+        }
+        drop(conn);
+
+        let confirmed = held_back.len();
+        let mut slots: Vec<String> = held_back.iter().map(|(_, slot)| slot.to_string()).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let slot_list = slots.join(", ");
+        let title = format!("Worker pool wedged: {confirmed} husk panes held back by the safety breaker");
+        let body = format!(
+            "The husk-pane sweep confirmed {confirmed} app-hosted panes as husks in a single pass — above \
+             its {max_per_pass}-per-pass limit — and deliberately retired **none** of them. A burst that \
+             size is better explained by the engine's bookkeeping going wrong for every slot at once than \
+             by that many genuinely-orphaned panes, and retiring a live worker destroys its in-flight work \
+             irreversibly.\n\n\
+             **Slots held back:** {slot_list}\n\n\
+             Each of those slots is desynced: the engine's pool believes it free while the app still hosts \
+             a pane there, so every dispatch into one is rejected `SlotBusy` and this work item's next \
+             execution cannot land.\n\n\
+             Verify the panes with `bossctl agents list --all`, then reclaim genuinely-dead ones with \
+             `bossctl agents retire-pane <slot>` (unaffected by the breaker, and it re-checks OS-level \
+             liveness itself before killing anything). If the workers are alive, the engine's live-worker \
+             bookkeeping is what is wrong — do not retire them.\n\n\
+             This item resolves automatically as soon as a sweep pass sees {max_per_pass} or fewer \
+             confirmed husks."
+        );
+        let mut filed = Vec::new();
+        for work_item_id in work_item_ids {
+            self.upsert_external_tracker_attention(&work_item_id, ATTENTION_KIND_HUSK_BREAKER_TRIPPED, &title, &body)?;
+            filed.push(work_item_id);
+        }
+        Ok(filed)
+    }
+
+    /// Resolve every open `husk_retirement_breaker_tripped` attention item,
+    /// whichever work item it sits on, and return how many were resolved.
+    /// Called by [`crate::husk_pane_sweep`] on the first pass that finds the
+    /// burst subsided.
+    ///
+    /// Deliberately keyed on the kind alone rather than on the ids the sweep
+    /// remembers filing: the condition is engine-wide, and the sweep's memory
+    /// of an episode does not survive an engine restart. Keying on the kind
+    /// means a restart mid-episode cannot strand an open item whose own body
+    /// promises it will clear itself.
+    pub fn resolve_husk_breaker_attentions(&self) -> Result<usize> {
+        let conn = self.connect()?;
+        let now = now_string();
+        let rows = conn.execute(
+            "UPDATE work_attention_items
+             SET status = 'resolved', resolved_at = ?1
+             WHERE kind = ?2
+               AND status = 'open'",
+            params![now, ATTENTION_KIND_HUSK_BREAKER_TRIPPED],
+        )?;
+        Ok(rows)
+    }
+
     /// Decide whether a persistently-stalled execution the dispatch-stall
     /// escalation sweep detected should be escalated onto the work-item
     /// attention surface — the terminal/liveness/id-kind gate the file-scan

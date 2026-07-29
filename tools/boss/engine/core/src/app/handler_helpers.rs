@@ -209,6 +209,53 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
         });
     }
 
+    // Husk-pane mass-retirement circuit breaker tripped: more confirmed husk
+    // panes in one sweep pass than the breaker will retire, so it retired
+    // none. That refusal is correct (retiring a live worker is
+    // unrecoverable) but it leaves every affected slot desynced — the pool
+    // believes it free while the app still hosts a pane, so dispatches into
+    // it are rejected `SlotBusy`. Before this banner the condition produced
+    // only a log line and pull-only dispatch events; one wedged pool went
+    // unnoticed for over an hour. See [`crate::husk_pane_sweep`].
+    let breaker = server_state.husk_breaker_health.snapshot();
+    if breaker.tripped {
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let since_suffix = breaker
+            .tripped_since_epoch
+            .map(|s| format_paused_since_phrase(s, now))
+            .filter(|s| !s.is_empty())
+            .map(|s| format!(" {s}"))
+            .unwrap_or_default();
+        let slots = breaker.slots.iter().map(u8::to_string).collect::<Vec<_>>().join(", ");
+        issues.push(EngineHealthIssue {
+            kind: "husk_retirement_breaker_tripped".to_owned(),
+            severity: "error".to_owned(),
+            title: format!(
+                "{} worker slots are wedged — husk retirement held back{since_suffix}",
+                breaker.slots.len(),
+            ),
+            body: format!(
+                "The husk-pane sweep confirmed {confirmed} app-hosted panes as husks in a single pass, \
+                 above its {max}-per-pass safety limit, and deliberately retired none of them: a burst \
+                 that size is better explained by the engine's live-worker bookkeeping going wrong for \
+                 every slot at once than by that many genuinely-orphaned panes, and retiring a live \
+                 worker destroys its in-flight work irreversibly.\n\
+                 \n\
+                 Slots held back: {slots}. Each is desynced — the engine's pool believes it free while \
+                 the app still hosts a pane there — so every dispatch into one is rejected `SlotBusy` \
+                 and that much of the pool is unusable.\n\
+                 \n\
+                 Check the panes with `bossctl agents list --all`. If the workers are genuinely dead, \
+                 reclaim each with `bossctl agents retire-pane <slot>` — that verb is not subject to the \
+                 breaker and re-checks OS-level liveness itself. If the workers are alive, the engine's \
+                 bookkeeping is what is wrong; do NOT retire them. This banner clears itself as soon as \
+                 a sweep pass sees {max} or fewer confirmed husks.",
+                confirmed = breaker.confirmed,
+                max = crate::husk_pane_sweep::MAX_RETIREMENTS_PER_PASS,
+            ),
+        });
+    }
+
     // Engine→app push channel wedged: consecutive `send_to_app` timeouts /
     // undeliverable enqueues mean small RPCs (reveal, pane release) are
     // stuck behind a saturated outbound queue. Surface it once here instead

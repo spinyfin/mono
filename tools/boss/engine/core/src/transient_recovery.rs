@@ -93,6 +93,39 @@
 //! attention instead of sitting `waiting_for_input` until an unrelated
 //! sweep reaps it.
 //!
+//! ## Freeing the slot means freeing the PANE, not just the bookkeeping
+//!
+//! Both terminal paths here — orphan+respawn and escalate — hand the
+//! worker's slot back to the pool. Doing that by clearing engine-side
+//! bookkeeping alone is not enough, and was the direct cause of a
+//! mass-wedge: on a 529-Overloaded burst, eleven slots across the
+//! interactive and review pools were released engine-side while the app
+//! went on hosting a live `claude` pane in every one of them. The pool
+//! believed the slots free, each redispatch hit `SpawnWorkerPane` and was
+//! rejected `SlotBusy` ("requested slot already hosts a pane (engine/app
+//! slot desync, not capacity)"), and the only mechanism that frees such a
+//! pane — [`crate::husk_pane_sweep`] — refused to act because eleven
+//! confirmed husks in one pass trips its mass-retirement circuit breaker.
+//! Nothing broke the loop: the panes stayed, the slots stayed desynced,
+//! the resume executions never landed, and the cube workspace leases
+//! stayed pinned behind them.
+//!
+//! So [`release_slot_and_pane`] tears the pane down through the canonical
+//! [`crate::app::ServerState::release_worker_pane`] teardown (injected as
+//! [`crate::completion::WorkerPaneReleaser`], the same seam the completion
+//! path and `bossctl agents stop` use) BEFORE any slot is handed back.
+//! Ordering matters in exactly one direction: a slot freed while its pane
+//! is still up is an invitation for the next dispatch to be rejected, so
+//! the pane always goes first. This also kills the wedged `claude`
+//! process, which the bookkeeping-only release never did — leaving the old
+//! process alive in the workspace the resume execution is about to
+//! re-lease with `allow_dirty`.
+//!
+//! This does not weaken the husk sweep's breaker in any way; it removes
+//! the burst that was feeding it. The breaker remains the backstop for the
+//! residual case it was built for — a pane teardown that the engine
+//! believes succeeded but that never reached the app.
+//!
 //! ## No infinite loop
 //!
 //! The retry cap and exponential backoff live in
@@ -113,6 +146,7 @@ use serde_json::Value;
 
 use boss_protocol::WorkerActivity;
 
+use crate::completion::{PaneReleaseOutcome, WorkerPaneReleaser};
 use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::driver::{DriverRegistry, WorkerErrorClass};
@@ -204,6 +238,12 @@ pub struct RecoveryContext<'a> {
     pub dispatch_events: &'a dyn DispatchEventSink,
     pub policy: &'a RecoveryPolicy,
     pub nudger: &'a dyn WorkerNudger,
+    /// Tears down the app-hosted pane behind a slot this sweep is about to
+    /// hand back to the pool. Not optional in production: releasing the
+    /// slot without it is what wedged eleven slots on a 529 burst (see the
+    /// module docs) — the pool frees the slot, the app keeps the pane, and
+    /// every redispatch into that slot is rejected `SlotBusy`.
+    pub pane_releaser: &'a dyn WorkerPaneReleaser,
 }
 
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`,
@@ -214,6 +254,7 @@ pub fn spawn_loop(
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
     nudger: Arc<dyn WorkerNudger>,
+    pane_releaser: Arc<dyn WorkerPaneReleaser>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     let policy = RecoveryPolicy::default();
@@ -233,6 +274,7 @@ pub fn spawn_loop(
                 dispatch_events: dispatch_events.as_ref(),
                 policy: &policy,
                 nudger: nudger.as_ref(),
+                pane_releaser: pane_releaser.as_ref(),
             };
             let outcome = run_one_pass(&cx, &mut nudged_executions, now).await;
             if outcome.has_activity() {
@@ -266,6 +308,7 @@ pub async fn run_one_pass(
         dispatch_events,
         policy,
         nudger,
+        pane_releaser,
         ..
     } = cx;
     let coordinator = cx.coordinator.clone();
@@ -465,7 +508,7 @@ pub async fn run_one_pass(
                     stall_reason,
                     "transient-recovery: worker stalled; auto-resuming on same workspace",
                 );
-                release_slot(&coordinator, live_states, state.slot_id).await;
+                release_slot_and_pane(&coordinator, live_states, pane_releaser, &execution_id, state.slot_id).await;
                 crate::reconcile_audit::append_reconcile_audit_best_effort(
                     work_db,
                     &work_item_id,
@@ -566,7 +609,7 @@ pub async fn run_one_pass(
                     error = %clipped,
                     "transient-recovery: escalating worker for human attention (not auto-retried)",
                 );
-                release_slot(&coordinator, live_states, state.slot_id).await;
+                release_slot_and_pane(&coordinator, live_states, pane_releaser, &execution_id, state.slot_id).await;
                 dispatch_events
                     .emit(
                         DispatchEvent::new(Stage::TransientRecoveryExhausted, Outcome::Error, &execution_id)
@@ -642,7 +685,54 @@ fn should_inspect(activity: WorkerActivity) -> bool {
     )
 }
 
-async fn release_slot(coordinator: &Arc<ExecutionCoordinator>, live_states: &LiveWorkerStateRegistry, slot_id: u8) {
+/// Hand `slot_id` back to the pool — pane first, bookkeeping second.
+///
+/// The pane teardown is the whole point. `release_pane` routes to
+/// [`crate::app::ServerState::release_worker_pane`], which asks the app to
+/// destroy the libghostty surface, signals the worker's process group
+/// (SIGTERM→SIGKILL) as an engine-side backstop, releases the pool claim,
+/// drops the live-state entry, and broadcasts the new snapshot. Doing all of
+/// that under one call is what keeps the engine's view of "slot N is free"
+/// and the app's view of "slot N hosts nothing" from diverging.
+///
+/// **Ordering is load-bearing and one-directional: pane down, then slot
+/// free.** The inverse — what this path did before, and what a related bug
+/// in this subsystem did earlier — publishes a free slot the app will still
+/// reject: the scheduler is kicked, claims the slot, calls
+/// `SpawnWorkerPane`, and gets `SlotBusy` from an app that is still hosting
+/// the old pane. That desync is unobservable from engine state alone (every
+/// engine-driven sweep reads bookkeeping the release already cleared), so it
+/// persists until the husk sweep retires the pane — and on a mass event the
+/// husk sweep's circuit breaker declines to, which is the wedge this closes.
+///
+/// [`PaneReleaseOutcome::NoLiveWorker`] means the run had no slot mapping,
+/// so `release_worker_pane` returned before touching *any* engine state:
+/// nothing was torn down and nothing was freed. Only then do we free the
+/// slot ourselves, which is exactly what this path did unconditionally
+/// before. On `Reaped` a second release would be redundant and racy — the
+/// scheduler has already been kicked and may have re-claimed the slot for a
+/// fresh execution by the time we got control back.
+async fn release_slot_and_pane(
+    coordinator: &Arc<ExecutionCoordinator>,
+    live_states: &LiveWorkerStateRegistry,
+    pane_releaser: &dyn WorkerPaneReleaser,
+    execution_id: &str,
+    slot_id: u8,
+) {
+    if pane_releaser.release_pane(execution_id).await == PaneReleaseOutcome::Reaped {
+        tracing::info!(
+            execution_id,
+            slot_id,
+            "transient-recovery: tore down the worker's app-hosted pane before freeing its slot",
+        );
+        return;
+    }
+    tracing::debug!(
+        execution_id,
+        slot_id,
+        "transient-recovery: no pane was mapped for this run; freeing the slot's engine-side \
+         bookkeeping directly",
+    );
     // Drop the live-state entry before releasing the pool claim — see the
     // matching comment in `dead_pid_sweep::reap_dead_execution`. Leaving it
     // behind desyncs the pool's "free" bookkeeping from the engine's own
@@ -760,6 +850,78 @@ mod tests {
         }
     }
 
+    /// [`WorkerPaneReleaser`] double that models what production's
+    /// `ServerState::release_worker_pane` actually does to engine state, in
+    /// the same order: tear the pane down, then release the pool claim, then
+    /// drop the live-state entry. `NoopWorkerPaneReleaser` reports `Reaped`
+    /// without touching anything, which would let a test "pass" while the
+    /// slot stayed claimed forever — the precise failure this module is
+    /// being fixed for.
+    ///
+    /// Records `(run_id, slot_id)` per release, plus whether the pool claim
+    /// was still held when the pane came down, so a test can assert the
+    /// pane-before-slot ordering rather than just the end state.
+    pub(super) struct RecordingPaneReleaser {
+        live_states: Arc<LiveWorkerStateRegistry>,
+        coordinator: Arc<ExecutionCoordinator>,
+        released: tokio::sync::Mutex<Vec<(String, u8)>>,
+        claim_held_at_pane_teardown: tokio::sync::Mutex<Vec<bool>>,
+    }
+
+    impl RecordingPaneReleaser {
+        pub(super) fn new(live_states: Arc<LiveWorkerStateRegistry>, coordinator: Arc<ExecutionCoordinator>) -> Self {
+            Self {
+                live_states,
+                coordinator,
+                released: tokio::sync::Mutex::new(Vec::new()),
+                claim_held_at_pane_teardown: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        pub(super) async fn released(&self) -> Vec<(String, u8)> {
+            self.released.lock().await.clone()
+        }
+
+        pub(super) async fn claim_held_at_pane_teardown(&self) -> Vec<bool> {
+            self.claim_held_at_pane_teardown.lock().await.clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkerPaneReleaser for RecordingPaneReleaser {
+        async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+            let Some(state) = self
+                .live_states
+                .snapshot()
+                .into_iter()
+                .find(|state| state.run_id == run_id)
+            else {
+                // No slot mapping — production returns before touching any
+                // engine state, which is what makes the caller's fallback
+                // release necessary.
+                return PaneReleaseOutcome::NoLiveWorker;
+            };
+            // The pane comes down first. Record whether the pool still
+            // believed the slot occupied at that moment: if a caller had
+            // already freed the claim, the scheduler could have handed this
+            // slot to a fresh dispatch that the app would then reject
+            // `SlotBusy`.
+            let claimed = self
+                .coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .iter()
+                .any(|id| id == run_id);
+            self.claim_held_at_pane_teardown.lock().await.push(claimed);
+            self.released.lock().await.push((run_id.to_owned(), state.slot_id));
+            let worker_id = worker_id_for_slot(state.slot_id);
+            self.coordinator.release_worker_and_kick(&worker_id, None).await;
+            self.live_states.release_slot(state.slot_id);
+            PaneReleaseOutcome::Reaped
+        }
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────
 
     /// Create a `running` execution with a backdated `started_at` (past
@@ -835,32 +997,55 @@ mod tests {
     const AUTH_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: 401 authentication_error: invalid x-api-key"}]}}"#;
     const CONNECTION_REFUSED_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: Unable to connect to API (ConnectionRefused)"}]}}"#;
     const UNRECOGNIZED_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: something we have never seen before"}]}}"#;
+    /// Verbatim shape of the error behind the mass-wedge incident this
+    /// module's pane teardown was added for — an HTTP 529 Overloaded burst
+    /// that stalled eleven workers at once.
+    const OVERLOADED_ERROR_LINE: &str = r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: 529 Overloaded. This is a server-side issue, usually temporary — try again in a moment."}]}}"#;
     const NORMAL_LINE: &str = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"working on the task"}]}}"#;
 
     fn now() -> i64 {
         boss_engine_utils::epoch_time::now_epoch_secs()
     }
 
-    /// Build the six-field [`RecoveryContext`] shared by nearly every test,
-    /// run one recovery pass, and return the outcome together with the sink
-    /// so callers can still assert on `sink.events()`. The `nudger` and the
+    /// Build the [`RecoveryContext`] shared by nearly every test, run one
+    /// recovery pass, and return the outcome together with the sink so
+    /// callers can still assert on `sink.events()`. The `nudger` and the
     /// `nudged` set vary per test; the policy is always
     /// `RecoveryPolicy::default()` and the clock is `now()`.
+    ///
+    /// The pane releaser is a [`RecordingPaneReleaser`] over the test's own
+    /// live-state registry and coordinator, so slot teardown behaves as it
+    /// does in production. Tests that need to inspect what it did call
+    /// [`run_pass_with_releaser`] instead.
     async fn run_pass(
         db: &WorkDb,
-        live: &LiveWorkerStateRegistry,
+        live: &Arc<LiveWorkerStateRegistry>,
         coordinator: &Arc<ExecutionCoordinator>,
         nudger: &dyn WorkerNudger,
+        nudged: &mut HashSet<String>,
+    ) -> (TransientRecoveryOutcome, Arc<RecordingDispatchEventSink>) {
+        let releaser = RecordingPaneReleaser::new(live.clone(), coordinator.clone());
+        run_pass_with_releaser(db, live, coordinator, nudger, &releaser, nudged).await
+    }
+
+    /// [`run_pass`] with the pane releaser supplied by the caller.
+    async fn run_pass_with_releaser(
+        db: &WorkDb,
+        live: &Arc<LiveWorkerStateRegistry>,
+        coordinator: &Arc<ExecutionCoordinator>,
+        nudger: &dyn WorkerNudger,
+        pane_releaser: &dyn WorkerPaneReleaser,
         nudged: &mut HashSet<String>,
     ) -> (TransientRecoveryOutcome, Arc<RecordingDispatchEventSink>) {
         let sink = Arc::new(RecordingDispatchEventSink::new());
         let cx = RecoveryContext {
             work_db: db,
-            live_states: live,
+            live_states: live.as_ref(),
             coordinator: coordinator.clone(),
             dispatch_events: sink.as_ref(),
             policy: &RecoveryPolicy::default(),
             nudger,
+            pane_releaser,
         };
         let outcome = run_one_pass(&cx, nudged, now()).await;
         (outcome, sink)
@@ -1003,6 +1188,176 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "transient_recovery");
         assert_eq!(events[0].outcome, "ok");
+    }
+
+    /// The orphan+respawn path must tear the worker's app-hosted pane down,
+    /// not merely drop the engine's bookkeeping for its slot. Releasing the
+    /// slot alone leaves the app hosting a live pane there, so the resume
+    /// execution's `SpawnWorkerPane` is rejected `SlotBusy` and the slot is
+    /// wedged until something retires the pane by hand.
+    #[tokio::test]
+    async fn orphan_respawn_tears_down_the_pane_before_freeing_the_slot() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, OVERLOADED_ERROR_LINE]);
+        let db = Arc::new(db);
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        let releaser = RecordingPaneReleaser::new(live.clone(), coordinator.clone());
+        let (outcome, _sink) = run_pass_with_releaser(
+            &db,
+            &live,
+            &coordinator,
+            &NoopWorkerNudger,
+            &releaser,
+            &mut HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(outcome.resumed, 1);
+        assert_eq!(
+            releaser.released().await,
+            vec![(dead_id.clone(), slot_id)],
+            "the stalled worker's pane must be torn down for its slot to be genuinely free",
+        );
+        assert_eq!(
+            releaser.claim_held_at_pane_teardown().await,
+            vec![true],
+            "the pool claim must still be held when the pane comes down — freeing the slot first \
+             publishes a slot the app will reject SlotBusy",
+        );
+        assert!(
+            live.get(slot_id).is_none(),
+            "live-state entry must be gone once the pane is down"
+        );
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&dead_id),
+            "pool claim must be released so the resume execution can be dispatched",
+        );
+    }
+
+    /// The escalate path frees the slot too, so it has the same obligation:
+    /// a worker parked behind an unrecoverable error must not keep a pane
+    /// alive on a slot the pool has already advertised as free.
+    #[tokio::test]
+    async fn escalation_tears_down_the_pane_too() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, AUTH_ERROR_LINE]);
+        let db = Arc::new(db);
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        let releaser = RecordingPaneReleaser::new(live.clone(), coordinator.clone());
+        let (outcome, _sink) = run_pass_with_releaser(
+            &db,
+            &live,
+            &coordinator,
+            &NoopWorkerNudger,
+            &releaser,
+            &mut HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(outcome.escalated, 1);
+        assert_eq!(releaser.released().await, vec![(dead_id, slot_id)]);
+        assert!(live.get(slot_id).is_none());
+    }
+
+    /// A nudge leaves the worker running, so it must NOT touch the pane —
+    /// the whole point of the nudge-first path is recovering in place.
+    #[tokio::test]
+    async fn nudge_does_not_touch_the_pane() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, OVERLOADED_ERROR_LINE]);
+        let db = Arc::new(db);
+        let exec_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&exec_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &exec_id, &work_item_id);
+
+        let releaser = RecordingPaneReleaser::new(live.clone(), coordinator.clone());
+        let nudger = RecordingNudger::new();
+        let (outcome, _sink) =
+            run_pass_with_releaser(&db, &live, &coordinator, &nudger, &releaser, &mut HashSet::new()).await;
+
+        assert_eq!(outcome.nudged, 1);
+        assert!(
+            releaser.released().await.is_empty(),
+            "a nudged worker keeps its pane — recovery happens in place",
+        );
+        assert!(live.get(slot_id).is_some(), "the slot stays live through a nudge");
+    }
+
+    /// When no pane was ever mapped for the run, `release_pane` reports
+    /// `NoLiveWorker` having touched nothing — so this path must still free
+    /// the slot itself, exactly as it did before pane teardown was added.
+    #[tokio::test]
+    async fn slot_is_still_freed_when_no_pane_was_mapped() {
+        let (dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let transcript = write_transcript(&dir, "t.jsonl", &[NORMAL_LINE, OVERLOADED_ERROR_LINE]);
+        let db = Arc::new(db);
+        let dead_id = create_running_execution(&db, &work_item_id, &transcript, 0);
+
+        let live = Arc::new(LiveWorkerStateRegistry::new());
+        let coordinator = make_coordinator(db.clone(), 2);
+        let worker_id = coordinator.worker_pool().claim_worker(&dead_id, None).await.unwrap();
+        let slot_id = crate::coordinator::slot_id_from_worker_id(&worker_id).unwrap();
+        register_idle_slot(&live, slot_id, &dead_id, &work_item_id);
+
+        /// Stands in for a run the app has no slot mapping for.
+        struct UnmappedPaneReleaser;
+        #[async_trait]
+        impl WorkerPaneReleaser for UnmappedPaneReleaser {
+            async fn release_pane(&self, _run_id: &str) -> PaneReleaseOutcome {
+                PaneReleaseOutcome::NoLiveWorker
+            }
+        }
+
+        let (outcome, _sink) = run_pass_with_releaser(
+            &db,
+            &live,
+            &coordinator,
+            &NoopWorkerNudger,
+            &UnmappedPaneReleaser,
+            &mut HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(outcome.resumed, 1);
+        assert!(live.get(slot_id).is_none(), "live-state entry must still be dropped");
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&dead_id),
+            "pool claim must still be released on the no-pane fallback",
+        );
     }
 
     #[tokio::test]
