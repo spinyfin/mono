@@ -394,11 +394,35 @@ impl CodexRolloutProgressSession {
                     }
                     "task_complete" if !self.turn_terminal => {
                         self.turn_terminal = true;
-                        Ok(vec![WorkerEvent::Stop {
-                            session_id,
-                            stop_hook_active: false,
-                            stop_reason: StopReason::Completed,
-                        }])
+                        // A codex `task_complete` carrying a non-null `error`
+                        // is a fatal provider/API failure, not a clean turn
+                        // end — the process is about to exit on it. Emitting
+                        // `StopReason::Completed` here is exactly the bug
+                        // that let a dead worker's `task_complete` read as a
+                        // normal idle turn: the engine has no other channel
+                        // that tells it this run's driver hit an
+                        // unrecoverable error. `StopReason::Other` is
+                        // reserved for that signal — see the stdout dialect's
+                        // `FatalError` handling above, which already uses it
+                        // for the same purpose.
+                        match rollout_task_complete_error_message(payload) {
+                            Some(message) => Ok(vec![
+                                WorkerEvent::Notification {
+                                    session_id: session_id.clone(),
+                                    message: message.clone(),
+                                },
+                                WorkerEvent::Stop {
+                                    session_id,
+                                    stop_hook_active: false,
+                                    stop_reason: StopReason::Other,
+                                },
+                            ]),
+                            None => Ok(vec![WorkerEvent::Stop {
+                                session_id,
+                                stop_hook_active: false,
+                                stop_reason: StopReason::Completed,
+                            }]),
+                        }
                     }
                     "task_complete" => Err(NormalizeError::UnknownEvent(
                         "duplicate rollout task_complete".to_owned(),
@@ -414,13 +438,20 @@ impl CodexRolloutProgressSession {
                             WorkerEvent::Stop {
                                 session_id,
                                 stop_hook_active: false,
-                                stop_reason: StopReason::Other,
+                                // Distinct from the fatal-error `Other` above:
+                                // an abort is Codex acting on an interruption
+                                // (its own default reason string is literally
+                                // "interrupted"), not a provider/API failure.
+                                stop_reason: StopReason::Interrupted,
                             },
                         ])
                     }
                     "turn_aborted" => Err(NormalizeError::UnknownEvent(
                         "duplicate rollout turn_aborted".to_owned(),
                     )),
+                    // Benign bookkeeping envelope: per-turn token accounting,
+                    // no progress or lifecycle signal to report.
+                    "token_count" => Ok(Vec::new()),
                     _ => Err(NormalizeError::UnknownEvent(format!("event_msg/{event_type}"))),
                 }
             }
@@ -460,6 +491,13 @@ impl CodexRolloutProgressSession {
                 }
                 Err(NormalizeError::UnknownEvent(format!("response_item/{item_type}")))
             }
+            // Benign bookkeeping envelopes: internal session/turn state
+            // snapshots with nothing to report as progress. Recognising them
+            // explicitly (rather than falling through to the catch-all
+            // below) keeps `unrecognised_envelopes` meaningful — every
+            // rollout dispatch used to count these, drowning out genuinely
+            // novel envelope shapes.
+            "world_state" | "turn_context" => Ok(Vec::new()),
             _ => Err(NormalizeError::UnknownEvent(record_type.to_owned())),
         }
     }
@@ -866,6 +904,18 @@ fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value
         }
         "task_started" => Some(lifecycle_system("task_started", "turn started")),
         "task_complete" => {
+            // A fatal `error` takes priority over `last_agent_message` (Codex
+            // sends `last_agent_message: null` alongside a fatal error — the
+            // worker never got to speak). Surfaced as AssistantText, not a
+            // lifecycle filler, so the transcript readers that scan for
+            // worker prose (triage decision, PR-URL fallback, the
+            // `pr_review` ReviewResult fallback) recover the provider's own
+            // diagnostic instead of finding no assistant text at all — the
+            // exact vague "transcript had no assistant text event" diagnosis
+            // this closes.
+            if let Some(message) = rollout_task_complete_error_message(payload) {
+                return Some(assistant_text(&format!("Codex reported a fatal error: {message}")));
+            }
             // Real final prose stays AssistantText so marker scans can see it.
             // The bare "turn completed" filler is lifecycle-only.
             match payload.get("last_agent_message").and_then(Value::as_str) {
@@ -875,6 +925,30 @@ fn normalize_rollout_event_message(event_type: &str, payload: &Map<String, Value
         }
         _ => None,
     }
+}
+
+/// Extract a diagnostic message from a rollout `task_complete` payload's
+/// `error` field, if present and non-null. `None` means a clean completion.
+///
+/// Codex's shape (verified against the field incident this closes): `error`
+/// is an object carrying `message` (itself often a JSON-encoded string, e.g.
+/// `{"type":"error","status":400,...}`) and `codex_error_info` (a short
+/// classifier, e.g. `"other"`). Both are included when present so the
+/// resulting attention item/log line names the specific failure rather than
+/// a bare "codex errored".
+fn rollout_task_complete_error_message(payload: &Map<String, Value>) -> Option<String> {
+    let error = payload.get("error")?;
+    if error.is_null() {
+        return None;
+    }
+    let message = error.get("message").and_then(Value::as_str);
+    let info = error.get("codex_error_info").and_then(Value::as_str);
+    Some(match (info, message) {
+        (Some(info), Some(message)) => format!("codex_error_info={info}: {message}"),
+        (None, Some(message)) => message.to_owned(),
+        (Some(info), None) => format!("codex_error_info={info}"),
+        (None, None) => error.to_string(),
+    })
 }
 
 /// Codex turn-boundary filler, tagged as system so it is not worker prose.
@@ -1418,7 +1492,7 @@ mod tests {
         assert!(matches!(
             &terminal[1],
             WorkerEvent::Stop {
-                stop_reason: StopReason::Other,
+                stop_reason: StopReason::Interrupted,
                 ..
             }
         ));

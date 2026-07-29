@@ -21,7 +21,27 @@ impl WorkerCompletionHandler {
     /// vocabulary of the whole completion subsystem and its call sites, and
     /// renaming it would churn far more than it clarifies.
     pub async fn on_stop(&self, execution_id: &str) -> StopOutcome {
-        let outcome = self.on_stop_inner(execution_id).await;
+        self.on_stop_with_turn_end(execution_id, None).await
+    }
+
+    /// Same as [`Self::on_stop`], but additionally takes the driver-resolved
+    /// [`crate::driver::TurnEnd`] for the Stop that triggered this call —
+    /// the production call site
+    /// ([`crate::app::worker_events::dispatch_completion_on_stop`]) always
+    /// has one via [`crate::events_socket::IncomingHookEvent::turn_boundary`];
+    /// `on_stop` passes `None` for every existing (pre-Codex) caller that
+    /// has no such signal to offer, which preserves their behaviour exactly.
+    ///
+    /// `turn_end` is consulted only for
+    /// [`boss_protocol::StopReason::Other`] — the driver's own signal that
+    /// this Stop is an unrecoverable error, not a clean completion or an
+    /// awaiting-input pause — see `on_stop_inner`'s early gate.
+    pub async fn on_stop_with_turn_end(
+        &self,
+        execution_id: &str,
+        turn_end: Option<&crate::driver::TurnEnd>,
+    ) -> StopOutcome {
+        let outcome = self.on_stop_inner(execution_id, turn_end).await;
         // `ci_remediation` (retrigger-kind only; fix-kind now dispatches through
         // revision_implementation) gets the catch-all finalizer on Stop.
         if let Ok(execution) = self.work_db.get_execution(execution_id) {
@@ -294,7 +314,11 @@ impl WorkerCompletionHandler {
         }
     }
 
-    pub(super) async fn on_stop_inner(&self, execution_id: &str) -> StopOutcome {
+    pub(super) async fn on_stop_inner(
+        &self,
+        execution_id: &str,
+        turn_end: Option<&crate::driver::TurnEnd>,
+    ) -> StopOutcome {
         let execution = match self.work_db.get_execution(execution_id) {
             Ok(execution) => execution,
             Err(err) => {
@@ -363,6 +387,39 @@ impl WorkerCompletionHandler {
                 ?err,
                 "stop event: failed to stamp stop_seen; SHA-delta recovery gate may not fire"
             );
+        }
+
+        // Driver-reported fatal error (StopReason::Other): the run's driver
+        // — today, Codex's rollout `task_complete.error` or a stdout
+        // `turn.failed` / fatal `error` envelope — has told us this Stop is
+        // not a clean completion, an interruption, or an awaiting-input
+        // pause, but an unrecoverable error the worker process already
+        // exited on. Fail loudly here, before ANY kind-specific finalizer
+        // (automation triage, answer-agent, pr_review) or the generic nudge
+        // loop below gets a chance to treat the dead process as idle and
+        // either wait for a result it can never produce or re-prompt a pane
+        // that is no longer there. This is the fix for the incident where a
+        // codex pr_review worker died on an HTTP 400, the engine read the
+        // clean turn boundary as a normal idle worker, and nudged (and kept
+        // renudging) an already-exited process while its cube lease leaked.
+        if turn_end.map(|end| end.reason) == Some(boss_protocol::StopReason::Other) {
+            let detail = self
+                .read_final_triage_message(execution_id)
+                .await
+                .into_message()
+                .unwrap_or_else(|| {
+                    "the driver reported a fatal error but no diagnostic text was recovered from \
+                     the transcript"
+                        .to_owned()
+                });
+            tracing::error!(
+                execution_id,
+                kind = %execution.kind,
+                detail,
+                "stop event: driver reported this turn boundary as an unrecoverable error; \
+                 failing the execution instead of nudging a dead process",
+            );
+            return self.finalize_driver_terminal_error(&execution, &detail).await;
         }
 
         // Maint task 6: an `automation_triage` execution never opens a PR.

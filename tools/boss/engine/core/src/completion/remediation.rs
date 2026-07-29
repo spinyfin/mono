@@ -275,6 +275,12 @@ impl WorkerCompletionHandler {
             | StopOutcome::DetectorFailed
             | StopOutcome::NoWorkspace
             | StopOutcome::DbError => true,
+            // The driver reported this worker's own terminal turn boundary
+            // as an unrecoverable error — the execution has already been
+            // failed by `on_stop_inner`'s early gate. Mark the CI attempt
+            // failed too rather than leaving it `running` forever; there is
+            // no live worker left to retrigger or push anything.
+            StopOutcome::DriverTerminalError { .. } => true,
         };
         if !should_mark_failed {
             return;

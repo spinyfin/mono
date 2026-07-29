@@ -1288,6 +1288,14 @@ pub const NUDGE_BREAKER_ATTENTION_KIND: &str = "nudge_breaker_tripped";
 /// the old silent drop.
 pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 
+/// Attention-item kind filed when a worker's driver reports its own terminal
+/// turn boundary as an unrecoverable error (e.g. Codex's rollout
+/// `task_complete.error`, or a stdout `turn.failed` / fatal `error`
+/// envelope). Distinct kind so the coordinator/UI can tell "the provider
+/// itself failed the run" apart from the nudge-breaker and give-up cases
+/// above, which both imply the worker ran to some kind of conclusion.
+pub const DRIVER_TERMINAL_ERROR_ATTENTION_KIND: &str = "driver_terminal_error";
+
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
 /// will simply push and open one, but a worker that's blocked has an
@@ -1588,6 +1596,20 @@ pub enum StopOutcome {
     /// loop on a worker that correctly found nothing to do. `work_item_id` is
     /// the closed task/chore.
     NoChangesNeeded { work_item_id: String },
+    /// The run's driver reported its own terminal turn boundary as an
+    /// unrecoverable error — Codex's rollout `task_complete.error`, or a
+    /// stdout `turn.failed` / fatal top-level `error` envelope
+    /// ([`crate::driver::TurnEnd::reason`] = [`boss_protocol::StopReason::Other`]).
+    /// The process that produced this Stop has already exited on its own;
+    /// there is nothing left to nudge or wait on. The execution is marked
+    /// `failed` (not left `running`/`waiting_human`), its cube lease and
+    /// pane are released, and an attention item naming the provider's error
+    /// text is filed. No nudge probe is queued — this bypasses every
+    /// kind-specific finalizer (including the `pr_review` ReviewResult
+    /// nudge loop) so a driver-reported fatal error can never wedge an
+    /// execution on a dead process the way an unparsed provider error used
+    /// to.
+    DriverTerminalError { detail: String },
     /// Unexpected DB failure while recording completion.
     DbError,
 }

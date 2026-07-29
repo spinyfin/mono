@@ -1521,6 +1521,74 @@ impl WorkDb {
         Ok(Some(updated))
     }
 
+    /// Unconditionally drive a pane-parked execution (`running` or
+    /// `waiting_human`) to the `failed` terminal status and release its cube
+    /// lease + workspace.
+    ///
+    /// For a driver that reported its own terminal turn boundary as an
+    /// unrecoverable error (Codex's `task_complete.error`, or a stdout
+    /// `turn.failed` / fatal `error` envelope) — the process already exited
+    /// on its own, so there is nothing left to nudge or wait on. Unlike
+    /// [`Self::mark_execution_orphaned`] (which deliberately keeps the lease
+    /// so a still-possibly-alive worker's in-flight commits aren't
+    /// abandoned), this is for a worker the driver has already told us is
+    /// definitively done: releasing the lease here is correct, not
+    /// premature.
+    ///
+    /// `error_text` becomes the terminal `work_runs.error_text` /
+    /// `result_summary` so the run history carries the provider's own
+    /// diagnostic, not just "failed".
+    ///
+    /// Idempotent: returns `Ok(None)` without writing anything if the
+    /// execution is already terminal, mirroring
+    /// [`Self::complete_pane_parked_execution`].
+    pub fn fail_pane_parked_execution(&self, execution_id: &str, error_text: &str) -> Result<Option<WorkExecution>> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if existing.status.is_terminal() {
+            return Ok(None);
+        }
+
+        let now = now_string();
+        let normalized_error = normalize_optional_text(Some(error_text.to_owned()));
+        tx.execute(
+            "UPDATE work_runs
+             SET status = 'failed',
+                 error_text = COALESCE(?2, error_text),
+                 result_summary = COALESCE(?2, result_summary),
+                 finished_at = COALESCE(finished_at, ?3)
+             WHERE execution_id = ?1
+               AND finished_at IS NULL",
+            params![execution_id, normalized_error, now],
+        )?;
+        tx.execute(
+            "UPDATE work_executions
+             SET status = 'failed',
+                 cube_lease_id = NULL,
+                 cube_workspace_id = NULL,
+                 workspace_path = NULL,
+                 finished_at = ?2
+             WHERE id = ?1",
+            params![execution_id, now],
+        )?;
+
+        let updated = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        // Canonical terminalization trace — see `mark_execution_orphaned`.
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            reason = %error_text,
+            "execution terminalized: driver-reported fatal error",
+        );
+        let mut pending = PendingEvents::new();
+        stage_execution_terminal(&mut pending, &tx, execution_id, &updated.work_item_id)?;
+        commit_and_publish(tx, pending, &self.event_bus)?;
+        Ok(Some(updated))
+    }
+
     pub fn create_run(&self, input: CreateRunInput) -> Result<WorkRun> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;

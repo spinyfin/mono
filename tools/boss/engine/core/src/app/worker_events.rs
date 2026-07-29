@@ -1782,7 +1782,10 @@ pub(super) async fn dispatch_completion_on_stop(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    let outcome = server_state.completion_handler.on_stop(run_id).await;
+    let outcome = server_state
+        .completion_handler
+        .on_stop_with_turn_end(run_id, incoming.turn_boundary())
+        .await;
     // Info-level so non-success outcomes (DetectorFailed, AwaitingInput,
     // StalePr, EmptyDiffPr) appear in the engine log without enabling
     // debug. The 2026-05-13 three-concurrent-workers regression had
