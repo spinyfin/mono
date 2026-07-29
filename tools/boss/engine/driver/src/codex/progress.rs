@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use boss_engine_codex_rollout::{
-    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call, extract_text_blocks,
-    is_rollout_tool_output,
+    CanonicalRolloutToolCall, canonical_rollout_tool_call as shared_canonical_rollout_tool_call,
+    canonical_rollout_tool_output as shared_canonical_rollout_tool_output, extract_text_blocks, is_rollout_tool_output,
 };
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
@@ -214,14 +214,26 @@ impl CodexProgressSession {
                         tool_name: "Bash".to_owned(),
                         tool_input: json!({ "command": command }),
                     }],
-                    StdoutEnvelope::CommandCompleted { command, output } => vec![WorkerEvent::PostToolUse {
-                        session_id,
-                        tool_name: "Bash".to_owned(),
-                        tool_input: json!({ "command": command }),
-                        // Keep aggregated_output as a bare string. The shared
-                        // PR-URL capture seam explicitly supports this shape.
-                        tool_response: Value::String(output.to_owned()),
-                    }],
+                    StdoutEnvelope::CommandCompleted {
+                        command,
+                        output,
+                        exit_code,
+                        status,
+                    } => {
+                        let mut events = vec![WorkerEvent::PostToolUse {
+                            session_id: session_id.clone(),
+                            tool_name: "Bash".to_owned(),
+                            tool_input: json!({ "command": command }),
+                            // Keep aggregated_output as a bare string. The shared
+                            // PR-URL capture seam explicitly supports this shape.
+                            tool_response: Value::String(output.to_owned()),
+                        }];
+                        if let Some(message) = command_denial_notification(status == Some("failed"), exit_code, output)
+                        {
+                            events.push(WorkerEvent::Notification { session_id, message });
+                        }
+                        events
+                    }
                     StdoutEnvelope::OperationalWarning { message } => vec![WorkerEvent::Notification {
                         session_id,
                         message: message.to_owned(),
@@ -447,16 +459,30 @@ impl CodexRolloutProgressSession {
                     let call = self.take_call(call_id).ok_or_else(|| {
                         NormalizeError::UnknownEvent(format!("unmatched rollout tool output {call_id}"))
                     })?;
-                    return Ok(vec![WorkerEvent::PostToolUse {
-                        session_id,
-                        tool_name: call.tool_name,
+                    let raw_output = payload.get("output").cloned().unwrap_or(Value::Null);
+                    let mut events = vec![WorkerEvent::PostToolUse {
+                        session_id: session_id.clone(),
+                        tool_name: call.tool_name.clone(),
                         tool_input: call.tool_input,
                         // Preserve the rollout dialect's exact `payload.output`
                         // value. Codex's PR capture override flattens the
                         // observed string/array forms without pretending this
                         // is stdout's `aggregated_output`.
-                        tool_response: payload.get("output").cloned().unwrap_or(Value::Null),
-                    }]);
+                        tool_response: raw_output.clone(),
+                    }];
+                    // Rollout has no separate numeric exit-code field for the
+                    // prose-wrapped `exec_command` form (only the structured
+                    // `{"output":...,"metadata":{"exit_code":N}}` string form
+                    // canonicalizes one), so `reported_failure` comes only
+                    // from that structured form when present; the marker scan
+                    // is what catches the masked-denial case either way.
+                    if call.tool_name == "Bash" {
+                        let canonical = shared_canonical_rollout_tool_output(&raw_output);
+                        if let Some(message) = command_denial_notification(canonical.is_error, None, &canonical.body) {
+                            events.push(WorkerEvent::Notification { session_id, message });
+                        }
+                    }
+                    return Ok(events);
                 }
                 Err(NormalizeError::UnknownEvent(format!("response_item/{item_type}")))
             }
@@ -483,6 +509,42 @@ impl ProgressSessionNormalizer for CodexRolloutProgressSession {
     }
 }
 
+/// Best-effort, macOS-Seatbelt-verified phrasing for a filesystem write
+/// refused by Codex's OS sandbox (`--sandbox read-only` / `workspace-write`).
+/// Neither exhaustive (other sandboxes, or a non-filesystem denial such as a
+/// network refusal, phrase differently) nor free of false positives
+/// (`Operation not permitted` is the generic EPERM string, which a command
+/// can hit for reasons that have nothing to do with Boss's sandbox) — see
+/// "Sandbox denials are invisible to exit status alone" in
+/// `docs/designs/codex-as-a-first-class-agent-driver.md`. A match only ever
+/// adds a [`WorkerEvent::Notification`]; it never blocks or retries anything.
+const SUSPECTED_DENIAL_MARKERS: &[&str] = &["Operation not permitted"];
+
+/// Build the extra `Notification` message for a `command_execution` /
+/// rollout tool-output result, if any.
+///
+/// `reported_failure` is the dialect's own exit status when it is
+/// trustworthy (a command whose own exit code was not masked by shell
+/// composition). `output` is scanned for a denial marker regardless of
+/// `reported_failure`: a write denied mid-compound-command reports the
+/// *outer* status as success (`exit_code:0`/`status:"completed"`), so the
+/// marker scan is what actually catches the case this exists for.
+fn command_denial_notification(reported_failure: bool, exit_code: Option<i64>, output: &str) -> Option<String> {
+    if let Some(marker) = SUSPECTED_DENIAL_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| output.contains(marker))
+    {
+        return Some(format!(
+            "codex: command output contains a suspected sandbox/permission denial ({marker:?}); a \
+             compound shell command can still report overall success, so verify no required write \
+             was silently refused"
+        ));
+    }
+    reported_failure
+        .then(|| format!("codex: command execution reported a non-zero exit status (exit_code={exit_code:?})"))
+}
+
 /// Parsed stdout dialect. This is intentionally not reused for rollout lines.
 enum StdoutEnvelope<'a> {
     ThreadStarted {
@@ -499,6 +561,8 @@ enum StdoutEnvelope<'a> {
     CommandCompleted {
         command: &'a str,
         output: &'a str,
+        exit_code: Option<i64>,
+        status: Option<&'a str>,
     },
     OperationalWarning {
         message: &'a str,
@@ -567,7 +631,18 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                         .get("aggregated_output")
                         .and_then(Value::as_str)
                         .ok_or(NormalizeError::MissingField("item.aggregated_output"))?;
-                    Ok(StdoutEnvelope::CommandCompleted { command, output })
+                    // Both present on every observed 0.145.0 capture, but
+                    // read best-effort: neither is on the trait contract
+                    // upstream of this parse, and a future Codex version
+                    // could drop or rename either without warning ([OQ-2]).
+                    let exit_code = item.get("exit_code").and_then(Value::as_i64);
+                    let status = item.get("status").and_then(Value::as_str);
+                    Ok(StdoutEnvelope::CommandCompleted {
+                        command,
+                        output,
+                        exit_code,
+                        status,
+                    })
                 }
                 ("item.completed", "error") => {
                     let message = item
@@ -1062,6 +1137,199 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn masked_sandbox_denial_in_compound_command_adds_a_suspected_denial_notification() {
+        // Empirical capture, codex-cli 0.145.0, `--sandbox read-only`: a
+        // denied `touch` composed before a trailing `echo` reports the
+        // *outer* command as a clean success (exit_code:0/status:"completed")
+        // even though a write was silently refused.
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-denied"}))
+            .unwrap();
+        let events = session
+            .normalize_stdout_events(&json!({
+                "type":"item.completed",
+                "item":{
+                    "id":"item_0",
+                    "type":"command_execution",
+                    "command":"/bin/zsh -lc 'touch denied.txt; echo \"exit:$?\"'",
+                    "aggregated_output":"touch: denied.txt: Operation not permitted\nexit:1\n",
+                    "exit_code":0,
+                    "status":"completed"
+                }
+            }))
+            .unwrap();
+        assert!(matches!(&events[0], WorkerEvent::PostToolUse { .. }), "got {events:?}");
+        assert!(
+            matches!(&events[1], WorkerEvent::Notification { message, .. } if message.contains("suspected sandbox/permission denial")),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn genuine_command_failure_adds_a_notification_without_the_marker_text() {
+        // Empirical control: the identical denied `touch` as the *sole*
+        // statement (nothing composed after it) reports honestly —
+        // exit_code:1/status:"failed" — with no masking. The genuine-failure
+        // path must still surface a Notification even without a recognised
+        // denial phrase, since Codex's own status is trustworthy here.
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-failed"}))
+            .unwrap();
+        let events = session
+            .normalize_stdout_events(&json!({
+                "type":"item.completed",
+                "item":{
+                    "id":"item_0",
+                    "type":"command_execution",
+                    "command":"some-tool that fails for its own reasons",
+                    "aggregated_output":"boom: no such widget\n",
+                    "exit_code":3,
+                    "status":"failed"
+                }
+            }))
+            .unwrap();
+        assert!(matches!(&events[0], WorkerEvent::PostToolUse { .. }), "got {events:?}");
+        assert!(
+            matches!(&events[1], WorkerEvent::Notification { message, .. } if message.contains("non-zero exit status") && message.contains("Some(3)")),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn clean_successful_command_adds_no_extra_notification() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-clean"}))
+            .unwrap();
+        let events = session
+            .normalize_stdout_events(&json!({
+                "type":"item.completed",
+                "item":{
+                    "id":"item_0",
+                    "type":"command_execution",
+                    "command":"echo hi",
+                    "aggregated_output":"hi\n",
+                    "exit_code":0,
+                    "status":"completed"
+                }
+            }))
+            .unwrap();
+        assert_eq!(events.len(), 1, "got {events:?}");
+    }
+
+    #[test]
+    fn rollout_prose_wrapped_denial_adds_a_suspected_denial_notification() {
+        // Empirical capture, rollout dialect: the exec_command tool's own
+        // textual wrapper embeds "Process exited with code 0" as prose while
+        // the denial itself is buried further inside that same string.
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-rollout-denied","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"exec_command",
+                    "call_id":"call-denied",
+                    "arguments":r#"{"cmd":"touch denied.txt; echo \"exit:$?\""}"#
+                }
+            }))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-denied",
+                    "output":"Process exited with code 0\nOutput:\ntouch: denied.txt: Operation not permitted\nexit:1\n"
+                }
+            }))
+            .unwrap();
+        assert!(matches!(&events[0], WorkerEvent::PostToolUse { .. }), "got {events:?}");
+        assert!(
+            matches!(&events[1], WorkerEvent::Notification { message, .. } if message.contains("suspected sandbox/permission denial")),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn rollout_structured_exit_code_adds_a_notification_without_the_marker_text() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-rollout-failed","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call-failed",
+                    "input":"some-tool that fails"
+                }
+            }))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-failed",
+                    "output":"{\"output\":\"boom\\n\",\"metadata\":{\"exit_code\":1}}"
+                }
+            }))
+            .unwrap();
+        assert!(matches!(&events[0], WorkerEvent::PostToolUse { .. }), "got {events:?}");
+        assert!(
+            matches!(&events[1], WorkerEvent::Notification { message, .. } if message.contains("non-zero exit status")),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn rollout_clean_output_adds_no_extra_notification() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-rollout-clean","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call-clean",
+                    "input":"echo hi"
+                }
+            }))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-clean",
+                    "output":[{"type":"input_text","text":"hi\n"}]
+                }
+            }))
+            .unwrap();
+        assert_eq!(events.len(), 1, "got {events:?}");
     }
 
     #[test]
