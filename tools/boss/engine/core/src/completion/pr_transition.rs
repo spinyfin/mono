@@ -80,11 +80,18 @@ impl WorkerCompletionHandler {
                     // "never skip" (right for genuinely new content, wrong for
                     // a rebase that contributes none). It is a no-op for any
                     // producer that isn't a conflict-resolution / CI-fix push.
-                    let noop_skip_reason = match self.check_pure_rebase_skip(&pr_url, producing).await {
+                    let pure_rebase_gate = self.check_pure_rebase_skip(&pr_url, producing, &cycle_root_id).await;
+                    let noop_skip_reason = match pure_rebase_gate.skip_reason {
                         Some(reason) => Some(reason),
                         None => {
-                            self.check_noop_skip(&pr_url, producing, review_cycle, last_reviewed_sha.as_deref())
-                                .await
+                            self.check_noop_skip(
+                                &pr_url,
+                                producing,
+                                review_cycle,
+                                last_reviewed_sha.as_deref(),
+                                pure_rebase_gate.post_head,
+                            )
+                            .await
                         }
                     };
 

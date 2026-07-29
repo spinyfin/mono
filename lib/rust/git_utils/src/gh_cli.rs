@@ -86,6 +86,34 @@ pub async fn fetch_pr_head_ref(repo_slug: &str, pr_number: u64) -> Result<String
     Ok(head_ref)
 }
 
+/// Fetch the target-branch ref name (`baseRefName`) for a PR by shelling
+/// out to `gh pr view <pr_number> -R <repo_slug> --json baseRefName --jq
+/// .baseRefName`.
+///
+/// Returns an error if the command fails or if the returned ref is empty.
+pub async fn fetch_pr_base_ref(repo_slug: &str, pr_number: u64) -> Result<String> {
+    let pr_str = pr_number.to_string();
+    let base_ref = run_gh(
+        &[
+            "pr",
+            "view",
+            &pr_str,
+            "-R",
+            repo_slug,
+            "--json",
+            "baseRefName",
+            "--jq",
+            ".baseRefName",
+        ],
+        &format!("gh pr view {pr_number} -R {repo_slug} --json baseRefName"),
+    )
+    .await?;
+    if base_ref.is_empty() {
+        return Err(anyhow!("empty baseRefName for PR {pr_number} in {repo_slug}"));
+    }
+    Ok(base_ref)
+}
+
 /// Validate and return the SHA string from `gh pr view ... --jq .headRefOid`
 /// stdout. Returns an error when the output is empty (which means GitHub
 /// returned a null or the JQ filter found nothing).
