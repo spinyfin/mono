@@ -205,4 +205,5 @@ mod worker_pane_interaction;
 mod worker_pane_lifecycle;
 mod worker_probe_dispatch;
 mod worker_process_reaping;
+mod worker_readoption;
 mod worker_tier;

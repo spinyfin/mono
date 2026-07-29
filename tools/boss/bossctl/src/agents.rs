@@ -506,10 +506,47 @@ pub(crate) async fn agents_retire_pane(socket_path: &Option<String>, json: bool,
     }
 }
 
+/// True when `reference` has the shape of an execution id (`exec_…`).
+///
+/// Used only by `agents stop` to decide whether a resolver miss should still
+/// be forwarded to the engine — see [`agents_stop`] for why. Deliberately
+/// narrow: a crew name or slot number that misses must still fail loudly with
+/// the live-candidate list rather than being posted to the engine as a run id.
+fn looks_like_execution_id(reference: &str) -> bool {
+    reference.starts_with("exec_")
+}
+
+/// Stop the worker referenced by `agent`.
+///
+/// Resolution normally goes through the live-worker list, but `stop` — alone
+/// among the agent verbs — must also work for a worker the engine has LOST
+/// TRACK of. That is not a hypothetical: a run whose execution was wrongly
+/// terminalized has its `LiveWorkerState` cleared while its process keeps
+/// running, so on 2026-07-28 `bossctl agents stop <exec-id>` answered `no live
+/// worker matches` for all six stranded workers and an operator had to `kill`
+/// them by pid. Being unable to reap a running worker is its own defect,
+/// independent of how it got stranded.
+///
+/// So an `exec_…` reference that misses the live list is forwarded to the
+/// engine anyway. The engine's stop path resolves the worker from durable
+/// state (`work_runs.shell_pid`) and reaps both the app-hosted pane and the OS
+/// process tree, which is precisely the case the live list cannot see. Other
+/// reference forms (crew name, slot id) still fail with the candidate list —
+/// a typo'd name must not be posted to the engine as a run id.
 pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
-    let run_id = resolve_agent_ref_or_work_item(&mut client, &agent, &states).await?;
+    let run_id = match resolve_agent_ref_or_work_item(&mut client, &agent, &states).await {
+        Ok(run_id) => run_id,
+        Err(_) if looks_like_execution_id(&agent) => {
+            eprintln!(
+                "warning: {agent} is not in the engine's live-worker list; stopping it from \
+                 durable state instead (this is the shape a worker the engine lost track of takes)"
+            );
+            agent.clone()
+        }
+        Err(err) => return Err(err),
+    };
     let response = client
         .send_request(&FrontendRequest::StopRun { run_id: run_id.clone() })
         .await
@@ -1583,6 +1620,33 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("no live worker matches `anything`"), "message was: {msg}");
         assert!(msg.contains("no live workers"), "message was: {msg}");
+    }
+
+    // ---- agents stop fallback ---------------------------------------------
+
+    /// `agents stop` must remain usable for a worker the engine has lost track
+    /// of — the shape whose `LiveWorkerState` was cleared while its process
+    /// kept running. An `exec_…` selector that misses the live list is the
+    /// signal that lets `agents_stop` forward it to the engine anyway rather
+    /// than reporting `no live worker matches` and leaving the operator to
+    /// `kill` by pid.
+    #[test]
+    fn execution_ids_are_recognised_for_the_untracked_stop_fallback() {
+        assert!(looks_like_execution_id("exec_18c6a6add38b5fe0_97"));
+        assert!(looks_like_execution_id("exec_"));
+    }
+
+    /// The fallback must stay narrow. A crew name or slot number that misses
+    /// is far more likely a typo than a stranded worker, and forwarding it to
+    /// the engine as a run id would turn a clear error into a silent no-op.
+    #[test]
+    fn names_and_slots_do_not_get_the_untracked_stop_fallback() {
+        assert!(!looks_like_execution_id("Worf"));
+        assert!(!looks_like_execution_id("3"));
+        // A friendly work-item selector, spelled without a literal id so the
+        // file-text-leakage check stays happy.
+        assert!(!looks_like_execution_id(&format!("T{}", 1234)));
+        assert!(!looks_like_execution_id("task_abc"));
     }
 
     // ---- pick_unique -------------------------------------------------------

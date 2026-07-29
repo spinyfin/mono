@@ -88,6 +88,7 @@ mod probes;
 mod products;
 mod projects;
 pub(crate) mod proposals;
+mod readoption;
 mod review;
 mod server;
 mod sessions;
@@ -656,6 +657,21 @@ struct ServerState {
     /// includes this pid as an ancestor is treated as the Boss tier
     /// for RPC authorization.
     boss_pid: StdMutex<Option<libc::pid_t>>,
+    /// Run ids whose terminal-execution contradiction is currently being
+    /// resolved (see
+    /// [`crate::app::worker_events::converge_terminal_execution_contradiction`]).
+    ///
+    /// Convergence runs off the hook fan-out, and a worker the engine has lost
+    /// track of keeps hooking at its normal rate — several events a second
+    /// during a busy turn. Without this latch each one would start its own
+    /// resolution, so a single stranded worker would fire a burst of
+    /// `ListHostedPanes` round-trips at the app and race a burst of writes
+    /// against the same execution row. One resolution per run at a time is all
+    /// that is ever useful: it either re-adopts (after which the run is no
+    /// longer terminal and no further hook reaches this path) or reaps (after
+    /// which the hooks stop).
+    #[builder(default)]
+    converging_terminal_runs: StdMutex<HashSet<String>>,
     /// Pending probes per run, FIFO. Each entry is the engine-minted
     /// `probe_id` paired with the verbatim text the caller queued.
     /// The events-socket consumer pops one entry per `Stop` hook event
@@ -1392,15 +1408,24 @@ impl ServerState {
         // lets the generic reader flush/drain without blocking teardown.
         self.agent_jsonl_progress_manager.stop_run(run_id);
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
-            tracing::debug!(
-                run_id,
-                "release_worker_pane: no slot mapped (already released or never spawned)",
-            );
-            // No mapped slot means no pane and no recorded pid to reap —
-            // the worker either already released or has not finished
-            // spawning. Either way the caller must not treat this as a
-            // reap that frees the workspace lease.
-            return PaneReleaseOutcome::NoLiveWorker;
+            // No slot mapping. Historically this returned `NoLiveWorker`
+            // immediately, on the reasoning that "no mapped slot means no pane
+            // and no recorded pid to reap". The first half is right; the
+            // second half is not, and it is the reason `bossctl agents stop`
+            // could not reap the six untracked workers on 2026-07-28. The
+            // registry is in-memory and is cleared unconditionally at the end
+            // of this very function ("successfully or not"), so a worker whose
+            // execution was wrongly terminalized loses its slot mapping while
+            // its process keeps running — and the durable
+            // `work_runs.shell_pid` the app reported is still sitting in the
+            // DB. Consult it before giving up.
+            //
+            // Only a pid that a probe says is ALIVE justifies proceeding: a
+            // genuinely mid-spawn worker has no recorded pid at all and must
+            // still report `NoLiveWorker`, because that verdict is what stops
+            // the caller releasing a cube lease out from under a workspace the
+            // worker is about to occupy.
+            return self.reap_untracked_worker_process(run_id).await;
         };
         // Snapshot the worker's recorded shell pid *before* we drop the
         // live-state entry further down — the engine-side reap backstop
@@ -1490,6 +1515,105 @@ impl ServerState {
         // A slot was mapped, so a worker had finished spawning: its pane
         // was torn down and (above) its OS process tree signalled. Report
         // `Reaped` so the caller may free the workspace lease.
+        PaneReleaseOutcome::Reaped
+    }
+
+    /// Last-resort teardown for a run the engine has no slot mapping for,
+    /// driven entirely by durable state.
+    ///
+    /// This is the path that makes "`bossctl` must be able to stop a worker it
+    /// can see in a pane" true. `bossctl agents stop` funnels through
+    /// `force_stop_execution` → `force_release` → `release_worker_pane`, and
+    /// every one of those steps used to dead-end at the in-memory
+    /// `WorkerRegistry` slot lookup. A worker whose execution was wrongly
+    /// terminalized has no slot mapping *by construction* — the terminal path
+    /// cleared it — so the operator's reap verb was blind to exactly the
+    /// workers that needed reaping, and the six live panes on 2026-07-28 had
+    /// to be killed by hand with `kill <pid>`.
+    ///
+    /// Two independent teardowns, because either can be the one that works:
+    ///
+    /// 1. **The app's pane**, if it still hosts one for this run. Found by
+    ///    asking the app what it hosts rather than by consulting engine
+    ///    bookkeeping — the bookkeeping being wrong is the premise here. This
+    ///    is also what clears the pane from the operator's screen.
+    /// 2. **The OS process tree**, from `work_runs.shell_pid`. Reaches the
+    ///    worker even when no app session is registered, the app is wedged, or
+    ///    the pane was already torn down while the process survived.
+    ///
+    /// Returns `Reaped` when either teardown had something real to act on, and
+    /// `NoLiveWorker` otherwise. Preserving `NoLiveWorker` for the "no durable
+    /// pid at all" case matters: that is the mid-spawn shape, and its contract
+    /// is that the caller must NOT release the cube lease (the worker is about
+    /// to occupy that workspace).
+    async fn reap_untracked_worker_process(&self, run_id: &str) -> PaneReleaseOutcome {
+        let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
+        let Some(shell_pid) = process.shell_pid() else {
+            tracing::debug!(
+                run_id,
+                verdict = process.reason(),
+                "release_worker_pane: no slot mapped and no live durable pid; treating as \
+                 mid-spawn or already released",
+            );
+            return PaneReleaseOutcome::NoLiveWorker;
+        };
+        tracing::warn!(
+            run_id,
+            shell_pid,
+            "release_worker_pane: no slot mapped but the run's recorded process is ALIVE — the \
+             engine lost track of a running worker. Reaping it from durable state so the operator's \
+             stop verb is not blind to exactly the workers that need stopping.",
+        );
+        // Ask the app what it actually hosts. Engine bookkeeping is what is
+        // wrong here, so it cannot be the source for the slot id.
+        match self.hosted_pane_slot_for_run(run_id).await {
+            Some(slot_id) => {
+                let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
+                    slot_id,
+                    kill_grace_seconds: 5,
+                });
+                match self.send_to_app(request, Duration::from_secs(5)).await {
+                    Ok(EngineToAppResponse::ReleaseWorkerPane { result: Ok(_) }) => {
+                        tracing::info!(run_id, slot_id, "release_worker_pane: released untracked pane");
+                    }
+                    Ok(EngineToAppResponse::ReleaseWorkerPane {
+                        result: Err(EngineToAppError::UnknownSlot),
+                    }) => {
+                        tracing::debug!(run_id, slot_id, "release_worker_pane: app reports unknown slot");
+                    }
+                    other => {
+                        tracing::warn!(
+                            run_id,
+                            slot_id,
+                            ?other,
+                            "release_worker_pane: untracked pane release did not succeed; \
+                             falling through to the process-tree reap",
+                        );
+                    }
+                }
+                // The slot the app was really using may still hold a stale
+                // pool claim and live-state entry from before the engine lost
+                // track. Clear both so the slot is genuinely reusable.
+                let worker_id = crate::coordinator::worker_id_for_slot(slot_id);
+                self.execution_coordinator
+                    .release_worker_and_kick(&worker_id, None)
+                    .await;
+                self.live_worker_states.release_slot(slot_id);
+                self.live_status_manager.stop_slot(slot_id);
+                self.broadcast_live_worker_states().await;
+            }
+            None => {
+                tracing::debug!(
+                    run_id,
+                    "release_worker_pane: app hosts no pane for this run; process-tree reap only",
+                );
+            }
+        }
+        reap_worker_process_tree(shell_pid, Duration::from_secs(5));
+        self.transcript_path_cache.forget(run_id);
+        self.run_cost_capture.forget(run_id);
+        // A live process was signalled, so this IS a reap: the caller may free
+        // the workspace lease.
         PaneReleaseOutcome::Reaped
     }
 

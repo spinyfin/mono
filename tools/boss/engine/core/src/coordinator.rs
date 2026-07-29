@@ -1259,6 +1259,43 @@ impl WorkerPool {
         Some(id)
     }
 
+    /// Claim one SPECIFIC slot for `execution_id` — the re-adoption
+    /// counterpart to [`Self::release_worker_if_execution`].
+    ///
+    /// Every other claim verb picks a slot for a *new* dispatch, so the pool
+    /// chooses. Re-adoption is the opposite situation: the worker already
+    /// exists and already occupies a pane in a known slot, and the pool's
+    /// bookkeeping for it was wrongly released. The slot is an input, not an
+    /// output.
+    ///
+    /// Restoring the claim is what makes a re-adoption stick. The pool's
+    /// claim table is the `is_live` oracle for
+    /// [`crate::orphan_sweep`] and the redundant-spawn guard; while it says
+    /// the slot is free, the work item stays eligible for re-dispatch no
+    /// matter what the execution row says.
+    ///
+    /// Returns `true` when the slot is claimed by `execution_id` on return.
+    /// Idempotent: a slot already claimed by the same execution succeeds
+    /// without touching anything. Refuses (returns `false`) when the slot does
+    /// not exist or is claimed by a DIFFERENT execution — yanking a live
+    /// claim to re-adopt a survivor would create the very double-worker state
+    /// re-adoption exists to prevent.
+    pub async fn reclaim_slot(&self, worker_id: &str, execution_id: &str) -> bool {
+        let mut inner = self.inner.lock().await;
+        let Some(worker) = inner.workers.iter_mut().find(|worker| worker.worker_id == worker_id) else {
+            return false;
+        };
+        match worker.execution_id.as_deref() {
+            Some(existing) if existing == execution_id => true,
+            Some(_) => false,
+            None => {
+                worker.execution_id = Some(execution_id.to_owned());
+                log_pool_claim(worker_id, execution_id, "readopt");
+                true
+            }
+        }
+    }
+
     /// Release `worker_id` back to the idle pool. If `last_workspace_id`
     /// is provided we record it as the worker's affinity for future
     /// preferred-workspace claims.

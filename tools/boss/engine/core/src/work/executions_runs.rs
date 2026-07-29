@@ -202,6 +202,169 @@ impl WorkDb {
         Ok(updated)
     }
 
+    /// Reverse an *inferred* terminalization: put an execution the engine
+    /// wrongly declared dead back into the live state its still-running worker
+    /// actually occupies.
+    ///
+    /// ## Why a terminal status is ever reversed
+    ///
+    /// `orphaned` and `abandoned` are not decisions — they are **guesses**.
+    /// Every site that writes them ([`Self::mark_execution_orphaned`],
+    /// [`crate::spawn_ack_sweep`], [`crate::dead_pid_sweep`], the orphan
+    /// sweep's `request_execution_with_live_check`) is inferring "the worker
+    /// must be gone" from the absence of a signal: no ack, no pid, no pool
+    /// claim, no hook. Absence of a signal is exactly what a degraded network
+    /// or a slow post-sleep RPC drain produces for a worker that is perfectly
+    /// alive. When that worker subsequently proves itself — a hook arrives, or
+    /// its recorded pid answers a probe — the guess is *disproven*, and the
+    /// only correct response is to withdraw it.
+    ///
+    /// Leaving it standing is what produced the 2026-07-28 duplicate-dispatch
+    /// storm: the row stayed terminal, so its work item stayed eligible for
+    /// re-dispatch, so a second (then third) worker was spawned on top of a
+    /// live one.
+    ///
+    /// `cancelled`, `completed` and `failed` are NOT reversible here and the
+    /// call errors on them. Those are real decisions — an operator stopped the
+    /// run, or the worker finished, or it genuinely errored — and a surviving
+    /// process contradicting one of them means the process should be reaped,
+    /// not the record rewritten.
+    ///
+    /// ## What it restores
+    ///
+    /// - The execution goes back to the status a healthy pane-hosted worker
+    ///   occupies: `running` for a `pr_review` reviewer pane, `waiting_human`
+    ///   for every other kind — the same split
+    ///   `runner::pane_spawn` applies at spawn time, kept in one rule so the
+    ///   re-adopted row is indistinguishable from a never-lost one.
+    ///   `waiting_human` additionally makes the row invisible to
+    ///   [`Self::list_orphan_active_candidates`], which is what stops the
+    ///   re-dispatch storm at its source.
+    /// - `finished_at` is cleared: the run did not finish.
+    /// - The latest `work_runs` row is un-orphaned **only if the reap was what
+    ///   stamped it**. A row this execution finished legitimately is
+    ///   `completed`/`failed` and is left alone; an `orphaned` one can only
+    ///   have come from the reap being reversed.
+    /// - A work item demoted to `todo` by the reap is put back to `active`,
+    ///   but only when this execution is still its latest — the same
+    ///   latest-execution guard [`demote_active_if_latest_execution`] applies
+    ///   in the other direction, so a newer execution driving the row is never
+    ///   clobbered.
+    ///
+    /// ## Refusals
+    ///
+    /// Errors when the execution is unknown, when its status is not an
+    /// inferred terminal, or when the work item already has a DIFFERENT live
+    /// execution. That last check is the anti-duplication invariant restated
+    /// at the storage layer: re-adopting into a row that already has a live
+    /// worker would create precisely the double-worker state this whole change
+    /// exists to prevent, so it is refused here even if a caller asks for it.
+    pub fn readopt_inferred_terminal_execution(&self, execution_id: &str, evidence: &str) -> Result<WorkExecution> {
+        let mut conn = self.connect()?;
+        let tx = conn.transaction()?;
+        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
+        if !matches!(existing.status, ExecutionStatus::Orphaned | ExecutionStatus::Abandoned) {
+            bail!(
+                "execution {execution_id} is `{}`, which is a deliberate outcome rather than an \
+                 inferred death; only `orphaned` / `abandoned` may be re-adopted",
+                existing.status
+            );
+        }
+        let conflicting: Option<String> = tx
+            .query_row(
+                "SELECT id FROM work_executions
+                 WHERE work_item_id = ?1
+                   AND id != ?2
+                   AND status IN ('running', 'waiting_human')
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1",
+                params![existing.work_item_id, execution_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(conflicting) = conflicting {
+            bail!(
+                "refusing to re-adopt {execution_id}: work item {} already has a live execution \
+                 ({conflicting}); re-adopting would put two workers on one row",
+                existing.work_item_id
+            );
+        }
+
+        // The status a healthy pane-hosted worker of this kind parks in.
+        let restored = if existing.kind == ExecutionKind::PrReview {
+            ExecutionStatus::Running
+        } else {
+            ExecutionStatus::WaitingHuman
+        };
+        let now = now_string();
+        tx.execute(
+            "UPDATE work_executions
+             SET status = ?2,
+                 finished_at = NULL
+             WHERE id = ?1",
+            params![execution_id, restored.as_str()],
+        )?;
+        // Un-orphan the latest run row, but only when the reap is what
+        // stamped it. A run that ended on its own terms is `completed` /
+        // `failed` and stays exactly as it is.
+        tx.execute(
+            "UPDATE work_runs
+             SET status = 'active',
+                 finished_at = NULL,
+                 result_summary = NULL
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             ) AND status = 'orphaned'",
+            params![execution_id],
+        )?;
+        // Reverse a demote, under the same latest-execution guard the demote
+        // itself uses.
+        tx.execute(
+            "UPDATE tasks
+             SET status            = 'active',
+                 last_status_actor = 'engine',
+                 updated_at        = ?2
+             WHERE id             = ?1
+               AND status         = 'todo'
+               AND deleted_at     IS NULL
+               AND ?3 = (
+                   SELECT id FROM work_executions
+                   WHERE work_item_id = ?1
+                   ORDER BY created_at DESC, id DESC
+                   LIMIT 1
+               )",
+            params![existing.work_item_id, now.as_str(), execution_id],
+        )?;
+
+        let updated = query_execution(&tx, execution_id)?
+            .with_context(|| format!("unknown execution after re-adoption: {execution_id}"))?;
+        // Counterpart to the canonical "execution terminalized" trace that
+        // every terminal-transition site emits. A re-adoption is the only
+        // transition that runs the other way, so it gets one greppable line
+        // naming the status it reversed and the evidence that disproved it —
+        // otherwise a row would appear to have left a terminal state with no
+        // recorded cause, which is the same instrumentation gap that made the
+        // ack-timeout / stale-reap contradiction so hard to attribute.
+        tracing::warn!(
+            execution_id = %execution_id,
+            work_item_id = %updated.work_item_id,
+            from_status = %existing.status,
+            to_status = %updated.status,
+            evidence = %evidence,
+            "execution re-adopted: inferred death disproven by a live worker",
+        );
+        // No bus event: `Event` carries only terminal-direction lifecycle
+        // signals, and publishing `ExecutionTerminal` for a row that just LEFT
+        // terminal would tell every subscriber the opposite of what happened.
+        // The UI refresh is the caller's job via `publish_work_item_changed`,
+        // the same layer that handles it for `force_stop_execution`.
+        commit_and_publish(tx, PendingEvents::new(), &self.event_bus)?;
+        Ok(updated)
+    }
+
     /// Auto-resume a work item whose worker stalled or died on a
     /// *transient* Claude API error. In one transaction:
     ///
@@ -2028,6 +2191,64 @@ impl WorkDb {
             )
             .optional()?;
         Ok(created_at.and_then(|s| s.parse::<i64>().ok()))
+    }
+
+    /// The newest LOCAL worker process this work item ever recorded: the
+    /// `(execution_id, shell_pid)` of the most recently created `work_runs`
+    /// row across ALL of the item's executions — terminal ones included —
+    /// that ran locally and reported a pid, restricted to rows created within
+    /// `max_age_secs`.
+    ///
+    /// This is the work-item-scoped sibling of
+    /// [`Self::latest_local_shell_pid_for_execution`], and it exists for the
+    /// one question that helper cannot answer: *before I dispatch a second
+    /// worker onto this row, is the previous one still running?* The
+    /// re-dispatchers ([`crate::orphan_sweep`]) reach that decision point
+    /// holding only a `work_item_id` — the execution they would be duplicating
+    /// is already terminal, so no "live execution" lookup finds it, and the
+    /// in-memory `LiveWorkerStateRegistry` entry that used to hold its pid was
+    /// dropped by `release_worker_pane`. The durable `work_runs.shell_pid` is
+    /// the only surviving handle on that process.
+    ///
+    /// **Terminal executions are deliberately included.** Excluding them would
+    /// make this blind to the exact failure it guards: an execution the engine
+    /// wrongly terminalized while its worker kept running.
+    ///
+    /// `max_age_secs` bounds pid reuse. A recorded pid is only meaningful while
+    /// the OS has not recycled it, so a caller must state how far back it is
+    /// willing to trust the number; see
+    /// [`crate::durable_liveness::REDISPATCH_PID_TRUST_SECS`] for the value the
+    /// re-dispatch guard uses and why. Rows older than that are not returned at
+    /// all, so a caller can never act on a pid this table can no longer vouch
+    /// for.
+    ///
+    /// The `host_id = 'local'` gate is the same hard safety rail
+    /// [`Self::latest_local_shell_pid_for_execution`] applies: `kill(pid, 0)`
+    /// on the engine host says nothing about a pid on another machine.
+    pub fn latest_local_worker_process_for_work_item(
+        &self,
+        work_item_id: &str,
+        max_age_secs: i64,
+        now_epoch_secs: i64,
+    ) -> Result<Option<(String, i64)>> {
+        let conn = self.connect()?;
+        let cutoff = now_epoch_secs - max_age_secs;
+        conn.query_row(
+            "SELECT r.execution_id, r.shell_pid
+             FROM work_runs r
+             JOIN work_executions e ON e.id = r.execution_id
+             WHERE e.work_item_id = ?1
+               AND r.host_id = 'local'
+               AND r.shell_pid IS NOT NULL
+               AND r.shell_pid > 0
+               AND CAST(r.created_at AS INTEGER) >= ?2
+             ORDER BY r.created_at DESC, r.id DESC
+             LIMIT 1",
+            params![work_item_id, cutoff],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Active runs on a non-local host whose backing execution is still
