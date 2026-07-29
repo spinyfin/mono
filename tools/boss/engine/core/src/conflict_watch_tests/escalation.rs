@@ -27,7 +27,7 @@ crate::stub_cube_client! { CleanRebaseCube {
         Ok(())
     }
     async fn rebase_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<RebaseOutcome> {
-        Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new(), linearized_commits: 0 })
+        Ok(RebaseOutcome { clean: true, pushed: true, conflicted_files: Vec::new(), linearized_commits: 0, linearize_decline: None })
     }
     async fn release_workspace(&self, _lease_id: &str) -> anyhow::Result<()> {
         Ok(())
@@ -142,7 +142,7 @@ crate::stub_cube_client! { ConflictsCube {
         Ok(())
     }
     async fn rebase_workspace(&self, _workspace_path: &std::path::Path, _pr: u64) -> anyhow::Result<RebaseOutcome> {
-        Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: self.conflicted_files.clone(), linearized_commits: 0 })
+        Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: self.conflicted_files.clone(), linearized_commits: 0, linearize_decline: None })
     }
     async fn release_workspace(&self, _lease_id: &str) -> anyhow::Result<()> {
         Ok(())

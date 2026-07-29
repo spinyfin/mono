@@ -566,6 +566,19 @@ pub struct RebaseOutcome {
     /// it is carried purely so the ladder can say so in its trace rather
     /// than reporting an indistinguishable "clean rebase".
     pub linearized_commits: usize,
+    /// Which guard refused the replay-only collapse, as cube's stable slug
+    /// (`conflicted_head`, `bookmarked_ancestor`, `multiple_children`,
+    /// `round_limit`, `range_still_conflicted`, `tree_drift`, `probe_error`,
+    /// `nothing_to_collapse`, `no_head`, or `not_attempted`).
+    ///
+    /// `None` on a clean rebase (nothing declined) and on a cube older than
+    /// the decline-reason plumbing. Without this every decline looked
+    /// identical from the engine's side — "a real conflict at the head" was
+    /// indistinguishable from "collapsed three commits then the tree drifted"
+    /// — which is exactly the blind spot that made the mechanical path's
+    /// silence undiagnosable. Stamped on the ladder's rung-1 fall-through
+    /// trace so guard hits can be counted without a code change.
+    pub linearize_decline: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder, serde::Deserialize)]
@@ -761,6 +774,12 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
     // Absent on a cube older than the replay-only collapse; 0 is the correct
     // reading there (that cube never collapsed anything).
     let linearized_commits = payload.get("linearized_commits").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    // Absent on a clean rebase (nothing declined) and on a cube older than the
+    // decline-reason plumbing.
+    let linearize_decline = payload
+        .get("linearize_decline")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
     let conflicted_files = payload
         .get("conflicted_files")
         .and_then(|v| v.as_array())
@@ -776,6 +795,7 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
         pushed,
         conflicted_files,
         linearized_commits,
+        linearize_decline,
     })
 }
 

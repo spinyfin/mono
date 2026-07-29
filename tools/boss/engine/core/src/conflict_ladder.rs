@@ -39,7 +39,11 @@
 //!   forward and proves the pushed tree byte-identical before reporting
 //!   clean ([`crate::coordinator::RebaseOutcome::linearized_commits`]); a
 //!   conflicted *head*, a bookmarked ancestor (stacked-PR boundary), or any
-//!   tree drift still declines and hands off here exactly as before.
+//!   tree drift still declines and hands off here exactly as before —
+//!   carrying *which* guard refused
+//!   ([`crate::coordinator::RebaseOutcome::linearize_decline`]), which this
+//!   module stamps on its rung-1 fall-through trace so the guard hits can be
+//!   counted without a code change.
 //!
 //! - **Rung 2 (T6) — small focused resolution agent.** When rung 1 leaves a
 //!   *bounded* residue of conflicted files ([`rung2_eligible`],
@@ -676,6 +680,12 @@ async fn run_rung1_in_lease(
         pr = pr_number,
         attempt_id = %attempt.id,
         residual_conflicts = residual_conflict_files,
+        // Which guard refused cube's replay-only collapse. Without it every
+        // rung-1 fall-through reads the same in the trace, and "the head
+        // carried a real conflict" cannot be told from "the collapse ran and
+        // then the tree drifted" — the blind spot the mechanical path is
+        // meant to close, not reproduce.
+        linearize_decline = rebase.linearize_decline.as_deref().unwrap_or("none"),
         "conflict_ladder: rung 1 left residual conflicts; falling through to rung 2/3",
     );
     log_routing_verdict(
