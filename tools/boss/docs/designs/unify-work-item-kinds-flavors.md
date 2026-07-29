@@ -14,18 +14,20 @@
 
 **Five kinds became eight.** `followup`, `design_postmortem`, and `task` were added. This is the single biggest challenge to the doc's model and is assessed in [§Does the collapse still fit?](#does-the-collapse-still-fit-eight-kinds-four-flavors).
 
-**The doc's predicted failure mode recurred, in production, after it was written.** The original argued that a hand-maintained `kind IN (…)` partition would keep silently dropping kinds from list surfaces. On 2026-07-20 exactly that happened again: `design_postmortem` and `followup` were invisible on _every_ listing surface because `TaskKind::ALL` was a second hand-authored literal that had gone stale. The incident (`postmortem-archived-fanout-2026-07-20`) is now cited in four places in the source as the reason for the current compile-time enforcement (`task.rs:423-439`, `workitems.rs:22-29`, `workitems.rs:53-62`). **This is the strongest available evidence for the doc's central premise, and it postdates the doc.**
+**The doc's predicted failure mode recurred, in production, after it was written.** The original argued that a hand-maintained `kind IN (…)` partition would keep silently dropping kinds from list surfaces. On 2026-07-20 exactly that happened again: `design_postmortem` and `followup` were invisible on _every_ listing surface because `TaskKind::ALL` was a second hand-authored literal that had gone stale. The incident (`postmortem-archived-fanout-2026-07-20`) is now cited in three places in the source as the reason for the current compile-time enforcement (`task.rs:423-439`, `workitems.rs:22-29`, `workitems.rs:53-62`). (It is referenced eleven times across six files repo-wide, but the other eight citations are about the sweep's backfill behavior, not about kind-set exhaustiveness.) **This is the strongest available evidence for the doc's central premise, and it postdates the doc.**
 
 ### Verdict per deliverable
 
 | Original item                                           | Verdict                                                              | Evidence                                   |
 | ------------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------ |
 | **T-A** — flavor-complete `list`                        | **Landed, different mechanism.** Filters not delivered.              | `workitems.rs:40-50`, `64-71`, `1127-1170` |
-| **T-B** — `flavor` column + derived `kind`              | **Not started.** No `flavor` exists anywhere in `tools/boss/`.       | grep: only `tokio::test(flavor = …)`       |
+| **T-B** — `flavor` column + derived `kind`              | **Not started.** No `flavor` column or struct field exists.          | grep: only doc comments + `libc` (below)   |
 | **T-C** — reparenting via `--project`/`--unset-project` | **Not started.** The gap is live.                                    | `cli/src/commands.rs:2761-2766`            |
 | **T-D** — engine `kind`-branch collapse                 | **Not started**, and partially pre-empted by `CHORE_LIKE_KINDS_SQL`. | `engine/core/src/work.rs:22-26`            |
 | **T-E** — unified `create --type`                       | **Not started.** Insert paths went from 2 to ≥5.                     | `work/create_entities.rs:185-224`          |
 | **T-F / T-G / T-H / T-I**                               | **Not started.**                                                     | —                                          |
+
+_T-B evidence, stated precisely:_ `grep -rn flavor --include='*.rs' tools/boss/` does return hits, but none of them is a `flavor` column or a `flavor` struct field. They are (a) roughly eight "flavor-complete" doc comments — e.g. `work/workitems.rs:32`, `populator.rs:1621`, and several test files — describing `list_tasks`'s post-T-A completeness, and (b) an unrelated `libc` identifier, `flavor: libc::c_int` for `PROC_PIDTBSDINFO` at `worker_registry.rs:196,229`. No storage or protocol surface carries the concept.
 
 **T-A shipped without the schema work**, exactly as the original predicted it could ("ships independently of the schema work"). That prediction is confirmed. But it shipped as _kind-completeness enforced by an exhaustive match_, not as a `--type`/`--project`/`--no-project` filter set over a `flavor` column. The bug is closed; the model change is not.
 
@@ -85,7 +87,7 @@ Unchanged in intent. Re-stated with current status:
 - A single leaf work-item entity with a **`flavor`** attribute and **project membership as an orthogonal nullable `project_id`**. — **Open.**
 - A **single flavor-complete `list` surface**. — **Achieved for `list_tasks`** (`workitems.rs:40-71`); **not achieved for `get_work_tree`** (`workitems.rs:800,817`); `--type` / `--no-project` filters **not delivered** (`TaskListArgs`, `cli/src/commands.rs:2255+`, has `--project` but no kind or membership filter).
 - **Promotion as a trivial field update.** — **Open.** See the operator gap above.
-- **Zero-break compatibility**; `T<n>` short ids stable. — Still satisfiable; `tasks_product_short_id_idx` is `UNIQUE(product_id, short_id)` (`migrations_b.rs:917`) and remains independent of `project_id`.
+- **Zero-break compatibility**; `T<n>` short ids stable. — Still satisfiable; `tasks_product_short_id_idx` is a _partial_ unique index — `ON tasks(product_id, short_id) WHERE short_id IS NOT NULL` (`migrations_b.rs:917-918`) — and remains independent of `project_id` either way.
 - **Flavor-behavior preservation.** — Now covers three more behaviors than the original enumerated; see §Flavor-behavior preservation.
 - A **phased path**: derive `kind` from `(flavor, project_id)` first. — Still the right shape, but the derivation is no longer sufficient on its own; see below.
 
@@ -103,9 +105,39 @@ Unchanged, with two corrections:
 
 ## Alternatives considered
 
-All four alternatives were re-read against current code. **A, B, and C stand unchanged** — no new evidence bears on them, and Alternative C's reasoning (executions, transcripts, attention items, dependency edges, and short ids all key on `tasks.id`) is if anything more true now that `attention_groups` and `worker_proposals` also key off it.
+All four original alternatives were re-read against current code and are reproduced below unchanged, each with a **drift verdict** attached. **A, B, and C stand unchanged or stronger; D is more clearly correct to reject than when written.** A fifth alternative has emerged in practice since and is added at the end.
 
-**Alternative D — drop `kind` immediately — is now more clearly correct to reject.** The original counted ~14 branch sites. The current count is higher and they are spread across more crates. Phasing remains right.
+### Alternative A — Fold project-membership into the flavor enum (rename `kind` → `flavor`)
+
+Keep one enum but rename it: `flavor ∈ {chore, task, design, investigation, revision}`, where `chore` vs `task` still encodes project membership. This is the smallest diff — a column rename.
+
+**Rejected.** It re-commits the original mistake: the deliverable axis and the membership axis stay conflated in one value. Promotion would still mean _changing the flavor_ (`chore` → `task`) rather than flipping a `project_id`, so the "trivial field update" goal is lost — every promotion mutates the discriminator that other code matches on. It also doesn't fix the list partition cleanly, because "list all normal-deliverable items regardless of project" still requires OR-ing two flavor values. The whole point of the project is to _separate_ these axes, not relabel their conflation.
+
+> **Drift verdict 2026-07-29: still valid, and strengthened.** `kind` is now a macro-generated closed enum (`task.rs:469-478`) whose variant set is compile-time load-bearing across the CLI, engine, and macOS app. Mutating that discriminator on every promotion is a costlier proposition today than when the doc was written, not a cheaper one.
+
+### Alternative B — A new neutral noun `boss work list`
+
+Leave `boss task` / `boss chore` as-is and add a third noun, `boss work`, as the flavor-complete surface.
+
+**Rejected.** It adds a third synonym for the same entity, fragmenting muscle memory and scripts further rather than consolidating. The engine already frames the model as "a chore is a kind of task," and the kind-agnostic verbs already live under `boss task`. Making `boss task list` complete (and keeping `boss chore list` as a narrowing alias) matches that existing framing, costs callers nothing, and means the _fix_ for the invisibility bug is "the noun you already use now shows everything." A brand-new noun would leave the old nouns as lingering partial views — the exact trap we're removing.
+
+> **Drift verdict 2026-07-29: strengthened, and now empirically confirmed.** T-A landed exactly as this alternative predicted it should: the flavor-complete surface arrived under the existing `boss task` noun (`workitems.rs:40-71`), and the doc comment there calls `boss task list` "the flavor-complete leaf listing surface". `boss task by-pr` was likewise added under `boss task` rather than a new noun. No third noun was needed and none was created.
+
+### Alternative C — Separate table per flavor (`designs`, `revisions`, …)
+
+Give each deliverable shape its own table foreign-keyed to a base row.
+
+**Rejected** — already litigated twice in this repo (`design-producing-tasks.md` Q1, `revision-tasks.md` Q1) and rejected both times. Executions, runs, transcripts, attention items, dependency edges, and short ids all key on `tasks.id`. A per-flavor table forces every join to become a `UNION ALL` or denies those flavors first-class plumbing. The whole codebase is built around one `tasks` table; splitting it is strictly more work for strictly less capability.
+
+> **Drift verdict 2026-07-29: still valid, and strengthened.** The set of things keyed on `tasks.id` has grown — `attention_groups` and `worker_proposals` now key off it too — so the `UNION ALL` blast radius of a per-flavor split is larger than when the alternative was rejected.
+
+### Alternative D — Drop `kind` immediately and compute everywhere
+
+Add `flavor`, delete `kind`, and rewrite every `match kind` site in one PR.
+
+**Rejected for v1.** The audit (§Flavor-behavior preservation) found ~14 distinct branch sites across `completion.rs`, `runner`-adjacent helpers, `executions_runs.rs`, `pr_flow.rs`, `revision_helpers.rs`, `chain_helpers.rs`, and several SQL queries. Touching all of them at once is a high-blast-radius change with no safe intermediate state and a painful rollback. The phased "derive first, collapse incrementally, drop last" path (Chosen approach) keeps every site green at each step.
+
+> **Drift verdict 2026-07-29: still valid; its numbers understate the case.** The original counted ~14 branch sites in one crate. The re-verified audit in §6 lists more, spread across several sibling crates plus the macOS app (17 `isChore` sites in `app-macos/Sources/`, 22 including tests). The high-blast-radius / no-safe-intermediate-state argument is correspondingly stronger, and phasing remains right.
 
 **A new alternative has emerged in practice and deserves to be named, because the codebase has partly adopted it:**
 
@@ -124,14 +156,20 @@ Rather than adding a `flavor` column, define the deliverable axis as _named, sha
 
 **[Re-reviewed. Direction stands. One invariant is now factually wrong and must be corrected before implementation.]**
 
-Two orthogonal axes, a derived `kind`, and a flavor-complete `boss task` noun.
+**Two orthogonal axes, a derived `kind`, and a flavor-complete `boss task` noun.** Project membership stays where it already is — a nullable `project_id`. The deliverable/behavior axis becomes a new `flavor` column. `kind` survives the transition as a _derived, denormalized display hint_ computed from `(flavor, project_id)` on every write, so all existing `kind`-matching code keeps working byte-for-byte until it is migrated deliberately.
 
 ### 1. The flavor model (orthogonal axes)
+
+Two axes, stored independently on `tasks`:
 
 | Axis                   | Storage                               | Values                                                                            |
 | ---------------------- | ------------------------------------- | --------------------------------------------------------------------------------- |
 | Deliverable / behavior | `flavor TEXT NOT NULL`                | `normal`, `design`, `investigation`, `revision` (**under-specified — see below**) |
 | Project membership     | `project_id TEXT NULL` (exists today) | NULL (free-floating) or a project id                                              |
+
+`flavor` has **four** values, not five: the legacy `chore` and `project_task` kinds _both_ collapse to `flavor = 'normal'` and are distinguished purely by `project_id`. "Chore" becomes the display name for `(normal, project_id IS NULL)`; "task" is `(normal, project_id IS NOT NULL)`. (Whether four still suffices given eight kinds is the subject of the next subsection.)
+
+The two axes are orthogonal _in storage_ but constrained by **flavor-specific invariants** on which combinations are legal — these are real today and must be preserved, enforced in Rust at the insert/update boundary, consistent with `tasks`'s no-`CHECK` house style (§5).
 
 **The invariant table as originally written is now wrong in one row.** Corrected against source:
 
@@ -146,7 +184,11 @@ Two orthogonal axes, a derived `kind`, and a flavor-complete `boss task` noun.
 
 This is **Risk 6 of the original doc, materialized**. The original wrote: "If a future 'free-floating design' use case appears, the invariant must relax. Out of scope now." It appeared. The invariant must relax, and it is no longer a hypothetical.
 
-Note also that `task_uses_per_task_doc` is _already a function of `(kind, has_project)`_ — the exact pair this design proposes to make first-class. The codebase reached for the two-axis predicate on its own where it needed it.
+Two invariant rows that did _not_ drift and remain load-bearing: `revision` inherits `project_id` from its parent chain and carries `parent_task_id`, with `pr_url` NULL because the chain root owns the PR (`pr_flow.rs:72`); and `investigation` is free on the membership axis (standalone or under a project).
+
+**Why orthogonal, not folded:** the issue brief recommends the orthogonal-axis model "unless there's a concrete reason not to," and there isn't one. Promotion is a `project_id` write that never touches `flavor`; the list surface becomes a filter over two independent dimensions instead of a partition over one conflated enum; and engine code that only cares about membership (`is this free-floating?`) tests `project_id IS NULL` without consulting the deliverable axis.
+
+Note also that `task_uses_per_task_doc` is _already a function of `(kind, has_project)`_ — the exact pair this design proposes to make first-class. The codebase reached for the two-axis predicate on its own where it needed it, which is independent corroboration of the orthogonality argument above.
 
 ### Does the collapse still fit? Eight kinds, four flavors
 
@@ -171,38 +213,105 @@ The original's four flavors do not cover the current eight kinds. Assessment of 
 
 ### 2. `kind` disposition: derive now, drop later
 
-**[Still the right lever. Derivation function needs extending.]**
+**[Still the right lever. Derivation function needs extending — see the annotations below.]**
 
-The `derive_kind(flavor, project_id)` helper as originally written handles four flavors and cannot produce `followup`, `design_postmortem`, or `task`. With the provenance axis above it becomes `derive_kind(flavor, project_id, provenance)`, or — cleaner — the three non-modelled kinds are handled as explicit carve-outs. This is a real complication the original did not anticipate and it makes T-B meaningfully larger.
+Keep `kind` as a **derived, denormalized column**, recomputed from `(flavor, project_id)` on every insert and every update that can change either input, via one shared helper:
 
-The rationale for keeping `kind` derived rather than dropping it is **strengthened**: `kind` is now a typed protocol enum with macro-enforced exhaustiveness, so far more code depends on its exact variant set than when the doc was written.
+```rust
+fn derive_kind(flavor: &str, project_id: Option<&str>) -> &'static str {
+    match flavor {
+        "design" => "design",
+        "investigation" => "investigation",
+        "revision" => "revision",
+        "normal" => if project_id.is_some() { "project_task" } else { "chore" },
+        other => other, // forward-compat: unknown flavor passes through
+    }
+}
+```
+
+The invariant "`kind` is always consistent with `(flavor, project_id)`" is enforced in the application layer (the write path computes `kind`; callers never set it directly), matching how every other `tasks` invariant is enforced — `tasks` deliberately carries no `CHECK` constraints so migrations stay `ALTER TABLE ADD COLUMN`-shaped and error messages stay in Rust (see `revision-tasks.md` Q1 for the established rationale, and §5 below for the corrected scope of that claim).
+
+**This is the load-bearing zero-break lever.** Because `kind` stays populated and correct, every `match task.kind` site (§Flavor-behavior preservation) keeps reading the same values it reads today. The engine collapse (rewriting those sites to read `flavor` + `project_id`) and the eventual `kind`-drop become _separate, independently-schedulable_ tasks rather than prerequisites — and the system is shippable after each one.
+
+`boss task show <id>` will surface `(flavor, project_id, kind)` together; the derivation guarantees they are always consistent.
+
+> **Drift annotations 2026-07-29 — none of the above is implemented; two parts need amending before it is.**
+>
+> - **The helper as written is incomplete.** It handles four flavors and cannot produce `followup`, `design_postmortem`, or `task`. With the provenance axis identified above it becomes `derive_kind(flavor, project_id, provenance)`, or — cleaner — the three non-modelled kinds are handled as explicit carve-outs. This is a real complication the original did not anticipate and it makes T-B meaningfully larger.
+> - **The `other => other` pass-through arm should be deleted.** It is the permissive-unknown-value pattern the 2026-07-20 incident discredited; see Risk 4. `flavor` should be a closed enum given the same `task_kind_variants!` macro treatment as `TaskKind`, so an unmapped flavor is a compile error rather than a silent pass-through.
+> - **The load-bearing-lever rationale is _strengthened_, not weakened.** `kind` is now a typed protocol enum with macro-enforced exhaustiveness, so far more code depends on its exact variant set than when the doc was written — which is precisely why keeping it derived rather than dropping it is still the right call.
+> - The application-layer-enforcement claim survives, but its justification was overstated in the original; see §5.
 
 ### 3. CLI surface: make `boss task` flavor-complete
 
-**[Half landed.]**
+**[Half landed. Spec below is the intended end state; per-item status is annotated inline.]**
 
-- `boss task list` returns every kind by default — **done** (`workitems.rs:40-71,1127-1170`).
-- `--type <flavor>` / `--flavor` — **not implemented.** `TaskListArgs` (`cli/src/commands.rs:2255+`) has `--product`, `--project`, `--status`, `--priority`, `--match`, `--limit`, `--id`, `--deleted`, `--include-archived`, `--repo`, and dependency filters. No kind or flavor filter.
-- `--no-project` — **not implemented.** `list_tasks(product_id, project_id: Option<&str>, …)` treats `None` as "all rows in product", not "free-floating only" (`workitems.rs:1127-1160`), so there is no way to ask for free-floating rows.
-- `boss chore list` as an alias — **not done**; it remains a distinct RPC (`list_chores`, `workitems.rs:1297-1311`), now widened to `kind IN ('chore','followup')`.
-- Unified `boss task create --type <flavor>` — **not done.** `TaskCreateArgs` has no kind/type flag. Create verbs remain split: `create`, `create-many`, `create-investigation`, `create-revision` under `boss task`, plus `create`/`create-many` under `boss chore`.
+`boss task` becomes the single flavor-complete leaf-work-item noun. `boss chore *` and the split `create-*` verbs remain as thin back-compat aliases.
 
-**The original said "two insert paths become one". That is now optimistic**: there are at least five (`insert_task_in_tx`, `insert_chore_in_tx`, `insert_investigation_in_tx`, `assert_parent_revisable_and_insert`, `insert_design_task_for_project_in_tx` — `work/create_entities.rs:185-224`), plus engine-internal minting for `followup` (`chain_helpers.rs:349`) and `design_postmortem` (`project_postmortem_sweep`). Note that `followup` and `design_postmortem` have **no create verb at all** — they are engine-minted only, which is a point in favour of the unified-create design (a `--type` flag would give them one for free, if that is even desirable).
+**`boss task list` returns every flavor by default** (chore, project_task, design, investigation, revision), with filters to slice:
+
+- `--type <flavor>` (repeatable / comma-list; `--flavor` accepted as a synonym) — filter by deliverable axis. Values: `normal`, `design`, `investigation`, `revision`.
+- `--project <P>` — only rows in project P (the existing flag, semantics unchanged).
+- `--no-project` — only free-floating rows (`project_id IS NULL`).
+- Existing `--status` / `--priority` / `--match` / `--repo` / `--id` / `--deleted` / dependency filters compose unchanged.
+
+The query collapses to one parametric `SELECT` over `tasks WHERE product_id = ? AND deleted_at IS NULL` with optional `flavor IN (…)` and `project_id` predicates — replacing the divergent hard-coded `kind IN (…)` lists (originally cited at `workitems.rs:462/471/577`, now `:1149/:1158/:1311`) and the tree query (originally `:267/:281`, now `:800/:817`).
+
+Back-compat aliases (behavior identical to today):
+
+- `boss chore list` ≡ `boss task list --no-project --type normal`.
+- `boss chore create` ≡ `boss task create` with no `--project`.
+- `boss task create-investigation` / `create-revision` stay; a unified `boss task create --type <flavor>` is added alongside them (the split verbs become aliases that set `--type`).
+
+The unified, flavor-complete `list` was the **highest-value early carve-out** and the first implementation deliverable (task **T-A**). It could land _before_ the schema work by mapping `--type` values onto the existing `kind` set and simply UNION-ing the currently-partitioned queries — closing the chores/revisions-invisible bug immediately, independent of the flavor column.
+
+> **Drift annotations 2026-07-29 — status of each item above.**
+>
+> - **Default flavor-completeness — done**, and it landed exactly by the predicted "before the schema work" route (`workitems.rs:40-71,1127-1170`), though via a compile-time-exhaustive `kind IN (…)` rather than a UNION.
+> - **`--type <flavor>` / `--flavor` — not implemented.** `TaskListArgs` (`cli/src/commands.rs:2255+`) has `--product`, `--project`, `--status`, `--priority`, `--match`, `--limit`, `--id`, `--deleted`, `--include-archived`, `--repo`, and dependency filters. No kind or flavor filter. The repeatable/comma-list semantics above remain the proposal.
+> - **`--no-project` — not implemented.** `list_tasks(product_id, project_id: Option<&str>, …)` treats `None` as "all rows in product", not "free-floating only" (`workitems.rs:1127-1160`), so there is no way to ask for free-floating rows. The `boss chore list ≡ boss task list --no-project --type normal` equivalence is therefore not yet expressible.
+> - **`boss chore list` as an alias — not done**; it remains a distinct RPC (`list_chores`, `workitems.rs:1297-1311`), now widened to `kind IN ('chore','followup')`. Note the widening means the equivalence above must become `--type normal` over `{chore, followup}`, i.e. it depends on the `followup`-collapses-to-`normal` model decision.
+> - **The collapsed parametric `SELECT` — not done.** `list_tasks` is one query, but it filters on generated `kind IN (…)`, not on `(flavor, project_id)`.
+> - **Unified `boss task create --type <flavor>` — not done.** `TaskCreateArgs` has no kind/type flag. Create verbs remain split: `create`, `create-many`, `create-investigation`, `create-revision` under `boss task`, plus `create`/`create-many` under `boss chore`.
+> - **The original said "two insert paths become one". That is now optimistic**: there are at least five in-transaction insert helpers — `insert_task_in_tx` (`work/insert_helpers.rs:143`), `insert_chore_in_tx` (`:224`), `insert_investigation_in_tx` (`:277`), `assert_parent_revisable_and_insert` (`work/revision_helpers.rs:98`) and `insert_design_task_for_project_in_tx` (`:675`) — reached through the public wrappers `create_task`/`create_chore`/`create_investigation`/`create_revision` at `work/create_entities.rs:185/193/203/218`. That file also carries `import_chore_with_external_ref` (`:245`) and the bulk `create_many_tasks`/`create_many_chores` (`:292`/`:306`), plus engine-internal minting for `followup` (`chain_helpers.rs:349`) and `design_postmortem` (`project_postmortem_sweep`). Note that `followup` and `design_postmortem` have **no create verb at all** — they are engine-minted only, which is a point in favour of the unified-create design (a `--type` flag would give them one for free, if that is even desirable).
 
 ### 4. Promotion (reparenting)
 
-**[Entirely unimplemented. Design still sound.]**
+**[Entirely unimplemented. Design still sound; two amendments annotated below.]**
 
-`boss task update --project <P> <id>` / `--unset-project <id>` remain the proposed surface. Re-verified:
+`boss task update --project <P> <id>` and `boss task update --unset-project <id>` are the reparenting surface. No bespoke `promote` verb — promotion is a `project_id` write.
 
-- The **data-preservation guarantee is still achievable as written.** `short_id` is `UNIQUE(product_id, short_id)` (`migrations_b.rs:917`) with no relationship to `project_id`, so `T<n>` stability is free.
-- The **ordinal bookkeeping anchor moved** but still exists: next-ordinal-in-project is `SELECT … WHERE project_id = ?1 AND kind = 'project_task'` at `exec_status_helpers.rs:387` (originally cited as `:217`). Reorder validation uses the same predicate at `workitems.rs:923`.
-- **`--project` is already taken as a resolution flag on `update`** (`cli/src/commands.rs:2761-2766`). The original did not notice this. Reusing the same flag name for reparenting is a direct collision and needs resolving — either a different flag (`--set-project`), or context-dependent behavior (surprising), or accepting that on `update` the flag becomes a write. **This is a new, concrete design decision the original doc does not address.**
-- The **v1 scope guard (`flavor = normal` only)** should be revisited given project-less `design` now exists.
+**Data-preservation guarantee (hard requirement):** reparenting changes only `project_id` (and project-side bookkeeping below). Everything else lives on the same row and is untouched: `short_id`, `status`, `last_status_actor`, `pr_url`, `effort_level`, dependency edges (`work_item_dependencies` key on `tasks.id`), `description`, and external links (`link-external` bindings). In particular, `short_id` is uniquely indexed on `(product_id, short_id)` and has **no relationship to `project_id`**, so `T<n>` is stable across (de)assignment _for free_ — no special handling required.
+
+**Project-side bookkeeping** (the only writes beyond `project_id`):
+
+- On `--project <P>`: assign `ordinal = MAX(ordinal) + 1` among project P's `project_task` rows (the slot the existing next-ordinal query already computes), placing the promoted row at the end of P's task list. `kind` recomputes `chore → project_task`.
+- On `--unset-project`: clear `ordinal` (set NULL) and `project_id`. `kind` recomputes `project_task → chore`.
+
+**Scope guard (v1):** `--project`/`--unset-project` apply to `flavor = normal` only. Reparenting a `design`, an `investigation`, or a `revision` (whose membership follows its parent chain) has flavor-specific rules and is deferred — the command rejects those flavors with a clear message rather than silently doing something surprising.
+
+> **Drift annotations 2026-07-29 — nothing above is implemented; the spec re-verifies with two amendments.**
+>
+> - The **data-preservation guarantee is still achievable as specified.** `tasks_product_short_id_idx` is a partial unique index — `ON tasks(product_id, short_id) WHERE short_id IS NOT NULL` (`migrations_b.rs:917-918`) — with no relationship to `project_id` either way, so `T<n>` stability is free exactly as written.
+> - The **ordinal bookkeeping anchor moved** but the query still exists in the assumed shape: next-ordinal-in-project is `SELECT … WHERE project_id = ?1 AND kind = 'project_task'` at `exec_status_helpers.rs:387` (originally cited as `:217`). Reorder validation uses the same predicate at `workitems.rs:923`.
+> - **Amendment 1 — `--project` is already taken as a resolution flag on `update`** (`cli/src/commands.rs:2752,2761-2766`): "Resolve a friendly short id against the product that owns this project." It never writes `project_id`. The original did not notice this. Reusing the same flag name for reparenting is a direct collision and needs resolving — either a different flag (`--set-project`), or context-dependent behavior (surprising), or accepting that on `update` the flag becomes a write. **This is a new, concrete design decision the original doc does not address.**
+> - **Amendment 2 — the v1 scope guard should be revisited.** It was written on the premise that `design` has an intrinsic `project_id`; §1 shows that premise is now false, so "reject `design`" is no longer obviously the right rejection. See Risk 3.
 
 ### 5. Migration & back-compat
 
 **[Re-derived against current schema. Good news: the migration shape survives intact.]**
+
+**Schema:** add `flavor` via `ALTER TABLE tasks ADD COLUMN flavor TEXT` in a new `migrate_tasks_flavor_column()`, the same shape as the existing `migrate_tasks_*` family (e.g. `migrate_tasks_doc_pointer_columns`, `migrate_tasks_parent_task_id_column`). Backfill in the same migration with one `UPDATE` per legacy kind (see the corrected backfill below). After backfill, `flavor` is logically `NOT NULL`, enforced in Rust: **the column is added nullable because SQLite `ADD COLUMN NOT NULL` without a constant default on a populated table is awkward — add-nullable, backfill, then treat-as-required is the house pattern**, and it is what keeps every `tasks` migration `ALTER TABLE`-shaped.
+
+**`kind` is retained and kept derived** (§2). No `match kind` site changes in the schema PR — they keep reading the derived value.
+
+**Back-compat:** `boss chore *` and split `create-*` verbs stay as aliases (§3). JSON `list` output gains a `flavor` field but keeps the existing `kind` field, so no consumer breaks. Scripts that pass `--kind`-style filters or read `kind` from JSON keep working.
+
+**`T<n>` stability:** unaffected by any of the above (`short_id` is independent of flavor and `project_id`).
+
+**Deprecation (later, out of v1):** once the engine collapse (T-D) lands and telemetry shows nothing reads `kind`, drop the column; once usage telemetry shows the aliases are unused, deprecate `boss chore *`. Both are explicitly `future / not a v1 blocker`.
+
+The re-verification of that plan against the current tree follows.
 
 **Constraints — the specific risk raised for this review does not exist.** There is **no `CHECK` constraint on `tasks`** tying its keys to its `kind`, or otherwise. The table DDL (`schema_init.rs:151-182`) carries none, and no migration rebuilds the table — the only `tasks` rebuilds in the tree are in test fixtures (`work/tests.rs:57`, `work/tests/t06.rs:665`). Every one of the ~30 `migrate_tasks_*` functions is `ALTER TABLE … ADD COLUMN`-shaped. **A `flavor` column can still be added as a plain `ADD COLUMN` + backfill.**
 
@@ -228,7 +337,7 @@ UPDATE tasks SET flavor = kind            WHERE kind IN ('investigation', 'revis
 
 **Index:** the proposed `tasks_product_flavor_idx ON tasks(product_id, flavor, deleted_at)` still mirrors the existing `tasks_product_idx ON tasks(product_id, kind, deleted_at)` (`schema_init.rs:184-185`) and remains appropriate.
 
-**Back-compat:** unchanged and still sound. Adding `flavor` to JSON while retaining `kind` breaks no consumer.
+**Back-compat verdict:** the back-compat plan stated above is unchanged and still sound. Adding `flavor` to JSON while retaining `kind` breaks no consumer, and no consumer has appeared since that would make it break one.
 
 ### 6. Flavor-behavior preservation (audit)
 
