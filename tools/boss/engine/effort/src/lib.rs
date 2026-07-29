@@ -230,11 +230,16 @@ pub fn is_design_family_kind(kind: &TaskKind) -> bool {
 /// override, automated-reviewer-pass-on-every-agent-authored-pr.md §5, the
 /// design-family kind floor, and the `reasoning` capability signal):
 /// 1. `tasks.model_override` (when non-empty after trim).
-/// 2. `pool_model_override` — the owning pool's override (when non-empty
-///    after trim). Both the automation pool and the review pool set this to
-///    `"opus"` unconditionally, so reviewer agents and automation agents are
-///    always Opus regardless of the row's effort level. Pass `None` for
-///    main-pool executions.
+/// 2. `pool_model_override` — the owning pool's override, expressed as a
+///    driver-relative [`PoolModelTier`] rather than a literal model slug.
+///    Both the automation pool and the review pool set this to
+///    [`PoolModelTier::Strong`] unconditionally, which resolves through the
+///    *selected driver's* menu the same way step 3 does (via
+///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]) — so a Claude
+///    reviewer still lands on Opus and a Codex reviewer lands on Codex's own
+///    strong-tier model, never on a literal `"opus"` a non-Claude CLI
+///    rejects. Reviewer/automation agents get the strong tier regardless of
+///    the row's effort level. Pass `None` for main-pool executions.
 /// 3. `tasks.reasoning` — the capability signal, from the selected driver's
 ///    [`boss_engine_driver::ModelMenu::model_for_reasoning`]. **This is the
 ///    lever that decides the model for every classified row**, and it does not
@@ -275,6 +280,26 @@ pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig,
     resolve_spawn_config_in(&DriverRegistry::default(), input)
 }
 
+/// Pool-level model-tier override (`resolve_spawn_config` precedence step 2).
+///
+/// Expressed as a driver-relative tier rather than a literal model slug so a
+/// pool override composes correctly across drivers: a hardcoded model name
+/// from one driver's vocabulary (e.g. Claude's `"opus"`) is not a model any
+/// other driver's CLI accepts, so applying it before the resolved driver's
+/// [`boss_engine_driver::ModelMenu`] is consulted reaches the wrong CLI
+/// verbatim — the bug this type exists to prevent (every review-pool and
+/// automation-pool execution on a non-Claude driver 400ing before the model
+/// emits a token).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolModelTier {
+    /// The strong/high-capability tier for the resolved driver, reached via
+    /// the same lever `tasks.reasoning = investigation` uses:
+    /// [`boss_engine_driver::ModelMenu::model_for_reasoning`]`(`[`ReasoningMode::Investigation`]`)`.
+    /// Both the automation pool and the review pool request this tier
+    /// unconditionally.
+    Strong,
+}
+
 /// Inputs to [`resolve_spawn_config_in`], grouped into one type per the
 /// repo's builder convention (`CLAUDE.md`, "Builder pattern convention") so
 /// additive fields don't touch every call site. All fields are optional —
@@ -284,7 +309,7 @@ pub fn resolve_spawn_config(input: &SpawnResolutionInput) -> Result<SpawnConfig,
 pub struct SpawnResolutionInput<'a> {
     pub effort_level: Option<EffortLevel>,
     pub model_override: Option<&'a str>,
-    pub pool_model_override: Option<&'a str>,
+    pub pool_model_override: Option<PoolModelTier>,
     pub product_default_model: Option<&'a str>,
     pub task_driver: Option<&'a str>,
     pub product_default_driver: Option<&'a str>,
@@ -306,8 +331,10 @@ pub fn resolve_spawn_config_in(
 
     let model = if let Some(m) = input.model_override.map(str::trim).filter(|s| !s.is_empty()) {
         m.to_owned()
-    } else if let Some(m) = input.pool_model_override.map(str::trim).filter(|s| !s.is_empty()) {
-        m.to_owned()
+    } else if let Some(PoolModelTier::Strong) = input.pool_model_override {
+        // Resolved against the selected driver's menu, same lever as step 3
+        // below — never a literal model slug from another driver's vocabulary.
+        (menu.model_for_reasoning)(ReasoningMode::Investigation).to_owned()
     } else if let Some(reasoning) = input.reasoning {
         // The capability lever. Note what is NOT consulted here: `effort_level`
         // plays no part, in either direction. That is the whole point — see
@@ -688,6 +715,12 @@ mod tests {
         false
     }
 
+    /// Distinct prefix vocabulary (`"stub-"`) so a test can assert a Claude
+    /// alias like `"opus"` does NOT belong to this driver.
+    fn stub_model_belongs_to_driver(model: &str) -> bool {
+        model.starts_with("stub-")
+    }
+
     fn stub_descriptor() -> DriverDescriptor {
         DriverDescriptor {
             name: "stub-codex",
@@ -703,6 +736,7 @@ mod tests {
                 model_for_reasoning: stub_model_for_reasoning,
                 prompt_addendum_for_level: stub_prompt_addendum_for_level,
                 model_requires_auto_permissions: stub_model_requires_auto_permissions,
+                model_belongs_to_driver: stub_model_belongs_to_driver,
             },
         }
     }
@@ -1367,7 +1401,7 @@ mod tests {
 
     #[test]
     fn pool_override_beats_effort_default_but_yields_to_task_override() {
-        // Review/automation pool sets pool_model_override = "opus". A low-effort
+        // Review/automation pool sets pool_model_override = Strong. A low-effort
         // row (Sonnet by default) in the review pool should still get Opus from
         // the pool override, but a task-level model_override still wins.
 
@@ -1375,7 +1409,7 @@ mod tests {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Small)
-                .pool_model_override("opus")
+                .pool_model_override(PoolModelTier::Strong)
                 .build(),
         )
         .unwrap();
@@ -1387,7 +1421,7 @@ mod tests {
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Small)
                 .model_override("sonnet")
-                .pool_model_override("opus")
+                .pool_model_override(PoolModelTier::Strong)
                 .build(),
         )
         .unwrap();
@@ -1400,7 +1434,7 @@ mod tests {
         // Pool override beats product default_model.
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
-                .pool_model_override("opus")
+                .pool_model_override(PoolModelTier::Strong)
                 .product_default_model("claude-sonnet-4-6")
                 .build(),
         )
@@ -1408,22 +1442,45 @@ mod tests {
         assert_eq!(cfg.model, "opus");
 
         // Pool override beats engine default.
-        let cfg = resolve_spawn_config(&SpawnResolutionInput::builder().pool_model_override("opus").build()).unwrap();
+        let cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .pool_model_override(PoolModelTier::Strong)
+                .build(),
+        )
+        .unwrap();
         assert_eq!(cfg.model, "opus");
     }
 
     #[test]
-    fn empty_pool_override_falls_through_to_effort_default() {
-        // An empty/whitespace pool override is the same as no override — the
-        // effort default still applies.
-        let cfg = resolve_spawn_config(
+    fn pool_override_resolves_against_the_selected_drivers_menu_not_claudes() {
+        // Regression guard: the review/automation pool override used to be a
+        // hardcoded `"opus"` string applied before the driver's menu was
+        // consulted, so a codex-driver reviewer got a literal `"opus"` its
+        // CLI rejected with an HTTP 400 before emitting a token. The override
+        // must resolve through the *resolved driver's* strong tier instead —
+        // a Claude row still lands on Opus, a Codex row lands on Codex's own
+        // strong-tier model (`gpt-5.6-sol`), never on Claude's alias.
+        let claude_cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
-                .effort_level(EffortLevel::Small)
-                .pool_model_override(" ")
+                .task_driver("claude")
+                .pool_model_override(PoolModelTier::Strong)
                 .build(),
         )
         .unwrap();
-        assert_eq!(cfg.model, "sonnet");
+        assert_eq!(claude_cfg.model, "opus");
+
+        let codex_cfg = resolve_spawn_config(
+            &SpawnResolutionInput::builder()
+                .task_driver("codex")
+                .pool_model_override(PoolModelTier::Strong)
+                .build(),
+        )
+        .unwrap();
+        assert_eq!(
+            codex_cfg.model, "gpt-5.6-sol",
+            "codex pool override must resolve to codex's own strong-tier model, not a Claude alias"
+        );
+        assert_ne!(codex_cfg.model, "opus");
     }
 
     #[test]
@@ -1433,7 +1490,7 @@ mod tests {
         let cfg = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Medium)
-                .pool_model_override("opus")
+                .pool_model_override(PoolModelTier::Strong)
                 .build(),
         )
         .unwrap();
@@ -1688,7 +1745,7 @@ mod tests {
         let pool_override = resolve_spawn_config(
             &SpawnResolutionInput::builder()
                 .effort_level(EffortLevel::Large)
-                .pool_model_override("opus")
+                .pool_model_override(PoolModelTier::Strong)
                 .kind(&TaskKind::Chore)
                 .reasoning(ReasoningMode::Standard)
                 .build(),

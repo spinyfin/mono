@@ -20,6 +20,7 @@ use crate::dispatch_events::{
     DispatchEvent, DispatchEventSink, NoopDispatchEventSink, Outcome as DispatchOutcome, Stage,
 };
 use crate::dispatch_inflight::InflightDispatches;
+use crate::effort::PoolModelTier;
 use crate::host_adapter::{HostAdapter, HostAdapterProvider, LocalHostAdapter, LocalHostAdapterProvider};
 use crate::host_registry::Host;
 use crate::host_scheduling::{self, ChoreRequirements, HostSlot};
@@ -1392,18 +1393,60 @@ pub fn slot_id_from_worker_id(worker_id: &str) -> Option<u8> {
     None
 }
 
-/// Returns the pool-level model override for the given `worker_id`, or `None`
-/// for the main pool (which has no override and falls through to the effort-
-/// driven default).
+/// Driver slug the review/automation pools dispatch on, independent of
+/// whatever `tasks.driver` the reviewed/automated row itself carries. Named
+/// so the reason is legible at every call site: reviews stay on Opus, and
+/// Opus is a Claude model, so the reviewer driver is Claude — never inherited
+/// from (and never varying with) the row under review.
+const REVIEWER_POOL_DRIVER: &str = "claude";
+
+/// Driver + model-tier dispatch policy for a pool-level worker
+/// (review or automation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolDispatchPolicy {
+    /// Driver slug the pool worker dispatches on. Overrides whatever
+    /// `tasks.driver` the reviewed/automated row itself carries — see
+    /// [`pool_dispatch_policy_for_worker_id`]'s doc comment for why.
+    pub driver: &'static str,
+    /// Model-tier override within that driver's menu
+    /// (`resolve_spawn_config` precedence step 2).
+    pub model_tier: PoolModelTier,
+}
+
+/// Returns the pool-level dispatch policy for the given `worker_id`, or
+/// `None` for the main pool (which has no override: it dispatches on the
+/// row's own `driver` / effort-driven model, falling through to the
+/// product/engine default exactly as before).
 ///
-/// Both the automation pool (`auto-worker-N`) and the review pool (`review-N`)
-/// always pin to Opus, per the automated-reviewer design §5: "the review pool
-/// sets its override to Opus unconditionally … reuses the automation pool's
-/// override mechanism." Returning a `'static str` avoids an allocation —
-/// callers pass this directly to [`crate::effort::resolve_spawn_config`].
-pub fn pool_model_override_for_worker_id(worker_id: &str) -> Option<&'static str> {
+/// **Single resolution point** for review/automation dispatch policy — no
+/// other call site should special-case a driver for pool dispatch. Today it
+/// returns a constant: both the automation pool (`auto-worker-N`) and the
+/// review pool (`review-N`) always dispatch on [`REVIEWER_POOL_DRIVER`] at
+/// [`PoolModelTier::Strong`] (Opus), per the automated-reviewer design §5.
+///
+/// This function takes only `worker_id` — deliberately, not the reviewed
+/// row's `driver` column — so the reviewer's dispatch policy cannot vary
+/// with who authored the work under review. Who authored a change must not
+/// determine who reviews it: a codex-authored chore gets a Claude reviewer
+/// on Opus exactly like a Claude-authored one, never a codex reviewer that
+/// inherited the row's own driver (the original bug: a hard-coded `"opus"`
+/// model string reaching whatever driver the reviewed row happened to carry,
+/// which 400s instantly against a non-Claude CLI).
+///
+/// The model half is a driver-relative [`PoolModelTier`] rather than a
+/// literal model slug, resolved against [`REVIEWER_POOL_DRIVER`]'s menu by
+/// [`crate::effort::resolve_spawn_config`] — never applied as a raw string
+/// before a driver is known.
+///
+/// Follow-on work (configurable reviewer model, load balancing across
+/// reviewer models, two-party review with two distinct reviewers on one PR)
+/// only needs to change what this function returns.
+pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatchPolicy> {
     if worker_id.starts_with(REVIEW_WORKER_ID_PREFIX) || worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX) {
-        Some("opus")
+        Some(PoolDispatchPolicy {
+            driver: REVIEWER_POOL_DRIVER,
+            model_tier: PoolModelTier::Strong,
+        })
     } else {
         None
     }

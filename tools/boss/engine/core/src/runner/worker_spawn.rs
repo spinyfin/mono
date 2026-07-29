@@ -7,7 +7,7 @@ use std::path::Path;
 use boss_engine_gh_invocation::gh_output;
 use boss_gh_telemetry::{callers, scope as gh_scope};
 
-use crate::coordinator::pool_model_override_for_worker_id;
+use crate::coordinator::{PoolDispatchPolicy, pool_dispatch_policy_for_worker_id};
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
 use crate::work::{WorkDb, WorkExecution, WorkItem};
@@ -190,6 +190,51 @@ async fn fetch_pr_diff(pr_url: &str) -> Option<String> {
             e
         })
         .ok()
+}
+
+/// The task-driver value fed into `resolve_spawn_config`'s driver-resolution
+/// step for this spawn. Review/automation-pool workers dispatch on
+/// `pool_policy`'s fixed driver unconditionally — ignoring `row_driver`
+/// entirely, so the driver of the row under review/automation never leaks
+/// into who reviews/automates it (see
+/// [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s doc comment).
+/// Main-pool workers (`pool_policy = None`) fall through to `row_driver` (or
+/// `None`, letting `resolve_spawn_config` fall through to the
+/// product/engine default) exactly as before.
+///
+/// A separate, standalone function for the same reason as
+/// [`check_model_driver_compatibility`]: testable without the full async
+/// prompt-composition machinery.
+fn effective_task_driver_for_worker(pool_policy: Option<PoolDispatchPolicy>, row_driver: Option<&str>) -> Option<&str> {
+    match pool_policy {
+        Some(policy) => Some(policy.driver),
+        None => row_driver,
+    }
+}
+
+/// Model/driver compatibility gate. Returns an error naming both the driver
+/// and the model when `model` is not one `driver_descriptor`'s
+/// [`crate::driver::ModelMenu::model_belongs_to_driver`] recognises as
+/// belonging to that driver.
+///
+/// A separate, standalone function (rather than inlined at the
+/// [`compose_worker_spawn`] call site) so it can be exercised directly by
+/// unit tests without standing up the full async prompt-composition
+/// machinery — see the `model_driver_gate_tests` module below.
+fn check_model_driver_compatibility(
+    driver_descriptor: &crate::driver::DriverDescriptor,
+    model: &str,
+) -> anyhow::Result<()> {
+    if (driver_descriptor.model_menu.model_belongs_to_driver)(model) {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "model/driver gate: resolved model {model:?} is not valid for driver {:?} ({}); \
+             refusing to dispatch a mismatched pair instead of letting the CLI reject it after spawn",
+            driver_descriptor.name,
+            driver_descriptor.label,
+        ))
+    }
 }
 
 /// Per-execution prompt + spawn-config composition shared by every
@@ -622,12 +667,16 @@ pub(crate) async fn compose_worker_spawn(
     // which the resolver consults first. Reused below for the capability gate.
     let work_item_kind = work_item_task_kind_enum(work_item);
     let registry = crate::driver::DriverRegistry::default();
+    // Single resolution point for review/automation dispatch policy — see
+    // `pool_dispatch_policy_for_worker_id`'s doc comment. `None` for
+    // main-pool workers, which dispatch on the row's own `driver` column.
+    let pool_policy = pool_dispatch_policy_for_worker_id(worker_id);
     let spawn_input = SpawnResolutionInput::builder()
         .maybe_effort_level(row_effort)
         .maybe_model_override(row_model_override.as_deref())
-        .maybe_pool_model_override(pool_model_override_for_worker_id(worker_id))
+        .maybe_pool_model_override(pool_policy.map(|p| p.model_tier))
         .maybe_product_default_model(product_default_model.as_deref())
-        .maybe_task_driver(row_driver.as_deref())
+        .maybe_task_driver(effective_task_driver_for_worker(pool_policy, row_driver.as_deref()))
         .maybe_product_default_driver(product_default_driver.as_deref())
         .maybe_kind(work_item_kind)
         .maybe_reasoning(row_reasoning)
@@ -635,14 +684,30 @@ pub(crate) async fn compose_worker_spawn(
     let spawn_config = resolve_spawn_config_in(&registry, &spawn_input)
         .map_err(|e| anyhow::anyhow!("effort/model resolution: {e}"))?;
 
+    // Model/driver compatibility gate: fail closed before the pane spawns
+    // when the resolved model does not belong to the resolved driver's
+    // vocabulary. `resolve_spawn_config_in` can hand back a model from
+    // several sources (an explicit override, a pool override, the
+    // reasoning/effort tables, a product default) and nothing upstream of
+    // this gate guarantees that value names a model the resolved driver's
+    // CLI actually accepts — without it, a mismatch (e.g. a Claude family
+    // alias like `"opus"` reaching a non-Claude driver) is passed through
+    // verbatim and only surfaces as an opaque HTTP 400 after the worker has
+    // already spawned and burned a slot.
+    //
+    // `spawn_config.driver` was already validated against this same
+    // `registry` by `resolve_spawn_config_in` above (it returns
+    // `UnknownDriverError` and bails before reaching here on an
+    // unregistered slug), so the lookup cannot fail.
+    let resolved_driver = registry
+        .get(&spawn_config.driver)
+        .expect("slug validated by resolve_spawn_config_in");
+    check_model_driver_compatibility(resolved_driver.descriptor(), &spawn_config.model)?;
+
     // Capability gate: fail closed before the pane spawns when the resolved
     // driver cannot satisfy the work-item kind's requirements. Products and
     // projects do not have a TaskKind; only Task/Chore rows are gated.
     if let Some(kind) = work_item_kind {
-        // `spawn_config.driver` was already validated against this same
-        // `registry` by `resolve_spawn_config_in` above (it returns
-        // `UnknownDriverError` and bails before reaching here on an
-        // unregistered slug), so the lookup cannot fail.
         let resolver = registry
             .resolver(&spawn_config.driver)
             .expect("slug validated by resolve_spawn_config_in");
@@ -679,6 +744,134 @@ pub(crate) async fn compose_worker_spawn(
         prompt_text,
         spawn_config,
     })
+}
+
+#[cfg(test)]
+mod reviewer_pool_policy_tests {
+    //! Verifies review/automation dispatch policy is decoupled from the
+    //! reviewed/automated row's own `driver` column — the single resolution
+    //! point is `crate::coordinator::pool_dispatch_policy_for_worker_id`,
+    //! and [`effective_task_driver_for_worker`] is what applies it ahead of
+    //! `resolve_spawn_config`.
+    use super::*;
+
+    #[test]
+    fn reviewer_effective_driver_ignores_the_reviewed_rows_driver_column() {
+        let policy =
+            crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").expect("review worker has a policy");
+        for row_driver in [Some("codex"), Some("grok"), Some("claude"), None] {
+            assert_eq!(
+                effective_task_driver_for_worker(Some(policy), row_driver),
+                Some("claude"),
+                "reviewer driver must not vary with the reviewed row's driver column, got row_driver={row_driver:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn main_pool_effective_driver_still_falls_through_to_row_driver() {
+        assert_eq!(effective_task_driver_for_worker(None, Some("codex")), Some("codex"));
+        assert_eq!(effective_task_driver_for_worker(None, None), None);
+    }
+
+    /// Resolves a review-pool spawn end to end (policy → effective driver →
+    /// `resolve_spawn_config`) for a row whose own `driver` column is
+    /// `row_driver`, mirroring exactly what `compose_worker_spawn` does.
+    fn resolve_reviewer_spawn(row_driver: Option<&str>) -> crate::effort::SpawnConfig {
+        let pool_policy = crate::coordinator::pool_dispatch_policy_for_worker_id("review-1").unwrap();
+        let registry = crate::driver::DriverRegistry::default();
+        let input = crate::effort::SpawnResolutionInput::builder()
+            .maybe_task_driver(effective_task_driver_for_worker(Some(pool_policy), row_driver))
+            .maybe_pool_model_override(Some(pool_policy.model_tier))
+            .build();
+        crate::effort::resolve_spawn_config_in(&registry, &input).unwrap()
+    }
+
+    #[test]
+    fn codex_authored_row_gets_a_claude_reviewer_on_opus_not_a_codex_reviewer() {
+        let cfg = resolve_reviewer_spawn(Some("codex"));
+        assert_eq!(
+            cfg.driver, "claude",
+            "reviewer must dispatch on Claude, not the authored row's codex driver"
+        );
+        assert_eq!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn claude_authored_row_under_review_is_unchanged_claude_reviewer_on_opus() {
+        let cfg = resolve_reviewer_spawn(Some("claude"));
+        assert_eq!(cfg.driver, "claude");
+        assert_eq!(cfg.model, "opus");
+    }
+
+    #[test]
+    fn untagged_row_under_review_still_gets_a_claude_reviewer_on_opus() {
+        let cfg = resolve_reviewer_spawn(None);
+        assert_eq!(cfg.driver, "claude");
+        assert_eq!(cfg.model, "opus");
+    }
+}
+
+#[cfg(test)]
+mod model_driver_gate_tests {
+    //! Targeted tests for [`check_model_driver_compatibility`] — the
+    //! spawn-time gate that fails closed when the resolved model does not
+    //! belong to the resolved driver's `ModelMenu`. Exercises the same
+    //! `DriverRegistry::default()` the production spawn path builds, so a
+    //! driver's real vocabulary (not a stub) is what gets checked.
+    use super::*;
+
+    #[test]
+    fn rejects_a_claude_alias_dispatched_on_the_codex_driver() {
+        // The exact bug this gate exists to catch: the review/automation
+        // pool override used to hand "opus" straight to whatever driver the
+        // row resolved to, so a codex-driver reviewer 400'd before emitting
+        // a token. The gate must refuse to dispatch that pair.
+        let registry = crate::driver::DriverRegistry::default();
+        let codex = registry.get("codex").expect("codex is registered");
+        let err = check_model_driver_compatibility(codex.descriptor(), "opus").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("opus"), "error must name the model, got: {msg:?}");
+        assert!(msg.contains("codex"), "error must name the driver, got: {msg:?}");
+    }
+
+    #[test]
+    fn rejects_a_codex_model_dispatched_on_the_claude_driver() {
+        let registry = crate::driver::DriverRegistry::default();
+        let claude = registry.get("claude").expect("claude is registered");
+        let err = check_model_driver_compatibility(claude.descriptor(), "gpt-5.6-sol").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("gpt-5.6-sol"));
+        assert!(msg.contains("claude"));
+    }
+
+    #[test]
+    fn accepts_every_registered_drivers_own_engine_default() {
+        let registry = crate::driver::DriverRegistry::default();
+        for slug in registry.slugs() {
+            let driver = registry.get(slug).expect("slug came from registry.slugs()");
+            let default_model = driver.descriptor().model_menu.engine_default;
+            check_model_driver_compatibility(driver.descriptor(), default_model).unwrap_or_else(|e| {
+                panic!("driver {slug:?}'s own engine_default {default_model:?} must pass its own gate: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn accepts_the_reviewer_pools_strong_tier_for_every_registered_driver() {
+        // Mirrors what `compose_worker_spawn` actually resolves for a
+        // review/automation-pool row: `PoolModelTier::Strong` through each
+        // driver's own `model_for_reasoning(Investigation)`.
+        let registry = crate::driver::DriverRegistry::default();
+        for slug in registry.slugs() {
+            let driver = registry.get(slug).expect("slug came from registry.slugs()");
+            let strong_model =
+                (driver.descriptor().model_menu.model_for_reasoning)(boss_protocol::ReasoningMode::Investigation);
+            check_model_driver_compatibility(driver.descriptor(), strong_model).unwrap_or_else(|e| {
+                panic!("driver {slug:?}'s own strong-tier model {strong_model:?} must pass its own gate: {e}")
+            });
+        }
+    }
 }
 
 #[cfg(test)]

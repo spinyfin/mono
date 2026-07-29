@@ -232,32 +232,38 @@ fn slot_id_from_worker_id_rejects_garbage() {
 }
 
 #[test]
-fn pool_model_override_for_worker_id_returns_opus_for_review_and_automation() {
-    // Review and automation pools always pin to Opus per the automated-reviewer
-    // design §5. Main-pool workers have no override and fall through to the
-    // effort-driven default.
+fn pool_dispatch_policy_for_worker_id_pins_review_and_automation_to_claude_opus() {
+    // Review and automation pools always dispatch on Claude at the strong
+    // tier (Opus) per the automated-reviewer design §5 — independent of
+    // whatever driver the reviewed/automated row itself carries. Main-pool
+    // workers have no policy and fall through to the row's own driver /
+    // the effort-driven default.
+    let expected = PoolDispatchPolicy {
+        driver: "claude",
+        model_tier: PoolModelTier::Strong,
+    };
     for ordinal in 1u8..=MAX_REVIEW_POOL_SIZE as u8 {
         let wid = format!("review-{ordinal}");
         assert_eq!(
-            pool_model_override_for_worker_id(&wid),
-            Some("opus"),
-            "review pool worker {wid:?} must return opus override"
+            pool_dispatch_policy_for_worker_id(&wid),
+            Some(expected),
+            "review pool worker {wid:?} must dispatch on Claude/Opus"
         );
     }
     for ordinal in 1u8..=MAX_AUTOMATION_POOL_SIZE as u8 {
         let wid = format!("auto-worker-{ordinal}");
         assert_eq!(
-            pool_model_override_for_worker_id(&wid),
-            Some("opus"),
-            "automation pool worker {wid:?} must return opus override"
+            pool_dispatch_policy_for_worker_id(&wid),
+            Some(expected),
+            "automation pool worker {wid:?} must dispatch on Claude/Opus"
         );
     }
     for ordinal in 1u8..=MAX_WORKER_POOL_SIZE as u8 {
         let wid = format!("worker-{ordinal}");
         assert_eq!(
-            pool_model_override_for_worker_id(&wid),
+            pool_dispatch_policy_for_worker_id(&wid),
             None,
-            "main pool worker {wid:?} must return no override"
+            "main pool worker {wid:?} must have no pool dispatch policy"
         );
     }
 }
