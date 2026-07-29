@@ -9,16 +9,19 @@
 //! to reimplement JSONL appending inline with that two-write bug.
 //!
 //! [`JsonlAppender`] fixes this by serializing every append — across all
-//! paths — through one process-wide `tokio::sync::Mutex`. That is a
-//! correctness-first choice over "build one buffer, issue one `write_all`":
-//! a single `write_all` call is atomic against concurrent appenders in
-//! practice (a single `write()` to a regular file opened with `O_APPEND`
-//! essentially never returns short), but `write_all` is not *documented* to
-//! issue exactly one syscall for arbitrarily large input, so relying on it
-//! alone leaves a correctness guarantee that quietly depends on record
-//! size. Serializing through a mutex removes that dependency entirely: no
-//! two appends' writes can ever be in flight at the same time, regardless
-//! of how many syscalls either one takes.
+//! paths, and across every [`JsonlAppender`] instance, since the lock is a
+//! crate-level `static` rather than an instance field — through one
+//! process-wide `tokio::sync::Mutex`. That is a correctness-first choice
+//! over "build one buffer, issue one `write_all`": a single `write_all`
+//! call is atomic against concurrent appenders in practice (a single
+//! `write()` to a regular file opened with `O_APPEND` essentially never
+//! returns short), but `write_all` is not *documented* to issue exactly one
+//! syscall for arbitrarily large input, so relying on it alone leaves a
+//! correctness guarantee that quietly depends on record size. Serializing
+//! through a mutex removes that dependency entirely: no two appends'
+//! writes can ever be in flight at the same time, regardless of how many
+//! syscalls either one takes, and regardless of how many `JsonlAppender`
+//! values a caller happens to construct.
 //!
 //! File handles are deliberately NOT cached across calls. Some callers
 //! append to an effectively unbounded set of paths over a long-lived
@@ -32,16 +35,25 @@
 //! own multi-process use case and is not a caller of this crate.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use serde::Serialize;
 use tokio::sync::Mutex;
 
-/// Serializes concurrent `.jsonl` appends within this process so that no
-/// two records' bytes can ever interleave on disk.
+/// Process-wide lock backing every [`JsonlAppender`]. Living at crate scope
+/// (rather than as an instance field) is what makes the "one process-wide
+/// mutex" guarantee true regardless of how many `JsonlAppender` values a
+/// caller constructs against the same or different roots: two independently
+/// constructed appenders still serialize through this one lock.
+static APPEND_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// Serializes concurrent `.jsonl` appends within this process — across all
+/// `JsonlAppender` instances — so that no two records' bytes can ever
+/// interleave on disk.
 #[derive(Debug, Default)]
 pub struct JsonlAppender {
-    lock: Mutex<()>,
+    _private: (),
 }
 
 impl JsonlAppender {
@@ -53,21 +65,57 @@ impl JsonlAppender {
     /// newline) to `path` as one write, creating `path`'s parent directory
     /// and the file itself if either is missing.
     pub async fn append(&self, path: &Path, value: &impl Serialize) -> io::Result<()> {
-        let mut line = serde_json::to_vec(value).map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        self.append_to_all(&[path], value).await.into_iter().next().unwrap()
+    }
+
+    /// Serialize `value` to a JSON line once and append it (with a trailing
+    /// newline) to every path in `paths`, all under a single acquisition of
+    /// the process-wide lock. Returns one result per input path, in order,
+    /// so a failure writing one path doesn't stop attempts at the others.
+    pub async fn append_to_all(&self, paths: &[&Path], value: &impl Serialize) -> Vec<io::Result<()>> {
+        let mut line = match serde_json::to_vec(value) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let err_msg = err.to_string();
+                return paths
+                    .iter()
+                    .map(|_| Err(io::Error::new(io::ErrorKind::InvalidData, err_msg.clone())))
+                    .collect();
+            }
+        };
         line.push(b'\n');
 
-        let _guard = self.lock.lock().await;
-        append_locked(path, &line)
+        let owned_paths: Vec<PathBuf> = paths.iter().map(|path| path.to_path_buf()).collect();
+        let guard = APPEND_LOCK.lock().await;
+        let results = tokio::task::spawn_blocking(move || {
+            let results = owned_paths.iter().map(|path| append_locked(path, &line)).collect();
+            drop(guard);
+            results
+        })
+        .await;
+        match results {
+            Ok(results) => results,
+            Err(join_err) => paths
+                .iter()
+                .map(|_| Err(io::Error::other(join_err.to_string())))
+                .collect(),
+        }
     }
 }
 
 fn append_locked(path: &Path, line: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::OpenOptions::new().create(true).append(true).open(path)?
+        }
+        Err(err) => return Err(err),
+    };
     file.write_all(line)
 }
 

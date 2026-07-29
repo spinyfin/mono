@@ -999,7 +999,7 @@
           "FILE:@@//tools/boss/engine/conflict-diagnosis/Cargo.toml fa691f33ae42a45556785426306de6b5de0167d42a9fb8d4ed920a26448d0a7b",
           "FILE:@@//tools/boss/engine/deterministic-resolvers/Cargo.toml 8caf1bd9cab99ca6758e0546ab993e04096e9d439fcc876fc8c440bff75cb8ce",
           "FILE:@@//tools/boss/engine/dispatch-events/Cargo.toml b760b2fe71b521ab606f50385ec3427f2d6bc5cc634cfbfec0b181b63e8ead80",
-          "FILE:@@//tools/boss/engine/jsonl-append/Cargo.toml 9de91e60b49d0bfb3655ee1804016bed7dae812c0bdf2a3e036494f22eed7c25",
+          "FILE:@@//tools/boss/engine/jsonl-append/Cargo.toml 7f2f8627d7f02bcb46b81d69f7e0ef3889172a9c1b3d0b5fc3e8c1b58aa24930",
           "FILE:@@//tools/boss/engine/utils/Cargo.toml 6601c6c1c146c177c4e645cc160379394ddd3209e97f66045b8135595b33ef0a",
           "FILE:@@//tools/boss/engine/dispatch-reader/Cargo.toml 0bb408a10772cda941577dee0a6091b9197fe49fc3508d13f71b92742a37b29e",
           "FILE:@@//tools/boss/log-files/Cargo.toml fbd57630f6057756be37768106ad72d0978076d45f91a64635ed41656555c8a4",

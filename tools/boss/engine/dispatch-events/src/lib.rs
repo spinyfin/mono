@@ -794,7 +794,17 @@ impl JsonlFileSink {
 impl DispatchEventSink for JsonlFileSink {
     async fn emit(&self, event: DispatchEvent) {
         let current_path = self.current_path();
-        if let Err(err) = self.appender.append(&current_path, &event).await {
+        let execution_path = self.execution_path(&event.execution_id);
+
+        let mut results = self
+            .appender
+            .append_to_all(&[current_path.as_path(), execution_path.as_path()], &event)
+            .await
+            .into_iter();
+        let current_result = results.next().expect("append_to_all returns one result per input path");
+        let execution_result = results.next().expect("append_to_all returns one result per input path");
+
+        if let Err(err) = current_result {
             tracing::warn!(
                 ?err,
                 path = %current_path.display(),
@@ -804,8 +814,7 @@ impl DispatchEventSink for JsonlFileSink {
             );
         }
 
-        let execution_path = self.execution_path(&event.execution_id);
-        if let Err(err) = self.appender.append(&execution_path, &event).await {
+        if let Err(err) = execution_result {
             tracing::warn!(
                 ?err,
                 path = %execution_path.display(),
