@@ -1378,9 +1378,11 @@ fn conflict_revision_gate_points_at_boss_propose_blocked_when_seam_is_on() {
             .build(),
     );
     assert!(
-        prompt.contains("boss propose blocked"),
-        "seam on: conflict-resolution gate must direct a wedged build to boss propose \
-             blocked:\n{prompt}",
+        prompt.contains(
+            "Do NOT idle waiting on a wedged build; call `boss propose blocked --reason \"...\"` naming the failure and stop."
+        ),
+        "seam on: conflict-resolution gate's own sentence must direct a wedged build to boss \
+             propose blocked (not merely any occurrence of that phrase elsewhere in the prompt):\n{prompt}",
     );
     assert!(
         !prompt.contains("[blocked] reason=\"...\""),
@@ -1403,9 +1405,11 @@ fn conflict_revision_gate_points_at_legacy_marker_when_seam_is_off() {
             .build(),
     );
     assert!(
-        prompt.contains("[blocked] reason=\"...\""),
-        "seam off (builder default = registry default): conflict-resolution gate must \
-             direct a wedged build to the legacy [blocked] marker:\n{prompt}",
+        prompt.contains(
+            "Do NOT idle waiting on a wedged build; emit a `[blocked] reason=\"...\"` marker naming the failure and stop."
+        ),
+        "seam off (builder default = registry default): conflict-resolution gate's own \
+             sentence must direct a wedged build to the legacy [blocked] marker:\n{prompt}",
     );
     assert!(
         !prompt.contains("boss propose"),
@@ -1938,6 +1942,72 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
     assert!(
         !prompt.contains("[deferred-scope] summary="),
         "revision prompt, seam on: must not also teach the legacy marker grammar:\n{prompt}",
+    );
+}
+
+#[test]
+fn escalation_protocol_directive_present_for_revision_implementation_seam_off() {
+    // A RevisionImplementation prompt never received
+    // `worker_escalation_protocol_directive` — only TaskImplementation /
+    // ChoreImplementation / ProjectDesign / InvestigationImplementation did
+    // (see the `matches!` guard above `deferred_scope_directive`'s call
+    // site). But `compose_revision_directive` injects a Bazel pre-push gate
+    // whose flag-on failure sentence points at "boss propose blocked" and,
+    // for the non-conflict-resolution variant, at "see \"If you are blocked
+    // or the work is bigger than estimated\" below for the exact syntax" —
+    // a section that was never rendered for revisions, leaving the
+    // cross-reference dangling. Assert the section is now present on both
+    // the seam-off (this test) and seam-on (below) revision paths.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains("## If you are blocked or the work is bigger than estimated"),
+        "revision_implementation prompt must render the escalation-protocol section so the \
+             Bazel gate's cross-reference to it is not dangling:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("[blocked] reason=\"<why>\""),
+        "revision prompt, seam off: escalation section must teach the legacy [blocked] marker:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("boss propose"),
+        "revision prompt, seam off: escalation section must not mention boss propose at all:\n{prompt}",
+    );
+}
+
+#[test]
+fn escalation_protocol_directive_teaches_boss_propose_verb_when_seam_is_on_for_revision_implementation() {
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .worker_signal_proposals_seam_enabled(true)
+            .build(),
+    );
+    assert!(
+        prompt.contains("## If you are blocked or the work is bigger than estimated"),
+        "revision_implementation prompt, seam on: must still render the escalation-protocol \
+             section:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("boss propose blocked --reason \"<why>\""),
+        "revision prompt, seam on: escalation section must teach the boss propose blocked verb:\n{prompt}",
+    );
+    assert!(
+        !prompt.contains("Two sanctioned markers, each on its own line in your final response"),
+        "revision prompt, seam on: must not also teach the legacy marker-only intro (the bare \
+             `[blocked] reason=\"<why>\"` bootstrap fallback IS still taught deliberately, so this \
+             checks the off-branch's distinguishing intro text instead):\n{prompt}",
     );
 }
 

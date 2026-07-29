@@ -1773,6 +1773,16 @@ fn compose_revision_directive(
     out.push('\n');
     out.push_str(check_bypass_prohibition_text());
     out.push('\n');
+    // The Bazel pre-push gate above (both variants) points a build-failure
+    // sentence at "boss propose blocked" and, on the non-conflict-resolution
+    // variant, at the "If you are blocked or the work is bigger than
+    // estimated" section for the exact syntax. Revisions never received that
+    // section, leaving the cross-reference dangling and the worker with no
+    // `--level` sibling verb or bootstrap-fallback guidance. Push it here so
+    // every path that renders the gate also renders what it points at.
+    out.push_str(&worker_escalation_protocol_directive(
+        worker_signal_proposals_seam_enabled,
+    ));
     out.push_str(&deferred_scope_directive(deferred_scope_proposals_seam_enabled));
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
