@@ -39,9 +39,10 @@ use progress::GrokProgressSession;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, HookWiringDestination,
-    ModelMenu, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
-    ProgressObservationWiring, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
-    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerKind,
+    ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed, ProgressFidelity, ProgressIngress,
+    ProgressObservationConfig, ProgressObservationWiring, ProgressSessionNormalizer, SpawnPlan, SpawnRequest,
+    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd,
+    WorkerErrorClass, WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -451,6 +452,47 @@ impl AgentDriver for GrokDriver {
         GrokProgressSession::new().normalize_progress_event(raw)
     }
 
+    /// Design T-19. The inherited [`super::default_pr_url_capture_feed`]
+    /// scans a Claude-shaped `tool_response.{stdout,stderr}` object; Grok's
+    /// canonicalised Bash-shaped `tool_response` (the `toolResult` rename —
+    /// see [`progress`]) carries neither key. Verified against a real
+    /// capture (`grok-pretooluse-decision-vocabulary-artifacts/hook_payloads/
+    /// PostToolUse.run_terminal_command.sample.json` under
+    /// `tools/boss/docs/investigations/`):
+    /// ```json
+    /// { "type": "Bash", "output": [104, 105, 10], "output_for_prompt": "exit: 0\nhi\n",
+    ///   "exit_code": 0, "command": "…", "truncated": false, … }
+    /// ```
+    /// Unadapted, the default's object arm hits its "neither `stdout` nor
+    /// `stderr` present" early-return and comes back `None` for every single
+    /// Grok Bash call — the primary path silently never fires and every PR
+    /// falls onto the reconstruction fallback, exactly the failure state
+    /// design T-19 forbids. Read `output_for_prompt` instead — the
+    /// exit-annotated combined-output text observed on the wire — falling
+    /// back to a lossy decode of the raw `output` byte array so a future
+    /// toolResult shape that drops `output_for_prompt` still yields
+    /// something scannable rather than going dark again.
+    fn pr_url_capture_feed(
+        &self,
+        tool_name: &str,
+        tool_input: &serde_json::Value,
+        tool_response: &serde_json::Value,
+    ) -> Option<PrUrlCaptureFeed> {
+        if tool_name != "Bash" {
+            return None;
+        }
+        let command = tool_input
+            .get("command")
+            .and_then(Value::as_str)
+            .or_else(|| tool_input.as_str())
+            .unwrap_or("")
+            .to_owned();
+        Some(PrUrlCaptureFeed {
+            output_text: grok_bash_output_text(tool_response),
+            command,
+        })
+    }
+
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
         // Design G-7: Grok's `Stop` hook maps directly onto
         // `WorkerEvent::Stop`, structurally identical to Claude's —
@@ -539,11 +581,69 @@ impl AgentDriver for GrokDriver {
     // arguments that Grok "should" Buffer are not enough to flip the
     // default.
 
+    /// Design T-18. The driver-neutral `BOSS_STRUCTURED_OUTPUT` /
+    /// `BOSS_PR_URL_OUTPUT` env-file contract already applies to every
+    /// worker — including Grok — unconditionally, from
+    /// `core/src/runner/prompt.rs::structured_output_env_vars`, which calls
+    /// [`default_structured_output_wiring`] directly rather than through
+    /// this trait method. So the file contract needs no Grok-specific code;
+    /// this override exists to record the evaluation of the native
+    /// alternative rather than to change behaviour.
+    ///
+    /// `--json-schema <SCHEMA>` ("implies `--output-format json`") was
+    /// evaluated and is **not** adopted. Evidence: `grok --help` documents
+    /// `--output-format` itself as "Output format for headless mode"
+    /// (default `plain`) — a headless-only concept. Probed live against a
+    /// real pty (`grok 0.2.112`, `--json-schema <file> --no-alt-screen
+    /// --always-approve --trust --cwd … --session-id … "<prompt>"`,
+    /// isolated `GROK_HOME`): the flag combination parses and the TUI
+    /// starts and renders normally — it is not rejected at the CLI-parse
+    /// level. But nothing available to this driver-wiring task can drive a
+    /// full turn to completion and read the rendered pane text to confirm
+    /// the flag constrains output *there* rather than silently no-oping
+    /// (or, worse, coercing the session toward a one-shot JSON-envelope
+    /// render that would break the pane worker shape) — that needs the
+    /// GhosttyKit AppKit harness the pane-viability spike used
+    /// (`tools/boss/docs/investigations/ghostty-grok-pane-viability.md`
+    /// Appendix A), out of scope here. Per T-18: "if it does not work,
+    /// record the negative result... so a later pass does not
+    /// re-investigate" — recorded. The env-file contract remains the sole
+    /// `StructuredOutput` mechanism for Grok; do not wire `--json-schema`
+    /// on the strength of it merely parsing.
+    fn structured_output_wiring(
+        &self,
+        request: &StructuredOutputRequest<'_>,
+    ) -> anyhow::Result<StructuredOutputArtifacts> {
+        Ok(default_structured_output_wiring(request))
+    }
+
     fn structured_output_fallback(&self, _kind: StructuredOutputKind, _text: &str) -> Vec<FallbackCandidate> {
         // No Grok-specific prose-scrape conventions yet. Empty Vec: primary
         // channel is the file contract (default structured_output_wiring).
         Vec::new()
     }
+}
+
+/// Extract the free text [`AgentDriver::pr_url_capture_feed`] feeds to the
+/// shared PR-URL regex from a Grok Bash-shaped `tool_response` (post
+/// `toolResult` → `tool_response` rename; see [`progress`]).
+///
+/// Prefers `output_for_prompt` — the `exit: N\n`-prefixed combined-output
+/// string observed on the wire, the same text Grok's own prompt rendering
+/// uses, so a PR URL printed by `gh pr create` / `cube pr create` lands in
+/// it exactly as it would in a Claude `stdout` field. Falls back to a lossy
+/// UTF-8 decode of the raw `output` byte array on the chance a future
+/// toolResult shape omits `output_for_prompt`, so this never regresses to
+/// silently scanning nothing.
+fn grok_bash_output_text(tool_response: &Value) -> String {
+    if let Some(text) = tool_response.get("output_for_prompt").and_then(Value::as_str) {
+        return text.to_owned();
+    }
+    let Some(bytes) = tool_response.get("output").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let bytes: Vec<u8> = bytes.iter().filter_map(Value::as_u64).map(|n| n as u8).collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 // ---------------------------------------------------------------------------
@@ -709,6 +809,123 @@ mod tests {
     fn normalize_transcript_entry_passes_through_non_acp_records() {
         let raw = json!({"type": "assistant", "content": [{"type": "text", "text": "already canonical"}]});
         assert_eq!(GrokDriver::default().normalize_transcript_entry(raw.clone()), raw);
+    }
+
+    // ── pr_url_capture_feed (design T-19) ───────────────────────────────
+
+    /// Real `toolResult` shape captured by the T-02 investigation
+    /// (`grok-pretooluse-decision-vocabulary-artifacts/hook_payloads/PostToolUse.run_terminal_command.sample.json`),
+    /// minus the fields this module never reads. `output` decodes (as
+    /// bytes) to `"/opt/homebrew/bin/git\n/opt/homebrew/bin/jj\n/opt/homebrew/bin/gh\n"`.
+    fn real_bash_tool_result() -> Value {
+        json!({
+            "type": "Bash",
+            "output": [
+                47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98, 105, 110, 47, 103,
+                105, 116, 10, 47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98, 105,
+                110, 47, 106, 106, 10, 47, 111, 112, 116, 47, 104, 111, 109, 101, 98, 114, 101, 119, 47, 98,
+                105, 110, 47, 103, 104, 10
+            ],
+            "output_for_prompt": "exit: 0\n/opt/homebrew/bin/git\n/opt/homebrew/bin/jj\n/opt/homebrew/bin/gh\n",
+            "exit_code": 0,
+            "command": "echo SHELL_OK > toolmap_shell.txt && which git jj gh || true",
+            "truncated": false,
+            "signal": Value::Null,
+            "timed_out": false,
+        })
+    }
+
+    #[test]
+    fn grok_bash_output_text_prefers_output_for_prompt() {
+        assert_eq!(
+            grok_bash_output_text(&real_bash_tool_result()),
+            "exit: 0\n/opt/homebrew/bin/git\n/opt/homebrew/bin/jj\n/opt/homebrew/bin/gh\n",
+        );
+    }
+
+    #[test]
+    fn grok_bash_output_text_falls_back_to_decoding_raw_output_bytes() {
+        let tool_result = json!({
+            "type": "Bash",
+            "output": [104, 105, 10], // "hi\n"
+            "exit_code": 0,
+        });
+        assert_eq!(grok_bash_output_text(&tool_result), "hi\n");
+    }
+
+    #[test]
+    fn grok_bash_output_text_is_empty_when_neither_field_present() {
+        assert_eq!(grok_bash_output_text(&json!({"type": "Bash"})), "");
+    }
+
+    #[test]
+    fn pr_url_capture_feed_reads_output_for_prompt_not_stdout_stderr() {
+        // Regression for the T-19 gap: the inherited default scans
+        // tool_response.{stdout,stderr}, which Grok's real Bash toolResult
+        // shape simply does not have (see real_bash_tool_result above). This
+        // must not silently come back None.
+        let tool_input = json!({"command": "which git jj gh"});
+        let feed = GrokDriver::default()
+            .pr_url_capture_feed("Bash", &tool_input, &real_bash_tool_result())
+            .expect("Grok Bash observation must yield a feed");
+        assert_eq!(feed.command, "which git jj gh");
+        assert!(feed.output_text.contains("/opt/homebrew/bin/git"));
+    }
+
+    #[test]
+    fn pr_url_capture_feed_extracts_real_pr_url_from_output_for_prompt() {
+        let tool_input = json!({"command": "cube pr create --branch boss/exec_x --title t"});
+        let tool_response = json!({
+            "type": "Bash",
+            "output_for_prompt": "exit: 0\nhttps://github.com/spinyfin/mono/pull/458\n",
+            "exit_code": 0,
+        });
+        let feed = GrokDriver::default()
+            .pr_url_capture_feed("Bash", &tool_input, &tool_response)
+            .expect("feed");
+        // The shared regex + command gates live in `engine/core`, one-way
+        // downstream of this crate (`pr_url_capture.rs`); this test only
+        // proves the driver hands it the right text. Use the shared regex
+        // crate directly (already a dependency here) rather than
+        // reimplementing the match.
+        let url = boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).expect("url");
+        assert_eq!(url, "https://github.com/spinyfin/mono/pull/458");
+        assert_eq!(feed.command, "cube pr create --branch boss/exec_x --title t");
+    }
+
+    #[test]
+    fn pr_url_capture_feed_returns_none_for_non_bash_tool() {
+        let tool_input = json!({"file_path": "/tmp/x.txt", "content": "hi"});
+        let tool_response = json!({"type": "SearchReplace", "EditsApplied": {}});
+        assert!(
+            GrokDriver::default()
+                .pr_url_capture_feed("Write", &tool_input, &tool_response)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pr_url_capture_feed_handles_missing_command_gracefully() {
+        let feed = GrokDriver::default()
+            .pr_url_capture_feed("Bash", &json!({}), &real_bash_tool_result())
+            .expect("feed");
+        assert_eq!(feed.command, "");
+    }
+
+    // ── structured_output_wiring (design T-18) ──────────────────────────
+
+    #[test]
+    fn structured_output_wiring_stays_on_the_env_file_contract() {
+        let path = std::path::PathBuf::from("/tmp/boss-worker-output/exec_x.pr-url.json");
+        let request = StructuredOutputRequest {
+            kind: StructuredOutputKind::PrUrl,
+            result_path: &path,
+            schema: None,
+        };
+        let artifacts = GrokDriver::default().structured_output_wiring(&request).unwrap();
+        assert_eq!(artifacts, default_structured_output_wiring(&request));
+        // No native --json-schema flag adopted (T-18: evaluated, not wired).
+        assert!(artifacts.extra_args.is_empty());
     }
 
     #[test]
