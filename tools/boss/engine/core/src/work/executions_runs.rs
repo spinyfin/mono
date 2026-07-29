@@ -2004,6 +2004,32 @@ impl WorkDb {
         .map_err(Into::into)
     }
 
+    /// `created_at` of the **latest** `work_runs` row for `execution_id`,
+    /// parsed as Unix epoch seconds. `None` when no run exists or the
+    /// column is unparseable.
+    ///
+    /// Unlike [`WorkExecution::started_epoch`], which reflects only the
+    /// *first* run (`start_execution_run` stamps `started_at =
+    /// COALESCE(started_at, now)`, so a resumed execution's `started_at`
+    /// never advances), this ages off the current run's own start —
+    /// exactly what a pane-attach-deadline check on a *resumed* execution
+    /// needs, so a fresh run's not-yet-attached pane is never judged
+    /// against an ancient first-run timestamp.
+    pub fn latest_run_started_epoch_for_execution(&self, execution_id: &str) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        let created_at: Option<String> = conn
+            .query_row(
+                "SELECT created_at FROM work_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(created_at.and_then(|s| s.parse::<i64>().ok()))
+    }
+
     /// Active runs on a non-local host whose backing execution is still
     /// non-terminal — the set of detached remote workers the engine
     /// should re-attach to after a restart.
@@ -2179,6 +2205,25 @@ impl WorkDb {
         conn.execute(
             "UPDATE work_executions SET started_at = ?2 WHERE id = ?1",
             params![execution_id, epoch_secs.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Backdate the *latest run's* `created_at`/`started_at`, as distinct
+    /// from [`Self::force_started_at_for_test`] which backdates
+    /// `work_executions.started_at` (frozen at the first run by
+    /// `start_execution_run`'s `COALESCE`). Lets a test model a resumed
+    /// execution whose first-ever `started_at` is ancient while its current
+    /// run is fresh, or vice versa.
+    #[cfg(test)]
+    pub fn force_latest_run_started_at_for_test(&self, execution_id: &str, epoch_secs: i64) -> Result<()> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            bail!("no run exists for execution {execution_id}");
+        };
+        conn.execute(
+            "UPDATE work_runs SET created_at = ?2, started_at = ?2 WHERE id = ?1",
+            params![run_id, epoch_secs.to_string()],
         )?;
         Ok(())
     }

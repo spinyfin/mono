@@ -77,25 +77,35 @@
 //! an execution whose worker had crashed *before* an engine restart (so it
 //! could never re-register) had its lease refreshed every pass indefinitely,
 //! pinning its cube workspace with nothing to reclaim it short of a manual
-//! operator intervention. [`db_fallback_death_evidence`] closes this gap by
+//! reset. [`db_fallback_death_evidence`] closes this gap by
 //! reusing the same *durable* (DB-persisted, restart-robust) signals
 //! [`crate::dead_pane_sweep`] and [`crate::lost_workspace_sweep`] already
 //! established for exactly this purpose: the worker shell pid the app
-//! reported (`work_runs.shell_pid`), probed with the same `kill(pid, 0)`
-//! primitive the registry sweep uses, or — if no pid was ever reported —
-//! whether the execution has been alive well past the pane-attach deadline.
-//! Only LOCAL executions are eligible (a pid probe says nothing about a
-//! worker on another host; those leases are [`crate::remote_lease_reconcile`]'s
-//! job against the *remote* cube). On positive evidence of death the row is
-//! reaped and its lease is **actively force-released** via
-//! [`reap_and_release_lease`] — unlike the dead-PID skip above, which
-//! deliberately leaves the lease to expire on its own TTL, a DB-fallback row
-//! has no other mechanism watching it, so waiting out the (24 h) TTL is not
-//! an option. Everything short of positive evidence (no durable pid yet and
-//! still within the attach deadline, a probe that returns alive/EPERM/an
-//! unexpected errno, or an unresolvable host/pid lookup) heartbeats exactly
-//! as before — this gate only ever *stops* heartbeating on proof, never on
-//! absence of proof.
+//! reported (`work_runs.shell_pid`), probed via
+//! [`crate::dead_pane_sweep::shell_pid_death_evidence`] — the pid-death
+//! signal's single, exclusive implementation, reused rather than
+//! reimplemented here so the grace window and liveness gates below can never
+//! drift between call sites — or, if no pid was ever reported, whether the
+//! execution's *current* run has been alive well past the pane-attach
+//! deadline. Only LOCAL executions are eligible (a pid probe says nothing
+//! about a worker on another host; those leases are
+//! [`crate::remote_lease_reconcile`]'s job against the *remote* cube). Only
+//! [`crate::execution_liveness::PaneLivenessVerdict`]-eligible states are
+//! ever reaped: the gate checks `execution.status.is_live()` first, exactly
+//! mirroring `dead_pane_sweep::reconcile_if_pane_dead` and
+//! `lost_workspace_sweep::reconcile_if_execution_dead_at` — a
+//! `waiting_review`/`waiting_merge` row is a park state whose worker finished
+//! its job, opened its PR, and exited by design, and must never be reaped
+//! just because its pane is (correctly) gone. On positive evidence of death
+//! from a *live* row the row is reaped and its lease is **actively
+//! force-released** via [`reap_and_release_lease`] — unlike the dead-PID
+//! skip above, which deliberately leaves the lease to expire on its own TTL,
+//! a DB-fallback row has no other mechanism watching it, so waiting out the
+//! (24 h) TTL is not an option. Everything short of positive evidence from a
+//! live row (no durable pid yet and still within the attach deadline, a
+//! probe that returns alive/EPERM/an unexpected errno, or an unresolvable
+//! host/pid lookup) heartbeats exactly as before — this gate only ever
+//! *stops* heartbeating on proof, never on absence of proof.
 //!
 //! ## Relationship with `HeartbeatGuard` (coordinator.rs)
 //!
@@ -436,6 +446,20 @@ async fn db_fallback_death_evidence(
     execution: &WorkExecution,
     now_epoch_s: i64,
 ) -> Option<DbFallbackDeathEvidence> {
+    // Only reconcile states where a live worker is expected to still be
+    // holding the workspace — exactly `is_live()`, mirroring
+    // `dead_pane_sweep::reconcile_if_pane_dead` and
+    // `lost_workspace_sweep::reconcile_if_execution_dead_at`'s identical gate.
+    // Every other non-terminal state (`waiting_review`, `waiting_merge`,
+    // `queued`, `ready`, `waiting_dependency`, ...) is a normal park state
+    // whose worker has already finished its job (opened a PR, in the review
+    // cases) and exited BY DESIGN — a dead or never-reported pid there is
+    // expected, not a zombie, and force-releasing its lease would hand back a
+    // workspace that is deliberately retained for a follow-up revision.
+    if !execution.status.is_live() {
+        return None;
+    }
+
     match work_db.latest_run_host_for_execution(&execution.id) {
         Ok(Some(host)) if host == "local" => {}
         Ok(_) => return None,
@@ -449,6 +473,19 @@ async fn db_fallback_death_evidence(
         }
     }
 
+    // Signal 1 — the durable pid-death probe. This is `dead_pane_sweep`'s
+    // exclusive implementation of the signal (see its module doc: "exactly
+    // one reaper per death signal"); reusing it here means the grace window,
+    // the `is_live()` gate, and the one-shot-driver exemption can never drift
+    // between the two call sites.
+    if let Some(shell_pid) = crate::dead_pane_sweep::shell_pid_death_evidence(work_db, execution, now_epoch_s).await {
+        return Some(DbFallbackDeathEvidence::ShellPidDead { shell_pid });
+    }
+
+    // Signal 2 — the pane never attached. Only applies when no durable pid
+    // was ever recorded at all (a recorded-but-dead pid is signal 1's job,
+    // handled above); if a pid IS recorded but still alive (or ambiguous),
+    // this must not fall through to a never-attached verdict.
     let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
         Ok(pid) => pid,
         Err(err) => {
@@ -460,34 +497,33 @@ async fn db_fallback_death_evidence(
             return None;
         }
     };
-
-    match shell_pid {
-        Some(pid) if pid > 0 => {
-            let Ok(pid32) = i32::try_from(pid) else {
-                return None;
-            };
-            if !matches!(probe_pid(pid32), PidStatus::Dead) {
-                return None;
-            }
-            // A dead pid is only a dead *worker* when the driver's process
-            // was supposed to outlive its turns — mirrors
-            // `dead_pane_sweep::reconcile_if_pane_dead`'s identical guard so
-            // a one-shot driver's expected post-turn exit is never mistaken
-            // for a death here.
-            if !crate::worker_process_exit::classify_worker_process_exit(work_db, None, &execution.id)
-                .await
-                .is_death()
-            {
-                return None;
-            }
-            Some(DbFallbackDeathEvidence::ShellPidDead { shell_pid: pid })
-        }
-        _ => {
-            let verdict =
-                crate::execution_liveness::classify_pane_liveness(None, execution.started_epoch(), now_epoch_s);
-            verdict.is_dead().then_some(DbFallbackDeathEvidence::PaneNeverAttached)
-        }
+    if shell_pid.is_some() {
+        // A pid was recorded but signal 1 did not consider it dead — leave it
+        // alone rather than judging the never-attached deadline against it.
+        return None;
     }
+
+    // Age off the *current* run's own start, not `execution.started_epoch()`:
+    // `start_execution_run` stamps `work_executions.started_at =
+    // COALESCE(started_at, now)`, so on a resumed execution that field is
+    // frozen at the FIRST run's start and never advances. Judging a freshly
+    // re-dispatched (pid-less-so-far) run against that ancient timestamp
+    // would immediately trip the never-attached deadline and force-release a
+    // live worker's lease. `work_runs.created_at` is stamped fresh on every
+    // resume, so it ages correctly across restarts.
+    let run_started_epoch = match work_db.latest_run_started_epoch_for_execution(&execution.id) {
+        Ok(epoch) => epoch,
+        Err(err) => {
+            tracing::debug!(
+                execution_id = %execution.id,
+                error = %format!("{err:#}"),
+                "cube-lease heartbeat: DB-fallback liveness check could not read latest run start; heartbeating conservatively",
+            );
+            return None;
+        }
+    };
+    let verdict = crate::execution_liveness::classify_pane_liveness(None, run_started_epoch, now_epoch_s);
+    verdict.is_dead().then_some(DbFallbackDeathEvidence::PaneNeverAttached)
 }
 
 /// Run a single heartbeat pass: refresh the cube lease of every live
@@ -653,17 +689,25 @@ async fn run_one_pass_impl(
                 // everything else (including "we can't tell") heartbeats as
                 // before, erring toward keeping a maybe-live lease alive.
                 if let Some(evidence) = db_fallback_death_evidence(ctx.work_db, &execution, now_epoch_s).await {
+                    let death_clause = evidence.reason_clause();
                     let reason = format!(
                         "cube-lease heartbeat: DB-fallback sweep found positive evidence its worker is gone \
-                         ({}); reaping and releasing its cube lease instead of continuing to heartbeat it",
-                        evidence.reason_clause(),
+                         ({death_clause}); reaping and releasing its cube lease instead of continuing to heartbeat it",
                     );
                     let details = serde_json::json!({
                         "reason": evidence.event_reason(),
                         "cube_workspace_id": execution.cube_workspace_id.as_deref().unwrap_or(""),
                     });
-                    if reap_and_release_lease(&ctx, &execution, lease_id, &reason, Stage::CubeLeaseAutoReap, details)
-                        .await
+                    if reap_and_release_lease(
+                        &ctx,
+                        &execution,
+                        lease_id,
+                        &reason,
+                        &death_clause,
+                        Stage::CubeLeaseAutoReap,
+                        details,
+                    )
+                    .await
                     {
                         outcome.auto_reaped += 1;
                         tracing::warn!(
@@ -922,6 +966,17 @@ async fn auto_reap_dead_lease(
         }
     }
 
+    let death_clause = if host_offline {
+        format!(
+            "its cube lease `{lease_id}` was no longer tracked after {consecutive_failures} consecutive heartbeat \
+             failures and its host is offline (disabled/removed)"
+        )
+    } else {
+        format!(
+            "its cube lease `{lease_id}` was no longer tracked after {consecutive_failures} consecutive heartbeat \
+             failures"
+        )
+    };
     let reason = if host_offline {
         format!(
             "cube-lease heartbeat: lease `{lease_id}` failed to refresh {consecutive_failures} consecutive times and \
@@ -941,7 +996,16 @@ async fn auto_reap_dead_lease(
         "consecutive_failures": consecutive_failures,
     });
 
-    let reaped = reap_and_release_lease(ctx, execution, lease_id, &reason, Stage::CubeLeaseAutoReap, details).await;
+    let reaped = reap_and_release_lease(
+        ctx,
+        execution,
+        lease_id,
+        &reason,
+        &death_clause,
+        Stage::CubeLeaseAutoReap,
+        details,
+    )
+    .await;
 
     if reaped {
         tracing::warn!(
@@ -969,6 +1033,14 @@ async fn auto_reap_dead_lease(
 /// independently established the worker is gone, so unlike a bare
 /// heartbeat failure this reap does not need to wait out the lease TTL.
 ///
+/// `reason` is the full sentence recorded on `mark_execution_orphaned` /
+/// `force_release_lease`; `death_clause` is the shorter clause
+/// [`crate::execution_liveness::finalize_dead_automation_triage_run`]
+/// interpolates into its own "no task was produced (pane died before Stop:
+/// {death_clause})" / "produced task X (recovered after pane death before
+/// Stop: {death_clause})" sentences — passing the full `reason` there would
+/// nest one sentence inside another and read incoherently.
+///
 /// Returns `true` iff this call actually transitioned the row to terminal
 /// (idempotent against a race with any other reconciler: if the row is
 /// already terminal by the time we get here, this is a no-op that still
@@ -978,6 +1050,7 @@ async fn reap_and_release_lease(
     execution: &WorkExecution,
     lease_id: &str,
     reason: &str,
+    death_clause: &str,
     stage: Stage,
     details: serde_json::Value,
 ) -> bool {
@@ -1014,7 +1087,7 @@ async fn reap_and_release_lease(
     .await;
 
     if execution.kind == ExecutionKind::AutomationTriage {
-        crate::execution_liveness::finalize_dead_automation_triage_run(ctx.work_db, execution, reason);
+        crate::execution_liveness::finalize_dead_automation_triage_run(ctx.work_db, execution, death_clause);
     }
 
     // Mirror host_reconcile::drain_execution's pr_review bookkeeping: a
@@ -1139,10 +1212,13 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use anyhow::{Result, anyhow};
-    use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput, WorkItemBinding};
+    use boss_protocol::{
+        ExecutionKind, ExecutionStatus, FinishExecutionRunInput, RequestExecutionInput, WorkItemBinding,
+    };
 
     use super::*;
     use crate::coordinator::{CubeRepoSummary, CubeWorkspaceStatus};
+    use crate::dead_pane_sweep::PANE_DEATH_GRACE_SECS;
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::live_worker_state::LiveWorkerStateRegistry;
     use crate::run_reconcile::{RunReconcileReport, RunReconcileVerdict};
@@ -1901,6 +1977,14 @@ mod tests {
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-durably-dead");
         db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
             .unwrap();
+        // Past the shared pid-death grace window, so the durable signal
+        // (now sourced from `dead_pane_sweep::shell_pid_death_evidence`) is
+        // eligible to fire.
+        db.force_started_at_for_test(
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs() - PANE_DEATH_GRACE_SECS - 300,
+        )
+        .unwrap();
 
         // Registry is empty: this execution is not tracked in memory at all
         // (e.g. it crashed before an engine restart and never re-registered).
@@ -1952,11 +2036,14 @@ mod tests {
         let product_id = create_product(&db);
         let work_item_id = create_chore(&db, &product_id);
         let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-never-attached");
-        // No shell pid ever recorded. Push `started_at` well past the
-        // pane-attach deadline so the age-based classifier fires without a
-        // real sleep.
+        // No shell pid ever recorded. Push the *current run's* start well past
+        // the pane-attach deadline so the age-based classifier fires without a
+        // real sleep — ages off `work_runs.created_at`, not
+        // `work_executions.started_at` (see
+        // `db_fallback_ages_never_attached_off_the_current_run_not_first_started_at`
+        // for why those two differ on a resumed execution).
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        db.force_started_at_for_test(
+        db.force_latest_run_started_at_for_test(
             &execution_id,
             now - crate::execution_liveness::PANE_ATTACH_DEADLINE_SECS - 60,
         )
@@ -2041,6 +2128,159 @@ mod tests {
         );
         assert_eq!(outcome.db_fallback_heartbeated, 1);
         assert_eq!(cube.calls(), vec![("lease-remote".to_owned(), Some(LEASE_TTL_SECS))]);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Running
+        );
+    }
+
+    /// A `waiting_review` execution is a park state whose worker has already
+    /// finished its job, opened its PR, and exited BY DESIGN — its shell pid
+    /// being dead is expected, not a zombie. Before the `is_live()` gate was
+    /// added, `db_fallback_death_evidence` would treat this as positive
+    /// evidence of death and force-release the lease of a workspace that is
+    /// deliberately retained for a follow-up revision. Mirrors
+    /// `dead_pane_sweep`'s `non_live_status_with_dead_pid_is_skipped` and
+    /// `lost_workspace_sweep`'s equivalent gate test.
+    #[tokio::test]
+    async fn db_fallback_does_not_reap_waiting_review_with_dead_pid() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-waiting-review");
+        db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
+            .unwrap();
+        let run_id = db.active_run_ids_for_execution(&execution_id).unwrap().remove(0);
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution_id)
+                .run_id(&run_id)
+                .execution_status(ExecutionStatus::WaitingReview)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        db.force_started_at_for_test(
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs() - PANE_DEATH_GRACE_SECS - 300,
+        )
+        .unwrap();
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::WaitingReview);
+        assert!(exec.cube_lease_id.is_some(), "waiting_review must retain its lease");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let cube = RecordingCube::default();
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+
+        assert_eq!(
+            outcome.auto_reaped, 0,
+            "a waiting_review execution (worker exited by design) must never be reaped"
+        );
+        assert_eq!(outcome.db_fallback_heartbeated, 1);
+        assert_eq!(
+            cube.calls(),
+            vec![("lease-waiting-review".to_owned(), Some(LEASE_TTL_SECS))]
+        );
+        assert!(cube.force_release_calls().is_empty());
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingReview
+        );
+    }
+
+    /// Same as above for `waiting_merge` — the other park state whose worker
+    /// has exited by design and whose lease must never be force-released by
+    /// this gate.
+    #[tokio::test]
+    async fn db_fallback_does_not_reap_waiting_merge_with_dead_pid() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-waiting-merge");
+        db.set_run_shell_pid_for_execution(&execution_id, dead_pid() as i64)
+            .unwrap();
+        let run_id = db.active_run_ids_for_execution(&execution_id).unwrap().remove(0);
+        db.finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&execution_id)
+                .run_id(&run_id)
+                .execution_status(ExecutionStatus::WaitingMerge)
+                .run_status("completed")
+                .build(),
+        )
+        .unwrap();
+        db.force_started_at_for_test(
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs() - PANE_DEATH_GRACE_SECS - 300,
+        )
+        .unwrap();
+        let exec = db.get_execution(&execution_id).unwrap();
+        assert_eq!(exec.status, ExecutionStatus::WaitingMerge);
+        assert!(exec.cube_lease_id.is_some(), "waiting_merge must retain its lease");
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let cube = RecordingCube::default();
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+
+        assert_eq!(
+            outcome.auto_reaped, 0,
+            "a waiting_merge execution (worker exited by design) must never be reaped"
+        );
+        assert_eq!(outcome.db_fallback_heartbeated, 1);
+        assert_eq!(
+            cube.calls(),
+            vec![("lease-waiting-merge".to_owned(), Some(LEASE_TTL_SECS))]
+        );
+        assert!(cube.force_release_calls().is_empty());
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingMerge
+        );
+    }
+
+    /// A never-attached verdict must be judged against the *current* run's
+    /// start, not `work_executions.started_at` (frozen at the first run's
+    /// start by `start_execution_run`'s `COALESCE`). A resumed execution
+    /// whose ancient `started_at` is already past the attach deadline, but
+    /// whose brand-new run has not yet had a chance to report a pid, must
+    /// keep being heartbeated rather than being force-reaped out from under
+    /// a live, freshly-dispatched worker.
+    #[tokio::test]
+    async fn db_fallback_ages_never_attached_off_the_current_run_not_first_started_at() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_chore(&db, &product_id);
+        let execution_id = running_execution_with_lease(&db, &work_item_id, "lease-resumed");
+
+        // Simulate a resume: `started_at` is ancient (as it would be after
+        // `COALESCE(started_at, now)` pinned it on the very first run), but
+        // the run row itself (created just now by `running_execution_with_lease`)
+        // is fresh.
+        db.force_started_at_for_test(
+            &execution_id,
+            boss_engine_utils::epoch_time::now_epoch_secs()
+                - crate::execution_liveness::PANE_ATTACH_DEADLINE_SECS
+                - 300,
+        )
+        .unwrap();
+
+        let live_states = LiveWorkerStateRegistry::new();
+        let cube = RecordingCube::default();
+        let sink = RecordingDispatchEventSink::new();
+        let breaker = HeartbeatFailureBreaker::default();
+        let outcome = run_one_pass(db.as_ref(), &live_states, &cube, &sink, &breaker).await;
+
+        assert_eq!(
+            outcome.auto_reaped, 0,
+            "a resumed execution's fresh run must not be judged against the ancient first-run started_at"
+        );
+        assert_eq!(outcome.db_fallback_heartbeated, 1);
+        assert_eq!(cube.calls(), vec![("lease-resumed".to_owned(), Some(LEASE_TTL_SECS))]);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Running
