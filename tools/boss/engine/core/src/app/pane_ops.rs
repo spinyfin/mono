@@ -594,7 +594,7 @@ impl ServerState {
     /// contradicting signal for the log.
     fn durable_live_process_evidence(&self, run_id: &str) -> Option<String> {
         let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
-        let shell_pid = process.shell_pid()?;
+        let shell_pid = process.alive_pid()?;
         let execution = self.work_db.get_execution(run_id).ok()?;
         if !matches!(
             execution.status,

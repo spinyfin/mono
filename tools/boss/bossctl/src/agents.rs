@@ -1643,9 +1643,7 @@ mod tests {
     fn names_and_slots_do_not_get_the_untracked_stop_fallback() {
         assert!(!looks_like_execution_id("Worf"));
         assert!(!looks_like_execution_id("3"));
-        // A friendly work-item selector, spelled without a literal id so the
-        // file-text-leakage check stays happy.
-        assert!(!looks_like_execution_id(&format!("T{}", 1234)));
+        assert!(!looks_like_execution_id("markdown-striping"));
         assert!(!looks_like_execution_id("task_abc"));
     }
 

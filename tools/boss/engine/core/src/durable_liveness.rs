@@ -25,11 +25,26 @@
 //! [`crate::work::WorkDb::set_run_shell_pid_for_execution`] the moment the
 //! app reports the pane's shell pid. It survives an engine restart, it
 //! survives `release_worker_pane` clearing the registry, and it survives the
-//! execution row going terminal. [`crate::dead_pane_sweep`] probes it; nothing
-//! on the re-dispatch or re-adoption paths did.
+//! execution row going terminal.
 //!
-//! This module makes that probe a first-class primitive so those paths can
-//! consult reality instead of the engine's own opinion.
+//! This module owns that probe so every path consults reality through one
+//! implementation instead of the engine's own opinion — or its own private
+//! copy of the pid semantics. Every caller goes through here:
+//! [`crate::dead_pane_sweep`], the re-dispatch guard in
+//! [`crate::orphan_sweep`], the re-adoption path, the husk classifier, and
+//! `release_worker_pane`'s reap.
+//!
+//! ## Two entry points, and which one to reach for
+//!
+//! [`probe_execution_worker`] answers from a run row of any age;
+//! [`probe_execution_worker_within`] (and the work-item-scoped
+//! [`probe_work_item_worker`]) refuse to answer once the row falls outside
+//! [`REDISPATCH_PID_TRUST_SECS`]. **Anything that signals a process, or that
+//! restores state from the pid, must use a bounded form.** A pid is a durable
+//! number, not a durable handle: once the OS recycles it the same integer names
+//! an unrelated process, and the reap signals a process *group*. The unbounded
+//! form is for callers whose failure direction is to decline to act, where a
+//! stale pid costs a missed reconciliation rather than a killed bystander.
 //!
 //! ## What it is not
 //!
@@ -46,8 +61,11 @@
 use crate::dead_pid_sweep::PidStatus;
 use crate::work::WorkDb;
 
-/// How far back a recorded `work_runs.shell_pid` is trusted by the
-/// re-dispatch guard ([`crate::orphan_sweep`]).
+/// How far back a recorded `work_runs.shell_pid` is trusted by the callers
+/// that act on it: the re-dispatch guard ([`crate::orphan_sweep`], via
+/// [`probe_work_item_worker`]) and the durable-pid reap in
+/// [`crate::app::ServerState::release_worker_pane`] (via
+/// [`probe_execution_worker_within`]).
 ///
 /// A pid is only meaningful until the OS recycles it, so a probe against an
 /// arbitrarily old row is not evidence — it is a coin flip that gets more
@@ -55,9 +73,11 @@ use crate::work::WorkDb;
 /// guards: the re-dispatch storm fires ~60–90 s after a run is terminalized
 /// (`ORPHAN_MIN_AGE_SECS` plus one sweep interval), so an hour is two orders
 /// of magnitude of headroom for the case that matters while keeping the
-/// recycling window small.
+/// recycling window small. macOS pids wrap at ~99999, so the bound is not
+/// theoretical: a days-old row can easily name a process that has nothing to
+/// do with Boss, and the reap signals a process *group*.
 ///
-/// A worker still running an hour after its execution went terminal is a
+/// A worker still running an hour after its run row was last touched is a
 /// different (and much louder) problem that belongs to
 /// [`crate::stale_worker_sweep`] and [`crate::husk_pane_sweep`], not to a
 /// guard whose only job is "don't double-dispatch onto a live process".
@@ -72,8 +92,10 @@ pub enum WorkerProcess {
     /// someone else).
     Alive { shell_pid: i32 },
     /// A local pid was recorded and `kill(pid, 0)` returned `ESRCH`: the
-    /// process is definitively gone.
-    Gone,
+    /// process is definitively gone. The pid is carried so a caller that
+    /// reconciles on death (`crate::dead_pane_sweep`) can name it in its
+    /// reason string and dispatch-event details.
+    Gone { shell_pid: i32 },
     /// No usable evidence: no pid was ever recorded, the run was remote, the
     /// row aged out of the trust window, or the probe itself failed with an
     /// unexpected errno. Callers MUST treat this as "I don't know", never as
@@ -87,8 +109,23 @@ impl WorkerProcess {
         matches!(self, WorkerProcess::Alive { .. })
     }
 
-    /// The recorded pid when one was probed, else `None`.
+    /// The pid that was probed, whatever the verdict — `None` only for
+    /// [`WorkerProcess::Unknown`], where no usable pid existed to probe.
+    /// For logs and event details; a caller deciding whether to *signal*
+    /// wants [`Self::alive_pid`].
     pub fn shell_pid(self) -> Option<i32> {
+        match self {
+            WorkerProcess::Alive { shell_pid } | WorkerProcess::Gone { shell_pid } => Some(shell_pid),
+            WorkerProcess::Unknown => None,
+        }
+    }
+
+    /// The recorded pid only when the process is positively alive.
+    ///
+    /// This is the accessor for anything destructive or state-restoring: a
+    /// `Gone` pid must never be signalled (it names a slot the OS is free to
+    /// have handed to someone else) nor stamped onto a re-adopted live state.
+    pub fn alive_pid(self) -> Option<i32> {
         match self {
             WorkerProcess::Alive { shell_pid } => Some(shell_pid),
             _ => None,
@@ -100,7 +137,7 @@ impl WorkerProcess {
     pub fn reason(self) -> &'static str {
         match self {
             WorkerProcess::Alive { .. } => "process_alive",
-            WorkerProcess::Gone => "process_gone",
+            WorkerProcess::Gone { .. } => "process_gone",
             WorkerProcess::Unknown => "process_unknown",
         }
     }
@@ -130,7 +167,7 @@ pub(crate) fn classify_worker_process(shell_pid: Option<i64>, status: &PidStatus
     };
     match status {
         PidStatus::Alive | PidStatus::PermissionDenied => WorkerProcess::Alive { shell_pid: pid },
-        PidStatus::Dead => WorkerProcess::Gone,
+        PidStatus::Dead => WorkerProcess::Gone { shell_pid: pid },
         PidStatus::Unknown(_) => WorkerProcess::Unknown,
     }
 }
@@ -154,6 +191,51 @@ pub fn probe_execution_worker(work_db: &WorkDb, execution_id: &str) -> WorkerPro
             return WorkerProcess::Unknown;
         }
     };
+    probe_recorded_pid(shell_pid)
+}
+
+/// [`probe_execution_worker`], but refusing to answer from a run row the pid
+/// table can no longer vouch for.
+///
+/// Same read as the unbounded probe, plus the pid-reuse bound
+/// [`probe_work_item_worker`] already applies: a row whose most recent
+/// timestamp (`finished_at` when the run has ended, else `created_at`) is
+/// further back than `max_age_secs` yields [`WorkerProcess::Unknown`] rather
+/// than a verdict.
+///
+/// **Use this, not [`probe_execution_worker`], for anything destructive.**
+/// A recorded pid is a durable *number*, not a durable *handle*: once the OS
+/// recycles it, the same integer names an unrelated process, and the reap in
+/// [`crate::app::ServerState::release_worker_pane`] signals a process
+/// **group**. The read-only callers (the husk classifier's
+/// `durable_live_process_evidence`, `bossctl`-facing state) keep the unbounded
+/// form on purpose: their failure direction is "decline to act", so a stale
+/// pid there costs a missed retirement, never a killed bystander.
+///
+/// `finished_at` rather than `created_at` is the anchor because the window
+/// bounds *pid staleness*, not run duration: a worker that has been running
+/// for six hours and was wrongly terminalized one minute ago is exactly the
+/// case this path exists to reap, and anchoring on `created_at` would exempt
+/// it. `finished_at` is written by the teardown that lost track of the worker,
+/// so it dates the engine's last first-hand knowledge of the process.
+pub fn probe_execution_worker_within(
+    work_db: &WorkDb,
+    execution_id: &str,
+    max_age_secs: i64,
+    now_epoch_secs: i64,
+) -> WorkerProcess {
+    let shell_pid =
+        match work_db.latest_local_shell_pid_for_execution_within(execution_id, max_age_secs, now_epoch_secs) {
+            Ok(pid) => pid,
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    error = %format!("{err:#}"),
+                    "durable liveness: failed to read shell pid within trust window; treating as unknown",
+                );
+                return WorkerProcess::Unknown;
+            }
+        };
     probe_recorded_pid(shell_pid)
 }
 
@@ -236,7 +318,10 @@ mod tests {
 
     #[test]
     fn esrch_is_gone_and_other_errno_is_unknown() {
-        assert_eq!(classify_worker_process(Some(42), &PidStatus::Dead), WorkerProcess::Gone);
+        assert_eq!(
+            classify_worker_process(Some(42), &PidStatus::Dead),
+            WorkerProcess::Gone { shell_pid: 42 },
+        );
         assert_eq!(
             classify_worker_process(
                 Some(42),
@@ -272,7 +357,49 @@ mod tests {
         let work_item_id = create_active_chore(&db, &product_id, "test chore");
         let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
 
-        assert_eq!(probe_execution_worker(&db, &execution_id), WorkerProcess::Gone);
+        let dead = i32::try_from(dead_pid()).unwrap();
+        assert_eq!(
+            probe_execution_worker(&db, &execution_id),
+            WorkerProcess::Gone { shell_pid: dead },
+        );
+        // `Gone` carries its pid so `dead_pane_sweep` can name it in the reason
+        // string and dispatch-event details without re-reading the row; only
+        // `alive_pid` gates the destructive/state-restoring callers.
+        assert_eq!(probe_execution_worker(&db, &execution_id).shell_pid(), Some(dead),);
+        assert_eq!(probe_execution_worker(&db, &execution_id).alive_pid(), None);
+    }
+
+    /// The destructive caller's bound. `probe_execution_worker` answers from a
+    /// row of any age — right for the read-only callers, whose failure
+    /// direction is to decline — but the reap in `release_worker_pane` signals
+    /// a process *group*, and a recycled pid is an unrelated bystander. The
+    /// bounded form must refuse rather than hand back a verdict.
+    #[test]
+    fn bounded_probe_refuses_a_row_outside_the_trust_window() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(std::process::id()));
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(
+            probe_execution_worker_within(&db, &execution_id, REDISPATCH_PID_TRUST_SECS, now).is_alive(),
+            "a fresh row must still answer",
+        );
+        assert_eq!(
+            probe_execution_worker_within(
+                &db,
+                &execution_id,
+                REDISPATCH_PID_TRUST_SECS,
+                now + REDISPATCH_PID_TRUST_SECS + 60,
+            ),
+            WorkerProcess::Unknown,
+            "an aged-out row must yield no verdict at all, not a pid to signal",
+        );
+        assert!(
+            probe_execution_worker(&db, &execution_id).is_alive(),
+            "the unbounded probe the read-only callers use is unaffected",
+        );
     }
 
     /// No pid recorded is `Unknown`, never `Gone` — that is the state a

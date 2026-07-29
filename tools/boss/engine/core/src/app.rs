@@ -1388,12 +1388,24 @@ impl ServerState {
     }
 
     /// Tear down the libghostty pane allocated for `run_id`.
-    /// Idempotent: `take_slot_for_run` returns `None` after the first
-    /// call so duplicate releases (completion-detection followed by a
+    /// Safe to call repeatedly: `take_slot_for_run` returns `None` after the
+    /// first call so duplicate releases (completion-detection followed by a
     /// chore-done update or `bossctl agents stop`) don't error out.
     /// Errors talking to the app are logged and swallowed — the slot
     /// mapping has already been removed, so a future release can't
     /// retry without a fresh registration.
+    ///
+    /// A second call is **not** a guaranteed no-op, and callers must not rely
+    /// on one: with no slot mapping this falls through to
+    /// [`ServerState::reap_untracked_worker_process`], which reaps from the
+    /// run's durable `work_runs.shell_pid` when that pid is alive and its row
+    /// is inside [`REDISPATCH_PID_TRUST_SECS`]. That is the point — the
+    /// terminal path clears the mapping, so a worker the engine lost track of
+    /// has no mapping *by construction* and used to be unreachable by the
+    /// operator's own stop verb. What still holds is the property callers
+    /// actually need: the pid is scoped to `run_id`'s own latest run row, so
+    /// this never reaches a worker belonging to a different execution, however
+    /// the slot was since recycled.
     ///
     /// Also drops the matching `LiveWorkerStateRegistry` entry and
     /// broadcasts the snapshot so subscribers (the kanban Doing dot,
@@ -1408,22 +1420,20 @@ impl ServerState {
         // lets the generic reader flush/drain without blocking teardown.
         self.agent_jsonl_progress_manager.stop_run(run_id);
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
-            // No slot mapping. Historically this returned `NoLiveWorker`
-            // immediately, on the reasoning that "no mapped slot means no pane
-            // and no recorded pid to reap". The first half is right; the
-            // second half is not, and it is the reason `bossctl agents stop`
-            // could not reap the six untracked workers on 2026-07-28. The
-            // registry is in-memory and is cleared unconditionally at the end
-            // of this very function ("successfully or not"), so a worker whose
-            // execution was wrongly terminalized loses its slot mapping while
-            // its process keeps running — and the durable
-            // `work_runs.shell_pid` the app reported is still sitting in the
-            // DB. Consult it before giving up.
+            // No slot mapping does not imply no process. The registry is
+            // in-memory and is cleared unconditionally at the end of this very
+            // function ("successfully or not"), while the durable
+            // `work_runs.shell_pid` the app reported survives — so a worker
+            // whose execution was wrongly terminalized loses its slot mapping
+            // while its process keeps running. Consult the DB before giving
+            // up; that is what makes `bossctl agents stop` able to reach
+            // exactly the workers the engine has lost track of (2026-07-28).
             //
-            // Only a pid that a probe says is ALIVE justifies proceeding: a
-            // genuinely mid-spawn worker has no recorded pid at all and must
-            // still report `NoLiveWorker`, because that verdict is what stops
-            // the caller releasing a cube lease out from under a workspace the
+            // Only a pid that a probe says is ALIVE, from a run row recent
+            // enough to still vouch for it, justifies proceeding: a genuinely
+            // mid-spawn worker has no recorded pid at all and must still
+            // report `NoLiveWorker`, because that verdict is what stops the
+            // caller releasing a cube lease out from under a workspace the
             // worker is about to occupy.
             return self.reap_untracked_worker_process(run_id).await;
         };
@@ -1546,14 +1556,33 @@ impl ServerState {
     /// pid at all" case matters: that is the mid-spawn shape, and its contract
     /// is that the caller must NOT release the cube lease (the worker is about
     /// to occupy that workspace).
+    ///
+    /// **Age-bounded, unlike the read-only probes.** The pid is read through
+    /// [`crate::durable_liveness::probe_execution_worker_within`] with the same
+    /// [`REDISPATCH_PID_TRUST_SECS`] window the re-dispatch guard uses, and an
+    /// older row yields `NoLiveWorker` without signalling anything. A recorded
+    /// pid is a durable number, not a durable handle: macOS wraps pids at
+    /// ~99999, `reap_worker_process_tree` signals the process *group*, and this
+    /// entry point is reachable from operator input — `bossctl agents stop`
+    /// forwards any unresolvable `exec_…` selector straight through
+    /// `force_stop_execution` → `force_release` → `release_worker_pane` with no
+    /// status or age gate of its own. Without the bound, `agents stop` on a
+    /// days-old execution id would signal whatever process group inherited that
+    /// number.
     async fn reap_untracked_worker_process(&self, run_id: &str) -> PaneReleaseOutcome {
-        let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
-        let Some(shell_pid) = process.shell_pid() else {
+        let process = crate::durable_liveness::probe_execution_worker_within(
+            &self.work_db,
+            run_id,
+            crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+        );
+        let Some(shell_pid) = process.alive_pid() else {
             tracing::debug!(
                 run_id,
                 verdict = process.reason(),
-                "release_worker_pane: no slot mapped and no live durable pid; treating as \
-                 mid-spawn or already released",
+                trust_window_secs = crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,
+                "release_worker_pane: no slot mapped and no live durable pid within the trust \
+                 window; treating as mid-spawn, already released, or too old to vouch for",
             );
             return PaneReleaseOutcome::NoLiveWorker;
         };

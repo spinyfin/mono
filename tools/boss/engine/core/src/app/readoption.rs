@@ -79,7 +79,7 @@ impl ServerState {
     /// Claim the right to resolve `run_id`'s contradiction. Returns `false`
     /// when another resolution is already in flight for the same run — see
     /// [`ServerState::converging_terminal_runs`] for why the latch exists.
-    fn begin_terminal_convergence(&self, run_id: &str) -> bool {
+    pub(super) fn begin_terminal_convergence(&self, run_id: &str) -> bool {
         self.converging_terminal_runs
             .lock()
             .expect("converging_terminal_runs poisoned")
@@ -87,7 +87,7 @@ impl ServerState {
     }
 
     /// Release the latch taken by [`Self::begin_terminal_convergence`].
-    fn end_terminal_convergence(&self, run_id: &str) {
+    pub(super) fn end_terminal_convergence(&self, run_id: &str) {
         self.converging_terminal_runs
             .lock()
             .expect("converging_terminal_runs poisoned")
@@ -132,7 +132,7 @@ impl ServerState {
         };
 
         let shell_pid = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id)
-            .shell_pid()
+            .alive_pid()
             .unwrap_or(0);
         let slot_id = self.hosted_pane_slot_for_run(run_id).await;
         if let Some(slot_id) = slot_id {
@@ -163,17 +163,45 @@ impl ServerState {
                 Ok(Some(_))
             );
             let pool = crate::live_worker_state::attributed_pool_label(restored.kind.clone(), has_source_automation);
-            // The spawn-time model is not persisted, so a re-adopted slot
-            // reports the generic driver label rather than inventing a
-            // specific one. Being vague about the model is cosmetic; being
-            // wrong about it would put a false claim on the pane titlebar.
+            // Ask the resolved driver, rather than assume — the same
+            // derivation `spawn_flow` makes at spawn time. The driver is
+            // durably resolvable from the run's task/product precedence, so
+            // there is no reason for re-adoption to guess, and guessing is not
+            // cosmetic: `awaiting_input_capable` gates the `WaitingForInput`
+            // promotion in `live_worker_state`, so a hardcoded `true` would let
+            // `mark_stalled_spawns` paint a re-adopted non-Claude worker as
+            // awaiting input — the wrong-indicator class this path exists to
+            // end.
+            //
+            // The spawn-time *model* is not persisted, so the label is the
+            // driver's, not a specific model: being vague about the model is
+            // cosmetic; being wrong about it would put a false claim on the
+            // pane titlebar.
+            //
+            // The slug not resolving at all (unknown execution, or a row with
+            // no task) falls back to the engine default driver, so even the
+            // degraded path states some driver's answer rather than a literal.
+            let driver = crate::driver_transcript::driver_for_execution(&self.work_db, run_id).or_else(|| {
+                crate::driver::DriverRegistry::default()
+                    .require(boss_engine_effort::ENGINE_DEFAULT_DRIVER)
+                    .ok()
+            });
+            let model_label = driver
+                .as_ref()
+                .map(|driver| driver.descriptor().label.to_owned())
+                .unwrap_or_else(|| boss_engine_effort::ENGINE_DEFAULT_DRIVER.to_owned());
+            let awaiting_input_capable = driver.is_some_and(|driver| {
+                driver
+                    .capabilities()
+                    .provides(crate::driver::Capability::AwaitingInputSignal)
+            });
             self.live_worker_states.register_spawn_with_capabilities(
                 slot_id,
                 run_id.to_owned(),
-                "claude".to_owned(),
+                model_label,
                 shell_pid,
                 binding,
-                true,
+                awaiting_input_capable,
                 crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
             );
             self.broadcast_live_worker_states().await;

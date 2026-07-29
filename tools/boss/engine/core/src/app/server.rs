@@ -193,12 +193,17 @@ pub fn process_is_alive(pid: libc::pid_t) -> bool {
 /// so the loop simply waits for the next real transition rather than spinning.
 // Lets `Arc<ServerState>` be coerced to `Arc<dyn WorkerReaper>` for the
 // terminal-work reconciler (wired in `run` below). Reaping a stranded worker
-// is exactly the completion path's pane teardown: `release_worker_pane`
-// resolves the slot from the run id via an atomic `take_slot_for_run`, so it
-// is idempotent and a no-op once the slot has been freed or recycled to a
-// different execution — the reconciler relies on that to never reap the wrong
-// worker. (Defined here rather than in `app.rs` so the new impl doesn't
-// re-touch app.rs's grandfathered `ServerState` giant struct.)
+// is exactly the completion path's pane teardown. What the reconciler relies
+// on is that `release_worker_pane` never reaps a worker belonging to a
+// *different* execution: it resolves the slot from the run id via an atomic
+// `take_slot_for_run`, and once that mapping is gone its durable-pid fallback
+// is likewise keyed to this run's own `work_runs.shell_pid` and bounded to
+// `REDISPATCH_PID_TRUST_SECS`. Note that fallback makes a repeat call not a
+// strict no-op — a worker still alive under a terminal run is reaped from
+// durable state even with no slot mapped, which for this reconciler is the
+// desired outcome rather than an exception to it. (Defined here rather than in
+// `app.rs` so the new impl doesn't re-touch app.rs's grandfathered
+// `ServerState` giant struct.)
 #[async_trait::async_trait]
 impl crate::terminal_work_sweep::WorkerReaper for ServerState {
     async fn reap_terminal_worker(&self, run_id: &str) {

@@ -356,6 +356,27 @@ impl LiveWorkerStateRegistry {
     /// A no-op (silently ignored, no entry created) if the slot has no
     /// live entry — mirrors the benign-drop behaviour of the other
     /// per-slot setters when a hook or wiring call races spawn/release.
+    /// Whether `slot_id`'s driver can signal "awaiting input", the flag that
+    /// gates the `WaitingForInput` promotion in `derive_activity` and
+    /// `mark_stalled_spawns`.
+    ///
+    /// Defaults to `true` for a slot with no recorded answer, matching the
+    /// gates themselves — an unregistered slot must not silently lose the
+    /// promotion. Read side of [`Self::set_awaiting_input_capable`] and of the
+    /// `awaiting_input_capable` argument to
+    /// [`Self::register_spawn_with_capabilities`], so a registration site's
+    /// derivation is assertable rather than only observable through the
+    /// activity it later produces.
+    pub fn awaiting_input_capable(&self, slot_id: u8) -> bool {
+        self.inner
+            .lock()
+            .expect("registry mutex poisoned")
+            .awaiting_input_capable
+            .get(&slot_id)
+            .copied()
+            .unwrap_or(true)
+    }
+
     pub fn set_awaiting_input_capable(&self, slot_id: u8, capable: bool) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         if !guard.by_slot.contains_key(&slot_id) {

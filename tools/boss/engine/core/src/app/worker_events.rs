@@ -683,13 +683,13 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
 /// ever gets: it is produced by the worker's own process, in-band, and cannot
 /// be forged by stale bookkeeping the way a pool claim or a registry entry can.
 ///
-/// Historically this function only *logged* the contradiction (as `SIG-4b`)
-/// and returned, on the stated reasoning that reconciliation belonged to the
-/// sweeps. It did not, because every sweep can only reap and every sweep
-/// correctly refuses to reap a live worker — so the contradiction was detected
-/// on every hook, filed as a diagnostic, and left standing indefinitely while
-/// the row went on being re-dispatched. See [`crate::worker_readoption`] for
-/// the full argument; this is the call site that acts on it.
+/// Convergence happens here rather than being left to the sweeps. Every
+/// sweep's only verb is reap, and each correctly refuses to reap a live
+/// worker, so the case where the engine — not the worker — is wrong has no
+/// other resolution: left to them the contradiction is re-detected on every
+/// hook, filed as a diagnostic, and stands indefinitely while the row goes on
+/// being re-dispatched. See [`crate::worker_readoption`] for the full
+/// argument; this is the call site that acts on it.
 ///
 /// Returns `true` when the event belonged to a terminal execution (so the
 /// caller skips the ordinary "dropping hook" warning — this path is the more

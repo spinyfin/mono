@@ -138,6 +138,57 @@ async fn release_worker_pane_reports_no_live_worker_for_a_dead_recorded_pid() {
     );
 }
 
+/// The destructive path is age-bounded even though the read-only probes are
+/// not. `bossctl agents stop` forwards any unresolvable `exec_…` selector
+/// straight to `force_stop_execution` → `force_release` →
+/// `release_worker_pane` with no status or age gate, and the reap signals a
+/// process *group*. macOS wraps pids at ~99999, so a days-old
+/// `work_runs.shell_pid` naming an unrelated process is realistic — the row
+/// must age out of the trust window rather than be believed.
+#[tokio::test]
+async fn release_worker_pane_refuses_to_reap_from_a_pid_outside_the_trust_window() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+
+    // A process that IS alive, standing in for whatever inherited a recycled
+    // pid. If the bound is dropped, this test kills it and fails on the wait.
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    // Backdate the run row past the trust window. Both timestamps move: the
+    // bound anchors on `COALESCE(finished_at, created_at)`, and a fixture run
+    // has both.
+    let stale =
+        boss_engine_utils::epoch_time::now_epoch_secs() - crate::durable_liveness::REDISPATCH_PID_TRUST_SECS - 600;
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET created_at = ?1, finished_at = ?1 WHERE execution_id = ?2",
+            rusqlite::params![stale.to_string(), &execution_id],
+        )
+        .unwrap();
+
+    assert_eq!(
+        server_state.release_worker_pane(&execution_id).await,
+        PaneReleaseOutcome::NoLiveWorker,
+        "a pid the run row can no longer vouch for is not evidence, and must not be signalled",
+    );
+
+    // The bystander is untouched: still running, so `try_wait` has no status.
+    assert!(
+        child.try_wait().expect("try_wait on child").is_none(),
+        "the process behind the aged-out pid must NOT have been signalled",
+    );
+    child.kill().expect("kill the test child");
+    let _ = tokio::task::spawn_blocking(move || child.wait()).await;
+}
+
 #[tokio::test]
 async fn reap_worker_process_tree_kills_orphan_child() {
     let mut child = spawn_group_leader_sleeper();

@@ -2193,6 +2193,48 @@ impl WorkDb {
         Ok(created_at.and_then(|s| s.parse::<i64>().ok()))
     }
 
+    /// [`Self::latest_local_shell_pid_for_execution`], restricted to a run row
+    /// whose most recent timestamp falls within `max_age_secs` of
+    /// `now_epoch_secs`.
+    ///
+    /// Same row selection and same `host_id = 'local'` rail; the only addition
+    /// is the pid-reuse bound that
+    /// [`Self::latest_local_worker_process_for_work_item`] already applies, so
+    /// the destructive caller
+    /// ([`crate::app::ServerState::release_worker_pane`]'s durable-pid reap)
+    /// cannot act on a pid this table can no longer vouch for.
+    ///
+    /// The bound is on `COALESCE(finished_at, created_at)` rather than
+    /// `created_at`: it exists to bound how long ago the engine last had
+    /// first-hand knowledge of the process, not how long the run has been
+    /// going. A six-hour worker whose run was terminalized a minute ago is
+    /// precisely what the reap path is for, and a `created_at` anchor would
+    /// exempt it.
+    pub fn latest_local_shell_pid_for_execution_within(
+        &self,
+        execution_id: &str,
+        max_age_secs: i64,
+        now_epoch_secs: i64,
+    ) -> Result<Option<i64>> {
+        let conn = self.connect()?;
+        let cutoff = now_epoch_secs - max_age_secs;
+        conn.query_row(
+            "SELECT shell_pid FROM work_runs
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             ) AND host_id = 'local'
+               AND CAST(COALESCE(finished_at, created_at) AS INTEGER) >= ?2",
+            params![execution_id, cutoff],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .optional()
+        .map(Option::flatten)
+        .map_err(Into::into)
+    }
+
     /// The newest LOCAL worker process this work item ever recorded: the
     /// `(execution_id, shell_pid)` of the most recently created `work_runs`
     /// row across ALL of the item's executions — terminal ones included —

@@ -92,8 +92,8 @@ use std::time::Duration;
 use boss_protocol::WorkExecution;
 
 use crate::coordinator::ExecutionCoordinator;
-use crate::dead_pid_sweep::{PidStatus, probe_pid};
 use crate::dispatch_events::{DispatchEventSink, Stage};
+use crate::durable_liveness::WorkerProcess;
 use crate::work::WorkDb;
 
 /// Cadence for the periodic pass. Fires immediately on boot, then every
@@ -217,35 +217,26 @@ pub(crate) async fn shell_pid_death_evidence(
     }
 
     // The durable, restart-robust liveness signal: the shell pid the app
-    // reported, persisted to `work_runs.shell_pid`. This lookup is ALSO the
-    // host-safety gate — it returns a pid only for a `host_id = 'local'` run, so
-    // a remote worker (whose pid lives on another machine, where a local
-    // `kill(pid, 0)` is meaningless) surfaces `None` and is never touched here.
-    // `None` (remote, never reported, or a pre-fix spawn) means we have no
-    // evidence either way → leave it alone.
-    let shell_pid = match work_db.latest_local_shell_pid_for_execution(&execution.id) {
-        Ok(Some(pid)) if pid > 0 => pid,
-        Ok(_) => return None,
-        Err(err) => {
-            tracing::debug!(
-                execution_id = %execution.id,
-                error = %format!("{err:#}"),
-                "pane-death reconcile: could not read durable shell pid; skipping conservatively",
-            );
-            return None;
-        }
+    // reported, persisted to `work_runs.shell_pid`, probed through the shared
+    // primitive so this sweep and the re-dispatch/re-adoption paths cannot
+    // drift apart on what "the worker's process is gone" means.
+    //
+    // The lookup behind it is ALSO the host-safety gate — it returns a pid only
+    // for a `host_id = 'local'` run, so a remote worker (whose pid lives on
+    // another machine, where a local `kill(pid, 0)` is meaningless) surfaces
+    // `Unknown` and is never touched here.
+    //
+    // Only `Gone` (ESRCH, "no such process") is positive evidence of death.
+    // `Alive`, alive-but-not-ours (EPERM, folded into `Alive`), and `Unknown`
+    // — remote, never reported, a pre-fix spawn, an unexpected errno, or a
+    // failed read — all leave the execution alone, so pid recycling can only
+    // ever cause a missed reap, never a false one. The unbounded probe is the
+    // right one here: this path's verb is "reconcile a row", not "signal a
+    // process", and its failure direction is to decline.
+    let shell_pid = match crate::durable_liveness::probe_execution_worker(work_db, &execution.id) {
+        WorkerProcess::Gone { shell_pid } => i64::from(shell_pid),
+        _ => return None,
     };
-
-    // Only ESRCH ("no such process") is positive evidence of death. Alive,
-    // alive-but-not-ours (EPERM), and any unexpected errno are treated as live
-    // — pid recycling can then only ever cause a missed reap, never a false one.
-    let probe_pid_i32 = match i32::try_from(shell_pid) {
-        Ok(pid) => pid,
-        Err(_) => return None,
-    };
-    if !matches!(probe_pid(probe_pid_i32), PidStatus::Dead) {
-        return None;
-    }
 
     // A dead pid is only a dead *worker* when the driver's process was
     // supposed to outlive its turns. `codex exec` serves one turn per process

@@ -164,7 +164,7 @@ type SweepPassFuture<'a, O> = Pin<Box<dyn Future<Output = O> + Send + 'a>>;
 /// Spawn a sweep loop over the engine's three standard sweep collaborators.
 ///
 /// The `work_db` / `coordinator` / `dispatch_events` sweeps (dead-pane,
-/// dispatch-failure recovery, orphan, PR-review recovery) all captured the
+/// dispatch-failure recovery, PR-review recovery) all captured the
 /// same `Arc` triple and re-cloned it per pass by hand. This owns that
 /// capture: it clones the triple each pass and hands `pass_fn` the exact
 /// shape `run_one_pass` already takes, so a call site is just
@@ -173,8 +173,10 @@ type SweepPassFuture<'a, O> = Pin<Box<dyn Future<Output = O> + Send + 'a>>;
 /// `coordinator` arrives as an owned `Arc` because the kick path needs
 /// `Arc<ExecutionCoordinator>`; the other two are borrows for the pass's
 /// duration. A sweep needing extra per-pass collaborators (a PR-state
-/// checker, a reaper) closes over them at the call site rather than
-/// widening this signature.
+/// checker, a reaper) drops down to [`spawn_sweep_loop`] and closes over
+/// them at the call site rather than widening this signature — that is why
+/// the orphan sweep is not on this list: it needs a fourth collaborator
+/// (`LiveWorkerConvergence`) to hand a live-worker contradiction to.
 ///
 /// Inherits [`spawn_sweep_loop`]'s fire-immediately-on-spawn contract.
 pub(crate) fn spawn_work_sweep_loop<O, F>(

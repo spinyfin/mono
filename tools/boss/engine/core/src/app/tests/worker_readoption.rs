@@ -246,6 +246,84 @@ async fn a_worker_whose_spawn_ack_was_lost_is_readopted_once_it_hooks() {
     assert!(after.finished_at.is_none());
 }
 
+/// Re-adoption must derive `awaiting_input_capable` from the run's own driver,
+/// the way `spawn_flow` does at spawn time. Hardcoding Claude's `true` here
+/// would let `mark_stalled_spawns` promote a re-adopted Codex worker to
+/// `WaitingForInput` — a driver that cannot signal awaiting-input at all —
+/// which is the wrong-indicator class this whole path exists to end.
+#[tokio::test]
+async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver() {
+    use crate::work::WorkItemPatch;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // A driver that does NOT provide AwaitingInputSignal. Claude does, so a
+    // hardcoded capability would pass against the default driver either way.
+    db.update_work_item(
+        &work_item_id,
+        WorkItemPatch {
+            driver: Some("codex".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+    let execution = db.get_execution(&execution_id).unwrap();
+
+    // The live-state slot is only restored when the app can say which slot
+    // hosts the pane, so stand one up and answer the probe.
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+    let server_clone = server_state.clone();
+    let execution_clone = execution.clone();
+    let converge = tokio::spawn(async move {
+        server_clone
+            .converge_terminal_execution(&execution_clone, "hook_after_terminal")
+            .await
+    });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![crate::protocol::HostedPaneEntry {
+                        slot_id: 4,
+                        run_id: execution_id.clone(),
+                        summary: None,
+                        task_title: None,
+                    }],
+                }),
+            },
+        )
+        .await;
+    assert_eq!(converge.await.expect("converge task"), "readopt");
+
+    assert!(
+        !server_state.live_worker_states.awaiting_input_capable(4),
+        "a re-adopted Codex worker must not be paintable as awaiting input",
+    );
+    let state = server_state
+        .live_worker_states
+        .get(4)
+        .expect("the re-adopted slot must carry a live-state entry");
+    assert_eq!(
+        state.model, "OpenAI Codex",
+        "the label must name the run's resolved driver, not a hardcoded `claude`",
+    );
+}
+
 /// Convergence is serialized per run. A worker mid-turn emits several hooks a
 /// second, and each one reaching this path independently would race writes
 /// against the same execution row and fan out `ListHostedPanes` round-trips at
@@ -257,20 +335,44 @@ async fn concurrent_hooks_for_one_run_converge_once() {
         stranded_live_worker(&server_state, i64::from(std::process::id()), "presumed dead");
     let execution = server_state.work_db.get_execution(&execution_id).unwrap();
 
-    // Hold the latch as if a resolution were already in flight.
-    let first = server_state.converge_terminal_execution(&execution, "hook_after_terminal");
-    let verdicts = tokio::join!(first, async {
-        // Give the first call a chance to take the latch before the second
-        // asks for it.
-        tokio::task::yield_now().await;
+    // Hold the latch exactly as an in-flight resolution on another task would.
+    // Taking it directly rather than racing two futures is what makes the
+    // assertion mean something: an `await`-ordering race can let the second
+    // call arrive after the first has already finished, in which case it
+    // returns `no_contradiction` (the row is no longer terminal) and the test
+    // passes with the latch deleted.
+    assert!(
+        server_state.begin_terminal_convergence(&execution_id),
+        "precondition: the latch is free before anyone claims it",
+    );
+
+    assert_eq!(
         server_state
             .converge_terminal_execution(&execution, "hook_after_terminal")
-            .await
-    });
-    let outcomes = [verdicts.0, verdicts.1];
+            .await,
+        "in_flight",
+        "a second resolution while one is in flight must be refused, not run",
+    );
     assert!(
-        outcomes.contains(&"readopt"),
-        "one of the two must actually do the work: {outcomes:?}",
+        server_state
+            .work_db
+            .get_execution(&execution_id)
+            .unwrap()
+            .status
+            .is_terminal(),
+        "the refused call must not have touched the execution row",
+    );
+
+    // The latch is released when the in-flight resolution ends, and the run is
+    // then convergeable again — a permanently-stuck latch would strand the row
+    // just as surely as the duplicate writes it prevents.
+    server_state.end_terminal_convergence(&execution_id);
+    assert_eq!(
+        server_state
+            .converge_terminal_execution(&execution, "hook_after_terminal")
+            .await,
+        "readopt",
+        "once the latch is free the contradiction must actually be resolved",
     );
     assert_eq!(
         server_state.work_db.get_execution(&execution_id).unwrap().status,

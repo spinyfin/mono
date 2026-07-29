@@ -514,13 +514,14 @@ async fn list_husk_panes_still_retires_an_untracked_slot_whose_process_is_gone()
 }
 
 #[tokio::test]
-async fn list_husk_panes_still_retires_a_lingering_shell_under_a_completed_run() {
+async fn list_husk_panes_still_retires_a_lingering_shell_under_a_cancelled_run() {
     use crate::test_support::*;
 
     // The shape the durable guard must NOT protect, and the reason it keys on
     // the terminal status as well as the pid: a genuine husk keeps its shell
-    // alive after `claude` exits inside it. Its execution completed — a real
-    // outcome, not an inference — so the pane is stray and must be reclaimed.
+    // alive after `claude` exits inside it. Its execution was cancelled — a
+    // decided outcome, not an inference — so the pane is stray and must be
+    // reclaimed.
     let (server_state, _dir) = test_server_state();
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
