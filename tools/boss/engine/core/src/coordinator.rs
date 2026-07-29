@@ -1007,6 +1007,18 @@ pub struct WorkerPool {
     /// released, never added or removed). Cached outside the mutex so
     /// [`WorkerPool::capacity_sync`] can be read without an `await`.
     len: usize,
+    /// Worker-id prefix for this pool (`"worker-"`, `AUTOMATION_WORKER_ID_PREFIX`,
+    /// or `REVIEW_WORKER_ID_PREFIX`), stamped at construction. [`Self::claim_worker_force`]
+    /// uses this — rather than a hardcoded main-pool prefix — so a forced claim that
+    /// grows a review or automation pool still mints a worker id with that pool's
+    /// prefix, keeping [`pool_for_worker_id`] / [`pool_dispatch_policy_for_worker_id`]
+    /// routing correct regardless of which pool was force-claimed.
+    prefix: &'static str,
+    /// Hard cap this pool's force-claim growth may not exceed (`MAX_WORKER_POOL_SIZE`,
+    /// [`MAX_AUTOMATION_POOL_SIZE`], or [`MAX_REVIEW_POOL_SIZE`] depending on which
+    /// pool this is). See [`Self::prefix`]'s doc for why this must be pool-specific
+    /// rather than always `MAX_WORKER_POOL_SIZE`.
+    hard_cap: usize,
 }
 
 #[derive(Debug)]
@@ -1103,7 +1115,7 @@ impl WorkerPool {
         Self::new_with_prefix(size, REVIEW_WORKER_ID_PREFIX, MAX_REVIEW_POOL_SIZE)
     }
 
-    fn new_with_prefix(size: usize, prefix: &str, hard_cap: usize) -> Self {
+    fn new_with_prefix(size: usize, prefix: &'static str, hard_cap: usize) -> Self {
         let clamped = if size > hard_cap {
             tracing::warn!(
                 requested = size,
@@ -1123,8 +1135,17 @@ impl WorkerPool {
             .collect();
         Self {
             len: clamped,
+            prefix,
+            hard_cap,
             inner: Arc::new(Mutex::new(WorkerPoolInner { workers })),
         }
+    }
+
+    /// This pool's hard cap on force-claim growth (see [`Self::prefix`]'s
+    /// doc). Used by [`ExecutionCoordinator::force_dispatch`] to report an
+    /// accurate cap in its error when a forced claim is rejected.
+    pub(crate) fn hard_cap(&self) -> usize {
+        self.hard_cap
     }
 
     /// Slot count, without locking. Equivalent to `capacity().await` but
@@ -1216,14 +1237,19 @@ impl WorkerPool {
         Some(worker_id)
     }
 
-    /// Skip-the-queue claim used by `bossctl agents launch`. Same
+    /// Skip-the-queue claim used by `bossctl agents launch` and
+    /// [`ExecutionCoordinator::force_dispatch`]'s recovery-probe path. Same
     /// deterministic, page-aware selection as `claim_worker`, but if every
-    /// configured slot is busy and the pool is still below the hard
-    /// cap (`MAX_WORKER_POOL_SIZE`) we grow the pool by one fresh slot
-    /// and hand it back. Returns `None` only when the pool is already
-    /// at the hard cap with no idle slot — at that point there's no
-    /// pane the macOS app could render anyway, so the launch is
-    /// rejected rather than silently overcommitting.
+    /// configured slot is busy and the pool is still below its own hard cap
+    /// (see [`Self::hard_cap`]) we grow THIS pool by one fresh slot, named
+    /// with THIS pool's [`Self::prefix`], and hand it back. Called on
+    /// whichever pool the execution targets — main, automation, or review —
+    /// so the returned worker id always carries the correct prefix and the
+    /// grown slot is capped by that pool's own hard cap, never
+    /// `MAX_WORKER_POOL_SIZE` regardless of which pool this is. Returns
+    /// `None` only when the pool is already at its hard cap with no idle
+    /// slot, so the launch/probe is rejected rather than silently
+    /// overcommitting.
     pub async fn claim_worker_force(&self, execution_id: &str, preferred_workspace_id: Option<&str>) -> Option<String> {
         let mut inner = self.inner.lock().await;
 
@@ -1242,15 +1268,15 @@ impl WorkerPool {
             return Some(worker_id);
         }
 
-        // Every existing slot is busy. Grow the pool — bounded by the
-        // hard cap so the app's fixed pane workspace can always render the
-        // forced worker.
-        if inner.workers.len() >= MAX_WORKER_POOL_SIZE {
+        // Every existing slot is busy. Grow the pool — bounded by this
+        // pool's own hard cap so the app's fixed pane workspace can always
+        // render the forced worker.
+        if inner.workers.len() >= self.hard_cap {
             return None;
         }
         let new_index = inner.workers.len();
         let worker = WorkerSlot {
-            worker_id: format!("worker-{}", new_index + 1),
+            worker_id: format!("{}{}", self.prefix, new_index + 1),
             execution_id: Some(execution_id.to_owned()),
             last_workspace_id: None,
         };

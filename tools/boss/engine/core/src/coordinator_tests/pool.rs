@@ -1424,6 +1424,272 @@ async fn force_dispatch_errors_at_hard_cap() {
     );
 }
 
+/// `force_dispatch`'s original bug: `claim_worker_force`'s pool-growth path
+/// always minted `worker-N` ids bounded by `MAX_WORKER_POOL_SIZE`, no matter
+/// which `WorkerPool` instance it was called on. Pin the fix directly at the
+/// `WorkerPool` level — independent of `force_dispatch`/pool classification
+/// — by growing a review pool past its configured size and checking both
+/// the minted id's prefix and the cap it is bounded by.
+#[tokio::test]
+async fn claim_worker_force_grows_review_pool_with_review_prefix_and_own_hard_cap() {
+    let pool = WorkerPool::new_review(1);
+    let first = pool.claim_worker("exec-0", None).await.unwrap();
+    assert_eq!(first, "review-1");
+    assert_eq!(pool.idle_count().await, 0);
+
+    let grown = pool
+        .claim_worker_force("exec-1", None)
+        .await
+        .expect("claim_worker_force should grow the review pool by one slot");
+    assert_eq!(
+        grown, "review-2",
+        "a forced claim that grows the review pool must mint a review- prefixed id, not worker-",
+    );
+    assert_eq!(pool.capacity().await, 2);
+
+    // Fill up to the review pool's OWN hard cap (MAX_REVIEW_POOL_SIZE),
+    // never MAX_WORKER_POOL_SIZE (16, and much larger).
+    for i in 2..MAX_REVIEW_POOL_SIZE {
+        pool.claim_worker_force(&format!("exec-{i}"), None)
+            .await
+            .unwrap_or_else(|| panic!("claim_worker_force should still grow the review pool at slot {i}"));
+    }
+    assert_eq!(pool.capacity().await, MAX_REVIEW_POOL_SIZE);
+    assert!(
+        pool.claim_worker_force("overflow", None).await.is_none(),
+        "claim_worker_force must reject once the review pool hits its OWN hard cap \
+         ({MAX_REVIEW_POOL_SIZE}), not the much larger MAX_WORKER_POOL_SIZE",
+    );
+    assert_eq!(pool.capacity().await, MAX_REVIEW_POOL_SIZE);
+}
+
+/// The core regression this fix closes: `force_dispatch` on a `pr_review`
+/// execution must classify it to the review pool exactly like
+/// `drain_ready_queue` does, claim a `review-` worker id (not `worker-`),
+/// resolve the pinned Opus reviewer policy through that id, and never touch
+/// the interactive/main pool's busy count. Before the fix, `force_dispatch`
+/// called `claim_worker_force` unconditionally on the main pool, which is
+/// exactly how a `pr_review` recovery-probe landed a review on Sonnet in an
+/// interactive slot (see the work item this closes).
+#[tokio::test]
+async fn force_dispatch_pr_review_claims_review_pool_worker_and_preserves_reviewer_policy() {
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+
+    let pr_url = "https://github.com/spinyfin/mono/pull/99";
+    let (_, chore_id) = make_pr_review_fixture(&db, Some(pr_url));
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id)
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let mut coord = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    );
+    coord.set_review_pool(WorkerPool::new_review(1));
+    let coordinator = Arc::new(coord);
+
+    let worker_id = coordinator
+        .force_dispatch(&execution.id)
+        .await
+        .expect("force_dispatch should claim a review-pool slot");
+    assert!(
+        worker_id.starts_with(REVIEW_WORKER_ID_PREFIX),
+        "a force-dispatched pr_review must claim a review- worker id, got {worker_id:?}",
+    );
+    assert_eq!(
+        pool_dispatch_policy_for_worker_id(&worker_id),
+        Some(PoolDispatchPolicy {
+            driver: "claude",
+            model_tier: PoolModelTier::Strong,
+        }),
+        "the review-pool worker id force_dispatch claimed must still resolve the pinned \
+         Claude/Opus reviewer policy",
+    );
+    assert_eq!(
+        coordinator.worker_pool().busy_count().await,
+        0,
+        "force-dispatching a pr_review must not consume an interactive/main-pool slot",
+    );
+    assert_eq!(coordinator.review_worker_pool().idle_count().await, 0);
+}
+
+/// Equivalent of the test above for an automation-pool kind: a regular
+/// task execution whose owning task carries `source_automation_id` must
+/// force-dispatch to an `auto-worker-` id (never `worker-`), resolve the
+/// same pinned Claude/Opus pool policy, and leave the interactive pool
+/// untouched.
+#[tokio::test]
+async fn force_dispatch_automation_sourced_task_claims_automation_pool_worker() {
+    use crate::work::CreateAutomationInput;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+
+    let automation = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Test automation".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "UTC".to_owned(),
+            },
+            standing_instruction: "do maintenance".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    let auto_chore = create_test_chore_manual(&db, product.id.clone(), "Automation chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+            rusqlite::params![automation.id, auto_chore.id],
+        )
+        .unwrap();
+    }
+    let execution = create_ready_chore_execution(&db, auto_chore.id.clone());
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let mut coord = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    );
+    coord.set_automation_pool(WorkerPool::new_automation(1));
+    let coordinator = Arc::new(coord);
+
+    let worker_id = coordinator
+        .force_dispatch(&execution.id)
+        .await
+        .expect("force_dispatch should claim an automation-pool slot");
+    assert!(
+        worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX),
+        "a force-dispatched automation-sourced task must claim an auto-worker- id, got {worker_id:?}",
+    );
+    assert_eq!(
+        pool_dispatch_policy_for_worker_id(&worker_id),
+        Some(PoolDispatchPolicy {
+            driver: "claude",
+            model_tier: PoolModelTier::Strong,
+        }),
+    );
+    assert_eq!(
+        coordinator.worker_pool().busy_count().await,
+        0,
+        "force-dispatching an automation-sourced task must not consume an interactive/main-pool slot",
+    );
+    assert_eq!(coordinator.automation_worker_pool().idle_count().await, 0);
+}
+
+/// Covers the `bossctl agents launch` entry point itself (not a direct
+/// `force_dispatch` call): `RequestExecutionInput { force: true }` — the
+/// same call `app/executions.rs` makes — on an automation-sourced chore
+/// must still route to the automation pool, not silently land on the main
+/// pool the way `force_dispatch` used to for every kind.
+#[tokio::test]
+async fn agents_launch_force_path_routes_automation_sourced_chore_to_automation_pool() {
+    use crate::work::CreateAutomationInput;
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+
+    let automation = db
+        .create_automation(CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Test automation".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "UTC".to_owned(),
+            },
+            standing_instruction: "do maintenance".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+
+    // `autostart(false)` so the chore does NOT get an auto-created `ready`
+    // execution — the launch verb's whole point is to skip-the-queue for a
+    // chore that would otherwise sit parked.
+    let auto_chore = create_test_chore_manual(&db, product.id.clone(), "Launched automation chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+            rusqlite::params![automation.id, auto_chore.id],
+        )
+        .unwrap();
+    }
+
+    let cube = Arc::new(FakeCubeClient::default());
+    let mut coord = ExecutionCoordinator::new(
+        db.clone(),
+        WorkerPool::new(1),
+        cube.clone(),
+        Arc::new(FakeExecutionRunner {
+            pending: true,
+            ..FakeExecutionRunner::default()
+        }),
+    );
+    coord.set_automation_pool(WorkerPool::new_automation(1));
+    let coordinator = Arc::new(coord);
+
+    // Mirror `app/executions.rs`'s `force = true` handler exactly:
+    // `request_execution` (force) then `force_dispatch` the resulting
+    // `ready` row.
+    let launched = db
+        .request_execution(
+            RequestExecutionInput::builder()
+                .work_item_id(auto_chore.id.clone())
+                .force(true)
+                .build(),
+        )
+        .unwrap();
+    assert_eq!(launched.status, ExecutionStatus::Ready);
+
+    let worker_id = coordinator
+        .force_dispatch(&launched.id)
+        .await
+        .expect("agents-launch force_dispatch should claim an automation-pool slot");
+    assert!(
+        worker_id.starts_with(AUTOMATION_WORKER_ID_PREFIX),
+        "bossctl agents launch on an automation-sourced chore must claim an auto-worker- id, \
+         got {worker_id:?}",
+    );
+    assert_eq!(
+        coordinator.worker_pool().busy_count().await,
+        0,
+        "bossctl agents launch on an automation-sourced chore must not consume an \
+         interactive/main-pool slot",
+    );
+    assert_eq!(coordinator.automation_worker_pool().idle_count().await, 0);
+}
+
 /// Regression for PR #345 — `bossctl work start`
 /// returned `status: ready` but no scheduler ever ran, leaving the
 /// row stranded. Root cause was a TOCTOU between the scheduler's
