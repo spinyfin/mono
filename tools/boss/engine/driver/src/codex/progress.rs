@@ -33,6 +33,18 @@ pub(super) struct RolloutToolCall {
     tool_input: Value,
 }
 
+/// Render a display string for one abandoned rollout tool call, for the
+/// unobserved-command notification. Prefers the reshaped `command` field
+/// (present for the `exec`/shell-shaped calls this detection cares about);
+/// falls back to `"<tool_name> <tool_input>"` for any other call shape so a
+/// non-shell tool call is still described rather than silently dropped.
+fn rollout_call_command_display(call: &RolloutToolCall) -> String {
+    match call.tool_input.get("command").and_then(Value::as_str) {
+        Some(command) => command.to_owned(),
+        None => format!("{} {}", call.tool_name, call.tool_input),
+    }
+}
+
 /// Thin adapter over [`boss_engine_codex_rollout::canonical_rollout_tool_call`].
 /// Progress tracking requires a `call_id`; transcript rendering does not.
 /// Shared pure reshape (exec → Bash, argv coerce) lives in the lower crate so
@@ -63,6 +75,11 @@ pub(super) struct CodexProgressSession {
     transcript_path_cache: Option<(String, String)>,
     turn_terminal: bool,
     terminal_message: Option<String>,
+    /// `command_execution` items whose `item.started` arrived but no
+    /// `item.completed` has yet, keyed by item id. Drained into abandoned-
+    /// command notifications whenever a Stop is about to be emitted — see
+    /// [`Self::drain_abandoned_command_notifications`].
+    open_commands: HashMap<String, String>,
 }
 
 impl CodexProgressSession {
@@ -81,7 +98,29 @@ impl CodexProgressSession {
             transcript_path_cache: None,
             turn_terminal: false,
             terminal_message: None,
+            open_commands: HashMap::new(),
         }
+    }
+
+    /// Abandoned-command detection (probe 6, exit-code investigation): drain
+    /// every still-open `command_execution` into a
+    /// [`WorkerEvent::Notification`] carrying
+    /// [`super::UNOBSERVED_COMMAND_MARKER`], ordered by item id for
+    /// determinism. Called immediately before a `Stop` is emitted so a later,
+    /// unrelated turn never re-flags the same command.
+    fn drain_abandoned_command_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
+        if self.open_commands.is_empty() {
+            return Vec::new();
+        }
+        let mut abandoned: Vec<(String, String)> = self.open_commands.drain().collect();
+        abandoned.sort_by(|left, right| left.0.cmp(&right.0));
+        abandoned
+            .into_iter()
+            .map(|(_, command)| WorkerEvent::Notification {
+                session_id: session_id.to_owned(),
+                message: super::unobserved_command_notification(&command),
+            })
+            .collect()
     }
 
     fn classify_thread_start(&mut self, thread_id: &str) -> SessionStartSource {
@@ -132,6 +171,7 @@ impl CodexProgressSession {
                 self.current_thread_id = Some(thread_id.to_owned());
                 self.turn_terminal = false;
                 self.terminal_message = None;
+                self.open_commands.clear();
                 // Codex stdout `thread.started` has no model field; SessionStart
                 // model remains None and the live-worker reducer keeps the
                 // launch default until a Claude-compatible hook supplies one.
@@ -175,11 +215,13 @@ impl CodexProgressSession {
                             Vec::new()
                         } else {
                             self.turn_terminal = true;
-                            vec![WorkerEvent::Stop {
+                            let mut events = self.drain_abandoned_command_notifications(&session_id);
+                            events.push(WorkerEvent::Stop {
                                 session_id,
                                 stop_hook_active: false,
                                 stop_reason: StopReason::Completed,
-                            }]
+                            });
+                            events
                         }
                     }
                     StdoutEnvelope::FatalError { message } => {
@@ -187,17 +229,17 @@ impl CodexProgressSession {
                         if !self.turn_terminal {
                             self.turn_terminal = true;
                             self.terminal_message = Some(message.to_owned());
-                            vec![
-                                WorkerEvent::Notification {
-                                    session_id: session_id.clone(),
-                                    message: message.to_owned(),
-                                },
-                                WorkerEvent::Stop {
-                                    session_id,
-                                    stop_hook_active: false,
-                                    stop_reason: StopReason::Other,
-                                },
-                            ]
+                            let mut events = self.drain_abandoned_command_notifications(&session_id);
+                            events.push(WorkerEvent::Notification {
+                                session_id: session_id.clone(),
+                                message: message.to_owned(),
+                            });
+                            events.push(WorkerEvent::Stop {
+                                session_id,
+                                stop_hook_active: false,
+                                stop_reason: StopReason::Other,
+                            });
+                            events
                         } else if duplicate_message {
                             tracing::debug!(message, "codex stdout: suppressing duplicate terminal error message");
                             Vec::new()
@@ -209,17 +251,22 @@ impl CodexProgressSession {
                             }]
                         }
                     }
-                    StdoutEnvelope::CommandStarted { command } => vec![WorkerEvent::PreToolUse {
-                        session_id,
-                        tool_name: "Bash".to_owned(),
-                        tool_input: json!({ "command": command }),
-                    }],
+                    StdoutEnvelope::CommandStarted { id, command } => {
+                        self.open_commands.insert(id.to_owned(), command.to_owned());
+                        vec![WorkerEvent::PreToolUse {
+                            session_id,
+                            tool_name: "Bash".to_owned(),
+                            tool_input: json!({ "command": command }),
+                        }]
+                    }
                     StdoutEnvelope::CommandCompleted {
+                        id,
                         command,
                         output,
                         exit_code,
                         status,
                     } => {
+                        self.open_commands.remove(id);
                         let mut events = vec![WorkerEvent::PostToolUse {
                             session_id: session_id.clone(),
                             tool_name: "Bash".to_owned(),
@@ -354,6 +401,33 @@ impl CodexRolloutProgressSession {
         Some(call)
     }
 
+    /// Abandoned-command detection (probe 6, exit-code investigation): drain
+    /// every rollout tool call that started (`function_call` /
+    /// `custom_tool_call`) but never received its matching output into a
+    /// [`WorkerEvent::Notification`] carrying
+    /// [`super::UNOBSERVED_COMMAND_MARKER`], oldest-first. Called immediately
+    /// before a `Stop` is emitted so a later, unrelated turn never re-flags
+    /// the same call.
+    fn drain_abandoned_command_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
+        if self.calls.is_empty() {
+            return Vec::new();
+        }
+        let ordered_ids = std::mem::take(&mut self.call_order);
+        let events = ordered_ids
+            .into_iter()
+            .filter_map(|call_id| self.calls.remove(&call_id))
+            .map(|call| WorkerEvent::Notification {
+                session_id: session_id.to_owned(),
+                message: super::unobserved_command_notification(&rollout_call_command_display(&call)),
+            })
+            .collect();
+        // Defensive: `call_order` is expected to mirror `calls`' keys exactly
+        // (every insert/removal keeps both in sync), but clear here too so a
+        // future divergence can never leak a call past its turn boundary.
+        self.calls.clear();
+        events
+    }
+
     fn session_id(&self) -> Result<String, NormalizeError> {
         self.current_thread_id
             .clone()
@@ -418,22 +492,28 @@ impl CodexRolloutProgressSession {
                         // `FatalError` handling above, which already uses it
                         // for the same purpose.
                         match rollout_task_complete_error_message(payload) {
-                            Some(message) => Ok(vec![
-                                WorkerEvent::Notification {
+                            Some(message) => {
+                                let mut events = self.drain_abandoned_command_notifications(&session_id);
+                                events.push(WorkerEvent::Notification {
                                     session_id: session_id.clone(),
                                     message: message.clone(),
-                                },
-                                WorkerEvent::Stop {
+                                });
+                                events.push(WorkerEvent::Stop {
                                     session_id,
                                     stop_hook_active: false,
                                     stop_reason: StopReason::Other,
-                                },
-                            ]),
-                            None => Ok(vec![WorkerEvent::Stop {
-                                session_id,
-                                stop_hook_active: false,
-                                stop_reason: StopReason::Completed,
-                            }]),
+                                });
+                                Ok(events)
+                            }
+                            None => {
+                                let mut events = self.drain_abandoned_command_notifications(&session_id);
+                                events.push(WorkerEvent::Stop {
+                                    session_id,
+                                    stop_hook_active: false,
+                                    stop_reason: StopReason::Completed,
+                                });
+                                Ok(events)
+                            }
                         }
                     }
                     "task_complete" => Err(NormalizeError::UnknownEvent(
@@ -442,21 +522,21 @@ impl CodexRolloutProgressSession {
                     "turn_aborted" if !self.turn_terminal => {
                         self.turn_terminal = true;
                         let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
-                        Ok(vec![
-                            WorkerEvent::Notification {
-                                session_id: session_id.clone(),
-                                message: format!("turn aborted: {reason}"),
-                            },
-                            WorkerEvent::Stop {
-                                session_id,
-                                stop_hook_active: false,
-                                // Distinct from the fatal-error `Other` above:
-                                // an abort is Codex acting on an interruption
-                                // (its own default reason string is literally
-                                // "interrupted"), not a provider/API failure.
-                                stop_reason: StopReason::Interrupted,
-                            },
-                        ])
+                        let mut events = self.drain_abandoned_command_notifications(&session_id);
+                        events.push(WorkerEvent::Notification {
+                            session_id: session_id.clone(),
+                            message: format!("turn aborted: {reason}"),
+                        });
+                        events.push(WorkerEvent::Stop {
+                            session_id,
+                            stop_hook_active: false,
+                            // Distinct from the fatal-error `Other` above:
+                            // an abort is Codex acting on an interruption
+                            // (its own default reason string is literally
+                            // "interrupted"), not a provider/API failure.
+                            stop_reason: StopReason::Interrupted,
+                        });
+                        Ok(events)
                     }
                     "turn_aborted" => Err(NormalizeError::UnknownEvent(
                         "duplicate rollout turn_aborted".to_owned(),
@@ -594,9 +674,11 @@ enum StdoutEnvelope<'a> {
         message: &'a str,
     },
     CommandStarted {
+        id: &'a str,
         command: &'a str,
     },
     CommandCompleted {
+        id: &'a str,
         command: &'a str,
         output: &'a str,
         exit_code: Option<i64>,
@@ -654,13 +736,21 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                 .ok_or(NormalizeError::MissingField("item.type"))?;
             match (envelope_type, item_type) {
                 ("item.started", "command_execution") => {
+                    let id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or(NormalizeError::MissingField("item.id"))?;
                     let command = item
                         .get("command")
                         .and_then(Value::as_str)
                         .ok_or(NormalizeError::MissingField("item.command"))?;
-                    Ok(StdoutEnvelope::CommandStarted { command })
+                    Ok(StdoutEnvelope::CommandStarted { id, command })
                 }
                 ("item.completed", "command_execution") => {
+                    let id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .ok_or(NormalizeError::MissingField("item.id"))?;
                     let command = item
                         .get("command")
                         .and_then(Value::as_str)
@@ -676,6 +766,7 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                     let exit_code = item.get("exit_code").and_then(Value::as_i64);
                     let status = item.get("status").and_then(Value::as_str);
                     Ok(StdoutEnvelope::CommandCompleted {
+                        id,
                         command,
                         output,
                         exit_code,
@@ -1143,6 +1234,76 @@ mod tests {
                 stop_hook_active: false,
                 stop_reason: StopReason::Completed,
             }
+        );
+    }
+
+    #[test]
+    fn stdout_command_started_with_no_completion_is_flagged_abandoned_at_turn_boundary() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-abandon"}))
+            .unwrap();
+        session.normalize_stdout(&json!({"type":"turn.started"})).unwrap();
+        session
+            .normalize_stdout(&json!({
+                "type":"item.started",
+                "item":{"id":"item_0","type":"command_execution","command":"sleep 999"}
+            }))
+            .unwrap();
+
+        // No item.completed ever arrives for item_0 (probe 6: the shell
+        // command outlives the model's yield window and the model stops
+        // polling) — turn.completed still fires.
+        let events = session
+            .normalize_stdout_events(&json!({"type":"turn.completed","usage":{}}))
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-abandon".into(),
+                    message: crate::codex::unobserved_command_notification("sleep 999"),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-abandon".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Completed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn stdout_command_completed_normally_never_flags_abandoned() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-clean"}))
+            .unwrap();
+        session.normalize_stdout(&json!({"type":"turn.started"})).unwrap();
+        session
+            .normalize_stdout(&json!({
+                "type":"item.started",
+                "item":{"id":"item_0","type":"command_execution","command":"echo hi"}
+            }))
+            .unwrap();
+        session
+            .normalize_stdout(&json!({
+                "type":"item.completed",
+                "item":{"id":"item_0","type":"command_execution","command":"echo hi","aggregated_output":"hi\n"}
+            }))
+            .unwrap();
+
+        let events = session
+            .normalize_stdout_events(&json!({"type":"turn.completed","usage":{}}))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![WorkerEvent::Stop {
+                session_id: "thread-clean".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Completed,
+            }]
         );
     }
 
@@ -1771,6 +1932,100 @@ mod tests {
             })),
             Err(NormalizeError::UnknownEvent(_))
         ));
+    }
+
+    #[test]
+    fn rollout_call_with_no_output_is_flagged_abandoned_at_task_complete() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-abandon","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"exec_command",
+                    "call_id":"call-abandon",
+                    "arguments":r#"{"cmd":"sleep 999"}"#
+                }
+            }))
+            .unwrap();
+
+        // No function_call_output for call-abandon ever arrives (probe 6) —
+        // task_complete still fires.
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","turn_id":"turn-abandon"}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-abandon".into(),
+                    message: crate::codex::unobserved_command_notification("sleep 999"),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-abandon".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Completed,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rollout_call_with_no_output_is_flagged_abandoned_at_turn_aborted() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-abort","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":"call-abort",
+                    "input":"sleep 999"
+                }
+            }))
+            .unwrap();
+
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"turn_aborted","reason":"interrupted"}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-abort".into(),
+                    message: crate::codex::unobserved_command_notification("sleep 999"),
+                },
+                WorkerEvent::Notification {
+                    session_id: "thread-abort".into(),
+                    message: "turn aborted: interrupted".into(),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-abort".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Other,
+                },
+            ]
+        );
     }
 
     #[test]

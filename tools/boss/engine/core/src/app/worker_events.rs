@@ -91,6 +91,11 @@ pub(super) async fn dispatch_worker_event_fanout(
     );
     crate::events_socket::publish_hook_derived_events(&server_state.event_bus, incoming).await;
     dispatch_live_worker_state(server_state, incoming).await;
+    // Codex unobserved-command detection: stage any abandoned-command
+    // Notification the progress session emitted ahead of its Stop, so
+    // `on_stop`'s NO_CHANGES_NEEDED gate (dispatched later in this same
+    // fan-out chain, on the following Stop event) sees it.
+    dispatch_codex_unobserved_command_on_notification(server_state, incoming);
     // Editorial PreToolUse audit: evaluate every
     // `gh pr|issue` Bash invocation against the
     // product's editorial rules and record the
@@ -169,6 +174,44 @@ pub(super) fn record_turn_boundary_on_stop(
             "failed to record turn boundary on run; a one-shot worker's clean exit \
              will now be reaped as a death (fail-safe direction)",
         ),
+    }
+}
+
+/// Stage a Codex "unobserved command" signal: a `command_execution` whose
+/// start record was observed but never completed before its turn boundary.
+/// The progress session in `boss_engine_driver::codex` detects the gap
+/// structurally (it already correlates start/complete pairs to emit
+/// `PreToolUse`/`PostToolUse`) and surfaces it as a `WorkerEvent::Notification`
+/// carrying [`crate::driver::codex::UNOBSERVED_COMMAND_MARKER`], ordered
+/// ahead of the `Stop` it precedes in the same normalised batch. Staging it
+/// here — mirroring the `boss propose` failure capture in
+/// `proposal_channel_error` — lets `WorkerCompletionHandler::on_stop` see it
+/// by the time that later `Stop` event's own dispatch call reaches
+/// `dispatch_completion_on_stop`.
+///
+/// A no-op for every event that isn't a matching `Notification` — in
+/// particular, every hook-shaped event Claude and every other driver emits.
+pub(super) fn dispatch_codex_unobserved_command_on_notification(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::WorkerEvent;
+    let WorkerEvent::Notification { message, .. } = &incoming.event else {
+        return;
+    };
+    let Some(command) = message.strip_prefix(crate::driver::codex::UNOBSERVED_COMMAND_MARKER) else {
+        return;
+    };
+    let Some(run_id) = incoming.run_id.as_deref() else {
+        return;
+    };
+    if server_state.staged_unobserved_commands.record(run_id, command.trim()) {
+        tracing::warn!(
+            execution_id = run_id,
+            command = command.trim(),
+            "codex_unobserved_command: staged an abandoned command_execution (item.started with no \
+             item.completed observed before the turn boundary)",
+        );
     }
 }
 

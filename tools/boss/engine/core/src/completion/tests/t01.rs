@@ -2410,3 +2410,57 @@ async fn recheck_for_pr_is_quiet_on_stale_pr() {
     assert!(cube.release_calls.lock().await.is_empty());
     assert!(pane.calls.lock().await.is_empty());
 }
+
+#[tokio::test]
+async fn no_op_marker_is_refused_when_a_command_was_left_unobserved() {
+    // A Codex command_execution started but never observed a completion
+    // before the turn boundary (probe 6, exit-code investigation). Even
+    // though the worker emitted NO_CHANGES_NEEDED, the "validation passed"
+    // claim rests on a command Boss never confirmed the outcome of — the
+    // no-op gate must refuse it and fall through to the normal
+    // produce-a-PR nudge instead of closing the task as done.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nRan the test suite and it passed; nothing else to change.\n\nNO_CHANGES_NEEDED\n",
+    );
+    let detector = StubPrDetector::ok(None);
+
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    handler
+        .staged_unobserved_commands
+        .record(&execution_id, "bazel test //tools/boss/...");
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::AwaitingInput),
+        "an unobserved command must refuse the no-op claim and fall through to the produce-a-PR \
+         nudge; got {outcome:?}",
+    );
+    assert_eq!(
+        probes.snapshot(),
+        [(execution_id.clone(), PROBE_NO_PR.to_owned())],
+        "the refused no-op claim must still get the normal produce-a-PR nudge",
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => {
+            assert_eq!(
+                t.status,
+                TaskStatus::Active,
+                "a refused no-op must not close the task as done"
+            );
+            assert!(t.pr_url.is_none());
+        }
+        other => panic!("expected chore, got {other:?}"),
+    }
+    let items = db.list_attention_items(&execution_id).unwrap();
+    assert!(
+        items
+            .iter()
+            .any(|i| i.kind == crate::codex_unobserved_command::UNOBSERVED_COMMAND_ATTENTION_KIND),
+        "the unobserved command must file its own attention item; got {items:?}",
+    );
+}

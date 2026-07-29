@@ -584,6 +584,15 @@ struct ServerState {
     /// increments `worker_proposals.channel_error`. See
     /// [`crate::proposal_channel_error`].
     staged_proposal_channel_errors: Arc<crate::proposal_channel_error::ProposalChannelErrorTracker>,
+    /// In-memory `execution_id → abandoned commands` staging map for Codex
+    /// `command_execution` items whose `item.started` was observed with no
+    /// matching `item.completed` before the turn boundary. Populated by the
+    /// worker-event dispatcher from a `WorkerEvent::Notification` carrying
+    /// [`crate::driver::codex::UNOBSERVED_COMMAND_MARKER`]; shared with the
+    /// completion handler so `on_stop`'s unobserved-command pass and its
+    /// `NO_CHANGES_NEEDED` refusal gate see the same state. See
+    /// [`crate::codex_unobserved_command`].
+    staged_unobserved_commands: Arc<crate::codex_unobserved_command::UnobservedCommandTracker>,
     /// Per-execution deny counter for the editorial PreToolUse loop guard
     /// (design R3). State is in-memory only; a restart resets it to zero,
     /// which is the safe direction (worst case a worker gets three fresh
@@ -932,6 +941,7 @@ impl ServerState {
         let staged_revision_pushes = Arc::new(crate::pr_url_capture::StagedRevisionPushCache::new());
         let staged_proposal_channel_errors =
             Arc::new(crate::proposal_channel_error::ProposalChannelErrorTracker::new());
+        let staged_unobserved_commands = Arc::new(crate::codex_unobserved_command::UnobservedCommandTracker::new());
 
         // Resolve the Boss state root early — both the feature-flags
         // store (loaded below, before the completion handler is
@@ -1093,6 +1103,7 @@ impl ServerState {
             .with_staged_pr_urls(staged_pr_urls.clone())
             .with_staged_revision_pushes(staged_revision_pushes.clone())
             .with_staged_proposal_channel_errors(staged_proposal_channel_errors.clone())
+            .with_staged_unobserved_commands(staged_unobserved_commands.clone())
             .with_feature_flags(feature_flags_for_handler)
             .with_merge_probe(ci_probe)
             .with_metrics(metrics_for_completion)
@@ -1232,6 +1243,7 @@ impl ServerState {
                 .staged_pr_urls(staged_pr_urls)
                 .staged_revision_pushes(staged_revision_pushes)
                 .staged_proposal_channel_errors(staged_proposal_channel_errors)
+                .staged_unobserved_commands(staged_unobserved_commands)
                 .editorial_deny_tracker(Arc::new(crate::editorial_hook::DenyTracker::new()))
                 .maybe_anthropic_api_key(anthropic_api_key)
                 .utility_model(utility_model)
