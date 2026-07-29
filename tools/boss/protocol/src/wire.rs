@@ -1510,41 +1510,50 @@ pub enum FrontendRequest {
         cap: Option<usize>,
     },
 
-    /// Boss-tier RPC: queue a probe prompt for `run_id`. By default
-    /// the engine holds the text until the next `Stop` hook event for
-    /// that run, then writes it into the worker's pty as if it were
-    /// typed by the user. When `urgent` is `true`, the engine delivers
-    /// the probe at the next `PostToolUse` boundary instead — after the
-    /// current tool call finishes (so no in-flight Bash is cancelled)
-    /// but before the worker starts its next tool call. Urgent probes
-    /// are pushed to the front of the per-run queue so they always
-    /// land before any queued non-urgent probes.
+    /// Boss-tier RPC: queue a probe prompt for `run_id` and deliver it at the
+    /// earliest opportunity the worker's pane actually offers.
+    ///
+    /// Transport follows the worker's pane posture, not the caller: if the
+    /// pane will take a write — parked at its prompt, or mid-turn on a driver
+    /// that buffers pane input, as Claude Code does — the engine writes the
+    /// text during this call and the agent takes it as a prompt without
+    /// needing a boundary. Only a pane that cannot be written to holds the
+    /// text for the next `PostToolUse` boundary and then the next `Stop`.
+    /// Waiting for a `Stop` was the old default, and for a worker in a long
+    /// autonomous run that is effectively its terminal one — so a probe meant
+    /// to steer arrived after the work it was meant to redirect.
     ///
     /// The engine evaluates deliverability **before** accepting, and answers
     /// with exactly one of two events. On acceptance,
     /// [`FrontendEvent::ProbeQueued`] carries the engine-minted `probe_id`
     /// and the [`crate::ProbeDeliveryExpectation`] the engine believes it can
     /// keep. When the probe cannot be delivered at all — no live pane for the
-    /// run, a terminal worker, or `urgent` against a driver whose foreground
-    /// process does not accept mid-turn input — it answers
+    /// run, or a terminal worker — it answers
     /// [`FrontendEvent::ProbeRefused`] and queues nothing. Accepting a probe
     /// that will never arrive is the failure mode this split exists to
     /// prevent: the caller could not distinguish it from "arriving shortly".
     ///
+    /// One probe is delivered per reply cycle: while a probe is in flight
+    /// (written, reply not yet emitted) the rest of the run's queue waits, so
+    /// several probes arrive in order rather than piling into the composer at
+    /// once. A chore-update notice is written on a separate path and is not
+    /// serialized against probes — the agent consumes whichever text reached
+    /// its composer first, exactly as it would for a human typing.
+    ///
     /// The worker's reply is surfaced asynchronously via
     /// [`FrontendEvent::ProbeReplied`] on the [`probe_topic`] for
     /// `run_id`, and delivery progress can be polled with
-    /// [`FrontendRequest::ProbeStatus`]. Urgent probes are prefixed with
+    /// [`FrontendRequest::ProbeStatus`]. Mid-turn probes are prefixed with
     /// `[coordinator-nudge]` in the transcript so the worker and human
     /// readers can identify coordinator-injected text.
     ProbeRun {
         run_id: String,
         text: String,
-        /// When `true`, deliver at the next tool-call boundary
-        /// (PostToolUse) rather than the next Stop boundary. The
-        /// engine waits for any in-flight tool call to return before
-        /// injecting, so no work is discarded. Omit or set to `false`
-        /// for the original queue-for-Stop behaviour.
+        /// Queue **priority**, not transport: when `true` the probe is pushed
+        /// to the front of the run's queue so it lands before any probe
+        /// already waiting there. It does not select a delivery boundary —
+        /// the engine picks the earliest one the pane allows either way — and
+        /// it is not a precondition for mid-turn delivery.
         #[serde(default)]
         urgent: bool,
     },

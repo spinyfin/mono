@@ -300,15 +300,6 @@ impl ServerState {
         self.live_worker_states.get(slot_id).map(|s| s.activity)
     }
 
-    /// True when `slot_id` has a live worker parked at its prompt. This is
-    /// the driver-independent floor only — for the full injection decision
-    /// (which also admits mid-turn writes on a buffering driver) use
-    /// [`Self::pane_input_posture_for_run`].
-    pub(super) fn pane_accepts_typed_input(&self, slot_id: u8) -> bool {
-        self.pane_typed_input_activity(slot_id)
-            .is_some_and(WorkerActivity::accepts_typed_input)
-    }
-
     /// What this run's driver does with mid-turn pane input.
     ///
     /// Fails closed to [`crate::driver::MidTurnPaneInput::Rejects`] when the

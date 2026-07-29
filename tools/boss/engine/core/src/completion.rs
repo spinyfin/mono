@@ -1004,9 +1004,16 @@ pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
 /// that can't be delivered are dropped silently at injection time
 /// (see `dispatch_probe_on_stop` in `app.rs`).
 pub trait ProbeQueuer: Send + Sync {
-    /// Push `text` onto the FIFO of probes for `run_id`. The next
-    /// `Stop` event for the run pops one and `SendToPane`'s it as if
-    /// the human had typed it.
+    /// Push `text` onto the FIFO of probes for `run_id`. The engine
+    /// `SendToPane`'s it as if the human had typed it, at the earliest
+    /// point the worker's pane will take a write.
+    ///
+    /// For a completion-driven probe that point is always the `Stop`
+    /// currently being handled: the completion handler runs inside the Stop
+    /// fan-out, before `dispatch_probe_on_stop`, so a nudge queued here is
+    /// delivered on the same boundary that produced it. That is a structural
+    /// property of this path, not a flag — a completion probe is never queued
+    /// mid-turn, so it never reaches a tool-boundary delivery.
     fn queue_probe(&self, run_id: &str, text: &str);
 
     /// Drop every not-yet-delivered probe queued for `run_id`.

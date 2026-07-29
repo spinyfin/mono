@@ -1,10 +1,12 @@
 //! Probe queueing and lifecycle tracking.
 //!
 //! A *probe* is a question the coordinator (or the completion handler)
-//! injects into a live worker's pane so the worker answers it at its next
-//! `Stop`/`PostToolUse` boundary. This module owns the per-run pending
-//! queue, the single in-flight slot awaiting a reply, and the observable
-//! [`ProbeDeliveryState`] each probe id moves through.
+//! injects into a live worker's pane, delivered at the earliest point that
+//! pane will take a write — during the `ProbeRun` call itself for a pane in a
+//! writable posture, otherwise at a `PostToolUse` or `Stop` boundary. This
+//! module owns the per-run pending queue, the single in-flight slot awaiting
+//! a reply, and the observable [`ProbeDeliveryState`] each probe id moves
+//! through.
 //!
 //! Split out of `app.rs`; pure structural move — no behavioural change.
 
@@ -14,9 +16,10 @@ use super::*;
 /// `ServerState::pending_probes` without depending on `ServerState`
 /// directly. Same late-bind dance as `ServerStatePaneReleaser` — the
 /// completion handler is built before the `Arc<ServerState>` exists,
-/// then `set_server_state` plumbs the upgrade target in. The next
-/// `Stop` event for the run pops one queued entry and `SendToPane`s
-/// it as if the user had typed it (`dispatch_probe_on_stop`).
+/// then `set_server_state` plumbs the upgrade target in. A probe queued
+/// through this adapter is queued from inside a `Stop` fan-out, and
+/// `dispatch_probe_on_stop` — which runs later in that same fan-out —
+/// `SendToPane`s it as if the user had typed it.
 #[derive(Default)]
 pub(super) struct ServerStateProbeQueuer {
     server: std::sync::OnceLock<Weak<ServerState>>,
@@ -62,10 +65,6 @@ impl ProbeQueuer for ServerStateProbeQueuer {
 pub(super) struct PendingProbe {
     pub(super) probe_id: String,
     pub(super) text: String,
-    /// When `true`, dispatch at the next `PostToolUse` boundary
-    /// rather than waiting for the next `Stop`. Urgent probes are
-    /// always inserted at the front of the per-run queue.
-    pub(super) urgent: bool,
 }
 
 /// One probe that has been written into the worker's pane and is
@@ -109,16 +108,24 @@ impl ServerState {
     /// queued probe with the eventual `FrontendEvent::ProbeReplied`
     /// push. Non-urgent probes append to the back (FIFO); urgent
     /// probes push to the front so they fire before any queued
-    /// non-urgent probes. The events-socket consumer delivers one
-    /// probe per `Stop` event (non-urgent) or per `PostToolUse`
-    /// event (urgent).
+    /// non-urgent probes.
+    ///
+    /// Queueing says nothing about *where* the probe is delivered — that
+    /// is chosen from the worker's pane posture at each delivery
+    /// opportunity (during this call for a writable pane, then at every
+    /// `PostToolUse`, then at every `Stop`). One probe is delivered per
+    /// reply cycle: see [`Self::has_in_flight_probe`].
     pub fn queue_probe(&self, run_id: String, text: String, urgent: bool) -> String {
         let probe_id = self.allocate_probe_id();
         let probe = PendingProbe {
             probe_id: probe_id.clone(),
             text,
-            urgent,
         };
+        // Urgency lives on the queue (position) and on the lifecycle record
+        // below (`ProbeRecord::urgent`, what `bossctl probe-status` reports).
+        // It is deliberately not carried on the pending entry: nothing after
+        // insertion branches on it, because transport is chosen from the
+        // worker's pane posture rather than from the caller's flag.
         self.probe_lifecycle
             .lock()
             .expect("probe_lifecycle mutex poisoned")
@@ -141,10 +148,12 @@ impl ServerState {
         probe_id
     }
 
-    /// Push a pre-minted `PendingProbe` back onto the front of the
-    /// queue for `run_id`. Used when `SendToPane` fails after we've
-    /// already popped the probe — the next Stop will retry, and the
-    /// caller's `probe_id` stays stable across the retry.
+    /// Push a pre-minted `PendingProbe` back onto the front of the queue for
+    /// `run_id`. Used when `SendToPane` fails after the probe was already
+    /// claimed — a later delivery opportunity retries, and the caller's
+    /// `probe_id` stays stable across the retry. Delivery sites should call
+    /// [`Self::release_probe_reservation`], which also frees the in-flight
+    /// slot.
     pub(super) fn requeue_probe_front(&self, run_id: String, probe: PendingProbe) {
         self.pending_probes
             .lock()
@@ -158,8 +167,15 @@ impl ServerState {
         format!("probe-{}", self.next_probe_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Pop the next pending probe for `run_id`, if any. Called from
-    /// the events-socket consumer when a `Stop` event arrives.
+    /// Pop the next pending probe for `run_id`, if any, without claiming the
+    /// run's in-flight slot.
+    ///
+    /// Test-only: every production delivery site goes through
+    /// [`Self::try_reserve_probe_for_delivery`], which pops *and* claims
+    /// atomically. A bare pop would reintroduce the window this rule exists to
+    /// close, so it stays out of the shipped build rather than sitting there
+    /// as the obvious-looking wrong choice.
+    #[cfg(test)]
     pub(super) fn pop_pending_probe(&self, run_id: &str) -> Option<PendingProbe> {
         let mut guard = self.pending_probes.lock().expect("pending_probes mutex poisoned");
         let queue = guard.get_mut(run_id)?;
@@ -168,6 +184,97 @@ impl ServerState {
             guard.remove(run_id);
         }
         probe
+    }
+
+    /// True when at least one probe is queued (not yet written into the
+    /// pane) for `run_id`. Lets the `PostToolUse` dispatcher no-op on the
+    /// overwhelming majority of tool boundaries without touching the
+    /// registry, the driver table, or the DB.
+    pub(super) fn has_pending_probe(&self, run_id: &str) -> bool {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// True when a probe has been written into `run_id`'s pane (or claimed
+    /// the run's delivery slot and is about to be) and its `ProbeReplied` is
+    /// still outstanding.
+    ///
+    /// Cheap pre-check only — [`Self::try_reserve_probe_for_delivery`] is the
+    /// one that decides, atomically. Every turn boundary clears the slot
+    /// unconditionally (`take_in_flight_probe` in
+    /// `dispatch_probe_reply_on_stop`), so a probe held back by this is
+    /// deferred by at most one reply cycle rather than stalled.
+    pub(super) fn has_in_flight_probe(&self, run_id: &str) -> bool {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .contains_key(run_id)
+    }
+
+    /// Claim the next queued probe for `run_id` **and** the run's single
+    /// in-flight slot in one atomic step, or return `None` if either is
+    /// unavailable.
+    ///
+    /// This is what makes "one probe in flight per run" a rule rather than a
+    /// hope. There are three concurrent delivery sites — the `ProbeRun` call
+    /// itself, every `PostToolUse`, and every `Stop` — and the pane write
+    /// between claiming a probe and recording it takes a round trip plus a
+    /// verification window. Checking `in_flight_probes` separately from
+    /// popping would let two of those sites both observe an empty slot and
+    /// both deliver, and since the slot holds one entry the first probe's
+    /// pending `ProbeReplied` would be silently discarded.
+    ///
+    /// The caller snapshots `transcript_path`/`offset_bytes` *before* calling
+    /// so the in-flight entry is complete from the moment it exists: any
+    /// boundary that lands mid-write still finds a well-formed entry to
+    /// extract a reply against, never a half-populated placeholder.
+    ///
+    /// Release the claim with [`Self::release_probe_reservation`] if the
+    /// write cannot be completed.
+    ///
+    /// Lock order is `in_flight_probes` → `pending_probes`; no other path
+    /// holds both, so there is nothing to deadlock against.
+    pub(super) fn try_reserve_probe_for_delivery(
+        &self,
+        run_id: &str,
+        transcript_path: Option<String>,
+        offset_bytes: u64,
+    ) -> Option<PendingProbe> {
+        let mut in_flight = self.in_flight_probes.lock().expect("in_flight_probes mutex poisoned");
+        if in_flight.contains_key(run_id) {
+            return None;
+        }
+        let mut pending = self.pending_probes.lock().expect("pending_probes mutex poisoned");
+        let queue = pending.get_mut(run_id)?;
+        let probe = queue.pop_front()?;
+        if queue.is_empty() {
+            pending.remove(run_id);
+        }
+        in_flight.insert(
+            run_id.to_owned(),
+            InFlightProbe {
+                probe_id: probe.probe_id.clone(),
+                transcript_path,
+                offset_bytes,
+            },
+        );
+        Some(probe)
+    }
+
+    /// Give back a claim taken by [`Self::try_reserve_probe_for_delivery`]
+    /// when the pane write did not happen: the probe returns to the front of
+    /// the queue with its id intact (callers waiting on the matching
+    /// `ProbeReplied` must not see their id reissued) and the run's in-flight
+    /// slot is freed for the next attempt.
+    pub(super) fn release_probe_reservation(&self, run_id: &str, probe: PendingProbe) {
+        self.in_flight_probes
+            .lock()
+            .expect("in_flight_probes mutex poisoned")
+            .remove(run_id);
+        self.requeue_probe_front(run_id.to_owned(), probe);
     }
 
     /// Drop every not-yet-delivered probe queued for `run_id`. Used by
@@ -182,34 +289,6 @@ impl ServerState {
             .lock()
             .expect("pending_probes mutex poisoned")
             .remove(run_id);
-    }
-
-    /// Note that `probe_id` was just dispatched into the worker's
-    /// pane for `run_id`. The next `Stop` boundary on this run will
-    /// look for an in-flight entry, read the transcript bytes
-    /// written after `offset_bytes`, and emit
-    /// `FrontendEvent::ProbeReplied`. Any prior in-flight probe for
-    /// the same run is overwritten — we only track one outstanding
-    /// reply at a time per run, since dispatch is serialized on
-    /// `Stop` events.
-    pub(super) fn note_probe_dispatched(
-        &self,
-        run_id: String,
-        probe_id: String,
-        transcript_path: Option<String>,
-        offset_bytes: u64,
-    ) {
-        self.in_flight_probes
-            .lock()
-            .expect("in_flight_probes mutex poisoned")
-            .insert(
-                run_id,
-                InFlightProbe {
-                    probe_id,
-                    transcript_path,
-                    offset_bytes,
-                },
-            );
     }
 
     /// Take and return the in-flight probe for `run_id`, if any.

@@ -118,7 +118,7 @@ use pane_ops::SendInputError;
 use pane_ops::{FocusPaneError, InterruptPaneError, OpenDocumentError, RetirePaneError};
 
 // Re-import worker event dispatch functions so child modules can access them via `use super::*`.
-use worker_events::{dispatch_probe_if_idle, dispatch_worker_event_fanout};
+use worker_events::{dispatch_probe_now, dispatch_worker_event_fanout};
 
 // Production ingress paths go through `dispatch_worker_event_fanout`, which
 // calls these in order. Only the test modules name them individually, to drive
@@ -126,8 +126,7 @@ use worker_events::{dispatch_probe_if_idle, dispatch_worker_event_fanout};
 // same situation as the `pane_ops` import above.
 #[cfg(test)]
 use worker_events::{
-    dispatch_live_worker_state, dispatch_probe_on_stop, dispatch_probe_reply_on_stop,
-    dispatch_urgent_probe_on_post_tool_use,
+    dispatch_live_worker_state, dispatch_probe_on_post_tool_use, dispatch_probe_on_stop, dispatch_probe_reply_on_stop,
 };
 
 // Re-import verified pane-injection types so child modules can access them via `use super::*`.

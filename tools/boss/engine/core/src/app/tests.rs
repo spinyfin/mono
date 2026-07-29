@@ -134,8 +134,8 @@ pub(super) fn register_working_worker_with_driver(
 
 /// Like [`register_working_worker_with_driver`], but leaves the slot at
 /// [`boss_protocol::WorkerActivity::Spawning`] — a worker whose pane exists
-/// but which has not reached a tool boundary yet. Used to pin that a refusal
-/// for this activity does not blame the driver, which is never consulted.
+/// but which has not reached a tool boundary yet. Used to pin which delivery
+/// boundary the engine promises before a worker's first turn starts.
 pub(super) fn register_spawning_worker_with_driver(
     server_state: &ServerState,
     slot_id: u8,

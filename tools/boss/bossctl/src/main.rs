@@ -68,23 +68,20 @@ enum Command {
         #[command(subcommand)]
         action: AgentsAction,
     },
-    /// Inject a probe prompt into a worker. If the worker is currently
-    /// parked (idle between turns, or sitting at its prompt after a
-    /// Stop that followed a notification/permission prompt) the text
-    /// lands immediately; if the worker is actively running it is
-    /// queued and delivered at the next Stop boundary. With
-    /// `--urgent`, the probe is delivered at the next tool-call
-    /// boundary (PostToolUse) instead of the next Stop boundary, so
-    /// the coordinator can redirect a mid-task worker without waiting
-    /// for it to finish its current turn. The engine always waits for
-    /// any in-flight tool call to return before injecting, so no work
-    /// is discarded.
+    /// Inject a probe prompt into a worker, delivered at the earliest
+    /// opportunity its pane offers. A parked worker (idle between turns, or
+    /// sitting at its prompt after a Stop that followed a
+    /// notification/permission prompt) takes the text immediately. A worker
+    /// that is mid-task also takes it immediately, buffered in its agent's
+    /// composer the same way text typed into the pane by hand would be — so
+    /// a probe can steer a worker in the middle of a long autonomous run
+    /// rather than reaching it as it exits. Only a worker whose driver reads
+    /// no mid-turn input at all waits for a boundary.
     ///
     /// The engine checks that the probe can actually be delivered before
     /// accepting it, and prints the boundary it committed to. If it cannot
-    /// deliver — no live pane, a terminal worker, or `--urgent` against a
-    /// driver that will not take mid-turn input — this exits non-zero rather
-    /// than reporting a queued probe that would never arrive.
+    /// deliver at all — no live pane, or a terminal worker — this exits
+    /// non-zero rather than reporting a queued probe that would never arrive.
     Probe {
         /// Worker reference: run id, slot id, or crew name (e.g.
         /// `Riker`). Crew names resolve only over currently-live
@@ -92,11 +89,10 @@ enum Command {
         agent: String,
         /// Probe text the worker will see as its next prompt.
         text: String,
-        /// Deliver the probe at the next tool-call boundary
-        /// (PostToolUse) instead of the next Stop boundary. Urgent
-        /// probes jump ahead of any queued non-urgent probes and are
-        /// prefixed with `[coordinator-nudge]` in the transcript so
-        /// the worker and human readers can identify them.
+        /// Jump the queue: deliver this probe before any probe already
+        /// waiting for the same worker. This is priority only — it does not
+        /// change *where* the probe is delivered, since the engine already
+        /// picks the earliest boundary the worker's pane allows.
         #[arg(long)]
         urgent: bool,
     },
