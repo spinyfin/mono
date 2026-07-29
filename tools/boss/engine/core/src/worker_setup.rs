@@ -62,7 +62,6 @@ use serde_json;
 
 use boss_protocol::ExecutionKind;
 
-use crate::driver::claude::{CLAUDE_DIR_GITIGNORE, pre_trust_workspace};
 use crate::driver::{
     AgentDriver, HookWiringDestination, ProgressIngress, ProgressObservationConfig, ToolUseInterceptionConfig,
 };
@@ -1752,9 +1751,12 @@ pub fn write_workspace_files(
     // Pre-accept the driver's first-run folder-trust dialog for this
     // workspace. Boss/cube created the workspace for the agent, so it is
     // trusted by construction; without this the headless worker wedges on
-    // the dialog (no human to press "1"). Best-effort — see
-    // [`crate::driver::claude::pre_trust_workspace`].
-    pre_trust_workspace(&input.workspace_path);
+    // the dialog (no human to press "1"). Best-effort, and driver-supplied —
+    // see [`crate::driver::AgentDriver::pre_trust_workspace`]: most drivers
+    // no-op here because `provision_workspace` already stamped their own
+    // trust record; only Claude's lives outside any per-run home and needs
+    // this second seam.
+    driver.pre_trust_workspace(&input.workspace_path);
 
     // Not necessarily under `config_dir`: a driver whose agent reads its
     // rules file from elsewhere (e.g. Codex's `$CODEX_HOME/AGENTS.md`, never
@@ -1770,7 +1772,7 @@ pub fn write_workspace_files(
         &agent_rules_path,
         render_claude_md(input, preamble, descriptor.config_dir),
     )?;
-    std::fs::write(&gitignore_path, CLAUDE_DIR_GITIGNORE)?;
+    std::fs::write(&gitignore_path, driver.config_dir_gitignore())?;
 
     let settings_path = worker_settings_path(&input.workspace_path);
     if let Some(parent) = settings_path.parent() {

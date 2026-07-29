@@ -1539,6 +1539,32 @@ pub trait AgentDriver: Send + Sync {
         runtime_state: Option<&DriverRuntimeState>,
     ) -> anyhow::Result<()>;
 
+    /// Pre-accept this driver's first-run trust/folder-approval dialog for
+    /// `workspace`, so a headless worker never blocks on it. Called by
+    /// `write_workspace_files` on every spawn, after [`Self::provision_workspace`]
+    /// has already run.
+    ///
+    /// Default: no-op. Most drivers stamp their own trust as part of
+    /// `provision_workspace` and need nothing here — Codex writes
+    /// `trust_level = "trusted"` into its own `config.toml`, Grok stamps
+    /// `trusted_folders.toml` in its per-run `GROK_HOME`. `ClaudeDriver` is
+    /// the one override: its trust record lives in the user-global
+    /// `~/.claude.json`, outside any per-run home `provision_workspace`
+    /// creates, so it needs this second seam.
+    fn pre_trust_workspace(&self, _workspace: &Path) {}
+
+    /// Content for the catch-all `.gitignore` `write_workspace_files` drops
+    /// into this driver's `config_dir`, hiding every engine-written
+    /// per-worker file there (agent-rules file, this `.gitignore` itself)
+    /// from `jj status` / `git status`.
+    ///
+    /// Default: a single self-excluding `*` pattern, sufficient for every
+    /// driver today. Override only if a driver ever needs a narrower
+    /// pattern.
+    fn config_dir_gitignore(&self) -> &'static str {
+        "*\n"
+    }
+
     // ── PermissionPolicy capability ─────────────────────────────────────────
 
     /// Write the driver's permission/hooks config to `dest_dir` and return the

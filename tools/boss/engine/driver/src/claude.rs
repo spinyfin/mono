@@ -577,6 +577,21 @@ impl AgentDriver for ClaudeDriver {
         Ok(())
     }
 
+    /// Override: Claude's trust record lives in the user-global
+    /// `~/.claude.json`, not in any per-run home `provision_workspace`
+    /// creates, so it needs this second pre-trust seam (see
+    /// [`pre_trust_workspace`] for the full rationale).
+    fn pre_trust_workspace(&self, workspace: &Path) {
+        pre_trust_workspace(workspace);
+    }
+
+    /// Override: same value as the trait default, spelled out via the
+    /// public [`CLAUDE_DIR_GITIGNORE`] constant so other call sites (and
+    /// tests) that need this exact content have a single source of truth.
+    fn config_dir_gitignore(&self) -> &'static str {
+        CLAUDE_DIR_GITIGNORE
+    }
+
     async fn write_permission_config(
         &self,
         _input: &PermissionInput,
