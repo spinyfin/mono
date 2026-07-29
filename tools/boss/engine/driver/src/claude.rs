@@ -121,6 +121,15 @@ fn claude_model_requires_auto_permissions(model: &str) -> bool {
     lower.contains("opus") || lower.contains("fable")
 }
 
+/// Returns `true` iff `model` names a Claude model: either a dated slug
+/// (contains `"claude"`, e.g. `"claude-opus-4-7"`) or one of the bare family
+/// aliases the effort/reasoning tables above hand out (`"opus"`, `"sonnet"`,
+/// `"haiku"`, `"fable"`). Case-insensitive.
+fn claude_model_belongs_to_driver(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.contains("claude") || matches!(lower.as_str(), "opus" | "sonnet" | "haiku" | "fable")
+}
+
 static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "claude",
     label: "Claude Code",
@@ -141,6 +150,7 @@ static CLAUDE_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: claude_model_for_reasoning,
         prompt_addendum_for_level: claude_prompt_addendum_for_level,
         model_requires_auto_permissions: claude_model_requires_auto_permissions,
+        model_belongs_to_driver: claude_model_belongs_to_driver,
     },
 };
 
@@ -988,6 +998,34 @@ mod tests {
     use super::*;
     use crate::Capability;
     use tempfile::TempDir;
+
+    #[test]
+    fn claude_model_belongs_to_driver_recognises_claude_vocabulary() {
+        for model in [
+            "opus",
+            "sonnet",
+            "haiku",
+            "fable",
+            "claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "OPUS",
+        ] {
+            assert!(
+                claude_model_belongs_to_driver(model),
+                "{model:?} should be recognised as a Claude model"
+            );
+        }
+    }
+
+    #[test]
+    fn claude_model_belongs_to_driver_rejects_other_drivers_models() {
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "grok-4.5", "codex-auto-review"] {
+            assert!(
+                !claude_model_belongs_to_driver(model),
+                "{model:?} should not be recognised as a Claude model"
+            );
+        }
+    }
 
     #[test]
     fn claude_driver_provides_all_capabilities() {

@@ -78,6 +78,7 @@ static GROK_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: model_menu::model_for_reasoning,
         prompt_addendum_for_level: model_menu::prompt_addendum_for_level,
         model_requires_auto_permissions: model_menu::model_requires_auto_permissions,
+        model_belongs_to_driver: model_menu::model_belongs_to_driver,
     },
 };
 
@@ -738,6 +739,11 @@ mod tests {
         assert_eq!((menu.default_model_for_level)(EffortLevel::Trivial), "grok-4.5");
         assert_eq!((menu.default_model_for_level)(EffortLevel::Max), "grok-4.5");
         assert!(!(menu.model_requires_auto_permissions)("grok-4.5"));
+        assert!((menu.model_belongs_to_driver)("grok-4.5"));
+        assert!((menu.model_belongs_to_driver)("GROK-4.5"));
+        // A Claude/Codex family alias must not be recognised as Grok's.
+        assert!(!(menu.model_belongs_to_driver)("opus"));
+        assert!(!(menu.model_belongs_to_driver)("gpt-5.6-sol"));
     }
 
     #[test]

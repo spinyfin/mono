@@ -113,6 +113,15 @@ fn codex_model_requires_auto_permissions(_model: &str) -> bool {
     false
 }
 
+/// Returns `true` iff `model` names a Codex model — the `gpt-5.*`/`gpt-4.*`
+/// SKU family `codex debug models` lists, plus the hidden `codex-auto-review`
+/// SKU. Case-insensitive. Guards against a Claude/Grok family alias (e.g.
+/// `"opus"`) reaching the Codex CLI verbatim.
+fn codex_model_belongs_to_driver(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    lower.starts_with("gpt-") || lower == "codex-auto-review"
+}
+
 static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
     name: "codex",
     label: "OpenAI Codex",
@@ -130,6 +139,7 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
         model_for_reasoning: codex_model_for_reasoning,
         prompt_addendum_for_level: codex_prompt_addendum_for_level,
         model_requires_auto_permissions: codex_model_requires_auto_permissions,
+        model_belongs_to_driver: codex_model_belongs_to_driver,
     },
 };
 
@@ -1547,6 +1557,36 @@ mod tests {
     use crate::{AbsenceDisposition, Capability};
     use boss_protocol::StopReason;
     use tempfile::TempDir;
+
+    #[test]
+    fn codex_model_belongs_to_driver_recognises_codex_vocabulary() {
+        for model in [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            "codex-auto-review",
+            "GPT-5.6-SOL",
+        ] {
+            assert!(
+                codex_model_belongs_to_driver(model),
+                "{model:?} should be recognised as a Codex model"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_model_belongs_to_driver_rejects_other_drivers_models() {
+        // The exact bug this gate exists to catch: a Claude family alias
+        // reaching the Codex CLI verbatim.
+        for model in ["opus", "sonnet", "claude-opus-4-7", "grok-4.5"] {
+            assert!(
+                !codex_model_belongs_to_driver(model),
+                "{model:?} should not be recognised as a Codex model"
+            );
+        }
+    }
 
     // Tests that mutate `BOSS_CODEX_*` go through
     // [`crate::test_support::codex_homes_override`] (owns

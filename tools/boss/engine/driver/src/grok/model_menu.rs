@@ -77,3 +77,10 @@ pub(super) fn prompt_addendum_for_level(level: EffortLevel) -> Option<&'static s
 pub(super) fn model_requires_auto_permissions(_model: &str) -> bool {
     false
 }
+
+/// Returns `true` iff `model` names a Grok model (`"grok-*"`). Case-insensitive.
+/// Guards against a Claude/Codex family alias (e.g. `"opus"`) reaching the
+/// Grok CLI verbatim.
+pub(super) fn model_belongs_to_driver(model: &str) -> bool {
+    model.to_ascii_lowercase().starts_with("grok-")
+}
