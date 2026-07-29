@@ -84,27 +84,23 @@ struct BossMacApp: App {
                 .environmentObject(appDelegate.updateModel)
         }
 
-        WindowGroup("Description", id: "markdown-viewer", for: MarkdownViewerContent.self) { $content in
-            if let content {
-                MarkdownViewerView(
-                    title: content.title,
-                    source: content.markdown,
-                    artifact: content.commentArtifact
-                )
-                .navigationTitle(content.title)
-                // Engine-back the comment layer (P529 Phase 2); the layer stays
-                // in-memory if `content.commentArtifact` is nil.
-                .environment(\.commentBackend, chatModel.commentBridge)
-            }
-        }
-        .defaultSize(width: 760, height: 640)
-
-        // Async variant of the markdown viewer: opens immediately in a
-        // loading state when the user clicks a design-doc icon, then
-        // transitions to loaded/failed when the raw-content fetch settles.
-        // Uses [[ChatViewModel.asyncMarkdownViewerVM]] (injected via
-        // environmentObject) rather than a value-type payload so the
-        // window content can be updated after it opens.
+        // Singleton markdown-document window. Two callers open it:
+        // - A design-doc icon click opens it immediately in a loading state,
+        //   then transitions to loaded/failed when the raw-content fetch
+        //   settles ([[ChatViewModel.openProjectDesignDoc]] /
+        //   [[ChatViewModel.openTaskDoc]]).
+        // - "Read full description" on a kanban card ([[WorkCardPopoverView]])
+        //   loads the already-in-memory task description straight into
+        //   `.loaded` — no fetch, no loading state
+        //   ([[ChatViewModel.openTaskDescription]]).
+        // Deliberately a `Window`, not a value-keyed `WindowGroup`: it is a
+        // single-instance surface (a second open replaces the current
+        // document rather than spawning another window), which is also what
+        // gives it the same NSWindow defaults as every other `Window` scene
+        // in the app rather than a `WindowGroup`'s. Uses
+        // [[ChatViewModel.asyncMarkdownViewerVM]] (injected via
+        // environmentObject) rather than a value-type payload so the window
+        // content can be updated after it opens.
         Window("Design Doc", id: "async-markdown-viewer") {
             AsyncMarkdownViewerView()
         }

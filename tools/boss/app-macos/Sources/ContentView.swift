@@ -197,9 +197,6 @@ struct ContentView: View {
             model.designRendererOpener = { [openWindow] content in
                 openWindow(id: "design-renderer", value: content)
             }
-            model.markdownViewerOpener = { [openWindow] content in
-                openWindow(id: "markdown-viewer", value: content)
-            }
             model.asyncMarkdownViewerOpener = { [openWindow] in
                 openWindow(id: "async-markdown-viewer")
             }
