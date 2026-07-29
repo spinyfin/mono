@@ -422,6 +422,8 @@ A related, smaller problem: `WorkerEvent` requires `session_id` on every variant
 
 Finally, `progress_fidelity()` is now registered per live-worker slot and consulted by the stale-worker sweep through `ProgressFidelity::stale_threshold_secs` (`live_worker_state.rs:165-177`; `stale_worker_sweep.rs:290-291`).
 
+A related but distinct observability gap — a denied write inside an already-allowed command is invisible to exit status on either dialect — is written up on its own below: [Sandbox denials are invisible to exit status alone](#sandbox-denials-are-invisible-to-exit-status-alone--a-distinct-failure-signal-is-needed).
+
 ### G-6 `ToolUseInterception`
 
 Codex hooks **do** fire on 0.145.0 and `PreToolUse` deny genuinely blocks a command pre-execution ([D-2](#deltas-that-change-the-design)). **The Codex driver declares this capability, deny-only** — it is the same mechanism the Claude path enforces with today, reached without building anything new.
@@ -440,6 +442,44 @@ Two things the declaration does **not** wave away.
 The `PATH`-shim design recovers the inline case properly, since a shim can rewrite argv freely. That is one of the reasons it remains worth doing as a [follow-on project](#guardrail-integrity).
 
 Separately, and independent of Codex: the `Degrade` disposition now has an engine dispatch path on `PostToolUse` (`worker_events.rs:793-835`). It calls a driver's registered post-hoc handler when present and makes the bare-degrade loss of guards visible rather than silently dropping it. Codex still does not land on `Degrade`, but the formerly latent abstraction bug is no longer an unimplemented path.
+
+`ToolUseInterception` denies a whole command _before_ it starts. It has nothing to say about a denial that happens _inside_ an already-allowed command, at the syscall level — that is a different mechanism (the OS sandbox, [G-3](#g-3-permissionpolicy)) with a different observability problem, covered next.
+
+### Sandbox denials are invisible to exit status alone — a distinct failure signal is needed
+
+Verified empirically, 2026-07-29, codex-cli 0.145.0 (harness matches [Appendix A](#appendix-a-reproducing-the-codex-spike), extended below). This is not a 13th capability — the non-goals section is explicit that the 12-capability vocabulary is fixed, and `G-1`–`G-12` already map 1:1 onto it — it is a cross-cutting gap inside two capabilities already declared: [G-3](#g-3-permissionpolicy) `PermissionPolicy` (which is what actually denies the write) and [G-5](#g-5-progressobservation--the-top-gap) `ProgressObservation` (which is where the denial should have become visible, and doesn't).
+
+**The finding.** Under `--sandbox read-only` (Boss's Reviewer mode), a denied filesystem write does not fail the command it was issued in. A compound shell invocation continues past the denial and reports success:
+
+```jsonl
+{
+  "type": "item.completed",
+  "item": {
+    "id": "item_0",
+    "type": "command_execution",
+    "command": "/bin/zsh -lc 'touch denied.txt; echo \"exit:$?\"'",
+    "aggregated_output": "touch: denied.txt: Operation not permitted\nexit:1\n",
+    "exit_code": 0,
+    "status": "completed"
+  }
+}
+```
+
+`exit_code: 0` / `status: "completed"` is Codex's own honest report of the _outer_ shell invocation: `echo` ran and exited zero, so the compound command as a whole "succeeded." The denied `touch` and its own real exit code (`1`, printed by the prompt's own `echo "exit:$?"`) are visible only as free text buried inside `aggregated_output`. Nothing in the envelope says "a write was refused." The rollout dialect shows the identical shape one layer further removed — the `exec_command` tool's own textual wrapper (`"Process exited with code 0\n...\nOutput:\ntouch: denied.txt: Operation not permitted\n"`) reports the same top-level zero, with the denial only as prose inside `output`.
+
+This is not an artifact of that one test — it is a structural property of shell composition, confirmed by the control case. Run the identical denied `touch` as the _only_ statement (nothing composed after it) and Codex reports it faithfully: `"exit_code":1,"status":"failed"`. Codex is not suppressing the per-command result; the ordinary case works correctly. The failure mode is specifically **a compound command whose last statement succeeds after an earlier statement was silently denied** — exactly the shape an agent's own multi-step shell scripts take (`mkdir -p x && cd x && touch y`, a script with several writes and a final `echo done`, etc.). Any consumer that infers "did this command fail" from the outer `exit_code`/`status` — the only signal the stdout normaliser threads through today, and today it doesn't even do that, see below — will pass a run whose writes were all silently refused.
+
+**Is there a structural denial event instead?** No. Checked both live dialects (above) and the binary's own embedded string table (`strings` against the installed `codex-cli 0.145.0`) for a per-command sandbox-denial marker: no `sandbox_denied`, no field on `command_execution` / `function_call_output` naming which syscall the seatbelt profile refused. The only sandbox-named identifiers in the binary (`sandboxError`, `SandboxLandlock`, `SandboxExecutableNotProvided`) are **turn/session-level** catastrophic-failure codes — "no sandbox executor is available on this host" — not a per-syscall runtime signal, and irrelevant to a healthy turn that silently ate a denied write. This is the structural reason the mechanism can't be fixed by "read a different field": Codex's own agent loop is not told a seatbelt denial happened either. The sandbox enforces below the level Codex's process supervision can see, by design — the same property [G-3](#g-3-permissionpolicy) already calls "OS-enforced... rather than advisory," which is a real strength for _preventing_ the write and a real weakness for _reporting_ that prevention.
+
+**Why this differs from [G-6](#g-6-tooluseinterception)'s `ToolUseInterception`.** A `PreToolUse` deny (Claude's or Codex's own) is a _whole-command_ refusal decided _before_ the process starts — the tool never runs, so there is nothing for an exit code to misreport. What this section describes happens _inside_ an already-allowed command, at the syscall level, _during_ execution — a granularity no hook, on either driver, observes. Boss's guardrail carrier (hooks) and Boss's sandbox (OS enforcement) are two different mechanisms with two different failure-observability properties, and this gap belongs to the second one. A future driver with syscall-granular OS sandboxing (Codex today; plausibly others) hits the identical shape, which is why this is written up as an abstraction gap rather than a Codex-only quirk.
+
+**Decision.** Do not try to make exit status trustworthy here — that would require Codex to change what it reports for compound shell commands, which is out of Boss's control and arguably not even wrong (the outer command genuinely did exit 0). Instead:
+
+1. Thread the `command_execution` item's own `exit_code` / `status` fields through the stdout-dialect normaliser instead of silently discarding them (today they are read off the raw envelope and then dropped before `WorkerEvent::PostToolUse` is built). This is a real, independent bug — even the _non_-masked case (a denied command with nothing composed after it, `status:"failed"`) is invisible to any typed consumer today — and fixing it is free once this code path is touched.
+2. Add a **best-effort, Codex-driver-local heuristic** that scans `command_execution` / tool-output text for known OS write-denial phrasings (verified: macOS Seatbelt's `Operation not permitted` on a denied write) and, on a match — or on a genuine `status:"failed"` from (1) — emits an _additional_ `WorkerEvent::Notification` alongside the ordinary `PostToolUse`. This reuses the exact channel Codex already uses for its own operational warnings ([D-6](#stream-drift--all-silent-all-additive), the hook-trust-bypass notice) rather than adding a new protocol variant: `WorkerEvent::PostToolUse` is matched in 17 files across the engine, and its `tool_response` shape is explicitly relied on as-is by PR-URL capture ([A-5](#proposed-p1422-amendments)) — reshaping either was rejected as unnecessary blast radius for a signal that is, honestly, a heuristic rather than ground truth.
+3. Name the heuristic's limits plainly, matching this doc's practice elsewhere: it both under-fires (a sandboxed network denial reports `Could not resolve host` / `Network is unreachable`, not `Operation not permitted` — the phrase list is neither exhaustive nor cross-platform-verified) and can over-fire (`Operation not permitted` is the generic EPERM string; a command can hit it for reasons that have nothing to do with Boss's sandbox). It is a visibility improvement, not a guardrail — it does not block or retry anything, it only makes a previously invisible class of run observable to whatever downstream policy (review-gate logic, attention surfacing, transient recovery) chooses to look at `Notification` events.
+
+Implemented in `engine/driver/src/codex/progress.rs` ([T-30](#t-30-surface-sandboxcommand-denials-as-a-distinct-notification-signal-a-13)); no `boss-protocol` change is needed.
 
 ### G-7 `TurnBoundary`
 
@@ -772,6 +812,7 @@ Discrete, filed-work-item-sized. The original design pass could not create Boss 
 | A-10 | `PromptComposition`: driver-supplied enforcement wording                             | `small`   | **New** — deferred                                                                | `worker_setup.rs:364` tells the worker _"A PreToolUse hook blocks these"_. The original pass rated this a correctness defect because the sentence was false for a Codex worker; under hook-based interception **it is true for both drivers**, so the defect is gone and this is hygiene. Still worth doing — shared prompt prose should not hardcode one driver's mechanism name — and it becomes live again when the `PATH`-shim project changes what actually enforces. Deferred, not closed.                                                                                                                                   |
 | A-11 | Resolve or delete `progress_fidelity()`                                              | `trivial` | **New**                                                                           | Landed: spawn records each driver's fidelity on the live-worker slot, and the stale-worker sweep consults `ProgressFidelity::stale_threshold_secs`. A Codex driver's declared tier now affects stale detection.                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | A-12 | Extend T1483's conformance harness to cover transport and turn boundaries            | `medium`  | **Amends T1483**                                                                  | T1483 (blocked on T1476 + T1479) was scoped against a Claude-shaped driver. It must also assert: stdout-JSONL ingress produces the same `WorkerEvent` sequence as hook ingress; a turn boundary drives completion identically from either source; and a pinned agent-CLI version is verified, given Codex's unversioned stream ([OQ-2](#oq-2)).                                                                                                                                                                                                                                                                                    |
+| A-13 | Thread `command_execution` exit status through; surface denials as a `Notification`  | `small`   | **New**                                                                           | `item.completed` carries `exit_code` / `status` that the stdout normaliser reads and then discards; a write denied by `--sandbox read-only` inside a compound shell command reports outer `exit_code:0` / `status:"completed"` regardless, so exit status alone can never detect it ([write-up](#sandbox-denials-are-invisible-to-exit-status-alone--a-distinct-failure-signal-is-needed)). Thread the fields through and add a best-effort text-heuristic classifier that emits an additional `WorkerEvent::Notification`, reusing the existing operational-warning channel rather than reshaping `PostToolUse`.                  |
 
 **Verdict on the existing tasks, as required by the brief:** T3324 (cut over every call site) remains sufficient and correctly scoped. T3326's registry-backed menu and driver-local effort work landed. T1476's shared file contract is present but its remaining prerequisite role needs verification; it still does not cover PR-URL capture (A-5). T1479 is now extraction-only (A-2). PR #2361 carries the T3325 trait-method work while leaving the synthesizer separate (A-4). T3328's transport split + #2363 reader landed for **engine-owned** streams (A-1); **pane-to-engine handoff (seam 5) is still open**. T1483 still needs the cross-transport coverage in A-12.
 
@@ -1051,13 +1092,21 @@ Replace or supplement `codex exec` with the persistent app-server protocol, givi
 - **Depends on:** T-23
 - **Scope:** deferred (future / not a v1 blocker) — experimental upstream surface; revisit once it stabilises
 
+### T-30 Surface sandbox/command denials as a distinct `Notification` signal (A-13)
+
+Thread `command_execution`'s `exit_code` / `status` through the stdout-dialect normaliser (today read off the raw envelope and discarded before `WorkerEvent::PostToolUse` is built), and add a Codex-local heuristic classifier over both dialects' tool-output text for known OS write-denial phrasings (macOS Seatbelt: `Operation not permitted`, verified). On a match, or on a genuine `status:"failed"`, emit an additional `WorkerEvent::Notification` alongside the ordinary `PostToolUse` — do not reshape `PostToolUse` / `tool_response`, which PR-URL capture depends on verbatim. Explicitly a best-effort visibility signal, not a guardrail: it does not block or retry, and the phrase list is neither exhaustive nor free of false positives. See [the write-up](#sandbox-denials-are-invisible-to-exit-status-alone--a-distinct-failure-signal-is-needed) for the empirical basis.
+
+- **Effort:** `small`
+- **Depends on:** T-12
+- **Scope:** in-scope
+
 ### Parallelism
 
 At the same depth, these may run in parallel:
 
 - **Depth 0:** T-01, T-08, T-27 — genuinely independent. **Start T-01 first regardless of slack:** it is the only hard gate, it is `small`, and T-11 cannot land without it.
 - **Depth 1:** PR #2361 supplies the in-flight turn-boundary routing; T-12 follows T-11 and that PR.
-- **Depth 2:** T-12 supplies the Codex normaliser. T-13, T-14, T-16, and T-17 follow their stated edges.
+- **Depth 2:** T-12 supplies the Codex normaliser. T-13, T-14, T-16, T-17, and T-30 follow their stated edges.
 - **Not in this graph:** T-02 and T-03 belong to the follow-on `PATH`-shim project and are independent of everything above.
 
 **File-overlap cautions — order these rather than running them concurrently:**
