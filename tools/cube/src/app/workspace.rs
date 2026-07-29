@@ -266,11 +266,6 @@ pub(super) fn run_workspace(
             reconcile_missing_workspaces_in_repo(&mut store, database_path, &repo, leased_at_epoch_s)?;
 
             // Free space is an input to this call, not a side effect of it.
-            // Before this existed the lease path had no idea how much disk was
-            // left and minted onto a volume at 100% utilisation exactly as
-            // happily as onto an empty one — the cascade that took a 1.8 TiB
-            // volume to exhaustion and hung the app for ~11.5 hours.
-            //
             // Reclaim-then-proceed: below the floor, compact every free
             // workspace for this repo (build output only, no network, bounded)
             // and re-measure. The lease itself is never refused for this —

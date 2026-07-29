@@ -1,9 +1,7 @@
 //! Free space on the volume the workspace pool lives on.
 //!
-//! Until this module existed, cube had no idea how much disk it was using or
-//! how much was left: the lease path minted workspaces on a volume at 100%
-//! utilisation exactly as happily as on an empty one, which is how a pool grew
-//! to 520 workspaces / ~191 GB and took a 1.8 TiB volume to exhaustion.
+//! Reads the volume behind the workspace pool so the lease path can treat free
+//! space as an input rather than an assumption.
 //!
 //! What this module is NOT is a cap on the pool. cube grows the pool on demand
 //! and a lease for a reachable repo always succeeds — that is a deliberate

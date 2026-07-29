@@ -2,6 +2,7 @@
 //! free-workspace high-water-mark trim.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 
@@ -10,6 +11,7 @@ use super::support::{
     unpushed_probe_command, with_database_path,
 };
 
+use crate::app::gc::{POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, POOL_GC_TRIM_PROGRESS_KEY, maybe_trigger_pool_gc};
 use crate::app::reclaim::{
     compact_free_workspaces, has_free_workspace_surplus, is_safe_artifact_dir_name, relieve_disk_pressure,
     trim_free_workspaces_to_mark,
@@ -263,6 +265,61 @@ fn a_stale_workspace_is_skipped_rather_than_recovered() {
 
     assert_eq!(report.dirs_removed, 0);
     assert!(target.is_dir());
+}
+
+#[test]
+fn the_tracked_files_probe_is_bounded_even_without_a_caller_deadline() {
+    // The probe deliberately bypasses `run_jj` (it must not trigger the stale
+    // working-copy recovery that wrapper performs) but must not thereby bypass
+    // its timeout discipline: it runs on the lease path with the repo lock
+    // held, where an unbounded subprocess wedges every lease for that repo.
+    let _config = ConfigGuard::new("[pool]\nbuild-artifact-dirs = [\"target\"]\n");
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
+    let ws = workspace_root.join("mono-agent-001");
+    write_artifact_tree(&ws, "target");
+    set_last_activity(&database_path, "mono-agent-001", LONG_IDLE);
+
+    let runner = FakeRunner::new(vec![tracked_probe(&ws, "target", "")]);
+    compact_free_workspaces(&runner, &store, Some(&database_path), None, NOW, false, None);
+    runner.assert_exhausted();
+
+    let timeouts = runner.observed_timeouts();
+    assert_eq!(timeouts.len(), 1, "the probe must run under a wall-clock bound");
+    assert!(
+        timeouts[0] <= Duration::from_secs(30),
+        "an unbounded probe would hang the lease path: {:?}",
+        timeouts[0],
+    );
+}
+
+#[test]
+fn a_probe_that_outlives_the_pass_budget_leaves_the_artifact_tree_alone() {
+    // A timeout is just another way of not getting an answer, and an
+    // unanswered safety question is not a yes.
+    let _config = ConfigGuard::new("[pool]\nbuild-artifact-dirs = [\"target\"]\n");
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
+    let ws = workspace_root.join("mono-agent-001");
+    let target = write_artifact_tree(&ws, "target");
+    set_last_activity(&database_path, "mono-agent-001", LONG_IDLE);
+
+    let runner = FakeRunner::new(vec![tracked_probe(&ws, "target", "").taking(Duration::from_secs(30))]);
+    let deadline = Instant::now() + Duration::from_millis(200);
+    let report = compact_free_workspaces(&runner, &store, Some(&database_path), None, NOW, false, Some(deadline));
+    runner.assert_exhausted();
+
+    assert_eq!(report.dirs_removed, 0);
+    assert!(
+        target.is_dir(),
+        "a probe cube could not complete means keep, not delete"
+    );
+    let timeouts = runner.observed_timeouts();
+    assert!(
+        timeouts[0] <= Duration::from_millis(200),
+        "the probe must be clipped to what the pass deadline has left: {:?}",
+        timeouts[0],
+    );
 }
 
 #[test]
@@ -583,6 +640,100 @@ fn trim_neither_counts_nor_removes_leased_workspaces() {
 }
 
 #[test]
+fn a_row_whose_directory_is_already_gone_does_not_inflate_the_surplus() {
+    // A phantom row — directory deleted out from under cube, reconcile has not
+    // caught up — occupies no disk. Counting it as surplus would have the trim
+    // remove that many *real* workspaces and leave the live free pool below
+    // the mark, which is the opposite of what the mark is for.
+    let _config = ConfigGuard::new("[pool]\nmax-free-workspaces = 2\n");
+    let (tempdir, database_path) = with_database_path();
+    let source = tempdir.path().join("source/mono");
+    std::fs::create_dir_all(source.join(".jj")).expect("canonical source");
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 4, Some(source.clone()));
+    set_last_activity(&database_path, "mono-agent-001", NOW - 90 * 3_600);
+    set_last_activity(&database_path, "mono-agent-002", NOW - 80 * 3_600);
+    set_last_activity(&database_path, "mono-agent-003", NOW - 2 * 3_600);
+    set_last_activity(&database_path, "mono-agent-004", NOW - 3_600);
+
+    // 001's directory is gone but its row is not, so 3 free workspaces
+    // actually exist against a mark of 2: exactly one may go.
+    std::fs::remove_dir_all(workspace_root.join("mono-agent-001")).expect("orphan the row");
+
+    let ws2 = workspace_root.join("mono-agent-002");
+    let mut script = trim_probe_reusable(&ws2);
+    script.push(forget_registration(&workspace_root, &source, "mono-agent-002"));
+    let runner = FakeRunner::new(script);
+
+    let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);
+    runner.assert_exhausted();
+
+    assert_eq!(report.workspaces_removed, 1, "one real surplus workspace, not two");
+    assert!(!ws2.exists());
+    assert!(workspace_root.join("mono-agent-003").is_dir(), "the mark is respected");
+    assert!(workspace_root.join("mono-agent-004").is_dir());
+}
+
+#[test]
+fn a_removal_drops_the_registry_row_before_it_touches_the_directory() {
+    // Ordering is the whole defence against handing a lease a directory that
+    // is being unlinked: once the row is gone nothing can select the
+    // workspace. So a removal interrupted between the two steps must leave a
+    // stray directory (which the next lease rediscovers and re-registers) and
+    // never a live row pointing at a half-deleted checkout.
+    let _config = ConfigGuard::new("[pool]\nmax-free-workspaces = 1\n");
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 2, None);
+    set_last_activity(&database_path, "mono-agent-001", NOW - 90 * 3_600);
+    set_last_activity(&database_path, "mono-agent-002", NOW - 10 * 3_600);
+
+    let ws1 = workspace_root.join("mono-agent-001");
+    let ws2 = workspace_root.join("mono-agent-002");
+    // Make the unlink fail: a directory entry cannot be removed from a
+    // read-only parent. Skip the assertions entirely if the running user
+    // ignores that (a root-owned CI container would) rather than asserting
+    // something vacuous.
+    let mut perms = std::fs::metadata(&workspace_root).expect("root metadata").permissions();
+    let original = perms.clone();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&workspace_root, perms).expect("make the root read-only");
+    let probe = workspace_root.join(".writable-probe");
+    let unlink_is_blocked = std::fs::write(&probe, "").is_err();
+
+    // 001's removal fails, so the pass moves on to 002 — which is refused for
+    // holding work, leaving the repo above its mark and nothing removed.
+    let mut script = trim_probe_reusable(&ws1);
+    script.extend(trim_probe_holds_work(&ws2));
+    let runner = FakeRunner::new(script);
+    let report = if unlink_is_blocked {
+        Some(trim_free_workspaces_to_mark(
+            &runner,
+            &store,
+            Some(&database_path),
+            NOW,
+            None,
+        ))
+    } else {
+        None
+    };
+    std::fs::set_permissions(&workspace_root, original).expect("restore the root");
+    let _ = std::fs::remove_file(&probe);
+
+    let Some(report) = report else {
+        return;
+    };
+    runner.assert_exhausted();
+    assert_eq!(report.workspaces_removed, 0, "the unlink failed, so nothing was freed");
+    assert!(ws1.is_dir(), "the directory survives an unlink that could not run");
+    let remaining = store.list_workspaces("mono").expect("list");
+    let ids: Vec<&str> = remaining.iter().map(|r| r.workspace_id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["mono-agent-002"],
+        "the row is dropped first, so no lease can be handed the directory being removed",
+    );
+}
+
+#[test]
 fn surplus_backlog_is_visible_to_the_gc_throttle() {
     let _config = ConfigGuard::new("[pool]\nmax-free-workspaces = 2\n");
     let (tempdir, database_path) = with_database_path();
@@ -596,6 +747,33 @@ fn surplus_backlog_is_visible_to_the_gc_throttle() {
     assert!(
         !has_free_workspace_surplus(&store),
         "leasing one drops the free count to the mark",
+    );
+}
+
+#[test]
+fn a_surplus_the_last_trim_could_not_act_on_does_not_pin_the_gc_at_five_minutes() {
+    // A repo whose surplus is entirely unpushed work sits above its mark
+    // permanently and correctly. Treating that steady state as backlog would
+    // have every lease past the five-minute mark pay a synchronous pass whose
+    // trim re-fetches those same candidates and removes nothing, forever.
+    let _config = ConfigGuard::new("[pool]\nmax-free-workspaces = 2\n");
+    let (tempdir, database_path) = with_database_path();
+    let (mut store, _root) = seed_pool(&tempdir, &database_path, 3, None);
+    let now = NOW;
+
+    store.set_pool_metadata_i(POOL_GC_LAST_AT_KEY, now - 10 * 60).unwrap();
+    // The previous pass walked every candidate it had and could remove none.
+    store.set_pool_metadata_i(POOL_GC_TRIM_PROGRESS_KEY, 0).unwrap();
+    assert!(
+        has_free_workspace_surplus(&store),
+        "the surplus is still there — it is just not actionable",
+    );
+
+    maybe_trigger_pool_gc(&mut store, Some(&database_path), now).expect("throttle");
+
+    assert!(
+        store.get_pool_metadata_i(POOL_GC_STARTED_AT_KEY).unwrap().is_none(),
+        "an unactionable surplus must fall back to the 24h interval, not retry in 5 minutes",
     );
 }
 

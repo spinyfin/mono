@@ -59,10 +59,11 @@
 
 use std::fs;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
 use crate::config::PoolConfig;
+use crate::lock::RepoLock;
 use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
 use crate::store::{Store, WorkspaceListFilter};
 use crate::{audit, config};
@@ -70,7 +71,19 @@ use crate::{audit, config};
 use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
-use crate::app::jj::{cleanup_workspace_logs, workspace_path_exists};
+use crate::app::jj::{budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
+use crate::app::util::repo_lock_path;
+
+/// Wall-clock bound for the purely local jj subprocesses this module spawns:
+/// the tracked-files probe and the `jj workspace forget` that de-registers a
+/// removed workspace. Neither touches the network, so both should return in
+/// well under a second — but "should" is not "does": either can block on the
+/// shared store's op-log lock behind the rest of the fleet. The probe is the
+/// one that must not be unbounded, because `relieve_disk_pressure` runs it on
+/// the lease path *while the repo lock is held*, where a wedged subprocess
+/// would stall every lease and release for that repo. Killed at the bound, the
+/// probe answers `None` — unknown, therefore untouched.
+const LOCAL_JJ_CMD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What one reclamation pass achieved. `available_delta_bytes` is measured as
 /// the change in the volume's available space across the pass, not by walking
@@ -143,13 +156,27 @@ pub(super) fn is_safe_artifact_dir_name(name: &str) -> bool {
 /// workspace and wrong here: this is a read taken to decide whether deleting
 /// is safe, and it must not mutate the thing it is inspecting. A stale
 /// workspace simply yields `None` — unknown, therefore untouched.
-fn artifact_dir_is_tracked(runner: &dyn CommandRunner, workspace_path: &Path, dir_name: &str) -> Option<bool> {
+///
+/// Bypassing `run_jj` does not mean bypassing its timeout discipline: the
+/// subprocess is bounded by [`LOCAL_JJ_CMD_TIMEOUT`], further clipped to
+/// whatever `deadline` has left, and a bound that has already elapsed answers
+/// `None` without spawning anything.
+fn artifact_dir_is_tracked(
+    runner: &dyn CommandRunner,
+    workspace_path: &Path,
+    dir_name: &str,
+    deadline: Option<Instant>,
+) -> Option<bool> {
+    let timeout = budgeted_timeout(deadline, LOCAL_JJ_CMD_TIMEOUT)?;
     let output = runner
-        .run(&RealCommandRunner::invocation(
-            workspace_path,
-            "jj",
-            &["--ignore-working-copy", "file", "list", "-r", "@", dir_name],
-        ))
+        .run_with_timeout(
+            &RealCommandRunner::invocation(
+                workspace_path,
+                "jj",
+                &["--ignore-working-copy", "file", "list", "-r", "@", dir_name],
+            ),
+            timeout,
+        )
         .ok()?;
     Some(!output.trim().is_empty())
 }
@@ -168,7 +195,12 @@ fn artifact_dir_is_tracked(runner: &dyn CommandRunner, workspace_path: &Path, di
 /// space in the workspace tree, so there is nothing to gain by removing them —
 /// and following one would delete through it into the output base every other
 /// workspace on the machine shares.
-fn compact_workspace(runner: &dyn CommandRunner, workspace_path: &Path, artifact_dirs: &[String]) -> Vec<String> {
+fn compact_workspace(
+    runner: &dyn CommandRunner,
+    workspace_path: &Path,
+    artifact_dirs: &[String],
+    deadline: Option<Instant>,
+) -> Vec<String> {
     let mut removed = Vec::new();
     for dir_name in artifact_dirs {
         if !is_safe_artifact_dir_name(dir_name) {
@@ -187,7 +219,7 @@ fn compact_workspace(runner: &dyn CommandRunner, workspace_path: &Path, artifact
         if meta.file_type().is_symlink() || !meta.is_dir() {
             continue;
         }
-        match artifact_dir_is_tracked(runner, workspace_path, dir_name) {
+        match artifact_dir_is_tracked(runner, workspace_path, dir_name, deadline) {
             Some(false) => {}
             Some(true) => {
                 eprintln!(
@@ -275,7 +307,7 @@ pub(super) fn compact_free_workspaces(
         }
 
         let before = DiskSpace::probe(&record.workspace_path).ok();
-        let removed = compact_workspace(runner, &record.workspace_path, &artifact_dirs);
+        let removed = compact_workspace(runner, &record.workspace_path, &artifact_dirs, deadline);
         if removed.is_empty() {
             continue;
         }
@@ -322,6 +354,9 @@ pub(super) fn compact_free_workspaces(
 /// lose. That means a repo whose surplus is entirely unpushed work will not
 /// reach its mark, which is correct: the mark is a disk target, not a promise
 /// that outranks somebody's afternoon.
+///
+/// Deciding runs unlocked and removing runs under the repo lock — the split is
+/// deliberate and explained at the acquisition site in `trim_one_repo`.
 pub(super) fn trim_free_workspaces_to_mark(
     runner: &dyn CommandRunner,
     store: &Store,
@@ -370,16 +405,23 @@ fn trim_one_repo(
     let mark = pool.max_free_workspaces(repo);
     let free = free_workspaces(store, repo);
     let mut report = ReclaimReport::default();
-    if free.len() <= mark {
-        return report;
-    }
-    let surplus = free.len() - mark;
 
     // Most idle first. A row cube has never leased (`None`) sorts oldest of
     // all — it is the strongest evidence nobody wants the workspace, and the
     // reuse probe below still has the final say.
     let mut candidates: Vec<&WorkspaceRecord> = free.iter().filter(|r| workspace_path_exists(r)).collect();
     candidates.sort_by_key(|r| r.last_activity_at_epoch_s.unwrap_or(i64::MIN));
+
+    // Surplus is counted over the same filtered set the candidates come from,
+    // not over every `Free` row. A phantom row — one whose directory was
+    // deleted out from under cube and which reconcile has not forgotten yet —
+    // occupies no disk, and the mark is a disk target; counting it would have
+    // the trim remove that many *real* workspaces and leave the live free pool
+    // below the mark.
+    if candidates.len() <= mark {
+        return report;
+    }
+    let surplus = candidates.len() - mark;
 
     let mut skipped_holding_work = 0usize;
     let mut probe_errors = 0usize;
@@ -430,12 +472,42 @@ fn trim_one_repo(
             continue;
         }
 
+        // Everything above answered "is this workspace removable?" without the
+        // repo lock, on purpose: the probe fetches, and holding the lock
+        // across a network round trip is what once wedged every lease and
+        // release for a repo. The *removal* is a different question, and it
+        // takes the lock — the lease path claims a workspace under this same
+        // lock, so holding it makes the re-check below and the removal one
+        // indivisible step. Without it the fetch above sits inside a
+        // check-to-delete window minutes wide, and a lease that claimed this
+        // row during it would have its directory deleted underneath it.
+        let lock_path = match repo_lock_path(repo, database_path) {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("cube: pool trim: {repo}: cannot resolve the repo lock, stopping: {e}");
+                break;
+            }
+        };
+        let _lock = match RepoLock::acquire(&lock_path) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!("cube: pool trim: {repo}: cannot take the repo lock, stopping: {e}");
+                break;
+            }
+        };
+        // Re-read under the lock. The probe took a fetch to answer, which is
+        // ample time for a lease to have claimed this row since the check at
+        // the top of the iteration.
+        if !still_free(store, record) {
+            continue;
+        }
+
         let context = TrimContext {
             now_epoch_s,
             mark,
             free_before: free.len(),
         };
-        match remove_workspace_from_disk(runner, store, database_path, repo_record, record, context) {
+        match remove_workspace_from_disk(runner, store, database_path, repo_record, record, context, deadline) {
             Ok(freed) => {
                 report.workspaces_removed += 1;
                 report.available_delta_bytes = report.available_delta_bytes.saturating_add(freed);
@@ -459,18 +531,6 @@ fn trim_one_repo(
     report
 }
 
-/// Delete a verified-empty-of-work free workspace and drop every trace of it.
-///
-/// Order matters. The directory goes first, because it is the only
-/// irreversible step and every check that licenses it has already passed; the
-/// two bookkeeping steps after it are recoverable if they fail. `jj workspace
-/// forget` against the *canonical* store is what stops the shared repo
-/// accumulating dead registrations — without it the removed workspace's
-/// working-copy commit stays reachable and the objects behind it are never
-/// collected, so the removal would free the checkout's bytes but not the
-/// history's. It is the exact inverse of the `jj workspace add` in
-/// `provision.rs` that created the attachment, and it is best-effort: a
-/// failure here leaves cosmetic cruft in the shared store, not a broken pool.
 /// The trim's view of the repo at the moment one removal is decided, carried
 /// alongside the workspace being removed so the audit line can say *why* it
 /// happened — "one of 4 free against a mark of 2" — rather than just that it
@@ -482,6 +542,26 @@ struct TrimContext {
     free_before: usize,
 }
 
+/// Delete a verified-empty-of-work free workspace and drop every trace of it.
+/// Called with the repo lock held.
+///
+/// Order matters, and the registry row goes first — the same order the
+/// operator-invoked `cube workspace remove` uses. Once the row is gone no
+/// lease can select the workspace, so the `rm -rf` that follows cannot race
+/// one; doing it the other way round would leave a live row pointing at a
+/// directory being unlinked. The row is also the recoverable half: the next
+/// lease rediscovers any directory still on disk and re-registers it, so a
+/// removal that dies between the two steps self-heals, while a lease handed a
+/// half-deleted checkout does not.
+///
+/// `jj workspace forget` against the *canonical* store is what stops the
+/// shared repo accumulating dead registrations — without it the removed
+/// workspace's working-copy commit stays reachable and the objects behind it
+/// are never collected, so the removal would free the checkout's bytes but not
+/// the history's. It is the exact inverse of the `jj workspace add` in
+/// `provision.rs` that created the attachment, bounded by
+/// [`LOCAL_JJ_CMD_TIMEOUT`] like every other subprocess here, and best-effort:
+/// a failure leaves cosmetic cruft in the shared store, not a broken pool.
 fn remove_workspace_from_disk(
     runner: &dyn CommandRunner,
     store: &Store,
@@ -489,8 +569,10 @@ fn remove_workspace_from_disk(
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
     context: TrimContext,
+    deadline: Option<Instant>,
 ) -> Result<u64> {
     let before = DiskSpace::probe(&repo_record.workspace_root).ok();
+    store.forget_workspace(&record.repo, &record.workspace_id)?;
     fs::remove_dir_all(&record.workspace_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
         path: record.workspace_path.clone(),
         source,
@@ -501,7 +583,7 @@ fn remove_workspace_from_disk(
         .unwrap_or(0);
 
     if let Some(canonical) = &repo_record.source {
-        let forget = runner.run(&CommandInvocation {
+        let invocation = CommandInvocation {
             cwd: repo_record.workspace_root.clone(),
             program: "jj".to_string(),
             args: vec![
@@ -512,7 +594,15 @@ fn remove_workspace_from_disk(
                 record.workspace_id.clone(),
             ],
             env: vec![],
-        });
+        };
+        let forget = match budgeted_timeout(deadline, LOCAL_JJ_CMD_TIMEOUT) {
+            Some(timeout) => runner.run_with_timeout(&invocation, timeout),
+            None => Err(crate::app::errors::CubeError::CommandTimedOut {
+                program: invocation.program.clone(),
+                args: invocation.args.clone(),
+                timeout_secs: 0,
+            }),
+        };
         if let Err(e) = forget {
             eprintln!(
                 "warning: cube removed {} but could not forget its registration in the shared store: {e}",
@@ -521,7 +611,6 @@ fn remove_workspace_from_disk(
         }
     }
 
-    store.forget_workspace(&record.repo, &record.workspace_id)?;
     if let Err(e) = cleanup_workspace_logs(&record.workspace_id) {
         eprintln!(
             "warning: failed to clean up workspace logs for {}: {e}",
@@ -685,6 +774,12 @@ pub(super) fn assert_mint_headroom(repo: &str, workspace_root: &Path) -> Result<
 /// Read-only and DB-only, so the pool-GC throttle can ask it cheaply: a pass
 /// that ran out of budget with a surplus still outstanding should retry in
 /// minutes rather than sleep for a day (see `POOL_GC_BACKLOG_RETRY_SECS`).
+///
+/// A raw surplus is necessary but not sufficient for that: a repo whose
+/// surplus is entirely unpushed work stays over its mark permanently and
+/// correctly, and retrying every five minutes forever would buy nothing. The
+/// caller therefore pairs this with the previous pass's trim outcome
+/// (`POOL_GC_TRIM_PROGRESS_KEY`) — see `maybe_trigger_pool_gc`.
 pub(super) fn has_free_workspace_surplus(store: &Store) -> bool {
     let pool = config::load_config().unwrap_or_default().pool;
     let Ok(repos) = store.list_repos() else {
