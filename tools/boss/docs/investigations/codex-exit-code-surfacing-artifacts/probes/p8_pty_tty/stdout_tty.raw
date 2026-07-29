@@ -1,0 +1,8 @@
+Reading additional input from stdin...
+{"type":"thread.started","thread_id":"019faecf-9973-7212-976c-4af01dbb2f33"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Running the requested command once."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo LINE-ONE; echo LINE-TWO; exit 7'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo LINE-ONE; echo LINE-TWO; exit 7'\"","aggregated_output":"LINE-ONE\nLINE-TWO\n","exit_code":7,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"observed_exit=7"}}
+{"type":"turn.completed","usage":{"input_tokens":28164,"cached_input_tokens":22016,"cache_write_input_tokens":0,"output_tokens":161,"reasoning_output_tokens":15}}

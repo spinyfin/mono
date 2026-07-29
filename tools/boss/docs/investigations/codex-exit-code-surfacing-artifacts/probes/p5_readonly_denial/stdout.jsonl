@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019faeca-c41d-7fb1-b07e-6aec2df2708f"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo BEFORE-WRITE; touch ./sandbox-probe-file.txt; echo AFTER-WRITE; exit 0'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo BEFORE-WRITE; touch ./sandbox-probe-file.txt; echo AFTER-WRITE; exit 0'\"","aggregated_output":"BEFORE-WRITE\ntouch: ./sandbox-probe-file.txt: Operation not permitted\nAFTER-WRITE\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"observed_exit=0"}}
+{"type":"turn.completed","usage":{"input_tokens":27400,"cached_input_tokens":24064,"cache_write_input_tokens":0,"output_tokens":187,"reasoning_output_tokens":44}}

@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019faecc-b338-7451-b41a-83d7a0a44d62"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run the specified command once and report only the exit code if the tool reveals one."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'for i in \"'$(seq 1 12); do echo tick-$i; sleep 4; done; echo FINAL-LINE; exit $(( $(od -An -N1 -tu1 /dev/urandom | tr -d \" \") % 50 + 10 ))'\"'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"observed_exit=NONE"}}
+{"type":"turn.completed","usage":{"input_tokens":42737,"cached_input_tokens":38656,"cache_write_input_tokens":0,"output_tokens":264,"reasoning_output_tokens":28}}
