@@ -1,0 +1,98 @@
+[
+  {
+    "hook_event": "session_start",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "user_prompt_submit",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "pre_tool_use",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": "run_terminal_command",
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "post_tool_use",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": "run_terminal_command",
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "stop",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "session_end",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "stop",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "session_start",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "user_prompt_submit",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "stop",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "session_end",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  },
+  {
+    "hook_event": "stop",
+    "notificationType": null,
+    "level": null,
+    "message": null,
+    "toolName": null,
+    "GROK_EVENT_env": null
+  }
+]

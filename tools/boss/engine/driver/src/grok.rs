@@ -236,11 +236,28 @@ impl AgentDriver for GrokDriver {
             // correct: no dispatch refusal, no synthesised tooling.
             //
             // AwaitingInputSignal — omitted → default Degrade (never
-            // Synthesize). Grok fires `Notification` with `notificationType`
-            // / `level`, but the vocabulary is uncharacterised and the
-            // capability's contract forbids guessing this state from a
-            // lower-fidelity channel. A Grok worker shows Working/Idle and
-            // never a fabricated WaitingForInput (design G-13 / T-24).
+            // Synthesize). The vocabulary is now *measured*, and the
+            // omission is the measured result rather than caution:
+            // `grok-notification-vocabulary-and-leader-process-2026-07-29.md`.
+            //
+            // A genuine awaiting-input signal exists —
+            // `notificationType: "permission_prompt"` (level `info`,
+            // "Tool permission requested") — but it is raised only by an
+            // interactive permission prompt, and Boss spawns with
+            // `--always-approve`, which suppresses that prompt. Under Boss's
+            // own flags the only `Notification` observed on the wire was
+            // `task_complete` ("Background task completed: <id>"), which
+            // means the opposite of blocked. Neither a `PreToolUse` hook
+            // deny nor a `--deny` rule raises one, and `--always-approve`
+            // also suppresses the folder-trust dialog outright.
+            //
+            // So there is nothing honest to bind to: mapping this capability
+            // onto `task_complete` would be exactly the fabricated
+            // WaitingForInput the contract prohibits. A Grok worker shows
+            // Working/Idle and never a fabricated WaitingForInput
+            // (design G-13 / T-24). This becomes earnable only if Boss ever
+            // spawns Grok workers *without* `--always-approve`, at which
+            // point `permission_prompt` is the already-measured mapping.
             //
             // CommandOutcomeObservation — omitted → default Degrade (never
             // Synthesize). Grok's stdout stream has not been characterised

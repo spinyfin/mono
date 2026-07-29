@@ -437,7 +437,11 @@ mod tests {
 
     #[test]
     fn notification_carries_message() {
-        // Notification.sample.json.
+        // Notification.sample.json. Confirmed on the wire against grok
+        // 0.2.114 under Boss's own spawn flags (`--always-approve --trust`):
+        // a background task completing is the *only* `Notification` a Boss
+        // worker produces. See
+        // `docs/investigations/grok-notification-vocabulary-and-leader-process-2026-07-29.md`.
         let raw = json!({
             "hookEventName": "notification",
             "sessionId": "76744658-0402-42f7-a644-68dd52f6dad4",
@@ -452,6 +456,38 @@ mod tests {
                 message: "Background task completed: 019fa637-a484-7bb1-82d2-81c9a1e1cc21".into(),
             }
         );
+    }
+
+    /// The one `notificationType` that genuinely means "blocked awaiting a
+    /// human" — measured against grok 0.2.114 by removing `--always-approve`
+    /// and sitting on the resulting permission prompt. It is pinned here so
+    /// the shape is captured in code, but it deliberately normalises to a
+    /// plain [`WorkerEvent::Notification`] like any other: Boss spawns Grok
+    /// with `--always-approve`, which suppresses the prompt that raises it,
+    /// so `GrokDriver` does **not** declare `Capability::AwaitingInputSignal`
+    /// and nothing downstream may promote this into `WaitingForInput`.
+    /// See `grok-notification-vocabulary-and-leader-process-2026-07-29.md`.
+    #[test]
+    fn permission_prompt_notification_stays_an_ordinary_notification() {
+        let raw = json!({
+            "hookEventName": "notification",
+            "sessionId": "76744658-0402-42f7-a644-68dd52f6dad4",
+            "notificationType": "permission_prompt",
+            "message": "Tool permission requested",
+            "level": "info",
+        });
+        assert_eq!(
+            session().normalize_progress_event(&raw).unwrap(),
+            WorkerEvent::Notification {
+                session_id: "76744658-0402-42f7-a644-68dd52f6dad4".into(),
+                message: "Tool permission requested".into(),
+            }
+        );
+        // `notificationType` is canonicalised for shape consistency but is
+        // not consumed — there is no awaiting-input branch to route it to.
+        let canonical = canonicalize(&raw).unwrap();
+        assert_eq!(canonical["notification_type"], "permission_prompt");
+        assert!(canonical.get("notificationType").is_none());
     }
 
     #[test]
