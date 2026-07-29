@@ -438,7 +438,7 @@ pub enum Stage {
     /// `dead_pane_sweep` (only ever probes a pid that was actually reported),
     /// and `cube_lease_auto_reap` (the engine's own DB-fallback heartbeat kept
     /// the lease alive, so it never failed) all miss — the 2026-07-03 zombies
-    /// that survived the T2168 fix. A recorded pid that is now dead is a
+    /// that survived the earlier dead-pane-sweep fix. A recorded pid that is now dead is a
     /// separate signal owned exclusively by `dead_pane_sweep`, which emits
     /// `Stage::PaneDeathReconcile` instead. The `details` object carries
     /// `reason` (`pane_never_attached`), `prior_status`, `age_in_status_secs`,
@@ -786,6 +786,15 @@ pub const DEFAULT_CURRENT_MAX_BYTES: u64 = 100 * 1024 * 1024;
 /// purpose for a forensic log, not a tight budget.
 pub const DEFAULT_CURRENT_MAX_FILES: usize = 5;
 
+/// Process-wide lock serializing the stat+rename+prune sequence in
+/// [`JsonlFileSink::maybe_rotate_current`]. Living at crate scope (rather than
+/// as an instance field), like `boss_engine_jsonl_append::APPEND_LOCK`, is
+/// what makes the "two concurrent emits crossing the threshold at once can't
+/// both act on a stale size" guarantee true regardless of how many
+/// `JsonlFileSink` values a caller constructs against the same or different
+/// roots — see that method's doc for the retention-slot bug this closes.
+static ROTATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 /// Production sink: appends each event as one JSON line to
 /// `<root>/dispatch-events/current.jsonl` and mirrors it into
 /// `<root>/executions/<execution_id>/dispatch.jsonl` so a
@@ -804,15 +813,6 @@ pub const DEFAULT_CURRENT_MAX_FILES: usize = 5;
 /// already understands the format. The per-execution mirrors are NOT
 /// rotated here — they are bounded per execution already and rotating
 /// them would fragment the single-execution diagnose view for no benefit.
-/// Process-wide lock serializing the stat+rename+prune sequence in
-/// [`JsonlFileSink::maybe_rotate_current`]. Living at crate scope (rather than
-/// as an instance field), like `boss_engine_jsonl_append::APPEND_LOCK`, is
-/// what makes the "two concurrent emits crossing the threshold at once can't
-/// both act on a stale size" guarantee true regardless of how many
-/// `JsonlFileSink` values a caller constructs against the same or different
-/// roots — see that method's doc for the retention-slot bug this closes.
-static ROTATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
 #[derive(Debug, Clone)]
 pub struct JsonlFileSink {
     root: PathBuf,
