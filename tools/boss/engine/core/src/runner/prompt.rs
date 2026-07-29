@@ -284,7 +284,7 @@ pub(super) fn designated_output_kind(execution: &WorkExecution, work_item: &Work
 /// env-file contract has a single source of truth with the driver's
 /// [`crate::driver::AgentDriver::structured_output_wiring`] default. The
 /// operative instruction is always the literal path embedded in the prompt —
-/// a model writes with the `Write` tool, not by expanding env vars — but
+/// the worker writes the file directly, not by expanding env vars — but
 /// exporting them keeps the convention self-documenting in the pane and lets
 /// a script resolve it.
 pub(super) fn structured_output_env_vars(
@@ -583,7 +583,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                 "\nAcceptance criterion: when you believe the work is done, the deliverable is a PR URL.\n\
                  - Push your commits to the existing PR branch with `cube pr update --branch <branch-name>` (see the ## RESUME EXISTING PR block above). Do NOT open a new PR.\n\
                  - Confirm the PR is updated with `gh pr view {pr_number}` (pass `-R owner/repo` since bare gh calls need it in a jj workspace — use `jj git remote` to find the slug, or check the PR URL above).\n\
-                 - As soon as cube prints the PR URL, record it: write `{{\"pr_url\": \"<the url>\"}}` with the `Write` tool to `{pr_url_artifact}` (also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
+                 - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
                  - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
@@ -594,7 +594,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                  - Push your branch (`jj bookmark create {expected_branch} -r @`) and open a PR with `cube pr create --branch {expected_branch}` which pushes the branch and opens the PR in one step (jj-aware, no GIT_DIR needed). It is safe to retry: if a prior call already created the PR (e.g. your tool killed an earlier invocation on a timeout but the push had actually landed), it returns that PR's URL instead of erroring. Use `cube pr update --branch {expected_branch}` only when you have new commits to push onto an already-open PR.\n\
                  - **Never use `jj git push`, `git push`, or `gh pr create` directly** — always use `cube pr create` or `cube pr update`. A PreToolUse hook blocks direct push/PR-create attempts and redirects you to cube.\n\
                  - If a PR already exists for this branch (e.g. you are resuming work or addressing review comments), push your new commits to update it instead of opening a duplicate. Check with `gh pr view` from inside the workspace.\n\
-                 - As soon as cube prints the PR URL, record it: write `{{\"pr_url\": \"<the url>\"}}` with the `Write` tool to `{pr_url_artifact}` (also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
+                 - As soon as cube prints the PR URL, record it by writing the file `{pr_url_artifact}` with the contents `{{\"pr_url\": \"<the url>\"}}` (path also exported as `$BOSS_PR_URL_OUTPUT`). That path is outside the repo/workspace, so it never pollutes your PR, and it is the channel the engine reads first.\n\
                  - Print the PR URL on its own line as the final thing in your final response as well, so the engine can still pick it up if that file write fails.\n\
                  - Before pushing, verify your changes are real with `jj diff -r @`. If the diff is empty, you have made no changes — do NOT commit, push, or open a PR. Stop and explain what went wrong instead.\n",
             ));
@@ -719,7 +719,7 @@ pub(crate) fn bazel_prepush_gate_text(seam_enabled: bool) -> String {
          - If a CI workflow file exists (`.github/workflows/*.yml`), open it and mirror the exact bazel target set it builds/tests (these repos typically run `bazel build //...` or a curated rollup). Run that same command locally so your gate matches what CI will enforce.\n\
          - Both `bazel build` and `bazel test` must finish clean — exit 0, no build errors, no failing tests — before you push. Clippy/lint is not reported by bazel; it runs at push time via the checkleft guard (and in CI).\n\
          \n\
-         Run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. Do NOT background one (no `&`, no `run_in_background`, no redirecting to a log file you then poll) and then idle in a self-paced wait-loop \"until the gate is green\". If the command wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
+         Run every long-running build-class command (Bazel, checkleft, tests, etc.) in the FOREGROUND and read its exit code directly. Do NOT background one — not with a trailing shell `&`, not via a backgrounded or asynchronous tool invocation, not by redirecting to a log file you then poll — and then idle in a self-paced wait-loop \"until the gate is green\". If the command wedges (host contention, a hung toolchain), those log files may never appear and the completion notification never arrives — you will wait forever with no way out, stranding your slot. If you need an upper bound, wrap the command itself in a timeout (e.g. `timeout 1800 bazel test //...`) so it returns control to you on expiry; on a timeout, treat it as a blocker (below), do not retry-and-idle.\n\
          \n\
          {failure_sentence}"
     )
@@ -908,7 +908,7 @@ fn pr_terminal_directive() -> String {
     out.push_str(
         "Opening the PR is the LAST thing you do. The engine reaps you immediately after the PR is created.\n\n",
     );
-    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (subagent workflows, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
+    out.push_str("You will NOT get another turn after `gh pr create` / `cube pr create` (or `cube pr update` for an existing PR). Do not plan followup commits, do not defer work to \"after the PR\", do not open the PR while background work (parallel/sub-agent runs, backgrounded builds, code reviews) is still in flight expecting to consume its results.\n\n");
     out.push_str("Therefore: finish everything — including consuming any review/self-review findings you started — BEFORE you open the PR. If a background review is still running and you care about its results, wait for it and address all findings FIRST, then open the PR. If you don't intend to wait, don't start the review.\n");
     out
 }
@@ -1411,7 +1411,7 @@ fn followups_emission_block(output_path: &str, seam_enabled: bool) -> String {
             "If, while completing this task, you noticed concrete follow-on work worth filing — a separate bug, a needed refactor, a missing test, a docs gap — that is OUT OF SCOPE for this PR, you may surface it for the human. This is OPTIONAL: only include genuine, actionable proposals, never invent work to fill it, and never list the change you just made.\n\n",
         );
         out.push_str(&format!(
-            "If (and only if) you have followups, **write** a JSON array of them with the `Write` tool to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`):\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so the manifest never pollutes your PR. Each array element is an object:\n",
+            "If (and only if) you have followups, **write** a JSON array of them to this exact file (also exported as `$BOSS_STRUCTURED_OUTPUT`):\n\n`{output_path}`\n\nThis path is outside the repo/workspace, so the manifest never pollutes your PR. Each array element is an object:\n",
         ));
         out.push_str("- `proposed_name` (required): a short task title.\n");
         out.push_str("- `proposed_description` (required): one paragraph of scope.\n");
