@@ -90,9 +90,9 @@ crate::stub_cube_client! { ScriptCube {
     async fn rebase_workspace_no_push(&self, _workspace_path: &std::path::Path, pr: u64) -> Result<RebaseOutcome> {
         self.rebases.lock().await.push(pr);
         match &self.script {
-            Script::Clean => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new() }),
+            Script::Clean => Ok(RebaseOutcome { clean: true, pushed: false, conflicted_files: Vec::new(), linearized_commits: 0 }),
             Script::Conflicts(files) => {
-                Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone() })
+                Ok(RebaseOutcome { clean: false, pushed: false, conflicted_files: files.clone(), linearized_commits: 0 })
             }
             Script::RebaseErrors => anyhow::bail!("rebase boom"),
             Script::EnsureRepoErrors | Script::LeaseErrors => unreachable!("must not reach rebase"),

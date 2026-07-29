@@ -16,6 +16,289 @@ use crate::app::pr::verify_push_reached_github;
 use crate::app::provision::find_workspace_record;
 use crate::app::reset::resolve_github_remote_for_workspace;
 
+/// jj template emitting one `commit_id` line per conflicted commit in a
+/// revset (and nothing for clean ones), so an empty result means "no commit
+/// in this range carries jj's conflict flag".
+const CONFLICT_COMMITS_TMPL: &str = r#"if(conflict, commit_id ++ "\n")"#;
+
+/// Upper bound on collapse iterations in [`try_linearize_replay_conflicts`],
+/// as a multiple of the conflicted-commit count. Each iteration removes at
+/// least one conflicted commit, so the count alone suffices; the multiplier
+/// is pure belt-and-braces against a jj version whose squash leaves the flag
+/// set, ensuring the loop terminates and declines rather than spinning.
+const LINEARIZE_MAX_ROUNDS_FACTOR: usize = 2;
+
+/// Collapse *replay-only* rebase conflicts forward, or decline.
+///
+/// After `jj rebase -b <branch> -d <main>`, a commit that is a strict
+/// ancestor of the branch head can carry jj's conflict flag even though the
+/// head's own rebased tree is fully resolved — the branch touched a region
+/// and a later commit rewrote or reverted it, so replaying commit-by-commit
+/// conflicts while merging the final trees (what `git merge-tree`, and
+/// GitHub, evaluate) does not. Nothing about that needs a human or an agent:
+/// the correct post-rebase content already exists at the head. But
+/// `jj git push` refuses a range containing any conflicted commit, so the
+/// rebase is finished and unpushable.
+///
+/// This squashes each such ancestor into its child until the range is clean,
+/// then **proves** the outcome before allowing the caller to push:
+///
+/// - the head that would be pushed must not itself be conflicted (a real
+///   content conflict is a real conflict — declined, never collapsed);
+/// - no conflicted commit may carry a bookmark, which would make it a
+///   stacked-PR boundary another PR points at;
+/// - each collapsed commit must have exactly one child (no fork to pick);
+/// - afterwards the range must be conflict-free, and the head's tree must be
+///   **byte-identical** to the rebased head's tree before the collapse
+///   (`jj diff --from <old head> --to <branch> --summary` empty).
+///
+/// Any of those failing returns `Ok(None)` — the caller then reports
+/// `REBASED_WITH_CONFLICTS` and hands off exactly as before. `Ok(Some(n))`
+/// means `n` commits were collapsed and the tree is verified unchanged.
+///
+/// Note the collapsed commits' descriptions do not survive (the child's
+/// message is kept via `--use-destination-message`, the only non-interactive
+/// option in a worker environment with no `$EDITOR`). Their content is
+/// preserved exactly; only the intermediate messages are lost, and the count
+/// is reported on the payload so the collapse is never silent.
+fn try_linearize_replay_conflicts(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    main_ref: &str,
+    boss_branch: &str,
+) -> Result<Option<usize>> {
+    // The head we would push must be clean on its own. When it is not, the
+    // conflict is genuine residue the rebase could not resolve — exactly the
+    // case that must still reach a resolver, and the one this must never
+    // paper over.
+    if commit_is_conflicted(runner, database_path, cwd, boss_branch)? {
+        return Ok(None);
+    }
+
+    // Snapshot the rebased head before any rewriting, so the tree can be
+    // compared against it afterwards. jj keeps rewritten commits resolvable
+    // by their old id, so this stays a valid diff endpoint after the squash.
+    let head_before = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(cwd, "jj", &["log", "-r", boss_branch, "--no-graph", "-T", "commit_id"]),
+    )?
+    .trim()
+    .to_owned();
+    if head_before.is_empty() {
+        return Ok(None);
+    }
+
+    // The operation to roll back to if any guard below declines after a
+    // squash has already landed. Without this, a decline part-way through
+    // (a bookmarked ancestor deeper in the stack, a fork, drifted tree)
+    // would leave the workspace half-rewritten while the caller reports
+    // "conflicts remain" — handing a worker a mangled history to resolve
+    // against. With it the whole attempt is atomic: either it succeeds and
+    // is verified, or the workspace is exactly as the rebase left it.
+    let pre_collapse_op = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(cwd, "jj", &["op", "log", "-n", "1", "--no-graph", "-T", "id"]),
+    )?
+    .trim()
+    .to_owned();
+
+    let mut collapsed = 0usize;
+    let verdict = collapse_and_verify(
+        runner,
+        database_path,
+        cwd,
+        main_ref,
+        boss_branch,
+        &head_before,
+        &mut collapsed,
+    );
+
+    // Roll back whatever landed unless the collapse both completed and
+    // verified. This is what makes the attempt atomic — including on an
+    // unexpected jj failure part-way through, which is propagated (these are
+    // local queries against a workspace that just rebased successfully, so a
+    // failure here is anomalous and worth surfacing) but never left half
+    // applied.
+    if collapsed > 0 && !matches!(verdict, Ok(true)) {
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(cwd, "jj", &["op", "restore", &pre_collapse_op]),
+        )?;
+    }
+
+    if verdict? { Ok(Some(collapsed)) } else { Ok(None) }
+}
+
+/// The collapse loop and its result gate, split out so
+/// [`try_linearize_replay_conflicts`] can roll back on every failure path
+/// from one place. Returns `true` only when every conflicted ancestor was
+/// collapsed *and* both result-gate checks passed; `collapsed` is updated as
+/// squashes land so the caller knows whether a rollback is owed.
+#[allow(clippy::too_many_arguments)]
+fn collapse_and_verify(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    main_ref: &str,
+    boss_branch: &str,
+    head_before: &str,
+    collapsed: &mut usize,
+) -> Result<bool> {
+    let push_range = format!("{main_ref}..{boss_branch}");
+    let mut rounds_left =
+        LINEARIZE_MAX_ROUNDS_FACTOR * conflicted_in_range(runner, database_path, cwd, &push_range)?.len() + 1;
+
+    loop {
+        let conflicted = conflicted_in_range(runner, database_path, cwd, &push_range)?;
+        if conflicted.is_empty() {
+            break;
+        }
+        rounds_left = match rounds_left.checked_sub(1) {
+            Some(n) if n > 0 => n,
+            _ => return Ok(false),
+        };
+
+        // Oldest first: collapsing bottom-up lets a conflict that a later
+        // commit already resolves disappear in one step.
+        let target = conflicted.last().expect("non-empty").clone();
+
+        // A bookmark on a conflicted ancestor means another PR in a stack
+        // points at it. Rewriting it would silently move that PR's head, so
+        // decline and let a resolver decide.
+        if commit_has_bookmark(runner, database_path, cwd, &target)? {
+            return Ok(false);
+        }
+
+        let children = run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                cwd,
+                "jj",
+                &[
+                    "log",
+                    "-r",
+                    &format!("children({target})"),
+                    "--no-graph",
+                    "-T",
+                    r#"commit_id ++ "\n""#,
+                ],
+            ),
+        )?;
+        let children: Vec<&str> = children.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+        let [child] = children.as_slice() else {
+            // No child (the head itself — already excluded above) or a fork:
+            // there is no single unambiguous place for the content to go.
+            return Ok(false);
+        };
+
+        run_jj(
+            runner,
+            database_path,
+            &RealCommandRunner::invocation(
+                cwd,
+                "jj",
+                &[
+                    "squash",
+                    "--from",
+                    &target,
+                    "--into",
+                    child,
+                    "--use-destination-message",
+                ],
+            ),
+        )?;
+        *collapsed += 1;
+    }
+
+    if *collapsed == 0 {
+        return Ok(false);
+    }
+
+    // Result gate. Everything below this point must hold or the collapse is
+    // discarded as unverified — a resolution that cannot be proven correct is
+    // handed off, never pushed.
+
+    // 1. Nothing in the range `jj git push` would reject may remain
+    //    conflicted. Checked over `{main_ref}..@`, the same (wider) range the
+    //    caller's own conflict check uses, so "clean" means one thing here.
+    if !conflicted_in_range(runner, database_path, cwd, &format!("{main_ref}..@"))?.is_empty() {
+        return Ok(false);
+    }
+
+    // 2. The pushed tree must be exactly what the rebase produced. This is
+    //    the real safety property: collapsing commits is only legitimate if
+    //    it changes history shape and nothing else. An empty diff between the
+    //    pre-collapse head and the post-collapse head proves it.
+    let tree_delta = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["diff", "--from", head_before, "--to", boss_branch, "--summary"],
+        ),
+    )?;
+    if !tree_delta.trim().is_empty() {
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+/// Conflicted commit ids within `revset`, newest first (jj's default order).
+fn conflicted_in_range(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    revset: &str,
+) -> Result<Vec<String>> {
+    let out = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(
+            cwd,
+            "jj",
+            &["log", "-r", revset, "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+        ),
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Whether `revision` itself carries jj's conflict flag.
+fn commit_is_conflicted(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    revision: &str,
+) -> Result<bool> {
+    Ok(!conflicted_in_range(runner, database_path, cwd, revision)?.is_empty())
+}
+
+/// Whether any bookmark points at `revision` — the stacked-PR guard.
+fn commit_has_bookmark(
+    runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
+    cwd: &Path,
+    revision: &str,
+) -> Result<bool> {
+    let out = run_jj(
+        runner,
+        database_path,
+        &RealCommandRunner::invocation(cwd, "jj", &["log", "-r", revision, "--no-graph", "-T", "bookmarks"]),
+    )?;
+    Ok(!out.trim().is_empty())
+}
+
 /// Position the workspace working copy on the head of a PR branch.
 ///
 /// Implements `cube workspace goto`. Fetches from the GitHub remote, resolves
@@ -418,7 +701,7 @@ pub(super) fn rebase_workspace_branch(
                 &format!("{main_ref}..@"),
                 "--no-graph",
                 "-T",
-                r#"if(conflict, commit_id ++ "\n")"#,
+                CONFLICT_COMMITS_TMPL,
             ],
         ),
     )?;
@@ -427,7 +710,36 @@ pub(super) fn rebase_workspace_branch(
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let has_conflicts = !conflicted_commit_ids.is_empty();
+    let mut has_conflicts = !conflicted_commit_ids.is_empty();
+
+    // A rebase replays each commit individually, so an *intermediate* commit
+    // can conflict even when the branch head's rebased tree is already
+    // correct and needs no human decision at all (the branch touched a
+    // region and a later commit rewrote or reverted it; `git merge-tree` of
+    // the same base/head pair reports the merge clean). jj keeps the
+    // conflict flag on that lower commit, and `jj git push` refuses the
+    // whole range while it carries one — so the rebase is complete but
+    // unpushable. Collapse those replay-only conflicts forward when, and
+    // only when, it can be proven to leave the pushed tree untouched.
+    let mut linearized_commits: usize = 0;
+    if has_conflicts {
+        match try_linearize_replay_conflicts(runner, database_path, cwd, &main_ref, &boss_branch)? {
+            Some(n) => {
+                linearized_commits = n;
+                has_conflicts = false;
+                eprintln!(
+                    "cube: workspace rebase: {boss_branch}: {n} replay-only conflicted commit(s) \
+                     collapsed forward; pushed tree verified byte-identical to the rebased head"
+                );
+            }
+            None => {
+                eprintln!(
+                    "cube: workspace rebase: {boss_branch}: conflicts are not replay-only \
+                     (or could not be collapsed with a provably identical tree); handing off unresolved"
+                );
+            }
+        }
+    }
 
     if has_conflicts {
         // Best-effort: list conflicted files across every conflicted commit
@@ -477,6 +789,7 @@ pub(super) fn rebase_workspace_branch(
                 "conflicted_files": conflicted_files,
                 "conflicted_commit_count": conflicted_commit_ids.len(),
                 "pushed": false,
+                "linearized_commits": 0,
                 "rebase_output": rebase_out,
             }),
         );
@@ -484,12 +797,24 @@ pub(super) fn rebase_workspace_branch(
 
     // Clean rebase. The local `boss_branch` bookmark followed the rebase to the
     // new head, so it is ready to advance the PR.
+    //
+    // Never let a collapse pass as an ordinary clean rebase: say so in the
+    // human message as well as on the payload, so a reader can always tell
+    // that history shape changed (content did not — that was verified).
+    let linearized_note = if linearized_commits > 0 {
+        format!(
+            " {linearized_commits} replay-only conflicted commit(s) were collapsed forward to make \
+             the branch pushable; the tree was verified byte-identical to the rebased head."
+        )
+    } else {
+        String::new()
+    };
     if opts.no_push {
         eprintln!("cube: workspace rebase: {boss_branch} rebased onto {main_branch} cleanly (push skipped)");
         return RunResult::new(
             format!(
-                "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts. \
-                 Push skipped (--no-push); update the PR with \
+                "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts.\
+                 {linearized_note} Push skipped (--no-push); update the PR with \
                  `jj git push -b {boss_branch} --remote {github_remote}`."
             ),
             json!({
@@ -498,6 +823,7 @@ pub(super) fn rebase_workspace_branch(
                 "main_branch": main_branch,
                 "conflicted_files": Vec::<String>::new(),
                 "pushed": false,
+                "linearized_commits": linearized_commits,
                 "rebase_output": rebase_out,
             }),
         );
@@ -527,7 +853,7 @@ pub(super) fn rebase_workspace_branch(
     RunResult::new(
         format!(
             "REBASED_CLEAN: branch `{boss_branch}` rebased onto `{main_branch}` with no conflicts \
-             and pushed to `{github_remote}` — the PR is updated."
+             and pushed to `{github_remote}` — the PR is updated.{linearized_note}"
         ),
         json!({
             "status": "clean",
@@ -535,6 +861,7 @@ pub(super) fn rebase_workspace_branch(
             "main_branch": main_branch,
             "conflicted_files": Vec::<String>::new(),
             "pushed": true,
+            "linearized_commits": linearized_commits,
             "rebase_output": rebase_out,
         }),
     )

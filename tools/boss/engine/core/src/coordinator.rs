@@ -551,6 +551,21 @@ pub struct RebaseOutcome {
     pub pushed: bool,
     /// Files still conflicted after the structural rebase (empty when clean).
     pub conflicted_files: Vec<String>,
+    /// How many *replay-only* conflicted commits `cube workspace rebase`
+    /// collapsed forward to make the branch pushable (0 for an ordinary
+    /// clean rebase, and always 0 on the conflict path).
+    ///
+    /// A rebase replays each commit individually, so an ancestor of the
+    /// branch head can carry jj's conflict flag even when the head's rebased
+    /// tree is already correct and `git merge-tree` reports the merge clean.
+    /// `jj git push` refuses a range containing any conflicted commit, so
+    /// before cube learned to collapse those the rebase was complete and
+    /// unpushable — and rung 1 declined, sending a conflict that did not
+    /// exist at the head to an agent. Non-zero here means cube collapsed
+    /// them *and* proved the pushed tree byte-identical to the rebased head;
+    /// it is carried purely so the ladder can say so in its trace rather
+    /// than reporting an indistinguishable "clean rebase".
+    pub linearized_commits: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, bon::Builder, serde::Deserialize)]
@@ -743,6 +758,9 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
         other => return Err(anyhow!("cube workspace rebase returned unexpected status `{other}`")),
     };
     let pushed = payload.get("pushed").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Absent on a cube older than the replay-only collapse; 0 is the correct
+    // reading there (that cube never collapsed anything).
+    let linearized_commits = payload.get("linearized_commits").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let conflicted_files = payload
         .get("conflicted_files")
         .and_then(|v| v.as_array())
@@ -757,6 +775,7 @@ fn parse_rebase_payload(payload: serde_json::Value) -> Result<RebaseOutcome> {
         clean,
         pushed,
         conflicted_files,
+        linearized_commits,
     })
 }
 

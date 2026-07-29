@@ -20,6 +20,27 @@
 //!   itself; the harness retires the attempt at rung 1 and the parent
 //!   returns to Review with no worker ever spawned.
 //!
+//!   **Why this rung used to almost never fire.** A rebase
+//!   replays each commit individually, while GitHub (and the
+//!   `boss_conflict_diagnosis` `git merge-tree` probe) merges the final
+//!   trees. A branch that touched a region and then rewrote or reverted it
+//!   conflicts *during replay* even though the merge is clean, so jj left
+//!   an ancestor of the branch head flagged while the head's own rebased
+//!   tree was already correct — and `jj git push` refuses a range
+//!   containing any conflicted commit. `cube workspace rebase` therefore
+//!   reported `REBASED_WITH_CONFLICTS` for a branch that needed no decision
+//!   at all, rung 1 declined, and (because the flagged commits dedupe to
+//!   one path) the residue was almost always exactly one file, which
+//!   [`rung2_eligible`] then routed to a small agent. Measured over the
+//!   `conflict_resolutions` table: 7 of 281 ladder-era attempts retired
+//!   mechanically, and 91 of the 107 attempts carrying a trustworthy
+//!   diagnosis had a *completely clean* `git merge-tree` yet still spawned
+//!   an agent. cube now collapses those replay-only conflicted ancestors
+//!   forward and proves the pushed tree byte-identical before reporting
+//!   clean ([`crate::coordinator::RebaseOutcome::linearized_commits`]); a
+//!   conflicted *head*, a bookmarked ancestor (stacked-PR boundary), or any
+//!   tree drift still declines and hands off here exactly as before.
+//!
 //! - **Rung 2 (T6) — small focused resolution agent.** When rung 1 leaves a
 //!   *bounded* residue of conflicted files ([`rung2_eligible`],
 //!   [`RUNG2_MAX_RESIDUAL_FILES`]), [`crate::conflict_watch`] spawns the
@@ -552,6 +573,12 @@ async fn run_rung1_in_lease(
                 work_item_id = %candidate.work_item_id,
                 pr = pr_number,
                 attempt_id = %attempt.id,
+                // Non-zero distinguishes "the rebase never conflicted" from
+                // "it conflicted only on replayed ancestors, which cube
+                // collapsed after proving the pushed tree unchanged". Both
+                // are legitimate rung-1 retires, but they are different
+                // events and the trace must not blur them.
+                linearized_commits = rebase.linearized_commits,
                 "conflict_ladder: rung 1 (engine-direct rebase) resolved and pushed; auto-retired with no agent",
             );
             return LadderOutcome::Retired;

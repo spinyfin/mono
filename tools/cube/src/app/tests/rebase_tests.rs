@@ -112,6 +112,116 @@ fn resolve_list_for_commit_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
     ExpectedCommand::ok(rebase_cwd(), "jj", &["resolve", "--list", "-r", commit_id], out)
 }
 
+/// The first probe `try_linearize_replay_conflicts` runs once the range check
+/// reports any conflict: is the branch head — the commit that would actually
+/// be pushed — conflicted on its own? A non-empty `out` means yes, which is a
+/// genuine content conflict and declines the collapse immediately.
+fn head_conflict_probe_cmd(branch: &str, out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["log", "-r", branch, "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+        out,
+    )
+}
+
+/// `jj log -r <branch> -T commit_id` — the pre-collapse head snapshot the
+/// tree-equality gate later diffs against.
+fn head_commit_id_cmd(branch: &str, out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["log", "-r", branch, "--no-graph", "-T", "commit_id"],
+        out,
+    )
+}
+
+/// Conflicted-commit enumeration over an arbitrary revset — used by the
+/// collapse loop over the push range and by its final re-check.
+fn conflicts_in_revset_cmd(revset: &str, conflicted_commit_ids: &[&str]) -> ExpectedCommand {
+    let out = if conflicted_commit_ids.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", conflicted_commit_ids.join("\n"))
+    };
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["log", "-r", revset, "--no-graph", "-T", CONFLICT_COMMITS_TMPL],
+        &out,
+    )
+}
+
+/// The pre-collapse operation snapshot, captured before any squash so a
+/// declining guard can roll the workspace back to exactly the post-rebase
+/// state.
+fn op_snapshot_cmd(out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["op", "log", "-n", "1", "--no-graph", "-T", "id"],
+        out,
+    )
+}
+
+/// The rollback a declining guard owes once at least one squash has landed.
+fn op_restore_cmd(op: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(rebase_cwd(), "jj", &["op", "restore", op], "")
+}
+
+/// The stacked-PR guard probe: does any bookmark point at this commit?
+fn bookmarks_at_cmd(commit_id: &str, out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["log", "-r", commit_id, "--no-graph", "-T", "bookmarks"],
+        out,
+    )
+}
+
+/// `children(<commit>)` enumeration — the collapse needs exactly one.
+fn children_of_cmd(commit_id: &str, child_ids: &[&str]) -> ExpectedCommand {
+    let out = if child_ids.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", child_ids.join("\n"))
+    };
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &[
+            "log",
+            "-r",
+            &format!("children({commit_id})"),
+            "--no-graph",
+            "-T",
+            r#"commit_id ++ "\n""#,
+        ],
+        &out,
+    )
+}
+
+/// The squash that collapses one replay-only conflicted commit forward.
+fn squash_into_cmd(from: &str, into: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["squash", "--from", from, "--into", into, "--use-destination-message"],
+        "",
+    )
+}
+
+/// The tree-equality gate: `jj diff --from <pre-collapse head> --to <branch>
+/// --summary`. Empty output proves the collapse changed history shape only.
+fn tree_delta_cmd(head_before: &str, branch: &str, out: &str) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        rebase_cwd(),
+        "jj",
+        &["diff", "--from", head_before, "--to", branch, "--summary"],
+        out,
+    )
+}
+
 /// Push + verify, the clean-rebase tail.
 fn push_and_verify_cmds(branch: &str) -> Vec<ExpectedCommand> {
     let api_path = format!("repos/{REBASE_OWNER_REPO}/branches/{branch}");
@@ -249,6 +359,9 @@ fn rebase_conflicts_skip_push_and_name_the_bookmark() {
         positioned_cmd(branch, "f1"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &["tip1"]));
+    // The head itself is conflicted — a real content conflict, so the
+    // replay-only collapse declines up front and this stays a hand-off.
+    cmds.push(head_conflict_probe_cmd(branch, "tip1\n"));
     cmds.push(resolve_list_for_commit_cmd("tip1", "src/foo.rs\nsrc/bar.rs\n"));
 
     let runner = FakeRunner::new(cmds);
@@ -283,6 +396,10 @@ fn rebase_conflicts_span_ancestor_commit_beyond_the_working_copy_tip() {
     ];
     // Two conflicted commits in the range: the tip and one ancestor.
     cmds.extend(set_track_rebase_check_cmds(branch, &["tip9", "ancestor1"]));
+    // The tip is among the conflicted commits, so this is genuine residue,
+    // not a replay-only artifact: the collapse declines and both commits'
+    // files must still be reported.
+    cmds.push(head_conflict_probe_cmd(branch, "tip9\n"));
     cmds.push(resolve_list_for_commit_cmd("tip9", "BUILD.bazel\n"));
     cmds.push(resolve_list_for_commit_cmd("ancestor1", "MODULE.bazel.lock\n"));
 
@@ -318,6 +435,7 @@ fn rebase_conflicts_dedupe_a_file_conflicted_on_more_than_one_commit() {
         positioned_cmd(branch, "d1"),
     ];
     cmds.extend(set_track_rebase_check_cmds(branch, &["tip5", "ancestor5"]));
+    cmds.push(head_conflict_probe_cmd(branch, "tip5\n"));
     cmds.push(resolve_list_for_commit_cmd("tip5", "src/shared.rs\n"));
     cmds.push(resolve_list_for_commit_cmd("ancestor5", "src/shared.rs\n"));
 
@@ -422,6 +540,209 @@ fn rebase_mispositioned_at_self_heals_with_jj_new_before_rebase() {
     assert_eq!(result.payload["branch"], branch);
     assert_eq!(result.payload["pushed"], true);
     assert!(result.message.starts_with("REBASED_CLEAN"));
+}
+
+// ─────────────── replay-only conflict linearization ───────────────
+//
+// A rebase replays each commit individually, so an ancestor can conflict
+// even when the branch head's rebased tree is already correct — `git
+// merge-tree` of the same base/head pair reports the merge clean. jj keeps
+// the flag on the lower commit and `jj git push` then refuses the whole
+// range, so the rebase is finished but unpushable and every such PR was
+// escalated to an agent for a conflict that does not exist at the head.
+// These cover collapsing that forward, and each guard that must decline.
+
+/// The full happy path: one conflicted ancestor under a clean head is
+/// collapsed into its child, the range re-check comes back clean, the tree
+/// is proven unchanged, and the normal clean push tail runs.
+#[test]
+fn rebase_collapses_a_replay_only_conflicted_ancestor_and_pushes() {
+    let branch = "boss/exec_replay";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "r1"),
+        positioned_cmd(branch, "r1"),
+    ];
+    // The range check sees one conflicted commit...
+    cmds.extend(set_track_rebase_check_cmds(branch, &["ancestor7"]));
+    // ...but the head that would be pushed is clean, so it is replay-only.
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "headbefore\n"));
+    cmds.push(op_snapshot_cmd("op-replay\n"));
+    // Sizing probe for the round bound, then the collapse loop.
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["ancestor7"]));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["ancestor7"]));
+    cmds.push(bookmarks_at_cmd("ancestor7", ""));
+    cmds.push(children_of_cmd("ancestor7", &["child7"]));
+    cmds.push(squash_into_cmd("ancestor7", "child7"));
+    // Loop re-entry: nothing conflicted left, so the collapse finishes.
+    cmds.push(conflicts_in_revset_cmd(&push_range, &[]));
+    // Result gate: wider range clean, and the tree is byte-identical.
+    cmds.push(conflicts_in_revset_cmd("main@github..@", &[]));
+    cmds.push(tree_delta_cmd("headbefore", branch, ""));
+    cmds.extend(push_and_verify_cmds(branch));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("replay-only rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "clean");
+    assert_eq!(result.payload["pushed"], true);
+    assert_eq!(
+        result.payload["linearized_commits"], 1,
+        "the collapse must be reported on the payload, never silent"
+    );
+    assert!(result.message.starts_with("REBASED_CLEAN"));
+    assert!(
+        result.message.contains("collapsed forward"),
+        "the human message must disclose that history shape changed: {}",
+        result.message
+    );
+}
+
+/// A conflicted head is a real content conflict. It must hand off even
+/// though ancestors are conflicted too — the collapse must never be a way
+/// to make a genuine conflict "succeed".
+#[test]
+fn rebase_declines_collapse_when_the_pushed_head_is_itself_conflicted() {
+    let branch = "boss/exec_realconflict";
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "h1"),
+        positioned_cmd(branch, "h1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["headx", "ancestorx"]));
+    cmds.push(head_conflict_probe_cmd(branch, "headx\n"));
+    cmds.push(resolve_list_for_commit_cmd("headx", "src/a.rs\n"));
+    cmds.push(resolve_list_for_commit_cmd("ancestorx", "src/b.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("real conflict rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "conflicts");
+    assert_eq!(result.payload["pushed"], false);
+    assert_eq!(result.payload["linearized_commits"], 0);
+    assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
+}
+
+/// A bookmark on the conflicted ancestor makes it a stacked-PR boundary
+/// another PR's head points at. Rewriting it would move that PR silently, so
+/// the collapse declines and hands off.
+#[test]
+fn rebase_declines_collapse_when_a_conflicted_ancestor_carries_a_bookmark() {
+    let branch = "boss/exec_stacked";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "s1"),
+        positioned_cmd(branch, "s1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["lowerpr"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "stackhead\n"));
+    cmds.push(op_snapshot_cmd("op-stacked\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["lowerpr"]));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["lowerpr"]));
+    cmds.push(bookmarks_at_cmd("lowerpr", "boss/exec_lower\n"));
+    cmds.push(resolve_list_for_commit_cmd("lowerpr", "src/stack.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("stacked rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "conflicts");
+    assert_eq!(result.payload["linearized_commits"], 0);
+    assert!(result.message.starts_with("REBASED_WITH_CONFLICTS"));
+}
+
+/// The result gate is the point of the whole thing: if the collapse would
+/// change the pushed tree by so much as one path, the resolution is not
+/// verifiable and must be discarded rather than pushed.
+#[test]
+fn rebase_declines_collapse_when_the_tree_would_change() {
+    let branch = "boss/exec_treedrift";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "t1"),
+        positioned_cmd(branch, "t1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["drifty"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "driftbefore\n"));
+    cmds.push(op_snapshot_cmd("op-drift\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["drifty"]));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["drifty"]));
+    cmds.push(bookmarks_at_cmd("drifty", ""));
+    cmds.push(children_of_cmd("drifty", &["driftchild"]));
+    cmds.push(squash_into_cmd("drifty", "driftchild"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &[]));
+    cmds.push(conflicts_in_revset_cmd("main@github..@", &[]));
+    // The tree moved — refuse to push it.
+    cmds.push(tree_delta_cmd("driftbefore", branch, "M src/drift.rs\n"));
+    // One squash had landed, so the decline owes a rollback to the
+    // post-rebase state before the conflicts are reported.
+    cmds.push(op_restore_cmd("op-drift"));
+    cmds.push(resolve_list_for_commit_cmd("drifty", "src/drift.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("tree drift rebase");
+    runner.assert_exhausted();
+    assert_eq!(
+        result.payload["status"], "conflicts",
+        "a collapse that changes the tree must never be reported as a clean rebase"
+    );
+    assert_eq!(result.payload["pushed"], false);
+    assert_eq!(result.payload["linearized_commits"], 0);
+}
+
+/// A conflicted ancestor with more than one child has no single place for
+/// its content to go — decline rather than guess.
+#[test]
+fn rebase_declines_collapse_when_a_conflicted_ancestor_has_multiple_children() {
+    let branch = "boss/exec_fork";
+    let push_range = format!("main@github..{branch}");
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "k1"),
+        positioned_cmd(branch, "k1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &["forky"]));
+    cmds.push(head_conflict_probe_cmd(branch, ""));
+    cmds.push(head_commit_id_cmd(branch, "forkhead\n"));
+    cmds.push(op_snapshot_cmd("op-fork\n"));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["forky"]));
+    cmds.push(conflicts_in_revset_cmd(&push_range, &["forky"]));
+    cmds.push(bookmarks_at_cmd("forky", ""));
+    cmds.push(children_of_cmd("forky", &["kid1", "kid2"]));
+    cmds.push(resolve_list_for_commit_cmd("forky", "src/fork.rs\n"));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("fork rebase");
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "conflicts");
+    assert_eq!(result.payload["linearized_commits"], 0);
+}
+
+/// A clean rebase must not pay for any of this: no head probe, no collapse
+/// machinery, straight to the push tail.
+#[test]
+fn rebase_clean_path_runs_no_linearization_probes() {
+    let branch = "boss/exec_untouched";
+    let mut cmds = vec![
+        fetch_cmd(),
+        remote_exists_cmd(branch, "u1"),
+        positioned_cmd(branch, "u1"),
+    ];
+    cmds.extend(set_track_rebase_check_cmds(branch, &[]));
+    cmds.extend(push_and_verify_cmds(branch));
+
+    let runner = FakeRunner::new(cmds);
+    let result = run_rebase(&runner, &rebase_opts(Some(branch), None, false)).expect("clean rebase");
+    // assert_exhausted is the real assertion: any extra probe would leave
+    // the script unconsumed or fail on an unexpected command.
+    runner.assert_exhausted();
+    assert_eq!(result.payload["status"], "clean");
+    assert_eq!(result.payload["linearized_commits"], 0);
 }
 
 // ───────────────────────── workspace push ─────────────────────────
