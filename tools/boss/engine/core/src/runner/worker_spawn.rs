@@ -456,6 +456,8 @@ pub(crate) async fn compose_worker_spawn(
                         .pr_template_set(&pr_template_set)
                         .editorial_enabled(editorial_enabled)
                         .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                        .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                        .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                         .build(),
                 )
             }
@@ -488,6 +490,8 @@ pub(crate) async fn compose_worker_spawn(
                     .pr_template_set(&pr_template_set)
                     .editorial_enabled(editorial_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                    .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                    .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
                     .build(),
             )
         } else {
