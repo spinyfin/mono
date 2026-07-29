@@ -3,6 +3,7 @@
 //! stub implementations, and helper constructors; the individual test
 //! functions live in the `t01`..`tNN` submodules.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -100,6 +101,8 @@ impl PrDetector for StubPrDetector {
 /// Configurable branch verifier for tests. Returns a fixed
 /// `headRefName` (or error), a fixed `headRefOid` (or error), and a
 /// fixed diff line count (or error) without shelling out to `gh`.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct StubBranchVerifier {
     result: Result<String, String>,
     head_oid_result: Mutex<Result<String, String>>,
@@ -111,6 +114,20 @@ struct StubBranchVerifier {
     /// Title returned by `fetch_pr_title`. Defaults to empty, same as
     /// `body_result` — tests that care override via `set_title`.
     title_result: Mutex<Result<String, String>>,
+    /// Merge-base SHA returned by `fetch_merge_base`. Defaults to a fixed
+    /// stand-in; tests that exercise the pure-rebase gate's CI-remediation
+    /// fallback (no `base_sha_at_trigger` recorded) override via
+    /// `set_merge_base`.
+    merge_base_result: Mutex<Result<String, String>>,
+    /// Signatures returned by `fetch_diff_signature`, keyed by the `head`
+    /// argument (tests only ever compare two distinct heads against the
+    /// same base, so keying on `head` alone distinguishes the calls).
+    /// A `head` with no entry falls back to a value derived from `head`
+    /// itself, which never coincidentally matches another head's
+    /// fallback — so a test that never calls `set_diff_signature` gets
+    /// two different ("not a pure rebase") signatures by construction,
+    /// safe for tests that don't exercise the pure-rebase gate at all.
+    diff_signature_results: Mutex<HashMap<String, Result<String, String>>>,
 }
 
 impl StubBranchVerifier {
@@ -127,6 +144,8 @@ impl StubBranchVerifier {
             diff_line_count_result: Mutex::new(Ok(999)),
             body_result: Mutex::new(Ok(String::new())),
             title_result: Mutex::new(Ok(String::new())),
+            merge_base_result: Mutex::new(Ok("merge_base_unknown".to_owned())),
+            diff_signature_results: Mutex::new(HashMap::new()),
         })
     }
 
@@ -151,6 +170,19 @@ impl StubBranchVerifier {
         *self.body_result.lock().await = body;
     }
 
+    /// Override the merge-base SHA returned by `fetch_merge_base`.
+    async fn set_merge_base(&self, base: Result<String, String>) {
+        *self.merge_base_result.lock().await = base;
+    }
+
+    /// Configure the diff signature `fetch_diff_signature` returns when
+    /// called with `head`. Pure-rebase gate tests set the same signature
+    /// for both `pre_head` and `post_head` to simulate a clean rebase, or
+    /// different signatures to simulate one that also changed content.
+    async fn set_diff_signature(&self, head: &str, sig: Result<String, String>) {
+        self.diff_signature_results.lock().await.insert(head.to_owned(), sig);
+    }
+
     /// Verifier that always returns a transient API error from
     /// `fetch_pr_head_ref`. Used to test that a branch-verification
     /// failure does NOT discard the staged URL (it is preserved for
@@ -162,6 +194,8 @@ impl StubBranchVerifier {
             diff_line_count_result: Mutex::new(Ok(999)),
             body_result: Mutex::new(Ok(String::new())),
             title_result: Mutex::new(Ok(String::new())),
+            merge_base_result: Mutex::new(Ok("merge_base_unknown".to_owned())),
+            diff_signature_results: Mutex::new(HashMap::new()),
         })
     }
 }
@@ -188,6 +222,23 @@ impl BranchVerifier for StubBranchVerifier {
         match &*guard {
             Ok(count) => Ok(*count),
             Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_merge_base(&self, _repo_slug: &str, _a: &str, _b: &str) -> Result<String> {
+        let guard = self.merge_base_result.lock().await;
+        match &*guard {
+            Ok(sha) => Ok(sha.clone()),
+            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_diff_signature(&self, _repo_slug: &str, _base: &str, head: &str) -> Result<String> {
+        let guard = self.diff_signature_results.lock().await;
+        match guard.get(head) {
+            Some(Ok(sig)) => Ok(sig.clone()),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => Ok(format!("default-signature-for-{head}")),
         }
     }
 
@@ -910,6 +961,113 @@ fn revision_fixture(
     // Snapshot the parent PR's head SHA as `on_execution_started` does.
     db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
     (dir, db, product.id, revision.id, execution.id)
+}
+
+/// Build a revision fixture (mirrors [`revision_fixture`]) whose revision
+/// task was created via a conflict-resolution or CI-fix attempt, with a
+/// matching `conflict_resolutions` / `ci_remediations` row recording
+/// `head_sha_before` (and, for a conflict resolution, `base_sha_at_trigger`)
+/// — the state [`WorkerCompletionHandler::check_pure_rebase_skip`] reads.
+///
+/// `created_via` selects the attempt table: a value starting with
+/// `CREATED_VIA_MERGE_CONFLICT_PREFIX` inserts a `conflict_resolutions` row
+/// (with `pre_base` recorded, if given); `CREATED_VIA_CI_FIX_PREFIX` inserts
+/// a `ci_remediations` row (which never records a base, exercising the
+/// merge-base fallback — `pre_base` is ignored for this case).
+fn pure_rebase_revision_fixture(
+    workspace_path: &Path,
+    created_via: &str,
+    pr_number: i64,
+    head_before: &str,
+    pre_base: Option<&str>,
+) -> (TempDir, Arc<WorkDb>, String, String, String, String) {
+    use crate::work::{CiRemediationInsertInput, ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
+    use boss_protocol::CreateRevisionInput;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path).unwrap());
+    let product = create_test_product_named(&db, "Boss-pure-rebase-test");
+    let parent_pr_url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+    let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![parent.id, parent_pr_url],
+        )
+        .unwrap();
+    }
+
+    if created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
+        db.insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: parent.id.clone(),
+            pr_url: parent_pr_url.clone(),
+            pr_number,
+            head_branch: "boss/exec_parent".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: pre_base.map(str::to_owned),
+            head_sha_before: Some(head_before.to_owned()),
+        })
+        .unwrap()
+        .expect("conflict_resolution insert must not be churn-guarded in a fresh fixture");
+    } else if created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX) {
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: parent.id.clone(),
+            pr_url: parent_pr_url.clone(),
+            pr_number,
+            head_branch: "boss/exec_parent".to_owned(),
+            head_sha_at_trigger: head_before.to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("ci_remediation insert must not be deduped in a fresh fixture");
+    } else {
+        panic!("pure_rebase_revision_fixture: created_via must carry a conflict/CI-fix prefix, got {created_via:?}");
+    }
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Rebase onto latest main")
+                .created_via(created_via)
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .prefer_is_soft(true)
+                .pr_url(parent_pr_url.clone())
+                .build(),
+        )
+        .unwrap();
+    let (execution, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            workspace_path.to_str().unwrap(),
+        )
+        .unwrap();
+    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
+    (dir, db, product.id, parent.id, revision.id, execution.id)
 }
 
 /// Configurable [`MergeProbe`] returning a fixed lifecycle state for

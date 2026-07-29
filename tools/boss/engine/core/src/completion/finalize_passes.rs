@@ -1076,6 +1076,227 @@ impl WorkerCompletionHandler {
         }
     }
 
+    /// Evaluate whether `producing`'s push is a conflict-resolution or
+    /// CI-fix result that changed nothing but the base it sits on — a
+    /// *pure* rebase, with no authored content and no manually-altered
+    /// conflict hunk. Returns `Some("pure_rebase")` when so; `None` when
+    /// `producing` isn't a conflict/CI-fix resolution, there's nothing on
+    /// record to compare against, or any GitHub call fails (fail open: an
+    /// unproven predicate must never suppress a real review).
+    ///
+    /// Deliberately independent of `review_cycle` / `last_reviewed_sha`
+    /// (unlike [`Self::check_noop_skip`]) so it also covers a
+    /// conflict/CI-fix push that lands before the PR's very first review —
+    /// `check_noop_skip`'s rule 1 always treats that as "never skip", which
+    /// is right for genuinely new content but wrong for a rebase that
+    /// contributes none.
+    ///
+    /// # The predicate
+    ///
+    /// Let `pre_head` be the PR head immediately before this resolution
+    /// began and `pre_base` the target-branch commit the PR was based on
+    /// at that same moment — both read off the `conflict_resolutions` /
+    /// `ci_remediations` attempt row that spawned `producing`.
+    /// `ci_remediations` rows never stamp a base (a CI failure isn't
+    /// necessarily caused by a base move), so `pre_base` is reconstructed
+    /// as `merge_base(pre_head, post_head)` in that case — exactly the
+    /// point the branches last shared, on a repo with linear target-branch
+    /// history. Let `post_head` be the PR's current head.
+    ///
+    /// The push is a pure rebase iff the file-level diff of
+    /// `pre_base..pre_head` (what the PR contributed before this
+    /// resolution) is byte-identical to the file-level diff of
+    /// `pre_base..post_head` (what it contributes now, against that SAME
+    /// fixed point). Any difference at all — new lines, a hand-resolved
+    /// conflict hunk, a dropped file — fails the predicate and a full
+    /// review still runs; a resolution that mostly rebases but also
+    /// hand-edits a few lines to make it compile is NOT purely a rebase.
+    ///
+    /// On success, appends a `[pr-review-skip]` audit line to the work
+    /// item's description (mirrors the `[deferred-scope]` /
+    /// `[engine-reconcile]` convention) so an operator asking "why did
+    /// this PR never get an AI review pass" has a durable answer on the
+    /// item itself, not just a log line.
+    pub(super) async fn check_pure_rebase_skip(
+        &self,
+        pr_url: &str,
+        producing: &crate::work::WorkExecution,
+    ) -> Option<&'static str> {
+        let task = match self.work_db.get_work_item(&producing.work_item_id) {
+            Ok(WorkItem::Task(t) | WorkItem::Chore(t)) => t,
+            Ok(_) => return None,
+            Err(err) => {
+                tracing::warn!(
+                    work_item_id = %producing.work_item_id,
+                    ?err,
+                    "pure-rebase skip: work item lookup failed; proceeding with review",
+                );
+                return None;
+            }
+        };
+        let created_via = task.created_via.clone();
+        // `conflict_resolutions` / `ci_remediations` rows are keyed on the
+        // review-cycle root (the original in-review task), not the
+        // revision task that actually pushed the fix — mirrors
+        // `compute_merge_parent_deletion_signoff`.
+        let root = self.work_db.review_cycle_root_id(&producing.work_item_id);
+        let (pre_head, pre_base) = if created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX) {
+            let cr = match self.work_db.latest_conflict_resolution_for_work_item(&root) {
+                Ok(Some(cr)) => cr,
+                Ok(None) => return None,
+                Err(err) => {
+                    tracing::warn!(work_item_id = %root, ?err, "pure-rebase skip: conflict_resolution lookup failed; proceeding with review");
+                    return None;
+                }
+            };
+            match cr.head_sha_before.filter(|s| !s.is_empty()) {
+                Some(pre_head) => (pre_head, cr.base_sha_at_trigger.filter(|s| !s.is_empty())),
+                None => return None,
+            }
+        } else if created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX) {
+            let attempt = match self.work_db.list_ci_remediations(None, &[], Some(&root), Some(1)) {
+                Ok(rows) => rows.into_iter().next(),
+                Err(err) => {
+                    tracing::warn!(work_item_id = %root, ?err, "pure-rebase skip: ci_remediation lookup failed; proceeding with review");
+                    return None;
+                }
+            };
+            match attempt.map(|a| a.head_sha_at_trigger).filter(|s| !s.is_empty()) {
+                Some(pre_head) => (pre_head, None),
+                None => return None,
+            }
+        } else {
+            // Not a conflict-resolution / CI-fix push — the predicate
+            // doesn't apply; fall through to the general no-op gate.
+            return None;
+        };
+
+        let repo_slug = match parse_repo_slug(&producing.repo_remote_url) {
+            Ok(slug) => slug,
+            Err(err) => {
+                tracing::warn!(
+                    repo_remote_url = %producing.repo_remote_url,
+                    ?err,
+                    "pure-rebase skip: cannot parse repo slug; proceeding with review",
+                );
+                return None;
+            }
+        };
+        let Some(pr_number) = pr_number_from_url(pr_url) else {
+            tracing::warn!(
+                pr_url,
+                "pure-rebase skip: cannot parse PR number; proceeding with review"
+            );
+            return None;
+        };
+
+        let post_head = match self.branch_verifier.fetch_pr_head_oid(&repo_slug, pr_number).await {
+            Ok(sha) => sha,
+            Err(err) => {
+                tracing::warn!(
+                    pr_url,
+                    ?err,
+                    "pure-rebase skip: cannot fetch PR head OID; proceeding with review"
+                );
+                return None;
+            }
+        };
+        if post_head == pre_head {
+            // Nothing pushed this round — `check_noop_skip`'s
+            // `sha_unchanged` rule covers this once it also has a
+            // `last_reviewed_sha` to compare against.
+            return None;
+        }
+
+        let pre_base = match pre_base {
+            Some(base) => base,
+            None => match self
+                .branch_verifier
+                .fetch_merge_base(&repo_slug, &pre_head, &post_head)
+                .await
+            {
+                Ok(base) => base,
+                Err(err) => {
+                    tracing::warn!(
+                        pr_url,
+                        pre_head,
+                        post_head,
+                        ?err,
+                        "pure-rebase skip: cannot compute merge-base; proceeding with review",
+                    );
+                    return None;
+                }
+            },
+        };
+
+        let diff_before = match self
+            .branch_verifier
+            .fetch_diff_signature(&repo_slug, &pre_base, &pre_head)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(err) => {
+                tracing::warn!(
+                    pr_url,
+                    pre_base,
+                    pre_head,
+                    ?err,
+                    "pure-rebase skip: cannot fetch pre-resolution diff signature; proceeding with review",
+                );
+                return None;
+            }
+        };
+        let diff_after = match self
+            .branch_verifier
+            .fetch_diff_signature(&repo_slug, &pre_base, &post_head)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(err) => {
+                tracing::warn!(
+                    pr_url,
+                    pre_base,
+                    post_head,
+                    ?err,
+                    "pure-rebase skip: cannot fetch post-resolution diff signature; proceeding with review",
+                );
+                return None;
+            }
+        };
+
+        if diff_before != diff_after {
+            return None;
+        }
+
+        // Recorded on `root` (the parent chore / chain root), not
+        // `producing.work_item_id` (the revision task) — the root is the
+        // PR-owning card an operator actually looks at, and the same item
+        // `review_cycle` / `last_reviewed_sha` are tracked on.
+        self.record_pure_rebase_skip(&root, &created_via, &pre_head, &post_head);
+        Some("pure_rebase")
+    }
+
+    /// Best-effort `[pr-review-skip]` audit line — see
+    /// [`Self::check_pure_rebase_skip`]. A failure here never blocks the
+    /// skip decision itself; it is logged and swallowed, mirroring
+    /// `append_reconcile_audit_best_effort`.
+    fn record_pure_rebase_skip(&self, work_item_id: &str, created_via: &str, pre_head: &str, post_head: &str) {
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let line = format!(
+            "\n[pr-review-skip] epoch {now}: reason=pure_rebase created_via={created_via} \
+             pre_head={pre_head} post_head={post_head} — automated review skipped: the resolution's \
+             diff against its pre-resolution base is byte-identical before and after, i.e. nothing \
+             changed but the base.",
+        );
+        if let Err(err) = crate::reconcile_audit::append_description_line(&self.work_db, work_item_id, &line) {
+            tracing::warn!(
+                work_item_id,
+                ?err,
+                "pure-rebase skip: audit-line append failed (non-fatal)",
+            );
+        }
+    }
+
     /// Evaluate the no-op / trivial-diff skip gate for the automated reviewer.
     ///
     /// Returns `Some(reason)` when the reviewer pass should be skipped,

@@ -1344,6 +1344,219 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 }
 
 // -----------------------------------------------------------
+// Pure-rebase skip gate (`check_pure_rebase_skip`): a conflict-resolution
+// or CI-fix push whose file-level diff against its pre-resolution base is
+// byte-identical before and after — i.e. nothing changed but the base —
+// must not trigger a review. Deliberately independent of `review_cycle` /
+// `last_reviewed_sha`, unlike `check_noop_skip`, so it also covers a
+// conflict/CI-fix that lands before the PR's very first review.
+// -----------------------------------------------------------
+
+/// A conflict-resolution revision whose diff signature against the
+/// recorded `base_sha_at_trigger` is identical before and after the push
+/// (a clean rebase, no hand-authored content) must skip the reviewer
+/// entirely — even though this is the PR's first-ever review pass
+/// (`review_cycle == 0`), which `check_noop_skip` alone would never skip.
+/// The skip must also leave a durable `[pr-review-skip]` audit line on the
+/// parent chore's description.
+#[tokio::test]
+async fn pure_rebase_skip_gate_skips_conflict_resolution_with_identical_diff() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 900;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pre_base = "base0000000000000000000000000000000000";
+    let (_dir, db, _product_id, parent_id, _revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test1"),
+        pr_number,
+        head_before,
+        Some(pre_base),
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    // Same file-level content at `pre_base` regardless of which head is
+    // compared — the defining shape of a clean rebase.
+    verifier
+        .set_diff_signature(head_before, Ok("same-signature".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature(head_after, Ok("same-signature".to_owned()))
+        .await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a pure-rebase conflict resolution must not enqueue a reviewer; got {outcome:?}",
+    );
+    assert!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != ExecutionKind::PrReview),
+        "no pr_review execution may be created for a pure-rebase conflict resolution",
+    );
+
+    let item = db.get_work_item(&parent_id).unwrap();
+    let description = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
+        other => panic!("expected a chore, got {other:?}"),
+    };
+    assert!(
+        description.contains("[pr-review-skip]") && description.contains("reason=pure_rebase"),
+        "the parent chore's description must carry a durable pure-rebase skip audit line; got {description:?}",
+    );
+}
+
+/// A conflict-resolution revision whose diff signature against
+/// `base_sha_at_trigger` DIFFERS between the pre- and post-resolution head
+/// — i.e. the resolution also touched real content, not just the base —
+/// must still enqueue a full reviewer pass. This is the "mostly rebases
+/// but also hand-edits three lines to make it compile" case the predicate
+/// is required to catch.
+#[tokio::test]
+async fn pure_rebase_skip_gate_does_not_skip_when_content_differs() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 901;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pre_base = "base0000000000000000000000000000000000";
+    let (_dir, db, _product_id, _parent_id, revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test2"),
+        pr_number,
+        head_before,
+        Some(pre_base),
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    // Distinct signatures — the resolution introduced real content.
+    verifier
+        .set_diff_signature(head_before, Ok("signature-before".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature(head_after, Ok("signature-after".to_owned()))
+        .await;
+    verifier.set_diff_line_count(Ok(40)).await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a conflict resolution that also changed content must still enqueue a reviewer; got {outcome:?}",
+    );
+    assert_eq!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .count(),
+        1,
+        "exactly one pr_review execution must be created",
+    );
+}
+
+/// A CI-fix revision's `ci_remediations` row never records a base, so the
+/// gate reconstructs one via `fetch_merge_base`. When the two diff
+/// signatures taken against that reconstructed base match, the CI-fix is
+/// still recognised as a pure rebase and the reviewer is skipped.
+#[tokio::test]
+async fn pure_rebase_skip_gate_skips_ci_fix_via_merge_base_fallback() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 902;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, _parent_id, _revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_CI_FIX_PREFIX}cir_test1"),
+        pr_number,
+        head_before,
+        None, // ci_remediations never records a base
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    verifier
+        .set_merge_base(Ok("reconstructed_base0000000000000000000".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature(head_before, Ok("same-signature".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature(head_after, Ok("same-signature".to_owned()))
+        .await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a pure-rebase CI-fix must not enqueue a reviewer; got {outcome:?}",
+    );
+}
+
+/// If the merge-base fetch fails (transient GitHub error) the gate must
+/// fail open — a full review still runs rather than silently suppressing
+/// one on an unproven predicate.
+#[tokio::test]
+async fn pure_rebase_skip_gate_fails_open_on_merge_base_error() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 903;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, _parent_id, revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_CI_FIX_PREFIX}cir_test2"),
+        pr_number,
+        head_before,
+        None,
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    verifier.set_merge_base(Err("simulated API error".to_owned())).await;
+    verifier.set_diff_line_count(Ok(40)).await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a merge-base fetch failure must fail open (enqueue reviewer); got {outcome:?}",
+    );
+    assert_eq!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .count(),
+        1,
+        "exactly one pr_review execution must be created on fail-open",
+    );
+}
+
+// -----------------------------------------------------------
 // Deliverable-satisfied gate tests (zombie-worker / "nothing left to do"
 // loop fix).
 //

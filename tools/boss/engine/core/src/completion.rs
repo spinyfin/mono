@@ -546,6 +546,22 @@ pub trait BranchVerifier: Send + Sync {
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
+    /// Returns the merge-base commit SHA of `a` and `b` in `repo_slug` — the
+    /// commit their histories last shared. Used by the conflict/CI-fix
+    /// pure-rebase skip gate to reconstruct the pre-rebase base when the
+    /// resolution's attempt row has none recorded (`ci_remediations` rows
+    /// never stamp a base; only `conflict_resolutions` rows do).
+    async fn fetch_merge_base(&self, repo_slug: &str, a: &str, b: &str) -> Result<String>;
+
+    /// Returns a canonical, comparable signature of the file-level diff
+    /// between `base` and `head` in `repo_slug`: every changed file's name,
+    /// status, and unified patch text, sorted by filename. Two calls whose
+    /// underlying content is identical return byte-identical strings
+    /// regardless of the commit SHAs involved — used by the pure-rebase
+    /// skip gate to tell "content unchanged, only the base moved" from a
+    /// resolution that introduced real content.
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String>;
+
     /// Returns `(title, body)` of PR `pr_number` in `repo_slug` in a single
     /// `gh pr view` call. The body is used by the metadata-only CI-fix
     /// finalize gate (issue #1252) to detect an operator-visible
@@ -583,6 +599,14 @@ impl BranchVerifier for CommandBranchVerifier {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 
+    async fn fetch_merge_base(&self, repo_slug: &str, a: &str, b: &str) -> Result<String> {
+        fetch_merge_base_cmd(repo_slug, a, b).await
+    }
+
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String> {
+        fetch_diff_signature_cmd(repo_slug, base, head).await
+    }
+
     async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
         fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
     }
@@ -608,6 +632,65 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
         .parse()
         .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
     Ok(total)
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<a>...<b>` and return the
+/// `merge_base_commit.sha` GitHub computed for the comparison — the commit
+/// where `a` and `b`'s histories last diverged. Used by the pure-rebase
+/// skip gate to reconstruct a resolution's pre-rebase base when the attempt
+/// row carries none.
+async fn fetch_merge_base_cmd(repo_slug: &str, a: &str, b: &str) -> Result<String> {
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(repo_slug, a, b, ".merge_base_commit.sha"),
+    )
+    .await?;
+    if trimmed.is_empty() {
+        anyhow::bail!("gh api repos/{repo_slug}/compare/{a}...{b}: empty merge_base_commit.sha");
+    }
+    Ok(trimmed)
+}
+
+/// One entry from GitHub's compare `.files[]` array, carrying enough to
+/// build a content-comparable diff signature.
+#[derive(serde::Deserialize)]
+struct DiffSignatureFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and
+/// return a canonical `(filename, status, patch)` signature of every
+/// changed file, sorted by filename and joined with control characters that
+/// cannot appear in a filename or unified-diff patch — so two signatures
+/// are byte-comparable regardless of the order GitHub returned files in.
+/// Used by the pure-rebase skip gate: identical signatures at two different
+/// `head` values (same `base`) mean the content introduced is identical,
+/// i.e. nothing changed but the base.
+async fn fetch_diff_signature_cmd(repo_slug: &str, base: &str, head: &str) -> Result<String> {
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(repo_slug, base, head, "[.files[] | {filename, status, patch}]"),
+    )
+    .await?;
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let mut files: Vec<DiffSignatureFile> = serde_json::from_str(&trimmed)
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
+    files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(files
+        .iter()
+        .map(|f| {
+            format!(
+                "{}\u{1f}{}\u{1f}{}",
+                f.filename,
+                f.status,
+                f.patch.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}"))
 }
 
 /// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title,body`
