@@ -815,13 +815,28 @@ impl WorkerCompletionHandler {
         if revision_warranted {
             // `review_result` is Some when `revision_warranted` is true.
             let result = review_result.expect("revision_warranted implies Some(ReviewResult)");
-            let instructions = crate::pr_review::render_revision_instructions(&result);
+            // The origin is the chain root — the task itself for a first-pass
+            // review, or the root of the revision chain for a re-review (same
+            // row `cycle_root_id` above already resolved) — so the title and
+            // description always point at the work item whose PR is actually
+            // under review, not at an intermediate revision row.
+            let origin_task_short_id = match self.work_db.get_work_item(&cycle_root_id) {
+                Ok(WorkItem::Task(ref t)) | Ok(WorkItem::Chore(ref t)) => t.short_id,
+                _ => None,
+            };
+            let origin = crate::pr_review::ReviewOrigin {
+                task_short_id: origin_task_short_id,
+                pr_number: pr_number_from_url(&pr_url).map(|n| n as i64),
+            };
+            let instructions = crate::pr_review::render_revision_instructions(&result, origin);
+            let title = crate::pr_review::render_revision_title(origin, result.findings.len());
             let created_via = format!("{CREATED_VIA_PR_REVIEW_PREFIX}{}", execution.id);
 
             match self.work_db.create_revision(
                 CreateRevisionInput::builder()
                     .parent_task_id(producing_task_id.clone())
                     .description(instructions)
+                    .name(title)
                     .created_via(created_via)
                     .build(),
                 self.pr_state_checker.as_ref(),

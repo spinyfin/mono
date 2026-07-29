@@ -343,8 +343,8 @@ pub(crate) fn resolve_revision_on_parent_close(
             .as_ref()
             .and_then(|r| r.pr_url.as_deref().and_then(extract_pr_number_from_url));
         let desc = rev.description.replace(
-            "Address all findings before finalising this revision.",
-            "Address all findings before closing this follow-up.",
+            "Address ALL findings before finalising this revision.",
+            "Address ALL findings before closing this follow-up.",
         );
         (Some(TaskKind::Followup), origin_short_id, origin_pr_num, desc)
     } else {

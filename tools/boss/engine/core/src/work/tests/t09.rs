@@ -29,7 +29,7 @@ fn pr_review_revision_creates_followup_with_correct_kind_and_provenance() {
         .create_revision(
             CreateRevisionInput::builder()
                 .parent_task_id(parent_id.clone())
-                .description("Address all findings before finalising this revision.")
+                .description("Address ALL findings before finalising this revision.")
                 .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_test_123"))
                 .build(),
             &checker,
@@ -111,7 +111,7 @@ fn pr_review_active_revision_creates_autostart_followup() {
         .create_revision(
             CreateRevisionInput::builder()
                 .parent_task_id(parent_id.clone())
-                .description("Address all findings before finalising this revision.")
+                .description("Address ALL findings before finalising this revision.")
                 .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_test_456"))
                 .build(),
             &checker,
@@ -156,7 +156,7 @@ fn followup_visible_to_merge_check_poller() {
     db.create_revision(
         CreateRevisionInput::builder()
             .parent_task_id(parent_id.clone())
-            .description("Address all findings before finalising this revision.")
+            .description("Address ALL findings before finalising this revision.")
             .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_test_789"))
             .build(),
         &checker,
@@ -215,7 +215,7 @@ fn list_chores_returns_followup_provenance() {
     db.create_revision(
         CreateRevisionInput::builder()
             .parent_task_id(parent_id.clone())
-            .description("Address all findings before finalising this revision.")
+            .description("Address ALL findings before finalising this revision.")
             .created_via(format!("{CREATED_VIA_PR_REVIEW_PREFIX}exec_prov_test"))
             .build(),
         &checker,

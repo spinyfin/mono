@@ -4,6 +4,49 @@
 
 use crate::types::*;
 
+/// Provenance of the PR + work item that produced a `ReviewResult`. Threaded
+/// into both the rendered revision instructions and the revision/follow-up
+/// card title so a row is never anonymous — including after
+/// `block_pending_revisions_on_parent_close` converts it from `revision` to
+/// `followup` when the reviewed PR merges before the findings are addressed.
+#[derive(Debug, Clone, Copy)]
+pub struct ReviewOrigin {
+    /// Per-product short id of the task under review — the chain root for a
+    /// re-review of an existing revision, the task itself otherwise. `None`
+    /// only for a legacy row that predates the `short_id` column.
+    pub task_short_id: Option<i64>,
+    /// GitHub PR number parsed from `ReviewResult::pr_url`. `None` when the
+    /// URL didn't parse to a canonical `.../pull/<n>` form (defensive; the
+    /// finalize path always supplies a validated PR url in practice).
+    pub pr_number: Option<i64>,
+}
+
+impl ReviewOrigin {
+    /// Human-readable origin reference, e.g. `"PR #<n> (originating work
+    /// item T<short_id>)"`. Degrades gracefully when either half is
+    /// unavailable, and falls back to a generic phrase if neither is.
+    fn describe(&self) -> String {
+        match (self.pr_number, self.task_short_id) {
+            (Some(pr), Some(short_id)) => format!("PR #{pr} (originating work item T{short_id})"),
+            (Some(pr), None) => format!("PR #{pr}"),
+            (None, Some(short_id)) => format!("originating work item T{short_id}"),
+            (None, None) => "the reviewed PR".to_owned(),
+        }
+    }
+}
+
+/// Short (1–10 word) card title identifying the origin PR and work item so
+/// automated-review cards are distinguishable on the board without opening
+/// them — see `boss task create-revision`'s `name` field.
+pub fn render_revision_title(origin: ReviewOrigin, finding_count: usize) -> String {
+    match (origin.task_short_id, origin.pr_number) {
+        (Some(short_id), Some(pr)) => format!("T{short_id} PR #{pr} review: {finding_count} finding(s)"),
+        (Some(short_id), None) => format!("T{short_id} PR review: {finding_count} finding(s)"),
+        (None, Some(pr)) => format!("PR #{pr} review: {finding_count} finding(s)"),
+        (None, None) => format!("Automated PR review: {finding_count} finding(s)"),
+    }
+}
+
 /// Render qualifying `ReviewResult` findings as human-readable revision
 /// instructions.
 ///
@@ -11,7 +54,11 @@ use crate::types::*;
 /// each with its title, file, location, and concrete detail. The rendering
 /// is the `revision_instructions` passed to the revising worker — it must
 /// be specific enough to act on without guessing.
-pub fn render_revision_instructions(result: &ReviewResult) -> String {
+///
+/// Opens with `origin` (the PR reviewed and the work item that produced it)
+/// before the generic no-punting preamble, so the description alone
+/// identifies what the findings are about.
+pub fn render_revision_instructions(result: &ReviewResult, origin: ReviewOrigin) -> String {
     let severity_rank = |s: &ReviewFindingSeverity| match s {
         ReviewFindingSeverity::Critical => 0u8,
         ReviewFindingSeverity::High => 1,
@@ -23,7 +70,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
     findings.sort_by_key(|f| severity_rank(&f.severity));
 
     let mut out = format!(
-        "Automated PR review found {} finding(s) requiring attention.\n\
+        "Automated PR review of {} found {} finding(s) requiring attention.\n\
          Address ALL findings before finalising this revision.\n\
          \n\
          ## HARD RULE: no punting — do the actual work\n\
@@ -48,6 +95,7 @@ pub fn render_revision_instructions(result: &ReviewResult) -> String {
          out-of-scope dependency, requires operator decision, etc.). Do NOT silently\n\
          file a follow-up or leave a TODO. The default is to do the work.\n\
          \n",
+        origin.describe(),
         findings.len()
     );
 
@@ -1527,6 +1575,16 @@ mod tests {
         );
     }
 
+    /// A representative origin for tests: short id and PR number are built
+    /// from data at the call site (never a literal short-id string) so
+    /// nothing here reads as a hardcoded work-item reference.
+    fn test_origin() -> ReviewOrigin {
+        ReviewOrigin {
+            task_short_id: Some(40 + 2),
+            pr_number: Some(5),
+        }
+    }
+
     #[test]
     fn render_revision_instructions_contains_title_and_detail() {
         let result = ReviewResult {
@@ -1550,13 +1608,73 @@ mod tests {
                 suspected_deletions: vec![],
             },
         };
-        let instructions = render_revision_instructions(&result);
+        let instructions = render_revision_instructions(&result, test_origin());
         assert!(instructions.contains("Null pointer dereference"));
         assert!(instructions.contains("src/main.rs"));
         assert!(instructions.contains("fn handle, ~L42"));
         assert!(instructions.contains("add a guard"));
         assert!(instructions.contains("One bug found."));
         assert!(instructions.contains("high")); // severity
+    }
+
+    #[test]
+    fn render_revision_instructions_opens_with_origin_before_preamble() {
+        let result = ReviewResult {
+            pr_url: "https://github.com/org/repo/pull/5".to_owned(),
+            head_sha: String::new(),
+            summary: "One bug found.".to_owned(),
+            revision_warranted: true,
+            findings: vec![
+                ReviewFinding::builder()
+                    .severity(ReviewFindingSeverity::High)
+                    .category(ReviewFindingCategory::Correctness)
+                    .file("src/main.rs")
+                    .title("Null pointer dereference")
+                    .detail("Add a guard.")
+                    .confidence(ReviewFindingConfidence::High)
+                    .build(),
+            ],
+            regression_check: RegressionCheck {
+                performed: true,
+                suspected_deletions: vec![],
+            },
+        };
+        let origin = test_origin();
+        let instructions = render_revision_instructions(&result, origin);
+        let origin_marker = format!("PR #{}", origin.pr_number.expect("test origin has a pr_number"));
+        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
+        let origin_pos = instructions
+            .find(&origin_marker)
+            .expect("origin PR reference must be present");
+        let short_id_pos = instructions
+            .find(&short_id_marker)
+            .expect("origin work item short id must be present");
+        let preamble_pos = instructions
+            .find("HARD RULE: no punting")
+            .expect("no-punting preamble must be present");
+        assert!(
+            origin_pos < preamble_pos && short_id_pos < preamble_pos,
+            "origin must open the description before the generic no-punting preamble: {instructions}"
+        );
+    }
+
+    #[test]
+    fn render_revision_title_identifies_origin_without_pr_number() {
+        let origin = ReviewOrigin {
+            task_short_id: Some(7),
+            pr_number: None,
+        };
+        let title = render_revision_title(origin, 3);
+        let short_id_marker = format!("T{}", origin.task_short_id.expect("test origin has a task_short_id"));
+        assert!(
+            title.contains(&short_id_marker),
+            "title must name the origin work item: {title}"
+        );
+        assert!(title.contains('3'), "title must include the finding count: {title}");
+        assert!(
+            !title.contains("PR #"),
+            "no PR number was supplied, so none should be rendered: {title}"
+        );
     }
 
     #[test]
@@ -1589,7 +1707,7 @@ mod tests {
                 suspected_deletions: vec![],
             },
         };
-        let instructions = render_revision_instructions(&result);
+        let instructions = render_revision_instructions(&result, test_origin());
         let critical_pos = instructions.find("Critical finding").expect("present");
         let low_pos = instructions.find("Low finding").expect("present");
         assert!(critical_pos < low_pos, "critical must appear before low");
@@ -1617,7 +1735,7 @@ mod tests {
                 suspected_deletions: vec![],
             },
         };
-        let instructions = render_revision_instructions(&result);
+        let instructions = render_revision_instructions(&result, test_origin());
         // Anti-punt mandates must be present.
         assert!(
             instructions.contains("no punting"),
@@ -1686,7 +1804,7 @@ mod tests {
             "a confirmed duplication finding must force a revision (revision-required, not advisory)"
         );
 
-        let instructions = render_revision_instructions(&result);
+        let instructions = render_revision_instructions(&result, test_origin());
         assert!(
             instructions.contains("duplication"),
             "instructions must label the duplication category"
