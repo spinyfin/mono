@@ -85,6 +85,10 @@ extension StructuredText.BlockQuoteStyle where Self == BossBlockQuoteStyle {
 struct BossTableStyle: StructuredText.TableStyle {
     private static let borderWidth: CGFloat = 0.5
     private static let cornerRadius: CGFloat = 6
+    // Same semantic color as the inline-code background (just fainter), so a
+    // code span inside a striped row blends rather than stacking into a
+    // third shade.
+    private static let stripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -93,6 +97,16 @@ struct BossTableStyle: StructuredText.TableStyle {
                 vertical: Self.borderWidth
             )
             .textual.blockSpacing(.init(top: 0, bottom: 16))
+            .textual.tableBackground { layout in
+                Canvas { context, _ in
+                    for bounds in layout.stripedBodyRowBounds() {
+                        context.fill(
+                            Path(bounds.integral),
+                            with: .style(Self.stripeColor)
+                        )
+                    }
+                }
+            }
             .textual.tableOverlay { layout in
                 Canvas { context, _ in
                     for divider in layout.dividers() {
@@ -113,6 +127,17 @@ struct BossTableStyle: StructuredText.TableStyle {
 
 extension StructuredText.TableStyle where Self == BossTableStyle {
     static var boss: Self { .init() }
+}
+
+extension StructuredText.TableLayout {
+    /// Body rows to stripe — every other row after the header (row 0), which
+    /// keeps its own distinct (bold) treatment and is never striped.
+    fileprivate func stripedBodyRowBounds() -> [CGRect] {
+        rowIndices
+            .dropFirst()
+            .filter { $0.isMultiple(of: 2) }
+            .map { rowBounds($0) }
+    }
 }
 
 // MARK: - Inline
