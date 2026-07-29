@@ -200,6 +200,9 @@ final class PopulationTimingLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.PopulationTimingLog")
     private var currentDate = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -241,7 +244,11 @@ final class PopulationTimingLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(
+                    lineData, to: handle, site: "PopulationTimingLog", warned: &writeFailureWarned
+                )
+            }
         }
     }
 
@@ -283,6 +290,7 @@ final class PopulationTimingLog: @unchecked Sendable {
         handle.seekToEndOfFile()
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {

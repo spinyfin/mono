@@ -309,6 +309,9 @@ final class TerminalLoopLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.TerminalLoopLog")
     private var currentDate = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -375,7 +378,11 @@ final class TerminalLoopLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(
+                    lineData, to: handle, site: "TerminalLoopLog", warned: &writeFailureWarned
+                )
+            }
         }
     }
 
@@ -433,6 +440,7 @@ final class TerminalLoopLog: @unchecked Sendable {
         handle.seekToEndOfFile()
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {

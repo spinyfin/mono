@@ -204,6 +204,9 @@ final class StallLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.StallLog")
     private var currentDate = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -251,7 +254,9 @@ final class StallLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(lineData, to: handle, site: "StallLog", warned: &writeFailureWarned)
+            }
         }
     }
 
@@ -309,6 +314,7 @@ final class StallLog: @unchecked Sendable {
         handle.seekToEndOfFile()
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {

@@ -28,6 +28,9 @@ final class IpcLog: @unchecked Sendable {
     private let queue = DispatchQueue(label: "Boss.IpcLog")
     private var currentDate: String = ""
     private var fileHandle: FileHandle?
+    /// Throttles the write-failure warning to at most one per rotation —
+    /// see [[DiagnosticWrite]].
+    private var writeFailureWarned = false
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd"
@@ -68,7 +71,9 @@ final class IpcLog: @unchecked Sendable {
                 }
                 openFile(dateStr: dateStr)
             }
-            fileHandle?.write(lineData)
+            if let handle = fileHandle {
+                DiagnosticWrite.append(lineData, to: handle, site: "IpcLog", warned: &writeFailureWarned)
+            }
         }
     }
 
@@ -93,6 +98,7 @@ final class IpcLog: @unchecked Sendable {
         handle.seekToEndOfFile()
         fileHandle = handle
         currentDate = dateStr
+        writeFailureWarned = false
     }
 
     private func pruneOldFiles() {

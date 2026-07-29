@@ -2148,7 +2148,9 @@ final class ChatViewModel: ObservableObject {
 
     func appendSystemMessage(_ text: String, alwaysShow: Bool = false) {
         guard alwaysShow || showSystemMessages else { return }
-        FileHandle.standardError.write(Data("\(text)\n".utf8))
+        // `write(contentsOf:)`, not the exception-raising `write(_:)` — see
+        // [[DiagnosticWrite]]. A closed/broken stderr must never abort the app.
+        try? FileHandle.standardError.write(contentsOf: Data("\(text)\n".utf8))
     }
 
     /// Non-private: [[ChatViewModel+BoardHelpers.swift]] resolves a task's
