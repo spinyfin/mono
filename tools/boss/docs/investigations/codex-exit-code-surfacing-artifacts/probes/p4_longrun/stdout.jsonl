@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"019faeca-91b5-77d3-9f28-314627be7ca7"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run the supplied command once and wait for its observed exit status."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'for i in \"'$(seq 1 12); do echo tick-$i; sleep 4; done; echo FINAL-LINE; exit 4'\"'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'for i in \"'$(seq 1 12); do echo tick-$i; sleep 4; done; echo FINAL-LINE; exit 4'\"'\"","aggregated_output":"tick-2\ntick-3\ntick-4\ntick-5\ntick-6\ntick-7\ntick-8\ntick-9\ntick-10\ntick-11\ntick-12\nFINAL-LINE\n","exit_code":4,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"observed_exit=4"}}
+{"type":"turn.completed","usage":{"input_tokens":71908,"cached_input_tokens":66816,"cache_write_input_tokens":0,"output_tokens":437,"reasoning_output_tokens":141}}

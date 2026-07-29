@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"019faecd-5f29-7341-bed4-2fce4876c904"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Running the requested command once."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo BEFORE-SIGNAL; kill -KILL \"'$$; echo NEVER-REACHED'\"'\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \"sh -c 'echo BEFORE-SIGNAL; kill -KILL \"'$$; echo NEVER-REACHED'\"'\"","aggregated_output":"BEFORE-SIGNAL\n","exit_code":137,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"observed_exit=137"}}
+{"type":"turn.completed","usage":{"input_tokens":28219,"cached_input_tokens":24576,"cache_write_input_tokens":0,"output_tokens":181,"reasoning_output_tokens":33}}

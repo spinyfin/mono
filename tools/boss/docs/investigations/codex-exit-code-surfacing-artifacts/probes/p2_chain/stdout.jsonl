@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"019faeca-9ece-76a3-9607-2d18697002c8"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc \"echo STEP-A && echo STEP-B && sh -c 'echo STEP-C-START; exit 9' && echo NEVER-REACHED\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_0","type":"command_execution","command":"/bin/zsh -lc \"echo STEP-A && echo STEP-B && sh -c 'echo STEP-C-START; exit 9' && echo NEVER-REACHED\"","aggregated_output":"STEP-A\nSTEP-B\nSTEP-C-START\n","exit_code":9,"status":"failed"}}
+{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"observed_exit=9"}}
+{"type":"turn.completed","usage":{"input_tokens":28161,"cached_input_tokens":24576,"cache_write_input_tokens":0,"output_tokens":189,"reasoning_output_tokens":39}}
