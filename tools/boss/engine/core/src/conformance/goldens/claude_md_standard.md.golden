@@ -219,7 +219,7 @@ reuse/duplication finding from the automated reviewer.
 ## Boundaries
 
 - Do not modify files outside this workspace. Sibling workspaces
-under `~/Documents/dev/workspaces/` belong to other workers.
+belong to other workers.
 - Do not modify cube's database, lease state, or workspace registry.
 - `~/Library/Application Support/Boss/` is coordinator/engine-only.
 Never read, write, or touch it. Ask the coordinator for
