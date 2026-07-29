@@ -810,6 +810,10 @@ pub struct JsonlFileSink {
     appender: Arc<JsonlAppender>,
     max_bytes: u64,
     max_files: usize,
+    /// Serializes the stat+rename+prune sequence in [`Self::maybe_rotate_current`]
+    /// so two concurrent emits crossing the threshold at once can't both act on
+    /// a stale size — see that method's doc for the retention-slot bug this closes.
+    rotation_lock: Arc<Mutex<()>>,
 }
 
 impl JsonlFileSink {
@@ -821,6 +825,7 @@ impl JsonlFileSink {
             appender: Arc::new(JsonlAppender::new()),
             max_bytes,
             max_files,
+            rotation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -838,12 +843,27 @@ impl JsonlFileSink {
     ///
     /// Best-effort: a `stat`/`rename` failure logs via `tracing` and is
     /// otherwise ignored — rotation must never turn a dropped write into a
-    /// dropped event. Two concurrent emits can both observe the file over
-    /// threshold and both attempt to rotate; the loser's `rename` fails
-    /// with `NotFound` (the winner already moved the file) and is silently
-    /// swallowed — no line is ever lost, since both emits' appends already
-    /// landed before either checks the size.
+    /// dropped event. The stat+rename+prune sequence runs under
+    /// `rotation_lock`, so two concurrent emits that both observe the file
+    /// over threshold no longer race: the loser re-stats after the winner
+    /// has already rotated and recreated an empty live file, sees it back
+    /// under threshold, and does nothing — it does NOT rotate a near-empty
+    /// file and burn a retention slot the way an unguarded re-check would.
+    /// After a successful rename, the live file is immediately recreated
+    /// empty (mirroring `trace_rotation::RotatingJsonlWriter`) so
+    /// `current.jsonl` is never observably absent to a concurrent reader
+    /// such as `TimelineIndex::refresh`.
+    ///
+    /// This `stat`s the file on every emit rather than tracking size with an
+    /// in-memory byte counter (as `trace_rotation` does). Deliberate: at
+    /// `DEFAULT_CURRENT_MAX_BYTES`'s ~two-month rotation cadence the extra
+    /// syscall per event is immaterial, and a `stat` is immune to counter
+    /// drift across process restarts (an in-memory counter re-seeded from
+    /// file length on startup is exactly as much bookkeeping as the current
+    /// approach has none of).
     async fn maybe_rotate_current(&self, current_path: &Path) {
+        let _guard = self.rotation_lock.lock().await;
+
         let len = match tokio::fs::metadata(current_path).await {
             Ok(meta) => meta.len(),
             Err(_) => return,
@@ -862,6 +882,14 @@ impl JsonlFileSink {
                 );
             }
             return;
+        }
+
+        if let Err(err) = tokio::fs::File::create(current_path).await {
+            tracing::warn!(
+                ?err,
+                path = %current_path.display(),
+                "failed to recreate dispatch-events current.jsonl after rotation"
+            );
         }
 
         let to_prune = boss_log_files::rotated_segments(current_path);
@@ -951,6 +979,7 @@ mod tests {
             appender: Arc::new(JsonlAppender::new()),
             max_bytes,
             max_files,
+            rotation_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -1009,10 +1038,19 @@ mod tests {
             .await;
 
         let backups = boss_log_files::rotated_segments(&current_path);
+        assert_eq!(backups.len(), 2, "expected exactly 2 rotated segments after prune");
+        // Each emit here crosses the 5-byte threshold on its own, so this
+        // scenario rotates twice: the pre-seeded `.1000` and `.1001` segments
+        // are both pushed out by the two freshly rotated segments, oldest
+        // first. Assert the specific survivors rather than just a count, so
+        // a prune that kept the wrong segments (e.g. newest-N-by-mtime
+        // instead of by parsed suffix) would fail this test.
         assert!(
-            backups.len() <= 2,
-            "expected at most 2 rotated segments after prune, got {}",
-            backups.len()
+            backups.iter().all(|p| {
+                let suffix = p.extension().and_then(|e| e.to_str());
+                suffix != Some("1000") && suffix != Some("1001")
+            }),
+            "pre-seeded segments should have been pruned, got {backups:?}"
         );
     }
 

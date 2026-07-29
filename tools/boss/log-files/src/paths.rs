@@ -79,9 +79,9 @@ impl LogSource {
     }
 
     /// True when this source uses the `<base>.<unix_seconds>` rotation scheme
-    /// (trace + audit). Day-rotated and single-file sources return false.
+    /// (trace + audit + dispatch). Day-rotated sources return false.
     pub fn uses_timestamp_rotation(self) -> bool {
-        matches!(self, LogSource::EngineTrace | LogSource::Audit)
+        matches!(self, LogSource::EngineTrace | LogSource::Audit | LogSource::Dispatch)
     }
 
     /// The bare live filename this source resolves to under a state root, when
@@ -163,9 +163,8 @@ pub fn resolve_log_source_path(source: LogSource, state_root: &Path) -> PathBuf 
 /// chronological order (oldest first). Callers scan this list as one stream;
 /// they never need to know about rotation or day-dating.
 ///
-/// - Trace / audit: rotated segments (oldest first) then the live file.
-/// - Dispatch: the single `current.jsonl` (and any `<name>.<unix_s>` siblings
-///   if present, for forward-compat with future rotation).
+/// - Trace / audit / dispatch: rotated `<name>.<unix_s>` segments (oldest
+///   first) then the live file.
 /// - Spawn: day-dated files under `diagnostics/`, sorted by date in the name.
 /// - Population-timing: both engine (`engine-population-timing-*`) and app
 ///   (`population-timing-*`) day files, merged and sorted by date.

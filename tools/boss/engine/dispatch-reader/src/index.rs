@@ -225,7 +225,7 @@ impl TimelineIndex {
             return Ok(self.handle_missing_stream());
         };
 
-        let resume_from = self.resume_offset(identity, len);
+        let resume_from = self.resume_offset(&path, identity, len);
         let rebuilding = resume_from.is_none();
         let mut stats = RefreshStats {
             rebuilt: rebuilding,
@@ -297,16 +297,26 @@ impl TimelineIndex {
     }
 
     /// The offset to resume from, or `None` when the pass must rebuild.
-    fn resume_offset(&self, identity: FileId, len: u64) -> Option<u64> {
+    fn resume_offset(&self, path: &Path, identity: FileId, len: u64) -> Option<u64> {
         let cursor = self.cursor?;
         match cursor.identity {
             // Anchored on a file that has since been replaced, or truncated
             // below where we stopped: records we never saw may be gone, so
             // in-memory state can no longer be trusted.
             Some(anchored) if anchored != identity || len < cursor.offset => None,
-            // Anchored while the stream did not exist yet — offset is 0, so
-            // reading from the start is a complete read, not a rebuild.
-            Some(_) | None => Some(cursor.offset),
+            // Anchored while the stream did not exist yet. If no rotated
+            // segment exists either, nothing has been dispatched at all yet,
+            // so reading this file from the start is a complete read, not a
+            // rebuild. But if a rotated segment now exists, the stream
+            // reappeared after a rotation raced this refresh: the live file
+            // went missing (`handle_missing_stream` dropped `states` and
+            // anchored on nothing) and has since been recreated, so the
+            // pre-rotation history that only lives in the rotated segment
+            // was never folded in. Force a rebuild so that history is not
+            // silently lost.
+            None if rotated_segments(path).is_empty() => Some(cursor.offset),
+            None => None,
+            Some(_) => Some(cursor.offset),
         }
     }
 
@@ -791,6 +801,57 @@ mod tests {
         assert!(!stats.rebuilt);
         assert_eq!(stats.records_applied, 1);
         assert_eq!(index.rebuilds(), 0);
+    }
+
+    /// Reproduces the rotation race the fix in `JsonlFileSink::maybe_rotate_current`
+    /// closes: a refresh that lands in the window between the rename and the
+    /// live file's recreation must not lose the timeline that only lives in
+    /// the just-rotated segment. Before the fix, `resume_offset` treated
+    /// "anchored on nothing, file now exists" the same as "stream just
+    /// appeared for the first time" and skipped folding rotated segments —
+    /// silently dropping every pre-rotation timeline.
+    #[tokio::test]
+    async fn rotation_racing_a_refresh_still_folds_the_rotated_segment() {
+        let dir = TempDir::new().unwrap();
+        emit(dir.path(), Stage::CubeChangeCreated, Outcome::Ok, "exec-1", 1_000).await;
+        let mut index = TimelineIndex::new(dir.path());
+        index.refresh().unwrap();
+        assert_eq!(index.tracked_timelines(), 1);
+
+        // Simulate a rotation caught mid-flight: the live file is renamed
+        // aside but — unlike the fixed `maybe_rotate_current` — not yet
+        // recreated, so a refresh right now observes it absent.
+        let live = stream(dir.path());
+        let rotated = boss_log_files::rotated_segment_path(&live, 1_700_000_000);
+        fs::rename(&live, &rotated).unwrap();
+
+        let missing_pass = index.refresh().unwrap();
+        assert!(missing_pass.rebuilt);
+        assert_eq!(
+            index.tracked_timelines(),
+            0,
+            "state is cleared while anchored on nothing"
+        );
+
+        // The live file reappears (recreated empty by rotation) and a new
+        // event lands.
+        emit(dir.path(), Stage::CubeChangeCreated, Outcome::Ok, "exec-2", 2_000).await;
+
+        let reappear_pass = index.refresh().unwrap();
+        assert!(
+            reappear_pass.rebuilt,
+            "re-anchoring on a real file after being anchored on nothing must rebuild"
+        );
+        let ids: Vec<String> = index
+            .pending_stalls(10_000, &flat(5))
+            .into_iter()
+            .map(|s| s.execution_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["exec-1".to_owned(), "exec-2".to_owned()],
+            "the pre-rotation timeline must still be tracked after folding the rotated segment"
+        );
     }
 
     #[tokio::test]
