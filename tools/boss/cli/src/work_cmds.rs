@@ -744,7 +744,7 @@ pub(crate) async fn run_task_command(command: TaskCommand, ctx: &RunContext) -> 
         TaskCommand::ByExec(args) => run_by_exec(&mut client, ctx, args).await,
         TaskCommand::Executions(args) => run_task_executions(&mut client, ctx, args).await,
         TaskCommand::Show(args) => run_show_leaf(&mut client, ctx, args, false).await,
-        TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
+        TaskCommand::Update(args) => run_update_leaf(&mut client, ctx, *args).await,
         TaskCommand::Complete(args) => run_complete_human_driven(&mut client, ctx, args).await,
         TaskCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         TaskCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
@@ -862,7 +862,7 @@ pub(crate) async fn run_chore_command(command: ChoreCommand, ctx: &RunContext) -
             })
         }
         ChoreCommand::Show(args) => run_show_leaf(&mut client, ctx, args, true).await,
-        ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, args).await,
+        ChoreCommand::Update(args) => run_update_leaf(&mut client, ctx, *args).await,
         ChoreCommand::Move(args) => run_move_leaf(&mut client, ctx, args).await,
         ChoreCommand::Cancel(args) => run_cancel_leaf(&mut client, ctx, args).await,
         ChoreCommand::Delete(args) => run_delete_leaf(&mut client, ctx, args).await,
@@ -1526,10 +1526,6 @@ pub(crate) async fn run_update_leaf(
         remove_tags,
         ..WorkItemPatch::default()
     };
-    ensure_patch_present(
-        &patch,
-        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, or --clear-tags",
-    )?;
     // Resolve the product from --product or --project (typed project id infers its product).
     let product_hint = match (args.product, args.project) {
         (Some(prod), _) => Some(prod),
@@ -1537,6 +1533,23 @@ pub(crate) async fn run_update_leaf(
         (None, None) => None,
     };
     let resolved_id = resolve_selector_to_primary_id(client, ctx, &args.id, product_hint).await?;
+    // `--set-project`/`--unset-project` need the item's own product to
+    // resolve a bare short id, which is only known once `resolved_id` is
+    // in hand — unlike every other patch field, this one can't be built
+    // up front alongside `patch` above.
+    let mut patch = patch;
+    patch.project_id = if args.unset_project {
+        Some(String::new())
+    } else if let Some(selector) = args.set_project {
+        let item_product_id = get_work_item(client, &resolved_id).await?.product_id().to_owned();
+        Some(resolve_selector_to_primary_id(client, ctx, &selector, Some(item_product_id)).await?)
+    } else {
+        None
+    };
+    ensure_patch_present(
+        &patch,
+        "provide at least one field to update, such as --status, --priority, --pr-url, --repo, --effort, --effort-matched-rule, --effort-reasons, --reasoning, --model, --driver, --autostart, --deferred, --human-driven, --blocked-reason, --blocked-detail, --tags, --add-tag, --remove-tag, --clear-tags, --set-project, or --unset-project",
+    )?;
     let (item, label) = expect_leaf_work_item(update_work_item(client, &resolved_id, patch).await?)?;
     let item = with_display_status(item);
     print_entity(ctx, &serde_json::json!({ label: item }), || {

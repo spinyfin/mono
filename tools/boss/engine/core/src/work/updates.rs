@@ -36,6 +36,22 @@ fn validate_blocked_reason_length(reason: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether `kind` may be moved between project membership states via
+/// `WorkItemPatch::project_id`. `Chore` and `ProjectTask` differ *only*
+/// by project membership (see `TaskKind` docs), so they are the only
+/// kinds a plain reassignment can express. Every other kind owns its
+/// membership through a different relationship that a project_id swap
+/// would corrupt: `design` / `design_postmortem` are a project's seed
+/// task, `investigation` and `followup` are intentionally project-less,
+/// and `revision` belongs to its parent chain, not a project directly.
+/// `Task` — the legacy generic kind kept only for exhaustive matches
+/// (no production code path creates it today) — is refused too, since
+/// its intended membership semantics are undefined until it is actually
+/// wired into a create path.
+fn is_movable_project_membership_kind(kind: &TaskKind) -> bool {
+    matches!(kind, TaskKind::Chore | TaskKind::ProjectTask)
+}
+
 /// Normalize and validate a free-form tag list for a leaf work item.
 /// Trims whitespace, drops empty strings, de-duplicates (first wins),
 /// and enforces [`boss_protocol::WORK_ITEM_TAG_MAX_LEN`] /
@@ -246,6 +262,14 @@ impl WorkDb {
         if task.deleted_at.is_some() {
             bail!("cannot update a deleted task: {id}");
         }
+        if patch.project_id.is_some() && !is_movable_project_membership_kind(&task.kind) {
+            bail!(
+                "cannot move {id}: kind `{}` has its own project-membership semantics \
+                 and cannot be reassigned between projects or the no-project state \
+                 (only `chore` and `project_task` rows are movable)",
+                task.kind
+            );
+        }
         // Pre-image for the Boothby audit trail — see the note in
         // `update_project`. Taken after the two refusal checks above so a
         // rejected patch never reaches the audit path at all.
@@ -363,6 +387,38 @@ impl WorkDb {
         if let Some(ordinal) = patch.ordinal {
             task.ordinal = Some(ordinal);
         }
+        // Movable-kind check already ran above; here `task.kind` is
+        // guaranteed to be `Chore` or `ProjectTask`. `project_id`,
+        // `kind`, and `ordinal` must move together (design §Required
+        // behaviour) or the row becomes incoherent — a `chore` with a
+        // `project_id`, or a `project_task` with no ordinal. This
+        // deliberately overrides any explicit `patch.ordinal` handled
+        // above: a project move always needs a fresh ordinal scoped to
+        // the target project, so a stale explicit value can't survive it.
+        if let Some(ref project_patch) = patch.project_id {
+            let trimmed = project_patch.trim();
+            let target_project_id = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_owned())
+            };
+            if let Some(target) = target_project_id.as_deref() {
+                ensure_project_belongs_to_product(&tx, target, &task.product_id)
+                    .with_context(|| format!("cannot move {id} into project {target}"))?;
+            }
+            if target_project_id != task.project_id {
+                task.ordinal = match target_project_id.as_deref() {
+                    Some(target) => Some(next_task_ordinal(&tx, target)?),
+                    None => None,
+                };
+                task.kind = if target_project_id.is_some() {
+                    TaskKind::ProjectTask
+                } else {
+                    TaskKind::Chore
+                };
+                task.project_id = target_project_id;
+            }
+        }
         task.updated_at = now_string();
 
         // Invariant: blocked_reason and blocked_attempt_id must be NULL for any
@@ -439,7 +495,7 @@ impl WorkDb {
                  blocked_reason = ?14, blocked_attempt_id = ?15, driver = ?16,
                  archived_reason = ?17, blocked_detail = ?18, deferred = ?19,
                  reasoning = ?20, tags = ?21, human_driven = ?22, completion_summary = ?23,
-                 effort_matched_rule = ?24, effort_reasons = ?25,
+                 effort_matched_rule = ?24, effort_reasons = ?25, project_id = ?26, kind = ?27,
                  last_status_actor = CASE WHEN ?8 = '' THEN last_status_actor ELSE ?8 END,
                  completed_at = CASE
                      WHEN ?4 IN ('done', 'archived', 'cancelled') THEN COALESCE(completed_at, ?7)
@@ -472,6 +528,8 @@ impl WorkDb {
                 task.completion_summary,
                 task.effort_matched_rule,
                 task.effort_reasons,
+                task.project_id,
+                task.kind.as_str(),
             ],
         )?;
 
