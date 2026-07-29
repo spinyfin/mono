@@ -2022,7 +2022,7 @@ mod tests {
                 WorkerEvent::Stop {
                     session_id: "thread-abort".into(),
                     stop_hook_active: false,
-                    stop_reason: StopReason::Other,
+                    stop_reason: StopReason::Interrupted,
                 },
             ]
         );
