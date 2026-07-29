@@ -9,7 +9,7 @@ use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use boss_event_bus::{Event, EventBus, EventKind, TopicFilter};
 use boss_protocol::{
-    EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, TaskKind, TaskStatus,
+    EngineToAppError, ExecutionKind, ExecutionStatus, FrontendEvent, LiveWorkerState, PauseReason, TaskKind, TaskStatus,
 };
 use tokio::process::Command;
 use tokio::sync::{Mutex, Semaphore};
@@ -1843,6 +1843,20 @@ pub struct ExecutionCoordinator {
     /// call and otherwise left at its last value.
     #[builder(default)]
     dispatch_pause_exempts_reviews: AtomicBool,
+    /// Why dispatch is currently paused. `None` whenever `dispatch_paused`
+    /// is `false` — [`Self::resume_dispatch`] always clears it, so a
+    /// subsequent pause can never inherit a stale reason. `Some` whenever
+    /// `dispatch_paused` is `true`: [`Self::pause_dispatch`] requires a
+    /// [`PauseReason`] (a validated non-empty string) rather than an
+    /// `Option<String>`, so there is no code path that can set
+    /// `dispatch_paused = true` without also setting this. A plain
+    /// `std::sync::Mutex` rather than the `tokio::sync::Mutex` used
+    /// elsewhere in this struct: every access here is a quick
+    /// read-or-replace with no `.await` in between, so a blocking lock
+    /// avoids forcing every caller (including the many sync
+    /// `is_dispatch_paused()`-style call sites) to become `async`.
+    #[builder(default)]
+    dispatch_paused_reason: std::sync::Mutex<Option<String>>,
     /// Global automation-pause flag — independent of `dispatch_paused`. When
     /// `true`: `drain_ready_queue` holds every execution bound for the
     /// automation pool (see [`Self::execution_targets_automation_pool`]),
@@ -1861,6 +1875,13 @@ pub struct ExecutionCoordinator {
     /// `state.db`.
     #[builder(default)]
     automation_paused_since_epoch_s: AtomicU64,
+    /// Why automation is currently paused. Same non-anonymity guarantee as
+    /// [`Self::dispatch_paused_reason`]: `None` iff `automation_paused` is
+    /// `false`, `Some` iff it is `true` — [`Self::pause_automation`] takes
+    /// a required [`PauseReason`], and [`Self::resume_automation`] always
+    /// clears it.
+    #[builder(default)]
+    automation_paused_reason: std::sync::Mutex<Option<String>>,
     /// Live per-slot worker registry, used by the lease-time occupancy
     /// guard to refuse leasing a workspace that is still the cwd of a
     /// tracked, live worker process (defect 3 — belt-and-suspenders

@@ -1074,6 +1074,12 @@ pub enum FrontendEvent {
         /// Whether the pause exempts `pr_review` executions (operator pause); `false` for a breaker pause.
         #[serde(default)]
         reviews_exempt: bool,
+        /// Why dispatch is paused. `None` when `paused = false` — resuming
+        /// always clears the stored reason. Always `Some` while paused;
+        /// see [`FrontendRequest::SetDispatchPaused`] for why the engine
+        /// cannot enter a paused state without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Response to [`FrontendRequest::SetAutomationPaused`] and
     /// [`FrontendRequest::GetAutomationState`]. Carries the current
@@ -1086,6 +1092,12 @@ pub enum FrontendEvent {
         /// Epoch seconds when automation was paused. `None` when `paused = false`.
         #[serde(skip_serializing_if = "Option::is_none")]
         paused_since_epoch_s: Option<u64>,
+        /// Why automation is paused. `None` when `paused = false` —
+        /// resuming always clears the stored reason. Always `Some` while
+        /// paused; see [`FrontendRequest::SetAutomationPaused`] for why the
+        /// engine cannot enter a paused state without one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// Response to [`FrontendRequest::SyncProductExternalTracker`].
     /// Emitted when the engine begins the on-demand reconcile pass

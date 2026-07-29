@@ -88,8 +88,10 @@ impl ExecutionCoordinator {
             dispatch_paused: AtomicBool::new(false),
             dispatch_paused_since_epoch_s: AtomicU64::new(0),
             dispatch_pause_exempts_reviews: AtomicBool::new(false),
+            dispatch_paused_reason: std::sync::Mutex::new(None),
             automation_paused: AtomicBool::new(false),
             automation_paused_since_epoch_s: AtomicU64::new(0),
+            automation_paused_reason: std::sync::Mutex::new(None),
             live_worker_states: None,
             refused_workspaces: Mutex::new(HashMap::new()),
             max_concurrent_interactive_workers: AtomicUsize::new(MAX_CONCURRENT_INTERACTIVE_WORKERS),
@@ -379,25 +381,40 @@ impl ExecutionCoordinator {
         self.worker_pool.clone()
     }
 
-    /// Pause or resume global dispatch. When `paused = true` the scheduler
-    /// drain stops claiming worker slots for new executions from the main and
-    /// automation pools; already-running executions are unaffected. `origin`
-    /// determines whether `pr_review` executions are exempt from the pause —
-    /// see [`DispatchPauseOrigin`] — and is ignored when resuming. Pass
-    /// `paused_since_epoch_s = 0` when resuming (it is ignored).
+    /// Pause global dispatch. The scheduler drain stops claiming worker
+    /// slots for new executions from the main and automation pools;
+    /// already-running executions are unaffected. `origin` determines
+    /// whether `pr_review` executions are exempt from the pause — see
+    /// [`DispatchPauseOrigin`]. `reason` is a required, validated non-empty
+    /// [`PauseReason`] rather than a bare `String` — there is no overload
+    /// that lets a caller pause dispatch without one, which is the point:
+    /// dispatch must never be found paused with no record of who paused it
+    /// or why. See [`Self::resume_dispatch`] to clear the pause.
     ///
     /// The caller is responsible for persisting the new state (including
-    /// `origin`, via [`DispatchPauseOrigin::as_metadata_str`]) to `state.db`
-    /// so it survives an engine restart — see the `handle_set_dispatch_paused`
-    /// handler in `app/engine_meta.rs`.
-    pub fn set_dispatch_paused(&self, paused: bool, paused_since_epoch_s: u64, origin: DispatchPauseOrigin) {
-        self.dispatch_paused.store(paused, Ordering::Release);
+    /// `origin`, via [`DispatchPauseOrigin::as_metadata_str`], and `reason`)
+    /// to `state.db` so it survives an engine restart — see the
+    /// `handle_set_dispatch_paused` handler in `app/engine_meta.rs`.
+    pub fn pause_dispatch(&self, paused_since_epoch_s: u64, origin: DispatchPauseOrigin, reason: PauseReason) {
+        self.dispatch_paused.store(true, Ordering::Release);
         self.dispatch_paused_since_epoch_s
-            .store(if paused { paused_since_epoch_s } else { 0 }, Ordering::Release);
-        if paused {
-            self.dispatch_pause_exempts_reviews
-                .store(origin == DispatchPauseOrigin::Operator, Ordering::Release);
-        }
+            .store(paused_since_epoch_s, Ordering::Release);
+        self.dispatch_pause_exempts_reviews
+            .store(origin == DispatchPauseOrigin::Operator, Ordering::Release);
+        *self.dispatch_paused_reason.lock().unwrap() = Some(reason.into());
+    }
+
+    /// Resume global dispatch. Clears the pause flag, the paused-since
+    /// timestamp, and — critically — the stored reason, so a later pause
+    /// starts from a clean slate rather than silently inheriting whatever
+    /// reason the previous episode carried.
+    ///
+    /// The caller is responsible for persisting the new state to
+    /// `state.db` — see `handle_set_dispatch_paused` in `app/engine_meta.rs`.
+    pub fn resume_dispatch(&self) {
+        self.dispatch_paused.store(false, Ordering::Release);
+        self.dispatch_paused_since_epoch_s.store(0, Ordering::Release);
+        *self.dispatch_paused_reason.lock().unwrap() = None;
     }
 
     /// `true` when dispatch is globally paused.
@@ -419,21 +436,42 @@ impl ExecutionCoordinator {
         if v == 0 { None } else { Some(v) }
     }
 
-    /// Pause or resume automation-originated activity — independent of
-    /// [`Self::set_dispatch_paused`]. When `paused = true`,
-    /// `drain_ready_queue` stops claiming worker slots for executions bound
-    /// for the automation pool, and the triage-fire seam
-    /// (`EngineTriageDispatcher::fire`) refuses to start a new pass; an
-    /// already-claimed automation worker is unaffected. Pass
-    /// `paused_since_epoch_s = 0` when resuming (it is ignored).
+    /// Why dispatch is currently paused, or `None` when not paused. See
+    /// [`Self::pause_dispatch`] / [`Self::resume_dispatch`].
+    pub fn dispatch_paused_reason(&self) -> Option<String> {
+        self.dispatch_paused_reason.lock().unwrap().clone()
+    }
+
+    /// Pause automation-originated activity — independent of
+    /// [`Self::pause_dispatch`]. `drain_ready_queue` stops claiming worker
+    /// slots for executions bound for the automation pool, and the
+    /// triage-fire seam (`EngineTriageDispatcher::fire`) refuses to start a
+    /// new pass; an already-claimed automation worker is unaffected.
+    /// `reason` is a required, validated non-empty [`PauseReason`] for the
+    /// same anonymity-prevention reason as [`Self::pause_dispatch`]. See
+    /// [`Self::resume_automation`] to clear the pause.
     ///
-    /// The caller is responsible for persisting the new state to `state.db`
-    /// so it survives an engine restart — see `handle_set_automation_paused`
-    /// in `app/engine_meta.rs`.
-    pub fn set_automation_paused(&self, paused: bool, paused_since_epoch_s: u64) {
-        self.automation_paused.store(paused, Ordering::Release);
+    /// The caller is responsible for persisting the new state (including
+    /// `reason`) to `state.db` so it survives an engine restart — see
+    /// `handle_set_automation_paused` in `app/engine_meta.rs`.
+    pub fn pause_automation(&self, paused_since_epoch_s: u64, reason: PauseReason) {
+        self.automation_paused.store(true, Ordering::Release);
         self.automation_paused_since_epoch_s
-            .store(if paused { paused_since_epoch_s } else { 0 }, Ordering::Release);
+            .store(paused_since_epoch_s, Ordering::Release);
+        *self.automation_paused_reason.lock().unwrap() = Some(reason.into());
+    }
+
+    /// Resume automation-originated activity. Clears the pause flag, the
+    /// paused-since timestamp, and the stored reason — see
+    /// [`Self::resume_dispatch`] for why clearing the reason matters.
+    ///
+    /// The caller is responsible for persisting the new state to
+    /// `state.db` — see `handle_set_automation_paused` in
+    /// `app/engine_meta.rs`.
+    pub fn resume_automation(&self) {
+        self.automation_paused.store(false, Ordering::Release);
+        self.automation_paused_since_epoch_s.store(0, Ordering::Release);
+        *self.automation_paused_reason.lock().unwrap() = None;
     }
 
     /// `true` when automation-originated activity is globally paused.
@@ -446,6 +484,12 @@ impl ExecutionCoordinator {
     pub fn automation_paused_since_epoch_s(&self) -> Option<u64> {
         let v = self.automation_paused_since_epoch_s.load(Ordering::Acquire);
         if v == 0 { None } else { Some(v) }
+    }
+
+    /// Why automation is currently paused, or `None` when not paused. See
+    /// [`Self::pause_automation`] / [`Self::resume_automation`].
+    pub fn automation_paused_reason(&self) -> Option<String> {
+        self.automation_paused_reason.lock().unwrap().clone()
     }
 
     /// The pool `execution` is **attributed** to (`"main"`,

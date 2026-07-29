@@ -7,6 +7,8 @@
 
 use super::*;
 
+use crate::protocol::PauseReason;
+
 pub(super) async fn handle_workspace_pool_summary(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,
@@ -503,7 +505,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::SetDispatchPaused { paused } = req else {
+    let FrontendRequest::SetDispatchPaused { paused, reason } = req else {
         unreachable!()
     };
     {
@@ -520,11 +522,30 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                     paused,
                     paused_since_epoch_s,
                     reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
+                    reason: coordinator.dispatch_paused_reason(),
                 },
             );
             return;
         }
-        // Snapshot the pause start (if any) before `set_dispatch_paused`
+        // A pause with no usable reason is rejected outright — dispatch must
+        // never be found paused with no record of who paused it or why.
+        // Ignored (never required) when resuming.
+        let pause_reason = if paused {
+            match reason.and_then(|r| PauseReason::new(r).ok()) {
+                Some(reason) => Some(reason),
+                None => {
+                    send_work_error(
+                        &sink,
+                        &request_id,
+                        "SetDispatchPaused { paused: true } requires a non-empty `reason`".to_owned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        // Snapshot the pause start (if any) before `resume_dispatch`
         // zeroes it on resume, so a resume's audit record can carry how
         // long the episode actually lasted.
         let paused_since_before = coordinator.dispatch_paused_since_epoch_s();
@@ -534,17 +555,32 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
         // the lifecycle of a change already in flight, not new work — stay
         // exempt from it. See `DispatchPauseOrigin`.
         let origin = crate::coordinator::DispatchPauseOrigin::Operator;
-        coordinator.set_dispatch_paused(paused, now_epoch_s, origin);
+        let reason_str = if paused {
+            let pause_reason = pause_reason.expect("validated above");
+            let reason_str = pause_reason.as_str().to_owned();
+            coordinator.pause_dispatch(now_epoch_s, origin, pause_reason);
+            Some(reason_str)
+        } else {
+            coordinator.resume_dispatch();
+            None
+        };
         // Persist the new state to the metadata table so it survives a restart.
         let db_result = if paused {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_epoch_s.to_string()))
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN, origin.as_metadata_str()))
+                .and_then(|()| {
+                    work_db.set_metadata(
+                        METADATA_KEY_DISPATCH_PAUSE_REASON,
+                        reason_str.as_deref().unwrap_or_default(),
+                    )
+                })
         } else {
             work_db
                 .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON, ""))
         };
         if let Err(err) = db_result {
             tracing::warn!(
@@ -555,7 +591,10 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
             );
         }
         if paused {
-            tracing::info!("dispatch: globally paused (operator) — PR-review executions remain exempt");
+            tracing::info!(
+                reason = reason_str.as_deref().unwrap_or_default(),
+                "dispatch: globally paused (operator) — PR-review executions remain exempt"
+            );
             server_state
                 .dispatch_events
                 .emit(
@@ -570,7 +609,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                         "paused_since_epoch_s": now_epoch_s,
                         "reviews_held": false,
                         "scope": ["dispatch"],
-                        "reason": "operator requested pause via bossctl dispatch pause / the app's dispatch toggle",
+                        "reason": reason_str,
                     })),
                 )
                 .await;
@@ -606,6 +645,7 @@ pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendReque
                 paused,
                 paused_since_epoch_s,
                 reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
+                reason: coordinator.dispatch_paused_reason(),
             },
         );
         // Broadcast the new health report to all connected app clients so
@@ -635,6 +675,7 @@ pub(super) async fn handle_get_dispatch_state(ctx: Dispatch, req: FrontendReques
                 paused,
                 paused_since_epoch_s,
                 reviews_exempt: coordinator.dispatch_pause_exempts_reviews(),
+                reason: coordinator.dispatch_paused_reason(),
             },
         );
     }
@@ -648,7 +689,7 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::SetAutomationPaused { paused } = req else {
+    let FrontendRequest::SetAutomationPaused { paused, reason } = req else {
         unreachable!()
     };
     {
@@ -664,20 +705,53 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
                 FrontendEvent::AutomationStateResult {
                     paused,
                     paused_since_epoch_s,
+                    reason: coordinator.automation_paused_reason(),
                 },
             );
             return;
         }
+        // A pause with no usable reason is rejected outright — see
+        // `handle_set_dispatch_paused` for why. Ignored when resuming.
+        let pause_reason = if paused {
+            match reason.and_then(|r| PauseReason::new(r).ok()) {
+                Some(reason) => Some(reason),
+                None => {
+                    send_work_error(
+                        &sink,
+                        &request_id,
+                        "SetAutomationPaused { paused: true } requires a non-empty `reason`".to_owned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
-        coordinator.set_automation_paused(paused, now_epoch_s);
+        let reason_str = if paused {
+            let pause_reason = pause_reason.expect("validated above");
+            let reason_str = pause_reason.as_str().to_owned();
+            coordinator.pause_automation(now_epoch_s, pause_reason);
+            Some(reason_str)
+        } else {
+            coordinator.resume_automation();
+            None
+        };
         let db_result = if paused {
             work_db
                 .set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "1")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, &now_epoch_s.to_string()))
+                .and_then(|()| {
+                    work_db.set_metadata(
+                        METADATA_KEY_AUTOMATION_PAUSE_REASON,
+                        reason_str.as_deref().unwrap_or_default(),
+                    )
+                })
         } else {
             work_db
                 .set_metadata(METADATA_KEY_AUTOMATION_PAUSED, "0")
                 .and_then(|()| work_db.set_metadata(METADATA_KEY_AUTOMATION_PAUSED_SINCE, "0"))
+                .and_then(|()| work_db.set_metadata(METADATA_KEY_AUTOMATION_PAUSE_REASON, ""))
         };
         if let Err(err) = db_result {
             tracing::warn!(
@@ -702,6 +776,7 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
             .publish(boss_event_bus::Event::AutomationMutation);
         if paused {
             tracing::info!(
+                reason = reason_str.as_deref().unwrap_or_default(),
                 "automation: globally paused (operator) — the scheduler stops evaluating \
                  occurrences, new triage passes and automation-pool spawns are held; \
                  already-running automation workers finish normally",
@@ -719,6 +794,7 @@ pub(super) async fn handle_set_automation_paused(ctx: Dispatch, req: FrontendReq
             FrontendEvent::AutomationStateResult {
                 paused,
                 paused_since_epoch_s,
+                reason: coordinator.automation_paused_reason(),
             },
         );
         // Broadcast the new health report to all connected app clients so
@@ -747,6 +823,7 @@ pub(super) async fn handle_get_automation_state(ctx: Dispatch, req: FrontendRequ
             FrontendEvent::AutomationStateResult {
                 paused,
                 paused_since_epoch_s,
+                reason: coordinator.automation_paused_reason(),
             },
         );
     }

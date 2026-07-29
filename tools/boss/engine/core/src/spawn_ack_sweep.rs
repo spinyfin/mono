@@ -882,10 +882,10 @@ mod tests {
         // Operator pause is already active before the spawn path breaks —
         // this is what exempts pr_review executions from the pause.
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        coordinator.set_dispatch_paused(
-            true,
+        coordinator.pause_dispatch(
             now.max(0) as u64,
             crate::coordinator::DispatchPauseOrigin::Operator,
+            boss_protocol::PauseReason::new("test: operator pause").unwrap(),
         );
         assert!(
             coordinator.dispatch_pause_exempts_reviews(),

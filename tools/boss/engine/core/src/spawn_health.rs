@@ -49,7 +49,7 @@
 //!   the `app_spawn_capability_unhealthy` attention item, and the
 //!   `spawn_capability_unhealthy` dispatch event all still fire — full
 //!   observability of the condition is preserved — but
-//!   [`ExecutionCoordinator::set_dispatch_paused`] is never called. The
+//!   [`ExecutionCoordinator::pause_dispatch`] is never called. The
 //!   attention item and dispatch event both say plainly that the breaker
 //!   would have tripped and was disabled by config.
 //!
@@ -87,7 +87,8 @@ use boss_protocol::CreateAttentionItemInput;
 use serde::Serialize;
 
 use crate::app::handler_helpers::{
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
+    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON, METADATA_KEY_DISPATCH_PAUSED,
+    METADATA_KEY_DISPATCH_PAUSED_SINCE,
 };
 use crate::config::DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER;
 use crate::coordinator::{DispatchPauseOrigin, ExecutionCoordinator};
@@ -577,15 +578,16 @@ pub async fn resume_dispatch_after_breaker_recovery(
     if !coordinator.is_dispatch_paused() || coordinator.dispatch_pause_exempts_reviews() {
         return false;
     }
-    // Snapshot the pause start before `set_dispatch_paused` zeroes it, so the
+    // Snapshot the pause start before `resume_dispatch` zeroes it, so the
     // resume's audit record can carry how long the episode actually lasted.
     let paused_since_epoch_s = coordinator.dispatch_paused_since_epoch_s();
     let now_epoch_s = boss_engine_utils::epoch_time::now_epoch_secs() as u64;
     let pause_duration_secs = paused_since_epoch_s.map(|since| now_epoch_s.saturating_sub(since));
-    coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Breaker);
+    coordinator.resume_dispatch();
     if let Err(err) = work_db
         .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "0")
         .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, "0"))
+        .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON, ""))
     {
         tracing::warn!(
             ?err,
@@ -688,7 +690,21 @@ pub async fn trip_spawn_capability_circuit(
             return;
         }
         let now_u64 = now_epoch_secs.max(0) as u64;
-        coordinator.set_dispatch_paused(true, now_u64, DispatchPauseOrigin::Breaker);
+        // The breaker is a programmatic pauser — it must supply its own
+        // specific reason describing what tripped, never a generic
+        // fallback (see the incident this row exists to prevent: dispatch
+        // found paused with no record of why). `distinct_work_items` and
+        // `SPAWN_HEALTH_WINDOW_SECS` are the exact threshold/window that
+        // fired; `tripping_execution_id`/`tripping_work_item_id` are the
+        // straw that broke it.
+        let reason_text = format!(
+            "spawn-capability circuit breaker tripped: {distinct_work_items} distinct work items \
+             failed to start a worker shell within {SPAWN_HEALTH_WINDOW_SECS}s (threshold \
+             {SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD}), most recently execution \
+             {tripping_execution_id} (work item {tripping_work_item_id})",
+        );
+        let reason = boss_protocol::PauseReason::new(reason_text).expect("format! output is never empty");
+        coordinator.pause_dispatch(now_u64, DispatchPauseOrigin::Breaker, reason);
         if let Err(err) = work_db
             .set_metadata(METADATA_KEY_DISPATCH_PAUSED, "1")
             .and_then(|()| work_db.set_metadata(METADATA_KEY_DISPATCH_PAUSED_SINCE, &now_u64.to_string()))
@@ -696,6 +712,12 @@ pub async fn trip_spawn_capability_circuit(
                 work_db.set_metadata(
                     METADATA_KEY_DISPATCH_PAUSE_ORIGIN,
                     DispatchPauseOrigin::Breaker.as_metadata_str(),
+                )
+            })
+            .and_then(|()| {
+                work_db.set_metadata(
+                    METADATA_KEY_DISPATCH_PAUSE_REASON,
+                    coordinator.dispatch_paused_reason().as_deref().unwrap_or_default(),
                 )
             })
         {
@@ -841,6 +863,8 @@ pub async fn trip_spawn_capability_circuit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use boss_protocol::PauseReason;
 
     #[test]
     fn trips_when_threshold_distinct_work_items_fail_in_window() {
@@ -1162,7 +1186,11 @@ mod tests {
         // the probe force-dispatches a real ready execution, not just
         // selects one.
         let coordinator = make_dispatchable_coordinator(db.clone(), 4);
-        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
+        coordinator.pause_dispatch(
+            0,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
 
         let spawn_health = SpawnHealthTracker::new();
         maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
@@ -1213,7 +1241,11 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 4);
         // An operator-originated pause must stay manual-resume-only — the
         // half-open probe is scoped strictly to Breaker-origin pauses.
-        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+        coordinator.pause_dispatch(
+            0,
+            DispatchPauseOrigin::Operator,
+            PauseReason::new("test: operator pause").unwrap(),
+        );
 
         let spawn_health = SpawnHealthTracker::new();
         maybe_admit_recovery_probe(&db, &coordinator, &spawn_health, 1000).await;
@@ -1234,7 +1266,11 @@ mod tests {
         let second = create_ready_chore_execution(&db, &second_item);
 
         let coordinator = make_dispatchable_coordinator(db.clone(), 4);
-        coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
+        coordinator.pause_dispatch(
+            0,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
 
         // The canary is picked from the *least* urgent ready row (`.last()`)
         // so a sustained outage's probes don't repeatedly burn the fleet's
@@ -1260,7 +1296,11 @@ mod tests {
     async fn resume_after_breaker_recovery_resumes_a_breaker_pause() {
         let (_dir, db) = open_db_arc();
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.set_dispatch_paused(true, 1000, DispatchPauseOrigin::Breaker);
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
 
         let sink = RecordingDispatchEventSink::new();
         let resumed =
@@ -1284,7 +1324,11 @@ mod tests {
     async fn resume_after_breaker_recovery_never_touches_an_operator_pause() {
         let (_dir, db) = open_db_arc();
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.set_dispatch_paused(true, 1000, DispatchPauseOrigin::Operator);
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Operator,
+            PauseReason::new("test: operator pause").unwrap(),
+        );
 
         let sink = NoopDispatchEventSink;
         let resumed = resume_dispatch_after_breaker_recovery(&db, &coordinator, &sink, None, "test recovery").await;
@@ -1610,7 +1654,11 @@ mod tests {
     async fn resume_after_breaker_recovery_emits_dispatch_resumed_with_duration() {
         let (_dir, db) = open_db_arc();
         let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.set_dispatch_paused(true, 1000, DispatchPauseOrigin::Breaker);
+        coordinator.pause_dispatch(
+            1000,
+            DispatchPauseOrigin::Breaker,
+            PauseReason::new("test: breaker pause").unwrap(),
+        );
 
         let sink = RecordingDispatchEventSink::new();
         let resumed =

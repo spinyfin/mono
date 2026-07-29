@@ -27,6 +27,7 @@ mod dispatch_stats;
 mod doctor;
 mod hosts;
 mod logs;
+mod pause;
 mod probe;
 mod review;
 use boss_engine::dispatch_events::DispatchEvent;
@@ -148,6 +149,13 @@ enum Command {
         /// state`; cannot be combined with other systems). Omit to pause
         /// every system.
         systems: Vec<PauseArg>,
+        /// Why these systems are being paused. Applied identically to
+        /// every system this call pauses — one reason per invocation, not
+        /// per system. Defaults to "the operator asked me to" when
+        /// omitted. Ignored (and need not be supplied) when the only
+        /// argument is `state`.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Resume one or more Boss systems in a single call. Defaults to
     /// every pausable system when no SYSTEMS are given. Symmetric with
@@ -412,7 +420,12 @@ enum DispatchAction {
     /// Equivalent to `bossctl pause dispatch`. To also stop automation
     /// (the scope operators usually want), use `bossctl pause` (defaults
     /// to every system) or `bossctl pause dispatch automation`.
-    Pause,
+    Pause {
+        /// Why dispatch is being paused. Defaults to "the operator asked
+        /// me to" when omitted.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
     /// resuming while already running is a no-op. Does not affect the
@@ -495,7 +508,12 @@ enum AutomationAction {
     /// Equivalent to `bossctl pause automation`. To also stop dispatch,
     /// use `bossctl pause` (defaults to every system) or `bossctl pause
     /// dispatch automation`.
-    Pause,
+    Pause {
+        /// Why automation is being paused. Defaults to "the operator
+        /// asked me to" when omitted.
+        #[arg(long)]
+        reason: Option<String>,
+    },
     /// Resume automation-originated activity. The engine immediately
     /// drains any automation-pool executions that queued while paused and
     /// resumes normal triage scheduling. Idempotent — resuming while
@@ -1215,15 +1233,16 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     include_stalled,
                 },
         } => dispatch_ghost_active(cli.json, state_root, stalled_after_secs, include_stalled),
-        Command::Pause { systems } => {
+        Command::Pause { systems, reason } => {
             if systems.iter().any(|s| matches!(s, PauseArg::State)) {
                 if systems.len() > 1 {
                     bail!("`bossctl pause state` does not take additional systems");
                 }
-                unified_state(&cli.socket_path, cli.json).await
+                pause::unified_state(&cli.socket_path, cli.json).await
             } else {
-                let targets = pause_arg_targets(&systems);
-                set_paused_for_systems(&cli.socket_path, cli.json, &targets, true).await
+                let targets = pause::pause_arg_targets(&systems);
+                let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+                pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason)).await
             }
         }
         Command::Resume { systems } => {
@@ -1232,22 +1251,25 @@ async fn dispatch(cli: Cli) -> Result<()> {
             } else {
                 systems
             };
-            set_paused_for_systems(&cli.socket_path, cli.json, &targets, false).await
+            pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, None).await
         }
-        Command::State => unified_state(&cli.socket_path, cli.json).await,
+        Command::State => pause::unified_state(&cli.socket_path, cli.json).await,
         Command::Dispatch {
-            action: DispatchAction::Pause,
-        } => dispatch_set_paused(&cli.socket_path, cli.json, true).await,
+            action: DispatchAction::Pause { reason },
+        } => {
+            let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+            pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await
+        }
         Command::Dispatch {
             action: DispatchAction::Resume,
-        } => dispatch_set_paused(&cli.socket_path, cli.json, false).await,
+        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None).await,
         Command::Dispatch {
             action: DispatchAction::State { history, n, state_root },
         } => {
             if history {
-                dispatch_pause_history(cli.json, state_root, n)
+                pause::dispatch_pause_history(cli.json, state_root, n)
             } else {
-                dispatch_state(&cli.socket_path, cli.json).await
+                pause::dispatch_state(&cli.socket_path, cli.json).await
             }
         }
         Command::Dispatch {
@@ -1257,14 +1279,17 @@ async fn dispatch(cli: Cli) -> Result<()> {
             action: DispatchAction::Concurrency { set },
         } => dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Automation {
-            action: AutomationAction::Pause,
-        } => automation_set_paused(&cli.socket_path, cli.json, true).await,
+            action: AutomationAction::Pause { reason },
+        } => {
+            let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+            pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await
+        }
         Command::Automation {
             action: AutomationAction::Resume,
-        } => automation_set_paused(&cli.socket_path, cli.json, false).await,
+        } => pause::automation_set_paused(&cli.socket_path, cli.json, None).await,
         Command::Automation {
             action: AutomationAction::State,
-        } => automation_state(&cli.socket_path, cli.json).await,
+        } => pause::automation_state(&cli.socket_path, cli.json).await,
         Command::Metrics {
             action: MetricsAction::List { prefix, state_root },
         } => metrics_list(cli.json, state_root, prefix.as_deref()),
@@ -1484,193 +1509,6 @@ fn dispatch_ghost_active(
     Ok(())
 }
 
-/// Current dispatch-pause state as returned by
-/// [`FrontendRequest::SetDispatchPaused`] / [`FrontendRequest::GetDispatchState`].
-struct DispatchPauseState {
-    paused: bool,
-    paused_since_epoch_s: Option<u64>,
-    reviews_exempt: bool,
-}
-
-/// Current automation-pause state as returned by
-/// [`FrontendRequest::SetAutomationPaused`] / [`FrontendRequest::GetAutomationState`].
-struct AutomationPauseState {
-    paused: bool,
-    paused_since_epoch_s: Option<u64>,
-}
-
-async fn set_dispatch_paused_raw(socket_path: &Option<String>, paused: bool) -> Result<DispatchPauseState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::SetDispatchPaused { paused })
-        .await
-        .context("sending SetDispatchPaused")?;
-    match response {
-        FrontendEvent::DispatchStateResult {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-        } => Ok(DispatchPauseState {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected SetDispatchPaused: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-async fn get_dispatch_state_raw(socket_path: &Option<String>) -> Result<DispatchPauseState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::GetDispatchState)
-        .await
-        .context("sending GetDispatchState")?;
-    match response {
-        FrontendEvent::DispatchStateResult {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-        } => Ok(DispatchPauseState {
-            paused,
-            paused_since_epoch_s,
-            reviews_exempt,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected GetDispatchState: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-async fn set_automation_paused_raw(socket_path: &Option<String>, paused: bool) -> Result<AutomationPauseState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::SetAutomationPaused { paused })
-        .await
-        .context("sending SetAutomationPaused")?;
-    match response {
-        FrontendEvent::AutomationStateResult {
-            paused,
-            paused_since_epoch_s,
-        } => Ok(AutomationPauseState {
-            paused,
-            paused_since_epoch_s,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected SetAutomationPaused: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-async fn get_automation_state_raw(socket_path: &Option<String>) -> Result<AutomationPauseState> {
-    let mut client = connect(socket_path).await?;
-    let response = client
-        .send_request(&FrontendRequest::GetAutomationState)
-        .await
-        .context("sending GetAutomationState")?;
-    match response {
-        FrontendEvent::AutomationStateResult {
-            paused,
-            paused_since_epoch_s,
-        } => Ok(AutomationPauseState {
-            paused,
-            paused_since_epoch_s,
-        }),
-        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-            bail!("engine rejected GetAutomationState: {message}")
-        }
-        other => bail!("engine returned unexpected response: {other:?}"),
-    }
-}
-
-/// One-line summary printed by `dispatch pause`/`dispatch resume` and
-/// reused by the unified `bossctl pause`/`bossctl resume`.
-fn format_dispatch_set_line(state: &DispatchPauseState) -> String {
-    if state.paused {
-        let since_str = state
-            .paused_since_epoch_s
-            .map(|s| format!(" (since epoch {s})"))
-            .unwrap_or_default();
-        let exempt_str = if state.reviews_exempt {
-            " — PR reviews are exempt and keep dispatching"
-        } else {
-            " — PR reviews are held too (spawn-capability breaker)"
-        };
-        format!("dispatch paused{since_str}{exempt_str}")
-    } else {
-        "dispatch resumed".to_string()
-    }
-}
-
-/// One-line summary printed by `automation pause`/`automation resume` and
-/// reused by the unified `bossctl pause`/`bossctl resume`.
-fn format_automation_set_line(state: &AutomationPauseState) -> String {
-    if state.paused {
-        let since_str = state
-            .paused_since_epoch_s
-            .map(|s| format!(" (since epoch {s})"))
-            .unwrap_or_default();
-        format!(
-            "automation paused{since_str} — new triage passes and automation-pool spawns are held; \
-             already-running automation workers finish normally"
-        )
-    } else {
-        "automation resumed".to_string()
-    }
-}
-
-async fn dispatch_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
-    let state = set_dispatch_paused_raw(socket_path, paused).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-                "reviews_exempt": state.reviews_exempt,
-            })
-        );
-    } else {
-        println!("{}", format_dispatch_set_line(&state));
-    }
-    Ok(())
-}
-
-async fn dispatch_state(socket_path: &Option<String>, json: bool) -> Result<()> {
-    let state = get_dispatch_state_raw(socket_path).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-                "reviews_exempt": state.reviews_exempt,
-            })
-        );
-    } else if state.paused {
-        let since_str = state
-            .paused_since_epoch_s
-            .map(|s| format!("  paused_since: epoch {s}"))
-            .unwrap_or_default();
-        println!("state: paused");
-        if !since_str.is_empty() {
-            println!("{since_str}");
-        }
-        if state.reviews_exempt {
-            println!("  reviews: exempt — PR-review executions keep dispatching");
-        } else {
-            println!("  reviews: held — spawn-capability breaker pause");
-        }
-    } else {
-        println!("state: running");
-    }
-    Ok(())
-}
-
 /// Current interactive-pool concurrency cap as returned by
 /// [`FrontendRequest::SetDispatchConcurrency`] / [`FrontendRequest::GetDispatchConcurrency`].
 struct DispatchConcurrencyState {
@@ -1755,254 +1593,6 @@ async fn dispatch_concurrency(socket_path: &Option<String>, json: bool, set: Opt
         None => get_dispatch_concurrency_raw(socket_path).await?,
     };
     print_dispatch_concurrency(json, &state);
-    Ok(())
-}
-
-async fn automation_set_paused(socket_path: &Option<String>, json: bool, paused: bool) -> Result<()> {
-    let state = set_automation_paused_raw(socket_path, paused).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-            })
-        );
-    } else {
-        println!("{}", format_automation_set_line(&state));
-    }
-    Ok(())
-}
-
-async fn automation_state(socket_path: &Option<String>, json: bool) -> Result<()> {
-    let state = get_automation_state_raw(socket_path).await?;
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "paused": state.paused,
-                "paused_since_epoch_s": state.paused_since_epoch_s,
-            })
-        );
-    } else if state.paused {
-        let since_str = state
-            .paused_since_epoch_s
-            .map(|s| format!("  paused_since: epoch {s}"))
-            .unwrap_or_default();
-        println!("state: paused");
-        if !since_str.is_empty() {
-            println!("{since_str}");
-        }
-    } else {
-        println!("state: running");
-    }
-    Ok(())
-}
-
-/// Resolve `bossctl pause`'s positional [`PauseArg`]s to the
-/// [`PauseSystem`]s to act on — empty input means "every system"
-/// ([`PauseSystem::all`]). Callers must handle [`PauseArg::State`]
-/// (the `bossctl state` alias) before reaching here; it maps to no
-/// system.
-fn pause_arg_targets(systems: &[PauseArg]) -> Vec<PauseSystem> {
-    if systems.is_empty() {
-        PauseSystem::all()
-    } else {
-        systems.iter().filter_map(|s| s.as_system()).collect()
-    }
-}
-
-/// Pause or resume every system in `targets`, calling the same
-/// per-system RPCs `dispatch pause`/`automation pause` use, then print
-/// one line (or one JSON object) per system touched. Backs both
-/// `bossctl pause`/`bossctl resume` and their `[SYSTEMS]`-restricted
-/// forms.
-async fn set_paused_for_systems(
-    socket_path: &Option<String>,
-    json: bool,
-    targets: &[PauseSystem],
-    paused: bool,
-) -> Result<()> {
-    let mut dispatch_result = None;
-    let mut automation_result = None;
-    for system in targets {
-        match system {
-            PauseSystem::Dispatch => dispatch_result = Some(set_dispatch_paused_raw(socket_path, paused).await?),
-            PauseSystem::Automation => automation_result = Some(set_automation_paused_raw(socket_path, paused).await?),
-        }
-    }
-
-    if json {
-        let mut systems = serde_json::Map::new();
-        if let Some(d) = &dispatch_result {
-            systems.insert(
-                "dispatch".to_string(),
-                serde_json::json!({
-                    "paused": d.paused,
-                    "paused_since_epoch_s": d.paused_since_epoch_s,
-                    "reviews_exempt": d.reviews_exempt,
-                }),
-            );
-        }
-        if let Some(a) = &automation_result {
-            systems.insert(
-                "automation".to_string(),
-                serde_json::json!({
-                    "paused": a.paused,
-                    "paused_since_epoch_s": a.paused_since_epoch_s,
-                }),
-            );
-        }
-        println!("{}", serde_json::Value::Object(systems));
-    } else {
-        if let Some(d) = &dispatch_result {
-            println!("{}", format_dispatch_set_line(d));
-        }
-        if let Some(a) = &automation_result {
-            println!("{}", format_automation_set_line(a));
-        }
-    }
-    Ok(())
-}
-
-/// One-line status used by the unified `bossctl state` / `bossctl pause
-/// state` view — deliberately more compact than the detailed multi-line
-/// `dispatch state` / `automation state` output, since this view shows
-/// every system at once.
-fn format_state_summary(paused: bool, paused_since_epoch_s: Option<u64>) -> String {
-    if paused {
-        match paused_since_epoch_s {
-            Some(s) => format!("paused (since epoch {s})"),
-            None => "paused".to_string(),
-        }
-    } else {
-        "running".to_string()
-    }
-}
-
-/// Show pause status for every system in the registry in one view.
-/// Backs both `bossctl state` and `bossctl pause state`.
-async fn unified_state(socket_path: &Option<String>, json: bool) -> Result<()> {
-    let dispatch = get_dispatch_state_raw(socket_path).await?;
-    let automation = get_automation_state_raw(socket_path).await?;
-
-    if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "dispatch": {
-                    "paused": dispatch.paused,
-                    "paused_since_epoch_s": dispatch.paused_since_epoch_s,
-                    "reviews_exempt": dispatch.reviews_exempt,
-                },
-                "automation": {
-                    "paused": automation.paused,
-                    "paused_since_epoch_s": automation.paused_since_epoch_s,
-                },
-            })
-        );
-    } else {
-        println!(
-            "dispatch:   {}",
-            format_state_summary(dispatch.paused, dispatch.paused_since_epoch_s)
-        );
-        if dispatch.paused {
-            let reviews = if dispatch.reviews_exempt {
-                "reviews: exempt — PR-review executions keep dispatching"
-            } else {
-                "reviews: held — spawn-capability breaker pause"
-            };
-            println!("            {reviews}");
-        }
-        println!(
-            "automation: {}",
-            format_state_summary(automation.paused, automation.paused_since_epoch_s)
-        );
-    }
-    Ok(())
-}
-
-/// Print recent dispatch pause/resume episodes with their full audit
-/// evidence — file-scan only over `dispatch-events/current.jsonl` (same
-/// pattern as `dispatch tail`/`diagnose`), so it works even when the engine
-/// is wedged and doesn't depend on the live RPC state `dispatch state`
-/// reads. Surfaces both operator (`dispatch_paused`/`dispatch_resumed`,
-/// `origin: "operator"`) and breaker-originated (`origin: "breaker"`,
-/// carrying the full `trigger` evidence — which executions/work
-/// items/slots failed to spawn, over what window, against which
-/// threshold) episodes in one place.
-fn dispatch_pause_history(json: bool, state_root: Option<PathBuf>, n: usize) -> Result<()> {
-    let root = resolve_state_root(state_root)?;
-    let events = dispatch_reader::read_current(&root)?;
-    let mut episodes: Vec<&DispatchEvent> = events
-        .iter()
-        .filter(|e| e.stage == "dispatch_paused" || e.stage == "dispatch_resumed")
-        .collect();
-    episodes.reverse();
-    episodes.truncate(n);
-
-    if json {
-        let value: Vec<serde_json::Value> = episodes
-            .iter()
-            .map(|e| {
-                serde_json::json!({
-                    "ts_epoch_ms": e.ts_epoch_ms,
-                    "stage": e.stage,
-                    "execution_id": e.execution_id,
-                    "work_item_id": e.work_item_id,
-                    "details": e.details,
-                })
-            })
-            .collect();
-        println!("{}", serde_json::to_string(&value)?);
-        return Ok(());
-    }
-
-    if episodes.is_empty() {
-        println!("no pause/resume episodes recorded");
-        return Ok(());
-    }
-
-    for event in episodes {
-        let kind = if event.stage == "dispatch_paused" {
-            "PAUSED"
-        } else {
-            "RESUMED"
-        };
-        let origin = event.details["origin"].as_str().unwrap_or("unknown");
-        let actor = event.details["actor"].as_str().unwrap_or("unknown");
-        println!(
-            "{kind}  ts_epoch_ms={} origin={origin} actor={actor}",
-            event.ts_epoch_ms
-        );
-        if let Some(reason) = event.details["reason"].as_str() {
-            println!("  reason: {reason}");
-        }
-        if let Some(scope) = event.details["scope"].as_array() {
-            let scope: Vec<&str> = scope.iter().filter_map(|v| v.as_str()).collect();
-            println!("  scope: {}", scope.join(","));
-        }
-        if let Some(duration) = event.details["pause_duration_secs"].as_u64() {
-            println!("  pause_duration_secs: {duration}");
-        }
-        let trigger = &event.details["trigger"];
-        if !trigger.is_null() {
-            println!("  trigger rule: {}", trigger["rule"].as_str().unwrap_or(""));
-            if let Some(triggering) = trigger["triggering_events"].as_array() {
-                println!("  triggering events ({}):", triggering.len());
-                for ev in triggering {
-                    println!(
-                        "    execution_id={} work_item_id={} slot_id={} shell_pid={} epoch_secs={}",
-                        ev["execution_id"].as_str().unwrap_or(""),
-                        ev["work_item_id"].as_str().unwrap_or(""),
-                        ev["slot_id"].as_str().unwrap_or(""),
-                        ev["shell_pid"].as_i64().unwrap_or(0),
-                        ev["epoch_secs"].as_i64().unwrap_or(0),
-                    );
-                }
-            }
-        }
-    }
     Ok(())
 }
 
