@@ -70,6 +70,113 @@ impl WorkerCompletionHandler {
         StopOutcome::NoChangesNeeded { work_item_id }
     }
 
+    /// Finalize an execution whose driver reported its own terminal turn
+    /// boundary as an unrecoverable error (see
+    /// [`StopOutcome::DriverTerminalError`]). The worker process that
+    /// produced this Stop has already exited — there is nothing left to
+    /// nudge, wait on, or reconstruct a decision from. Marks the execution
+    /// `failed`, releases its cube lease and pane, and files a human-visible
+    /// attention item naming the provider's own diagnostic.
+    ///
+    /// Deliberately parallel to [`Self::finalize_no_op_completion`]'s
+    /// teardown mechanics but with `failed` (not `completed`) status: the
+    /// caller — [`crate::completion::stop`]'s early gate in `on_stop_inner`
+    /// — runs this BEFORE any kind-specific finalizer (automation triage,
+    /// answer-agent, pr_review, the generic nudge loop), so a driver-reported
+    /// fatal error can never reach the nudge path that used to re-prompt an
+    /// already-dead process.
+    ///
+    /// Idempotent against an already-finalized execution: the DB write
+    /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
+    pub(super) async fn finalize_driver_terminal_error(
+        &self,
+        execution: &crate::work::WorkExecution,
+        detail: &str,
+    ) -> StopOutcome {
+        let completion = match self.work_db.fail_pane_parked_execution(&execution.id, detail) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    ?err,
+                    "driver terminal error: failed to record execution failure",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+        // The run is definitively over — drop every in-flight cache so
+        // nothing lingers for this now-terminal execution.
+        self.staged_pr_urls.forget(&execution.id);
+        self.nudge_breaker.forget(&execution.id);
+        self.build_wait_tracker.forget(&execution.id);
+        self.background_children_tracker.forget(&execution.id);
+        self.hold_registry.release(&execution.id);
+        crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
+        // Reap termination path: tear down any driver-owned state outside the
+        // workspace (e.g. Codex's per-run CODEX_HOME) before the lease itself
+        // is released.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            execution.workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
+        if let Some(lease_id) = execution.cube_lease_id.as_deref()
+            && let Err(err) = self.cube_client.release_workspace(lease_id).await
+        {
+            tracing::error!(
+                execution_id = %execution.id,
+                lease_id,
+                ?err,
+                "driver terminal error: cube workspace release failed",
+            );
+        }
+        self.pane_releaser.release_pane(&execution.id).await;
+
+        let body = format!(
+            "The worker's own driver reported its terminal turn boundary as an unrecoverable \
+             error, so the engine failed this execution instead of treating a dead process as a \
+             clean completion or nudging it for a result it can never produce.\n\n\
+             **Driver-reported error:**\n\n{detail}\n\n\
+             The execution's cube lease and worker slot have been released."
+        );
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
+                "Worker failed: driver reported an unrecoverable error",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "driver terminal error: failed to file attention item",
+            );
+        }
+
+        self.publisher
+            .publish(
+                &completion.id,
+                &execution.work_item_id,
+                completion.status.as_str(),
+                "worker_driver_terminal_error",
+            )
+            .await;
+        tracing::error!(
+            execution_id = %execution.id,
+            work_item_id = %execution.work_item_id,
+            kind = %execution.kind,
+            detail,
+            "driver terminal error: execution failed (driver reported an unrecoverable error)",
+        );
+        StopOutcome::DriverTerminalError {
+            detail: detail.to_owned(),
+        }
+    }
+
     /// File a human-visible attention item recording that a reviewer worker
     /// exhausted its re-prompts without ever producing a readable
     /// `ReviewResult`, so its PR is advancing to Review **unreviewed**. Unlike
