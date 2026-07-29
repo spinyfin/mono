@@ -592,8 +592,17 @@ impl WorkerCompletionHandler {
         // below correctly refuses to queue a *new* one. Drop any stale
         // queued probe now, before the event loop's `dispatch_probe_on_stop`
         // gets a chance to pop it.
-        if self.unresolved_worker_signal_reason(&execution).is_some() {
-            self.probe_queuer.clear_pending_probes(execution_id);
+        //
+        // The discard is recorded against each probe (`Dropped`, with this
+        // reason) rather than performed silently: this path is where a
+        // coordinator-issued probe accepted with a `next_turn_boundary`
+        // commitment can legitimately be thrown away, so it is exactly the
+        // path that must be able to explain itself afterwards.
+        if let Some(signal) = self.unresolved_worker_signal_reason(&execution) {
+            self.probe_queuer.clear_pending_probes(
+                execution_id,
+                &format!("discarded at a Stop that suppressed nudging: {signal}"),
+            );
         }
 
         // AI #6 running-status gate (incident 001 §5): in Claude Code

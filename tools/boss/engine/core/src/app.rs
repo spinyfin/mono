@@ -137,7 +137,7 @@ use pane_delivery::{PaneInjectOutcome, PaneInjectRequest, PaneInputPosture, Pane
 // keep their public `boss_engine::app::` paths.
 pub use app_session::SendToAppError;
 use app_session::{APP_CHANNEL_UNHEALTHY_STREAK, AppChannelHealth, AppSessionHandle};
-use probes::{InFlightProbe, PendingProbe, ProbeRecord, ServerStateProbeQueuer};
+use probes::{InFlightProbe, PendingProbe, ProbeDispatchOutcome, ProbeRecord, ServerStateProbeQueuer};
 use trust::PidFileGuard;
 pub use trust::{PeerClass, RpcTier};
 
@@ -1390,6 +1390,15 @@ impl ServerState {
         // no slot was ever mapped. Cancellation closes the source stream and
         // lets the generic reader flush/drain without blocking teardown.
         self.agent_jsonl_progress_manager.stop_run(run_id);
+        // Settle any probe still waiting for a delivery boundary on this run.
+        // The pane is going away, so the boundary the engine committed to when
+        // it answered `ProbeQueued` is never going to arrive — leaving the
+        // probe in the queue means `bossctl probe-status` reports `queued`
+        // forever against a run that no longer exists. Runs *before* the
+        // no-slot early return below: a run that never finished spawning can
+        // have probes queued against it too (`dispatch_probe_if_idle` leaves
+        // them there when no slot is mapped yet).
+        self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
         let Some(slot_id) = self.worker_registry.take_slot_for_run(run_id) else {
             tracing::debug!(
                 run_id,

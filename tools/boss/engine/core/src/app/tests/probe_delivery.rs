@@ -640,3 +640,327 @@ async fn lifecycle_transition_for_an_unqueued_id_creates_no_record() {
     server_state.set_probe_lifecycle("probe-never-queued", ProbeDeliveryState::Consumed);
     assert_eq!(server_state.probe_lifecycle_state("probe-never-queued"), None);
 }
+
+// ── The accepted commitment is honoured or visibly broken ───────────────────
+//
+// A probe accepted with an `expected_delivery` commitment was silently
+// dropped at the boundary it named: it left the pending queue without a
+// lifecycle transition and without a log line, so it reported `queued`
+// against a run whose pane had already been reaped, forever. The tests below
+// pin the three properties that make that impossible to repeat — leaving the
+// queue always settles the record, a dying run settles what it leaves behind,
+// and every exit from the drain path is named.
+
+/// A `Stop`/turn-boundary hook event for `run_id`.
+fn stop_event(run_id: &str) -> crate::events_socket::IncomingHookEvent {
+    crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "claude-sess-1".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        Some(run_id.to_owned()),
+        None,
+    )
+}
+
+/// A pid that is definitely not a live process: spawn a trivial child, reap
+/// it, and hand back its pid. Reaped means the kernel has released the entry,
+/// so `kill(pid, 0)` answers `ESRCH` — the same verdict the engine would get
+/// for a worker whose process exited out from under its pane.
+fn a_definitely_dead_pid() -> i32 {
+    let mut child = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("spawning a trivial child must succeed");
+    let pid = child.id() as i32;
+    child.wait().expect("waiting on the trivial child must succeed");
+    assert!(
+        matches!(
+            crate::dead_pid_sweep::probe_pid(pid),
+            crate::dead_pid_sweep::PidStatus::Dead
+        ),
+        "fixture precondition: a reaped child's pid must probe dead",
+    );
+    pid
+}
+
+/// The headline regression. A probe queued against a run whose pane is then
+/// released must end at a terminal state — never `queued`, which is a live
+/// promise that nothing is left to keep. Before the fix nothing swept the
+/// pending queue on teardown, so the record sat at `queued` against a dead
+/// run indefinitely and `bossctl probe-status` reported delivery as pending.
+#[tokio::test]
+async fn a_probe_outliving_its_run_is_abandoned_not_left_queued() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let probe_id = server_state.queue_probe(run_id.clone(), "still there?".into(), false);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued),
+    );
+
+    // The run ends: its pane is torn down and its slot freed. No app session
+    // is registered, which is the same shape as a teardown the app cannot be
+    // reached for.
+    server_state.release_worker_pane(&run_id).await;
+
+    let state = server_state
+        .probe_lifecycle_state(&probe_id)
+        .expect("the probe record must survive the run it targeted");
+    assert_eq!(
+        state,
+        ProbeDeliveryState::Abandoned,
+        "a probe whose run died before its delivery boundary must be reported abandoned",
+    );
+    assert!(state.is_terminal() && state.is_undeliverable());
+    assert!(
+        !state.is_delivered(),
+        "an abandoned probe was never delivered and must not claim to be",
+    );
+    let record = server_state
+        .probe_record(&probe_id)
+        .expect("probe record must still be queryable");
+    assert!(
+        record.detail.is_some_and(|d| d.contains("pane released")),
+        "the terminal record must explain how the probe got there",
+    );
+    assert_eq!(
+        server_state.pending_probe_count(&run_id),
+        0,
+        "the drained queue must not leave the probe behind for a boundary that will never come",
+    );
+}
+
+/// The same guarantee for a probe queued before the worker ever mapped a slot
+/// — a spawning worker that dies during startup. The drain runs ahead of the
+/// no-slot early return in `release_worker_pane` precisely so this case is not
+/// a hole: `dispatch_probe_if_idle` deliberately leaves probes queued when
+/// there is no slot yet, so this is exactly where one can be stranded.
+#[tokio::test]
+async fn a_probe_queued_before_a_slot_existed_is_still_settled_when_the_run_dies() {
+    let (server_state, _dir) = test_server_state();
+    let probe_id = server_state.queue_probe("run-that-never-spawned".into(), "hello?".into(), false);
+
+    let outcome = server_state.release_worker_pane("run-that-never-spawned").await;
+    assert_eq!(
+        outcome,
+        PaneReleaseOutcome::NoLiveWorker,
+        "fixture precondition: this run never mapped a slot",
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Abandoned),
+        "a probe must not survive the run it was addressed to, slot mapping or not",
+    );
+}
+
+/// The root cause of the silent drop: the completion handler's discard of a
+/// stale queued nudge removed the probe from the queue while leaving the
+/// lifecycle table reading `queued`. Discarding is legitimate — reporting it
+/// as still-on-its-way is not. The discard must land on `Dropped` and carry
+/// the reason it was discarded for.
+#[tokio::test]
+async fn clearing_a_stale_queued_probe_records_that_it_was_dropped_and_why() {
+    use crate::completion::ProbeQueuer;
+
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    let probe_id = server_state.queue_probe(run_id.clone(), "produce a PR".into(), false);
+
+    // Go through the production adapter the completion handler holds, not the
+    // inherent method, so the wiring is covered too.
+    let queuer = crate::app::probes::ServerStateProbeQueuer::default();
+    queuer.set_server_state(Arc::downgrade(&server_state));
+    queuer.clear_pending_probes(&run_id, "worker reported [blocked]");
+
+    let record = server_state
+        .probe_record(&probe_id)
+        .expect("a discarded probe must remain queryable — that is the whole point");
+    assert_eq!(
+        record.state,
+        ProbeDeliveryState::Dropped,
+        "a discarded probe must not keep reporting `queued`",
+    );
+    assert!(
+        record.detail.is_some_and(|d| d.contains("[blocked]")),
+        "the discard reason must reach the status record, not just the log",
+    );
+    assert_eq!(server_state.pending_probe_count(&run_id), 0);
+}
+
+/// `consumed` must mean consumed. `SendToPane` returning `Ok` only proves the
+/// app wrote bytes into the pty; a pane whose foreground process has already
+/// exited accepts them with nobody reading. That is how a probe injected into
+/// a dead `codex` pane came to be reported `consumed`, which made the state
+/// useless as evidence that a worker had seen anything.
+#[tokio::test]
+async fn a_write_into_a_pane_whose_process_is_gone_is_not_recorded_as_consumed() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    // Park the worker so the Stop-path posture guard permits the write, then
+    // point its live state at a pid that is definitely gone — the pane is
+    // still there and still accepts bytes, but nothing is reading them.
+    server_state.live_worker_states.apply_event(
+        3,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    server_state
+        .live_worker_states
+        .update_shell_pid(&run_id, a_definitely_dead_pid())
+        .expect("fixture precondition: the run must have a live-state entry");
+
+    let responder = app_session_capturing_one_send(&server_state).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), "anyone home?".into(), false);
+    let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
+
+    responder
+        .await
+        .expect("app responder task")
+        .expect("the write is still issued — the engine cannot know it is unread until it checks");
+    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Orphaned));
+    let state = server_state
+        .probe_lifecycle_state(&probe_id)
+        .expect("probe must have a record");
+    assert_eq!(
+        state,
+        ProbeDeliveryState::Orphaned,
+        "a write into a pane with no live process must not be reported as consumed",
+    );
+    assert!(
+        !state.is_delivered(),
+        "`delivered` is what a caller trusts; an orphaned write delivered nothing",
+    );
+}
+
+/// The liveness check is deliberately one-sided: it downgrades only on a
+/// positive dead verdict. A live worker — and the test fixtures' unreported
+/// pid `0`, where liveness is simply unknowable — must keep the honest
+/// `Consumed`, or every probe in the fleet would be libelled as orphaned.
+#[tokio::test]
+async fn a_live_worker_still_records_consumed() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, None);
+    server_state.live_worker_states.apply_event(
+        3,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    // This process is unambiguously alive.
+    server_state
+        .live_worker_states
+        .update_shell_pid(&run_id, std::process::id() as i32)
+        .expect("fixture precondition: the run must have a live-state entry");
+
+    let responder = app_session_capturing_one_send(&server_state).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), "still with me?".into(), false);
+    let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
+
+    responder.await.expect("app responder task").expect("SendToPane issued");
+    assert_eq!(outcome, ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed));
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Consumed),
+    );
+}
+
+/// No silent exits. Each way out of the Stop drain path answers with a
+/// distinct outcome, so a trace (and a test) can tell "nothing was queued"
+/// from "something was queued and could not be delivered" — the distinction
+/// that was missing when the dropped probe had to be diagnosed, where both
+/// cases produced an identical empty trace.
+#[tokio::test]
+async fn every_exit_from_the_stop_drain_path_names_itself() {
+    let (server_state, _dir) = test_server_state();
+
+    // Not a delivery boundary for this path at all.
+    assert_eq!(
+        dispatch_probe_on_stop(&server_state, &post_tool_use("run-anything")).await,
+        ProbeDispatchOutcome::NotADeliveryBoundary,
+    );
+
+    // A boundary with no run id: nothing to look a queue up by.
+    let anonymous = crate::events_socket::IncomingHookEvent::for_test(
+        WorkerEvent::Stop {
+            session_id: "sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+        None,
+        None,
+    );
+    assert_eq!(
+        dispatch_probe_on_stop(&server_state, &anonymous).await,
+        ProbeDispatchOutcome::NoRunId,
+    );
+
+    // The common case, and the one that used to be indistinguishable from a
+    // probe that had gone missing.
+    let idle_run = register_working_worker_with_driver(&server_state, 3, None);
+    server_state.live_worker_states.apply_event(
+        3,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    assert_eq!(
+        dispatch_probe_on_stop(&server_state, &stop_event(&idle_run)).await,
+        ProbeDispatchOutcome::NothingQueued,
+    );
+
+    // Queued, but the run has no pane to write into. The probe stays put.
+    let orphan_probe = server_state.queue_probe("run-with-no-slot".into(), "hi".into(), false);
+    assert_eq!(
+        dispatch_probe_on_stop(&server_state, &stop_event("run-with-no-slot")).await,
+        ProbeDispatchOutcome::NoSlotMapping,
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&orphan_probe),
+        Some(ProbeDeliveryState::Queued),
+        "an undeliverable-for-now probe is still genuinely queued; only a dead run settles it",
+    );
+
+    // Queued against a slot whose posture forbids a write (mid-turn on a
+    // driver that does not read stdin). Fail closed, probe stays queued.
+    let codex_run = register_working_worker_with_driver(&server_state, 4, Some("codex"));
+    let deferred_probe = server_state.queue_probe(codex_run.clone(), "hi".into(), false);
+    assert_eq!(
+        dispatch_probe_on_stop(&server_state, &stop_event(&codex_run)).await,
+        ProbeDispatchOutcome::PostureRefused,
+    );
+    assert_eq!(
+        server_state.probe_lifecycle_state(&deferred_probe),
+        Some(ProbeDeliveryState::Queued),
+    );
+}
+
+/// Every outcome renders as a distinct, non-empty label. The labels are what
+/// a human reads out of the trace when a probe goes missing, so two branches
+/// sharing one name would reintroduce the ambiguity this type exists to
+/// remove.
+#[test]
+fn dispatch_outcome_labels_are_distinct() {
+    let all = [
+        ProbeDispatchOutcome::NotADeliveryBoundary,
+        ProbeDispatchOutcome::NoRunId,
+        ProbeDispatchOutcome::NothingQueued,
+        ProbeDispatchOutcome::NoSlotMapping,
+        ProbeDispatchOutcome::PostureRefused,
+        ProbeDispatchOutcome::AlreadyInFlight,
+        ProbeDispatchOutcome::RacedToEmpty,
+        ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed),
+        ProbeDispatchOutcome::RequeuedAfterFailure,
+    ];
+    let labels: std::collections::HashSet<&str> = all.iter().map(|o| o.as_str()).collect();
+    assert_eq!(labels.len(), all.len(), "each dispatch outcome needs its own label");
+    assert!(labels.iter().all(|l| !l.is_empty()));
+}
