@@ -314,6 +314,23 @@ pub const REGISTRY: &[FeatureFlagSpec] = &[
         capability_id: None,
     },
     FeatureFlagSpec {
+        name: "codex_sandbox_enforced",
+        description: "Run Codex Standard/Triage/AnswerAgent workers under the OS-enforced `--sandbox \
+             workspace-write` seatbelt instead of `--sandbox danger-full-access` (design: \
+             codex-as-a-first-class-agent-driver.md). Codex's seatbelt template hardcodes a mach-service \
+             allowlist that excludes LaunchServices, so `xcode-locator` fails with \
+             kLSExecutableIncorrectFormat and every bazel build using apple_support's crosstool breaks \
+             under it — this blocks Codex workers from building anything in mono. DEFAULT OFF: \
+             danger-full-access puts Codex workers at the same no-OS-sandbox posture Claude workers have \
+             always run at (advisory PATH_GUARD_SCRIPT PreToolUse hook remains either way). Reviewer \
+             always stays `--sandbox read-only` regardless of this flag — it never runs build gates, and \
+             materialize_guards wires no reviewer denylist for Codex. Enable to put the kernel-enforced \
+             workspace-write fence back once the LaunchServices allowlist gap is fixed upstream.",
+        category: "codex",
+        default_enabled: false,
+        capability_id: None,
+    },
+    FeatureFlagSpec {
         name: "worker_rpc_tier",
         description: "Enforce the worker RPC tier on the engine's frontend socket (design: \
              worker-proposal-api-replace-fragile-worker-to-engine-seams.md, task 3). A connection whose \
@@ -834,6 +851,30 @@ mod tests {
         store2.load().unwrap();
         assert!(store2.is_enabled("attentions_questions_backstop"));
         assert!(store2.is_enabled("attentions_followups_backstop"));
+    }
+
+    #[test]
+    fn codex_sandbox_enforced_defaults_off_and_can_be_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+        store.load().unwrap();
+        assert!(
+            !store.is_enabled("codex_sandbox_enforced"),
+            "codex_sandbox_enforced must default disabled (danger-full-access by default)"
+        );
+        let snap = store.snapshot_all(None);
+        let sandbox = snap
+            .iter()
+            .find(|s| s.name == "codex_sandbox_enforced")
+            .expect("codex_sandbox_enforced must be in registry");
+        assert!(!sandbox.default_enabled);
+        assert_eq!(sandbox.category, "codex");
+
+        store.set("codex_sandbox_enforced", true).unwrap();
+        assert!(store.is_enabled("codex_sandbox_enforced"));
+        let store2 = make_store(&tmp);
+        store2.load().unwrap();
+        assert!(store2.is_enabled("codex_sandbox_enforced"));
     }
 
     #[test]

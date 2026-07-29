@@ -94,10 +94,39 @@ mod apply_permission_extra_args_tests {
             "Codex spawn default includes workspace-write: {}",
             plan.command
         );
-        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer));
+        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
         assert!(
             merged.contains("read-only"),
             "Reviewer must get --sandbox read-only: {merged}"
+        );
+        assert!(
+            !merged.contains("workspace-write"),
+            "default sandbox must be replaced: {merged}"
+        );
+        // Required contract flags survive the rewrite.
+        assert!(merged.contains("--json"), "{merged}");
+        assert!(merged.contains("--strict-config"), "{merged}");
+    }
+
+    #[test]
+    fn standard_sandbox_unenforced_replaces_workspace_write_default_with_danger_full_access() {
+        let plan = CodexDriver::default().spawn_invocation(SpawnRequest {
+            model: "gpt-5.6-terra",
+            effort: None,
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some("exec-standard-1"),
+        });
+        assert!(
+            plan.command.contains("workspace-write"),
+            "Codex spawn default includes workspace-write: {}",
+            plan.command
+        );
+        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Standard, false));
+        assert!(
+            merged.contains("danger-full-access"),
+            "Standard with codex_sandbox_enforced off must get --sandbox danger-full-access: {merged}"
         );
         assert!(
             !merged.contains("workspace-write"),
@@ -570,6 +599,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             is_remote: false,
             path_guard_script: path_guard_script.clone(),
             checkleft_guard_script: checkleft_guard_script.clone(),
+            codex_sandbox_enforced: self.feature_flags.is_enabled("codex_sandbox_enforced"),
         };
         let permission_artifacts = driver
             .write_permission_config(&permission_input, &settings_dir)
