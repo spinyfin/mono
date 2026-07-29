@@ -664,18 +664,29 @@ async fn on_stop_recovers_pr_url_from_the_driver_final_message_producer() {
 /// After the fix, the fallback resolves the run's *actual* driver, so a
 /// Codex-attributed chore must fall through to the cold-path detector
 /// instead of parsing the Claude-shaped line.
+///
+/// This is sound only because `fixture()` spawns a main-pool worker
+/// (`"worker-1"`) on a chore with no `source_automation_id` — the row's own
+/// `driver` column genuinely governs a main-pool run, unlike a `pr_review` or
+/// `automation_triage` execution, which always runs on the review/automation
+/// pool and so always resolves to that pool's fixed driver regardless of the
+/// row's `driver` column (see `driver_transcript::driver_for_execution`).
+/// Assert that precondition here so this test does not silently start
+/// asserting the wrong invariant if `fixture()` ever gains automation
+/// provenance.
 #[tokio::test]
 async fn on_stop_ignores_claude_shaped_driver_fallback_for_non_claude_driver() {
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
-    db.update_work_item(
-        &chore_id,
-        crate::work::WorkItemPatch {
-            driver: Some("codex".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(
+            t.source_automation_id, None,
+            "precondition: this test's invariant (row driver governs) only holds for a \
+             main-pool execution with no automation provenance",
+        ),
+        other => panic!("expected chore, got {other:?}"),
+    }
+    set_work_item_driver(&db, &chore_id, "codex");
     let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/999"));
     write_assistant_transcript(
         &db,

@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use boss_protocol::{Attention, AttentionGroup, CreateAttentionInput};
-use boss_transcript_markdown::{TranscriptEventKind, parse_transcript};
+use boss_transcript_markdown::TranscriptEventKind;
 use serde::Deserialize;
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
@@ -360,8 +360,8 @@ pub async fn reconcile_task_followups(
                     return None;
                 }
             };
-            let assistant_text = extract_assistant_text(&jsonl);
             let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id);
+            let assistant_text = extract_assistant_text(driver.as_deref(), &jsonl);
             followups_from_driver_fallback(
                 driver.as_deref().unwrap_or(&crate::driver::ClaudeDriver),
                 &assistant_text,
@@ -486,8 +486,14 @@ fn read_followups_artifact(structured_output_dir: Option<&Path>, execution_id: &
 /// We scan only assistant text (never the user prompt or tool output) so the
 /// `FOLLOWUPS:` instructions in the worker's *prompt* can never be mistaken
 /// for an emitted block.
-fn extract_assistant_text(jsonl: &str) -> String {
-    parse_transcript(jsonl)
+/// `driver` is the resolved [`crate::driver::AgentDriver`] governing this
+/// transcript's dialect (see [`crate::driver_transcript`]'s module doc for
+/// why parsing every driver's native output with the Claude-only
+/// `boss_transcript_markdown::parse_transcript` is wrong): `None` only when
+/// the execution's driver could not be resolved, in which case the raw parse
+/// is the same fallback every other post-hoc reader uses.
+fn extract_assistant_text(driver: Option<&dyn AgentDriver>, jsonl: &str) -> String {
+    crate::driver_transcript::parse_transcript_with_driver(driver, jsonl)
         .into_iter()
         .filter_map(|event| match event.kind {
             TranscriptEventKind::AssistantText(text) => Some(text),
@@ -785,7 +791,12 @@ pub async fn extract_followups_backstop(
         }
     };
 
-    let assistant_text = extract_assistant_text(&jsonl);
+    // Intentional exception to driver-aware parsing: this backstop only ever
+    // feeds a lossy tail of prose to a Claude utility-model extractor, never
+    // scans for a driver-specific marker, so an un-normalized parse is
+    // sufficient here and the driver lookup is not worth the extra DB round
+    // trip on this best-effort path.
+    let assistant_text = extract_assistant_text(None, &jsonl);
     if assistant_text.is_empty() {
         return None;
     }

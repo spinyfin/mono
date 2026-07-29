@@ -1937,6 +1937,35 @@ impl WorkDb {
         Ok(host)
     }
 
+    /// Worker id (`work_runs.agent_id`, e.g. `worker-3`, `review-1`,
+    /// `auto-worker-2`) of the agent-session `work_runs` row for
+    /// `execution_id`, or `None` when the execution has no run yet.
+    ///
+    /// This is the *spawned worker's* id, not the reviewed/automated row's
+    /// own `driver` column — [`crate::driver_transcript::driver_for_execution`]
+    /// uses it to detect a pool-dispatched run (review/automation pool
+    /// workers always run [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s
+    /// fixed driver, overriding whatever `tasks.driver` the row carries,
+    /// exactly as `worker_spawn::effective_task_driver_for_worker` does at
+    /// spawn time).
+    ///
+    /// Resolves the target run with the same preference order as
+    /// [`Self::transcript_path_for_execution`] /
+    /// [`resolve_run_id_for_execution_hooks`] so the worker id and the
+    /// transcript it produced stay paired.
+    pub fn latest_run_agent_id_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        let agent_id: Option<String> = conn
+            .query_row("SELECT agent_id FROM work_runs WHERE id = ?1", params![run_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(agent_id)
+    }
+
     /// Persist the remote worker pid onto the agent-session `work_runs` row
     /// for `execution_id`. The SSH spawn path captures the pid from the
     /// wrapper handshake (`parse_remote_pid`) and stamps it here so the

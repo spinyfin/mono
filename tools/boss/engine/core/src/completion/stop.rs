@@ -241,10 +241,10 @@ impl WorkerCompletionHandler {
     /// and the alternative it competes with is the far more expensive cold-path
     /// `detect_pr` reconstruction.
     async fn stage_pr_url_from_driver_prose(&self, execution: &crate::work::WorkExecution) -> bool {
-        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+        let (driver, transcript) = self.read_final_triage_message_with_driver(&execution.id).await;
+        let Some(text) = transcript.into_message() else {
             return false;
         };
-        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, &execution.id);
         let candidates = driver
             .as_deref()
             .unwrap_or(&crate::driver::ClaudeDriver)

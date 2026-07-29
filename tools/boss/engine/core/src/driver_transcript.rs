@@ -38,9 +38,22 @@ use crate::transcript_markdown::TranscriptEvent;
 use crate::work::WorkDb;
 
 /// The [`AgentDriver`] governing `execution_id`, resolved through the same
-/// `tasks.driver` → `products.default_driver` → engine-default precedence
-/// used at spawn time ([`WorkDb::get_execution_driver_slug`]) and the same
-/// [`DriverRegistry`] every other call site looks slugs up in.
+/// precedence used at spawn time: a pool-dispatched run (review/automation
+/// pool worker) always resolves to
+/// [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed driver,
+/// ahead of and overriding the reviewed/automated row's own
+/// `tasks.driver` → `products.default_driver` → engine-default chain
+/// ([`WorkDb::get_execution_driver_slug`]) — exactly the precedence
+/// `worker_spawn::effective_task_driver_for_worker` applies at spawn. The
+/// resolved slug is looked up in the same [`DriverRegistry`] every other call
+/// site uses.
+///
+/// Without this override, a `pr_review` or `automation_triage` execution
+/// (both always dispatched on the review/automation pool, which forces
+/// Claude regardless of the row's own driver) would resolve the *reviewed
+/// row's* driver instead of the driver the run actually used — parsing a
+/// Claude reviewer's transcript with a non-Claude producer, which silently
+/// discards a valid prose-recovered result.
 ///
 /// `None` (with a WARN) when the execution has no resolvable slug or the slug
 /// is not registered in this binary. Callers fall back to an un-normalized
@@ -48,26 +61,7 @@ use crate::work::WorkDb;
 /// historical behaviour, and dropping a whole Stop-boundary read on a slug
 /// lookup would lose markers that a raw parse can still recover.
 pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
-    let slug = match work_db.get_execution_driver_slug(execution_id) {
-        Ok(Some(slug)) => slug,
-        Ok(None) => {
-            tracing::debug!(
-                execution_id,
-                "driver transcript: no driver slug resolves for this execution; \
-                 reading the transcript without driver normalization",
-            );
-            return None;
-        }
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                error = %format!("{err:#}"),
-                "driver transcript: driver slug lookup failed; reading the transcript \
-                 without driver normalization",
-            );
-            return None;
-        }
-    };
+    let slug = resolve_execution_driver_slug(work_db, execution_id)?;
     match DriverRegistry::default().require(&slug) {
         Ok(driver) => Some(driver),
         Err(err) => {
@@ -77,6 +71,71 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
                 %err,
                 "driver transcript: unknown driver slug; reading the transcript without \
                  driver normalization",
+            );
+            None
+        }
+    }
+}
+
+/// [`driver_for_execution`], defaulting to [`crate::driver::ClaudeDriver`]
+/// when no driver resolves at all. The single documented home for the
+/// `driver.as_deref().unwrap_or(&ClaudeDriver)` fail-safe every Stop-boundary
+/// fallback site needs, instead of that idiom being spelled out at each call
+/// site.
+pub fn driver_for_execution_or_default(work_db: &WorkDb, execution_id: &str) -> Arc<dyn AgentDriver> {
+    driver_for_execution(work_db, execution_id).unwrap_or_else(|| Arc::new(crate::driver::ClaudeDriver))
+}
+
+/// The driver slug that actually governed `execution_id`'s run: the pool's
+/// fixed driver for a review/automation-pool worker, else the reviewed row's
+/// own `tasks.driver` → `products.default_driver` → engine-default chain.
+///
+/// `pub(crate)` so call sites that only need the slug (not a resolved
+/// [`AgentDriver`]) — e.g. [`crate::worker_process_exit::one_turn_per_process`],
+/// which asks a driver for its [`crate::driver::WorkerProcessLifetime`] rather
+/// than for transcript parsing — go through the same pool-dispatch-aware
+/// resolution instead of reading `tasks.driver` directly and mis-resolving a
+/// pool-dispatched run's actual driver.
+pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+    if let Some(slug) = pool_override_driver_slug(work_db, execution_id) {
+        return Some(slug);
+    }
+    match work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => Some(slug),
+        Ok(None) => {
+            tracing::debug!(
+                execution_id,
+                "driver transcript: no driver slug resolves for this execution; \
+                 reading the transcript without driver normalization",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: driver slug lookup failed; reading the transcript \
+                 without driver normalization",
+            );
+            None
+        }
+    }
+}
+
+/// The pool's fixed driver slug when `execution_id`'s latest run's worker id
+/// is a review/automation-pool worker, else `None` (main-pool workers fall
+/// through to the row's own driver, unchanged).
+fn pool_override_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+    match work_db.latest_run_agent_id_for_execution(execution_id) {
+        Ok(Some(worker_id)) => {
+            crate::coordinator::pool_dispatch_policy_for_worker_id(&worker_id).map(|policy| policy.driver.to_owned())
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: worker id lookup failed; skipping pool-dispatch override",
             );
             None
         }

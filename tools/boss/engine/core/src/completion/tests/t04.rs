@@ -374,32 +374,26 @@ async fn pr_review_pass_clean_advances_to_in_review_without_revision() {
     );
 }
 
-/// The `ReviewResult` fallback used to hardcode `ClaudeDriver`
-/// unconditionally, so a Codex-attributed reviewer's Claude-shaped
-/// fenced-JSON transcript would still be recovered even though Codex
-/// declares no prose-scrape convention
-/// (`CodexDriver::structured_output_fallback` always returns `Vec::new()`).
-/// After the fix, the fallback resolves the run's *actual* driver via
-/// `driver_transcript::driver_for_execution`, so a Codex-attributed
-/// reviewer execution must NOT recover a result from a Claude-shaped
-/// transcript — it falls through to the re-prompt path exactly as if the
-/// reviewer had written nothing at all.
+/// The `ReviewResult` fallback used to resolve the *reviewed row's* driver
+/// (`tasks.driver`) rather than the driver the reviewer run actually used.
+/// But `pr_review` executions always dispatch on the review pool
+/// (`pr_review_exec_fixture`'s fixed `"review-worker-1"` worker id), which
+/// always runs Claude regardless of the producing row's own driver column
+/// (see `coordinator::pool_dispatch_policy_for_worker_id`) — so a
+/// codex-attributed producing chore still gets reviewed by Claude, and its
+/// Claude-shaped fenced-JSON transcript must still be recovered exactly as
+/// for a Claude-attributed chore. `driver_transcript::driver_for_execution`
+/// resolves the pool's driver ahead of the row's, so this must advance to
+/// `in_review` rather than falling into the re-prompt path.
 #[tokio::test]
-async fn pr_review_pass_ignores_claude_shaped_fallback_for_non_claude_driver() {
+async fn pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_chore() {
     let workspace = tempdir().unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/88";
     let json = clean_review_result_json(pr_url);
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
         pr_review_exec_fixture(workspace.path(), Some(&json));
 
-    db.update_work_item(
-        &chore_id,
-        crate::work::WorkItemPatch {
-            driver: Some("codex".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
+    set_work_item_driver(&db, &chore_id, "codex");
 
     let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
         .handler
@@ -407,9 +401,21 @@ async fn pr_review_pass_ignores_claude_shaped_fallback_for_non_claude_driver() {
 
     let outcome = handler.on_stop(&pr_review_exec_id).await;
     assert!(
-        matches!(outcome, StopOutcome::ReviewPassAwaitingResult),
-        "a Codex-attributed reviewer run must not be parsed via Claude's fallback \
-         convention; got {outcome:?}",
+        matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+        "a codex-attributed chore's reviewer is still a Claude reviewer pane (review-pool \
+         dispatch always overrides the row's driver), so its Claude-shaped transcript must \
+         still be recovered; got {outcome:?}",
+    );
+
+    let item = db.get_work_item(&chore_id).unwrap();
+    let task = match item {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected task/chore, got {other:?}"),
+    };
+    assert_eq!(
+        task.status,
+        TaskStatus::InReview,
+        "chore must advance to in_review even though its own `driver` column is codex",
     );
 }
 

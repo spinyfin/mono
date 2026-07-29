@@ -195,23 +195,20 @@ pub async fn classify_worker_process_exit(
 /// Fails closed to `false` on every unresolvable case, so a run whose driver
 /// cannot be identified keeps the historical "any exit is a death" treatment.
 fn one_turn_per_process(work_db: &WorkDb, execution_id: &str) -> bool {
-    let slug = match work_db.get_execution_driver_slug(execution_id) {
-        Ok(Some(slug)) => slug,
-        Ok(None) => {
-            tracing::debug!(
-                execution_id,
-                "process exit: no driver recorded for execution; treating the exit as a death",
-            );
-            return false;
-        }
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                ?err,
-                "process exit: driver lookup failed; treating the exit as a death",
-            );
-            return false;
-        }
+    // Goes through the same pool-dispatch-aware resolution as
+    // `driver_transcript::driver_for_execution` rather than
+    // `get_execution_driver_slug` directly: a review/automation-pool worker
+    // always runs the pool's fixed (Claude, persistent-pane) driver,
+    // regardless of the reviewed/automated row's own `tasks.driver` — reading
+    // the row's driver here would misclassify a Claude reviewer pane as
+    // one-turn-per-process whenever the row under review carries a
+    // one-shot driver like Codex.
+    let Some(slug) = crate::driver_transcript::resolve_execution_driver_slug(work_db, execution_id) else {
+        tracing::debug!(
+            execution_id,
+            "process exit: no driver recorded for execution; treating the exit as a death",
+        );
+        return false;
     };
     match DriverRegistry::default().get(&slug) {
         Some(driver) => driver.worker_process_lifetime() == WorkerProcessLifetime::OneTurnPerProcess,

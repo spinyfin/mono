@@ -102,24 +102,29 @@ async fn driver_terminal_error_fails_execution_releases_lease_and_skips_nudge() 
     let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) = pr_review_exec_fixture(workspace.path(), None);
 
     // The attention detail is recovered from the run's transcript, read
-    // through the run's own driver (see `driver_transcript::driver_for_execution`)
-    // so the rollout dialect is normalized correctly. Mark the producing
-    // task as codex-driven and write the raw rollout lines a real ingress
-    // would have tailed, so this test exercises the same read path
-    // production uses rather than asserting against a hand-built string.
-    db.update_work_item(
-        &chore_id,
-        crate::work::WorkItemPatch {
-            driver: Some("codex".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let transcript_path = workspace.path().join(format!("rollout-{pr_review_exec_id}.jsonl"));
+    // through the run's own driver (see `driver_transcript::driver_for_execution`).
+    // A `pr_review` execution always dispatches on the review pool
+    // (`pr_review_exec_fixture`'s fixed `"review-worker-1"` worker id), which
+    // always runs Claude regardless of the producing chore's own `driver`
+    // column (`coordinator::pool_dispatch_policy_for_worker_id`) — so the
+    // reviewer's transcript is Claude-shaped, not a raw codex rollout, and
+    // that is the dialect this fixture's transcript must be written in for
+    // the read path to recover the diagnostic. (`codex_task_complete_turn_end`
+    // below still exercises `CodexDriver`'s own rollout normalizer directly,
+    // independent of which driver reads this stored transcript — that proves
+    // the adapter, this proves the Stop-boundary read.)
+    let transcript_path = workspace.path().join(format!("transcript-{pr_review_exec_id}.jsonl"));
     let transcript_jsonl = format!(
-        "{}\n{}\n",
-        json!({"type": "session_meta", "payload": {"id": "thread-1"}}),
-        json!({"type": "event_msg", "payload": fatal_task_complete_payload()}),
+        "{}\n",
+        json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "text",
+                    "text": "Fatal error: {\"type\":\"error\",\"status\":400,\"code\":\"bad_request\"} (other)",
+                }],
+            },
+        }),
     );
     std::fs::write(&transcript_path, transcript_jsonl).unwrap();
     db.set_run_transcript_path_if_unset(&pr_review_exec_id, transcript_path.to_str().unwrap())

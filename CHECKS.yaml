@@ -219,3 +219,35 @@ checks:
           pattern: '\b[TP]\d{3,}\b'
           message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in source. Remove the reference; if provenance is genuinely needed, put it in the PR description instead."
           severity: warning
+
+  # Guards the driver-agnostic transcript sweep (all four
+  # `AgentDriver::structured_output_fallback` call sites now resolve their
+  # driver through `driver_transcript::driver_for_execution`/
+  # `driver_for_execution_or_default` instead of hardcoding `ClaudeDriver`).
+  # `changed_lines_only` means this cannot retroactively prove today's tree is
+  # clean (a one-off `grep -rn "ClaudeDriver.structured_output_fallback("`
+  # confirms that at authoring time), but it does stop a future call site from
+  # reintroducing the exact bug this sweep fixed: a hardcoded `ClaudeDriver`
+  # used directly as the receiver of `.structured_output_fallback(`, instead
+  # of resolving the run's actual driver.
+  #
+  # The pattern requires the dot to follow `ClaudeDriver` with no intervening
+  # `)` so it does NOT flag the sanctioned fail-safe idiom
+  # (`driver.as_deref().unwrap_or(&ClaudeDriver).structured_output_fallback(...)`),
+  # where a `)` from `unwrap_or(...)` always separates the two — only a
+  # direct, unconditional `ClaudeDriver.structured_output_fallback(` (or
+  # `&ClaudeDriver).structured_output_fallback(` immediately, with no
+  # resolution step at all) matches.
+  - id: boss-ism/hardcoded-claude-driver-fallback
+    check: text/forbidden-pattern
+    policy:
+      severity: error
+      changed_lines_only: true
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: hardcoded-claude-driver-structured-output-fallback
+          pattern: 'ClaudeDriver\.structured_output_fallback\('
+          message: "Do not call ClaudeDriver.structured_output_fallback(...) directly. Resolve the run's actual driver via driver_transcript::driver_for_execution (or driver_for_execution_or_default) first — a pool-dispatched or non-Claude-driven execution must not be parsed as if it always ran Claude."
+          severity: error
