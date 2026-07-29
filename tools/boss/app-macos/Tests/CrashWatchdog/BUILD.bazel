@@ -1,0 +1,63 @@
+load("@build_bazel_rules_apple//apple:macos.bzl", "macos_unit_test")
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_binary", "swift_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("//tools/test-sandbox:defs.bzl", "XCODE_TEST_ENV")
+
+package(default_visibility = ["//visibility:private"])
+
+config_setting(
+    name = "coverage_enabled",
+    values = {"collect_code_coverage": "true"},
+)
+
+_COVERAGE_LINKOPTS = select({
+    ":coverage_enabled": ["-fprofile-instr-generate"],
+    "//conditions:default": [],
+})
+
+macos_unit_test(
+    name = "CrashWatchdogTests",
+    size = "small",
+    env = XCODE_TEST_ENV,
+    minimum_os_version = "15.0",
+    runner = "//tools/test-sandbox:macos_direct_test_runner",
+    deps = [":crash_watchdog_tests_lib"],
+)
+
+swift_library(
+    name = "crash_watchdog_tests_lib",
+    testonly = True,
+    srcs = ["CrashWatchdogTests.swift"],
+    copts = [],
+    linkopts = _COVERAGE_LINKOPTS,
+    module_name = "CrashWatchdogTests",
+    deps = ["//tools/boss/app-macos/Sources/CrashWatchdog"],
+)
+
+# A subprocess that really aborts. XCTest cannot host this: the assertion is
+# that the process dies, so the crashing code has to live in its own binary.
+swift_binary(
+    name = "crash_watchdog_harness",
+    testonly = True,
+    srcs = ["CrashWatchdogHarness.swift"],
+    copts = [
+        "-swift-version",
+        "6",
+        "-strict-concurrency=complete",
+    ],
+    deps = ["//tools/boss/app-macos/Sources/CrashWatchdog"],
+)
+
+# The reproduction itself: injects sentry-native 0.7.8's unbounded spin as the
+# prior SIGABRT handler and asserts the process still dies inside the grace.
+# Runs in ~15s: the scenarios spend real wall time waiting on subprocess
+# deadlines by construction, and the unguarded case waits out its full window
+# on purpose. The script's own deadlines cap the worst case near 35s, inside
+# the 60s a "small" test gets.
+sh_test(
+    name = "crash_watchdog_livelock_test",
+    size = "small",
+    srcs = ["crash_watchdog_test.sh"],
+    args = ["$(rootpath :crash_watchdog_harness)"],
+    data = [":crash_watchdog_harness"],
+)

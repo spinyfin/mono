@@ -1,0 +1,22 @@
+load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
+
+package(default_visibility = ["//visibility:private"])
+
+# Kept out of the Boss app module so the livelock reproduction in
+# //tools/boss/app-macos/Tests/CrashWatchdog can link it into a bare
+# command-line harness — the whole point of the test is to abort a real
+# process, which is not something an XCTest bundle can survive doing.
+swift_library(
+    name = "CrashWatchdog",
+    srcs = glob(["*.swift"]),
+    copts = [
+        "-swift-version",
+        "6",
+        "-strict-concurrency=complete",
+    ],
+    module_name = "CrashWatchdog",
+    visibility = [
+        "//tools/boss/app-macos:__pkg__",
+        "//tools/boss/app-macos/Tests/CrashWatchdog:__pkg__",
+    ],
+)
