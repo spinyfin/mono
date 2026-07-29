@@ -15,6 +15,7 @@ rust_library(
         "//tools/boss/engine/dispatch-reader:__pkg__",
     ],
     deps = [
+        "//tools/boss/engine/jsonl-append",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(normal = True),
 )
@@ -29,6 +30,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//tools/boss/engine/jsonl-append",
         "//tools/boss/engine/utils",
     ] + all_crate_deps(
         normal = True,

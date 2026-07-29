@@ -8,6 +8,7 @@ workspace = "../../../.."
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 bon = { workspace = true }
+boss-engine-jsonl-append = { path = "../jsonl-append" }
 boss-engine-utils = { path = "../utils" }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
