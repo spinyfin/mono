@@ -99,13 +99,16 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 /// so the disk gate is inert unless a test asks otherwise. Tests that *are*
 /// about the floor either configure the floor around this reading (a
 /// `min-free-bytes` of `u64::MAX` is below nothing) or inject their own with
-/// [`with_reading`]. The state is thread-local, so it is scoped to the test
+/// [`with_reading`] — or, when the behaviour under test is free space
+/// *changing*, a sequence of them with [`with_readings`]. The state is
+/// thread-local, so it is scoped to the test
 /// that set it under libtest's thread-per-test model, and the returned guard
 /// restores the previous value so it stays scoped under `--test-threads=1`
 /// too.
 #[cfg(test)]
 pub(super) mod testing {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
 
     use super::DiskSpace;
 
@@ -121,32 +124,65 @@ pub(super) mod testing {
         /// `None` means "call the real `statvfs`", which only the probe's own
         /// tests want.
         static READING: Cell<Option<DiskSpace>> = const { Cell::new(Some(AMPLE_TEST_VOLUME)) };
+        /// A scripted sequence of readings, consulted ahead of [`READING`].
+        /// Empty means "not scripted".
+        static SCRIPT: RefCell<VecDeque<DiskSpace>> = const { RefCell::new(VecDeque::new()) };
     }
 
     pub(super) fn injected_reading() -> Option<DiskSpace> {
-        READING.get()
+        SCRIPT
+            .with_borrow_mut(|script| {
+                // The last entry sticks: a script says how the volume changes
+                // over the first N probes, not how many probes there are.
+                if script.len() > 1 {
+                    script.pop_front()
+                } else {
+                    script.front().copied()
+                }
+            })
+            .or_else(|| READING.get())
     }
 
-    /// Restores the previous injected reading when dropped.
+    /// Restores the previous injected reading (and scripted sequence) when
+    /// dropped.
     #[must_use = "the injected reading is restored when this guard drops"]
-    pub(in crate::app) struct ReadingGuard(Option<DiskSpace>);
+    pub(in crate::app) struct ReadingGuard(Option<DiskSpace>, VecDeque<DiskSpace>);
 
     impl Drop for ReadingGuard {
         fn drop(&mut self) {
             READING.set(self.0);
+            SCRIPT.with_borrow_mut(|script| *script = std::mem::take(&mut self.1));
         }
+    }
+
+    fn guard_replacing(reading: Option<DiskSpace>, script: VecDeque<DiskSpace>) -> ReadingGuard {
+        ReadingGuard(
+            READING.replace(reading),
+            SCRIPT.with_borrow_mut(|current| std::mem::replace(current, script)),
+        )
     }
 
     /// Make every `DiskSpace::probe` on this thread answer `space` until the
     /// returned guard drops.
     pub(in crate::app) fn with_reading(space: DiskSpace) -> ReadingGuard {
-        ReadingGuard(READING.replace(Some(space)))
+        guard_replacing(Some(space), VecDeque::new())
+    }
+
+    /// Make consecutive probes on this thread answer `readings` in order,
+    /// sticking on the last one once the script is exhausted.
+    ///
+    /// This is what makes a *change* in free space testable — reclamation that
+    /// clears the floor is a before/after pair of probes, and with a single
+    /// fixed reading the "recovered" arm can never be reached.
+    pub(in crate::app) fn with_readings(readings: &[DiskSpace]) -> ReadingGuard {
+        assert!(!readings.is_empty(), "a reading script needs at least one reading");
+        guard_replacing(None, readings.iter().copied().collect())
     }
 
     /// Opt back into the real `statvfs` — for the probe's own tests, which are
     /// the one place that should be reading the host.
     pub(in crate::app) fn use_real_volume() -> ReadingGuard {
-        ReadingGuard(READING.replace(None))
+        guard_replacing(None, VecDeque::new())
     }
 
     /// A volume with `available_bytes` free out of [`AMPLE_TEST_VOLUME`]'s
@@ -200,6 +236,21 @@ mod tests {
             DiskSpace::probe(tempdir.path()).expect("probe"),
             testing::AMPLE_TEST_VOLUME,
             "the guard restores what it replaced",
+        );
+    }
+
+    #[test]
+    fn a_scripted_sequence_advances_then_sticks() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let low = testing::volume_with_free(1024);
+        let high = testing::volume_with_free(4096);
+        let _script = testing::with_readings(&[low, high]);
+        assert_eq!(DiskSpace::probe(tempdir.path()).expect("probe"), low);
+        assert_eq!(DiskSpace::probe(tempdir.path()).expect("probe"), high);
+        assert_eq!(
+            DiskSpace::probe(tempdir.path()).expect("probe"),
+            high,
+            "the last reading sticks once the script is exhausted",
         );
     }
 

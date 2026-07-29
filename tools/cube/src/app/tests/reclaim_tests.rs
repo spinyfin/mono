@@ -11,12 +11,13 @@ use super::support::{
     unpushed_probe_command, with_database_path,
 };
 
-use crate::app::disk::testing::{AMPLE_TEST_VOLUME, volume_with_free, with_reading};
+use crate::app::disk::testing::{AMPLE_TEST_VOLUME, volume_with_free, with_reading, with_readings};
 use crate::app::errors::CubeError;
 use crate::app::gc::{POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, POOL_GC_TRIM_PROGRESS_KEY, maybe_trigger_pool_gc};
+use crate::app::provision::discover_workspaces;
 use crate::app::reclaim::{
     assert_mint_headroom, compact_free_workspaces, has_free_workspace_surplus, is_safe_artifact_dir_name,
-    relieve_disk_pressure, trim_free_workspaces_to_mark,
+    relieve_disk_pressure, stage_workspace_for_removal, trim_free_workspaces_to_mark,
 };
 use crate::metadata::{RepoRecord, WorkspaceCandidate};
 use crate::store::Store;
@@ -471,6 +472,85 @@ fn forget_registration(workspace_root: &Path, source: &Path, workspace_id: &str)
 }
 
 #[test]
+fn a_staged_workspace_cannot_be_rediscovered_and_re_registered() {
+    // The window the staging rename exists to close. Dropping the registry row
+    // is NOT enough on its own: the lease path rebuilds the registry from disk
+    // (`discover_workspaces` + `sync_workspaces`) under the same repo lock, so
+    // a directory still matching the prefix comes straight back as a free,
+    // most-idle-looking candidate — and gets handed to a worker while the trim
+    // is unlinking it. Once staged, the directory no longer matches the prefix,
+    // so the rediscovery finds nothing to resurrect.
+    let _config = ConfigGuard::new("[pool]\n");
+    let (tempdir, database_path) = with_database_path();
+    let source = tempdir.path().join("source/mono");
+    std::fs::create_dir_all(source.join(".jj")).expect("canonical source");
+    let (mut store, workspace_root) = seed_pool(&tempdir, &database_path, 1, Some(source.clone()));
+    let repo_record = store.get_repo("mono").expect("get repo").expect("repo row");
+    let record = store
+        .list_workspaces("mono")
+        .expect("list")
+        .pop()
+        .expect("one workspace");
+
+    let runner = FakeRunner::new(vec![forget_registration(&workspace_root, &source, "mono-agent-001")]);
+    store.forget_workspace("mono", "mono-agent-001").expect("forget row");
+    let staged = stage_workspace_for_removal(&runner, &repo_record, &record, None).expect("stage");
+    runner.assert_exhausted();
+
+    assert!(!record.workspace_path.exists(), "the prefixed name is gone");
+    assert!(staged.is_dir(), "the tree is still on disk, just out of circulation");
+    assert_eq!(staged.file_name().unwrap(), ".removing-mono-agent-001");
+
+    // Now do exactly what a concurrent lease would do next.
+    let rediscovered = discover_workspaces(&repo_record).expect("discover");
+    assert!(
+        rediscovered.is_empty(),
+        "a staged workspace must be invisible to rediscovery, got {rediscovered:?}",
+    );
+    store.sync_workspaces("mono", &rediscovered).expect("sync");
+    assert!(
+        store.list_workspaces("mono").expect("list").is_empty(),
+        "the lease path must not be able to re-register a workspace being removed",
+    );
+}
+
+#[test]
+fn staging_clears_a_leftover_from_a_pass_that_died_mid_removal() {
+    // A crash between the rename and the unlink leaves a dotted directory. It
+    // is invisible and therefore harmless, but the next removal of the same id
+    // has to be able to reuse the name — `fs::rename` onto a non-empty
+    // directory fails.
+    let _config = ConfigGuard::new("[pool]\n");
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
+    let repo_record = store.get_repo("mono").expect("get repo").expect("repo row");
+    let record = store
+        .list_workspaces("mono")
+        .expect("list")
+        .pop()
+        .expect("one workspace");
+
+    let leftover = workspace_root.join(".removing-mono-agent-001");
+    std::fs::create_dir_all(leftover.join("target/debug")).expect("leftover");
+    assert!(
+        discover_workspaces(&repo_record).expect("discover").len() == 1,
+        "only the live workspace is discoverable; the leftover is not",
+    );
+
+    let runner = FakeRunner::new(vec![]);
+    store.forget_workspace("mono", "mono-agent-001").expect("forget row");
+    let staged = stage_workspace_for_removal(&runner, &repo_record, &record, None).expect("stage");
+    runner.assert_exhausted();
+
+    assert_eq!(staged, leftover);
+    assert!(
+        staged.join(".jj").is_dir(),
+        "the staged tree is the workspace, not the leftover"
+    );
+    assert!(!staged.join("target").exists(), "the leftover was cleared first");
+}
+
+#[test]
 fn trim_removes_the_most_idle_surplus_down_to_the_mark() {
     let _config = ConfigGuard::new("[pool]\nmax-free-workspaces = 2\n");
     let (tempdir, database_path) = with_database_path();
@@ -783,7 +863,7 @@ fn a_surplus_the_last_trim_could_not_act_on_does_not_pin_the_gc_at_five_minutes(
 
 #[test]
 fn no_disk_pressure_relief_when_the_volume_is_above_its_floor() {
-    // A floor of one byte is below anything a real volume reports, so this
+    // A floor of one byte is below the injected test volume, so this
     // exercises the ordinary path: no reclamation, no audit noise, no cost.
     let _config = ConfigGuard::new("[pool]\nmin-free-bytes = 1\nmin-free-percent = 0\n");
     let (tempdir, database_path) = with_database_path();
@@ -812,9 +892,9 @@ fn no_disk_pressure_relief_when_the_volume_is_above_its_floor() {
 
 #[test]
 fn disk_pressure_compacts_before_the_lease_continues() {
-    // A floor of u64::MAX is above anything any volume can report, so the
-    // pressure path always fires — the cheapest way to exercise "below the
-    // floor" without needing a full disk.
+    // A floor of u64::MAX is above the injected test volume, so the pressure
+    // path always fires and no re-measure can ever clear it — the cheapest way
+    // to exercise "below the floor, and still below it afterwards".
     let _config = ConfigGuard::new(
         "[pool]\n\
          min-free-bytes = 18446744073709551615\n\
@@ -842,9 +922,10 @@ fn disk_pressure_compacts_before_the_lease_continues() {
 
     assert_eq!(relief.report.workspaces_compacted, 1);
     assert!(!target.exists(), "urgent compaction ignores the idle window");
-    // No real volume can clear a u64::MAX floor, so this stays false — which
-    // is what makes a *mint* in the same lease call fail loudly, while
-    // reusing an existing workspace carries on.
+    // The injected volume cannot clear a u64::MAX floor, so this stays false —
+    // which is what makes a *mint* in the same lease call fail loudly, while
+    // reusing an existing workspace carries on. The opposite arm is pinned by
+    // `disk_pressure_that_recovers_lets_the_mint_through`.
     assert!(!relief.recovered);
 
     let pressure = audit_events(&tempdir)
@@ -854,6 +935,49 @@ fn disk_pressure_compacts_before_the_lease_continues() {
     assert_eq!(pressure["repo"], "mono");
     assert_eq!(pressure["workspaces_compacted"], 1);
     assert_eq!(pressure["recovered"], false);
+}
+
+#[test]
+fn disk_pressure_that_recovers_lets_the_mint_through() {
+    // The whole point of reclaim-then-proceed: a lease that arrives on a
+    // volume below its floor compacts, the re-measure clears the floor, and
+    // the mint that would have been refused goes ahead instead. Scripting the
+    // probe is the only way to express "space changed" — the first reading is
+    // 1 GiB against the default `max(20 GiB, 2% of total)` floor, every
+    // reading after it is the ample volume, which is what compaction is
+    // standing in for.
+    let _config = ConfigGuard::new("[pool]\nbuild-artifact-dirs = [\"target\"]\n");
+    let _disk = with_readings(&[volume_with_free(1024 * 1024 * 1024), AMPLE_TEST_VOLUME]);
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
+    let ws = workspace_root.join("mono-agent-001");
+    let target = write_artifact_tree(&ws, "target");
+    set_last_activity(&database_path, "mono-agent-001", LONG_IDLE);
+
+    let runner = FakeRunner::new(vec![tracked_probe(&ws, "target", "")]);
+    let relief = relieve_disk_pressure(
+        &runner,
+        &store,
+        Some(&database_path),
+        "mono",
+        &workspace_root,
+        NOW,
+        None,
+    )
+    .expect("the first reading is below the floor, so relief should have run");
+    runner.assert_exhausted();
+
+    assert_eq!(relief.report.workspaces_compacted, 1);
+    assert!(!target.exists());
+    assert!(relief.recovered, "the re-measure cleared the floor");
+    assert_eq!(
+        audit_events(&tempdir)
+            .into_iter()
+            .find(|e| e["event"] == "pool.disk_pressure")
+            .expect("pool.disk_pressure audit event")["recovered"],
+        true,
+    );
+    assert_mint_headroom("mono", &workspace_root).expect("a mint refused before reclamation must be allowed after it");
 }
 
 #[test]

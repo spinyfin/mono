@@ -58,7 +58,7 @@
 //! fires on every lease and compacts everything free that is left.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::command_runner::{CommandInvocation, CommandRunner, RealCommandRunner};
@@ -484,15 +484,30 @@ fn trim_one_repo(
         // check-to-delete window minutes wide, and a lease that claimed this
         // row during it would have its directory deleted underneath it.
         //
-        // The critical section is exactly those two sqlite statements, and the
-        // unlink is deliberately outside it. `RepoLock::acquire` is a blocking
-        // flock with no timeout and no way for the pass deadline to preempt a
-        // waiter, so every second spent holding it is a second every lease and
-        // release for this repo can spend blocked — and `remove_dir_all` on a
-        // ~600 MB checkout plus a `jj workspace forget` subprocess is seconds,
-        // not microseconds. Nothing after the row is gone needs the lock
-        // anyway: no lease can select a workspace that is no longer in the
-        // registry, so there is nobody left to race.
+        // The critical section is the two sqlite statements, an `fs::rename`
+        // and the `jj workspace forget` — and the `rm -rf` is deliberately
+        // outside it. `RepoLock::acquire` is a blocking flock with no timeout
+        // and no way for the pass deadline to preempt a waiter, so every second
+        // spent holding it is a second every lease and release for this repo
+        // can spend blocked, and `remove_dir_all` on a ~600 MB checkout is
+        // seconds, not microseconds.
+        //
+        // Dropping the registry row is NOT on its own enough to make the
+        // workspace unselectable, which is why the rename is inside the lock
+        // too: the lease path re-derives the registry from disk under this same
+        // lock (`discover_workspaces` then `Store::sync_workspaces`, which
+        // INSERTs every directory matching the repo's `workspace_prefix` as a
+        // free row). A directory left in place after its row is gone is
+        // therefore rediscovered and re-registered — with a NULL
+        // `last_activity_at_epoch_s`, i.e. as the most-idle candidate there
+        // is — and handed to a worker while this pass unlinks it. Moving it to
+        // a dotted staging name closes that: dotted names do not match the
+        // prefix, so `discover_workspaces` cannot see it, and the same lock
+        // that covers the rename covers the `jj workspace forget`, so that
+        // forget cannot detach a registration a concurrent mint has re-minted
+        // under the same id. It is the mirror of the `.incoming-` staging
+        // `auto_create_workspace` uses for the inverse operation. A rename is
+        // one inode operation, so the lock still costs microseconds.
         let lock_path = match repo_lock_path(repo, database_path) {
             Ok(path) => path,
             Err(e) => {
@@ -500,7 +515,7 @@ fn trim_one_repo(
                 break;
             }
         };
-        let forgotten = {
+        let staged = {
             let _lock = match RepoLock::acquire(&lock_path) {
                 Ok(lock) => lock,
                 Err(e) => {
@@ -514,22 +529,37 @@ fn trim_one_repo(
             if !still_free(store, record) {
                 continue;
             }
-            store.forget_workspace(&record.repo, &record.workspace_id)
+            if let Err(e) = store.forget_workspace(&record.repo, &record.workspace_id) {
+                eprintln!(
+                    "cube: pool trim: {}: could not drop the registry row, leaving it alone: {e}",
+                    record.workspace_id,
+                );
+                continue;
+            }
+            stage_workspace_for_removal(runner, repo_record, record, deadline)
         };
-        if let Err(e) = forgotten {
-            eprintln!(
-                "cube: pool trim: {}: could not drop the registry row, leaving it alone: {e}",
-                record.workspace_id,
-            );
-            continue;
-        }
+        let staged_path = match staged {
+            Ok(path) => path,
+            Err(e) => {
+                // The row is already gone but the directory is still where it
+                // was, which is the self-healing half of the ordering: the next
+                // lease rediscovers it and re-registers it as free. Nothing is
+                // lost, this pass just did not reclaim it.
+                eprintln!(
+                    "cube: pool trim: {}: could not stage it for removal, leaving the directory in \
+                     place for rediscovery: {e}",
+                    record.workspace_id,
+                );
+                continue;
+            }
+        };
 
         let context = TrimContext {
             now_epoch_s,
             mark,
             free_on_disk,
         };
-        match remove_workspace_from_disk(runner, database_path, repo_record, record, context, deadline) {
+        match remove_workspace_from_disk(database_path, repo_record, record, &staged_path, context) {
             Ok(freed) => {
                 report.workspaces_removed += 1;
                 report.available_delta_bytes = report.available_delta_bytes.saturating_add(freed);
@@ -573,18 +603,33 @@ struct TrimContext {
     free_on_disk: usize,
 }
 
-/// Delete a verified-empty-of-work free workspace whose registry row the
-/// caller has already dropped, and clear up everything else it left behind.
+/// The staging basename a workspace is moved to once its registry row is gone
+/// and before its bytes are unlinked. The leading dot is load-bearing: it is
+/// what keeps `discover_workspaces` — which matches on the repo's
+/// `workspace_prefix` — from seeing the directory and re-registering it as a
+/// free, leasable workspace while the unlink is in flight.
+pub(super) fn removal_staging_name(workspace_id: &str) -> String {
+    format!(".removing-{workspace_id}")
+}
+
+/// Take a workspace out of circulation: move it to a dotted staging name and
+/// detach its registration from the shared canonical store.
 ///
-/// Called with the repo lock **released**. Order is what makes that safe, and
-/// the registry row goes first — the same order the operator-invoked `cube
-/// workspace remove` uses. Once the row is gone no lease can select the
-/// workspace, so the `rm -rf` here cannot race one and needs no lock to
-/// exclude it; doing it the other way round would leave a live row pointing at
-/// a directory being unlinked. The row is also the recoverable half: the next
-/// lease rediscovers any directory still on disk and re-registers it, so a
-/// removal that dies between the two steps self-heals, while a lease handed a
-/// half-deleted checkout does not.
+/// Called with the repo lock **held**, and that is the whole point. Dropping
+/// the registry row alone does not make a workspace unselectable, because the
+/// lease path rebuilds the registry from disk (`discover_workspaces` +
+/// `Store::sync_workspaces`) under this same lock, re-registering any directory
+/// that still matches the repo's `workspace_prefix` as free. Only once the
+/// directory is renamed out of the prefix is the workspace genuinely
+/// unreachable, so rename and row-drop have to be one indivisible step. The
+/// `jj workspace forget` is in here for the same reason: the id it names is
+/// only unambiguously *this* workspace's while the lock excludes a concurrent
+/// mint re-minting it.
+///
+/// Everything expensive — the `rm -rf` of the staged tree — is left to
+/// [`remove_workspace_from_disk`], which runs unlocked. A crash between the two
+/// leaves an invisible `.removing-` directory: cosmetic cruft, not a workspace
+/// a lease can be handed.
 ///
 /// `jj workspace forget` against the *canonical* store is what stops the
 /// shared repo accumulating dead registrations — without it the removed
@@ -594,23 +639,30 @@ struct TrimContext {
 /// `provision.rs` that created the attachment, bounded by
 /// [`LOCAL_JJ_CMD_TIMEOUT`] like every other subprocess here, and best-effort:
 /// a failure leaves cosmetic cruft in the shared store, not a broken pool.
-fn remove_workspace_from_disk(
+pub(super) fn stage_workspace_for_removal(
     runner: &dyn CommandRunner,
-    database_path: Option<&Path>,
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
-    context: TrimContext,
     deadline: Option<Instant>,
-) -> Result<u64> {
-    let before = DiskSpace::probe(&repo_record.workspace_root).ok();
-    fs::remove_dir_all(&record.workspace_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
-        path: record.workspace_path.clone(),
-        source,
+) -> Result<PathBuf> {
+    let staged_path = repo_record
+        .workspace_root
+        .join(removal_staging_name(&record.workspace_id));
+    if staged_path.exists() {
+        // A leftover from a pass that died between staging and unlinking.
+        // Clearing it is what lets the rename below succeed — `fs::rename`
+        // onto a non-empty directory fails.
+        fs::remove_dir_all(&staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
+            path: staged_path.clone(),
+            source,
+        })?;
+    }
+    fs::rename(&record.workspace_path, &staged_path).map_err(|source| {
+        crate::app::errors::CubeError::WorkspaceDirRemove {
+            path: record.workspace_path.clone(),
+            source,
+        }
     })?;
-    let freed = before
-        .zip(DiskSpace::probe(&repo_record.workspace_root).ok())
-        .map(|(before, after)| after.available_bytes.saturating_sub(before.available_bytes))
-        .unwrap_or(0);
 
     if let Some(canonical) = &repo_record.source {
         let invocation = CommandInvocation {
@@ -635,11 +687,42 @@ fn remove_workspace_from_disk(
         };
         if let Err(e) = forget {
             eprintln!(
-                "warning: cube removed {} but could not forget its registration in the shared store: {e}",
+                "warning: cube staged {} for removal but could not forget its registration in the \
+                 shared store: {e}",
                 record.workspace_id,
             );
         }
     }
+
+    Ok(staged_path)
+}
+
+/// Unlink a workspace already staged out of circulation by
+/// [`stage_workspace_for_removal`], and clear up everything else it left
+/// behind.
+///
+/// Called with the repo lock **released**, which is safe precisely because
+/// staging already happened under it: the tree at `staged_path` no longer
+/// matches the repo's `workspace_prefix`, so no lease can rediscover it, and
+/// its registry row and shared-store registration are both already gone. There
+/// is nothing left for the unlink to race, so the seconds it takes on a ~600 MB
+/// checkout are seconds no lease or release for this repo spends blocked.
+fn remove_workspace_from_disk(
+    database_path: Option<&Path>,
+    repo_record: &RepoRecord,
+    record: &WorkspaceRecord,
+    staged_path: &Path,
+    context: TrimContext,
+) -> Result<u64> {
+    let before = DiskSpace::probe(&repo_record.workspace_root).ok();
+    fs::remove_dir_all(staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
+        path: staged_path.to_path_buf(),
+        source,
+    })?;
+    let freed = before
+        .zip(DiskSpace::probe(&repo_record.workspace_root).ok())
+        .map(|(before, after)| after.available_bytes.saturating_sub(before.available_bytes))
+        .unwrap_or(0);
 
     if let Err(e) = cleanup_workspace_logs(&record.workspace_id) {
         eprintln!(
