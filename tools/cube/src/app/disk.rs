@@ -30,7 +30,21 @@ impl DiskSpace {
     ///
     /// `path` need not be the mount point; any path on the volume works, which
     /// is why callers pass a repo's `workspace_root` directly.
+    ///
+    /// Under `cfg(test)` this answers the injected reading described in
+    /// [`self::testing`] instead of calling `statvfs`, so no test's outcome
+    /// depends on how full the machine running it happens to be.
     pub(super) fn probe(path: &Path) -> Result<Self> {
+        #[cfg(test)]
+        if let Some(injected) = testing::injected_reading() {
+            return Ok(injected);
+        }
+        Self::probe_volume(path)
+    }
+
+    /// The real `statvfs` read, unconditionally. Production `probe` is this;
+    /// tests reach it only through [`testing::use_real_volume`].
+    fn probe_volume(path: &Path) -> Result<Self> {
         let stats = fs4::statvfs(path).map_err(CubeError::Io)?;
         Ok(Self {
             available_bytes: stats.available_space(),
@@ -70,12 +84,88 @@ pub(super) fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// The seam that keeps free space out of every test that is not *about* free
+/// space.
+///
+/// [`DiskSpace::probe`] statvfs's whatever volume the caller's path sits on,
+/// which for a test is the volume its tempdir landed on — the machine's. That
+/// makes any behaviour keyed off the floor (notably the mint refusal in
+/// `assert_mint_headroom`) a function of how full the developer's or CI
+/// agent's disk is, and a lease test that never mentions disk would start
+/// failing on a host below 20 GiB free.
+///
+/// So under `cfg(test)` the probe answers an injected reading, defaulting to
+/// [`AMPLE_TEST_VOLUME`] — comfortably above any floor the defaults produce,
+/// so the disk gate is inert unless a test asks otherwise. Tests that *are*
+/// about the floor either configure the floor around this reading (a
+/// `min-free-bytes` of `u64::MAX` is below nothing) or inject their own with
+/// [`with_reading`]. The state is thread-local, so it is scoped to the test
+/// that set it under libtest's thread-per-test model, and the returned guard
+/// restores the previous value so it stays scoped under `--test-threads=1`
+/// too.
+#[cfg(test)]
+pub(super) mod testing {
+    use std::cell::Cell;
+
+    use super::DiskSpace;
+
+    /// The default reading every test sees: a 1 TiB volume with 512 GiB free.
+    /// Both halves matter — `total_bytes` feeds the proportional floor, and a
+    /// zero total would make `min-free-percent` vacuous.
+    pub(in crate::app) const AMPLE_TEST_VOLUME: DiskSpace = DiskSpace {
+        available_bytes: 512 * 1024 * 1024 * 1024,
+        total_bytes: 1024 * 1024 * 1024 * 1024,
+    };
+
+    thread_local! {
+        /// `None` means "call the real `statvfs`", which only the probe's own
+        /// tests want.
+        static READING: Cell<Option<DiskSpace>> = const { Cell::new(Some(AMPLE_TEST_VOLUME)) };
+    }
+
+    pub(super) fn injected_reading() -> Option<DiskSpace> {
+        READING.get()
+    }
+
+    /// Restores the previous injected reading when dropped.
+    #[must_use = "the injected reading is restored when this guard drops"]
+    pub(in crate::app) struct ReadingGuard(Option<DiskSpace>);
+
+    impl Drop for ReadingGuard {
+        fn drop(&mut self) {
+            READING.set(self.0);
+        }
+    }
+
+    /// Make every `DiskSpace::probe` on this thread answer `space` until the
+    /// returned guard drops.
+    pub(in crate::app) fn with_reading(space: DiskSpace) -> ReadingGuard {
+        ReadingGuard(READING.replace(Some(space)))
+    }
+
+    /// Opt back into the real `statvfs` — for the probe's own tests, which are
+    /// the one place that should be reading the host.
+    pub(in crate::app) fn use_real_volume() -> ReadingGuard {
+        ReadingGuard(READING.replace(None))
+    }
+
+    /// A volume with `available_bytes` free out of [`AMPLE_TEST_VOLUME`]'s
+    /// total, for tests that need the floor to bite.
+    pub(in crate::app) fn volume_with_free(available_bytes: u64) -> DiskSpace {
+        DiskSpace {
+            available_bytes,
+            ..AMPLE_TEST_VOLUME
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn probes_the_volume_containing_a_real_path() {
+        let _real = testing::use_real_volume();
         let tempdir = tempfile::tempdir().expect("tempdir");
         let space = DiskSpace::probe(tempdir.path()).expect("probe");
         // Nothing about the host is assertable beyond internal consistency:
@@ -87,8 +177,30 @@ mod tests {
 
     #[test]
     fn probe_fails_loudly_for_a_path_that_does_not_exist() {
+        let _real = testing::use_real_volume();
         let err = DiskSpace::probe(Path::new("/definitely/not/a/real/mount/point-cube")).unwrap_err();
         assert!(matches!(err, CubeError::Io(_)), "expected an I/O error, got {err:?}");
+    }
+
+    #[test]
+    fn tests_read_an_injected_volume_not_the_host_one() {
+        // The point of the seam: a test that says nothing about disk gets a
+        // reading no host can perturb, and one that cares can pin its own for
+        // exactly as long as it needs it.
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            DiskSpace::probe(tempdir.path()).expect("probe"),
+            testing::AMPLE_TEST_VOLUME,
+        );
+        {
+            let _low = testing::with_reading(testing::volume_with_free(1024));
+            assert_eq!(DiskSpace::probe(tempdir.path()).expect("probe").available_bytes, 1024);
+        }
+        assert_eq!(
+            DiskSpace::probe(tempdir.path()).expect("probe"),
+            testing::AMPLE_TEST_VOLUME,
+            "the guard restores what it replaced",
+        );
     }
 
     #[test]

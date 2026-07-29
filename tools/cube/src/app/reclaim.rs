@@ -355,7 +355,8 @@ pub(super) fn compact_free_workspaces(
 /// reach its mark, which is correct: the mark is a disk target, not a promise
 /// that outranks somebody's afternoon.
 ///
-/// Deciding runs unlocked and removing runs under the repo lock — the split is
+/// Only dropping the registry row runs under the repo lock; both deciding
+/// (which fetches) and unlinking (which is slow) run without it. The split is
 /// deliberate and explained at the acquisition site in `trim_one_repo`.
 pub(super) fn trim_free_workspaces_to_mark(
     runner: &dyn CommandRunner,
@@ -421,7 +422,8 @@ fn trim_one_repo(
     if candidates.len() <= mark {
         return report;
     }
-    let surplus = candidates.len() - mark;
+    let free_on_disk = candidates.len();
+    let surplus = free_on_disk - mark;
 
     let mut skipped_holding_work = 0usize;
     let mut probe_errors = 0usize;
@@ -475,12 +477,22 @@ fn trim_one_repo(
         // Everything above answered "is this workspace removable?" without the
         // repo lock, on purpose: the probe fetches, and holding the lock
         // across a network round trip is what once wedged every lease and
-        // release for a repo. The *removal* is a different question, and it
+        // release for a repo. Claiming the row is a different question, and it
         // takes the lock — the lease path claims a workspace under this same
-        // lock, so holding it makes the re-check below and the removal one
+        // lock, so holding it makes the re-check and the row's removal one
         // indivisible step. Without it the fetch above sits inside a
         // check-to-delete window minutes wide, and a lease that claimed this
         // row during it would have its directory deleted underneath it.
+        //
+        // The critical section is exactly those two sqlite statements, and the
+        // unlink is deliberately outside it. `RepoLock::acquire` is a blocking
+        // flock with no timeout and no way for the pass deadline to preempt a
+        // waiter, so every second spent holding it is a second every lease and
+        // release for this repo can spend blocked — and `remove_dir_all` on a
+        // ~600 MB checkout plus a `jj workspace forget` subprocess is seconds,
+        // not microseconds. Nothing after the row is gone needs the lock
+        // anyway: no lease can select a workspace that is no longer in the
+        // registry, so there is nobody left to race.
         let lock_path = match repo_lock_path(repo, database_path) {
             Ok(path) => path,
             Err(e) => {
@@ -488,26 +500,36 @@ fn trim_one_repo(
                 break;
             }
         };
-        let _lock = match RepoLock::acquire(&lock_path) {
-            Ok(lock) => lock,
-            Err(e) => {
-                eprintln!("cube: pool trim: {repo}: cannot take the repo lock, stopping: {e}");
-                break;
+        let forgotten = {
+            let _lock = match RepoLock::acquire(&lock_path) {
+                Ok(lock) => lock,
+                Err(e) => {
+                    eprintln!("cube: pool trim: {repo}: cannot take the repo lock, stopping: {e}");
+                    break;
+                }
+            };
+            // Re-read under the lock. The probe took a fetch to answer, which
+            // is ample time for a lease to have claimed this row since the
+            // check at the top of the iteration.
+            if !still_free(store, record) {
+                continue;
             }
+            store.forget_workspace(&record.repo, &record.workspace_id)
         };
-        // Re-read under the lock. The probe took a fetch to answer, which is
-        // ample time for a lease to have claimed this row since the check at
-        // the top of the iteration.
-        if !still_free(store, record) {
+        if let Err(e) = forgotten {
+            eprintln!(
+                "cube: pool trim: {}: could not drop the registry row, leaving it alone: {e}",
+                record.workspace_id,
+            );
             continue;
         }
 
         let context = TrimContext {
             now_epoch_s,
             mark,
-            free_before: free.len(),
+            free_on_disk,
         };
-        match remove_workspace_from_disk(runner, store, database_path, repo_record, record, context, deadline) {
+        match remove_workspace_from_disk(runner, database_path, repo_record, record, context, deadline) {
             Ok(freed) => {
                 report.workspaces_removed += 1;
                 report.available_delta_bytes = report.available_delta_bytes.saturating_add(freed);
@@ -520,7 +542,15 @@ fn trim_one_repo(
         database_path,
         "pool.trim",
         repo = repo,
-        free_before = free.len(),
+        // `free_before` is the set `surplus` was computed over — free rows
+        // whose directory is actually on disk — so `free_before - mark ==
+        // surplus` always reads true. `free_rows` is the raw row count; the
+        // two differ exactly when phantom rows exist (a directory deleted out
+        // from under cube that reconcile has not forgotten yet), and seeing
+        // both is how an operator tells that apart from an under-removing
+        // trim.
+        free_before = free_on_disk,
+        free_rows = free.len(),
         mark = mark,
         surplus = surplus,
         removed = report.workspaces_removed,
@@ -534,22 +564,24 @@ fn trim_one_repo(
 /// The trim's view of the repo at the moment one removal is decided, carried
 /// alongside the workspace being removed so the audit line can say *why* it
 /// happened — "one of 4 free against a mark of 2" — rather than just that it
-/// did.
+/// did. `free_on_disk` is the count the surplus was computed over, so the
+/// subtraction the line invites a reader to do actually works out.
 #[derive(Debug, Clone, Copy)]
 struct TrimContext {
     now_epoch_s: i64,
     mark: usize,
-    free_before: usize,
+    free_on_disk: usize,
 }
 
-/// Delete a verified-empty-of-work free workspace and drop every trace of it.
-/// Called with the repo lock held.
+/// Delete a verified-empty-of-work free workspace whose registry row the
+/// caller has already dropped, and clear up everything else it left behind.
 ///
-/// Order matters, and the registry row goes first — the same order the
-/// operator-invoked `cube workspace remove` uses. Once the row is gone no
-/// lease can select the workspace, so the `rm -rf` that follows cannot race
-/// one; doing it the other way round would leave a live row pointing at a
-/// directory being unlinked. The row is also the recoverable half: the next
+/// Called with the repo lock **released**. Order is what makes that safe, and
+/// the registry row goes first — the same order the operator-invoked `cube
+/// workspace remove` uses. Once the row is gone no lease can select the
+/// workspace, so the `rm -rf` here cannot race one and needs no lock to
+/// exclude it; doing it the other way round would leave a live row pointing at
+/// a directory being unlinked. The row is also the recoverable half: the next
 /// lease rediscovers any directory still on disk and re-registers it, so a
 /// removal that dies between the two steps self-heals, while a lease handed a
 /// half-deleted checkout does not.
@@ -564,7 +596,6 @@ struct TrimContext {
 /// a failure leaves cosmetic cruft in the shared store, not a broken pool.
 fn remove_workspace_from_disk(
     runner: &dyn CommandRunner,
-    store: &Store,
     database_path: Option<&Path>,
     repo_record: &RepoRecord,
     record: &WorkspaceRecord,
@@ -572,7 +603,6 @@ fn remove_workspace_from_disk(
     deadline: Option<Instant>,
 ) -> Result<u64> {
     let before = DiskSpace::probe(&repo_record.workspace_root).ok();
-    store.forget_workspace(&record.repo, &record.workspace_id)?;
     fs::remove_dir_all(&record.workspace_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
         path: record.workspace_path.clone(),
         source,
@@ -622,7 +652,7 @@ fn remove_workspace_from_disk(
         "cube: pool trim: removed {} (idle {}s; {} free for {}, mark {}), reclaiming {}",
         record.workspace_id,
         idle_secs(record, context.now_epoch_s),
-        context.free_before,
+        context.free_on_disk,
         record.repo,
         context.mark,
         human_bytes(freed),
@@ -637,7 +667,7 @@ fn remove_workspace_from_disk(
         prior_holder = record.last_holder.as_deref(),
         prior_task = record.last_task.as_deref(),
         idle_secs = idle_secs(record, context.now_epoch_s),
-        free_before = context.free_before,
+        free_before = context.free_on_disk,
         mark = context.mark,
         available_delta_bytes = freed,
     );

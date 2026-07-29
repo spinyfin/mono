@@ -11,10 +11,12 @@ use super::support::{
     unpushed_probe_command, with_database_path,
 };
 
+use crate::app::disk::testing::{AMPLE_TEST_VOLUME, volume_with_free, with_reading};
+use crate::app::errors::CubeError;
 use crate::app::gc::{POOL_GC_LAST_AT_KEY, POOL_GC_STARTED_AT_KEY, POOL_GC_TRIM_PROGRESS_KEY, maybe_trigger_pool_gc};
 use crate::app::reclaim::{
-    compact_free_workspaces, has_free_workspace_surplus, is_safe_artifact_dir_name, relieve_disk_pressure,
-    trim_free_workspaces_to_mark,
+    assert_mint_headroom, compact_free_workspaces, has_free_workspace_surplus, is_safe_artifact_dir_name,
+    relieve_disk_pressure, trim_free_workspaces_to_mark,
 };
 use crate::metadata::{RepoRecord, WorkspaceCandidate};
 use crate::store::Store;
@@ -852,4 +854,47 @@ fn disk_pressure_compacts_before_the_lease_continues() {
     assert_eq!(pressure["repo"], "mono");
     assert_eq!(pressure["workspaces_compacted"], 1);
     assert_eq!(pressure["recovered"], false);
+}
+
+#[test]
+fn a_mint_is_allowed_on_a_volume_above_its_floor() {
+    // The ordinary case, and the one that must not depend on the host: the
+    // default floor is `max(20 GiB, 2% of total)`, which the injected volume
+    // clears with room to spare no matter how full the machine running the
+    // suite happens to be.
+    let _config = ConfigGuard::new("[pool]\n");
+    let _disk = with_reading(AMPLE_TEST_VOLUME);
+    let (tempdir, _database_path) = with_database_path();
+
+    assert_mint_headroom("mono", tempdir.path()).expect("an ample volume must not refuse a mint");
+}
+
+#[test]
+fn a_mint_is_refused_on_a_volume_below_its_floor() {
+    // 7.4 GiB free against the default floor — the reading taken from a CI
+    // agent that had filled up. Injected rather than provoked, because the
+    // refusal is the behaviour under test and "run the suite on a full disk"
+    // is not a test.
+    let _config = ConfigGuard::new("[pool]\n");
+    let _disk = with_reading(volume_with_free(7_945_670_000));
+    let (tempdir, _database_path) = with_database_path();
+
+    let err = assert_mint_headroom("mono", tempdir.path()).expect_err("a volume below its floor must refuse a mint");
+    let CubeError::InsufficientDiskSpace {
+        repo,
+        available,
+        floor,
+        shortfall,
+        ..
+    } = err
+    else {
+        panic!("expected InsufficientDiskSpace, got {err:?}");
+    };
+    assert_eq!(repo, "mono");
+    assert_eq!(available, "7.4 GiB");
+    assert_eq!(
+        floor, "20.5 GiB",
+        "the floor is max(20 GiB, 2% of total), and 2% of 1 TiB just edges it out",
+    );
+    assert_eq!(shortfall, "13.1 GiB");
 }
