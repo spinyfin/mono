@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 mod home;
 mod hooks;
 mod model_menu;
+mod progress;
 
 pub use home::{
     COMPAT_SURFACES, COMPAT_VENDORS, GROK_AUTH_SOURCE_ENV, GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV,
@@ -32,12 +33,13 @@ pub use home::{
 };
 
 use home::{assert_grok_home_safe_to_delete, provision_grok_home, read_session_id, read_workspace_path_stamp};
+use progress::GrokProgressSession;
 
 use super::{
     AgentDriver, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective, HookWiringDestination,
     ModelMenu, PermissionArtifacts, PermissionInput, ProgressFidelity, ProgressIngress, ProgressObservationConfig,
-    ProgressObservationWiring, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd,
-    WorkerErrorClass,
+    ProgressObservationWiring, ProgressSessionNormalizer, SpawnPlan, SpawnRequest, ToolUseInterceptionConfig,
+    ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
 };
 
 // ---------------------------------------------------------------------------
@@ -400,14 +402,34 @@ impl AgentDriver for GrokDriver {
         })
     }
 
-    fn normalize_progress_event(&self, _raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        // Follow-on: T-10 (Grok camelCase / snake_case event dialect).
-        unimplemented!("GrokDriver::normalize_progress_event — not yet implemented")
+    fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
+        // Stateless compatibility path for direct callers — mirrors
+        // CodexDriver's own comment: this driver's hook payload is fully
+        // self-describing per invocation, so a fresh, stateless
+        // GrokProgressSession is equivalent to a durable one (see that
+        // type's doc comment in `grok/progress.rs`).
+        GrokProgressSession::new().normalize_progress_event(raw)
     }
 
-    fn turn_boundary(&self, _event: &WorkerEvent) -> Option<TurnEnd> {
-        // Honest "no boundary yet" until progress normalise lands (T-10 / T-12).
-        None
+    fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
+        // Design G-7: Grok's `Stop` hook maps directly onto
+        // `WorkerEvent::Stop`, structurally identical to Claude's —
+        // `stopHookActive` canonicalises to `stop_hook_active`, i.e.
+        // `TurnEnd::continuation`. Recovering a turn boundary for an
+        // Esc-interrupted turn (which skips the `Stop` hook entirely) is a
+        // separate concern (design T-12), not this event mapping.
+        match event {
+            WorkerEvent::Stop {
+                session_id,
+                stop_hook_active,
+                stop_reason,
+            } => Some(TurnEnd {
+                session_id: session_id.clone(),
+                reason: *stop_reason,
+                continuation: *stop_hook_active,
+            }),
+            _ => None,
+        }
     }
 
     fn tool_use_interception_wiring(&self, _config: &ToolUseInterceptionConfig) -> ToolUseInterceptionWiring {
