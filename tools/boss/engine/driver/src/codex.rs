@@ -248,22 +248,41 @@ pub fn codex_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
 
 /// Sandbox mode for Codex `exec --sandbox` from Boss's abstract worker kind.
 ///
-/// Reviewer is OS-enforced read-only; every other kind uses workspace-write
-/// (structural Boss data-dir fence). Single source of truth for
+/// Reviewer is always OS-enforced read-only, regardless of `sandbox_enforced`
+/// — it never runs build gates, and `materialize_guards` wires no reviewer
+/// denylist for Codex, so loosening it would drop that protection entirely.
+///
+/// Every other kind is gated by the `codex_sandbox_enforced` feature flag
+/// (default off): Codex's seatbelt template hardcodes a mach-service
+/// allowlist that excludes LaunchServices, so `xcode-locator` fails under
+/// `workspace-write` and every bazel build using `apple_support`'s crosstool
+/// breaks with it — see `tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md`.
+/// With the flag off, Standard/Triage/AnswerAgent get `danger-full-access`,
+/// the same no-OS-sandbox posture the Claude driver has always run workers
+/// at (`claude.rs`'s `--permission-mode auto`); the advisory
+/// `PATH_GUARD_SCRIPT` PreToolUse hook remains the Boss-data-dir fence
+/// either way. Single source of truth for
 /// [`CodexDriver::write_permission_config`]'s `extra_args` — the spawn plan's
 /// default is overridden when pane_spawn applies those args.
-pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind) -> &'static str {
+pub fn codex_sandbox_for_worker_kind(worker_kind: WorkerKind, sandbox_enforced: bool) -> &'static str {
     match worker_kind {
         WorkerKind::Reviewer => "read-only",
-        // Standard / Triage / AnswerAgent: workspace-write is the
-        // structural Boss-data-dir fence (design execution shape).
-        WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => "workspace-write",
+        WorkerKind::Standard | WorkerKind::Triage | WorkerKind::AnswerAgent => {
+            if sandbox_enforced {
+                "workspace-write"
+            } else {
+                "danger-full-access"
+            }
+        }
     }
 }
 
 /// CLI `extra_args` that encode sandbox policy for the spawn flow.
-pub fn codex_sandbox_extra_args(worker_kind: WorkerKind) -> Vec<String> {
-    vec!["--sandbox".into(), codex_sandbox_for_worker_kind(worker_kind).into()]
+pub fn codex_sandbox_extra_args(worker_kind: WorkerKind, sandbox_enforced: bool) -> Vec<String> {
+    vec![
+        "--sandbox".into(),
+        codex_sandbox_for_worker_kind(worker_kind, sandbox_enforced).into(),
+    ]
 }
 
 /// Reclaim a Boss-owned per-run `CODEX_HOME` after retention policy says it
@@ -705,10 +724,13 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
         CODEX_DESCRIPTOR.config_dir, CODEX_DESCRIPTOR.initial_prompt_filename,
     );
 
-    // Default sandbox is workspace-write. Permission policy may replace it
-    // via [`PermissionArtifacts::extra_args`] (`--sandbox read-only` for
-    // Reviewer) applied by the spawn flow — do not hardcode a second source
-    // of truth here without also applying extra_args.
+    // Baked-in fallback sandbox is workspace-write, but permission policy
+    // always replaces it via [`PermissionArtifacts::extra_args`] (see
+    // `codex_sandbox_for_worker_kind`: `--sandbox read-only` for Reviewer,
+    // `--sandbox danger-full-access` for every other kind unless the
+    // `codex_sandbox_enforced` feature flag is on, in which case
+    // `workspace-write`) applied by the spawn flow — do not hardcode a
+    // second source of truth here without also applying extra_args.
     let mut cmd = String::from("codex exec --json --strict-config --skip-git-repo-check --sandbox workspace-write");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
@@ -1269,7 +1291,7 @@ impl AgentDriver for CodexDriver {
         // stays on the spawn plan's base command (required flag contract).
         Ok(PermissionArtifacts {
             config_files: vec![codex_home.join("config.toml")],
-            extra_args: codex_sandbox_extra_args(input.worker_kind),
+            extra_args: codex_sandbox_extra_args(input.worker_kind, input.codex_sandbox_enforced),
             env: vec![("CODEX_HOME".into(), codex_home.display().to_string())],
         })
     }
@@ -2274,12 +2296,12 @@ else:
 
     #[test]
     fn reviewer_sandbox_extra_args_are_read_only() {
-        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer), "read-only");
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer, false), "read-only");
+        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Reviewer, true), "read-only");
         assert_eq!(
-            codex_sandbox_extra_args(WorkerKind::Reviewer),
+            codex_sandbox_extra_args(WorkerKind::Reviewer, false),
             vec!["--sandbox".to_owned(), "read-only".to_owned()]
         );
-        assert_eq!(codex_sandbox_for_worker_kind(WorkerKind::Standard), "workspace-write");
         // Final command after permission merge must prefer reviewer read-only
         // over the spawn-plan default workspace-write.
         let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-review-sandbox"));
@@ -2288,7 +2310,8 @@ else:
             "spawn default is workspace-write: {}",
             plan.command
         );
-        let merged = crate::apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer));
+        let merged =
+            crate::apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
         assert!(
             merged.contains("--sandbox") && merged.contains("read-only"),
             "Reviewer must get --sandbox read-only after extra_args apply: {merged}"
@@ -2296,6 +2319,38 @@ else:
         assert!(
             !merged.contains("workspace-write"),
             "default sandbox must be replaced, not duplicated: {merged}"
+        );
+    }
+
+    #[test]
+    fn standard_worker_sandbox_defaults_to_danger_full_access() {
+        // codex_sandbox_enforced=false (the feature-flag default): Standard,
+        // Triage, and AnswerAgent all get danger-full-access, matching the
+        // Claude driver's no-OS-sandbox posture.
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::Standard, false),
+            "danger-full-access"
+        );
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::Triage, false),
+            "danger-full-access"
+        );
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::AnswerAgent, false),
+            "danger-full-access"
+        );
+        // codex_sandbox_enforced=true restores the OS-enforced fence.
+        assert_eq!(
+            codex_sandbox_for_worker_kind(WorkerKind::Standard, true),
+            "workspace-write"
+        );
+        assert_eq!(
+            codex_sandbox_extra_args(WorkerKind::Standard, true),
+            vec!["--sandbox".to_owned(), "workspace-write".to_owned()]
+        );
+        assert_eq!(
+            codex_sandbox_extra_args(WorkerKind::Standard, false),
+            vec!["--sandbox".to_owned(), "danger-full-access".to_owned()]
         );
     }
 

@@ -94,7 +94,7 @@ mod apply_permission_extra_args_tests {
             "Codex spawn default includes workspace-write: {}",
             plan.command
         );
-        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer));
+        let merged = apply_permission_extra_args(&plan.command, &codex_sandbox_extra_args(WorkerKind::Reviewer, false));
         assert!(
             merged.contains("read-only"),
             "Reviewer must get --sandbox read-only: {merged}"
@@ -570,6 +570,7 @@ impl ExecutionRunner for PaneSpawnRunner {
             is_remote: false,
             path_guard_script: path_guard_script.clone(),
             checkleft_guard_script: checkleft_guard_script.clone(),
+            codex_sandbox_enforced: self.feature_flags.is_enabled("codex_sandbox_enforced"),
         };
         let permission_artifacts = driver
             .write_permission_config(&permission_input, &settings_dir)

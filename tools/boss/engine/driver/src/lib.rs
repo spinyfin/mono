@@ -84,6 +84,15 @@ pub struct PermissionInput {
     /// Absolute path to the materialised `boss-checkleft-push-guard.py`
     /// script, when the local checkleft push guard applies. `None` for remote.
     pub checkleft_guard_script: Option<PathBuf>,
+    /// Codex-only: mirrors the `codex_sandbox_enforced` feature flag. When
+    /// `false` (the flag's default), Codex's Standard/Triage/AnswerAgent
+    /// workers get `--sandbox danger-full-access` instead of the OS-enforced
+    /// `workspace-write` seatbelt, matching the Claude driver's no-OS-sandbox
+    /// posture (see `codex::codex_sandbox_for_worker_kind`). Reviewer always
+    /// stays `--sandbox read-only` regardless of this value. Ignored by every
+    /// other driver.
+    #[builder(default)]
+    pub codex_sandbox_enforced: bool,
 }
 
 /// What a driver's [`Capability::PermissionPolicy`] rendering produces,

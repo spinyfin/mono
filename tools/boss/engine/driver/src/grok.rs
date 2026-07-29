@@ -1094,6 +1094,7 @@ mod tests {
             is_remote: false,
             path_guard_script: None,
             checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
         };
         let err = GrokDriver::default()
             .write_permission_config(&input, tmp.path())
