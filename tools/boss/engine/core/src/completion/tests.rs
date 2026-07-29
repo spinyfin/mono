@@ -3,6 +3,7 @@
 //! stub implementations, and helper constructors; the individual test
 //! functions live in the `t01`..`tNN` submodules.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -100,34 +101,69 @@ impl PrDetector for StubPrDetector {
 /// Configurable branch verifier for tests. Returns a fixed
 /// `headRefName` (or error), a fixed `headRefOid` (or error), and a
 /// fixed diff line count (or error) without shelling out to `gh`.
+///
+/// Constructed via [`Self::ok`] / [`Self::err`], which delegate to the
+/// derived builder — every field but `result` carries a `#[builder(default
+/// = ...)]` stand-in, so both constructors only ever set `result` and the
+/// builder earns its keep instead of being redundant with two hand-written
+/// struct literals.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
 struct StubBranchVerifier {
     result: Result<String, String>,
+    /// `headRefOid` returned by `fetch_pr_head_oid`. Defaults to a stable
+    /// stand-in so tests that don't touch the SHA-delta path don't need to
+    /// wire one explicitly. Tests that exercise the gate call
+    /// [`StubBranchVerifier::set_head_oid`] to override.
+    #[builder(default = Mutex::new(Ok("oid_unknown".to_owned())))]
     head_oid_result: Mutex<Result<String, String>>,
     /// Line count returned by `fetch_diff_line_count`. Defaults to
     /// `999` (non-trivial) so tests that don't exercise the skip gate
     /// never accidentally trigger a skip.
+    #[builder(default = Mutex::new(Ok(999)))]
     diff_line_count_result: Mutex<Result<u64, String>>,
+    /// Body returned by `fetch_pr_title_and_body`. Defaults to empty —
+    /// tests that care override via `set_body`.
+    #[builder(default = Mutex::new(Ok(String::new())))]
     body_result: Mutex<Result<String, String>>,
-    /// Title returned by `fetch_pr_title`. Defaults to empty, same as
-    /// `body_result` — tests that care override via `set_title`.
+    /// Title returned by `fetch_pr_title_and_body`. Defaults to empty,
+    /// same as `body_result` — tests that care override via `set_title`.
+    #[builder(default = Mutex::new(Ok(String::new())))]
     title_result: Mutex<Result<String, String>>,
+    /// `baseRefName` returned by `fetch_pr_base_ref`. Defaults to a fixed
+    /// stand-in; tests that exercise the pure-rebase gate's CI-remediation
+    /// arm (no base branch on the attempt row) override via
+    /// [`StubBranchVerifier::set_base_ref`].
+    #[builder(default = Mutex::new(Ok("base_unknown".to_owned())))]
+    base_ref_result: Mutex<Result<String, String>>,
+    /// Signatures returned by `fetch_diff_signature`, keyed by the exact
+    /// `(base, head)` argument pair. A pair with no configured entry
+    /// returns an error identifying the unexpected pair — so a
+    /// pure-rebase gate test that gets the base wrong (the AI #1
+    /// regression this guards) fails loudly with "don't skip" instead of
+    /// silently matching by `head` alone.
+    #[builder(default = Mutex::new(HashMap::new()))]
+    diff_signature_results: Mutex<HashMap<(String, String), Result<String, String>>>,
+    /// Every `(base, head)` pair `fetch_diff_signature` was actually
+    /// called with, in call order. Lets a test assert the exact pairs the
+    /// gate requested, not just the resulting skip/no-skip outcome.
+    #[builder(default = Mutex::new(Vec::new()))]
+    diff_signature_calls: Mutex<Vec<(String, String)>>,
 }
 
 impl StubBranchVerifier {
-    /// Verifier that always reports the given branch name. The
-    /// `headRefOid` defaults to the literal string `"oid_unknown"`
-    /// so tests that don't touch the SHA-delta path get a stable
-    /// stand-in without having to wire one explicitly. Tests that
-    /// exercise the gate call [`Self::with_head_oid`] to override.
-    /// The PR body defaults to empty.
+    /// Verifier that always reports the given branch name for
+    /// `fetch_pr_head_ref`; every other field takes its builder default.
     fn ok(branch: &str) -> Arc<Self> {
-        Arc::new(Self {
-            result: Ok(branch.to_owned()),
-            head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
-            diff_line_count_result: Mutex::new(Ok(999)),
-            body_result: Mutex::new(Ok(String::new())),
-            title_result: Mutex::new(Ok(String::new())),
-        })
+        Arc::new(Self::builder().result(Ok(branch.to_owned())).build())
+    }
+
+    /// Verifier that always returns a transient API error from
+    /// `fetch_pr_head_ref`. Used to test that a branch-verification
+    /// failure does NOT discard the staged URL (it is preserved for
+    /// the next sweep to retry).
+    fn err(message: &str) -> Arc<Self> {
+        Arc::new(Self::builder().result(Err(message.to_owned())).build())
     }
 
     /// Override the `headRefOid` returned by `fetch_pr_head_oid`.
@@ -151,18 +187,27 @@ impl StubBranchVerifier {
         *self.body_result.lock().await = body;
     }
 
-    /// Verifier that always returns a transient API error from
-    /// `fetch_pr_head_ref`. Used to test that a branch-verification
-    /// failure does NOT discard the staged URL (it is preserved for
-    /// the next sweep to retry).
-    fn err(message: &str) -> Arc<Self> {
-        Arc::new(Self {
-            result: Err(message.to_owned()),
-            head_oid_result: Mutex::new(Ok("oid_unknown".to_owned())),
-            diff_line_count_result: Mutex::new(Ok(999)),
-            body_result: Mutex::new(Ok(String::new())),
-            title_result: Mutex::new(Ok(String::new())),
-        })
+    /// Override the `baseRefName` returned by `fetch_pr_base_ref`.
+    async fn set_base_ref(&self, base_ref: Result<String, String>) {
+        *self.base_ref_result.lock().await = base_ref;
+    }
+
+    /// Configure the diff signature `fetch_diff_signature` returns when
+    /// called with the exact `(base, head)` pair. Pure-rebase gate tests
+    /// set the same signature for `(base_ref, pre_head)` and
+    /// `(base_ref, post_head)` to simulate a clean rebase, or different
+    /// signatures to simulate one that also changed content.
+    async fn set_diff_signature(&self, base: &str, head: &str, sig: Result<String, String>) {
+        self.diff_signature_results
+            .lock()
+            .await
+            .insert((base.to_owned(), head.to_owned()), sig);
+    }
+
+    /// Every `(base, head)` pair `fetch_diff_signature` was called with,
+    /// in call order.
+    async fn diff_signature_calls_snapshot(&self) -> Vec<(String, String)> {
+        self.diff_signature_calls.lock().await.clone()
     }
 }
 
@@ -188,6 +233,27 @@ impl BranchVerifier for StubBranchVerifier {
         match &*guard {
             Ok(count) => Ok(*count),
             Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_pr_base_ref(&self, _repo_slug: &str, _pr_number: u64) -> Result<String> {
+        let guard = self.base_ref_result.lock().await;
+        match &*guard {
+            Ok(base) => Ok(base.clone()),
+            Err(msg) => Err(anyhow::anyhow!(msg.clone())),
+        }
+    }
+
+    async fn fetch_diff_signature(&self, _repo_slug: &str, base: &str, head: &str) -> Result<String> {
+        self.diff_signature_calls
+            .lock()
+            .await
+            .push((base.to_owned(), head.to_owned()));
+        let guard = self.diff_signature_results.lock().await;
+        match guard.get(&(base.to_owned(), head.to_owned())) {
+            Some(Ok(sig)) => Ok(sig.clone()),
+            Some(Err(msg)) => Err(anyhow::anyhow!(msg.clone())),
+            None => Err(anyhow::anyhow!("unexpected base {base} for head {head}")),
         }
     }
 
@@ -910,6 +976,132 @@ fn revision_fixture(
     // Snapshot the parent PR's head SHA as `on_execution_started` does.
     db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
     (dir, db, product.id, revision.id, execution.id)
+}
+
+/// Build a revision fixture (mirrors [`revision_fixture`]) whose revision
+/// task was created via a conflict-resolution or CI-fix attempt, with a
+/// matching `conflict_resolutions` / `ci_remediations` row recording
+/// `head_sha_before` (and, for a conflict resolution, `base_sha_at_trigger`)
+/// — the state [`WorkerCompletionHandler::check_pure_rebase_skip`] reads.
+/// The attempt row's `revision_task_id` is stamped to the created
+/// revision's id, mirroring the production producer path — the gate
+/// selects its attempt row by this link, not merely "latest for the root".
+///
+/// `created_via` selects the attempt table: a value starting with
+/// `CREATED_VIA_MERGE_CONFLICT_PREFIX` inserts a `conflict_resolutions` row
+/// (with `pre_base` recorded, if given, and `base_branch` fixed to
+/// `"main"`); `CREATED_VIA_CI_FIX_PREFIX` inserts a `ci_remediations` row
+/// (which never records a base — `pre_base` is ignored for this case, and
+/// the gate resolves the base branch live via `fetch_pr_base_ref`).
+fn pure_rebase_revision_fixture(
+    workspace_path: &Path,
+    created_via: &str,
+    pr_number: i64,
+    head_before: &str,
+    pre_base: Option<&str>,
+) -> (TempDir, Arc<WorkDb>, String, String, String, String) {
+    use crate::work::{CiRemediationInsertInput, ConflictResolutionInsertInput, FakePrStateChecker, PrOpenState};
+    use boss_protocol::CreateRevisionInput;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(path).unwrap());
+    let product = create_test_product_named(&db, "Boss-pure-rebase-test");
+    let parent_pr_url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+    let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![parent.id, parent_pr_url],
+        )
+        .unwrap();
+    }
+
+    let is_conflict = created_via.starts_with(CREATED_VIA_MERGE_CONFLICT_PREFIX);
+    let attempt_id = if is_conflict {
+        db.insert_conflict_resolution(ConflictResolutionInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: parent.id.clone(),
+            pr_url: parent_pr_url.clone(),
+            pr_number,
+            head_branch: "boss/exec_parent".to_owned(),
+            base_branch: "main".to_owned(),
+            base_sha_at_trigger: pre_base.map(str::to_owned),
+            head_sha_before: Some(head_before.to_owned()),
+        })
+        .unwrap()
+        .expect("conflict_resolution insert must not be churn-guarded in a fresh fixture")
+        .id
+    } else if created_via.starts_with(CREATED_VIA_CI_FIX_PREFIX) {
+        db.insert_ci_remediation(CiRemediationInsertInput {
+            product_id: product.id.clone(),
+            work_item_id: parent.id.clone(),
+            pr_url: parent_pr_url.clone(),
+            pr_number,
+            head_branch: "boss/exec_parent".to_owned(),
+            head_sha_at_trigger: head_before.to_owned(),
+            attempt_kind: "fix".to_owned(),
+            consumes_budget: 1,
+            failed_checks: "[]".to_owned(),
+            failure_kind: "pr_branch_ci".to_owned(),
+            before_commit_sha: None,
+        })
+        .unwrap()
+        .expect("ci_remediation insert must not be deduped in a fresh fixture")
+        .id
+    } else {
+        panic!("pure_rebase_revision_fixture: created_via must carry a conflict/CI-fix prefix, got {created_via:?}");
+    };
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Rebase onto latest main")
+                .created_via(created_via)
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    // Mirrors the production path (`conflict_watch::on_conflict_detected` /
+    // the CI-fix equivalent): the producer stamps the soft-FK from the
+    // attempt row to the `kind=revision` task it just spawned, immediately
+    // after `create_revision` succeeds. `check_pure_rebase_skip` selects
+    // its attempt row by this link.
+    if is_conflict {
+        db.set_conflict_resolution_revision_task_id(&attempt_id, &revision.id)
+            .unwrap();
+    } else {
+        db.set_ci_remediation_revision_task_id(&attempt_id, &revision.id)
+            .unwrap();
+    }
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .prefer_is_soft(true)
+                .pr_url(parent_pr_url.clone())
+                .build(),
+        )
+        .unwrap();
+    let (execution, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            workspace_path.to_str().unwrap(),
+        )
+        .unwrap();
+    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+    db.set_execution_pr_head_before(&execution.id, head_before).unwrap();
+    (dir, db, product.id, parent.id, revision.id, execution.id)
 }
 
 /// Configurable [`MergeProbe`] returning a fixed lifecycle state for

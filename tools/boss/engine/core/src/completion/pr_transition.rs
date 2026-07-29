@@ -71,9 +71,29 @@ impl WorkerCompletionHandler {
                     // No-op / trivial-diff skip gate. Runs before
                     // the cycle-bound check so a pure rebase doesn't consume a
                     // cycle slot or surface an attention item.
-                    let noop_skip_reason = self
-                        .check_noop_skip(&pr_url, producing, review_cycle, last_reviewed_sha.as_deref())
-                        .await;
+                    //
+                    // `check_pure_rebase_skip` runs first: it is keyed off the
+                    // conflict/CI-fix attempt row rather than
+                    // `review_cycle`/`last_reviewed_sha`, so it also catches a
+                    // pure rebase that lands before the PR's very first review
+                    // — a case `check_noop_skip`'s rule 1 always treats as
+                    // "never skip" (right for genuinely new content, wrong for
+                    // a rebase that contributes none). It is a no-op for any
+                    // producer that isn't a conflict-resolution / CI-fix push.
+                    let pure_rebase_gate = self.check_pure_rebase_skip(&pr_url, producing, &cycle_root_id).await;
+                    let noop_skip_reason = match pure_rebase_gate.skip_reason {
+                        Some(reason) => Some(reason),
+                        None => {
+                            self.check_noop_skip(
+                                &pr_url,
+                                producing,
+                                review_cycle,
+                                last_reviewed_sha.as_deref(),
+                                pure_rebase_gate.post_head,
+                            )
+                            .await
+                        }
+                    };
 
                     if let Some(skip_reason) = noop_skip_reason {
                         tracing::info!(

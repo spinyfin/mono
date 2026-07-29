@@ -546,6 +546,28 @@ pub trait BranchVerifier: Send + Sync {
     /// trivially-small pushes that don't warrant a fresh reviewer pass.
     async fn fetch_diff_line_count(&self, repo_slug: &str, base: &str, head: &str) -> Result<u64>;
 
+    /// Returns the `baseRefName` (target-branch ref name) for PR
+    /// `pr_number` in `repo_slug`. Used by the conflict/CI-fix pure-rebase
+    /// skip gate to resolve the live base ref against which both the
+    /// pre- and post-resolution diff signatures are three-dot compared —
+    /// `ci_remediations` rows never stamp a base branch (a CI failure isn't
+    /// necessarily caused by a base move), so it's fetched fresh here
+    /// rather than read off the attempt row.
+    async fn fetch_pr_base_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String>;
+
+    /// Returns a canonical, comparable signature of the file-level diff
+    /// between `base` and `head` in `repo_slug`: every changed file's name,
+    /// status, and unified patch text (with each hunk's `@@ -a,b +c,d @@`
+    /// line-position range normalized away — see
+    /// `normalize_patch_hunk_headers` — so a hunk that shifted position
+    /// because an unrelated upstream commit edited the same file above it
+    /// doesn't register as a content change), sorted by filename. Two
+    /// calls whose underlying content is identical return byte-identical
+    /// strings regardless of the commit SHAs involved — used by the
+    /// pure-rebase skip gate to tell "content unchanged, only the base
+    /// moved" from a resolution that introduced real content.
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String>;
+
     /// Returns `(title, body)` of PR `pr_number` in `repo_slug` in a single
     /// `gh pr view` call. The body is used by the metadata-only CI-fix
     /// finalize gate (issue #1252) to detect an operator-visible
@@ -583,6 +605,14 @@ impl BranchVerifier for CommandBranchVerifier {
         fetch_diff_line_count_cmd(repo_slug, base, head).await
     }
 
+    async fn fetch_pr_base_ref(&self, repo_slug: &str, pr_number: u64) -> Result<String> {
+        git_utils::gh_cli::fetch_pr_base_ref(repo_slug, pr_number).await
+    }
+
+    async fn fetch_diff_signature(&self, repo_slug: &str, base: &str, head: &str) -> Result<String> {
+        fetch_diff_signature_cmd(repo_slug, base, head).await
+    }
+
     async fn fetch_pr_title_and_body(&self, repo_slug: &str, pr_number: u64) -> Result<(String, String)> {
         fetch_pr_title_and_body_cmd(repo_slug, pr_number).await
     }
@@ -608,6 +638,69 @@ async fn fetch_diff_line_count_cmd(repo_slug: &str, base: &str, head: &str) -> R
         .parse()
         .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
     Ok(total)
+}
+
+/// One entry from GitHub's compare `.files[]` array, carrying enough to
+/// build a content-comparable diff signature.
+#[derive(serde::Deserialize)]
+struct DiffSignatureFile {
+    filename: String,
+    status: String,
+    #[serde(default)]
+    patch: Option<String>,
+}
+
+/// Shell out to `gh api repos/<repo_slug>/compare/<base>...<head>` and
+/// return a canonical `(filename, status, patch)` signature of every
+/// changed file, sorted by filename and joined with control characters that
+/// cannot appear in a filename or unified-diff patch — so two signatures
+/// are byte-comparable regardless of the order GitHub returned files in.
+/// Used by the pure-rebase skip gate: identical signatures at two different
+/// `head` values (same `base`) mean the content introduced is identical,
+/// i.e. nothing changed but the base.
+async fn fetch_diff_signature_cmd(repo_slug: &str, base: &str, head: &str) -> Result<String> {
+    let trimmed = gh_scope(
+        callers::COMPLETION,
+        gh_compare_jq(repo_slug, base, head, "[.files[] | {filename, status, patch}]"),
+    )
+    .await?;
+    let endpoint = format!("repos/{repo_slug}/compare/{base}...{head}");
+    let mut files: Vec<DiffSignatureFile> = serde_json::from_str(&trimmed)
+        .with_context(|| format!("unexpected output from `gh api {endpoint}`: {trimmed:?}"))?;
+    files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    Ok(files
+        .iter()
+        .map(|f| {
+            let patch = f.patch.as_deref().map(normalize_patch_hunk_headers).unwrap_or_default();
+            format!("{}\u{1f}{}\u{1f}{}", f.filename, f.status, patch)
+        })
+        .collect::<Vec<_>>()
+        .join("\u{1e}"))
+}
+
+/// Strip the numeric line-position range out of every unified-diff hunk
+/// header (`@@ -a,b +c,d @@ optional-context`) in `patch`, leaving the
+/// `@@ ... @@ optional-context` marker and every context/added/removed
+/// body line untouched. Two patches whose authored content is identical
+/// but whose hunks landed at different line numbers — because an upstream
+/// commit picked up by a rebase edited the same file above the hunk —
+/// produce identical normalized output; a real content change still
+/// changes the body lines and so still changes the output. Used by
+/// [`fetch_diff_signature_cmd`] so the pure-rebase skip gate's diff
+/// signature is comparable across a base movement that shifted line
+/// numbers without touching the PR's own content.
+fn normalize_patch_hunk_headers(patch: &str) -> String {
+    patch
+        .lines()
+        .map(|line| match line.strip_prefix("@@ ") {
+            Some(rest) => match rest.find(" @@") {
+                Some(end) => format!("@@ ...{}", &rest[end..]),
+                None => line.to_owned(),
+            },
+            None => line.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Shell out to `gh pr view <pr_number> -R <repo_slug> --json title,body`

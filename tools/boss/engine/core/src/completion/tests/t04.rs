@@ -1344,6 +1344,446 @@ async fn noop_revision_push_does_not_enqueue_a_review() {
 }
 
 // -----------------------------------------------------------
+// Pure-rebase skip gate (`check_pure_rebase_skip`): a conflict-resolution
+// or CI-fix push whose file-level diff against the PR's target-branch ref
+// is byte-identical before and after the push -- i.e. nothing changed but
+// the base -- must not trigger a review. Both sides are three-dot compared
+// against the SAME live base ref (`cr.base_branch` for a conflict
+// resolution; fetched via `fetch_pr_base_ref` for a CI-fix, which never
+// stamps one), never against a fixed pre-rebase commit -- comparing
+// against a fixed point would pull in every upstream commit the rebase
+// crossed and make the predicate false for any base movement at all.
+// Deliberately independent of `review_cycle` / `last_reviewed_sha`, unlike
+// `check_noop_skip`, so it also covers a conflict/CI-fix that lands before
+// the PR's very first review.
+// -----------------------------------------------------------
+
+/// A conflict-resolution revision whose diff signature against the PR's
+/// base branch (`"main"`, per the fixture) is identical before and after
+/// the push (a clean rebase, no hand-authored content) must skip the
+/// reviewer entirely -- even though this is the PR's first-ever review
+/// pass (`review_cycle == 0`), which `check_noop_skip` alone would never
+/// skip. The skip must also leave a durable `[pr-review-skip]` audit line
+/// on the parent chore's description. Also asserts the gate requested
+/// exactly the `(base, head)` pairs `("main", pre_head)` /
+/// `("main", post_head)` -- the regression guard for comparing each head
+/// against a shared fixed point instead of the live base ref.
+#[tokio::test]
+async fn pure_rebase_skip_gate_skips_conflict_resolution_with_identical_diff() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 900;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pre_base = "base0000000000000000000000000000000000";
+    let (_dir, db, _product_id, parent_id, _revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test1"),
+        pr_number,
+        head_before,
+        Some(pre_base),
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    // Same file-level content against the PR's base branch regardless of
+    // which head is compared -- the defining shape of a clean rebase.
+    verifier
+        .set_diff_signature("main", head_before, Ok("same-signature".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature("main", head_after, Ok("same-signature".to_owned()))
+        .await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone())
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a pure-rebase conflict resolution must not enqueue a reviewer; got {outcome:?}",
+    );
+    assert!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .all(|e| e.kind != ExecutionKind::PrReview),
+        "no pr_review execution may be created for a pure-rebase conflict resolution",
+    );
+    assert_eq!(
+        verifier.diff_signature_calls_snapshot().await,
+        vec![
+            ("main".to_owned(), head_before.to_owned()),
+            ("main".to_owned(), head_after.to_owned()),
+        ],
+        "the gate must compare both heads against the PR's own base branch, not a fixed pre-rebase point",
+    );
+
+    let item = db.get_work_item(&parent_id).unwrap();
+    let description = match item {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t.description,
+        other => panic!("expected a chore, got {other:?}"),
+    };
+    assert!(
+        description.contains("[pr-review-skip]") && description.contains("reason=pure_rebase"),
+        "the parent chore's description must carry a durable pure-rebase skip audit line; got {description:?}",
+    );
+}
+
+/// A conflict-resolution revision whose diff signature against the base
+/// branch DIFFERS between the pre- and post-resolution head -- i.e. the
+/// resolution also touched real content, not just the base -- must still
+/// enqueue a full reviewer pass. This is the "mostly rebases but also
+/// hand-edits three lines to make it compile" case the predicate is
+/// required to catch.
+#[tokio::test]
+async fn pure_rebase_skip_gate_does_not_skip_when_content_differs() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 901;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pre_base = "base0000000000000000000000000000000000";
+    let (_dir, db, _product_id, _parent_id, revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test2"),
+        pr_number,
+        head_before,
+        Some(pre_base),
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    // Distinct signatures -- the resolution introduced real content.
+    verifier
+        .set_diff_signature("main", head_before, Ok("signature-before".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature("main", head_after, Ok("signature-after".to_owned()))
+        .await;
+    verifier.set_diff_line_count(Ok(40)).await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a conflict resolution that also changed content must still enqueue a reviewer; got {outcome:?}",
+    );
+    assert_eq!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .count(),
+        1,
+        "exactly one pr_review execution must be created",
+    );
+}
+
+/// A CI-fix revision's `ci_remediations` row never records a base branch,
+/// so the gate resolves one live via `fetch_pr_base_ref`. When the two
+/// diff signatures taken against that base match, the CI-fix is still
+/// recognised as a pure rebase and the reviewer is skipped. Also asserts
+/// the exact `(base, head)` pairs requested, keyed on the fetched base --
+/// not the reconstructed-merge-base value the predicate used to require.
+#[tokio::test]
+async fn pure_rebase_skip_gate_skips_ci_fix_via_live_base_ref() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 902;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, _parent_id, _revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_CI_FIX_PREFIX}cir_test1"),
+        pr_number,
+        head_before,
+        None, // ci_remediations never records a base
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    verifier.set_base_ref(Ok("main".to_owned())).await;
+    verifier
+        .set_diff_signature("main", head_before, Ok("same-signature".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature("main", head_after, Ok("same-signature".to_owned()))
+        .await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone())
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a pure-rebase CI-fix must not enqueue a reviewer; got {outcome:?}",
+    );
+    assert_eq!(
+        verifier.diff_signature_calls_snapshot().await,
+        vec![
+            ("main".to_owned(), head_before.to_owned()),
+            ("main".to_owned(), head_after.to_owned()),
+        ],
+        "the gate must compare both heads against the live-fetched base ref",
+    );
+}
+
+/// If the `fetch_pr_base_ref` call fails (transient GitHub error) the gate
+/// must fail open -- a full review still runs rather than silently
+/// suppressing one on an unproven predicate.
+#[tokio::test]
+async fn pure_rebase_skip_gate_fails_open_on_base_ref_error() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 903;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, _parent_id, revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_CI_FIX_PREFIX}cir_test2"),
+        pr_number,
+        head_before,
+        None,
+    );
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    verifier.set_base_ref(Err("simulated API error".to_owned())).await;
+    verifier.set_diff_line_count(Ok(40)).await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier)
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "a base-ref fetch failure must fail open (enqueue reviewer); got {outcome:?}",
+    );
+    assert_eq!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)
+            .count(),
+        1,
+        "exactly one pr_review execution must be created on fail-open",
+    );
+}
+
+/// If nothing pushed this round (the PR's current head still equals
+/// `pre_head`), the gate itself must report "no skip" without fetching a
+/// base ref or diff signature it has no need for — leaving
+/// `check_noop_skip`'s own `sha_unchanged` rule (once it has a
+/// `last_reviewed_sha` to compare against) to own that case. Called
+/// directly rather than through `on_stop`: the Stop-boundary SHA-delta
+/// gate that runs ahead of the reviewer-enqueue path also treats an
+/// unmoved PR head as "nothing to finalize yet" and never reaches
+/// `check_pure_rebase_skip` at all, so exercising this specific fallthrough
+/// needs a direct call.
+#[tokio::test]
+async fn pure_rebase_skip_gate_falls_through_when_head_unchanged() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 904;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let (_dir, db, _product_id, _parent_id, _revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test3"),
+        pr_number,
+        head_before,
+        Some("base0000000000000000000000000000000000"),
+    );
+
+    // PR head is still exactly `head_before` -- nothing landed.
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_before.to_owned())).await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone());
+
+    let producing = db.get_execution(&execution_id).unwrap();
+    let cycle_root_id = db.review_cycle_root_id(&producing.work_item_id);
+    let pr_url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+    let gate = handler
+        .check_pure_rebase_skip(&pr_url, &producing, &cycle_root_id)
+        .await;
+
+    assert_eq!(
+        gate.skip_reason, None,
+        "an unmoved head must never itself trigger a skip",
+    );
+    assert_eq!(
+        gate.post_head,
+        Some(head_before.to_owned()),
+        "the fetched head OID must still be threaded through for `check_noop_skip` to reuse",
+    );
+    assert!(
+        verifier.diff_signature_calls_snapshot().await.is_empty(),
+        "an unmoved head needs no diff signature comparison at all",
+    );
+}
+
+/// When no `conflict_resolutions` / `ci_remediations` row exists at all
+/// for the review-cycle root (e.g. a `created_via` conflict-resolution
+/// prefix that predates the attempt-ledger cutover, or the row was purged),
+/// the gate must find nothing to compare against and report "no skip"
+/// rather than erroring or panicking.
+#[tokio::test]
+async fn pure_rebase_skip_gate_falls_through_when_no_attempt_row_exists() {
+    let workspace = tempdir().unwrap();
+    let pr_number = 906;
+    let parent_pr_url = format!("https://github.com/spinyfin/mono/pull/{pr_number}");
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = Arc::new(WorkDb::open(db_path).unwrap());
+    let product = create_test_product_named(&db, "Boss-pure-rebase-no-attempt-row-test");
+    let parent = create_test_chore_manual(&db, product.id.clone(), "Parent chore");
+    {
+        let conn = db.connect().unwrap();
+        conn.execute(
+            "UPDATE tasks SET status = 'in_review', pr_url = ?2 WHERE id = ?1",
+            rusqlite::params![parent.id, parent_pr_url],
+        )
+        .unwrap();
+    }
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db
+        .create_revision(
+            boss_protocol::CreateRevisionInput::builder()
+                .parent_task_id(parent.id.clone())
+                .description("Rebase onto latest main")
+                .created_via(format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_no_attempt_row"))
+                .build(),
+            &checker,
+        )
+        .unwrap();
+    let execution = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(revision.id.clone())
+                .kind(ExecutionKind::RevisionImplementation)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .prefer_is_soft(true)
+                .pr_url(parent_pr_url.clone())
+                .build(),
+        )
+        .unwrap();
+    let (execution, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-1",
+            "mono",
+            "lease-1",
+            "mono-agent-001",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    finish_run_waiting_human(&db, &execution.id, &run.id, Some("spawned revision worker pane"));
+
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone());
+
+    let producing = db.get_execution(&execution.id).unwrap();
+    let cycle_root_id = db.review_cycle_root_id(&producing.work_item_id);
+    let gate = handler
+        .check_pure_rebase_skip(&parent_pr_url, &producing, &cycle_root_id)
+        .await;
+
+    assert_eq!(
+        gate.skip_reason, None,
+        "no attempt row on record means nothing to compare -- must fall through, not skip",
+    );
+    assert_eq!(gate.post_head, None, "no PR-head fetch should even happen");
+    assert!(verifier.diff_signature_calls_snapshot().await.is_empty());
+}
+
+/// When no `conflict_resolutions` / `ci_remediations` row's
+/// `revision_task_id` points at this revision task -- e.g. a fresher,
+/// unrelated attempt row exists for the same review-cycle root, as the
+/// merge poller or a `retrigger` attempt can produce between this
+/// revision's push and `on_stop` -- the gate must find nothing to compare
+/// against and fall through, rather than mistakenly picking that unrelated
+/// row's `pre_head`/base and comparing against the wrong point.
+#[tokio::test]
+async fn pure_rebase_skip_gate_ignores_attempt_row_not_owned_by_this_revision() {
+    use crate::work::ConflictResolutionInsertInput;
+
+    let workspace = tempdir().unwrap();
+    let pr_number = 905;
+    let head_before = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let pre_base = "base0000000000000000000000000000000000";
+    let (_dir, db, product_id, parent_id, revision_id, execution_id) = pure_rebase_revision_fixture(
+        workspace.path(),
+        &format!("{CREATED_VIA_MERGE_CONFLICT_PREFIX}crz_test4"),
+        pr_number,
+        head_before,
+        Some(pre_base),
+    );
+
+    // A fresher conflict_resolutions row lands for the same root, with no
+    // `revision_task_id` (e.g. inserted by the merge poller after this
+    // revision's own attempt row, before it was stamped) -- this must NOT
+    // be mistaken for the attempt that spawned `execution_id`'s revision.
+    db.insert_conflict_resolution(ConflictResolutionInsertInput {
+        product_id,
+        work_item_id: parent_id.clone(),
+        pr_url: format!("https://github.com/spinyfin/mono/pull/{pr_number}"),
+        pr_number,
+        head_branch: "boss/exec_parent".to_owned(),
+        base_branch: "main".to_owned(),
+        base_sha_at_trigger: Some("decoy_base00000000000000000000000000000".to_owned()),
+        head_sha_before: Some("decoy_head00000000000000000000000000000".to_owned()),
+    })
+    .unwrap();
+
+    let head_after = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head_after.to_owned())).await;
+    // Only the pair the OWNING attempt row would request is configured;
+    // the decoy row's pair is deliberately left unconfigured so the stub
+    // errors (and the gate fails open) if it were ever requested.
+    verifier
+        .set_diff_signature("main", head_before, Ok("same-signature".to_owned()))
+        .await;
+    verifier
+        .set_diff_signature("main", head_after, Ok("same-signature".to_owned()))
+        .await;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_branch_verifier(verifier.clone())
+        .with_pr_state_checker(open_pr_checker())
+        .with_enable_revision_triggered_reviews(true);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        !matches!(outcome, StopOutcome::ReviewerEnqueued { .. }),
+        "the gate must still find the owning attempt row and skip; got {outcome:?}",
+    );
+    assert!(
+        db.list_ready_executions()
+            .unwrap()
+            .iter()
+            .all(|e| !(e.kind == ExecutionKind::PrReview && e.work_item_id == revision_id)),
+        "no pr_review execution may be created once the owning attempt row is correctly matched",
+    );
+}
+
+// -----------------------------------------------------------
 // Deliverable-satisfied gate tests (zombie-worker / "nothing left to do"
 // loop fix).
 //
