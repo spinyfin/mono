@@ -744,6 +744,10 @@ mod tests {
             AbsenceDisposition::Synthesize
         );
         assert!(!caps.provides(Capability::CommandOutcomeObservation));
+        assert_eq!(
+            caps.absence_disposition(Capability::CommandOutcomeObservation),
+            AbsenceDisposition::Degrade
+        );
         assert_ne!(
             caps.absence_disposition(Capability::CommandOutcomeObservation),
             AbsenceDisposition::Synthesize
