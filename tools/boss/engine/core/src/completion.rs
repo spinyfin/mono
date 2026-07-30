@@ -49,7 +49,7 @@ use boss_protocol::{
     AUTOMATION_OUTCOME_FAILED_WILL_RETRY, AUTOMATION_OUTCOME_PRODUCED_TASK, AUTOMATION_OUTCOME_SKIPPED, Attention,
     AttentionGroup, BranchNaming, CREATED_VIA_CI_FIX_PREFIX, CREATED_VIA_MERGE_CONFLICT_PREFIX,
     CREATED_VIA_PR_REVIEW_PREFIX, CreateRevisionInput, ExecutionKind, ExecutionStatus, FrontendEvent, ProposalKind,
-    TaskKind,
+    ProposalState, TaskKind,
 };
 
 use crate::attentions_detector;
@@ -184,6 +184,23 @@ crate::register_counter!(
      sentinel scrape (or the attentions_followups_backstop LLM pass) because no worker_proposals \
      row of kind followup_task existed for the execution (followup_proposals_seam on).",
 );
+// Worker-proposal seam: fallback-hit counter for `finalize_automation_triage`'s
+// legacy `automation: task`/`automation: skip` marker parser, `recover_skip_reason`,
+// and the `find_most_recent_open_task_for_automation` open-task recovery
+// heuristic (design implementation task 11 — the worst-failing seam in the
+// design's inventory), incremented only when `automation_outcome_proposals_seam`
+// is on and no `worker_proposals` row of kind `automation_outcome` existed for
+// the execution — mirrors `WORKER_SIGNAL_FALLBACK_HIT_*`/`DEFERRED_SCOPE_FALLBACK_HIT`/
+// `FOLLOWUP_FALLBACK_HIT` above. Same remote-worker caveat applies (see the
+// comment on those counters).
+crate::register_counter!(
+    AUTOMATION_OUTCOME_FALLBACK_HIT,
+    "worker_proposals.fallback_hit.automation_outcome",
+    "finalize_automation_triage fell back to the legacy automation: task/skip marker parser, \
+     recover_skip_reason, and the find_most_recent_open_task_for_automation recovery heuristic \
+     because no worker_proposals row of kind automation_outcome existed for the execution \
+     (automation_outcome_proposals_seam on).",
+);
 
 /// Register all PR-URL-capture counter handles with `registry`. Called from
 /// [`crate::metrics_init::init_all`] at engine startup so duplicate-name panics
@@ -199,6 +216,7 @@ pub fn register_metrics(registry: &Registry) {
     registry.register_counter(&WORKER_SIGNAL_FALLBACK_HIT_BLOCKED);
     registry.register_counter(&DEFERRED_SCOPE_FALLBACK_HIT);
     registry.register_counter(&FOLLOWUP_FALLBACK_HIT);
+    registry.register_counter(&AUTOMATION_OUTCOME_FALLBACK_HIT);
 }
 
 /// Catch-all `failure_reason` stamped on a `conflict_resolutions` row

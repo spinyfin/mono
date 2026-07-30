@@ -30,6 +30,7 @@ fn golden_input() -> WorkerSetupInput {
         execution_kind: "chore_implementation".into(),
         task_kind: Some("chore".into()),
         worker_kind: WorkerKind::Standard,
+        automation_outcome_proposals_seam_enabled: false,
     }
 }
 
