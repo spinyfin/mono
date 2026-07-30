@@ -11,12 +11,10 @@
 //! nothing this turn" and "the guard no longer exists" produce byte-identical
 //! observations from the trace alone.
 //!
-//! Boss used to resolve that ambiguity by *inference*: once any guard record
-//! had been read for a run, the guards were taken to be armed and reachable
-//! for the remainder of it. Under `codex exec` the remainder of a run was the
-//! tail of its single turn, so the inference was safe to the point of being
-//! trivial. Under a long-lived interactive session it spans hours and many
-//! turns, and it is false:
+//! A guard record is evidence about the turn that wrote it, not about the
+//! chain's present state, so liveness is established per turn rather than
+//! remembered. Over a session spanning hours and many turns the difference is
+//! measurable:
 //!
 //! ```text
 //! turn 1   `echo one-canary`   → 5 guard records, command runs
@@ -28,18 +26,18 @@
 //! `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`.
 //! Turn 2 ran unguarded and nothing in Codex's stream said so.
 //!
-//! # What replaces the inference
+//! # How liveness is established instead
 //!
 //! The property being asserted — "the guards are armed and reachable" — is
 //! directly checkable, because Boss materialised the chain itself and wrote
 //! [`super::HOOK_TRUST_ATTESTATION_FILENAME`] naming every hook command and
-//! its content hash. So the reader stops inferring liveness from history and
-//! re-checks it at each turn boundary against disk.
+//! its content hash, alongside the config that declares and trusts them. So
+//! the reader re-checks liveness against disk at each turn boundary rather
+//! than inferring it from history.
 //!
-//! This only ever *adds* a firing condition to the silent-guards signal: a
-//! chain that breaks mid-session is now reported, where before it was
-//! invisible for the life of the session. Nothing that fired before stops
-//! firing.
+//! The check is orthogonal to the trace, not a replacement for it: it stops at
+//! the first bad entry, so a run that lost one wrapper of five still has four
+//! guards running and recording. The caller reports both.
 
 use std::path::{Path, PathBuf};
 
@@ -99,13 +97,29 @@ mod tests {
     use super::*;
 
     /// A `CODEX_HOME` shaped like one `write_hooks_and_attest` leaves behind:
-    /// an executable wrapper plus an attestation binding its bytes.
+    /// a config that declares and trusts one hook, an executable wrapper, and
+    /// an attestation binding its bytes.
     fn armed_home(dir: &Path) -> PathBuf {
         let guards = dir.join("guards");
         fs::create_dir_all(&guards).unwrap();
         let wrapper = guards.join("00_path_guard.sh");
         let body = "#!/bin/sh\nexit 0\n";
         fs::write(&wrapper, body).unwrap();
+        fs::write(
+            dir.join("config.toml"),
+            format!(
+                "[[hooks.PreToolUse]]\n\
+                 matcher = \".*\"\n\
+                 [[hooks.PreToolUse.hooks]]\n\
+                 type = \"command\"\n\
+                 command = \"{}\"\n\
+                 \n\
+                 [hooks.state.\"k\"]\n\
+                 trusted_hash = \"sha256:whatever\"\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -166,6 +180,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let wrapper = armed_home(dir.path());
         fs::write(&wrapper, "#!/bin/sh\necho '{\"decision\":\"approve\"}'\n").unwrap();
+        assert!(matches!(
+            armed_chain_status(Some(dir.path())),
+            ArmedChainStatus::Broken(_)
+        ));
+    }
+
+    #[test]
+    fn a_config_that_lost_its_trust_state_is_broken() {
+        // The wrappers are untouched, but Codex skips an untrusted hook
+        // silently — so the chain is as inert as if they had been deleted.
+        let dir = TempDir::new().unwrap();
+        armed_home(dir.path());
+        let config = dir.path().join("config.toml");
+        let raw = fs::read_to_string(&config).unwrap();
+        fs::write(&config, raw.replace("sha256:whatever", "sha256:0000")).unwrap();
         assert!(matches!(
             armed_chain_status(Some(dir.path())),
             ArmedChainStatus::Broken(_)

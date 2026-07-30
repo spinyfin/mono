@@ -99,14 +99,9 @@ pub(super) struct CodexRolloutProgressSession {
     /// "command guardrails were not enforced" at `error`.
     ///
     /// What this flag must **not** be read as is "the guards are still armed".
-    /// It once was: the suppression rested on "guards are armed once, at run
-    /// start, so one record settles it for the run". Under `codex exec` that
-    /// window was the tail of a single turn. Under a long-lived session it is
-    /// the whole session, and it is measurably false — a session whose
-    /// `$CODEX_HOME/guards` was removed between two turns ran turn 2's command
-    /// unguarded with the latch already set. Liveness is now re-checked against
-    /// disk every turn by [`guard_chain::armed_chain_status`]; this flag is
-    /// only what keeps a quiet, tool-less turn from alarming.
+    /// Liveness is re-checked against disk at every turn boundary by
+    /// [`guard_chain::armed_chain_status`]. This flag's only job is to keep a
+    /// turn whose cell invoked no inner tool from alarming.
     #[builder(default)]
     guard_records_seen: bool,
 }
@@ -145,29 +140,32 @@ impl CodexRolloutProgressSession {
 
     /// Guard-activity notifications for the turn that is ending.
     ///
-    /// Three outcomes, all engine-visible:
+    /// Three conditions, all engine-visible, and they compose — a turn can
+    /// report a broken chain *and* what the guards still armed decided:
     ///
     /// - the armed chain is no longer intact on disk → one
     ///   [`super::GUARDS_SILENT_MARKER`] notification, **every** turn it stays
-    ///   broken and regardless of whether this turn ran a tool call. This is
-    ///   the condition a session lifetime introduces: arming is a one-time act
-    ///   and a session outlives it, so "armed" has to be re-established rather
-    ///   than remembered. See [`guard_chain`];
+    ///   broken and regardless of whether this turn ran a tool call. Arming is
+    ///   a one-time act and a session outlives it, so "armed" is
+    ///   re-established rather than remembered. See [`guard_chain`];
     /// - records exist → one [`super::GUARD_TRACE_MARKER`] notification
     ///   summarising them, so "did the guard fire, and what did it decide?" is
-    ///   answerable from the trace for every Codex execution;
+    ///   answerable from the trace for every Codex execution. Emitted whether
+    ///   or not the chain check passed: verification stops at the first bad
+    ///   entry, so the guards behind it keep running and recording;
     /// - tool calls ran and **no guard record has been read for this run at
     ///   all** → one [`super::GUARDS_SILENT_MARKER`] notification, the signal
     ///   that Codex skipped its hooks from the very start (untrusted trust
     ///   record, unexecutable handler) and every guardrail was inert while the
-    ///   run looked healthy.
+    ///   run looked healthy. Suppressed when the chain check already reported
+    ///   a break, which carries the same marker with a more specific detail.
     ///
-    /// The third signal is run-scoped rather than per-turn: see
+    /// The third condition is run-scoped rather than per-turn: see
     /// [`Self::guard_records_seen`] for why a per-turn comparison fires on
     /// ordinary code-mode cells that invoke no tool. The first is what keeps
-    /// that scoping honest now that a run can span hours — it is a fresh check,
-    /// not a widened window, so a chain that breaks after the latch is set is
-    /// still reported.
+    /// that scoping honest over a run that can span hours — it is a fresh
+    /// check, not a widened window, so a chain that breaks after the latch is
+    /// set is still reported.
     ///
     /// Called immediately before a `Stop`, mirroring
     /// [`Self::drain_abandoned_command_notifications`].
@@ -177,36 +175,47 @@ impl CodexRolloutProgressSession {
             return Vec::new();
         };
 
-        // Ask disk, not history, whether the guards are still reachable. A
-        // broken chain is reported ahead of anything the trace says: records
-        // from earlier turns do not make the current turn guarded.
-        if let ArmedChainStatus::Broken(detail) = guard_chain::armed_chain_status(Some(&codex_home)) {
-            return vec![WorkerEvent::Notification {
-                session_id: session_id.to_owned(),
-                message: super::guard_chain_broken_notification(&detail),
-            }];
-        }
+        let mut events = Vec::new();
 
+        // Ask disk, not history, whether the guards are still reachable:
+        // records from earlier turns do not make the current turn guarded.
+        let chain_broken = match guard_chain::armed_chain_status(Some(&codex_home)) {
+            ArmedChainStatus::Broken(detail) => {
+                events.push(WorkerEvent::Notification {
+                    session_id: session_id.to_owned(),
+                    message: super::guard_chain_broken_notification(&detail),
+                });
+                true
+            }
+            ArmedChainStatus::Intact | ArmedChainStatus::Unknown => false,
+        };
+
+        // Drain the trace either way. A broken chain is broken at its first bad
+        // entry, so a run that lost one wrapper of five still has four guards
+        // recording — and a `block` they issue while the chain is degraded is
+        // exactly what an operator needs to see.
         let read = guard_trace::read_records_from(&guard_trace::guard_trace_path(&codex_home), self.guard_trace_line);
         self.guard_trace_line = read.next_line;
         if read.records.is_empty() && read.unparseable_lines == 0 {
-            // The chain was just verified intact, so a turn with no new record
-            // is a turn whose cells called no guarded tool — not a disarmed
-            // guardrail.
-            if observed == 0 || self.guard_records_seen {
-                return Vec::new();
+            // With the chain intact, a turn with no new record is a turn whose
+            // cells called no guarded tool — not a disarmed guardrail. With the
+            // chain broken it is already reported above, and a second
+            // notification under the same marker adds nothing.
+            if !chain_broken && observed > 0 && !self.guard_records_seen {
+                events.push(WorkerEvent::Notification {
+                    session_id: session_id.to_owned(),
+                    message: super::guards_silent_notification(observed),
+                });
             }
-            return vec![WorkerEvent::Notification {
-                session_id: session_id.to_owned(),
-                message: super::guards_silent_notification(observed),
-            }];
+            return events;
         }
         self.guard_records_seen = true;
         let summary = guard_trace::summarize(&read);
-        vec![WorkerEvent::Notification {
+        events.push(WorkerEvent::Notification {
             session_id: session_id.to_owned(),
             message: super::guard_trace_notification(&summary),
-        }]
+        });
+        events
     }
 
     fn classify_thread_start(&self, thread_id: &str) -> SessionStartSource {
@@ -938,9 +947,10 @@ mod tests {
         events
     }
 
-    /// A `CODEX_HOME` shaped like one `write_hooks_and_attest` leaves behind:
-    /// an executable wrapper plus an attestation binding its bytes. Returns the
-    /// wrapper so a test can break the chain the way a live session can.
+    /// A `CODEX_HOME` shaped like one `write_hooks_and_attest` leaves behind: a
+    /// config that declares and trusts one hook, an executable wrapper, and an
+    /// attestation binding its bytes. Returns the wrapper so a test can break
+    /// the chain the way a live session can.
     fn armed_codex_home(home: &Path) -> PathBuf {
         use boss_engine_codex_hook_trust::{
             HookAttestationEntry, HookTrustAttestation, ObservationProof, sha256_hex_prefixed, write_attestation_file,
@@ -951,6 +961,21 @@ mod tests {
         let wrapper = guards.join("00_path_guard.sh");
         let body = "#!/bin/sh\nexit 0\n";
         std::fs::write(&wrapper, body).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[[hooks.PreToolUse]]\n\
+                 matcher = \".*\"\n\
+                 [[hooks.PreToolUse.hooks]]\n\
+                 type = \"command\"\n\
+                 command = \"{}\"\n\
+                 \n\
+                 [hooks.state.\"k\"]\n\
+                 trusted_hash = \"sha256:whatever\"\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1078,6 +1103,53 @@ mod tests {
         // is still a defect, not a one-shot notice.
         let third = guard_trace_turn(&mut session, "call-3");
         assert!(is_silent_signal(&third), "got {third:?}");
+    }
+
+    #[test]
+    fn a_broken_chain_does_not_suppress_the_surviving_guards_trace() {
+        // `verify_armed_chain_on_disk` stops at the first bad entry, so one
+        // wrapper removed of several leaves the rest live and recording. Their
+        // decisions — a block, a guard error — are exactly what an operator
+        // needs while the chain is degraded, so the turn must report both.
+        let dir = TempDir::new().unwrap();
+        armed_codex_home(dir.path());
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+        let mut session = started_rollout_session(dir.path());
+
+        let first = guard_trace_turn(&mut session, "call-1");
+        assert!(!is_silent_signal(&first), "turn 1 is guarded: {first:?}");
+
+        std::fs::remove_dir_all(dir.path().join("guards")).unwrap();
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n\
+             {\"guard\":\"02_push_guard\",\"decision\":\"block\",\"reason\":\"jj git push\"}\n",
+        )
+        .unwrap();
+
+        let second = guard_trace_turn(&mut session, "call-2");
+        assert!(
+            is_silent_signal(&second),
+            "the broken chain must be reported: {second:?}"
+        );
+        let trace_summary = second
+            .iter()
+            .find_map(|event| match event {
+                WorkerEvent::Notification { message, .. } if message.starts_with(super::super::GUARD_TRACE_MARKER) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the surviving guards' decisions must still be reported: {second:?}"));
+        assert!(
+            trace_summary.contains("jj git push"),
+            "the block a live guard recorded must reach the operator: {trace_summary}"
+        );
     }
 
     #[test]

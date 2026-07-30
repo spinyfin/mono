@@ -1186,7 +1186,10 @@ pub fn write_hooks_and_attest(
     let attestation = arm_and_attest(&request)
         .map_err(|err| anyhow!("Codex hook-trust gate refused to arm PreToolUse guards: {err}"))?;
 
-    let attestation_path = codex_home.join(HOOK_TRUST_ATTESTATION_FILENAME);
+    // One derivation, shared with the per-turn re-check that reads it back: a
+    // writer and reader that each build this path would drift into reporting
+    // every turn boundary as a broken chain.
+    let attestation_path = guard_chain::attestation_path(codex_home);
     write_attestation_file(&attestation_path, &attestation)
         .map_err(|err| anyhow!("writing hook-trust attestation: {err}"))?;
 

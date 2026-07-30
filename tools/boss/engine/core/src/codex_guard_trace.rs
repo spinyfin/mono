@@ -56,7 +56,9 @@ pub fn register_metrics(registry: &crate::metrics::Registry) {
 pub enum GuardTraceSignal {
     /// Guards ran. Carries the rendered summary (counts plus notable blocks).
     Reported(String),
-    /// Tool calls ran with no guard invocation recorded.
+    /// The guardrails were not enforced for this turn — the armed chain is no
+    /// longer intact on disk, or tool calls ran with no guard invocation
+    /// recorded for the run. The detail says which.
     Silent(String),
 }
 
@@ -86,8 +88,9 @@ pub fn record(registry: &crate::metrics::Registry, run_id: Option<&str>, signal:
             tracing::error!(
                 run_id,
                 detail = %detail,
-                "codex: tool calls ran with no PreToolUse guard invocation recorded for this run; \
-                 command guardrails were not being enforced"
+                // Condition-neutral: `detail` names which of the two raised it
+                // (a broken armed chain, or no guard record for the run).
+                "codex: PreToolUse guardrails were not enforced for this turn"
             );
         }
     }

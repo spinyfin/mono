@@ -1127,22 +1127,81 @@ pub fn read_attestation_file(path: &Path) -> Result<HookTrustAttestation, TrustG
 /// that vanishes mid-session disarms every guardrail with nothing in Codex's
 /// own stream to say so.
 ///
-/// Only the hook `command` paths are checked here: those are what Codex
-/// invokes, and they are the only files whose disappearance is *silent*. The
-/// trace shim and the guard bodies behind each wrapper carry their own
-/// content checks, which run inside the wrapper and fail **closed** with a
-/// recorded decision — a loud failure that needs no external detection.
+/// # What is checked
+///
+/// Both halves of "Codex will invoke this guard", because both can be lost
+/// without a stream event:
+///
+/// - `$CODEX_HOME/config.toml` must still *declare* each attested hook command
+///   and must still stamp that hook's `trusted_hash` under
+///   `[hooks.state."<key>"]`. A config that loses either invokes no hook (or
+///   skips an untrusted one) in silence, and every fresh-process turn re-reads
+///   it, so this is reachable inside one run.
+/// - each hook `command` must still be a regular executable file with the bytes
+///   that were attested.
+///
+/// Not checked: the trace shim and the guard bodies *behind* each wrapper. They
+/// carry their own content checks, which run inside the wrapper and fail
+/// **closed** with a recorded decision — a loud failure that needs no external
+/// detection.
 pub fn verify_armed_chain_on_disk(attestation: &HookTrustAttestation) -> Result<(), TrustGateError> {
     if attestation.hooks.is_empty() {
         return Err(TrustGateError::AttestationIncomplete {
             detail: "attestation carries no hook entries".into(),
         });
     }
+
+    let config_path = resolve_absolute(Path::new(&attestation.config_path));
+    let config_raw = fs::read_to_string(&config_path).map_err(|err| TrustGateError::AttestationStale {
+        detail: format!("config unreadable at {}: {err}", config_path.display()),
+    })?;
+
     for entry in &attestation.hooks {
+        // The hook definition itself. A `[[hooks.PreToolUse]]` block deleted
+        // after arming leaves its `[hooks.state]` row behind, so the trust
+        // check below cannot see it; the command path is what the block
+        // carries, so its absence from the config text is the signal.
+        if !config_raw.contains(&entry.command) {
+            return Err(TrustGateError::AttestationStale {
+                detail: format!(
+                    "config at {} no longer declares hook command `{}`",
+                    config_path.display(),
+                    entry.command
+                ),
+            });
+        }
+
+        // The stamped trust record. Codex skips an untrusted hook silently, so
+        // a state row that was edited or dropped disarms the guard as
+        // thoroughly as deleting it (text scan; the config is Boss-owned and
+        // may use array-of-tables grammar elsewhere).
+        match trusted_hash_in_config(&config_raw, &entry.key) {
+            Some(hash) if hash == entry.trusted_hash => {}
+            Some(hash) => {
+                return Err(TrustGateError::AttestationStale {
+                    detail: format!(
+                        "config trusted_hash for `{}` is {hash}, attestation has {}",
+                        entry.key, entry.trusted_hash
+                    ),
+                });
+            }
+            None => {
+                return Err(TrustGateError::AttestationStale {
+                    detail: format!("config no longer stamps hooks.state.\"{}\".trusted_hash", entry.key),
+                });
+            }
+        }
+
         let command = resolve_absolute(Path::new(&entry.command));
         let observed = ensure_guard_executable(&command)?;
+        // Every hook Boss arms is content-bound (`require_guard_executable`),
+        // so a missing hash is an attestation that cannot prove what it was
+        // meant to prove. Fail closed rather than passing the entry through
+        // unchecked.
         let Some(attested) = entry.guard_content_sha256.as_deref() else {
-            continue;
+            return Err(TrustGateError::AttestationIncomplete {
+                detail: format!("attestation missing guard content hash for `{}`", command.display()),
+            });
         };
         if observed != attested {
             return Err(TrustGateError::AttestationStale {
