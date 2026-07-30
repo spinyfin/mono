@@ -643,6 +643,13 @@ struct ServerState {
     /// reads it to raise a banner when the daemon wedges and stalls all
     /// builds. See [`crate::syspolicyd_monitor`].
     syspolicyd_health: Arc<crate::syspolicyd_monitor::SyspolicydHealth>,
+    /// Shared escalation flag for the husk sweep's mass-retirement circuit
+    /// breaker. The sweep sets it when it declines to retire a burst of
+    /// confirmed husks (and clears it when the burst subsides);
+    /// [`build_engine_health_report`] turns it into an error-severity banner
+    /// naming the wedged slots. Without it the breaker's refusal reached the
+    /// operator only through the engine log. See [`crate::husk_pane_sweep`].
+    husk_breaker_health: Arc<crate::husk_pane_sweep::HuskRetirementBreakerHealth>,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
@@ -1252,6 +1259,7 @@ impl ServerState {
                 .review_pool_size(review_pool_size)
                 .coordinator_model(coordinator_model)
                 .syspolicyd_health(Arc::new(crate::syspolicyd_monitor::SyspolicydHealth::new()))
+                .husk_breaker_health(Arc::new(crate::husk_pane_sweep::HuskRetirementBreakerHealth::new()))
                 .next_session_id(AtomicU64::new(1))
                 .work_revision(work_revision)
                 .app_pid(StdMutex::new(app_pid))
@@ -1573,6 +1581,25 @@ impl crate::transient_recovery::WorkerNudger for ServerState {
 
     async fn broadcast_live_states(&self) {
         ServerState::broadcast_live_worker_states(self).await;
+    }
+}
+
+/// Let the transient-recovery sweep tear a stalled worker's pane down
+/// through the exact same teardown `bossctl agents stop` and the completion
+/// path use, so freeing a slot frees it on BOTH sides of the engine/app
+/// boundary. Without this the sweep released only its own bookkeeping and
+/// the app kept hosting a live pane on a slot the pool advertised as free —
+/// the `SlotBusy` desync that wedged eleven slots during a 529 burst (see
+/// [`crate::transient_recovery`]).
+///
+/// Distinct from [`ServerStatePaneReleaser`], which exists to break an
+/// ownership cycle (the completion handler is owned BY `ServerState`). The
+/// sweep is spawned with its own `Arc<ServerState>`, so it can implement the
+/// trait directly, exactly as the `WorkerNudger` impl above does.
+#[async_trait]
+impl WorkerPaneReleaser for ServerState {
+    async fn release_pane(&self, run_id: &str) -> PaneReleaseOutcome {
+        ServerState::release_worker_pane(self, run_id).await
     }
 }
 

@@ -1098,9 +1098,18 @@ pub async fn serve_with_merge_probe(
     // "O'Brien": twelve `request_recorded` → `worker_claimed=skipped` cycles
     // while a stray husk pane held a slot the pool believed free). Runs every
     // 60s.
+    // When its mass-retirement circuit breaker trips it retires nothing —
+    // correct, since retiring a live worker is unrecoverable — and escalates
+    // instead: an error-severity engine-health banner (via
+    // `husk_breaker_health`) plus a durable attention item on every work item
+    // whose pane is held back. A safety valve that declines silently is its
+    // own failure mode; the 529-burst wedge went unnoticed for over an hour
+    // because the refusal only ever reached the engine log.
     let _husk_pane_sweep_handle = crate::husk_pane_sweep::spawn_loop(
         Arc::clone(&server_state) as Arc<dyn crate::husk_pane_sweep::HuskPaneSweepSource>,
         server_state.dispatch_events.clone(),
+        server_state.work_db.clone(),
+        server_state.husk_breaker_health.clone(),
         crate::husk_pane_sweep::DEFAULT_INTERVAL,
     );
 
@@ -1297,12 +1306,21 @@ pub async fn serve_with_merge_probe(
     // is unfinished) and auto-resumes them on the same workspace with
     // bounded retries + backoff, escalating non-retryable / cap-reached
     // failures for human attention. Runs every 60s and fires on boot.
+    //
+    // The pane releaser is what makes "release the slot" mean the same thing
+    // on both sides of the engine/app boundary: the sweep tears the stalled
+    // worker's pane down (and kills its process) through the canonical
+    // `release_worker_pane` teardown before the slot goes back to the pool.
+    // Releasing engine bookkeeping alone is what wedged eleven slots during a
+    // 529 burst — the pool advertised slots the app was still hosting panes
+    // in, so every redispatch was rejected `SlotBusy`.
     let _transient_recovery_handle = crate::transient_recovery::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
         server_state.execution_coordinator.clone(),
         server_state.dispatch_events.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::transient_recovery::WorkerNudger>,
+        Arc::clone(&server_state) as Arc<dyn crate::completion::WorkerPaneReleaser>,
         crate::transient_recovery::DEFAULT_INTERVAL,
     );
 
