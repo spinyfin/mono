@@ -44,6 +44,14 @@ pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creatio
 pub struct ReviewVerdictInput {
     pub head_sha: Option<String>,
     pub findings_count: i64,
+    /// The severity gate's own answer for this pass — did the findings
+    /// warrant a revision — independent of what happened to that answer
+    /// afterward. It stays `true` for both destroy paths
+    /// (`dropped_duplicate_head`, `revision_creation_failed`): the gate did
+    /// warrant a revision in both cases, even though none exists. Whether a
+    /// revision was actually minted, suppressed as a duplicate, or lost to a
+    /// failed `create_revision` is entirely encoded in `gate_outcome`; do not
+    /// derive that from this field.
     pub revision_warranted: bool,
     pub gate_outcome: &'static str,
 }
@@ -63,6 +71,9 @@ pub struct ReviewVerdict {
     pub work_item_id: String,
     pub head_sha: Option<String>,
     pub findings_count: i64,
+    /// The severity gate's own answer, independent of `gate_outcome` — see
+    /// [`ReviewVerdictInput::revision_warranted`] for why it does not track
+    /// whether a revision actually exists.
     pub revision_warranted: bool,
     pub gate_outcome: String,
     pub revision_task_id: Option<String>,
@@ -125,10 +136,13 @@ impl WorkDb {
     /// invalidates the revision that was actually created.
     pub fn set_review_verdict_revision_task_id(&self, execution_id: &str, revision_task_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
+        let rows = conn.execute(
             "UPDATE pr_review_verdicts SET revision_task_id = ?2 WHERE execution_id = ?1",
             params![execution_id, revision_task_id],
         )?;
+        if rows == 0 {
+            tracing::warn!(execution_id, revision_task_id, "review verdict amend matched no row");
+        }
         Ok(())
     }
 
@@ -141,10 +155,13 @@ impl WorkDb {
     /// identically to a revision that simply hasn't dispatched yet.
     pub fn mark_review_verdict_revision_creation_failed(&self, execution_id: &str) -> Result<()> {
         let conn = self.connect()?;
-        conn.execute(
+        let rows = conn.execute(
             "UPDATE pr_review_verdicts SET gate_outcome = ?2 WHERE execution_id = ?1",
             params![execution_id, REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED],
         )?;
+        if rows == 0 {
+            tracing::warn!(execution_id, "review verdict amend matched no row");
+        }
         Ok(())
     }
 

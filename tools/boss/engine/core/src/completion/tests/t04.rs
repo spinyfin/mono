@@ -712,8 +712,100 @@ async fn duplicate_pr_review_passes_on_same_head_mint_only_one_revision() {
     );
     assert_eq!(verdict_b.findings_count, 1);
     assert!(
+        verdict_b.revision_warranted,
+        "revision_warranted is the severity gate's own (pre-dedup) answer — it stays true \
+         even though the duplicate-head guard suppressed the revision; gate_outcome is what \
+         records the suppression"
+    );
+    assert!(verdict_b.revision_task_id.is_none());
+}
+
+/// A second pass on an already-reviewed head that itself found nothing
+/// qualifying must record `completed_clean`, not `dropped_duplicate_head` —
+/// the duplicate-head guard only applies to findings that were actually
+/// computed and then suppressed. This exercises the
+/// `duplicate_head_review && !original_revision_warranted` branch of
+/// `gate_outcome` in `finalize_pr_review_pass`.
+#[tokio::test]
+async fn duplicate_head_review_with_no_findings_records_completed_clean() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json_a = high_finding_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_a, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json_a));
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome_a = handler.on_stop(&pr_review_exec_a).await;
+    assert!(
+        matches!(outcome_a, StopOutcome::ReviewPassRevisionCreated { .. }),
+        "first pass with a high finding must create a revision; got {outcome_a:?}",
+    );
+
+    // A second, independent pr_review execution for the same chore,
+    // reviewing the SAME head sha ("sha_reviewed_abc123") as pass A, but
+    // this time the reviewer found nothing worth a revision.
+    let json_b = clean_review_result_json(pr_url);
+    let pr_review_exec_b = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let (pr_review_exec_b, run_b) = db
+        .start_execution_run(
+            &pr_review_exec_b.id,
+            "review-worker-2",
+            "mono",
+            "lease-review-2",
+            "mono-agent-review-002",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    let _ = db
+        .finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&pr_review_exec_b.id)
+                .run_id(&run_b.id)
+                .execution_status(ExecutionStatus::Running)
+                .run_status("completed")
+                .result_summary("reviewer spawned")
+                .build(),
+        )
+        .unwrap();
+    let transcript_path = workspace
+        .path()
+        .join(format!("transcript-{}.jsonl", pr_review_exec_b.id));
+    std::fs::write(&transcript_path, make_review_transcript_jsonl(&json_b).as_bytes()).unwrap();
+    db.set_run_transcript_path_if_unset(&pr_review_exec_b.id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let outcome_b = handler.on_stop(&pr_review_exec_b.id).await;
+    assert!(
+        matches!(outcome_b, StopOutcome::ReviewPassCompleted { .. }),
+        "a clean duplicate-head pass must not mint a revision; got {outcome_b:?}",
+    );
+
+    let verdict_b = db
+        .review_verdict_for_execution(&pr_review_exec_b.id)
+        .unwrap()
+        .expect("the clean duplicate-head pass must still record a verdict");
+    assert_eq!(
+        verdict_b.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        "a duplicate-head pass whose own findings never qualified must read as a genuine \
+         clean pass, not as a dropped-duplicate (nothing was suppressed — there was nothing \
+         to suppress)",
+    );
+    assert!(
         !verdict_b.revision_warranted,
-        "revision_warranted must be false once the duplicate-head guard suppresses it"
+        "this pass's own severity gate never warranted a revision",
     );
     assert!(verdict_b.revision_task_id.is_none());
 }
@@ -728,7 +820,7 @@ async fn pr_review_pass_revision_creation_failure_amends_verdict() {
     let workspace = tempdir().unwrap();
     let pr_url = "https://github.com/spinyfin/mono/pull/88";
     let json = high_finding_review_result_json(pr_url);
-    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+    let (_dir, db, product_id, chore_id, pr_review_exec_id, _pr_url) =
         pr_review_exec_fixture(workspace.path(), Some(&json));
 
     // The parent is revisable per cached DB state (status starts `active`,
@@ -746,7 +838,7 @@ async fn pr_review_pass_revision_creation_failure_amends_verdict() {
     );
 
     // No revision was actually created.
-    let revisions = db.list_revisions(&_product_id, None, false, Some(&chore_id)).unwrap();
+    let revisions = db.list_revisions(&product_id, None, false, Some(&chore_id)).unwrap();
     assert!(
         revisions.is_empty(),
         "create_revision failed; no revision row should exist, got {revisions:?}",

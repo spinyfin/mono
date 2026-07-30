@@ -686,13 +686,25 @@ impl WorkerCompletionHandler {
         // triggered pass, the task itself otherwise) so the counter
         // accumulates across the whole revision chain instead of resetting
         // to zero on every fresh revision task row — see
-        // `WorkDb::review_cycle_root_id`. Resolved here (moved ahead of the
-        // `record_worker_pr_completion` call below, which it does not
-        // depend on) because the duplicate-head check right after needs it
-        // to compute this pass's `gate_outcome` BEFORE that call, so the
-        // verdict recorded in the same transaction reflects the real
-        // outcome instead of a value patched in after the fact.
+        // `WorkDb::review_cycle_root_id`. Depends only on task kind and
+        // chain parentage, not on anything `record_worker_pr_completion`
+        // writes, so it's safe to resolve ahead of that call.
         let cycle_root_id = self.work_db.review_cycle_root_id(producing_task_id);
+
+        // incident-002 postmortem action item: rationale-independent
+        // both-parents deletion tripwire. For a conflict-resolution review, diff the resolution
+        // against BOTH merge parents; if it removed a surface a merged parent
+        // added, halt auto-progression — the task is held in `blocked:
+        // deletion_signoff` pending explicit operator sign-off instead of
+        // advancing to human Review, regardless of the reviewer's verdict.
+        let deletion_signoff = self
+            .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
+            .await;
+        let completion_target = if deletion_signoff.is_empty() {
+            WorkerPrCompletionTarget::InReview
+        } else {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff
+        };
 
         // Dedup at the revision-minting end too. If a prior COMPLETED
         // review pass already recorded this exact head sha as reviewed
@@ -705,7 +717,11 @@ impl WorkerCompletionHandler {
         // Read the state BEFORE `increment_task_review_cycle` overwrites it
         // with this pass's own (matching) sha — the "before_commit_sha ==
         // head_sha" signature pattern used elsewhere for re-fire guards
-        // (see ci_watch's rebounce idempotency key).
+        // (see ci_watch's rebounce idempotency key). Read as late as possible
+        // (right before that write, after the `.await` above) to keep the
+        // window between this read and `increment_task_review_cycle`'s write
+        // as narrow as possible — this is exactly the guard meant to catch
+        // two `pr_review` executions racing past the enqueue-side dedup.
         let duplicate_head_review = match self.work_db.get_task_review_cycle_state(&cycle_root_id) {
             Ok((_, prior_sha)) => {
                 head_sha_for_cycle.as_deref().is_some_and(|sha| !sha.is_empty())
@@ -725,27 +741,13 @@ impl WorkerCompletionHandler {
         };
         let revision_warranted = original_revision_warranted && !duplicate_head_review;
 
-        // incident-002 postmortem action item: rationale-independent
-        // both-parents deletion tripwire. For a conflict-resolution review, diff the resolution
-        // against BOTH merge parents; if it removed a surface a merged parent
-        // added, halt auto-progression — the task is held in `blocked:
-        // deletion_signoff` pending explicit operator sign-off instead of
-        // advancing to human Review, regardless of the reviewer's verdict.
-        let deletion_signoff = self
-            .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
-            .await;
-        let completion_target = if deletion_signoff.is_empty() {
-            WorkerPrCompletionTarget::InReview
-        } else {
-            WorkerPrCompletionTarget::BlockedDeletionSignoff
-        };
-
-        // Durable per-pass review verdict (Boss cannot otherwise tell a
-        // clean review from a destroyed one — see the work item this
-        // change implements). `None` result ⇒ the only way this point is
-        // reached with no `ReviewResult` is the give-up path above
-        // (`NudgeDecision::Trip`); every other None-result path already
-        // returned early. Findings computed then dropped by the
+        // Durable per-pass review verdict. Without it,
+        // `work_executions.status = 'completed'` is written identically for a
+        // clean review and for one whose findings were computed and then
+        // discarded, so stored state cannot distinguish them. `None` result
+        // ⇒ the only way this point is reached with no `ReviewResult` is the
+        // give-up path above (`NudgeDecision::Trip`); every other None-result
+        // path already returned early. Findings computed then dropped by the
         // duplicate-head guard are recorded as such, not silently folded
         // into `completed_clean`.
         let findings_count = review_result.as_ref().map_or(0, |r| r.findings.len() as i64);
@@ -758,10 +760,14 @@ impl WorkerCompletionHandler {
         } else {
             crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN
         };
+        // `revision_warranted` on the verdict is the gate's own (pre-dedup)
+        // answer — see `ReviewVerdictInput::revision_warranted` — so it
+        // stays `true` for a dropped-duplicate pass even though no revision
+        // exists; `gate_outcome` is what tells that story.
         let review_verdict = crate::work::ReviewVerdictInput {
             head_sha: head_sha_for_cycle.clone(),
             findings_count,
-            revision_warranted,
+            revision_warranted: original_revision_warranted,
             gate_outcome,
         };
 
