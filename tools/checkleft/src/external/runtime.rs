@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
+use globset::{Glob, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
@@ -20,7 +21,7 @@ use crate::path::validate_relative_path;
 
 use super::component_bindings::Check as WitCheck;
 use super::component_bindings::checkleft::check::types as wit_types;
-use super::declarative::run_declarative_check_with_progress;
+use super::declarative::{resolve, run_declarative_check_with_progress};
 use super::sandbox::{AccessScope, HostCeiling, create_sandbox};
 use super::{
     EXTERNAL_CHECK_DECLARATIVE_RUNTIME_V1, ExternalCheckComponentLimits, ExternalCheckComponentPackage,
@@ -584,6 +585,76 @@ impl DefaultExternalCheckExecutor {
     }
 }
 
+/// Narrow `changeset` to the files selected by a component check's `applies_to`
+/// config override, using the same glob dialect and repo-relative path
+/// coordinates as the declarative path's `select_files` (`executor.rs:280-313`):
+/// `globset::Glob::new` with default options, matched against `ChangedFile::path`.
+///
+/// Returns `Ok(None)` when `config` carries no `applies_to` key — component
+/// checks then keep receiving the full changeset, unchanged from prior
+/// behaviour (there is no definition-side `applies_to` for component packages
+/// to fall back to; `mod.rs`'s `reject_declarative_fields` rejects the field on
+/// the manifest side, so "override, or match-all" is the entire semantics).
+///
+/// Errors loudly — instead of silently returning a changeset with zero
+/// matching files — when the override is present, `changeset` has at least one
+/// non-deleted file, and the glob(s) select none of them. This is the same
+/// failure mode the stale-exclusion audit (`crate::exclusion`) exists to catch
+/// on the `exclude` side: a config key that quietly weakens coverage. That
+/// audit is diff-gated to re-evaluate only when a file a *declared exclusion
+/// depends on* changes, and requires a guest round trip
+/// (`declared_exclusions_for_component` / `evaluate_exclusion_for_component`)
+/// to re-read that file's content — machinery built for "was this exclusion
+/// still justified", which needs external state. Whether `applies_to` matches
+/// zero files has no such dependency: it is a pure function of the current
+/// changeset and glob set, decidable inline on every run without any guest
+/// call. So this reuses the audit's *outcome*, not its *mechanism*: the error
+/// path below is the exact same `Result<CheckResult>` → "check execution
+/// failed" finding conversion `runner.rs` already applies to an invalid
+/// `applies_to` override (see `resolve::override_applies_to` errors), rather
+/// than a parallel diagnostic channel.
+fn narrow_by_applies_to(changeset: &ChangeSet, config: &toml::Value) -> Result<Option<ChangeSet>> {
+    let globs = match resolve::override_applies_to(config) {
+        None => return Ok(None),
+        Some(result) => result.context("invalid `applies_to` config override")?,
+    };
+
+    let mut builder = GlobSetBuilder::new();
+    for pattern in &globs {
+        builder.add(Glob::new(pattern).with_context(|| format!("invalid `applies_to` glob `{pattern}`"))?);
+    }
+    let globset = builder.build().context("failed to build `applies_to` glob set")?;
+
+    let non_deleted_before = changeset
+        .changed_files
+        .iter()
+        .filter(|f| !matches!(f.kind, ChangeKind::Deleted))
+        .count();
+
+    let mut narrowed = changeset.clone();
+    narrowed.changed_files.retain(|file| globset.is_match(&file.path));
+    narrowed
+        .file_line_deltas
+        .retain(|path, _| globset.is_match(path.as_path()));
+    narrowed.file_diffs.retain(|path, _| globset.is_match(path.as_path()));
+
+    let non_deleted_after = narrowed
+        .changed_files
+        .iter()
+        .filter(|f| !matches!(f.kind, ChangeKind::Deleted))
+        .count();
+
+    if non_deleted_before > 0 && non_deleted_after == 0 {
+        bail!(
+            "`applies_to` config override {globs:?} matched none of {non_deleted_before} changed \
+             file(s) in this changeset; check the glob(s) for a typo, or remove `applies_to` to \
+             match every file"
+        );
+    }
+
+    Ok(Some(narrowed))
+}
+
 impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     fn execute(
         &self,
@@ -597,9 +668,11 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
     ) -> Result<CheckResult> {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
+                // The host lowers an exclusion-filtered, applies_to-narrowed changeset
+                // so the guest never sees an excluded or out-of-scope path and cannot
+                // target it.
                 let filtered = exclusion.filter_changeset(changeset);
+                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -641,9 +714,11 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         match &package.implementation {
             ExternalCheckPackageImplementation::Component(component) => {
                 // Component checks are opaque wasm calls — no per-file granularity.
-                // The host lowers an exclusion-filtered changeset so the guest never
-                // sees an excluded path and cannot target it.
+                // The host lowers an exclusion-filtered, applies_to-narrowed changeset
+                // so the guest never sees an excluded or out-of-scope path and cannot
+                // target it.
                 let filtered = exclusion.filter_changeset(changeset);
+                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -678,7 +753,15 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
             ExternalCheckPackageImplementation::Declarative(d) => {
                 super::declarative::eligible_file_count(&self.root, d, changeset, config)
             }
-            ExternalCheckPackageImplementation::Component(_) => changeset.changed_files.len(),
+            // A malformed or zero-match override causes `execute`/`execute_with_progress`
+            // to fail; here we fall back to the full changeset size so the progress
+            // count is conservative and consistent with the "something went wrong"
+            // signal the runner will surface when the check actually runs.
+            ExternalCheckPackageImplementation::Component(_) => narrow_by_applies_to(changeset, config)
+                .ok()
+                .flatten()
+                .map(|narrowed| narrowed.changed_files.len())
+                .unwrap_or_else(|| changeset.changed_files.len()),
         }
     }
 

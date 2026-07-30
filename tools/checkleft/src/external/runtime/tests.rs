@@ -926,6 +926,240 @@ fn build_large_rs_source_with_violation(line_count: usize) -> String {
     s
 }
 
+// --- applies_to config-override tests (component mode) ---
+//
+// `narrow_by_applies_to` (defined in `runtime.rs`, exercised here via `super::`
+// since `tests` is a child module) is the pure host-side function that gives
+// component checks the same `applies_to` config-override narrowing the
+// declarative path already had. These pin its two outcomes directly — no glob
+// override narrows nothing (`Ok(None)`), a matching override narrows
+// (`Ok(Some(_))`) — before the slower end-to-end tests below prove it is
+// actually wired into `execute`/`execute_with_progress`/`eligible_file_count`.
+
+#[test]
+fn narrow_by_applies_to_absent_override_is_a_noop() {
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(Default::default());
+
+    let narrowed = super::narrow_by_applies_to(&changeset, &config).expect("no override present");
+    assert!(
+        narrowed.is_none(),
+        "absent `applies_to` must leave the changeset untouched"
+    );
+}
+
+#[test]
+fn narrow_by_applies_to_filters_to_matching_files_only() {
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: PathBuf::from("only/here.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("elsewhere/there.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["only/*.rs"]
+    });
+
+    let narrowed = super::narrow_by_applies_to(&changeset, &config)
+        .expect("valid override")
+        .expect("override present");
+    assert_eq!(narrowed.changed_files.len(), 1);
+    assert_eq!(narrowed.changed_files[0].path, PathBuf::from("only/here.rs"));
+}
+
+#[test]
+fn narrow_by_applies_to_zero_match_against_nonempty_changeset_errors() {
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["**/*.swift"]
+    });
+
+    let err = super::narrow_by_applies_to(&changeset, &config)
+        .expect_err("a glob matching none of a non-empty changeset must error, not silently pass");
+    let message = format!("{err:#}");
+    assert!(message.contains("applies_to"), "got: {message}");
+    assert!(message.contains("matched none"), "got: {message}");
+}
+
+#[test]
+fn narrow_by_applies_to_zero_match_against_all_deleted_changeset_does_not_error() {
+    // A changeset containing only deleted files has zero *non-deleted* files to
+    // begin with, so a zero-match narrowing is not a sign of a typo'd glob —
+    // there was nothing to select in the first place. Must not error.
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("gone.rs"),
+        kind: ChangeKind::Deleted,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["**/*.swift"]
+    });
+
+    let narrowed =
+        super::narrow_by_applies_to(&changeset, &config).expect("must not error on an all-deleted changeset");
+    assert!(narrowed.is_some());
+}
+
+#[test]
+fn narrow_by_applies_to_invalid_glob_errors() {
+    let changeset = ChangeSet::new(vec![]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["["]
+    });
+
+    let err = super::narrow_by_applies_to(&changeset, &config).expect_err("an invalid glob must be rejected");
+    assert!(format!("{err:#}").contains("applies_to"));
+}
+
+/// End-to-end: run the real bundled `rust/giant-structs` component through
+/// `execute`, proving `applies_to` config-override narrowing is actually wired
+/// into the component dispatch path (not just the pure helper above) — a
+/// root-level `.rs` file matching the glob is scanned, one in a nested
+/// directory that does not match is skipped entirely.
+#[test]
+fn applies_to_config_override_narrows_component_changeset_to_matching_files() {
+    let temp = tempdir().expect("temp dir");
+    write_file(temp.path(), "only/here.rs", BIG_STRUCT_SOURCE);
+    write_file(temp.path(), "elsewhere/there.rs", BIG_STRUCT_SOURCE);
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: PathBuf::from("only/here.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("elsewhere/there.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["only/*.rs"]
+    });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let result = executor
+        .execute(
+            &bundled_package("rust/giant-structs"),
+            &changeset,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+            None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
+        )
+        .expect("execute");
+
+    assert_eq!(
+        result.findings.len(),
+        1,
+        "only the applies_to-matched file must be scanned; got {:?}",
+        result.findings
+    );
+    let loc = result.findings[0]
+        .location
+        .as_ref()
+        .expect("finding must have location");
+    assert_eq!(loc.path, std::path::Path::new("only/here.rs"));
+}
+
+/// End-to-end zero-match: a valid but non-matching `applies_to` override run
+/// through the real component path must fail the check run loudly rather than
+/// silently reporting zero findings.
+#[test]
+fn applies_to_config_override_zero_match_fails_component_execution() {
+    let temp = tempdir().expect("temp dir");
+    write_file(temp.path(), "src.rs", BIG_STRUCT_SOURCE);
+
+    let tree = LocalSourceTree::new(temp.path()).expect("source tree");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["**/*.swift"]
+    });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let err = executor
+        .execute(
+            &bundled_package("rust/giant-structs"),
+            &changeset,
+            &tree,
+            &config,
+            std::path::Path::new(""),
+            None,
+            &crate::exclusion_matcher::ExclusionMatcher::default(),
+        )
+        .expect_err("a non-matching applies_to override against a non-empty changeset must fail the run");
+    let message = format!("{err:#}");
+    assert!(message.contains("applies_to"), "got: {message}");
+}
+
+#[test]
+fn eligible_file_count_reflects_applies_to_narrowing_for_component_checks() {
+    let temp = tempdir().expect("temp dir");
+    let changeset = ChangeSet::new(vec![
+        ChangedFile {
+            path: PathBuf::from("only/here.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+        ChangedFile {
+            path: PathBuf::from("elsewhere/there.rs"),
+            kind: ChangeKind::Modified,
+            old_path: None,
+        },
+    ]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["only/*.rs"]
+    });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let count = executor.eligible_file_count(&bundled_package("rust/giant-structs"), &changeset, &config);
+    assert_eq!(
+        count, 1,
+        "eligible_file_count must reflect the applies_to-narrowed set, not the full changeset"
+    );
+}
+
+#[test]
+fn eligible_file_count_falls_back_to_full_changeset_when_applies_to_is_invalid() {
+    let temp = tempdir().expect("temp dir");
+    let changeset = ChangeSet::new(vec![ChangedFile {
+        path: PathBuf::from("src.rs"),
+        kind: ChangeKind::Modified,
+        old_path: None,
+    }]);
+    let config = toml::Value::Table(toml::toml! {
+        applies_to = ["["]
+    });
+
+    let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
+    let count = executor.eligible_file_count(&bundled_package("rust/giant-structs"), &changeset, &config);
+    assert_eq!(
+        count, 1,
+        "an invalid override must fall back to the full changeset count, not panic or zero out"
+    );
+}
+
 // --- Host-side exclusion helper unit tests ---
 
 #[test]

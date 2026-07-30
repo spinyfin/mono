@@ -12,7 +12,6 @@ description = "checkleft check (text/forbidden-pattern): flag lines in changed f
 checkleft-check-sdk = { path = "../../../sdk" }
 serde = { workspace = true, features = ["derive"] }
 regex = { workspace = true }
-globset = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

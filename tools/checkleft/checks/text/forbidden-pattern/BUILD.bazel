@@ -18,7 +18,6 @@ rust_library(
     visibility = ["//tools/checkleft/preinstalled-bundle:__pkg__"],
     deps = [
         "//tools/checkleft/sdk:checkleft_check_sdk",
-        "@@rules_rust++crate+mono_crates__globset-0.4.18//:globset",
         "@@rules_rust++crate+mono_crates__regex-1.12.4//:regex",
     ] + all_crate_deps(normal = True),
 )
@@ -34,7 +33,6 @@ rust_test(
     ),
     deps = [
         "//tools/checkleft/sdk:checkleft_check_sdk",
-        "@@rules_rust++crate+mono_crates__globset-0.4.18//:globset",
         "@@rules_rust++crate+mono_crates__regex-1.12.4//:regex",
         "@@rules_rust++crate+mono_crates__tempfile-3.27.0//:tempfile",
     ] + all_crate_deps(
