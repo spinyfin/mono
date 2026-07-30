@@ -23,13 +23,16 @@
 # Mac).
 #
 # Structure: a single static `prepare` step (skip-logic + version + tag +
-# GitHub Release) fans out to the `linux`, `musl`, and `darwin` build steps
-# ONLY when a release is actually being cut. The fan-out is dynamic: at the end
-# of `prepare`, if a release was created, it calls `buildkite-agent pipeline
-# upload .buildkite/pipeline-checkleft-release-builds.yml` to inject the build
-# steps into the running build. On a no-release run (scheduled build, nothing
-# changed) prepare exits without uploading that fragment, so the leaf steps
-# never appear and no bazel builds run.
+# GitHub Release, created as a DRAFT) fans out to the `linux`, `musl`, and
+# `darwin` build steps ONLY when a release is actually being cut, followed by
+# a `publish` step (depends_on all three build steps) that verifies every
+# required asset's checksum and flips the release from draft to published.
+# The fan-out is dynamic: at the end of `prepare`, if a release was created,
+# it calls `buildkite-agent pipeline upload
+# .buildkite/pipeline-checkleft-release-builds.yml` to inject the build +
+# publish steps into the running build. On a no-release run (scheduled build,
+# nothing changed) prepare exits without uploading that fragment, so the leaf
+# steps never appear and no bazel builds run.
 #
 # The concurrency_group lives on `prepare` so two release runs can't create
 # tags at once; the build steps are unconstrained (each run's builds attach to

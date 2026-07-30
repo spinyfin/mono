@@ -243,30 +243,42 @@ is_manual() {
   [[ "${BUILDKITE_SOURCE:-}" == "ui" || "${BUILDKITE_SOURCE:-}" == "api" ]]
 }
 
-# resolve_last_release — sets LAST_TAG, LAST_SHA, and LAST_IS_DRAFT for the
-# newest checkleft-v* release. `gh release list` includes drafts by default
-# (no --exclude-drafts), so an interrupted prior run's draft is visible here —
-# that is what lets phase_prepare tell "already published" apart from "draft
-# left over from an aborted run" for the same commit.
-resolve_last_release() {
-  log "[checkleft-release] resolving last ${TAG_PREFIX}* release"
-  local last_json
-  last_json="$(gh release list --repo "${REPO}" --limit 300 --json tagName,isDraft \
-    --jq "[.[] | select(.tagName | startswith(\"${TAG_PREFIX}\"))] | .[0]" 2>/dev/null || true)"
-  LAST_TAG=""
-  LAST_IS_DRAFT="false"
-  if [[ -n "${last_json}" && "${last_json}" != "null" ]]; then
-    LAST_TAG="$(jq -r '.tagName // empty' <<<"${last_json}")"
-    LAST_IS_DRAFT="$(jq -r '.isDraft // false' <<<"${last_json}")"
-  fi
-  LAST_SHA=""
-  if [[ -n "${LAST_TAG}" ]]; then
-    git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
-    LAST_SHA="$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)"
-    if [[ -z "${LAST_SHA}" ]]; then
-      LAST_SHA="$(gh api "repos/${REPO}/commits/${LAST_TAG}" --jq '.sha' 2>/dev/null || true)"
+# _resolve_tag_sha TAG — echoes the commit sha a tag points at (empty if TAG is
+# empty or unresolvable). Fetches the tag ref first so a warm agent workspace
+# sees it even if it predates the workspace's last full fetch.
+_resolve_tag_sha() {
+  local tag="$1" sha=""
+  if [[ -n "${tag}" ]]; then
+    git fetch origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || true
+    sha="$(git rev-list -n 1 "${tag}" 2>/dev/null || true)"
+    if [[ -z "${sha}" ]]; then
+      sha="$(gh api "repos/${REPO}/commits/${tag}" --jq '.sha' 2>/dev/null || true)"
     fi
   fi
+  echo "${sha}"
+}
+
+# resolve_last_release — sets LAST_TAG/LAST_SHA (newest PUBLISHED checkleft-v*
+# release only) and LAST_DRAFT_TAG/LAST_DRAFT_SHA (newest DRAFT checkleft-v*
+# release only), kept strictly separate because their consumers want different
+# things: should_skip()'s idempotency guard and the changelog `--from` range
+# must never land on a draft — a release that was never published is not "the
+# last release" for either change-detection or changelog purposes, and doing
+# so would silently drop the commits/changes between a stranded draft and the
+# next real release. Only phase_prepare's resume check wants the draft.
+resolve_last_release() {
+  log "[checkleft-release] resolving last ${TAG_PREFIX}* release"
+  local releases_json
+  releases_json="$(gh release list --repo "${REPO}" --limit 300 --json tagName,isDraft \
+    --jq "[.[] | select(.tagName | startswith(\"${TAG_PREFIX}\"))]" 2>/dev/null || true)"
+  releases_json="${releases_json:-[]}"
+  [[ "${releases_json}" == "null" ]] && releases_json="[]"
+
+  LAST_TAG="$(jq -r '[.[] | select(.isDraft == false)][0].tagName // empty' <<<"${releases_json}")"
+  LAST_DRAFT_TAG="$(jq -r '[.[] | select(.isDraft == true)][0].tagName // empty' <<<"${releases_json}")"
+
+  LAST_SHA="$(_resolve_tag_sha "${LAST_TAG}")"
+  LAST_DRAFT_SHA="$(_resolve_tag_sha "${LAST_DRAFT_TAG}")"
 }
 
 # should_skip — echoes a skip reason and returns 0 when this run is a no-op.
@@ -349,27 +361,45 @@ phase_prepare() {
 
   # Resume-existing-draft check: if the newest checkleft-v* release is for THIS
   # commit and is still a draft, a prior run got interrupted before publishing
-  # (e.g. the prepare step itself was retried, or a build/publish phase failed
-  # and the operator re-triggered the whole pipeline on the same commit).
-  # should_skip()'s idempotency guard would otherwise treat "HEAD == last
-  # release commit" as "nothing to do" — which is correct for an already
-  # PUBLISHED release, but wrong here: a draft means the release never
-  # finished, so silently skipping would strand it forever. Resume it
-  # deterministically by re-adopting the existing tag/version rather than
-  # computing a new one (which would orphan the draft and its uploaded
+  # (e.g. the pipeline was re-triggered on the same commit after a build or
+  # publish phase failed). should_skip()'s idempotency guard would otherwise
+  # treat "HEAD == last release commit" as "nothing to do" — which is correct
+  # for an already PUBLISHED release, but wrong here: a draft means the
+  # release never finished, so silently skipping would strand it forever.
+  # Resume it deterministically by re-adopting the existing tag/version rather
+  # than computing a new one (which would orphan the draft and its uploaded
   # assets). Chosen over failing the build because the fan-out build phases
   # are already idempotent (asset upload uses --clobber; publish re-verifies),
   # so resuming is safe and avoids manual tag cleanup for a routine retry.
+  #
+  # Only auto-resume on a manual trigger (or an explicit override): a cron
+  # tick that resumes an unpublishable draft would otherwise re-fan-out and
+  # fail every time it runs, forever, burning three release builds per tick
+  # with no bound. A scheduled run that sees a stranded draft stops instead
+  # and points at how to recover it — see "Abandoning a draft release" in
+  # tools/checkleft/docs/buildkite-release-setup.md.
   local head_sha
   head_sha="$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")"
-  if [[ -n "${LAST_SHA}" && "${head_sha}" == "${LAST_SHA}" && "${LAST_IS_DRAFT}" == "true" ]]; then
-    NEW_TAG="${LAST_TAG}"
+  if [[ -n "${LAST_DRAFT_SHA}" && "${head_sha}" == "${LAST_DRAFT_SHA}" ]]; then
+    if ! is_manual && [[ "${CHECKLEFT_RESUME_DRAFT:-}" != "1" ]]; then
+      die "release ${LAST_DRAFT_TAG} exists as an unpublished draft for this commit (${head_sha:0:12}), and this is a scheduled trigger — refusing to auto-resume it forever on every cron tick. To resume it, either re-trigger this pipeline manually (ui/api), or set CHECKLEFT_RESUME_DRAFT=1 on a scheduled build. To abandon it instead, delete the draft and its tag (see 'Abandoning a draft release' in tools/checkleft/docs/buildkite-release-setup.md): gh release delete ${LAST_DRAFT_TAG} --repo ${REPO} --yes && git push origin :refs/tags/${LAST_DRAFT_TAG}"
+    fi
+    NEW_TAG="${LAST_DRAFT_TAG}"
     NEW_VERSION="${NEW_TAG#"${TAG_PREFIX}"}"
     log "[checkleft-release] resuming existing draft release ${NEW_TAG} for ${head_sha:0:12} — skipping tag/release creation"
     meta_set "${META_TAG_KEY}" "${NEW_TAG}"
     if command -v buildkite-agent &>/dev/null; then
-      log "[checkleft-release] uploading build phases for ${NEW_TAG}"
-      buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release-builds.yml
+      # The build fragment may already be uploaded in THIS build (e.g. the
+      # prepare job itself was retried after uploading it the first time
+      # around) — Buildkite step keys are unique per build, so re-uploading
+      # would fail on a duplicate-key collision. Only upload if the publish
+      # step (the last one in the fragment) isn't already present.
+      if buildkite-agent step get id --step "checkleft-release-publish" &>/dev/null; then
+        log "[checkleft-release] build phases already present in this build — not re-uploading"
+      else
+        log "[checkleft-release] uploading build phases for ${NEW_TAG}"
+        buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release-builds.yml
+      fi
     fi
     log "[checkleft-release] prepare done — resumed draft ${NEW_TAG}; build phases will attach remaining assets"
     return 0
@@ -519,9 +549,9 @@ phase_musl() {
   STAGE="$(mktemp -d)"
 
   local musl_target="//tools/checkleft:checkleft_musl"
-  # The --define must be forwarded to both the build and the cquery so their
-  # configuration hashes match; without it the Make-variable $(CHECKLEFT_VERSION)
-  # falls back to the .bazelrc default of "0.0.0-dev" (T1329/T1328 seam).
+  # The --define must reach both the build and the cquery invocation — their
+  # configuration hashes must match, or the Make-variable $(CHECKLEFT_VERSION)
+  # silently falls back to the .bazelrc default of "0.0.0-dev".
   local version_define="--define=CHECKLEFT_VERSION=${NEW_VERSION}"
   log "[checkleft-release] bazel build -c opt ${version_define} ${musl_target}"
   bazel build -c opt "${version_define}" "${musl_target}"
