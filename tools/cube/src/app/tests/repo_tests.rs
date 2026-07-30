@@ -185,6 +185,7 @@ fn resolver_config(name: &str, origin_pattern: &str, clone_command: Option<&str>
             clone_command: clone_command.map(str::to_string),
         }],
         unhealthy_gc: Default::default(),
+        pool: Default::default(),
     }
 }
 

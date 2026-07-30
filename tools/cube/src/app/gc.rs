@@ -13,9 +13,11 @@ use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config, paths};
 
+use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
+use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
 use crate::app::salvage::{
@@ -57,6 +59,23 @@ const POOL_GC_TIME_BUDGET: Duration = Duration::from_secs(20);
 /// bounded passes rather than stalling for a day once there's more work than
 /// one budget allows.
 pub(super) const POOL_GC_BACKLOG_RETRY_SECS: i64 = 5 * 60;
+
+/// Whether the last pass's free-pool trim showed it could make progress: `1`
+/// if it removed at least one workspace or stopped early at its deadline, `0`
+/// if it walked every candidate it had and could remove none.
+///
+/// This is what makes a free-workspace surplus an actionable backlog signal
+/// rather than a raw one. A repo whose surplus is entirely unpushed work sits
+/// above its mark permanently, and that is the intended outcome — the mark is
+/// a disk target, not a promise that outranks somebody's afternoon. Counting
+/// that steady state as backlog would pin the throttle at
+/// [`POOL_GC_BACKLOG_RETRY_SECS`] forever, so every five minutes some `cube
+/// workspace lease` would pay a synchronous pass whose trim re-fetches each of
+/// those same candidates and removes nothing: lease latency and shared-store
+/// contention for guaranteed zero progress. A surplus therefore only shortens
+/// the interval while the previous pass demonstrated it could act on one; a
+/// pass that came up empty falls back to [`AUTO_GC_INTERVAL_SECS`].
+pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progress";
 
 /// List and optionally forget consumed `boss/exec_*` bookmarks and closed/merged
 /// `pr/<n>` bookmarks in a workspace.
@@ -315,7 +334,18 @@ pub(super) fn maybe_trigger_pool_gc(store: &mut Store, database_path: Option<&Pa
     // Skip if a pass completed recently — how recently depends on whether
     // there is known backlog left over from a prior bounded pass.
     if let Some(last_completed) = store.get_pool_metadata_i(POOL_GC_LAST_AT_KEY)? {
-        let interval = if pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true) {
+        // A free-workspace surplus counts as backlog for the same reason an
+        // aged-unhealthy one does: trimming needs a `jj git fetch` per
+        // candidate, so a repo well over its mark will not drain inside one
+        // 20s pass, and without this the next attempt would be a full day away
+        // with the surplus sitting on disk in the meantime. But only a surplus
+        // the trim can actually act on counts — see
+        // POOL_GC_TRIM_PROGRESS_KEY for the steady state this rules out.
+        // Every check here is DB-only.
+        let trim_made_progress = store.get_pool_metadata_i(POOL_GC_TRIM_PROGRESS_KEY)?.unwrap_or(1) != 0;
+        let has_backlog = pool_gc_has_aged_unhealthy_backlog(store, now_epoch_s).unwrap_or(true)
+            || (trim_made_progress && has_free_workspace_surplus(store));
+        let interval = if has_backlog {
             POOL_GC_BACKLOG_RETRY_SECS
         } else {
             AUTO_GC_INTERVAL_SECS
@@ -353,12 +383,52 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
     };
     let runner = RealCommandRunner;
 
-    // Run the aged-unhealthy recycler first so it genuinely gets first claim
-    // on the time budget — it is the part that actually reclaims disk space
-    // from stuck-dirty workspaces, and it must not be starved by the
-    // reconcile pass below (which only refreshes cached health labels, a
-    // less time-critical repair). It is bounded by `deadline` itself, so a
-    // large backlog cannot consume more than its share.
+    // Compaction goes first: it is the pass that actually returns the disk
+    // (uncleaned build-artifact trees were 82% of the entire workspaces tree
+    // when the pool filled a 1.8 TiB volume, against ~600 MB for a checkout)
+    // and it is the cheapest one here — one local jj read plus an unlink per
+    // workspace, no network at all. Going last would let a large dirty or
+    // unreachable-remote backlog starve it indefinitely behind their `jj git
+    // fetch` calls. The passes below reclaim no bytes themselves: the
+    // aged-unhealthy recycler resets working copies, and the trim is the
+    // secondary mechanism.
+    //
+    // It gets half the budget, not all of it. The deadline is only consulted
+    // between workspaces, and unlinking a 20 GiB `target/` is tens of seconds
+    // of syscalls that cannot be interrupted partway, so a single large tree
+    // handed the whole budget would skip every pass below wholesale — starving
+    // the recycler that salvages workspaces holding work, which is what makes
+    // them eligible for the trim in the first place.
+    let compaction_deadline = deadline.checked_sub(POOL_GC_TIME_BUDGET / 2).unwrap_or(deadline);
+    if let Ok(now) = current_epoch_s() {
+        let compacted = compact_free_workspaces(
+            &runner,
+            &store,
+            database_path.as_deref(),
+            None,
+            now,
+            false,
+            Some(compaction_deadline),
+        );
+        if !compacted.is_empty() {
+            eprintln!(
+                "cube: auto gc: compacted {} workspace(s), {} build-artifact dir(s), reclaiming {}",
+                compacted.workspaces_compacted,
+                compacted.dirs_removed,
+                human_bytes(compacted.available_delta_bytes),
+            );
+        }
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after compaction, deferring the rest to the next pass");
+        return;
+    }
+
+    // The aged-unhealthy recycler runs next: it salvages and resets workspaces
+    // stuck dirty, which is what makes them eligible for the trim below on a
+    // later pass. Bounded by `deadline` itself, so a large backlog cannot
+    // consume more than its share.
     let gc_config = config::load_config().unwrap_or_default().unhealthy_gc;
     let max_age_secs = gc_config.max_age_secs();
     if let Ok(now) = current_epoch_s() {
@@ -402,6 +472,37 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
 
     if Instant::now() >= deadline {
         eprintln!("cube: auto gc: time budget exhausted after reconcile pass, deferring log/bookmark gc");
+        return;
+    }
+
+    // Trim surplus free workspaces down to each repo's high-water mark. This
+    // is the secondary reclamation mechanism and deliberately runs late: it
+    // costs a `jj git fetch` per candidate, and it wants the state the two
+    // passes above have just corrected — the aged-unhealthy recycler resets
+    // stuck-dirty workspaces (making them provably empty of work, hence
+    // eligible here) and reconcile has just relabelled whatever recovered.
+    if let Ok(now) = current_epoch_s() {
+        let trimmed = trim_free_workspaces_to_mark(&runner, &store, database_path.as_deref(), now, Some(deadline));
+        if trimmed.workspaces_removed > 0 {
+            eprintln!(
+                "cube: auto gc: removed {} surplus free workspace(s), reclaiming {}",
+                trimmed.workspaces_removed,
+                human_bytes(trimmed.available_delta_bytes),
+            );
+        }
+        // Record whether this trim could act, so the throttle knows whether a
+        // surviving surplus is worth retrying for in minutes or is simply the
+        // steady state (see POOL_GC_TRIM_PROGRESS_KEY). Running out of budget
+        // counts as progress: the pass stopped with candidates unexamined, so
+        // it has not shown that it cannot act.
+        let made_progress = trimmed.workspaces_removed > 0 || Instant::now() >= deadline;
+        let _ = store
+            .set_pool_metadata_i(POOL_GC_TRIM_PROGRESS_KEY, i64::from(made_progress))
+            .map_err(|e| eprintln!("cube: auto gc: failed to record the trim outcome: {e}"));
+    }
+
+    if Instant::now() >= deadline {
+        eprintln!("cube: auto gc: time budget exhausted after the pool trim, deferring log/bookmark gc");
         return;
     }
 

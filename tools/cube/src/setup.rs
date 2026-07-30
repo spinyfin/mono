@@ -575,6 +575,7 @@ steps:
             unhealthy_since_epoch_s: None,
             last_holder: None,
             last_task: None,
+            last_activity_at_epoch_s: None,
         }
     }
 

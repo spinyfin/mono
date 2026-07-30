@@ -10,8 +10,10 @@ use crate::setup::{SetupReport, run_setup_engine};
 use crate::store::Store;
 use crate::{audit, setup};
 
+use crate::app::disk::DiskSpace;
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::{network_cmd_timeout, workspace_path_exists};
+use crate::app::reclaim::assert_mint_headroom;
 use crate::app::util::current_epoch_s;
 
 pub(super) fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
@@ -31,8 +33,21 @@ pub(super) fn next_workspace_id(prefix: &str, existing: &[String]) -> String {
     format!("{prefix}{next:03}")
 }
 
+/// Grow the pool by one workspace.
+///
+/// There is deliberately no cap on how many times this may succeed. The pool
+/// is an optimisation — reuse a known-good checkout — and a lease for a
+/// reachable repo always succeeds; bounding disk is the job of the reclamation
+/// passes in [`crate::app::reclaim`], not of admission control here.
+///
+/// The one thing that can stop a mint is the *volume* being below cube's
+/// free-space floor after reclamation has already tried and failed to clear
+/// it — see [`assert_mint_headroom`]. That is a fact about the host, not about
+/// the pool: it fires identically whether the repo has three workspaces or
+/// three hundred, and it leaves reusing an existing free workspace working.
 pub(super) fn auto_create_workspace(
     runner: &dyn CommandRunner,
+    database_path: Option<&Path>,
     repo_record: &RepoRecord,
     existing: &[crate::metadata::WorkspaceCandidate],
 ) -> Result<crate::metadata::WorkspaceCandidate> {
@@ -44,6 +59,11 @@ pub(super) fn auto_create_workspace(
         path: repo_record.workspace_root.clone(),
         source: e,
     })?;
+
+    // After create_dir_all, so the probe has a path on the volume to stat even
+    // on a first-ever provision, and before the attach, so a refusal costs
+    // nothing and leaves no partial state.
+    assert_mint_headroom(&repo_record.repo, &repo_record.workspace_root)?;
 
     // The canonical repo is the single shared object store every pool workspace
     // attaches to via `jj workspace add` — the cube design (R4) chose the
@@ -143,6 +163,27 @@ pub(super) fn auto_create_workspace(
         path: workspace_path.clone(),
         source,
     })?;
+
+    // Pool growth — the failure mode that produced 520 mono workspaces — left
+    // no direct trace before this event existed. It had to be reconstructed
+    // after the fact from `was_auto_created: true` on `lease.acquired`, which
+    // only records the mints that went on to a successful lease and says
+    // nothing about how large the pool was when each one happened. Record the
+    // mint itself, with the pool size and the disk it landed on, so the growth
+    // curve is readable directly.
+    let disk = DiskSpace::probe(&repo_record.workspace_root).ok();
+    audit!(
+        database_path,
+        "workspace.created",
+        repo = repo_record.repo,
+        workspace_id = workspace_id,
+        workspace_path = workspace_path.display().to_string(),
+        canonical_source = canonical.display().to_string(),
+        pool_size_before = existing.len(),
+        pool_size_after = existing.len() + 1,
+        disk_available_bytes = disk.map(|d| d.available_bytes),
+        disk_total_bytes = disk.map(|d| d.total_bytes),
+    );
 
     Ok(crate::metadata::WorkspaceCandidate {
         workspace_id,

@@ -15,6 +15,7 @@ mod pr_tests;
 mod push_tests;
 mod quarantine_tests;
 mod rebase_tests;
+mod reclaim_tests;
 mod reconcile_tests;
 mod release_tests;
 mod remove_tests;

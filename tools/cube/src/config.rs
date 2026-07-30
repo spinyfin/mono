@@ -126,6 +126,176 @@ impl UnhealthyGcConfig {
     }
 }
 
+/// Default per-repo high-water mark for *free* workspaces.
+///
+/// The pool has no cap on total workspaces and never will — a lease for a
+/// reachable repo always succeeds, and admission control is deliberately not
+/// how cube bounds disk (see [`PoolConfig`]). This mark is a GC target, not a
+/// gate: when a repo holds more free workspaces than this, pool GC trims the
+/// surplus back down to it. Leased workspaces do not count toward it and are
+/// never touched by it.
+///
+/// Twenty is sized off the observed steady state rather than the pathological
+/// one. The pool that triggered this work had grown to 520 mono workspaces,
+/// but the manual cleanup that recovered the machine left 51 across *three*
+/// repos and dispatch continued to work; peak concurrent leases observed was
+/// 35, of which 30 were orphans with no live agent. Twenty free per repo is
+/// therefore several times the warm capacity real dispatch draws on, while
+/// making a 500-entry pool structurally impossible.
+pub const DEFAULT_MAX_FREE_WORKSPACES: usize = 20;
+
+/// How long a workspace must have been idle before the *routine* pool GC pass
+/// will reclaim its build-artifact trees.
+///
+/// Compaction costs the next lease a cold build, so a workspace released
+/// minutes ago — and likely to be re-leased within the hour — keeps its cache.
+/// Six hours is well past the point where an incremental cache is still worth
+/// much (`main` has moved, dependencies with it) and well short of the 24h
+/// retention TTL. The urgent, disk-pressure pass ignores this window entirely:
+/// when the volume is near exhaustion a cold build is unambiguously cheaper
+/// than a full disk.
+pub const DEFAULT_COMPACT_IDLE_HOURS: u64 = 6;
+
+/// Absolute free-space floor below which a lease triggers reclamation.
+///
+/// 20 GiB is roughly one fully-built mono workspace (the largest observed
+/// `target/` was 20.93 GiB), so this is "less than one more worker's worth of
+/// headroom left".
+pub const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+/// Proportional free-space floor, as a percentage of the volume's total size.
+///
+/// Applied as `max(min_free_bytes, min_free_percent% of total)` so a large
+/// volume gets proportionally more headroom than a flat byte floor would give
+/// it: on the 1.8 TiB volume that filled to exhaustion, 2% is ~36 GiB.
+pub const DEFAULT_MIN_FREE_PERCENT: u64 = 2;
+
+/// Directory names, relative to a workspace root, treated as regenerable
+/// build output and reclaimed by compaction.
+///
+/// `target` is Cargo's; `.build` is SwiftPM's. Both are pure compiler output:
+/// deleting one costs a rebuild and nothing else, and neither is coupled to
+/// any state cube records.
+///
+/// `node_modules` is deliberately NOT here, though it is the obvious third
+/// candidate. It is an *installed dependency tree*, not build output: it needs
+/// the network to reconstruct, and cube's own `workspace_setup` table records
+/// install steps as completed, so removing it out from under that state leaves
+/// a workspace whose setup believes it already ran. It remains available via
+/// `[pool] build-artifact-dirs` for anyone who wants it.
+///
+/// Bazel's outputs need no entry at all: `bazel-out` and friends are symlinks
+/// into a single shared output base under `~/Library/Caches/bazel/`, so they
+/// occupy no meaningful space in the workspace tree — and compaction refuses
+/// to follow symlinks precisely so it can never delete through one into that
+/// shared cache.
+pub fn default_build_artifact_dirs() -> Vec<String> {
+    vec!["target".to_string(), ".build".to_string()]
+}
+
+/// Per-repo overrides for the free-workspace high-water mark.
+///
+/// mono, flunge and checkleft-sandbox have very different footprints (a built
+/// mono workspace is tens of GiB; checkleft-sandbox's whole shared store is
+/// 0.01 GiB), so the mark is per repo rather than one number for all of them.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct RepoPoolConfig {
+    /// Overrides [`PoolConfig::max_free_workspaces`] for this repo.
+    #[serde(rename = "max-free-workspaces")]
+    pub max_free_workspaces: Option<usize>,
+}
+
+/// Controls how pool GC bounds workspace disk usage.
+///
+/// Read this together with the deliberate absence of a cap on the *total*
+/// number of workspaces. cube grows the pool on demand and a lease for a
+/// reachable repo always succeeds; that is a design decision, not an
+/// oversight, and it stands. What was missing was the other half — nothing
+/// ever gave disk back. Every knob here is about reclamation, and the only
+/// one that can fail a call ([`Self::min_free_bytes`]) keys off the volume's
+/// actual free space, never off how many workspaces exist.
+#[derive(Debug, Clone, Default, Deserialize, bon::Builder)]
+#[builder(on(String, into))]
+#[serde(default)]
+pub struct PoolConfig {
+    /// Default per-repo high-water mark for free workspaces. See
+    /// [`DEFAULT_MAX_FREE_WORKSPACES`].
+    #[serde(rename = "max-free-workspaces")]
+    pub max_free_workspaces: Option<usize>,
+    /// Per-repo overrides, keyed by repo id (`[pool.repos.mono]`).
+    #[builder(default)]
+    pub repos: std::collections::HashMap<String, RepoPoolConfig>,
+    /// Directory names reclaimed by compaction. See
+    /// [`default_build_artifact_dirs`].
+    #[serde(rename = "build-artifact-dirs")]
+    pub build_artifact_dirs: Option<Vec<String>>,
+    /// Idle window before routine compaction touches a workspace. See
+    /// [`DEFAULT_COMPACT_IDLE_HOURS`].
+    #[serde(rename = "compact-idle-hours")]
+    pub compact_idle_hours: Option<u64>,
+    /// Absolute free-space floor. See [`DEFAULT_MIN_FREE_BYTES`].
+    #[serde(rename = "min-free-bytes")]
+    pub min_free_bytes: Option<u64>,
+    /// Proportional free-space floor. See [`DEFAULT_MIN_FREE_PERCENT`].
+    #[serde(rename = "min-free-percent")]
+    pub min_free_percent: Option<u64>,
+}
+
+impl PoolConfig {
+    /// The free-workspace high-water mark for `repo`: its own override, else
+    /// the configured default, else [`DEFAULT_MAX_FREE_WORKSPACES`].
+    ///
+    /// `CUBE_POOL_MAX_FREE_WORKSPACES` overrides the *default* only, so an
+    /// explicit per-repo entry still wins — the env var is an operator's
+    /// blunt instrument, not a way to silently retune one repo.
+    pub fn max_free_workspaces(&self, repo: &str) -> usize {
+        if let Some(per_repo) = self.repos.get(repo).and_then(|r| r.max_free_workspaces) {
+            return per_repo;
+        }
+        env_u64("CUBE_POOL_MAX_FREE_WORKSPACES")
+            .map(|v| v as usize)
+            .or(self.max_free_workspaces)
+            .unwrap_or(DEFAULT_MAX_FREE_WORKSPACES)
+    }
+
+    /// Directory names compaction reclaims, relative to a workspace root.
+    pub fn build_artifact_dirs(&self) -> Vec<String> {
+        self.build_artifact_dirs
+            .clone()
+            .unwrap_or_else(default_build_artifact_dirs)
+    }
+
+    /// Idle window, in seconds, before routine compaction touches a workspace.
+    pub fn compact_idle_secs(&self) -> i64 {
+        let hours = env_u64("CUBE_POOL_COMPACT_IDLE_HOURS")
+            .or(self.compact_idle_hours)
+            .unwrap_or(DEFAULT_COMPACT_IDLE_HOURS);
+        (hours as i64).saturating_mul(SECS_PER_HOUR)
+    }
+
+    /// The free-space floor for a volume of `total_bytes`:
+    /// `max(min_free_bytes, min_free_percent% of total)`.
+    ///
+    /// Below this, a lease reclaims before it does anything else; a mint that
+    /// still cannot clear it afterwards fails loudly rather than pushing the
+    /// volume over.
+    pub fn free_space_floor_bytes(&self, total_bytes: u64) -> u64 {
+        let absolute = env_u64("CUBE_POOL_MIN_FREE_BYTES")
+            .or(self.min_free_bytes)
+            .unwrap_or(DEFAULT_MIN_FREE_BYTES);
+        let percent = env_u64("CUBE_POOL_MIN_FREE_PERCENT")
+            .or(self.min_free_percent)
+            .unwrap_or(DEFAULT_MIN_FREE_PERCENT);
+        let proportional = total_bytes / 100 * percent.min(100);
+        absolute.max(proportional)
+    }
+}
+
+fn env_u64(key: &str) -> Option<u64> {
+    std::env::var(key).ok().and_then(|v| v.parse::<u64>().ok())
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct CubeConfig {
@@ -136,6 +306,8 @@ pub struct CubeConfig {
     /// Controls time-bounded reclaim of long-lived unhealthy free workspaces.
     #[serde(rename = "unhealthy-gc")]
     pub unhealthy_gc: UnhealthyGcConfig,
+    /// Controls how pool GC bounds workspace disk usage.
+    pub pool: PoolConfig,
 }
 
 /// Load cube user config from the standard config file path.
@@ -246,6 +418,56 @@ mod tests {
     fn unhealthy_gc_max_age_days_still_honoured_for_existing_configs() {
         let cfg: CubeConfig = toml::from_str("[unhealthy-gc]\nmax-age-days = 2\n").expect("parse");
         assert_eq!(cfg.unhealthy_gc.max_age_secs(), 48 * 3_600);
+    }
+
+    #[test]
+    fn pool_defaults_are_the_documented_ones() {
+        let pool = PoolConfig::default();
+        assert_eq!(pool.max_free_workspaces("mono"), DEFAULT_MAX_FREE_WORKSPACES);
+        assert_eq!(pool.compact_idle_secs(), DEFAULT_COMPACT_IDLE_HOURS as i64 * 3_600);
+        assert_eq!(pool.build_artifact_dirs(), vec!["target", ".build"]);
+    }
+
+    #[test]
+    fn node_modules_is_not_reclaimed_by_default() {
+        // It is an installed dependency tree coupled to cube's setup state,
+        // not compiler output — opt-in only. See `default_build_artifact_dirs`.
+        assert!(
+            !PoolConfig::default()
+                .build_artifact_dirs()
+                .contains(&"node_modules".to_string())
+        );
+    }
+
+    #[test]
+    fn per_repo_mark_overrides_the_default() {
+        let cfg: CubeConfig = toml::from_str(
+            "[pool]\n\
+             max-free-workspaces = 20\n\
+             [pool.repos.flunge]\n\
+             max-free-workspaces = 4\n",
+        )
+        .expect("parse");
+        assert_eq!(cfg.pool.max_free_workspaces("flunge"), 4);
+        // A repo with no entry falls back to the configured default.
+        assert_eq!(cfg.pool.max_free_workspaces("mono"), 20);
+    }
+
+    #[test]
+    fn free_space_floor_takes_the_larger_of_absolute_and_proportional() {
+        let pool = PoolConfig::default();
+        // 1.8 TiB: 2% (~36 GiB) dominates the 20 GiB absolute floor.
+        let large = 1_800 * 1024 * 1024 * 1024_u64;
+        assert_eq!(pool.free_space_floor_bytes(large), large / 100 * 2);
+        // 200 GiB: 2% is 4 GiB, so the absolute floor dominates.
+        let small = 200 * 1024 * 1024 * 1024_u64;
+        assert_eq!(pool.free_space_floor_bytes(small), DEFAULT_MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn free_space_floor_honours_explicit_config() {
+        let cfg: CubeConfig = toml::from_str("[pool]\nmin-free-bytes = 1024\nmin-free-percent = 0\n").expect("parse");
+        assert_eq!(cfg.pool.free_space_floor_bytes(1_000_000), 1024);
     }
 
     #[test]
