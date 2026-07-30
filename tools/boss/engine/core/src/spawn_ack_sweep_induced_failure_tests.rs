@@ -16,8 +16,8 @@
 //! `onSurfaceAttached`, and then runs the **real** sweeps in sequence:
 //!
 //! 1. [`crate::dead_pid_sweep`] — `kill(pid, 0)` finds the child alive, so
-//!    it declines to reap. (Named in the brief as the fallback for
-//!    grok-class drivers; insufficient on its own.)
+//!    it declines to reap. `dead_pid_sweep` is the nominal fallback for
+//!    grok-class drivers, and is insufficient on its own.
 //! 2. [`crate::live_worker_state::LiveWorkerStateRegistry::mark_stalled_spawns`]
 //!    — declines to promote, because grok omits
 //!    `Capability::AwaitingInputSignal`.
@@ -207,7 +207,7 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
         "gate 3: pass 1 must not be the thing that catches this",
     );
 
-    // ── Done-definition 1: detected, attention raised, both resources freed.
+    // ── Detected, attention raised, both resources freed.
     assert_eq!(
         outcome.driver_start_reaped, 1,
         "driver-start verification must detect the never-started driver",
@@ -260,10 +260,9 @@ async fn a_pane_hosting_only_a_live_login_shell_is_detected_and_fully_released()
 /// The control: the identical setup, with the one difference that the
 /// driver signalled. Nothing is touched.
 ///
-/// This is done-definition 3 stated as a test — the detection must not
-/// reap a working worker, and in particular a live shell pid is not what
-/// distinguishes the two cases. Both runs here have one; only the driver
-/// signal differs.
+/// The detection must not reap a working worker, and in particular a live
+/// shell pid is not what distinguishes the two cases. Both runs here have
+/// one; only the driver signal differs.
 #[tokio::test]
 async fn the_same_pane_with_a_driver_signal_is_left_completely_alone() {
     let shell = LiveShell::spawn();

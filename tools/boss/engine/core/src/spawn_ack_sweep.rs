@@ -104,15 +104,26 @@
 //!
 //! ## Why pass 2 raises an attention item and pass 1 does not
 //!
-//! Pass 1's failure is "the app's spawn path is misbehaving" — already
-//! aggregated across work items by [`crate::spawn_health`], which raises
-//! one loud attention item when the breaker trips rather than one per
-//! churned redispatch. Pass 2's failure is different in kind: a pane
+//! Both passes feed [`crate::spawn_health`] — the reap is shared, so every
+//! cause records evidence, records a failure against the work item, and can
+//! trip the spawn-capability breaker that pauses dispatch once enough
+//! DISTINCT work items fail inside the window. That is deliberate for a
+//! driver-start timeout too: a driver binary that cannot exec on this host
+//! fails identically for every work item routed to it, which is exactly the
+//! systemic shape the breaker exists to stop, and the alternative — reaping
+//! and redispatching forever without ever pausing — is the churn the breaker
+//! was built to end.
+//!
+//! What differs is *visibility*. Pass 1's failure is "the app's spawn path
+//! is misbehaving", and the breaker's one loud attention item on trip is a
+//! faithful summary of it. Pass 2's failure is different in kind: a pane
 //! genuinely came up and a live process was left holding a workspace with
-//! no driver in it. That is not self-evident from a redispatch, it is not
-//! visible anywhere else in the UI, and in the incident it went unnoticed
-//! precisely because nothing said anything. So it gets its own
-//! per-execution item ([`DRIVER_START_ATTENTION_KIND`]).
+//! no driver in it. A single aggregate item cannot name which workspace is
+//! still held, and a lone occurrence — the 2026-07-30 incident was one — is
+//! below any aggregate threshold and would surface nowhere at all. So pass 2
+//! additionally raises its own per-execution item
+//! ([`DRIVER_START_ATTENTION_KIND`]) on top of the aggregation, rather than
+//! instead of it.
 //!
 //! ## Cadence
 //!
@@ -657,6 +668,12 @@ pub(crate) async fn reap_never_started_spawn(
     // failure spreads across many work items, which the per-item churn guard
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
+    //
+    // All three causes feed it, driver-start timeouts included: a driver
+    // binary that cannot exec on this host fails the same way for every work
+    // item routed to it, so it belongs in the aggregate. Pass 2's own
+    // per-execution attention item above is additional to this, not a
+    // replacement for it — see the module doc.
     ctx.spawn_health
         .record_evidence(crate::spawn_health::SpawnFailureEvidence {
             execution_id: execution_id.to_owned(),
@@ -1479,7 +1496,7 @@ mod tests {
         );
     }
 
-    /// Done-definition 2: the detection must not inherit `mark_stalled_spawns`'s
+    /// The detection must not inherit `mark_stalled_spawns`'s
     /// `Capability::AwaitingInputSignal` exemption.
     ///
     /// Runs the identical scenario for a capability-declaring driver (claude)
@@ -1578,7 +1595,7 @@ mod tests {
         );
     }
 
-    /// Done-definition 3: no false positives. A worker whose driver DID start
+    /// No false positives: a worker whose driver DID start
     /// is never touched, however long it then runs without further events —
     /// the driver-start signal is first-write-wins and permanent.
     #[tokio::test]
@@ -1622,6 +1639,85 @@ mod tests {
         assert!(
             cube.released_lease_ids().is_empty(),
             "the cube lease must NOT be released out from under a working worker",
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+        assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
+    }
+
+    /// Re-adoption then sweep: the engine re-registers an already-running
+    /// worker, and the sweep must leave it entirely alone.
+    ///
+    /// `readopt_live_worker` restores the row to `waiting_human` and
+    /// re-registers the slot, which stamps `spawned_at` with the current
+    /// time for a process that has been running for however long. The
+    /// `redispatch_guard` trigger carries no driver-originated evidence at
+    /// all (it fires off a recorded-*shell*-pid probe), and a worker parked
+    /// at `waiting_human` emits no further hook by definition — so without
+    /// the re-adoption exemption nothing would ever supply the missing
+    /// proof and this pass would reap a live worker one grace window later:
+    /// pane killed by process group, workspace torn down, cube lease
+    /// force-released.
+    #[tokio::test]
+    async fn a_readopted_live_worker_is_not_reaped_as_a_never_started_driver() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        // Exactly what `readopt_live_worker` does for the pid-only trigger.
+        live_states.register_readoption(
+            1,
+            execution_id.as_str(),
+            "grok-4.5",
+            92697,
+            Some(WorkItemBinding {
+                work_item_id: work_item_id.clone(),
+                work_item_name: "test chore".to_owned(),
+                execution_id: execution_id.clone(),
+            }),
+            false,
+            crate::live_worker_state::LiveSpawnRouting::none(),
+            crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+        );
+        // Age the re-registration past every window under test.
+        live_states.set_spawn_time_for_test(
+            1,
+            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+        );
+        assert!(
+            live_states.driver_signal_at(1).is_none(),
+            "precondition: a pid-triggered re-adoption records no driver proof",
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "a re-adopted worker is not a spawn, so it has no driver start to verify",
+        );
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+            "the re-adopted execution must be left exactly as re-adoption restored it",
+        );
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the slot must NOT be released out from under a re-adopted worker",
+        );
+        assert!(
+            cube.released_lease_ids().is_empty(),
+            "the cube lease must NOT be force-released out from under a re-adopted worker",
         );
         assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
         assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));

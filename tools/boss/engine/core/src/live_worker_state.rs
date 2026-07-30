@@ -128,58 +128,80 @@ pub const STALE_ACTIVITY_DOWNGRADE_SECS: i64 = 30;
 /// Thread-safe registry of LiveWorkerState entries, keyed by slot id.
 #[derive(Default)]
 pub struct LiveWorkerStateRegistry {
-    inner: Mutex<Inner>,
+    /// Every live slot's complete record. One map, not several parallel
+    /// ones keyed by the same `u8`: a slot's whole footprint is
+    /// established by a single `insert` and torn down by a single
+    /// `remove`, so no registration or release site has to remember a
+    /// per-field lifecycle, and there is no failure mode where one table
+    /// keeps a stale entry a sibling table already dropped.
+    inner: Mutex<HashMap<u8, SlotEntry>>,
 }
 
-#[derive(Default, bon::Builder)]
-struct Inner {
-    by_slot: HashMap<u8, LiveWorkerState>,
-    /// Per-slot flag set when a `Notification` hook arrives, cleared on
-    /// the next `Stop`. Lets us turn a `Stop` into `WaitingForInput`
-    /// rather than `Idle` when claude is paused on a permission
-    /// prompt.
-    notification_pending: HashMap<u8, bool>,
-    /// Epoch-seconds timestamp recorded when `register_spawn` creates a
-    /// slot. Used by `mark_stalled_spawns` to detect workers that have
+/// One slot's full record: the wire-format state the app and `bossctl`
+/// render, plus the engine-side bookkeeping only the sweeps read.
+struct SlotEntry {
+    state: LiveWorkerState,
+    meta: SlotMeta,
+}
+
+/// Per-slot engine-side bookkeeping.
+///
+/// Deliberately kept out of [`LiveWorkerState`]: that struct is the wire
+/// format the app/bossctl consume, and none of these values has a UI
+/// consumer — only the sweeps'.
+///
+/// Builder-constructed per the repo's convention for structs past five
+/// fields. Only `spawned_at` and `awaiting_input_capable` are decided by
+/// the caller; the rest start at the one value a fresh entry can honestly
+/// hold (`bon` defaults the two `Option` fields to `None` on its own), so
+/// the construction site states exactly what it knows and nothing else.
+#[derive(bon::Builder)]
+struct SlotMeta {
+    /// Set when a `Notification` hook arrives, cleared on the next `Stop`.
+    /// Lets us turn a `Stop` into `WaitingForInput` rather than `Idle`
+    /// when claude is paused on a permission prompt.
+    #[builder(default = false)]
+    notification_pending: bool,
+    /// Epoch-seconds timestamp recorded when `register_spawn` creates the
+    /// entry. Used by `mark_stalled_spawns` to detect workers that have
     /// been stuck in `Spawning` without any hook event (the initial
     /// directory-trust prompt fires before `SessionStart`, so the normal
-    /// `Notification`→`WaitingForInput` path is never triggered for it).
-    spawned_at: HashMap<u8, i64>,
-    /// Per-slot [`ProgressFidelity`] tier declared by the driver running
-    /// this slot, set by [`LiveWorkerStateRegistry::set_progress_fidelity`]
-    /// after spawn. Consulted by `crate::stale_worker_sweep` to decide
-    /// whether — and at what threshold — cadence-based staleness applies to
-    /// this slot. Absent (no entry) defaults to [`ProgressFidelity::Rich`]
+    /// `Notification`→`WaitingForInput` path is never triggered for it),
+    /// and by `unverified_driver_starts` to age a spawn against
+    /// [`DRIVER_START_GRACE_SECS`].
+    spawned_at: i64,
+    /// [`ProgressFidelity`] tier declared by the driver running this slot,
+    /// set by [`LiveWorkerStateRegistry::set_progress_fidelity`] after
+    /// spawn. Consulted by `crate::stale_worker_sweep` to decide whether —
+    /// and at what threshold — cadence-based staleness applies to this
+    /// slot. `None` (never declared) reads as [`ProgressFidelity::Rich`]
     /// — today's only driver (Claude) and every existing call site that
     /// never sets this explicitly, so the default preserves current
-    /// behaviour unchanged. Deliberately kept out of [`LiveWorkerState`]
-    /// itself: that struct is the wire format the app/bossctl consume, and
-    /// this value has no UI consumer, only the sweep's.
+    /// behaviour unchanged.
     ///
     /// In-memory only, and not persisted or rehydrated anywhere: if the
-    /// engine restarts while a worker is alive, this map starts empty and
-    /// the slot re-defaults to `Rich` until the driver re-declares (which
-    /// today only happens at spawn, not on rehydrate). For a `Coarse`- or
-    /// `Minimal`-tier driver this silently re-enables cadence-based
-    /// staleness judgement for a slot the exemption was meant to protect —
-    /// a live worker mid-turn with no per-tool event can then be swept as
-    /// stale. No-op today (Claude is `Rich`), but a real gap for the first
-    /// non-`Rich` driver.
-    progress_fidelity: HashMap<u8, ProgressFidelity>,
-    /// Per-slot: does this run's driver declare
-    /// `Capability::AwaitingInputSignal`? Gates whether `apply_event`
-    /// trusts a `WorkerEvent::Notification` as a genuine "worker is
-    /// blocked on human input" signal.
+    /// engine restarts while a worker is alive, the registry starts empty
+    /// and the slot re-defaults to `Rich` until the driver re-declares
+    /// (which today only happens at spawn, not on rehydrate). For a
+    /// `Coarse`- or `Minimal`-tier driver this silently re-enables
+    /// cadence-based staleness judgement for a slot the exemption was
+    /// meant to protect — a live worker mid-turn with no per-tool event
+    /// can then be swept as stale. No-op today (Claude is `Rich`), but a
+    /// real gap for the first non-`Rich` driver.
+    progress_fidelity: Option<ProgressFidelity>,
+    /// Does this run's driver declare `Capability::AwaitingInputSignal`?
+    /// Gates whether `apply_event` trusts a `WorkerEvent::Notification` as
+    /// a genuine "worker is blocked on human input" signal.
     ///
-    /// Defaults to `true` via `register_spawn` (Claude is the only driver
-    /// in production today, and it provides the capability), so the ~30
+    /// Seeded `true` by `register_spawn` (Claude is the only driver in
+    /// production today, and it provides the capability), so the ~30
     /// existing test call sites keep working unchanged. Production spawn
     /// sites that resolve a real driver call
     /// `register_spawn_with_capabilities` instead, passing the resolved
     /// value directly so it can never be left at the default by a
     /// forgotten follow-up call — see that method's doc for why the honest
     /// default on absence is "never fake it", not a lower-fidelity guess.
-    awaiting_input_capable: HashMap<u8, bool>,
+    awaiting_input_capable: bool,
     /// Epoch-seconds timestamp of the first **driver-originated** signal
     /// observed for the slot's current run — the moment Boss gained
     /// positive evidence that the driver binary itself is running.
@@ -192,7 +214,7 @@ struct Inner {
     /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
     /// engine-side verdict. Treating it as proof of driver start would
     /// let the engine's own guesses vouch for a driver that never ran.
-    /// This map is written by exactly one method
+    /// This field is written by exactly one method
     /// ([`LiveWorkerStateRegistry::record_driver_signal`]) from exactly
     /// two call sites in the hook ingress — a real worker hook, and
     /// receipt of a `transcript_path` — so "has this driver started?"
@@ -205,7 +227,55 @@ struct Inner {
     /// the driver was never exec'd). Every check that treated a positive
     /// pid as evidence of a working worker is what the 2026-07-30
     /// incident walked through untouched.
-    driver_signal_at: HashMap<u8, i64>,
+    driver_signal_at: Option<i64>,
+    /// Whether this registration is one driver-start verification may
+    /// judge at all. See [`DriverStartExpectation`].
+    #[builder(default = DriverStartExpectation::EngineSpawned)]
+    driver_start_expectation: DriverStartExpectation,
+}
+
+/// Whether the engine is entitled to expect a driver start for a slot's
+/// current registration.
+///
+/// [`LiveWorkerStateRegistry::unverified_driver_starts`] asks "did the
+/// driver binary Boss launched ever come up?". That question presupposes
+/// Boss launched one, and one registration path does not launch anything:
+/// re-adoption ([`crate::app::ServerState`]'s convergence for a worker
+/// that outlived the execution the engine wrongly terminalized) registers
+/// a slot for a process that has been running, unobserved, for however
+/// long. Its `spawned_at` is the moment the engine noticed, not the moment
+/// anything exec'd, so aging that stamp answers a question nobody asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverStartExpectation {
+    /// The engine launched a driver for this registration and is owed
+    /// proof it came up. The normal spawn path.
+    EngineSpawned,
+    /// The registration re-adopted an already-running worker. Driver-start
+    /// verification does not apply; the convergence rules that already own
+    /// a running worker — `crate::dead_pid_sweep`, `crate::husk_pane_sweep`,
+    /// `crate::stale_worker_sweep` and `crate::orphan_sweep`'s redispatch
+    /// guard — judge it on evidence about the process that actually exists.
+    Readopted,
+}
+
+/// What Boss knows about a re-adopted worker at the moment it re-registers
+/// the slot. Passed to [`LiveWorkerStateRegistry::register_readoption`].
+///
+/// The two triggers differ in kind, and collapsing them would either
+/// discard real proof or manufacture it:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadoptionEvidence {
+    /// A worker hook arrived for a run the engine had already
+    /// terminalized. That is driver-originated proof of exactly the sort
+    /// [`LiveWorkerStateRegistry::record_driver_signal`] exists to record,
+    /// so re-adoption records it rather than throwing it away.
+    DriverHook,
+    /// Only a recorded shell pid was observed alive (`crate::durable_liveness`
+    /// probing the pid the app reported for the pane). That is evidence
+    /// about the *shell*, never about the driver — the exact conflation
+    /// `driver_signal_at` exists to prevent — so nothing is recorded as
+    /// driver proof.
+    LiveShellPid,
 }
 
 /// Which driver-originated signal proved the driver is running. Recorded
@@ -364,25 +434,23 @@ impl LiveWorkerStateRegistry {
         let kind = state.kind.clone();
         let work_item_id = state.work_item_id.clone();
 
+        // The whole entry — wire state and engine bookkeeping alike — is
+        // replaced in one `insert`. A recycled slot therefore cannot
+        // inherit *any* of the previous occupant's metadata. That is
+        // hygiene for `progress_fidelity` (a fresh occupant defaults to
+        // `Rich` until the spawn flow declares a tier) and load-bearing
+        // for `driver_signal_at`: a slot whose prior run had a healthy
+        // driver must never vouch for a new run whose driver never
+        // exec'd, which is precisely the "one process stands in for
+        // another" confusion that signal exists to remove.
+        let meta = SlotMeta::builder()
+            .spawned_at(boss_engine_utils::epoch_time::now_epoch_secs())
+            .awaiting_input_capable(awaiting_input_capable)
+            .build();
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let displaced = guard.by_slot.insert(slot_id, state);
-        guard.notification_pending.remove(&slot_id);
-        guard.awaiting_input_capable.insert(slot_id, awaiting_input_capable);
-        guard
-            .spawned_at
-            .insert(slot_id, boss_engine_utils::epoch_time::now_epoch_secs());
-        // A fresh occupant starts with no declared fidelity (defaults to
-        // Rich via `progress_fidelity_for_slot`) until the spawn flow calls
-        // `set_progress_fidelity` — never inherit the prior occupant's tier
-        // across a slot recycle.
-        guard.progress_fidelity.remove(&slot_id);
-        // Same reasoning, but load-bearing rather than hygienic: a
-        // recycled slot MUST NOT inherit the previous occupant's
-        // driver-start proof. Leaving it would let a slot whose prior
-        // run had a healthy driver vouch for a new run whose driver
-        // never exec'd — precisely the "one process stands in for
-        // another" confusion this signal exists to remove.
-        guard.driver_signal_at.remove(&slot_id);
+        let displaced = guard
+            .insert(slot_id, SlotEntry { state, meta })
+            .map(|prior| prior.state);
         drop(guard);
 
         tracing::info!(
@@ -419,14 +487,89 @@ impl LiveWorkerStateRegistry {
         }
     }
 
+    /// Register a slot for a worker that was **already running** before
+    /// the engine re-established tracking for it.
+    ///
+    /// Same registration as [`Self::register_spawn_with_capabilities`],
+    /// plus the two things re-adoption must not get wrong:
+    ///
+    /// 1. The entry is marked [`DriverStartExpectation::Readopted`], so
+    ///    [`Self::unverified_driver_starts`] leaves it alone. Registration
+    ///    stamps `spawned_at` with the current time — correct for a spawn,
+    ///    a fiction for a re-adoption, where the process may have been
+    ///    running for hours. Aging that fiction against
+    ///    [`DRIVER_START_GRACE_SECS`] would report a healthy long-running
+    ///    worker as a driver that never started and reap it: pane torn
+    ///    down (which signals the recorded shell pid's process *group*),
+    ///    workspace torn down, cube lease force-released. That is the
+    ///    incident re-adoption exists to prevent, re-created by the check
+    ///    meant to prevent a different one.
+    /// 2. When the re-adoption was triggered by a worker hook
+    ///    ([`ReadoptionEvidence::DriverHook`]) the driver signal is
+    ///    recorded, because that hook *is* driver-originated proof and
+    ///    discarding real evidence is never the safe default. A pid-only
+    ///    trigger ([`ReadoptionEvidence::LiveShellPid`]) records nothing:
+    ///    a live shell says nothing about the driver.
+    ///
+    /// Exists as its own method rather than a flag on the spawn
+    /// registration so the marking cannot be forgotten by a caller that
+    /// registers and then returns — the failure direction of forgetting it
+    /// is a live worker being killed.
+    #[allow(clippy::too_many_arguments)]
+    #[track_caller]
+    pub fn register_readoption(
+        &self,
+        slot_id: u8,
+        run_id: impl Into<String>,
+        model: impl Into<String>,
+        shell_pid: i32,
+        binding: Option<WorkItemBinding>,
+        awaiting_input_capable: bool,
+        routing: LiveSpawnRouting,
+        evidence: ReadoptionEvidence,
+    ) {
+        let run_id = run_id.into();
+        self.register_spawn_with_capabilities(
+            slot_id,
+            run_id.clone(),
+            model,
+            shell_pid,
+            binding,
+            awaiting_input_capable,
+            routing,
+        );
+        {
+            let mut guard = self.inner.lock().expect("registry mutex poisoned");
+            if let Some(entry) = guard.get_mut(&slot_id) {
+                entry.meta.driver_start_expectation = DriverStartExpectation::Readopted;
+            }
+        }
+        if evidence == ReadoptionEvidence::DriverHook {
+            self.record_driver_signal(&run_id, DriverSignalKind::HookEvent);
+        }
+        tracing::info!(
+            slot_id,
+            run_id = %run_id,
+            evidence = ?evidence,
+            "live-state registry: slot re-adopted for an already-running worker; \
+             driver-start verification does not apply to this registration",
+        );
+    }
+
     /// Declare the [`ProgressFidelity`] tier for `slot_id`'s driver. The
     /// spawn flow calls this right after `register_spawn` with the
     /// resolved driver's `progress_fidelity()`. Slots this is never called
     /// for (e.g. most tests) default to [`ProgressFidelity::Rich`] via
     /// [`Self::progress_fidelity_for_slot`].
+    ///
+    /// A no-op for a slot with no live entry, mirroring the other per-slot
+    /// setters: the tier belongs to the occupant, so there is nothing to
+    /// declare it against.
     pub fn set_progress_fidelity(&self, slot_id: u8, fidelity: ProgressFidelity) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.progress_fidelity.insert(slot_id, fidelity);
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.progress_fidelity = Some(fidelity);
+        }
     }
 
     /// The declared [`ProgressFidelity`] tier for `slot_id`, or
@@ -435,9 +578,8 @@ impl LiveWorkerStateRegistry {
     pub fn progress_fidelity_for_slot(&self, slot_id: u8) -> ProgressFidelity {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard
-            .progress_fidelity
             .get(&slot_id)
-            .copied()
+            .and_then(|entry| entry.meta.progress_fidelity)
             .unwrap_or(ProgressFidelity::Rich)
     }
 
@@ -475,18 +617,16 @@ impl LiveWorkerStateRegistry {
         self.inner
             .lock()
             .expect("registry mutex poisoned")
-            .awaiting_input_capable
             .get(&slot_id)
-            .copied()
+            .map(|entry| entry.meta.awaiting_input_capable)
             .unwrap_or(true)
     }
 
     pub fn set_awaiting_input_capable(&self, slot_id: u8, capable: bool) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        if !guard.by_slot.contains_key(&slot_id) {
-            return;
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.awaiting_input_capable = capable;
         }
-        guard.awaiting_input_capable.insert(slot_id, capable);
     }
 
     /// Drop the entry for `slot_id`. Called when the engine releases
@@ -504,12 +644,10 @@ impl LiveWorkerStateRegistry {
     pub fn release_slot(&self, slot_id: u8) {
         let caller = std::panic::Location::caller();
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let removed = guard.by_slot.remove(&slot_id);
-        guard.notification_pending.remove(&slot_id);
-        guard.awaiting_input_capable.remove(&slot_id);
-        guard.spawned_at.remove(&slot_id);
-        guard.progress_fidelity.remove(&slot_id);
-        guard.driver_signal_at.remove(&slot_id);
+        // One `remove` drops the slot's entire footprint — wire state and
+        // every piece of engine bookkeeping — so no field can outlive the
+        // occupant it describes.
+        let removed = guard.remove(&slot_id).map(|entry| entry.state);
         drop(guard);
 
         match removed {
@@ -535,7 +673,7 @@ impl LiveWorkerStateRegistry {
     /// by the topic publisher.
     pub fn snapshot(&self) -> Vec<LiveWorkerState> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        let mut out: Vec<LiveWorkerState> = guard.by_slot.values().cloned().collect();
+        let mut out: Vec<LiveWorkerState> = guard.values().map(|entry| entry.state.clone()).collect();
         out.sort_by_key(|s| s.slot_id);
         out
     }
@@ -546,10 +684,10 @@ impl LiveWorkerStateRegistry {
     /// `UpdateWorkerShellPid` after the libghostty surface initializes.
     pub fn update_shell_pid(&self, run_id: &str, shell_pid: i32) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        for state in guard.by_slot.values_mut() {
-            if state.run_id == run_id {
-                let slot_id = state.slot_id;
-                state.shell_pid = shell_pid;
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                let slot_id = entry.state.slot_id;
+                entry.state.shell_pid = shell_pid;
                 return Some(slot_id);
             }
         }
@@ -578,17 +716,13 @@ impl LiveWorkerStateRegistry {
     /// (a hook for a released or unknown run — a benign no-op).
     pub fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let slot_id = guard
-            .by_slot
-            .values()
-            .find(|state| state.run_id == run_id)
-            .map(|state| state.slot_id)?;
-        if guard.driver_signal_at.contains_key(&slot_id) {
+        let entry = guard.values_mut().find(|entry| entry.state.run_id == run_id)?;
+        let slot_id = entry.state.slot_id;
+        if entry.meta.driver_signal_at.is_some() {
             // Already proven; keep the first timestamp.
             return Some(slot_id);
         }
-        let now = boss_engine_utils::epoch_time::now_epoch_secs();
-        guard.driver_signal_at.insert(slot_id, now);
+        entry.meta.driver_signal_at = Some(boss_engine_utils::epoch_time::now_epoch_secs());
         drop(guard);
         tracing::info!(
             slot_id,
@@ -602,7 +736,14 @@ impl LiveWorkerStateRegistry {
     /// Whether a driver-originated signal has been recorded for `slot_id`.
     pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.driver_signal_at.get(&slot_id).copied()
+        guard.get(&slot_id).and_then(|entry| entry.meta.driver_signal_at)
+    }
+
+    /// Whether driver-start verification applies to `slot_id`'s current
+    /// registration. `None` for a slot with no live entry.
+    pub fn driver_start_expectation(&self, slot_id: u8) -> Option<DriverStartExpectation> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.get(&slot_id).map(|entry| entry.meta.driver_start_expectation)
     }
 
     /// Every live slot that has gone `threshold_secs` past its spawn
@@ -631,36 +772,48 @@ impl LiveWorkerStateRegistry {
     ///
     /// The result is that this check fires for every driver, with any
     /// capability set, in any activity, with or without a reported pid.
-    /// A slot with no recorded spawn time is skipped — it cannot be aged
-    /// — and that is a loud `warn`, not a silent pass, because a live
-    /// entry without a spawn stamp means the registry itself is
-    /// inconsistent and the check has no ground truth to work from.
+    ///
+    /// ## The one exemption, and why it is not a hole
+    ///
+    /// A slot registered by [`Self::register_readoption`] —
+    /// [`DriverStartExpectation::Readopted`] — is skipped. That path
+    /// re-registers a worker that was **already running**, so its
+    /// `spawned_at` records when the engine noticed the process, not when
+    /// anything exec'd; a worker re-adopted after six hours of work would
+    /// otherwise be 300 s "silent" the instant it was re-adopted and be
+    /// reaped for a driver start that happened long before Boss lost
+    /// track of it. The exemption is narrow in the way that matters: it
+    /// turns off *this* check only, and a re-adopted worker remains fully
+    /// owned by the rules that judge a process on evidence about the
+    /// process — `crate::dead_pid_sweep`, `crate::husk_pane_sweep`,
+    /// `crate::stale_worker_sweep`, and `crate::orphan_sweep`'s redispatch
+    /// guard, which is itself one of the two triggers that produce a
+    /// re-adoption. A re-adoption triggered by a worker hook additionally
+    /// carries a real `driver_signal_at`, so it would be skipped by the
+    /// first check above regardless.
+    ///
+    /// A slot whose `spawned_at` is in the future is skipped as too
+    /// recent, the same as any other in-window spawn.
     pub fn unverified_driver_starts(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<UnverifiedDriverStart> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
         let mut out = Vec::new();
-        for (slot_id, state) in guard.by_slot.iter() {
-            if guard.driver_signal_at.contains_key(slot_id) {
+        for (slot_id, entry) in guard.iter() {
+            if entry.meta.driver_signal_at.is_some() {
                 continue;
             }
-            let Some(&spawned_at) = guard.spawned_at.get(slot_id) else {
-                tracing::warn!(
-                    slot_id,
-                    run_id = %state.run_id,
-                    "driver-start check: live slot has no recorded spawn time; cannot age it, so \
-                     driver-start verification cannot run for this slot",
-                );
+            if entry.meta.driver_start_expectation == DriverStartExpectation::Readopted {
                 continue;
-            };
-            if spawned_at > cutoff {
+            }
+            if entry.meta.spawned_at > cutoff {
                 continue;
             }
             out.push(UnverifiedDriverStart {
                 slot_id: *slot_id,
-                run_id: state.run_id.clone(),
-                shell_pid: state.shell_pid,
-                silent_secs: now_epoch_secs.saturating_sub(spawned_at),
-                activity: state.activity,
+                run_id: entry.state.run_id.clone(),
+                shell_pid: entry.state.shell_pid,
+                silent_secs: now_epoch_secs.saturating_sub(entry.meta.spawned_at),
+                activity: entry.state.activity,
             });
         }
         out.sort_by_key(|c| c.slot_id);
@@ -675,10 +828,10 @@ impl LiveWorkerStateRegistry {
     /// immediately, without waiting for the next hook event.
     pub fn set_held(&self, run_id: &str, held: bool) -> Option<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        for state in guard.by_slot.values_mut() {
-            if state.run_id == run_id {
-                let slot_id = state.slot_id;
-                state.held = held;
+        for entry in guard.values_mut() {
+            if entry.state.run_id == run_id {
+                let slot_id = entry.state.slot_id;
+                entry.state.held = held;
                 return Some(slot_id);
             }
         }
@@ -690,9 +843,8 @@ impl LiveWorkerStateRegistry {
         self.inner
             .lock()
             .expect("registry mutex poisoned")
-            .by_slot
             .get(&slot_id)
-            .cloned()
+            .map(|entry| entry.state.clone())
     }
 
     /// Return the `run_id` of the non-terminal slot currently working on
@@ -702,8 +854,8 @@ impl LiveWorkerStateRegistry {
     pub fn run_id_for_work_item(&self, work_item_id: &str) -> Option<String> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard
-            .by_slot
             .values()
+            .map(|entry| &entry.state)
             .find(|state| !state.activity.is_terminal() && state.work_item_id.as_deref() == Some(work_item_id))
             .map(|state| state.run_id.clone())
     }
@@ -718,8 +870,8 @@ impl LiveWorkerStateRegistry {
     pub fn shell_pid_for_run(&self, run_id: &str) -> Option<i32> {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard
-            .by_slot
             .values()
+            .map(|entry| &entry.state)
             .find(|state| !state.activity.is_terminal() && state.run_id == run_id)
             .map(|state| state.shell_pid)
             .filter(|pid| *pid > 0)
@@ -738,9 +890,8 @@ impl LiveWorkerStateRegistry {
     pub fn is_run_live(&self, run_id: &str) -> bool {
         let guard = self.inner.lock().expect("registry mutex poisoned");
         guard
-            .by_slot
             .values()
-            .any(|state| state.run_id == run_id && !state.activity.is_terminal())
+            .any(|entry| entry.state.run_id == run_id && !entry.state.activity.is_terminal())
     }
 
     /// Apply a hook event to the state for `slot_id`. Returns `true`
@@ -756,15 +907,10 @@ impl LiveWorkerStateRegistry {
     pub fn apply_event(&self, slot_id: u8, event: &WorkerEvent) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let now = current_iso8601();
-        // Split-borrow `Inner` so we can mutate `by_slot` and
-        // `notification_pending` simultaneously.
-        let Inner {
-            by_slot,
-            notification_pending,
-            awaiting_input_capable,
-            ..
-        } = &mut *guard;
-        let Some(state) = by_slot.get_mut(&slot_id) else {
+        // The wire state and the per-slot bookkeeping this arm reads and
+        // writes now live in one entry, so a single lookup reaches both;
+        // `SlotEntry`'s fields split-borrow without a second map access.
+        let Some(SlotEntry { state, meta }) = guard.get_mut(&slot_id) else {
             return false;
         };
         let before = state.clone();
@@ -819,7 +965,7 @@ impl LiveWorkerStateRegistry {
             WorkerEvent::PreToolUse { tool_name, .. } => {
                 state.activity = WorkerActivity::Working;
                 state.current_tool = Some(tool_name.clone());
-                notification_pending.remove(&slot_id);
+                meta.notification_pending = false;
             }
             WorkerEvent::PostToolUse { .. } => {
                 state.current_tool = None;
@@ -837,14 +983,14 @@ impl LiveWorkerStateRegistry {
                 // guess: this is one of two places the "don't fake
                 // WaitingForInput" contract is enforced, the other being
                 // `mark_stalled_spawns`'s own `awaiting_input_capable` check.
-                if awaiting_input_capable.get(&slot_id).copied().unwrap_or(true) {
+                if meta.awaiting_input_capable {
                     state.activity = WorkerActivity::WaitingForInput;
                     state.current_tool = None;
-                    notification_pending.insert(slot_id, true);
+                    meta.notification_pending = true;
                 }
             }
             WorkerEvent::Stop { .. } => {
-                let was_pending = notification_pending.remove(&slot_id).unwrap_or(false);
+                let was_pending = std::mem::take(&mut meta.notification_pending);
                 state.current_tool = None;
                 state.activity = if was_pending {
                     WorkerActivity::WaitingForInput
@@ -877,7 +1023,7 @@ impl LiveWorkerStateRegistry {
                 // later the husk sweep retired five of them, killing live
                 // work. Keeping `current_tool` is what lets the corroboration
                 // guard see through a `SessionEnd` the process did not honor.
-                notification_pending.remove(&slot_id);
+                meta.notification_pending = false;
             }
         }
 
@@ -907,7 +1053,7 @@ impl LiveWorkerStateRegistry {
     /// the value the caller passed.
     pub fn set_live_status(&self, slot_id: u8, status: Option<String>) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let Some(state) = guard.by_slot.get_mut(&slot_id) else {
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
             return false;
         };
         match (&status, &state.live_status) {
@@ -954,7 +1100,7 @@ impl LiveWorkerStateRegistry {
     /// when the slot is torn down.
     pub fn set_recovery_status(&self, slot_id: u8, status: Option<String>) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let Some(state) = guard.by_slot.get_mut(&slot_id) else {
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
             return false;
         };
         if state.recovery_status == status {
@@ -969,7 +1115,7 @@ impl LiveWorkerStateRegistry {
     /// `true` if the entry actually changed.
     pub fn mark_errored(&self, slot_id: u8) -> bool {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let Some(state) = guard.by_slot.get_mut(&slot_id) else {
+        let Some(state) = guard.get_mut(&slot_id).map(|entry| &mut entry.state) else {
             return false;
         };
         if state.activity == WorkerActivity::Errored {
@@ -1041,15 +1187,9 @@ impl LiveWorkerStateRegistry {
     /// set before the threshold elapses; this method ignores them.
     pub fn mark_stalled_spawns(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<u8> {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        let Inner {
-            by_slot,
-            spawned_at,
-            awaiting_input_capable,
-            ..
-        } = &mut *guard;
         let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
         let mut changed = Vec::new();
-        for (slot_id, state) in by_slot.iter_mut() {
+        for (slot_id, SlotEntry { state, meta }) in guard.iter_mut() {
             if state.activity != WorkerActivity::Spawning {
                 continue;
             }
@@ -1058,7 +1198,7 @@ impl LiveWorkerStateRegistry {
                 // owns this slot, not the directory-trust-prompt path.
                 continue;
             }
-            if !awaiting_input_capable.get(slot_id).copied().unwrap_or(true) {
+            if !meta.awaiting_input_capable {
                 // This driver never declared `Capability::AwaitingInputSignal`,
                 // so — same "don't fake it" contract `apply_event` enforces on
                 // `Notification` — this sweep must not promote the slot either.
@@ -1074,10 +1214,7 @@ impl LiveWorkerStateRegistry {
                 // worker is past the startup phase; not our concern.
                 continue;
             }
-            let Some(&age_secs) = spawned_at.get(slot_id) else {
-                continue;
-            };
-            if age_secs > cutoff {
+            if meta.spawned_at > cutoff {
                 // Spawned too recently; give the worker more time.
                 continue;
             }
@@ -1121,7 +1258,8 @@ impl LiveWorkerStateRegistry {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
         let cutoff = iso8601_utc(now_epoch_secs.saturating_sub(threshold_secs));
         let mut changed = Vec::new();
-        for (slot_id, state) in guard.by_slot.iter_mut() {
+        for (slot_id, entry) in guard.iter_mut() {
+            let state = &mut entry.state;
             if state.activity != WorkerActivity::Spawning {
                 continue;
             }
@@ -1146,7 +1284,9 @@ impl LiveWorkerStateRegistry {
     #[cfg(test)]
     pub fn set_spawn_time_for_test(&self, slot_id: u8, epoch_secs: i64) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        guard.spawned_at.insert(slot_id, epoch_secs);
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.meta.spawned_at = epoch_secs;
+        }
     }
 
     /// Override `last_event_at` for `slot_id` to an arbitrary ISO-8601
@@ -1158,8 +1298,8 @@ impl LiveWorkerStateRegistry {
     #[cfg(test)]
     pub fn set_last_event_at_for_test(&self, slot_id: u8, last_event_at: impl Into<String>) {
         let mut guard = self.inner.lock().expect("registry mutex poisoned");
-        if let Some(state) = guard.by_slot.get_mut(&slot_id) {
-            state.last_event_at = Some(last_event_at.into());
+        if let Some(entry) = guard.get_mut(&slot_id) {
+            entry.state.last_event_at = Some(last_event_at.into());
         }
     }
 }
@@ -2277,6 +2417,84 @@ mod tests {
         let first = reg.driver_signal_at(1).unwrap();
         reg.record_driver_signal("run-a", DriverSignalKind::TranscriptPath);
         assert_eq!(reg.driver_signal_at(1), Some(first));
+    }
+
+    /// Register a re-adopted slot aged past `DRIVER_START_GRACE_SECS` —
+    /// the shape re-adoption always produces, because registration stamps
+    /// `spawned_at` with the current time for a process that has in fact
+    /// been running for however long.
+    fn aged_readopted_slot(reg: &LiveWorkerStateRegistry, slot: u8, run: &str, evidence: ReadoptionEvidence) {
+        reg.register_readoption(
+            slot,
+            run,
+            "grok-4.5",
+            92697,
+            None,
+            false,
+            LiveSpawnRouting::none(),
+            evidence,
+        );
+        reg.set_spawn_time_for_test(
+            slot,
+            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+        );
+    }
+
+    /// A worker re-adopted on a live shell pid alone has no driver-start
+    /// proof and never will — a worker parked at `waiting_human` emits no
+    /// further hook by definition. Aging its re-registration would reap a
+    /// live worker mid-work, which is the incident re-adoption exists to
+    /// prevent.
+    #[test]
+    fn a_readopted_slot_is_never_reported_as_a_never_started_driver() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_readopted_slot(&reg, 1, "run-a", ReadoptionEvidence::LiveShellPid);
+
+        assert_eq!(reg.driver_start_expectation(1), Some(DriverStartExpectation::Readopted));
+        assert!(
+            reg.driver_signal_at(1).is_none(),
+            "a live shell pid is not driver-start proof and must not be recorded as any",
+        );
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(
+            reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty(),
+            "driver-start verification does not apply to a registration that spawned nothing",
+        );
+    }
+
+    /// A hook arriving after the engine terminalized the run came from the
+    /// driver itself, so re-adoption records it rather than discarding it.
+    #[test]
+    fn a_hook_triggered_readoption_records_the_driver_signal() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_readopted_slot(&reg, 1, "run-a", ReadoptionEvidence::DriverHook);
+
+        assert!(
+            reg.driver_signal_at(1).is_some(),
+            "the hook that triggered the re-adoption IS driver-originated proof",
+        );
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty());
+    }
+
+    /// The exemption belongs to the registration, not the slot: recycling
+    /// the slot for a genuine spawn must restore verification.
+    #[test]
+    fn recycling_a_readopted_slot_for_a_real_spawn_restores_verification() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_readopted_slot(&reg, 1, "run-a", ReadoptionEvidence::LiveShellPid);
+
+        aged_slot_with_live_shell(&reg, 1, "run-b", false);
+
+        assert_eq!(
+            reg.driver_start_expectation(1),
+            Some(DriverStartExpectation::EngineSpawned)
+        );
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let found = reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].run_id, "run-b");
     }
 
     #[test]
