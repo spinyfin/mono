@@ -110,8 +110,12 @@ pub fn sanitize_run_id_for_home(run_id: &str) -> anyhow::Result<String> {
 /// Per-run container: holds `grok-home/` (`GROK_HOME`) and `process-home/` (`HOME`).
 pub fn grok_run_container_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     let safe = sanitize_run_id_for_home(run_id)?;
-    let container = grok_homes_root().join(safe);
+    // Resolve the root exactly once, then check containment against that same
+    // value — see the equivalent note in `codex::codex_home_for_run`. Two
+    // separate reads let a concurrent `GROK_HOMES_ROOT_ENV` change (tests
+    // only) fail the check for a valid run id.
     let root = grok_homes_root();
+    let container = root.join(safe);
     if !container.starts_with(&root) || container == root {
         bail!(
             "resolved Grok run container {} is not a strict child of homes root {}",

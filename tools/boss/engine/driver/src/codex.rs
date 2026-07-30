@@ -231,11 +231,17 @@ pub fn sanitize_run_id_for_home(run_id: &str) -> anyhow::Result<String> {
 /// the homes root (see [`sanitize_run_id_for_home`]).
 pub fn codex_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
     let safe = sanitize_run_id_for_home(run_id)?;
-    let home = codex_homes_root().join(safe);
+    // Resolve the root exactly once and check containment against that same
+    // value. Reading it twice made the check compare a home built from one
+    // root against a *re-read* root, so a concurrent change to
+    // `CODEX_HOMES_ROOT_ENV` between the two reads (only tests mutate it, via
+    // `test_support::codex_homes_override`) made this bail spuriously on a
+    // perfectly valid run id.
+    let root = codex_homes_root();
+    let home = root.join(safe);
     // Logical containment: a join of a single segment under an absolute root
     // always starts with that root; keep the check so a future root change
     // cannot silently open an escape.
-    let root = codex_homes_root();
     if !home.starts_with(&root) || home == root {
         bail!(
             "resolved CODEX_HOME {} is not a strict child of homes root {}",
@@ -1659,6 +1665,12 @@ mod tests {
         // Codex never reads `.codex/AGENTS.md` (verified with `codex debug
         // prompt-input`). Must route to `$CODEX_HOME/AGENTS.md`, not the
         // trait default (`<workspace>/<config_dir>/<agent_rules_filename>`).
+        // Pin the homes root for the whole assertion. Both sides resolve it
+        // from `CODEX_HOMES_ROOT_ENV`, so without the override a sibling test
+        // installing or dropping its own override between the two resolutions
+        // makes them disagree — the flake this test showed on CI.
+        let tmp = TempDir::new().unwrap();
+        let _homes = crate::test_support::codex_homes_override(&tmp.path().join("homes"));
         let driver = CodexDriver::default();
         let workspace = Path::new("/tmp/some-workspace");
         let destination = driver.agent_rules_destination(workspace, "run-agents-md-1");
