@@ -273,9 +273,9 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// shell pid once Ghostty has finished its asynchronous startup.
     var onSurfaceAttached: (() -> Void)?
     /// Called on the main actor when this session's libghostty surface
-    /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
-    /// post-sleep "no active display" condition, #800). Worker panes set
-    /// this to a closure that NACKs the spawn back to the engine
+    /// FAILS to create (`ghostty_surface_new` returned NULL — most often the
+    /// no-active-display condition, #800). Worker panes set this to a
+    /// closure that NACKs the spawn back to the engine
     /// (`report_worker_spawn_failed`) so it fails fast instead of waiting
     /// out the 60s spawn-ack timeout, and logs a durable diagnostic. Fired
     /// at most once per session — the host view dedupes — and never for a
@@ -291,12 +291,12 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// per-work-item guard never will. Misclassifying here is what let the
     /// 2026-07 no-active-display incident burn 818 executions across 79
     /// work items with the breaker never fed once.
-    /// Called once when `ghostty_surface_new` returns NULL. Carries the
-    /// measured host snapshot (and the input diagnostic block) taken at
-    /// rejection time so the durable spawn log cannot disagree with the
-    /// reason string if the display state changes moments later.
+    /// `environmental` is true only for a measured host-wide condition.
+    /// The snapshot and diagnostic are captured at rejection time so the
+    /// durable record cannot disagree with the NACK reason.
     var onSurfaceCreationFailed: ((
         _ reason: String,
+        _ environmental: Bool,
         _ host: HostDisplaySnapshot,
         _ diagnostic: String
     ) -> Void)?

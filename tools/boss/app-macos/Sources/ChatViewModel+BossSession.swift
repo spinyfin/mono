@@ -88,12 +88,15 @@ extension ChatViewModel {
     }
 
     /// Called by ContentView when a worker pane's libghostty surface fails to
-    /// create so no shell ever comes up (the post-sleep "no active display"
-    /// condition). NACKs the engine so it reaps the execution immediately and
-    /// feeds its spawn-capability circuit breaker, instead of waiting out the
-    /// 60s spawn-ack timeout.
-    func workerPaneSpawnFailed(runId: String, reason: String) {
+    /// create so no shell ever comes up (most often the no-active-display
+    /// condition). NACKs the engine so it acts immediately instead of waiting
+    /// out the 60s spawn-ack timeout.
+    ///
+    /// `environmental` decides what the engine does with the execution:
+    /// requeue it re-dispatchable (a measured host condition, nothing to do
+    /// with this work item) or terminalize it as `orphaned` (anything else).
+    func workerPaneSpawnFailed(runId: String, reason: String, environmental: Bool) {
         guard isAppSessionRegistered else { return }
-        engine.sendReportWorkerSpawnFailed(runId: runId, reason: reason)
+        engine.sendReportWorkerSpawnFailed(runId: runId, reason: reason, environmental: environmental)
     }
 }

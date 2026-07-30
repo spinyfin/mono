@@ -38,7 +38,7 @@ impl ServerState {
     /// Called whenever health-affecting state changes (dispatch pause/resume,
     /// etc.) so subscribed frontends update the health banner without polling
     /// or restarting.
-    pub async fn broadcast_engine_health(self: &Arc<Self>) {
+    pub async fn broadcast_engine_health(&self) {
         let report = build_engine_health_report(self);
         let envelope = FrontendEventEnvelope::push(FrontendEvent::EngineHealthResult { report });
         self.topic_broker.publish(TOPIC_ENGINE_HEALTH, envelope).await;

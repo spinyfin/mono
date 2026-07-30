@@ -22,21 +22,12 @@ import Foundation
 /// Fields other than `activeDisplayCount` are evidence (lock, asleep,
 /// online, and AppKit screen count), not a separate gate.
 struct HostDisplaySnapshot: Codable, Equatable, Sendable {
-    /// Displays CoreGraphics considers active — the set
-    /// `CVDisplayLinkCreateWithActiveCGDisplays` builds over.
     var activeDisplayCount: Int
-    /// Connected displays (may be non-zero while active is zero — asleep).
     var onlineDisplayCount: Int
-    /// `CGDisplayIsAsleep(CGMainDisplayID())`.
     var mainDisplayAsleep: Bool
-    /// `CGSSessionScreenIsLocked` — login session showing the lock screen.
     var sessionLocked: Bool
-    /// `kCGSSessionOnConsoleKey` — false when fast-user-switched away.
     var sessionOnConsole: Bool
-    /// AppKit `NSScreen.screens.count` (can disagree with CG; disagreement is a clue).
     var screenCount: Int
-    /// Whether AppKit still has a `NSScreen.main` — recorded as evidence only;
-    /// it can be true while activeDisplayCount is 0, so it must not drive attribution.
     var nsScreenMainNonNil: Bool
     private enum CodingKeys: String, CodingKey {
         case activeDisplayCount = "active_display_count"
@@ -48,7 +39,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         case nsScreenMainNonNil = "ns_screen_main_non_nil"
     }
 
-    /// One-line human summary for NACK reasons and log lines.
     var summary: String {
         "active_displays=\(activeDisplayCount) online_displays=\(onlineDisplayCount) "
             + "main_display_asleep=\(mainDisplayAsleep) session_locked=\(sessionLocked) "
@@ -56,7 +46,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
             + "ns_screen_main_non_nil=\(nsScreenMainNonNil)"
     }
 
-    /// Dictionary form for JSONL `surface_failed` extras (snake_case keys).
     var jsonObject: [String: Any] {
         [
             "active_display_count": activeDisplayCount,
@@ -69,11 +58,10 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         ]
     }
 
-    /// Read the live host state. Cheap (CG list sizing + session dict + AppKit).
     @MainActor
-    static func capture() -> HostDisplaySnapshot {
+    static func capture() -> Self {
         let session = CGSessionCopyCurrentDictionary() as? [String: Any] ?? [:]
-        return HostDisplaySnapshot(
+        return make(
             activeDisplayCount: displayCount(CGGetActiveDisplayList),
             onlineDisplayCount: displayCount(CGGetOnlineDisplayList),
             mainDisplayAsleep: CGDisplayIsAsleep(CGMainDisplayID()) != 0,
@@ -84,7 +72,6 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         )
     }
 
-    /// Pure helper for tests — builds a snapshot without touching the system.
     static func make(
         activeDisplayCount: Int,
         onlineDisplayCount: Int = 0,
@@ -93,8 +80,8 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         sessionOnConsole: Bool = true,
         screenCount: Int = 0,
         nsScreenMainNonNil: Bool = false
-    ) -> HostDisplaySnapshot {
-        HostDisplaySnapshot(
+    ) -> Self {
+        Self(
             activeDisplayCount: activeDisplayCount,
             onlineDisplayCount: onlineDisplayCount,
             mainDisplayAsleep: mainDisplayAsleep,
@@ -112,4 +99,30 @@ struct HostDisplaySnapshot: Codable, Equatable, Sendable {
         guard query(0, nil, &count) == .success else { return 0 }
         return Int(count)
     }
+}
+
+enum SpawnCapability {
+    enum Verdict: Equatable {
+        case canHostPane
+        case environmentUnavailable(reason: String)
+
+        var isBlocked: Bool {
+            if case .environmentUnavailable = self { return true }
+            return false
+        }
+    }
+
+    static func verdict(for snapshot: HostDisplaySnapshot) -> Verdict {
+        guard snapshot.activeDisplayCount == 0 else { return .canHostPane }
+        return .environmentUnavailable(
+            reason: "no active display, so libghostty cannot create a worker-pane surface; measured \(snapshot.summary). "
+                + "Clears automatically when a display becomes active again."
+        )
+    }
+
+    @MainActor
+    static func snapshot() -> HostDisplaySnapshot { HostDisplaySnapshot.capture() }
+
+    @MainActor
+    static func current() -> Verdict { verdict(for: snapshot()) }
 }

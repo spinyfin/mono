@@ -77,26 +77,23 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
         )
     }
 
-    /// Log that surface creation failed and no shell came up. `reason` mirrors
-    /// the NACK sent to the engine. When `host` is provided, its measured
-    /// fields are embedded as a nested `host` object so `bossctl logs spawn`
-    /// can show the rejected display precondition. When `diagnostic` is
-    /// provided, the rejected-input block (cwd, env, app handle) is stored
-    /// under `diagnostic` — production fd 2 is `/dev/null`, so this is the
-    /// durable place that block is readable.
+    /// Log a rejected surface with the measured host state and input diagnostic.
     func surfaceFailed(
         runId: String,
         reason: String,
-        host: HostDisplaySnapshot? = nil,
+        environmental: Bool,
+        host: HostDisplaySnapshot,
         diagnostic: String? = nil
     ) {
-        var extra: [String: Any] = ["reason": reason]
-        if let host {
-            extra["host"] = host.jsonObject
-        }
-        if let diagnostic {
-            extra["diagnostic"] = diagnostic
-        }
+        var extra: [String: Any] = ["reason": reason, "environmental": environmental]
+        extra["active_display_count"] = host.activeDisplayCount
+        extra["online_display_count"] = host.onlineDisplayCount
+        extra["main_display_asleep"] = host.mainDisplayAsleep
+        extra["session_locked"] = host.sessionLocked
+        extra["session_on_console"] = host.sessionOnConsole
+        extra["screen_count"] = host.screenCount
+        extra["host"] = host.jsonObject
+        if let diagnostic { extra["diagnostic"] = diagnostic }
         record(event: Self.eventSurfaceFailed, runId: runId, extra: extra)
     }
 

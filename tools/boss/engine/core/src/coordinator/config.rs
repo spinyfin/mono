@@ -66,6 +66,9 @@ impl ExecutionCoordinator {
         let host_adapter_provider: Arc<dyn HostAdapterProvider> =
             Arc::new(LocalHostAdapterProvider::new(Arc::clone(&host_adapter)));
         Self {
+            // No frontend to notify in this constructor's context; `app::server`
+            // registers the real sink via `set_health_notifier` at startup.
+            health_notifier: std::sync::Mutex::new(None),
             work_db,
             worker_pool,
             automation_pool: WorkerPool::new_automation(MAX_AUTOMATION_POOL_SIZE),
@@ -491,6 +494,7 @@ impl ExecutionCoordinator {
         drop(current);
         if changed {
             self.notify_pause_state_changed();
+            self.notify_health_changed();
         }
     }
 
@@ -505,6 +509,7 @@ impl ExecutionCoordinator {
         let was_paused = self.dispatch_pause.lock().unwrap().take().is_some();
         if was_paused {
             self.notify_pause_state_changed();
+            self.notify_health_changed();
         }
     }
 
@@ -514,6 +519,42 @@ impl ExecutionCoordinator {
     /// way to be sure they describe the same instant.
     pub fn dispatch_pause(&self) -> Option<DispatchPause> {
         self.dispatch_pause.lock().unwrap().clone()
+    }
+
+    /// Register the engine-health sink. Called once at startup by
+    /// `app::server`, after `ServerState` exists. Stored weakly — see the
+    /// field's doc comment for the reference cycle this avoids.
+    pub fn set_health_notifier(&self, notifier: std::sync::Weak<dyn crate::coordinator::EngineHealthNotifier>) {
+        *self.health_notifier.lock().unwrap() = Some(notifier);
+    }
+
+    /// Fire a health broadcast for a pause-state transition.
+    ///
+    /// Fire-and-forget on a detached task: `pause_dispatch` /
+    /// `resume_dispatch` are synchronous and are called from inside sweep
+    /// passes and RPC handlers, none of which should block on fanning a
+    /// push out to every connected frontend. A dropped notification is a
+    /// stale banner until the next transition or reconnect, never a stalled
+    /// pause — the state change itself has already been applied and
+    /// persisted by the caller.
+    ///
+    /// No-op when no notifier is registered, which is the case in every unit
+    /// test that constructs a bare coordinator (and outside a tokio runtime,
+    /// where `spawn` would panic).
+    fn notify_health_changed(&self) {
+        let Some(notifier) = self
+            .health_notifier
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return;
+        };
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        tokio::spawn(async move { notifier.broadcast_engine_health().await });
     }
 
     /// `true` when dispatch is globally paused.

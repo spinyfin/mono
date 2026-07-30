@@ -164,18 +164,44 @@ fn report_worker_spawn_failed_round_trips_with_expected_tag() {
     let original = FrontendRequest::ReportWorkerSpawnFailed {
         run_id: "exec_abc".to_owned(),
         reason: "ghostty_surface_new returned NULL (no active display)".to_owned(),
+        environmental: true,
     };
     let value = serde_json::to_value(&original).unwrap();
     assert_eq!(value["type"], "report_worker_spawn_failed");
     assert_eq!(value["run_id"], "exec_abc");
     assert_eq!(value["reason"], "ghostty_surface_new returned NULL (no active display)");
+    assert_eq!(value["environmental"], serde_json::json!(true));
 
     let json = serde_json::to_string(&original).unwrap();
     let parsed: FrontendRequest = serde_json::from_str(&json).unwrap();
     match parsed {
-        FrontendRequest::ReportWorkerSpawnFailed { run_id, reason } => {
+        FrontendRequest::ReportWorkerSpawnFailed {
+            run_id,
+            reason,
+            environmental,
+        } => {
             assert_eq!(run_id, "exec_abc");
             assert_eq!(reason, "ghostty_surface_new returned NULL (no active display)");
+            assert!(environmental);
+        }
+        other => panic!("wrong variant: {other:?}"),
+    }
+}
+
+/// A pre-#2579 app omits `environmental` entirely. It must decode as `false`
+/// — the historical orphan-the-execution behaviour — and never as `true`:
+/// silently requeueing a failure whose cause an old app could not classify
+/// would turn a real defect into an unbounded retry.
+#[test]
+fn report_worker_spawn_failed_defaults_environmental_to_false_for_old_apps() {
+    let json = r#"{"type":"report_worker_spawn_failed","run_id":"exec_abc","reason":"boom"}"#;
+    let parsed: FrontendRequest = serde_json::from_str(json).unwrap();
+    match parsed {
+        FrontendRequest::ReportWorkerSpawnFailed { environmental, .. } => {
+            assert!(
+                !environmental,
+                "an unclassified NACK must keep failing loudly, not be silently deferred"
+            );
         }
         other => panic!("wrong variant: {other:?}"),
     }
