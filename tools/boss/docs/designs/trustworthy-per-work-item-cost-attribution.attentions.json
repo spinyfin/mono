@@ -1,0 +1,49 @@
+[
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The design proposes two labelled views: `direct` (a row's own executions) and `inclusive` (direct + revision-child descendants), with board-level totals summing `direct` ONLY. A row's detail view would lead with `inclusive`. Revision children hold ~20% of cache-read and ~21% of output, so ignoring them under-counts a chore by that much, while summing `inclusive` board-wide double-counts that same slice. Confirm the semantics?",
+    "choices": [
+      "Yes — two views, detail leads with `inclusive`, board sums `direct` only (recommended)",
+      "Two views, but the detail view should lead with `direct` and show `inclusive` beside it",
+      "One view only — `direct` everywhere; accept the ~20% under-count on chores",
+      "One view only — `inclusive` everywhere; forbid board-level totals entirely"
+    ],
+    "anchor": "layer-4--roll-up-semantics"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "`pr_review` executions attach to the same work item (118 runs, 140M cache-read). The design counts them as spend but never blends them into a single number: every figure reports an `implementation` / `design` / `overhead` class split alongside the total. Confirm?",
+    "choices": [
+      "Yes — include, always with the three-way class split shown (recommended)",
+      "Include, but as a single blended total with no class split",
+      "Exclude `pr_review` and `automation_triage` from a work item's figure entirely",
+      "Include, but split only two ways: implementation vs everything-else"
+    ],
+    "anchor": "layer-4--roll-up-semantics"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "Where should the model rate table live? Rate changes are a human decision with money attached, so the design assumes version-controlled and code-reviewed rather than runtime-editable.",
+    "choices": [
+      "Version-controlled file in the repo, loaded by the engine — changes go through PR review (recommended)",
+      "A DB table editable at runtime via a `bossctl cost rates set` verb",
+      "Version-controlled file as the source of truth, with a runtime DB override for urgent corrections"
+    ],
+    "anchor": "layer-3--a-dated-rate-table-with-a-loud-failure-policy"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "When SOME runs on a work item are unpriceable (unknown model, no rate epoch, capture skipped), what should the row show? The design proposes showing the priced subtotal labelled as a floor, always adjacent to the coverage ratio.",
+    "choices": [
+      "Priced subtotal labelled a lower bound, with the coverage ratio always adjacent (recommended)",
+      "No figure at all unless every run on the row is priceable — refuse anything partial",
+      "Priced subtotal plus an estimated extrapolation over the unpriced runs, clearly marked as an estimate"
+    ],
+    "anchor": "layer-3--a-dated-rate-table-with-a-loud-failure-policy"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Entry 23 in the task breakdown records backfill of the ~4017 pre-instrumentation rows as PERMANENTLY rejected (the provider transcripts are deleted) rather than deferred work. It is tagged `deferred` only because that is the tag that keeps it visible without auto-starting it. Confirm it must never be materialised into a task?",
+    "anchor": "proposed-implementation-task-breakdown"
+  }
+]
