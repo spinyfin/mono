@@ -1325,6 +1325,20 @@ pub struct PrUrlCaptureFeed {
     pub command: String,
 }
 
+/// Extract the shell command string from a `pr_url_capture_feed` `tool_input`:
+/// Claude/Codex/Grok's `{ "command": "…" }` object shape, or a bare command
+/// string for a normaliser that puts free text directly on `tool_input`.
+/// Shared so the `command` key and bare-string fallback stay a single
+/// cross-driver convention rather than three copies that can drift.
+pub(crate) fn command_from_tool_input(tool_input: &serde_json::Value) -> String {
+    tool_input
+        .get("command")
+        .and_then(|v| v.as_str())
+        .or_else(|| tool_input.as_str())
+        .unwrap_or("")
+        .to_owned()
+}
+
 /// Default [`AgentDriver::pr_url_capture_feed`] body: Claude's PostToolUse
 /// Bash shape **and** the Codex-style bare-string shape produced when a
 /// stdout-JSONL normaliser maps `item.command` / `item.aggregated_output`
@@ -1350,12 +1364,7 @@ pub fn default_pr_url_capture_feed(
         return None;
     }
 
-    let command = tool_input
-        .get("command")
-        .and_then(|v| v.as_str())
-        .or_else(|| tool_input.as_str())
-        .unwrap_or("")
-        .to_owned();
+    let command = command_from_tool_input(tool_input);
 
     let output_text = if let Some(text) = tool_response.as_str() {
         // Codex `command_execution.aggregated_output` (and any other
