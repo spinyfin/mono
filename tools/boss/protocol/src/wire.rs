@@ -1815,22 +1815,35 @@ pub enum FrontendRequest {
     },
 
     /// App reports that a worker pane's shell never came up — the
-    /// libghostty surface failed to create (typically `ghostty_surface_new`
-    /// returning NULL when there is no active display after sleep/wake,
-    /// the #800 condition). This is the proactive NACK for the false-live
-    /// spawn: the spawn RPC was already answered `Ok(shell_pid: 0)`
-    /// synchronously because the surface is created asynchronously, so the
-    /// only way the engine learns the shell never started — short of the
-    /// 60s `spawn_ack_sweep` timeout — is this message. The engine reaps
-    /// the execution immediately (mirroring the sweep) and feeds its
-    /// spawn-capability circuit breaker, so a systemic post-wake failure
-    /// is caught in seconds instead of churning for hours. `reason` is a
-    /// short human-readable cause for the orphan record and diagnostics.
+    /// libghostty surface failed to create (`ghostty_surface_new` returned
+    /// NULL, the #800 condition). This is the proactive NACK for the
+    /// false-live spawn: the spawn RPC was already answered
+    /// `Ok(shell_pid: 0)` synchronously because the surface is created
+    /// asynchronously, so the only way the engine learns the shell never
+    /// started — short of the 60s `spawn_ack_sweep` timeout — is this
+    /// message. The engine reaps the execution immediately (mirroring the
+    /// sweep) and feeds its spawn-capability circuit breaker, so a systemic
+    /// failure is caught in seconds instead of churning for hours. `reason`
+    /// is a short human-readable cause for the diagnostics record.
     /// Fire-and-forget; no response expected. Only the registered app
     /// session may call this.
+    ///
+    /// `environmental` is the load-bearing field: `true` means the app
+    /// **measured** a host condition that makes surface creation impossible
+    /// for *any* work item (no active display — see
+    /// `SpawnCapability.evaluate()` app-side), so the failure says nothing
+    /// about the work item and the execution must be returned to the queue
+    /// re-dispatchable rather than terminalized. `false` (the default, and
+    /// what every pre-#2579 app sends) keeps the historical behaviour: the
+    /// execution is marked `orphaned` and the failure counts against the
+    /// work item's churn budget. Defaulting to `false` is deliberate — a
+    /// cause the app cannot positively identify as environmental must still
+    /// fail loudly, never be silently requeued.
     ReportWorkerSpawnFailed {
         run_id: String,
         reason: String,
+        #[serde(default)]
+        environmental: bool,
     },
 
     RequestExecution {

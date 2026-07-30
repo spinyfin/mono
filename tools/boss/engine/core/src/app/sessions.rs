@@ -499,7 +499,12 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
     let Dispatch {
         server_state, peer_pid, ..
     } = ctx;
-    let FrontendRequest::ReportWorkerSpawnFailed { run_id, reason } = req else {
+    let FrontendRequest::ReportWorkerSpawnFailed {
+        run_id,
+        reason,
+        environmental,
+    } = req
+    else {
         unreachable!()
     };
     if !server_state.authorize_rpc(RpcTier::AppOrBoss, peer_pid) {
@@ -567,12 +572,38 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
     );
 
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+    // A measured host condition is conclusive on its first report, so hold
+    // dispatch now rather than letting the breaker infer it from two more
+    // spawns.
+    //
+    // Ordered BEFORE the reap deliberately. The reap ends in
+    // `release_worker_and_kick`, and that kick would otherwise race the hold:
+    // the execution is requeued to `ready` moments earlier, so a scheduler
+    // pass slipping through the gap would redispatch it straight back into
+    // the same wall. Holding first makes the kick a no-op and the row simply
+    // waits. Holding on a host condition is correct independently of whether
+    // the reap that follows succeeds — the host cannot spawn either way.
+    if environmental {
+        crate::spawn_health::hold_dispatch_for_host_environment(
+            server_state.work_db.as_ref(),
+            server_state.execution_coordinator.as_ref(),
+            server_state.dispatch_events.as_ref(),
+            &run_id,
+            &execution.work_item_id,
+            &reason,
+            now_epoch_secs,
+        )
+        .await;
+    }
     crate::spawn_ack_sweep::reap_never_started_spawn(
         &spawn_reap_ctx(&server_state),
         &execution,
         state.slot_id,
         state.shell_pid,
-        crate::spawn_ack_sweep::ReapCause::AppNack { reason: &reason },
+        crate::spawn_ack_sweep::ReapCause::AppNack {
+            reason: &reason,
+            environmental,
+        },
         now_epoch_secs,
     )
     .await;
@@ -859,6 +890,13 @@ mod tests {
     }
 
     async fn call_nack(server_state: &Arc<ServerState>, run_id: &str) {
+        call_nack_with(server_state, run_id, false).await;
+    }
+
+    /// `environmental` picks between the two NACK dispositions: `false` is
+    /// the historical orphan-and-count-against-churn path, `true` is the
+    /// measured-host-condition path that must instead requeue.
+    async fn call_nack_with(server_state: &Arc<ServerState>, run_id: &str, environmental: bool) {
         let sink = make_session_sink();
         let ctx = dispatch_ctx(server_state, &sink);
         handle_report_worker_spawn_failed(
@@ -866,6 +904,7 @@ mod tests {
             FrontendRequest::ReportWorkerSpawnFailed {
                 run_id: run_id.to_owned(),
                 reason: "test-nack".to_owned(),
+                environmental,
             },
         )
         .await;

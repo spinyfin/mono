@@ -78,10 +78,24 @@ final class SpawnDiagnosticsLog: @unchecked Sendable {
     }
 
     /// Log that surface creation failed and no shell came up — the
-    /// post-sleep/wake false-live spawn. `reason` mirrors the NACK sent to the
-    /// engine.
-    func surfaceFailed(runId: String, reason: String) {
-        record(event: Self.eventSurfaceFailed, runId: runId, extra: ["reason": reason])
+    /// false-live spawn. `reason` mirrors the NACK sent to the engine.
+    ///
+    /// The measured `host` snapshot is recorded as flat fields alongside it.
+    /// Before this, the record carried only the reason string — and that
+    /// string was a hardcoded guess ("likely no active display after
+    /// sleep/wake"), so the durable diagnostic asserted a cause nobody had
+    /// measured. A future incident greps these fields to distinguish "no
+    /// display was attached", "the display was asleep" and "the session was
+    /// locked" without re-running the investigation.
+    func surfaceFailed(runId: String, reason: String, environmental: Bool, host: HostDisplaySnapshot) {
+        var extra: [String: Any] = ["reason": reason, "environmental": environmental]
+        extra["active_display_count"] = host.activeDisplayCount
+        extra["online_display_count"] = host.onlineDisplayCount
+        extra["main_display_asleep"] = host.mainDisplayAsleep
+        extra["session_locked"] = host.sessionLocked
+        extra["session_on_console"] = host.sessionOnConsole
+        extra["screen_count"] = host.screenCount
+        record(event: Self.eventSurfaceFailed, runId: runId, extra: extra)
     }
 
     private func record(event: String, runId: String, extra: [String: Any]) {
