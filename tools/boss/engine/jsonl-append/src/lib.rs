@@ -3,10 +3,18 @@
 //! A JSONL writer that issues a record's body and its trailing newline as
 //! two separate `write()` calls is corruptible under concurrency: `O_APPEND`
 //! makes each individual `write()` atomic, but not the *pair* of them, so
-//! two interleaved appenders can produce `bodyAbodyB\n\n` on disk instead of
-//! two well-formed lines. This is exactly the defect that motivated this
-//! crate — see the dispatch-events sink, `boss-dispatch-events`, which used
-//! to reimplement JSONL appending inline with that two-write bug.
+//! two concurrent appenders *in the same process* can produce `bodyAbodyB\n\n`
+//! on disk instead of two well-formed lines. This is exactly the defect that
+//! motivated this crate — see the dispatch-events sink, `boss-dispatch-events`,
+//! which used to reimplement JSONL appending inline with that two-write bug.
+//!
+//! That is the *measured* cause, not a hypothesis. Every damaged row in the
+//! rotated `dispatch-events` segment that motivated this work is that one
+//! shape — two complete, well-formed records concatenated with no newline
+//! between them, followed by a stray blank line — with zero torn or truncated
+//! records, and the pairs mix worker slots belonging to a single engine's
+//! pool. The fix is to fold the newline into the same buffer as the body
+//! (`line.push(b'\n')` below) and issue exactly one `write_all`.
 //!
 //! [`JsonlAppender`] fixes this by serializing every append — across all
 //! paths, and across every [`JsonlAppender`] instance, since the lock is a
@@ -30,9 +38,17 @@
 //! Each [`JsonlAppender::append`] call opens, writes, and closes.
 //!
 //! This utility serializes writers **within one process**. It does not
-//! provide cross-process exclusion (that needs a real file lock, e.g.
-//! `flock`) — `tools/boss/event-shim` already does that correctly for its
-//! own multi-process use case and is not a caller of this crate.
+//! provide cross-process exclusion, and does not need to: the dispatch-event
+//! stream has exactly one writer process by construction. The engine refuses
+//! to start at all if a live process already holds `<state_root>/events.sock`
+//! (`tools/boss/engine/core/src/app/server.rs:368-390`) — the probe is derived
+//! from the state root, so a different `--socket-path` does not evade it, and
+//! it fires before the event sink is constructed. `bossctl` only reads these
+//! files. Anything that appends to a Boss `.jsonl` from a second process is
+//! outside this crate's contract and must not.
+//!
+//! (`tools/boss/event-shim` does take a real `flock` for its own genuinely
+//! multi-process buffer, and is not a caller of this crate.)
 
 use std::io;
 use std::path::{Path, PathBuf};

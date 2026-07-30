@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use boss_engine::dispatch_events::DispatchEvent;
-use boss_engine::dispatch_reader::{self, is_terminal_event};
+use boss_engine::dispatch_reader::{self, DamagedLine, is_terminal_event};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -73,6 +73,21 @@ impl Severity {
 #[builder(on(String, into))]
 pub struct Finding {
     pub sig_id: String,
+    /// True when this finding's conclusion rests on an event NOT being present
+    /// in the timeline (rather than on the events that ARE there).
+    ///
+    /// Deliberately a field every construction site must set, not a lookup
+    /// table keyed on `sig_id`: a table is something a new signature can be
+    /// added without updating, which is the same "proceeds as if nothing is
+    /// missing" failure this whole surface exists to remove. Declaring it wrong
+    /// is possible; declaring it by accident is not.
+    ///
+    /// When it is set and the stream had unreadable records overlapping the
+    /// finding's window, `run_diagnose` marks the finding unreliable rather
+    /// than presenting it as fact — see
+    /// [`crate::stream_integrity::ABSENCE_CAVEAT`].
+    #[builder(default)]
+    pub absence_based: bool,
     pub severity: Severity,
     pub title: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -297,6 +312,11 @@ fn match_sig1_worker_claimed_stall(events: &[DispatchEvent], now_ms: u128, scope
         }
         out.push(Finding {
             sig_id: "SIG-1".into(),
+            // "This stage stalled" is entirely a claim about what did NOT
+            // follow it: the last real event is non-terminal and nothing came
+            // after. An unreadable record in the gap could be the very event
+            // that moved the stage on.
+            absence_based: true,
             severity,
             title: "Persistent worker_claimed stall".into(),
             execution_id: Some(exec_id),
@@ -384,6 +404,7 @@ fn match_sig2_redundant_spawn_zombie(
             let sample = blocked_in_scope[0];
             out.push(Finding {
                 sig_id: "SIG-2".into(),
+                absence_based: false,
                 severity: Severity::Info,
                 title: "redundant_spawn supersede (normal path unless target is zombie)".into(),
                 execution_id: Some(sample.execution_id.clone()),
@@ -424,6 +445,7 @@ fn match_sig2_redundant_spawn_zombie(
         }
         out.push(Finding {
             sig_id: "SIG-2".into(),
+            absence_based: false,
             severity,
             title: "redundant_spawn zombie (recurring live_execution_id)".into(),
             execution_id: Some(live_id.clone()),
@@ -477,6 +499,7 @@ fn match_sig3_info(events: &[DispatchEvent], scope: &BTreeSet<String>) -> Vec<Fi
     if pool_exhausted > 0 {
         out.push(Finding {
             sig_id: "SIG-3a".into(),
+            absence_based: false,
             severity: Severity::Info,
             title: "pool_exhausted capacity pressure (not a claim leak)".into(),
             execution_id: None,
@@ -496,6 +519,7 @@ fn match_sig3_info(events: &[DispatchEvent], scope: &BTreeSet<String>) -> Vec<Fi
     if !reconciles.is_empty() {
         out.push(Finding {
             sig_id: "SIG-3b".into(),
+            absence_based: false,
             severity: Severity::Info,
             title: "pool_claim_reconcile (engine already reaped a stuck claim)".into(),
             execution_id: reconciles.first().map(|e| e.execution_id.clone()),
@@ -535,6 +559,7 @@ fn match_sig4_spawn_ack_timeout(events: &[DispatchEvent], scope: &BTreeSet<Strin
         // Do NOT match bare shell_pid==0 without this stage.
         out.push(Finding {
             sig_id: "SIG-4".into(),
+            absence_based: false,
             severity: Severity::P1,
             title: "spawn_ack_timeout with shell_pid=0 (never-started worker)".into(),
             execution_id: Some(event.execution_id.clone()),
@@ -659,6 +684,7 @@ fn match_sig6_lease_timeout(
             let severity = if fleetish { Severity::P0 } else { Severity::P1 };
             Finding {
                 sig_id: "SIG-6".into(),
+                absence_based: false,
                 severity,
                 title: "cube workspace lease timeout".into(),
                 execution_id: Some(exec_id),
@@ -727,6 +753,7 @@ fn match_sig_a_untracked_lease(
             let severity = if with_sig2 { Severity::P0 } else { Severity::P1 };
             Finding {
                 sig_id: "SIG-A".into(),
+                absence_based: false,
                 severity,
                 title: "Untracked-lease heartbeat storm".into(),
                 execution_id: Some(exec_id),
@@ -765,6 +792,7 @@ fn match_sig_b_slot_busy(events: &[DispatchEvent], scope: &BTreeSet<String>) -> 
         }
         out.push(Finding {
             sig_id: "SIG-B".into(),
+            absence_based: false,
             severity: Severity::P1,
             title: "SlotBusy spawn collision (slot desync, not capacity)".into(),
             execution_id: Some(event.execution_id.clone()),
@@ -835,6 +863,7 @@ fn match_sig_h_husk_breaker_wedge(
 
     vec![Finding {
         sig_id: "SIG-H".into(),
+        absence_based: false,
         severity: if scoped_slot_busy { Severity::P0 } else { Severity::P1 },
         title: "Husk-retirement circuit breaker is wedging worker slots".into(),
         execution_id: held_back.first().map(|e| e.execution_id.clone()),
@@ -895,6 +924,7 @@ fn match_sig_c_historical_autobind(events: &[DispatchEvent], scope: &BTreeSet<St
     }
     vec![Finding {
         sig_id: "SIG-C".into(),
+        absence_based: false,
         severity: Severity::Info,
         title: "Historical auto-bind deleted-row storm (forensic only)".into(),
         execution_id: hits.first().map(|e| e.execution_id.clone()),
@@ -928,6 +958,7 @@ fn match_sig_d_transient_exhausted(events: &[DispatchEvent], scope: &BTreeSet<St
         let class = event.details.get("class").and_then(|v| v.as_str()).unwrap_or("");
         out.push(Finding {
             sig_id: "SIG-D".into(),
+            absence_based: false,
             severity: Severity::P1,
             title: format!("transient_recovery_exhausted ({reason}/{class})"),
             execution_id: Some(event.execution_id.clone()),
@@ -960,6 +991,7 @@ fn match_sig_e_spawn_nack(events: &[DispatchEvent], scope: &BTreeSet<String>) ->
         }
         out.push(Finding {
             sig_id: "SIG-E".into(),
+            absence_based: false,
             severity: Severity::P2,
             title: "spawn_nack / libghostty surface failure".into(),
             execution_id: Some(event.execution_id.clone()),
@@ -994,6 +1026,7 @@ fn match_sig_f_worker_parse(events: &[DispatchEvent], scope: &BTreeSet<String>) 
         }
         out.push(Finding {
             sig_id: "SIG-F".into(),
+            absence_based: false,
             severity: Severity::P2,
             title: "Worker-id parse failure".into(),
             execution_id: Some(event.execution_id.clone()),
@@ -1089,6 +1122,11 @@ fn match_sig4b_hook_after_terminal(
         let run_id = fields.get("run_id").and_then(|v| v.as_str()).map(str::to_owned);
         out.push(Finding {
             sig_id: "SIG-4b".into(),
+            // The recovery text tells the reader to conclude from the absence
+            // of a paired `live_worker_readopted` / `husk_pane_reconcile` that
+            // the convergence path did not run. That inference is only as sound
+            // as the stream's completeness.
+            absence_based: true,
             severity: Severity::P2,
             title: "Hook after terminal (ack-timeout / stale-reap contradiction)".into(),
             execution_id: run_id,
@@ -1151,6 +1189,7 @@ fn match_sig5_queue_side(
         // Prefer structured field match; message prefix is corroboration only.
         out.push(Finding {
             sig_id: sig_id.into(),
+            absence_based: false,
             severity: Severity::P1,
             title: title.into(),
             execution_id: fields.get("execution_id").and_then(|v| v.as_str()).map(str::to_owned),
@@ -1191,6 +1230,7 @@ fn match_sig_g_scheduler_wakeup(
             .unwrap_or_default();
         out.push(Finding {
             sig_id: "SIG-G".into(),
+            absence_based: false,
             severity: Severity::P1,
             title: "Scheduler wakeup drop".into(),
             execution_id: exec_ids.first().cloned(),
@@ -1262,8 +1302,13 @@ pub fn resolve_diagnose_scope(
         }
     }
 
-    // Fallback: scan current.jsonl for matching work_item_id.
-    let events = dispatch_reader::read_current(root).unwrap_or_default();
+    // Fallback: scan current.jsonl for matching work_item_id. Damage is
+    // deliberately discarded here — this is id resolution, not evidence, and
+    // the same file is read again (with its integrity reported) by
+    // `run_diagnose` moments later.
+    let events = dispatch_reader::read_current(root)
+        .unwrap_or_default()
+        .into_events_ignoring_damage();
     let mut execs: BTreeSet<String> = BTreeSet::new();
     for event in &events {
         if event.work_item_id.as_deref() == Some(id) {
@@ -1297,29 +1342,90 @@ pub struct WorkItemResolution {
     pub execution_ids: Vec<String>,
 }
 
+/// Events for a diagnose scope, together with which files they came from could
+/// not be read in full.
+///
+/// Damage is kept split by source rather than pooled, because the two sources
+/// mean different things for a single execution's timeline. A per-execution
+/// mirror holds only that execution's records, so damage in it is unambiguously
+/// damage to that timeline. `current.jsonl` is the whole fleet's stream, so a
+/// damaged line in it belongs to *some* execution — only when a timeline was
+/// reconstructed from it (its mirror was missing or pruned) is that damage
+/// definitely this timeline's. Pooling the two would either over-attribute
+/// fleet damage to every execution or under-attribute real mirror damage.
+#[derive(Debug, Clone, Default)]
+pub struct ScopeEvents {
+    pub events: Vec<DispatchEvent>,
+    /// Damage in each execution's own mirror, keyed by execution id.
+    pub mirror_damage: BTreeMap<String, Vec<DamagedLine>>,
+    /// Damage in the flat `current.jsonl` stream.
+    pub flat_damage: Vec<DamagedLine>,
+    /// Executions whose timeline had to be reconstructed from the flat stream,
+    /// making `flat_damage` their timeline's damage too.
+    pub reconstructed_from_flat: BTreeSet<String>,
+    /// Executions this load actually covered, i.e. the ones for which
+    /// [`ScopeEvents::damage_for`] is an answer rather than a default. An
+    /// execution outside this set (a `live_execution_id` pulled in by the fleet
+    /// scan, say) has no mirror read for it, so an empty `damage_for` must not be
+    /// mistaken for "its timeline is intact".
+    pub covered: BTreeSet<String>,
+}
+
+impl ScopeEvents {
+    /// Damage that bears on `execution_id`'s own timeline.
+    pub fn damage_for(&self, execution_id: &str) -> Vec<DamagedLine> {
+        let mut out = self.mirror_damage.get(execution_id).cloned().unwrap_or_default();
+        if self.reconstructed_from_flat.contains(execution_id) {
+            out.extend(self.flat_damage.iter().cloned());
+        }
+        out
+    }
+
+    /// True when this load read `execution_id`'s own dispatch source, so
+    /// [`ScopeEvents::damage_for`] is authoritative for it.
+    pub fn covers(&self, execution_id: &str) -> bool {
+        self.covered.contains(execution_id)
+    }
+
+    /// Every damaged line seen while loading the scope.
+    pub fn all_damage(&self) -> Vec<DamagedLine> {
+        let mut out: Vec<DamagedLine> = self.mirror_damage.values().flatten().cloned().collect();
+        out.extend(self.flat_damage.iter().cloned());
+        out
+    }
+}
+
 /// Load dispatch events for the scope: prefer per-exec mirrors; for any
 /// execution whose mirror is missing/pruned (empty), reconstruct that
 /// execution from `current.jsonl`. Partial mirror sets still get filled —
 /// not only when *all* mirrors are empty.
-pub fn load_scope_events(root: &Path, scope: &DiagnoseScope) -> Result<Vec<DispatchEvent>> {
-    let mut all = Vec::new();
+pub fn load_scope_events(root: &Path, scope: &DiagnoseScope) -> Result<ScopeEvents> {
+    let mut loaded = ScopeEvents::default();
     let mut missing_execs: BTreeSet<String> = BTreeSet::new();
+    loaded.covered = scope.execution_ids.iter().cloned().collect();
     for exec_id in &scope.execution_ids {
-        let events = dispatch_reader::read_execution(root, exec_id)?;
-        if events.is_empty() {
+        let read = dispatch_reader::read_execution(root, exec_id)?;
+        if !read.damage.is_empty() {
+            loaded.mirror_damage.insert(exec_id.clone(), read.damage);
+        }
+        if read.events.is_empty() {
             missing_execs.insert(exec_id.clone());
         }
-        all.extend(events);
+        loaded.events.extend(read.events);
     }
     if missing_execs.is_empty() {
-        return Ok(all);
+        return Ok(loaded);
     }
 
     // Some (or all) per-exec mirrors missing/pruned — reconstruct those
-    // executions from the flat current.jsonl stream.
+    // executions from the flat current.jsonl stream. Its damage now bears on
+    // those timelines, since it is the only record of them we have.
     let current = dispatch_reader::read_current(root)?;
-    let mirrors_all_empty = all.is_empty();
+    loaded.flat_damage = current.damage;
+    loaded.reconstructed_from_flat = missing_execs.clone();
+    let mirrors_all_empty = loaded.events.is_empty();
     let mut from_current: Vec<DispatchEvent> = current
+        .events
         .into_iter()
         .filter(|e| {
             missing_execs.contains(e.execution_id.as_str())
@@ -1331,29 +1437,37 @@ pub fn load_scope_events(root: &Path, scope: &DiagnoseScope) -> Result<Vec<Dispa
         })
         .collect();
     if from_current.is_empty() {
-        return Ok(all);
+        return Ok(loaded);
     }
     if mirrors_all_empty {
-        return Ok(from_current);
+        loaded.events = from_current;
+        return Ok(loaded);
     }
     // Merge: keep present mirrors, add reconstructed events for missing execs
     // (dedupe by ts+stage+exec is good enough).
-    let mut keys: BTreeSet<(u128, String, String)> = all
+    let mut keys: BTreeSet<(u128, String, String)> = loaded
+        .events
         .iter()
         .map(|e| (e.ts_epoch_ms, e.stage.clone(), e.execution_id.clone()))
         .collect();
     for event in from_current.drain(..) {
         let key = (event.ts_epoch_ms, event.stage.clone(), event.execution_id.clone());
         if keys.insert(key) {
-            all.push(event);
+            loaded.events.push(event);
         }
     }
-    all.sort_by_key(|e| e.ts_epoch_ms);
-    Ok(all)
+    loaded.events.sort_by_key(|e| e.ts_epoch_ms);
+    Ok(loaded)
 }
 
 /// Parse engine-trace live + rotated segments, returning JSON objects that
 /// touch the scope. Tolerates torn lines (skips unparseable).
+///
+/// Unlike the dispatch stream, this one is read as-is: the same survey that
+/// found 25 damaged lines in a single rotated `current.jsonl` segment found no
+/// damage at all across the engine-trace segments (6 files, 102,066 records —
+/// zero blank lines, zero concatenated records, zero torn records), so there is
+/// nothing here to salvage or account for.
 pub fn load_scope_trace_records(
     root: &Path,
     scope_execution_ids: &BTreeSet<String>,
@@ -1389,32 +1503,117 @@ pub fn load_scope_trace_records(
     Ok(out)
 }
 
-/// Format findings for human-readable CLI output.
-pub fn print_findings(findings: &[Finding]) {
-    if findings.is_empty() {
-        println!("signatures: no matches");
-        return;
+/// Mark every absence-based finding whose evidence could be hiding the event it
+/// says is missing as unreliable, rather than letting it be read as established
+/// fact.
+///
+/// **Attribution matters as much as conservatism.** The damage tested is the
+/// damage that bears on *this* finding, not the pooled fleet view:
+///
+/// - A finding about an execution `loaded` covered is tested against
+///   [`ScopeEvents::damage_for`] — its own mirror, plus the flat stream only when
+///   its timeline was reconstructed from it. The sink writes every event to both
+///   the flat stream and the mirror, so a torn line in `current.jsonl` does not
+///   imply this execution's mirror is missing anything, and neither does damage
+///   in some other execution's mirror. Stamping `UNRELIABLE:` on a timeline the
+///   same command just reported `complete: true` is a precision loss, not
+///   caution — and a caveat that appears on findings it does not apply to is a
+///   caveat readers learn to skip.
+/// - A finding with no execution id, or about an execution outside the load, has
+///   no narrower window available, so it falls back to the pooled view.
+///
+/// The window is `[first event of this finding's execution, now]` — the span
+/// over which the missing event could have occurred.
+pub fn qualify_absence_findings(
+    findings: &mut [Finding],
+    events: &[DispatchEvent],
+    loaded: &ScopeEvents,
+    integrity: &crate::stream_integrity::IntegrityReport,
+    now_ms: u128,
+) -> usize {
+    if integrity.lost_lines().next().is_none() {
+        return 0;
     }
-    println!("signatures: {} finding(s)", findings.len());
+    let mut qualified = 0;
+    for finding in findings.iter_mut().filter(|f| f.absence_based) {
+        let window_start = finding
+            .execution_id
+            .as_deref()
+            .and_then(|exec| {
+                events
+                    .iter()
+                    .filter(|e| e.execution_id == exec)
+                    .map(|e| e.ts_epoch_ms)
+                    .min()
+            })
+            .unwrap_or(0);
+        let could_hide = match finding.execution_id.as_deref() {
+            Some(exec) if loaded.covers(exec) => loaded
+                .damage_for(exec)
+                .iter()
+                .filter(|line| line.shape.lost_records())
+                .any(|line| line.overlaps_window(window_start, now_ms)),
+            _ => integrity.could_hide_event_in(window_start, now_ms),
+        };
+        if !could_hide {
+            continue;
+        }
+        finding
+            .evidence
+            .push(crate::stream_integrity::ABSENCE_CAVEAT.to_owned());
+        if let Some(obj) = finding.details.as_object_mut() {
+            obj.insert("absence_unreliable".into(), Value::Bool(true));
+        } else {
+            finding.details = serde_json::json!({ "absence_unreliable": true });
+        }
+        qualified += 1;
+    }
+    qualified
+}
+
+/// Format findings for human-readable CLI output.
+///
+/// `integrity` is not optional: "no matches" printed over a stream with holes
+/// in it is not a clean bill of health, and this is the last place that
+/// distinction can still be made before an operator reads it as one.
+pub fn render_findings(findings: &[Finding], integrity: &crate::stream_integrity::IntegrityReport) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    if findings.is_empty() {
+        let _ = writeln!(out, "signatures: no matches");
+        if !integrity.is_intact() {
+            let _ = writeln!(out, "  {}", crate::stream_integrity::NO_MATCHES_CAVEAT);
+        }
+        return out;
+    }
+    let _ = writeln!(out, "signatures: {} finding(s)", findings.len());
     for finding in findings {
-        println!("\n{}  {}  {}", finding.severity.as_str(), finding.sig_id, finding.title);
+        let _ = writeln!(
+            out,
+            "\n{}  {}  {}",
+            finding.severity.as_str(),
+            finding.sig_id,
+            finding.title
+        );
         if let Some(exec) = &finding.execution_id {
-            print!("    execution_id={exec}");
+            let _ = write!(out, "    execution_id={exec}");
             if let Some(wi) = &finding.work_item_id {
-                print!("  work_item_id={wi}");
+                let _ = write!(out, "  work_item_id={wi}");
             }
-            println!();
+            let _ = writeln!(out);
         } else if let Some(wi) = &finding.work_item_id {
-            println!("    work_item_id={wi}");
+            let _ = writeln!(out, "    work_item_id={wi}");
         }
         if finding.count > 1 {
-            println!("    count={}", finding.count);
+            let _ = writeln!(out, "    count={}", finding.count);
         }
         for line in &finding.evidence {
-            println!("    evidence: {line}");
+            let _ = writeln!(out, "    evidence: {line}");
         }
-        println!("    recovery: {}", finding.recovery);
+        let _ = writeln!(out, "    recovery: {}", finding.recovery);
     }
+    out
 }
 
 /// Full `bossctl dispatch diagnose` pipeline: resolve scope, load artifacts,
@@ -1450,7 +1649,8 @@ pub fn run_diagnose(
     });
     let scope = resolve_diagnose_scope(root, id, db_resolution)?;
 
-    let events = load_scope_events(root, &scope)?;
+    let loaded = load_scope_events(root, &scope)?;
+    let events = loaded.events.clone();
     let scope_execs: BTreeSet<String> = scope.execution_ids.iter().cloned().collect();
     let mut scope_items: BTreeSet<String> = BTreeSet::new();
     if let Some(wi) = &scope.work_item_id {
@@ -1464,7 +1664,17 @@ pub fn run_diagnose(
 
     // Fleet scan for cross-exec SIGs (SIG-2 recurrence). Same path as
     // `dispatch stats` — one pass over current.jsonl.
-    let fleet = dispatch_reader::read_current(root).unwrap_or_default();
+    let fleet_read = dispatch_reader::read_current(root).unwrap_or_default();
+    let fleet = fleet_read.events;
+
+    // One deduplicated integrity view over every file this command read: the
+    // per-execution mirrors, the flat stream loaded for reconstruction, and the
+    // flat stream loaded for the fleet scan (the last two are the same file, so
+    // dedupe by file+line is what stops it being double-reported).
+    let mut all_damage = loaded.all_damage();
+    all_damage.extend(fleet_read.damage);
+
+    let integrity = crate::stream_integrity::IntegrityReport::new(all_damage);
 
     let mut db_facts = ExecDbFacts::default();
     if let Some(work_db) = db {
@@ -1508,6 +1718,7 @@ pub fn run_diagnose(
         }
     }
     sort_findings(&mut findings);
+    let qualified = qualify_absence_findings(&mut findings, &events, &loaded, &integrity, now_ms);
 
     if json {
         let mut timelines = serde_json::Map::new();
@@ -1515,7 +1726,22 @@ pub fn run_diagnose(
             for exec_id in &scope.execution_ids {
                 let owned: Vec<DispatchEvent> = events.iter().filter(|e| e.execution_id == *exec_id).cloned().collect();
                 let durations = dispatch_reader::stage_durations_ms(&owned, now_ms);
-                timelines.insert(exec_id.clone(), build_timeline_json(exec_id, &owned, &durations));
+                let mut timeline = build_timeline_json(exec_id, &owned, &durations);
+                // Per-timeline, not only in the top-level block: an automated
+                // caller that reads one timeline out of `timelines` must not be
+                // able to consume it without the reason it may be incomplete.
+                if let Some(obj) = timeline.as_object_mut() {
+                    let damage = loaded.damage_for(exec_id);
+                    obj.insert(
+                        "unreadable_records".into(),
+                        serde_json::to_value(&damage).unwrap_or(Value::Array(Vec::new())),
+                    );
+                    obj.insert(
+                        "complete".into(),
+                        Value::Bool(!damage.iter().any(|d| d.shape.lost_records())),
+                    );
+                }
+                timelines.insert(exec_id.clone(), timeline);
             }
         }
         // v2 shape (findings, multi-exec). On the single-execution path also
@@ -1544,6 +1770,11 @@ pub fn run_diagnose(
             "findings".into(),
             serde_json::to_value(&findings).unwrap_or(Value::Array(Vec::new())),
         );
+        let mut integrity_json = integrity.to_json();
+        if let Some(obj) = integrity_json.as_object_mut() {
+            obj.insert("absence_findings_qualified".into(), Value::from(qualified));
+        }
+        payload.insert("stream_integrity".into(), integrity_json);
         if scope.resolved_as == ResolvedAs::Execution {
             let exec_id = scope
                 .execution_ids
@@ -1583,8 +1814,21 @@ pub fn run_diagnose(
         }
     }
 
+    // Before the timeline, not after: an operator who reads a timeline and then
+    // learns it had holes has already formed the conclusion this is meant to
+    // prevent.
+    integrity.print_banner();
+
     if events.is_empty() && findings.is_empty() {
-        println!("no dispatch events or signature matches for {id}");
+        // "Nothing here" is precisely the conclusion damage invalidates, so it
+        // is the one case that must never be stated bare.
+        if integrity.is_intact() {
+            println!("no dispatch events or signature matches for {id}");
+        } else {
+            println!("no READABLE dispatch events or signature matches for {id}");
+            println!("  {}", crate::stream_integrity::NO_EVENTS_CAVEAT);
+        }
+        integrity.print_footer();
         return Ok(());
     }
 
@@ -1592,14 +1836,12 @@ pub fn run_diagnose(
         for exec_id in &scope.execution_ids {
             let exec_events: Vec<DispatchEvent> =
                 events.iter().filter(|e| e.execution_id == *exec_id).cloned().collect();
-            if exec_events.is_empty() {
+            let damage = loaded.damage_for(exec_id);
+            if exec_events.is_empty() && damage.is_empty() {
                 continue;
             }
-            let durations = dispatch_reader::stage_durations_ms(&exec_events, now_ms);
             println!("\ntimeline for execution {exec_id}");
-            for (event, duration_ms) in exec_events.iter().zip(durations.iter()) {
-                print_timeline_event(event, *duration_ms);
-            }
+            print!("{}", render_timeline(&exec_events, &damage, now_ms));
         }
         if events.is_empty() {
             println!("\n(no dispatch events recorded for this id)");
@@ -1607,8 +1849,56 @@ pub fn run_diagnose(
     }
 
     println!();
-    print_findings(&findings);
+    print!("{}", render_findings(&findings, &integrity));
+    integrity.print_footer();
     Ok(())
+}
+
+/// Render one execution's timeline with its unreadable regions marked in place.
+///
+/// A marker is emitted at the position the damaged bytes actually occupied —
+/// after the last record read before them — so the gap is visible where it
+/// happened rather than as a note at the end. Damage that no record precedes
+/// leads the timeline.
+///
+/// Returns the rendered text rather than printing, so a test can assert the
+/// marker really is *inside* the timeline: "the timeline carries a visible
+/// marker" is a claim about the rendered output, and a printer proves nothing.
+pub fn render_timeline(events: &[DispatchEvent], damage: &[DamagedLine], now_ms: u128) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let durations = dispatch_reader::stage_durations_ms(events, now_ms);
+    let markers = crate::stream_integrity::timeline_markers(damage);
+    let mut next_marker = 0usize;
+
+    // Leading markers: damage with no preceding record.
+    while let Some(marker) = markers.get(next_marker) {
+        if marker.after_ts_epoch_ms.is_some() {
+            break;
+        }
+        let _ = writeln!(out, "  {}", marker.text);
+        next_marker += 1;
+    }
+
+    for (event, duration_ms) in events.iter().zip(durations.iter()) {
+        write_timeline_event(&mut out, event, *duration_ms);
+        while let Some(marker) = markers.get(next_marker) {
+            match marker.after_ts_epoch_ms {
+                Some(after) if after <= event.ts_epoch_ms => {
+                    let _ = writeln!(out, "  {}", marker.text);
+                    next_marker += 1;
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // Anything left belongs after the last record we could read.
+    for marker in &markers[next_marker.min(markers.len())..] {
+        let _ = writeln!(out, "  {}", marker.text);
+    }
+    out
 }
 
 pub(crate) fn build_timeline_json(execution_id: &str, events: &[DispatchEvent], durations: &[u128]) -> Value {
@@ -1629,9 +1919,12 @@ pub(crate) fn build_timeline_json(execution_id: &str, events: &[DispatchEvent], 
     })
 }
 
-fn print_timeline_event(event: &DispatchEvent, stage_duration_ms: u128) {
+fn write_timeline_event(out: &mut String, event: &DispatchEvent, stage_duration_ms: u128) {
+    use std::fmt::Write;
+
     let worker = event.worker_id.as_deref().unwrap_or("-");
-    println!(
+    let _ = writeln!(
+        out,
         "  {}  {}/{}  +{}ms  worker={}",
         event.ts_epoch_ms, event.stage, event.outcome, stage_duration_ms, worker,
     );
@@ -1641,25 +1934,25 @@ fn print_timeline_event(event: &DispatchEvent, stage_duration_ms: u128) {
     if let Some(worker_id) = &event.worker_id
         && let Some(slot) = boss_engine::coordinator::slot_id_from_worker_id(worker_id)
     {
-        match boss_engine::coordinator::worker_page_label(slot) {
-            Some(page) => println!("    page:      {page} (slot {slot})"),
-            None => println!("    slot:      {slot}"),
-        }
+        let _ = match boss_engine::coordinator::worker_page_label(slot) {
+            Some(page) => writeln!(out, "    page:      {page} (slot {slot})"),
+            None => writeln!(out, "    slot:      {slot}"),
+        };
     }
     if let Some(lease) = &event.cube_lease_id {
-        println!("    lease:     {lease}");
+        let _ = writeln!(out, "    lease:     {lease}");
     }
     if let Some(workspace) = &event.cube_workspace_id {
-        println!("    workspace: {workspace}");
+        let _ = writeln!(out, "    workspace: {workspace}");
     }
     if let Some(err) = &event.error_message {
-        println!("    error:     {err}");
+        let _ = writeln!(out, "    error:     {err}");
     }
     if !event.details.is_null() {
-        match serde_json::to_string(&event.details) {
-            Ok(text) => println!("    details:   {text}"),
-            Err(_) => println!("    details:   <unserializable>"),
-        }
+        let _ = match serde_json::to_string(&event.details) {
+            Ok(text) => writeln!(out, "    details:   {text}"),
+            Err(_) => writeln!(out, "    details:   <unserializable>"),
+        };
     }
 }
 
@@ -2038,7 +2331,13 @@ mod tests {
         let root = std::env::temp_dir().join(format!("bossctl-doctor-partial-mirrors-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let de = root.join("dispatch-events");
-        let execs = de.join("executions");
+        std::fs::create_dir_all(&de).unwrap();
+        // Mirrors live at `<root>/executions/<id>/dispatch.jsonl`, NOT under
+        // `dispatch-events/` — see `dispatch_reader::execution_path`. This
+        // fixture used to write them under `dispatch-events/executions/`, where
+        // the reader never looks, so BOTH executions were reconstructed from the
+        // flat stream and the "partial" case the test names was never exercised.
+        let execs = root.join("executions");
         std::fs::create_dir_all(&execs).unwrap();
 
         let present = "exec_present";
@@ -2064,15 +2363,24 @@ mod tests {
             execution_ids: vec![present.into(), missing.into()],
             work_item_id: Some("task_partial".into()),
         };
-        let events = load_scope_events(&root, &scope).unwrap();
+        let loaded = load_scope_events(&root, &scope).unwrap();
         let _ = std::fs::remove_dir_all(&root);
-        let ids: BTreeSet<_> = events.iter().map(|e| e.execution_id.as_str()).collect();
+        let ids: BTreeSet<_> = loaded.events.iter().map(|e| e.execution_id.as_str()).collect();
         assert!(ids.contains(present), "{ids:?}");
         assert!(
             ids.contains(missing),
             "partial missing mirror must be reconstructed from current.jsonl: {ids:?}"
         );
-        assert_eq!(events.len(), 2);
+        assert_eq!(loaded.events.len(), 2);
+        assert!(
+            loaded.reconstructed_from_flat.contains(missing),
+            "the reconstructed execution must be recorded, so flat-stream damage is \
+             attributed to its timeline"
+        );
+        assert!(
+            !loaded.reconstructed_from_flat.contains(present),
+            "an execution with its own mirror must not inherit fleet-stream damage"
+        );
     }
 
     #[test]
@@ -2102,5 +2410,360 @@ mod tests {
         assert_eq!(payload["events"].as_array().unwrap().len(), 1);
         assert!(payload["findings"].as_array().unwrap().is_empty());
         assert!(payload.get("timelines").is_some());
+    }
+
+    // ── Stream-damage surfacing ────────────────────────────────────────────
+
+    /// Fixture root with one execution mirror whose lines reproduce the two
+    /// corruption shapes: a concatenated pair (the writer's interleave, fully
+    /// recoverable) and a truncated record (genuinely lost). Returns the root;
+    /// the caller removes it.
+    fn damaged_mirror_root(name: &str, exec_id: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("bossctl-doctor-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mirror_dir = root.join("executions").join(exec_id);
+        std::fs::create_dir_all(&mirror_dir).unwrap();
+        let record = |ts: u128, stage: &str| {
+            format!(
+                r#"{{"ts_epoch_ms":{ts},"stage":"{stage}","outcome":"ok","execution_id":"{exec_id}","work_item_id":"task_damaged","details":{{}}}}"#
+            )
+        };
+        let contents = format!(
+            "{}\n{}{}\n{{\"ts_epoch_ms\":400,\"stage\":\"cube_workspace_lea\n{}\n",
+            record(100, "status_transition"),
+            // Two whole records on one line — bodyA+bodyB+\n+\n on disk.
+            record(200, "request_recorded"),
+            record(300, "host_selected"),
+            // A truncated record: no resync can recover this one.
+            record(500, "worker_claimed"),
+        );
+        std::fs::write(mirror_dir.join("dispatch.jsonl"), contents).unwrap();
+        root
+    }
+
+    fn exec_scope(exec_id: &str) -> DiagnoseScope {
+        DiagnoseScope {
+            input_id: exec_id.to_owned(),
+            resolved_as: ResolvedAs::Execution,
+            execution_ids: vec![exec_id.to_owned()],
+            work_item_id: Some("task_damaged".to_owned()),
+        }
+    }
+
+    /// End to end over a stream containing BOTH corruption shapes: the
+    /// concatenated records must be recovered into the timeline (not silently
+    /// dropped as they were before), and the truncated one must be reported as
+    /// a loss rather than vanishing.
+    #[test]
+    fn a_damaged_mirror_yields_recovered_events_and_reported_losses() {
+        let exec_id = "exec_damaged_mirror";
+        let root = damaged_mirror_root("damage-e2e", exec_id);
+        let loaded = load_scope_events(&root, &exec_scope(exec_id)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let stages: Vec<&str> = loaded.events.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec![
+                "status_transition",
+                "request_recorded",
+                "host_selected",
+                "worker_claimed"
+            ],
+            "both concatenated records must land in the timeline, in order"
+        );
+
+        let damage = loaded.damage_for(exec_id);
+        assert_eq!(damage.len(), 2, "both damaged lines must be reported: {damage:?}");
+        assert_eq!(damage[0].shape, boss_engine::dispatch_reader::DamageShape::Concatenated);
+        assert_eq!(damage[0].recovered, 2);
+        assert_eq!(
+            damage[1].shape,
+            boss_engine::dispatch_reader::DamageShape::Unrecoverable
+        );
+    }
+
+    /// The timeline itself must carry the marker — the whole point is that a
+    /// reader of the timeline cannot see it as complete. Asserted against the
+    /// rendered text, at the right position, not merely against a count.
+    #[test]
+    fn the_rendered_timeline_carries_a_marker_where_records_were_unreadable() {
+        let exec_id = "exec_marked_timeline";
+        let root = damaged_mirror_root("damage-render", exec_id);
+        let loaded = load_scope_events(&root, &exec_scope(exec_id)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        let rendered = render_timeline(&loaded.events, &loaded.damage_for(exec_id), 10_000);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let marker_positions: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("UNREADABLE"))
+            .map(|(idx, _)| idx)
+            .collect();
+        assert_eq!(marker_positions.len(), 2, "rendered timeline:\n{rendered}");
+        assert!(
+            rendered.contains("unrecoverable"),
+            "the lost record must be named as lost, not merely flagged:\n{rendered}"
+        );
+
+        // The concatenated line sat between the ts=100 and ts=200 records, so
+        // its marker must land after the first stage line and before the last.
+        let first_stage = lines
+            .iter()
+            .position(|line| line.contains("status_transition"))
+            .expect("timeline renders the first stage");
+        let last_stage = lines
+            .iter()
+            .position(|line| line.contains("worker_claimed"))
+            .expect("timeline renders the last stage");
+        assert!(
+            marker_positions[0] > first_stage && marker_positions[0] < last_stage,
+            "the marker must sit inside the timeline at the damaged position, not be appended:\n{rendered}"
+        );
+    }
+
+    /// Load the damaged-mirror fixture for `exec_id`, returning both the
+    /// per-execution attribution (`ScopeEvents`) and the pooled report built from
+    /// it. Absence qualification needs both: the pooled view for the fleet-level
+    /// fallback, the attribution for everything else.
+    fn damaged_scope(exec_id: &str, name: &str) -> (ScopeEvents, crate::stream_integrity::IntegrityReport) {
+        let root = damaged_mirror_root(name, exec_id);
+        let loaded = load_scope_events(&root, &exec_scope(exec_id)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let integrity = crate::stream_integrity::IntegrityReport::new(loaded.all_damage());
+        (loaded, integrity)
+    }
+
+    fn damaged_integrity(exec_id: &str, name: &str) -> crate::stream_integrity::IntegrityReport {
+        damaged_scope(exec_id, name).1
+    }
+
+    /// One unrecoverable line, bracketed wide enough to overlap any test window.
+    fn lost_line(path: &str, line_number: u64) -> DamagedLine {
+        DamagedLine::builder()
+            .path(std::path::PathBuf::from(path))
+            .line_number(line_number)
+            .byte_len(400)
+            .recovered(0)
+            .lost_bytes(400)
+            .lost_excerpt("{\"ts_epoch_ms\":1,\"stage\":\"worker_cla")
+            .shape(dispatch_reader::DamageShape::Unrecoverable)
+            .build()
+    }
+
+    /// A clean timeline with no findings prints "no matches"; a damaged one must
+    /// not let that read as a clean bill of health.
+    #[test]
+    fn no_matches_is_qualified_when_the_stream_was_damaged() {
+        let intact = crate::stream_integrity::IntegrityReport::default();
+        let clean = render_findings(&[], &intact);
+        assert!(clean.contains("no matches"));
+        assert!(
+            !clean.contains("does NOT mean"),
+            "an intact stream must not be qualified: {clean}"
+        );
+
+        let damaged = damaged_integrity("exec_no_matches", "damage-nomatch");
+        let rendered = render_findings(&[], &damaged);
+        assert!(rendered.contains("no matches"));
+        assert!(
+            rendered.contains(crate::stream_integrity::NO_MATCHES_CAVEAT),
+            "\"no matches\" over a damaged stream must be qualified: {rendered}"
+        );
+    }
+
+    /// SIG-1's conclusion is that nothing followed `worker_claimed`. With
+    /// unreadable records in the window, that must be marked unreliable rather
+    /// than asserted — and must NOT be marked when the stream is intact.
+    #[test]
+    fn an_absence_based_finding_is_qualified_only_when_damage_overlaps_it() {
+        let exec_id = "exec_qualified";
+        let events = vec![ev_from_json(
+            r#"{"ts_epoch_ms":100,"stage":"worker_claimed","outcome":"ok","execution_id":"exec_qualified","work_item_id":"task_damaged","details":{}}"#,
+        )];
+        let now = 100 + SIG1_CRITICAL_MS;
+        let mut findings = match_dispatch_signatures(&events, now, None, None, &scope(&[exec_id]));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].sig_id, "SIG-1");
+        assert!(findings[0].absence_based, "SIG-1 must declare itself absence-based");
+
+        let intact = crate::stream_integrity::IntegrityReport::default();
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &ScopeEvents::default(), &intact, now),
+            0,
+            "an intact stream must leave the finding stated as fact"
+        );
+        assert!(!findings[0].evidence.iter().any(|e| e.contains("UNRELIABLE")));
+
+        // Damage in THIS execution's own mirror.
+        let (loaded, damaged) = damaged_scope(exec_id, "damage-qualify");
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, now),
+            1,
+            "damage overlapping the window must qualify the conclusion"
+        );
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .any(|e| e == crate::stream_integrity::ABSENCE_CAVEAT),
+            "{:?}",
+            findings[0].evidence
+        );
+        assert_eq!(findings[0].details["absence_unreliable"], Value::Bool(true));
+    }
+
+    /// A SIG-1 fixture plus the `[exec, now]` window it is about.
+    fn sig1_finding(exec_id: &str) -> (Vec<Finding>, Vec<DispatchEvent>, u128) {
+        let events = vec![ev_from_json(&format!(
+            r#"{{"ts_epoch_ms":100,"stage":"worker_claimed","outcome":"ok","execution_id":"{exec_id}","work_item_id":"task_damaged","details":{{}}}}"#
+        ))];
+        let now = 100 + SIG1_CRITICAL_MS;
+        let findings = match_dispatch_signatures(&events, now, None, None, &scope(&[exec_id]));
+        assert_eq!(findings.len(), 1);
+        (findings, events, now)
+    }
+
+    /// Attribution, not pooling. An unrecoverable line in execution B's mirror
+    /// says nothing about execution A's timeline — the mirrors are separate files
+    /// and the sink writes A's events to A's mirror. Qualifying A's finding on B's
+    /// damage would stamp `UNRELIABLE:` on a timeline the same command reports
+    /// `complete: true`, which is the over-qualification that teaches readers to
+    /// skip the caveat.
+    #[test]
+    fn another_executions_mirror_damage_does_not_qualify_this_finding() {
+        let exec_id = "exec_attributed";
+        let (mut findings, events, now) = sig1_finding(exec_id);
+
+        let loaded = ScopeEvents {
+            covered: scope(&[exec_id, "exec_other"]),
+            mirror_damage: BTreeMap::from([(
+                "exec_other".to_owned(),
+                vec![lost_line("/state/executions/exec_other/dispatch.jsonl", 7)],
+            )]),
+            ..ScopeEvents::default()
+        };
+        let pooled = crate::stream_integrity::IntegrityReport::new(loaded.all_damage());
+        assert!(pooled.lost_lines().next().is_some(), "the pooled view IS damaged");
+
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, now),
+            0,
+            "damage in a sibling execution's mirror must not qualify this execution's finding"
+        );
+        assert!(!findings[0].evidence.iter().any(|e| e.contains("UNRELIABLE")));
+    }
+
+    /// Flat-stream damage belongs to an execution's timeline only when that
+    /// timeline was reconstructed from the flat stream. Otherwise the mirror is
+    /// the source and holds every one of that execution's events.
+    #[test]
+    fn flat_stream_damage_qualifies_only_a_reconstructed_timeline() {
+        let exec_id = "exec_flat";
+        let flat = vec![lost_line("/state/dispatch-events/current.jsonl", 266_198)];
+
+        let from_mirror = ScopeEvents {
+            covered: scope(&[exec_id]),
+            flat_damage: flat.clone(),
+            ..ScopeEvents::default()
+        };
+        let (mut findings, events, now) = sig1_finding(exec_id);
+        let pooled = crate::stream_integrity::IntegrityReport::new(from_mirror.all_damage());
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &from_mirror, &pooled, now),
+            0,
+            "the mirror was intact, so a torn fleet-stream line hides nothing from this timeline"
+        );
+
+        let reconstructed = ScopeEvents {
+            covered: scope(&[exec_id]),
+            flat_damage: flat,
+            reconstructed_from_flat: scope(&[exec_id]),
+            ..ScopeEvents::default()
+        };
+        let (mut findings, events, now) = sig1_finding(exec_id);
+        let pooled = crate::stream_integrity::IntegrityReport::new(reconstructed.all_damage());
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &reconstructed, &pooled, now),
+            1,
+            "when the flat stream IS the only record of this timeline, its damage is this timeline's"
+        );
+    }
+
+    /// A finding about an execution this load never read has no per-execution
+    /// attribution available, so it falls back to the pooled view rather than
+    /// silently reading as intact.
+    #[test]
+    fn an_uncovered_execution_falls_back_to_the_pooled_view() {
+        let exec_id = "exec_uncovered";
+        let (mut findings, events, now) = sig1_finding(exec_id);
+        let loaded = ScopeEvents {
+            covered: scope(&["exec_someone_else"]),
+            mirror_damage: BTreeMap::from([(
+                "exec_someone_else".to_owned(),
+                vec![lost_line("/state/executions/exec_someone_else/dispatch.jsonl", 3)],
+            )]),
+            ..ScopeEvents::default()
+        };
+        let pooled = crate::stream_integrity::IntegrityReport::new(loaded.all_damage());
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, now),
+            1,
+            "no narrower window is available, so the conservative reading applies"
+        );
+    }
+
+    /// A finding that rests on events that ARE present must never be qualified,
+    /// however damaged the stream is: over-qualifying everything would make the
+    /// caveat noise and teach operators to ignore it.
+    #[test]
+    fn a_presence_based_finding_is_never_qualified_by_stream_damage() {
+        let events = vec![ev_from_json(
+            r#"{"ts_epoch_ms":100,"stage":"spawn_ack_timeout","outcome":"ok","execution_id":"exec_presence","details":{"slot_id":3,"shell_pid":0,"threshold_secs":60}}"#,
+        )];
+        let mut findings = match_dispatch_signatures(&events, 1_000, None, None, &scope(&["exec_presence"]));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].sig_id, "SIG-4");
+        assert!(!findings[0].absence_based);
+
+        let (loaded, damaged) = damaged_scope("exec_presence", "damage-presence");
+        assert_eq!(
+            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, 1_000),
+            0
+        );
+        assert!(!findings[0].evidence.iter().any(|e| e.contains("UNRELIABLE")));
+    }
+
+    /// Write an engine-trace fixture into a scratch state root and return it.
+    fn trace_root(name: &str, contents: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("bossctl-trace-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(boss_log_files::ENGINE_TRACE_FILENAME), contents).unwrap();
+        root
+    }
+
+    fn trace_line(ts: &str, message: &str, exec_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","level":"INFO","target":"boss_engine::coordinator","fields":{{"message":"{message}","execution_id":"{exec_id}"}}}}"#
+        )
+    }
+
+    /// The trace scan keeps the records that touch the scope, skips the rest,
+    /// and tolerates an unparseable line rather than failing the whole scan.
+    #[test]
+    fn the_trace_scan_keeps_in_scope_records_and_skips_unreadable_lines() {
+        let contents = format!(
+            "{}\n{}\n{{\"timestamp\":\"2026-07-26T00:00:02Z\",\"level\":\"IN\n",
+            trace_line("2026-07-26T00:00:00Z", "mine", "exec_trace"),
+            trace_line("2026-07-26T00:00:01Z", "someone else's", "exec_other"),
+        );
+        let root = trace_root("scope", &contents);
+        let records = load_scope_trace_records(&root, &scope(&["exec_trace"]), &BTreeSet::new()).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["fields"]["execution_id"], Value::String("exec_trace".into()));
     }
 }

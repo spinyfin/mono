@@ -454,7 +454,11 @@ pub(super) async fn unified_state(socket_path: &Option<String>, json: bool) -> R
 /// threshold) episodes in one place.
 pub(super) fn dispatch_pause_history(json: bool, state_root: Option<PathBuf>, n: usize) -> Result<()> {
     let root = resolve_state_root(state_root)?;
-    let events = dispatch_reader::read_current(&root)?;
+    let read = dispatch_reader::read_current(&root)?;
+    // A pause episode is read as a pair; an unreadable record can hide the
+    // `dispatch_resumed` half and make a closed episode look open.
+    let integrity = crate::stream_integrity::IntegrityReport::new(read.damage);
+    let events = read.events;
     let mut episodes: Vec<&DispatchEvent> = events
         .iter()
         .filter(|e| e.stage == "dispatch_paused" || e.stage == "dispatch_resumed")
@@ -475,9 +479,16 @@ pub(super) fn dispatch_pause_history(json: bool, state_root: Option<PathBuf>, n:
                 })
             })
             .collect();
-        println!("{}", serde_json::to_string(&value)?);
+        println!(
+            "{}",
+            serde_json::json!({
+                "episodes": value,
+                "stream_integrity": integrity.to_json(),
+            })
+        );
         return Ok(());
     }
+    integrity.print_notice();
 
     if episodes.is_empty() {
         println!("no pause/resume episodes recorded");

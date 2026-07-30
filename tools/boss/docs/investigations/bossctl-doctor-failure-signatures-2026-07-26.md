@@ -52,20 +52,27 @@ Uniform `{timestamp, level, target, fields}`. Discriminator is **`fields.message
 
 ### Schema / emitter map (current `main`, paths relative to `tools/boss/`)
 
-| Concern                                                                     | Location                                                                                                                                                                                 |
-| --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Stage` enum (44 variants) / wire strings                                   | `engine/dispatch-events/src/lib.rs` (`enum Stage` ~:43, `as_str` ~:521–566)                                                                                                              |
-| `Outcome` / `DispatchEvent` / `JsonlFileSink` dual-write to `current.jsonl` | same crate (`Outcome` ~:576, `DispatchEvent` ~:598, sink ~:750+)                                                                                                                         |
-| `read_current` / `parse_lines` (skips unparseable) / stall detector         | `engine/dispatch-reader/src/lib.rs`                                                                                                                                                      |
-| `StageThresholds`                                                           | `engine/dispatch-reader/src/timeline.rs`                                                                                                                                                 |
-| Stall thresholds wiring (15 s sweep)                                        | `engine/core/src/app/server.rs` ~:1528–1555                                                                                                                                              |
-| `PERSISTENT_STALL_THRESHOLD` (5 min attention)                              | `engine/core/src/dispatch_stall_escalation.rs`                                                                                                                                           |
-| `engine-trace.jsonl` path / rotation                                        | `log-files/src/paths.rs`, `engine/core/src/trace_rotation.rs`, `log-files/src/segments.rs`                                                                                               |
-| Terminal-event predicate used by ghost-active / stall                       | `is_terminal_event` in `dispatch-reader/src/timeline.rs`: **any `outcome=="error"`**, or **`pane_spawned`+`ok`**. Note: normal worker _completion_ is **not** a dispatch terminal event. |
+| Concern                                                                            | Location                                                                                                                                                                                 |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Stage` enum (44 variants) / wire strings                                          | `engine/dispatch-events/src/lib.rs` (`enum Stage` ~:43, `as_str` ~:521–566)                                                                                                              |
+| `Outcome` / `DispatchEvent` / `JsonlFileSink` dual-write to `current.jsonl`        | same crate (`Outcome` ~:576, `DispatchEvent` ~:598, sink ~:750+)                                                                                                                         |
+| `read_current` / `parse_lines` (salvages + reports damaged lines) / stall detector | `engine/dispatch-reader/src/lib.rs`, `engine/dispatch-reader/src/integrity.rs`                                                                                                           |
+| `StageThresholds`                                                                  | `engine/dispatch-reader/src/timeline.rs`                                                                                                                                                 |
+| Stall thresholds wiring (15 s sweep)                                               | `engine/core/src/app/server.rs` ~:1528–1555                                                                                                                                              |
+| `PERSISTENT_STALL_THRESHOLD` (5 min attention)                                     | `engine/core/src/dispatch_stall_escalation.rs`                                                                                                                                           |
+| `engine-trace.jsonl` path / rotation                                               | `log-files/src/paths.rs`, `engine/core/src/trace_rotation.rs`, `log-files/src/segments.rs`                                                                                               |
+| Terminal-event predicate used by ghost-active / stall                              | `is_terminal_event` in `dispatch-reader/src/timeline.rs`: **any `outcome=="error"`**, or **`pane_spawned`+`ok`**. Note: normal worker _completion_ is **not** a dispatch terminal event. |
 
 ### Torn-write tolerance
 
-The 274,624-record corpus contains **one** unparseable line. `boss_dispatch_reader::parse_lines` already drops unparseable lines with a warning (`lib.rs` ~:93–110); the incremental index counts `malformed_lines` and continues. Doctor must do the same — never abort a pass on a single bad line.
+The 274,624-record corpus contains **one** unparseable line. Never abort a pass on a single bad line.
+
+**Superseded (mono#2549).** This section originally said readers should do what `parse_lines` then did — drop the unparseable line with a stderr warning. That was wrong twice over, and both halves are now fixed; see `boss_dispatch_reader::integrity` and the [stream integrity](#stream-integrity-and-exit-codes) section below.
+
+- The dominant corruption shape is **whole records concatenated** by the writer's historical body-then-newline two-write pair (`bodyA` `bodyB` `\n` `\n` on disk — hence `trailing characters at line 1 column <len(bodyA)+1>`, at whole-record columns, never mid-token). Those records are fully present, so they are now **recovered**, not dropped.
+- Whatever cannot be recovered is returned as a structured `DamagedLine` and reported. A diagnose verb whose primary evidence is an _absence_ cannot treat "some records were unreadable" as a stderr side note.
+- Recovery is gated so it cannot invent: resync anchors on a bare `{`, so records recovered after a resync must pass a plausibility check (known `Stage` / `Outcome`, non-empty `execution_id`, credible `ts_epoch_ms` vs. the preceding record) before being accepted. Rejected bytes stay counted as lost. A fabricated event in a forensic timeline is worse than a reported loss.
+- The writer no longer has the two-write bug: `boss_engine_jsonl_append` folds the trailing newline into the same buffer as the body and issues one `write_all` (`engine/jsonl-append/src/lib.rs:102`, `:135`), behind a process-wide mutex. The interleave shape does not recur. No cross-process file lock is involved: cross-process exclusion is neither provided nor needed, because the engine refuses to start when a live process already holds `<state_root>/events.sock` (`engine/core/src/app/server.rs:368-390`), so the stream has exactly one writer process by construction.
 
 ### Never-observed Stage variants (8 of 44)
 
@@ -104,6 +111,49 @@ Verified against the built `bossctl --help` / subcommand help on this host (2026
 | `bossctl logs`                     | File-scan over engine-trace / audit / dispatch / spawn / population-timing | Doctor should call into the same path resolution (`boss_log_files`) rather than hardcoding paths |
 
 **Design rule:** doctor is the **signature catalog + multi-signal correlation** layer. Existing verbs remain the raw inspectors.
+
+### Stream integrity and exit codes
+
+Landed in mono#2549. This is a durable operator- and automation-facing contract for `bossctl dispatch diagnose`, so it belongs here next to the surfaces it changes. Implementation: `bossctl/src/stream_integrity.rs` (reporting), `engine/dispatch-reader/src/integrity.rs` (recovery + accounting).
+
+Scope is the **dispatch** stream. `diagnose` also reads `engine-trace.jsonl` (+ rotated segments; SIG-4b / SIG-5 / SIG-5c / SIG-G read only the latter), which is deliberately not covered: the same corpus survey that found 25 damaged lines in one rotated `current.jsonl` segment measured the engine-trace segments as well — 6 files, 102,066 records, **zero** blank lines, **zero** concatenated records, **zero** torn records. There is nothing there to recover or account for, so no parallel accounting path exists for it. There is no flag that suppresses any of the below.
+
+#### Exit status
+
+| Code | Meaning                                                                                                                                                      |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`  | Report produced; every line of the dispatch stream read cleanly.                                                                                             |
+| `1`  | The command itself failed. No usable report.                                                                                                                 |
+| `3`  | **Report produced but incomplete** — records were genuinely lost (not merely concatenated and recovered). The output is usable; it just may not be complete. |
+
+Exit `3` is a claim about **this report**, not about the id you asked for. It latches on any file the command read, which includes the fleet-wide `current.jsonl` (the SIG-2 recurrence scan) — so it can fire for damage unrelated to `<id>`. A script that wants "is `<id>`'s own timeline complete" must read `timelines.<id>.complete` from `--json`, which uses per-execution attribution (a mirror's damage is that execution's; flat-stream damage counts only when that timeline was reconstructed from the flat stream). The same attribution decides whether a finding gets the `UNRELIABLE:` prefix.
+
+#### Human output
+
+- An integrity **banner** printed _above_ the timeline (so damage is read before any conclusion it undermines). Names the unreadable line count, how much was recovered, and how many lines lost records.
+- An in-timeline `!! UNREADABLE …` **marker** at the position the unreadable bytes actually occupied.
+- `UNRELIABLE: …` prefixed to any finding whose conclusion rests on an **absence** when damage could be hiding the missing event.
+- `signatures: no matches` and "no dispatch events" are **never printed bare** over a damaged stream — each gets an explicit caveat, because "there is nothing here" and "I could not read what is here" otherwise look identical.
+- A **footer** naming every file and line, with the exit-status note.
+
+#### `--json`
+
+- Top-level `stream_integrity`: `intact`, `unreadable_lines`, `recovered_records`, `lines_with_lost_records`, `exit_code`, `lines[]`, `absence_findings_qualified`.
+- Per timeline: `timelines.<exec_id>.complete` (bool) and `.unreadable_records[]`, so an automated caller reading one timeline out of the map cannot consume it without the reason it may be incomplete.
+- Findings whose absence conclusion was qualified carry `details.absence_unreliable: true`.
+
+#### Changed JSON shapes (breaking)
+
+Two listing verbs used to emit a **bare array**, which left nowhere for the integrity block to live. Both now emit an **object**:
+
+| Verb                              | Was     | Now                                                |
+| --------------------------------- | ------- | -------------------------------------------------- |
+| `dispatch tail --json`            | `[ … ]` | `{ "events": [ … ], "stream_integrity": { … } }`   |
+| `dispatch state --history --json` | `[ … ]` | `{ "episodes": [ … ], "stream_integrity": { … } }` |
+
+A consumer doing `jq '.[0]'` on either must switch to `jq '.events[0]'` / `jq '.episodes[0]'`. `dispatch ghost-active --json` and `dispatch stats --json` were already objects; each simply gains a `stream_integrity` key.
+
+For these listing verbs the human output carries a one-line `!! stream integrity: …` notice instead of the full banner/footer — they print a listing, not a timeline. `diagnose` is the verb that gets the full treatment, and the notice points at it.
 
 ### Recommended I/O architecture for the implementor
 

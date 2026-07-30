@@ -112,8 +112,11 @@ pub struct RefreshStats {
     pub bytes_scanned: u64,
     /// Records folded into the index this pass.
     pub records_applied: usize,
-    /// Lines that failed to parse and were skipped. The corpus contains at
-    /// least one genuinely torn record; a skip is expected, not an error.
+    /// Lines that were not exactly one record. Counted whether or not salvage
+    /// then recovered the records they held (`records_applied` covers those),
+    /// because "the stream interleaved here" is worth logging either way.
+    /// Never fatal: the bytes are consumed regardless, and aborting the pass
+    /// would stop the stall detector on a forensic-log defect.
     pub malformed_lines: usize,
     /// True when the pass could not resume incrementally and re-read the
     /// whole stream (first pass, or the stream was rotated/truncated/removed).
@@ -379,6 +382,10 @@ fn fold_open_file(
     let mut reader = BufReader::new(file);
     let mut outcome = FoldOutcome::default();
     let mut line = Vec::new();
+    // Timestamp of the last record this pass applied, threaded into salvage as
+    // the neighbour bound for its plausibility gate (see
+    // `integrity::salvage_damaged_line`).
+    let mut prev_ts_epoch_ms: Option<u128> = None;
     loop {
         line.clear();
         let read = reader
@@ -402,13 +409,29 @@ fn fold_open_file(
         }
         match serde_json::from_slice::<DispatchEvent>(trimmed) {
             Ok(event) => {
+                prev_ts_epoch_ms = Some(event.ts_epoch_ms);
                 apply_event(states, &event);
                 outcome.records += 1;
             }
-            // A genuinely unparseable record (the corpus contains one) must
-            // not abort the pass — it is already consumed, so skipping it
-            // here matches what a full rescan does.
-            Err(_) => outcome.malformed += 1,
+            // Not one clean record. Most such lines are the writer's historical
+            // two-write interleave and still hold every record intact, so
+            // salvage them rather than dropping the timeline updates they
+            // carry — the same recovery `parse_lines` does, so the incremental
+            // index and a full rescan continue to agree. Whatever salvage
+            // cannot recover is counted (never fatal: the bytes are already
+            // consumed, and a pass that aborted here would stop the stall
+            // detector entirely).
+            Err(_) => {
+                outcome.malformed += 1;
+                let Ok(text) = std::str::from_utf8(trimmed) else {
+                    continue;
+                };
+                for event in crate::integrity::salvage_damaged_line(text, prev_ts_epoch_ms).records {
+                    prev_ts_epoch_ms = Some(event.ts_epoch_ms);
+                    apply_event(states, &event);
+                    outcome.records += 1;
+                }
+            }
         }
     }
     Ok(outcome)
@@ -732,6 +755,37 @@ mod tests {
 
         let idle = index.refresh().unwrap();
         assert_eq!(idle.bytes_scanned, 0, "the bad line must not be re-read forever");
+    }
+
+    /// The engine's own sweeps must not lose a stall to the writer's
+    /// interleave defect either: a line holding two whole records has to fold
+    /// BOTH into the index, so a timeline whose only evidence of a wedge landed
+    /// on a concatenated line is still detected. The line is still counted as
+    /// malformed — recovery does not make the corruption unreportable.
+    #[tokio::test]
+    async fn concatenated_records_are_recovered_into_the_index() {
+        let dir = TempDir::new().unwrap();
+        let mut first = DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-1");
+        first.ts_epoch_ms = 1_000;
+        let mut second = DispatchEvent::new(Stage::CubeChangeCreated, Outcome::Ok, "exec-2");
+        second.ts_epoch_ms = 2_000;
+        let mut line = serde_json::to_vec(&first).unwrap();
+        line.extend(serde_json::to_vec(&second).unwrap());
+        line.push(b'\n');
+        append_raw(dir.path(), &line);
+
+        let mut index = TimelineIndex::new(dir.path());
+        let stats = index.refresh().unwrap();
+        assert_eq!(stats.malformed_lines, 1, "the interleave is still reported");
+        assert_eq!(stats.records_applied, 2, "and both records are recovered");
+        assert_eq!(index.tracked_timelines(), 2);
+
+        let stalls = index.pending_stalls(10_000, &flat(5));
+        let stalled: Vec<&str> = stalls.iter().map(|s| s.execution_id.as_str()).collect();
+        assert!(
+            stalled.contains(&"exec-2"),
+            "the second record on the damaged line must still produce its stall: {stalled:?}"
+        );
     }
 
     #[tokio::test]

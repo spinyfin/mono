@@ -1125,7 +1125,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
     // Drain a beat so the async emit lands on disk before we read.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?.events;
     let transition: Vec<_> = events.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transition.len(),
@@ -1154,7 +1154,7 @@ async fn kanban_drag_emits_status_transition_event() -> Result<()> {
         })
         .await?;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let events_after = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let events_after = boss_engine::dispatch_reader::read_current(&engine.state_root())?.events;
     let transitions_after: Vec<_> = events_after.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transitions_after.len(),
@@ -1270,7 +1270,7 @@ async fn kanban_drag_emits_status_transition_error_when_repo_unresolvable() -> R
     // Drain a beat so the async emit lands on disk before we read.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?;
+    let events = boss_engine::dispatch_reader::read_current(&engine.state_root())?.events;
     let transition: Vec<_> = events.iter().filter(|e| e.stage == "status_transition").collect();
     assert_eq!(
         transition.len(),
