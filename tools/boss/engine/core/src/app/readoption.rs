@@ -25,6 +25,27 @@ use crate::worker_readoption::{ContradictionVerdict, ReapReason, classify_contra
 /// the worker *is* alive. Only a human can.
 pub const PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND: &str = "progress_ingress_unrecoverable";
 
+/// Whether `driver` observes its worker by tailing a JSONL file, the same
+/// derivation `spawn_flow::start_worker` makes at spawn time.
+///
+/// Only the [`crate::driver::ProgressIngress`] *variant* is read, and every
+/// driver picks its variant from its own identity rather than from the config
+/// it is handed, so this is a classification probe: the run id is real
+/// (Codex derives its rollout directory from it) and the rest of the config
+/// is empty because nothing here reads the wiring it would produce.
+fn driver_tails_a_progress_file(driver: &dyn crate::driver::AgentDriver, run_id: &str) -> bool {
+    matches!(
+        driver.progress_observation_wiring(&crate::driver::ProgressObservationConfig {
+            events_socket_path: std::path::PathBuf::new(),
+            lease_id: String::new(),
+            run_id: run_id.to_owned(),
+            workspace_path: std::path::PathBuf::new(),
+            forwarder_binary: std::path::PathBuf::new(),
+        }),
+        crate::driver::ProgressIngress::AgentJsonlFile(_),
+    )
+}
+
 /// What [`ServerState::readopt_progress_ingress`] did, for the dispatch trace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IngressReadoption {
@@ -138,15 +159,9 @@ impl ServerState {
     ///    eligible for re-dispatch. Restoring it first closes the duplicate
     ///    window as early as possible, and if any later step fails the row is
     ///    still correct.
-    /// 2. **The pool claim**, keyed to the slot the app actually hosts the
-    ///    pane in. This is the `is_live` oracle the re-dispatchers consult, so
-    ///    without it the row would still read as re-dispatchable to
-    ///    `orphan_sweep` even though its status now says otherwise.
-    /// 3. **The live-state entry**, which is what the agent indicator paints
-    ///    from and what `bossctl agents list` / `agents stop` resolve against.
-    /// 4. **Progress ingress**, for a driver that observes its worker by
-    ///    tailing a file rather than by receiving hook callbacks. Steps 1–3
-    ///    make the run *countable* again; this is what makes it *observable*
+    /// 2. **Progress ingress**, for a driver that observes its worker by
+    ///    tailing a file rather than by receiving hook callbacks. Step 1
+    ///    makes the run *countable* again; this is what makes it *observable*
     ///    again. For a worker that runs one turn per process the distinction
     ///    is academic — the run is over before readoption could matter — but
     ///    for a long-lived agent session it is the whole ballgame: with no
@@ -155,12 +170,25 @@ impl ServerState {
     ///    and a workspace lease that nothing will ever release. See
     ///    [`Self::readopt_progress_ingress`].
     ///
-    /// Steps 2 and 3 need a slot id, and the only trustworthy source for it is
+    ///    Ahead of steps 3 and 4 rather than after them, because it is the
+    ///    one restore step that does not need a slot id: a run whose pane the
+    ///    app cannot name — or will not answer about — still has a rollout to
+    ///    read, and making the tail wait on that answer would put the
+    ///    ballgame behind the cosmetics.
+    /// 3. **The pool claim**, keyed to the slot the app actually hosts the
+    ///    pane in. This is the `is_live` oracle the re-dispatchers consult, so
+    ///    without it the row would still read as re-dispatchable to
+    ///    `orphan_sweep` even though its status now says otherwise.
+    /// 4. **The live-state entry**, which is what the agent indicator paints
+    ///    from and what `bossctl agents list` / `agents stop` resolve against.
+    ///
+    /// Steps 3 and 4 need a slot id, and the only trustworthy source for it is
     /// the app: the engine's own mapping was cleared by the teardown being
     /// reversed. When the app cannot be asked, re-adoption still completes at
-    /// step 1 — degraded (the indicator stays blank until the worker's pane is
-    /// re-observed) but convergent in the way that matters, because the row no
-    /// longer invites a duplicate dispatch.
+    /// steps 1 and 2 — degraded (the indicator stays blank until the worker's
+    /// pane is re-observed) but convergent in the way that matters, because
+    /// the row no longer invites a duplicate dispatch and the session is
+    /// still being read.
     async fn readopt_live_worker(&self, execution: &WorkExecution, trigger: &str) {
         let run_id = execution.id.as_str();
         let prior_status = execution.status.to_string();
@@ -317,16 +345,35 @@ impl ServerState {
         let checkpoint = match self.work_db.load_ingress_checkpoint(run_id) {
             Ok(Some(checkpoint)) => checkpoint,
             Ok(None) => {
-                // No record at all. Either this run was dispatched by an
-                // engine that predates the checkpoint column, or its write
-                // failed. Both are "cannot tell", which is not the same as
-                // "nothing to do" — say so rather than let a silent return
-                // read as a healthy no-op in the trace.
+                // No record at all: this run was dispatched by an engine that
+                // predates the checkpoint column, or its `Armed` write failed.
+                //
+                // Whether that matters is decidable rather than unknowable —
+                // ask the driver that was already resolved for this run. For
+                // one that tails a file, a missing checkpoint leaves exactly
+                // the state this whole path exists to prevent: a live worker
+                // with no tail, no turn boundary, and a slot and a lease
+                // nothing will release. That is an attention item, not a log
+                // line. Only a driver that never tails a file gets to be
+                // merely `Unknown`.
+                if driver
+                    .as_deref()
+                    .is_some_and(|driver| driver_tails_a_progress_file(driver, run_id))
+                {
+                    self.file_ingress_readoption_attention(
+                        execution,
+                        "this run recorded no progress-ingress checkpoint, so there is no rollout \
+                         path or resume offset to re-attach to",
+                    )
+                    .await;
+                    return IngressReadoption::Failed;
+                }
                 tracing::warn!(
                     run_id,
-                    "readopt: this run recorded no progress-ingress checkpoint, so whether it has a \
-                     rollout to re-attach is unknowable. A file-tailing driver readopted here stays \
-                     unobserved.",
+                    driver_resolved = driver.is_some(),
+                    "readopt: this run recorded no progress-ingress checkpoint. Its driver does \
+                     not tail a file (or could not be resolved to say), so there is nothing to \
+                     re-establish.",
                 );
                 return IngressReadoption::Unknown;
             }

@@ -69,11 +69,23 @@ pub enum IngressCheckpoint {
     /// through the engine's fan-out. `session_state` is the driver session
     /// that belongs to that same offset — see
     /// [`crate::driver::ProgressSessionNormalizer::resume_state`].
+    ///
+    /// `identity` names the *incarnation* of `path` that offset is an offset
+    /// into. A path is not an identity: the rollout can be rotated or
+    /// replaced under the same name (the live tail already handles that case
+    /// mid-stream), and if the engine dies before any byte of the new
+    /// incarnation has been dispatched, the stored offset still describes the
+    /// dead one. Resuming on path alone would then attach at an offset
+    /// belonging to a different file — skipping its first `consumed_bytes`
+    /// bytes and most likely landing mid-line. Recording the device/inode the
+    /// offset came from turns that into the same loud failure as a vanished
+    /// or uncorrelated rollout.
     Attached {
         ingress: AgentJsonlFileIngress,
         path: PathBuf,
         session_id: String,
         consumed_bytes: u64,
+        identity: FileIdentity,
         #[serde(default)]
         session_state: Option<serde_json::Value>,
     },
@@ -88,6 +100,47 @@ pub enum IngressCheckpoint {
 pub trait IngressCheckpointStore: Send + Sync {
     fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String>;
     fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String>;
+
+    /// Resolve, once, where this run's repeated checkpoint writes go.
+    ///
+    /// The steady-state cost of the durability guarantee is one write per
+    /// dispatched event, so anything else the write path does is paid at that
+    /// same rate. The production store derives the `work_runs` row from the
+    /// execution id with an ordered scan, under the process-wide work-db
+    /// connection lock; that answer is fixed for the life of a run, so the
+    /// ingress resolves it at attach time and hands it back on every write.
+    ///
+    /// The default is no pre-resolution: a store keyed directly by run id has
+    /// nothing to resolve.
+    fn resolve_checkpoint_target(&self, run_id: &str) -> Result<CheckpointTarget, String> {
+        Ok(CheckpointTarget::ByRunId(run_id.to_owned()))
+    }
+
+    /// Write to a destination from [`Self::resolve_checkpoint_target`].
+    fn store_ingress_checkpoint_at(
+        &self,
+        target: &CheckpointTarget,
+        checkpoint: &IngressCheckpoint,
+    ) -> Result<(), String> {
+        match target {
+            CheckpointTarget::ByRunId(run_id) => self.store_ingress_checkpoint(run_id, checkpoint),
+            CheckpointTarget::Resolved(handle) => {
+                Err(format!("this store did not resolve the checkpoint target {handle}"))
+            }
+        }
+    }
+}
+
+/// Where an [`IngressCheckpointStore`] writes one run's checkpoints.
+#[derive(Clone, Debug)]
+pub enum CheckpointTarget {
+    /// The store looks its destination up from the run id on each write.
+    /// What a store with nothing to pre-resolve returns, and the fallback
+    /// when pre-resolution fails.
+    ByRunId(String),
+    /// A store-private handle resolved once at attach time. Opaque: only the
+    /// store that produced it may interpret it.
+    Resolved(String),
 }
 
 impl IngressCheckpointStore for crate::work::WorkDb {
@@ -95,6 +148,28 @@ impl IngressCheckpointStore for crate::work::WorkDb {
         let json = serde_json::to_string(checkpoint).map_err(|err| format!("{err}"))?;
         self.set_run_progress_ingress_checkpoint(run_id, &json)
             .map_err(|err| format!("{err:#}"))
+    }
+
+    fn resolve_checkpoint_target(&self, run_id: &str) -> Result<CheckpointTarget, String> {
+        self.resolve_run_row_for_execution(run_id)
+            .map_err(|err| format!("{err:#}"))?
+            .map(CheckpointTarget::Resolved)
+            .ok_or_else(|| format!("no work_runs row for execution {run_id}"))
+    }
+
+    fn store_ingress_checkpoint_at(
+        &self,
+        target: &CheckpointTarget,
+        checkpoint: &IngressCheckpoint,
+    ) -> Result<(), String> {
+        match target {
+            CheckpointTarget::ByRunId(run_id) => self.store_ingress_checkpoint(run_id, checkpoint),
+            CheckpointTarget::Resolved(run_row_id) => {
+                let json = serde_json::to_string(checkpoint).map_err(|err| format!("{err}"))?;
+                self.set_run_progress_ingress_checkpoint_by_row(run_row_id, &json)
+                    .map_err(|err| format!("{err:#}"))
+            }
+        }
     }
 
     fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String> {
@@ -123,6 +198,12 @@ struct StreamSegment {
     stream_len: u64,
     file_start: u64,
     file_len: u64,
+    /// The incarnation these file offsets are offsets into. Per segment
+    /// rather than per map because the reader can still be inside a segment
+    /// that predates a rotation the tail has already installed — and a
+    /// checkpoint taken there must name the incarnation the *offset* belongs
+    /// to, not the one the tail happens to be reading now.
+    identity: FileIdentity,
 }
 
 /// Translates the reader's consumed-byte position back into a rollout-file
@@ -140,15 +221,24 @@ struct StreamFileMap {
     stream_end: u64,
 }
 
+/// A resolved point in the rollout: which byte, and which incarnation of the
+/// file that byte belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilePosition {
+    offset: u64,
+    identity: FileIdentity,
+}
+
 impl StreamFileMap {
     /// Note that `len` bytes starting at `file_start` are about to be handed
     /// to the reader. Called *before* the write so the map is never behind
     /// bytes the reader could already have consumed.
-    fn record_bytes(&mut self, file_start: u64, len: u64) {
+    fn record_bytes(&mut self, file_start: u64, len: u64, identity: FileIdentity) {
         if len == 0 {
             return;
         }
         if let Some(last) = self.segments.back_mut()
+            && last.identity == identity
             && last.stream_len == last.file_len
             && last.stream_start + last.stream_len == self.stream_end
             && last.file_start + last.file_len == file_start
@@ -163,34 +253,39 @@ impl StreamFileMap {
             stream_len: len,
             file_start,
             file_len: len,
+            identity,
         });
         self.stream_end += len;
     }
 
     /// Note the one-byte synthetic line delimiter, after which the file
-    /// offset restarts at `next_file_start`.
-    fn record_delimiter(&mut self, next_file_start: u64) {
+    /// offset restarts at `next_file_start` in incarnation `identity`.
+    fn record_delimiter(&mut self, next_file_start: u64, identity: FileIdentity) {
         self.segments.push_back(StreamSegment {
             stream_start: self.stream_end,
             stream_len: 1,
             file_start: next_file_start,
             file_len: 0,
+            identity,
         });
         self.stream_end += 1;
     }
 
-    /// The rollout-file offset the reader is at, having consumed
-    /// `stream_offset` bytes.
+    /// The rollout-file position the reader is at, having consumed
+    /// `stream_offset` bytes — the offset and the incarnation it indexes.
     ///
     /// Resolves against the newest segment that starts at or before the
     /// position, so a position sitting exactly on an incarnation boundary
     /// names the new incarnation rather than the dead one.
-    fn file_offset_for(&self, stream_offset: u64) -> Option<u64> {
+    fn file_position_for(&self, stream_offset: u64) -> Option<FilePosition> {
         self.segments
             .iter()
             .rev()
             .find(|segment| segment.stream_start <= stream_offset)
-            .map(|segment| segment.file_start + (stream_offset - segment.stream_start).min(segment.file_len))
+            .map(|segment| FilePosition {
+                offset: segment.file_start + (stream_offset - segment.stream_start).min(segment.file_len),
+                identity: segment.identity,
+            })
     }
 
     /// Drop segments the reader can never ask about again.
@@ -208,11 +303,19 @@ impl StreamFileMap {
 
 /// Writes the run's [`IngressCheckpoint::Attached`] record after every
 /// dispatched event.
+///
+/// The *write* is per event by design — that is what bounds the crash window
+/// to a single record — but nothing else here may be. `target` is the store's
+/// resolved destination for this run, resolved once when the ingress attaches
+/// rather than re-derived on every event: on the production store that
+/// derivation is a scan over `work_runs` under the single shared work-db
+/// connection lock, for an answer that cannot change across a run.
 #[derive(bon::Builder)]
 #[builder(on(String, into))]
 struct AttachedCheckpointer {
     run_id: String,
     store: Arc<dyn IngressCheckpointStore>,
+    target: CheckpointTarget,
     ingress: AgentJsonlFileIngress,
     path: PathBuf,
     session_id: String,
@@ -228,7 +331,7 @@ impl ProgressCheckpointSink for AttachedCheckpointer {
             );
             return;
         };
-        let Some(file_offset) = map.file_offset_for(consumed_bytes) else {
+        let Some(position) = map.file_position_for(consumed_bytes) else {
             // Cannot happen while the tail is the only writer — the reader
             // consumes bytes the tail recorded first. Leaving the stored
             // point alone re-reads a bounded prefix on resume, which is the
@@ -246,13 +349,14 @@ impl ProgressCheckpointSink for AttachedCheckpointer {
             ingress: self.ingress.clone(),
             path: self.path.clone(),
             session_id: self.session_id.clone(),
-            consumed_bytes: file_offset,
+            consumed_bytes: position.offset,
+            identity: position.identity,
             session_state,
         };
-        if let Err(err) = self.store.store_ingress_checkpoint(&self.run_id, &checkpoint) {
+        if let Err(err) = self.store.store_ingress_checkpoint_at(&self.target, &checkpoint) {
             tracing::warn!(
                 run_id = %self.run_id,
-                file_offset,
+                file_offset = position.offset,
                 %err,
                 "agent JSONL progress: could not persist the resume point",
             );
@@ -260,8 +364,12 @@ impl ProgressCheckpointSink for AttachedCheckpointer {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FileIdentity {
+/// Which incarnation of a pathname a descriptor or an offset refers to.
+///
+/// Public because [`IngressCheckpoint::Attached`] persists it: a resume point
+/// is only meaningful paired with the incarnation it was measured against.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FileIdentity {
     device: u64,
     inode: u64,
 }
@@ -490,16 +598,32 @@ impl AgentJsonlProgressManager {
                 path,
                 session_id,
                 consumed_bytes,
+                identity,
                 session_state,
             } => {
                 let prepared = PreparedSource::with_baseline(ingress, HashSet::new())?;
-                let candidate = validate_candidate(&prepared, &path)?
+                let mut candidate = validate_candidate(&prepared, &path)?
                     .ok_or_else(|| format!("recorded rollout {} is no longer attachable", path.display()))?;
                 if candidate.session_id != session_id {
                     return Err(format!(
                         "recorded rollout {} now reports session {} rather than {session_id}",
                         path.display(),
                         candidate.session_id,
+                    ));
+                }
+                if candidate.identity != identity {
+                    // The pathname survived but the file behind it did not:
+                    // rotated or replaced while this engine was down. The
+                    // recorded offset indexes the dead incarnation, and the
+                    // size check below cannot see that — a replacement that
+                    // is merely long enough passes it, and the tail would
+                    // then skip the new file's first `consumed_bytes` bytes
+                    // and very likely resume mid-line.
+                    return Err(format!(
+                        "recorded rollout {} is a different file now ({:?} rather than {:?})",
+                        path.display(),
+                        candidate.identity,
+                        identity,
                     ));
                 }
                 let size = candidate
@@ -509,14 +633,22 @@ impl AgentJsonlProgressManager {
                     .len();
                 if size < consumed_bytes {
                     // Shorter than what we already published means the file
-                    // was truncated or replaced under the same name and inode.
-                    // There is no offset in it that means what the checkpoint
-                    // meant, so there is nothing honest to resume from.
+                    // was truncated and regrown under the same name and
+                    // inode. There is no offset in it that means what the
+                    // checkpoint meant, so there is nothing honest to resume
+                    // from.
                     return Err(format!(
                         "recorded rollout {} is {size} bytes but {consumed_bytes} were already consumed",
                         path.display(),
                     ));
                 }
+                // The record's own invariant, checked rather than trusted:
+                // `consumed_bytes` is always immediately past a newline. A
+                // truncate-and-regrow that happened to land at exactly the
+                // same length keeps the inode and passes the size check, and
+                // attaching mid-line there would splice a fragment of the
+                // dead incarnation onto the new one's next line.
+                verify_record_boundary(&mut candidate.file, &path, consumed_bytes)?;
                 // Prove the driver can take its own recorded state back
                 // before anything is attached. The reader would otherwise
                 // discover this mid-flight, in a spawned task with nobody to
@@ -700,6 +832,7 @@ async fn run_prepared<S>(
                 path: candidate.path.clone(),
                 session_id: candidate.session_id.clone(),
                 consumed_bytes: 0,
+                identity: candidate.identity,
                 session_state: None,
             };
             if let Err(err) = store.store_ingress_checkpoint(&run_id, &attached) {
@@ -725,9 +858,26 @@ async fn run_prepared<S>(
         "agent JSONL progress: attached rollout",
     );
     let transcript_path = candidate.path.clone();
+    // Resolved here, once, so the per-event write below is a single keyed
+    // update. A store that cannot resolve it still gets its checkpoints — the
+    // run-id keyed path is the fallback, and losing the durable resume point
+    // over a failed lookup would be a far worse trade than a slower write.
+    let target = match store.resolve_checkpoint_target(&run_id) {
+        Ok(target) => target,
+        Err(err) => {
+            tracing::warn!(
+                run_id,
+                %err,
+                "agent JSONL progress: could not pre-resolve the checkpoint destination; \
+                 falling back to resolving it on each write",
+            );
+            CheckpointTarget::ByRunId(run_id.clone())
+        }
+    };
     let checkpointer = AttachedCheckpointer::builder()
         .run_id(run_id.clone())
         .store(store)
+        .target(target)
         .ingress(prepared.ingress.clone())
         .path(candidate.path.clone())
         .session_id(candidate.session_id.clone())
@@ -1168,7 +1318,9 @@ where
             // Revalidate the restarted logical stream on this exact
             // descriptor before publishing either its prefix or a delimiter.
             revalidate_truncated_stream(&prepared, &path, &session_id, &mut file, opened_identity)?;
-            record_delimiter(&map, 0)?;
+            // A truncation keeps the inode, so the new incarnation of the
+            // bytes is still `opened_identity` — what restarts is the offset.
+            record_delimiter(&map, 0, opened_identity)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             offset = 0;
             continue;
@@ -1196,7 +1348,7 @@ where
                 // the reader: the checkpointer resolves the reader's position
                 // through this map, and a position it cannot resolve leaves
                 // the durable resume point where it was.
-                record_bytes(&map, offset, count as u64)?;
+                record_bytes(&map, offset, count as u64, opened_identity)?;
                 offset += count as u64;
                 write_or_halt(&mut writer, &buffer[..count], &mut halt).await?;
                 continue;
@@ -1247,7 +1399,11 @@ where
                 .filter(|new| new.session_id == session_id)
                 .ok_or_else(|| format!("rotated rollout {} lost run correlation", path.display()))?;
             after_rotation_validation(&rotated)?;
-            record_delimiter(&map, 0)?;
+            // Everything from the delimiter on belongs to the new inode; the
+            // segments before it keep naming the old one, so a checkpoint
+            // taken while the reader is still behind the boundary stays
+            // paired with the incarnation its offset came from.
+            record_delimiter(&map, 0, rotated.identity)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             // Transfer the exact descriptor whose session/cwd/filename/link
             // and inode evidence was just validated. Never reopen `path`.
@@ -1274,17 +1430,42 @@ where
     }
 }
 
-fn record_bytes(map: &Mutex<StreamFileMap>, file_start: u64, len: u64) -> Result<(), String> {
-    map.lock()
-        .map_err(|_| "rollout offset map poisoned".to_owned())?
-        .record_bytes(file_start, len);
+/// Check the invariant [`IngressCheckpoint::Attached::consumed_bytes`]
+/// asserts about itself: it is immediately past a newline.
+///
+/// Offset zero is trivially a boundary. Anything else must have `\n` as its
+/// preceding byte, or the offset does not name the start of a record in *this*
+/// file — which means attaching there would hand the reader a fragment.
+fn verify_record_boundary(file: &mut fs::File, path: &Path, consumed_bytes: u64) -> Result<(), String> {
+    if consumed_bytes == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(consumed_bytes - 1))
+        .map_err(|err| format!("seek {}: {err}", path.display()))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)
+        .map_err(|err| format!("read {} at {}: {err}", path.display(), consumed_bytes - 1))?;
+    if last[0] != b'\n' {
+        return Err(format!(
+            "recorded rollout {} does not end a record at {consumed_bytes} (preceding byte is {:?}, not a newline)",
+            path.display(),
+            last[0] as char,
+        ));
+    }
     Ok(())
 }
 
-fn record_delimiter(map: &Mutex<StreamFileMap>, next_file_start: u64) -> Result<(), String> {
+fn record_bytes(map: &Mutex<StreamFileMap>, file_start: u64, len: u64, identity: FileIdentity) -> Result<(), String> {
     map.lock()
         .map_err(|_| "rollout offset map poisoned".to_owned())?
-        .record_delimiter(next_file_start);
+        .record_bytes(file_start, len, identity);
+    Ok(())
+}
+
+fn record_delimiter(map: &Mutex<StreamFileMap>, next_file_start: u64, identity: FileIdentity) -> Result<(), String> {
+    map.lock()
+        .map_err(|_| "rollout offset map poisoned".to_owned())?
+        .record_delimiter(next_file_start, identity);
     Ok(())
 }
 
@@ -1382,6 +1563,12 @@ mod tests {
 
     fn test_store() -> Arc<dyn IngressCheckpointStore> {
         Arc::new(MemoryCheckpointStore::default())
+    }
+
+    /// The device/inode a checkpoint would have recorded for `path` as it is
+    /// on disk right now.
+    fn identity_of(path: &Path) -> FileIdentity {
+        file_identity(&fs::metadata(path).unwrap())
     }
 
     /// The tail as every pre-existing test drives it: from byte zero, with an
@@ -2331,6 +2518,7 @@ mod tests {
                     path: sessions.join("rollout-new-thread-gone.jsonl"),
                     session_id: "thread-gone".into(),
                     consumed_bytes: 128,
+                    identity: FileIdentity { device: 1, inode: 1 },
                     session_state: None,
                 },
                 CaptureSink::default(),
@@ -2375,6 +2563,7 @@ mod tests {
                     path: fs::canonicalize(&path).unwrap(),
                     session_id: "thread-short".into(),
                     consumed_bytes: size + 1,
+                    identity: identity_of(&path),
                     session_state: None,
                 },
                 CaptureSink::default(),
@@ -2411,6 +2600,7 @@ mod tests {
                     path: fs::canonicalize(&path).unwrap(),
                     session_id: "thread-expected".into(),
                     consumed_bytes: 0,
+                    identity: identity_of(&path),
                     session_state: None,
                 },
                 CaptureSink::default(),
@@ -2418,6 +2608,110 @@ mod tests {
             )
             .expect_err("a rollout for another session is not this run's resume point");
         assert!(err.contains("thread-expected"), "got {err}");
+    }
+
+    /// A rollout replaced under the same pathname while the engine was down
+    /// is a different file, and the recorded offset indexes the dead one.
+    /// Path plus length cannot see that — the replacement only has to be long
+    /// enough — so the incarnation the offset was measured against is
+    /// recorded and checked. Attaching anyway would skip the new file's first
+    /// `consumed_bytes` bytes and land mid-line.
+    #[tokio::test]
+    async fn resuming_a_rollout_rotated_under_the_same_path_fails_loudly() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let path = sessions.join("rollout-new-thread-rotated.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-rotated")).unwrap();
+        let dead_incarnation = identity_of(&path);
+        let consumed = fs::metadata(&path).unwrap().len();
+
+        // Replaced, not appended to: a new inode behind the same name, at
+        // least as long as what the previous engine had already consumed.
+        fs::remove_file(&path).unwrap();
+        let mut replacement = rollout_text(&workspace, "thread-rotated");
+        replacement.push_str(&second_turn_text());
+        fs::write(&path, &replacement).unwrap();
+        assert_ne!(
+            identity_of(&path),
+            dead_incarnation,
+            "precondition: the replacement must genuinely be a different file",
+        );
+        assert!(
+            fs::metadata(&path).unwrap().len() >= consumed,
+            "precondition: the replacement must be long enough to defeat the size check alone",
+        );
+
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-rotated",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: fs::canonicalize(&path).unwrap(),
+                    session_id: "thread-rotated".into(),
+                    consumed_bytes: consumed,
+                    identity: dead_incarnation,
+                    session_state: None,
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("an offset into a dead incarnation is not resumable");
+        assert!(err.contains("different file now"), "got {err}");
+        assert!(manager.runs.lock().unwrap().is_empty());
+    }
+
+    /// The `Attached` record asserts that `consumed_bytes` is immediately past
+    /// a newline. Checked rather than trusted: a truncate-and-regrow that
+    /// happens to land at the same length keeps the inode and passes the size
+    /// check, and attaching mid-line there splices a fragment of the dead
+    /// incarnation onto the new one's next record.
+    #[tokio::test]
+    async fn resuming_at_an_offset_that_is_not_a_record_boundary_fails_loudly() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let path = sessions.join("rollout-new-thread-midline.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-midline")).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-midline",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: fs::canonicalize(&path).unwrap(),
+                    session_id: "thread-midline".into(),
+                    // One byte short of the final newline: inside the last
+                    // record rather than after it.
+                    consumed_bytes: size - 1,
+                    identity: identity_of(&path),
+                    session_state: None,
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("an offset inside a record is not resumable");
+        assert!(err.contains("does not end a record"), "got {err}");
+        assert!(manager.runs.lock().unwrap().is_empty());
     }
 
     /// A session state the driver cannot take back is a failed resume, not a
@@ -2449,6 +2743,7 @@ mod tests {
                     path: fs::canonicalize(&path).unwrap(),
                     session_id: "thread-badstate".into(),
                     consumed_bytes: 0,
+                    identity: identity_of(&path),
                     session_state: Some(serde_json::json!("not a session snapshot")),
                 },
                 CaptureSink::default(),
@@ -2484,41 +2779,71 @@ mod tests {
     /// every checkpoint after the first anomaly.
     #[test]
     fn stream_positions_resolve_to_the_file_offsets_they_came_from() {
+        let first = FileIdentity { device: 1, inode: 100 };
         let mut map = StreamFileMap::default();
         // A resumed tail: the reader's byte 0 is the file's byte 100.
-        map.record_bytes(100, 50);
-        assert_eq!(map.file_offset_for(0), Some(100));
-        assert_eq!(map.file_offset_for(50), Some(150));
+        map.record_bytes(100, 50, first);
+        assert_eq!(map.file_position_for(0).unwrap().offset, 100);
+        assert_eq!(map.file_position_for(50).unwrap().offset, 150);
 
         // Contiguous growth stays one segment.
-        map.record_bytes(150, 25);
+        map.record_bytes(150, 25, first);
         assert_eq!(map.segments.len(), 1);
-        assert_eq!(map.file_offset_for(75), Some(175));
+        assert_eq!(map.file_position_for(75).unwrap().offset, 175);
 
         // The file is truncated: one stream byte, no file bytes, and the file
-        // offset restarts.
-        map.record_delimiter(0);
-        map.record_bytes(0, 10);
+        // offset restarts. Truncation keeps the inode.
+        map.record_delimiter(0, first);
+        map.record_bytes(0, 10, first);
         assert_eq!(
-            map.file_offset_for(76),
-            Some(0),
+            map.file_position_for(76).unwrap().offset,
+            0,
             "the delimiter itself maps to the start of the new incarnation",
         );
-        assert_eq!(map.file_offset_for(80), Some(4));
+        assert_eq!(map.file_position_for(80).unwrap().offset, 4);
 
         // Positions the reader cannot have reached yet clamp rather than
         // running off the end of the segment they land in.
-        assert_eq!(map.file_offset_for(999), Some(10));
+        assert_eq!(map.file_position_for(999).unwrap().offset, 10);
+    }
+
+    /// A rotation replaces the inode mid-stream. A checkpoint taken while the
+    /// reader is still behind the boundary must stay paired with the
+    /// incarnation its own offset came from — pairing it with the incarnation
+    /// the *tail* is now reading is the stale-offset resume this identity
+    /// exists to refuse.
+    #[test]
+    fn positions_carry_the_incarnation_their_offset_belongs_to() {
+        let old = FileIdentity { device: 1, inode: 7 };
+        let new = FileIdentity { device: 1, inode: 8 };
+        let mut map = StreamFileMap::default();
+        map.record_bytes(0, 40, old);
+        map.record_delimiter(0, new);
+        map.record_bytes(0, 30, new);
+
+        assert_eq!(map.file_position_for(10).unwrap().identity, old);
+        assert_eq!(
+            map.file_position_for(40).unwrap().identity,
+            new,
+            "the boundary itself belongs to the incarnation that follows it",
+        );
+        assert_eq!(map.file_position_for(60).unwrap().identity, new);
+        assert_eq!(
+            map.segments.len(),
+            3,
+            "bytes from two incarnations must never merge into one segment",
+        );
     }
 
     /// Pruning must never move an answer the checkpointer could still ask for.
     #[test]
     fn pruning_consumed_segments_preserves_the_live_answer() {
+        let identity = FileIdentity { device: 1, inode: 9 };
         let mut map = StreamFileMap::default();
-        map.record_bytes(0, 10);
-        map.record_delimiter(0);
-        map.record_bytes(0, 10);
+        map.record_bytes(0, 10, identity);
+        map.record_delimiter(0, identity);
+        map.record_bytes(0, 10, identity);
         map.prune_through(21);
-        assert_eq!(map.file_offset_for(21), Some(10));
+        assert_eq!(map.file_position_for(21).unwrap().offset, 10);
     }
 }

@@ -324,6 +324,186 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
     );
 }
 
+// ─── progress-ingress readoption ────────────────────────────────────────────
+
+/// Read back the `progress_ingress` field the readoption stamped on its
+/// `live_worker_readopted` dispatch event.
+///
+/// Goes through the JSONL the production `JsonlFileSink` actually wrote,
+/// under the state root `test_server_state` gave the config, rather than
+/// through a substituted sink: the field is a forensic surface, and asserting
+/// on it where an operator would read it is what proves it survives
+/// serialisation.
+fn readopted_progress_ingress(state_root: &std::path::Path, execution_id: &str) -> String {
+    let path = state_root.join("executions").join(execution_id).join("dispatch.jsonl");
+    let contents = std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
+    let event = contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["stage"] == "live_worker_readopted")
+        .expect("re-adoption must emit a live_worker_readopted event");
+    event["details"]["progress_ingress"]
+        .as_str()
+        .expect("the event must name what happened to the progress ingress")
+        .to_owned()
+}
+
+fn progress_ingress_attention(server_state: &ServerState, execution_id: &str) -> Vec<boss_protocol::WorkAttentionItem> {
+    server_state
+        .work_db
+        .list_attention_items(execution_id)
+        .unwrap()
+        .into_iter()
+        .filter(|item| item.kind == crate::app::readoption::PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND)
+        .collect()
+}
+
+/// Store `checkpoint` as the run's durable resume point.
+fn record_checkpoint(
+    server_state: &ServerState,
+    execution_id: &str,
+    checkpoint: &crate::agent_jsonl_progress::IngressCheckpoint,
+) {
+    use crate::agent_jsonl_progress::IngressCheckpointStore;
+    server_state
+        .work_db
+        .store_ingress_checkpoint(execution_id, checkpoint)
+        .expect("the seeded execution has a work_runs row to write to");
+}
+
+/// **Coverage: a re-adopted run whose recorded rollout cannot be re-attached.**
+///
+/// The worker is alive, so no sweep will ever resolve this — every sweep that
+/// could reads liveness, and liveness is exactly what is true. The attention
+/// item is the only thing that turns "this session will never produce another
+/// turn boundary" into something a human sees, so it is the thing worth
+/// pinning at this layer.
+#[tokio::test]
+async fn a_readopted_run_whose_checkpoint_is_unresolvable_files_an_attention_item() {
+    let (server_state, dir) = test_server_state();
+    let (_work_item_id, execution_id) =
+        stranded_live_worker(&server_state, i64::from(std::process::id()), "presumed dead");
+    // A rollout directory that is not there: the ingress cannot verify a root
+    // it cannot stat, so the resume fails before anything is attached.
+    record_checkpoint(
+        &server_state,
+        &execution_id,
+        &crate::agent_jsonl_progress::IngressCheckpoint::Armed {
+            ingress: crate::driver::AgentJsonlFileIngress {
+                directory: dir.path().join("no-such-sessions-dir"),
+                filename_prefix: "rollout-".to_owned(),
+                filename_suffix: ".jsonl".to_owned(),
+                workspace_path: dir.path().to_path_buf(),
+            },
+            baseline: Vec::new(),
+        },
+    );
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(
+        &server_state,
+        &execution_id,
+        "hook_after_terminal",
+    )
+    .await;
+
+    assert_eq!(
+        readopted_progress_ingress(dir.path(), &execution_id),
+        "failed",
+        "the dispatch trace must record that the run came back un-observable",
+    );
+    let items = progress_ingress_attention(&server_state, &execution_id);
+    assert_eq!(items.len(), 1, "exactly one operator-visible item, got {items:?}");
+    assert!(
+        items[0].body_markdown.contains("bossctl agents stop"),
+        "the item must tell an operator what to do, got {:?}",
+        items[0].body_markdown,
+    );
+    assert_eq!(
+        server_state.work_db.get_execution(&execution_id).unwrap().status,
+        ExecutionStatus::WaitingHuman,
+        "a failed ingress restore must not block the row restore — the duplicate-dispatch stop \
+         is the more urgent half and does not depend on the tail",
+    );
+}
+
+/// **Coverage: a file-tailing run that recorded no checkpoint at all.**
+///
+/// A Codex session that was in flight when the engine was upgraded to the
+/// build that added the column, or one whose `Armed` write failed. The
+/// resulting state is identical to the case above — live worker, no tail, no
+/// turn boundary — so it must be reported identically. A warning in the log
+/// is not a report: nothing reads it, and the run holds a slot and a lease
+/// until a human intervenes.
+#[tokio::test]
+async fn a_file_tailing_run_with_no_checkpoint_is_an_attention_item_not_a_warning() {
+    use crate::work::WorkItemPatch;
+
+    let (server_state, dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    db.update_work_item(
+        &work_item_id,
+        WorkItemPatch {
+            driver: Some("codex".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(
+        &server_state,
+        &execution_id,
+        "hook_after_terminal",
+    )
+    .await;
+
+    assert_eq!(
+        readopted_progress_ingress(dir.path(), &execution_id),
+        "failed",
+        "a file-tailing driver with no checkpoint is unobservable, not merely unknown",
+    );
+    assert_eq!(
+        progress_ingress_attention(&server_state, &execution_id).len(),
+        1,
+        "the operator has to hear about it",
+    );
+}
+
+/// A hook-callback driver's progress never depended on a tail, so re-adoption
+/// has nothing to re-establish — and says so, rather than reporting the
+/// silence as either success or failure. The negative control for both cases
+/// above: without it, "failed" could be the answer for every run.
+#[tokio::test]
+async fn a_hook_callback_run_reports_that_there_was_no_tail_to_restore() {
+    let (server_state, dir) = test_server_state();
+    let (_work_item_id, execution_id) =
+        stranded_live_worker(&server_state, i64::from(std::process::id()), "presumed dead");
+    record_checkpoint(
+        &server_state,
+        &execution_id,
+        &crate::agent_jsonl_progress::IngressCheckpoint::NotFileIngress,
+    );
+
+    crate::app::worker_events::converge_terminal_execution_contradiction(
+        &server_state,
+        &execution_id,
+        "hook_after_terminal",
+    )
+    .await;
+
+    assert_eq!(
+        readopted_progress_ingress(dir.path(), &execution_id),
+        "not_file_ingress"
+    );
+    assert!(
+        progress_ingress_attention(&server_state, &execution_id).is_empty(),
+        "a driver that never tailed a file must not raise an unobservable-worker alarm",
+    );
+}
+
 /// Convergence is serialized per run. A worker mid-turn emits several hooks a
 /// second, and each one reaching this path independently would race writes
 /// against the same execution row and fan out `ListHostedPanes` round-trips at

@@ -531,23 +531,51 @@ impl ProgressSessionNormalizer for CodexRolloutProgressSession {
 /// - `observed_tool_calls` and `turn_terminal` are the in-flight turn's own
 ///   accounting; zeroing them mid-turn mis-scopes the guard comparison to a
 ///   fragment of the turn.
-#[derive(Debug, bon::Builder, serde::Serialize, serde::Deserialize)]
-#[builder(on(String, into))]
+///
+/// **Every field is required on the wire, and there is deliberately no
+/// builder.** Only [`Self::capture`] ever writes this type and only
+/// [`Self::apply`] ever reads it, so a blanket `#[serde(default)]` would buy
+/// nothing but the ability to accept a *degenerate* snapshot: `{}`, or an
+/// object that lost fields to a truncated write, would deserialize into an
+/// all-zero state and `restore_resume_state` would return `Ok`. `apply` would
+/// then quietly install exactly the session the list above calls fatal.
+/// Absent fields must therefore fail deserialization and reach the attention
+/// item. The one exception is `current_thread_id`, whose `None` is a real
+/// value a session genuinely holds before its `session_meta` record.
+///
+/// A struct literal in `capture` rather than a builder, for the same reason
+/// the CLAUDE.md builder convention exempts the DB mappers: a new session
+/// field that nobody captured should be a compile error, not a silent
+/// default. The turn accounting and the guard cursor are grouped into their
+/// own types rather than flattened here, so that property holds without the
+/// type reaching the size at which the convention would demand a builder.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct RolloutResumeState {
     #[serde(default)]
     current_thread_id: Option<String>,
     /// Open calls in `call_order` order, so the LRU eviction order survives
     /// the round trip rather than being re-invented by `HashMap` iteration.
-    #[serde(default)]
     open_calls: Vec<(String, RolloutToolCall)>,
-    #[serde(default)]
-    turn_terminal: bool,
-    #[serde(default)]
-    guard_trace_line: usize,
-    #[serde(default)]
+    turn: TurnResumeState,
+    guards: GuardResumeState,
+}
+
+/// The in-flight turn's own accounting, which is scoped to one turn and means
+/// nothing across turns — hence its own type rather than two loose fields.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct TurnResumeState {
+    terminal: bool,
     observed_tool_calls: usize,
-    #[serde(default)]
-    guard_records_seen: bool,
+}
+
+/// The read cursor into the guard decision log, plus whether anything has
+/// been read from it. The pair is only ever meaningful together: a zero
+/// cursor with `records_seen` true is a log that exists and is unread, while
+/// a zero cursor with it false is the `GUARDS_SILENT_MARKER` precondition.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct GuardResumeState {
+    trace_line: usize,
+    records_seen: bool,
 }
 
 impl RolloutResumeState {
@@ -560,10 +588,14 @@ impl RolloutResumeState {
         Self {
             current_thread_id: session.current_thread_id.clone(),
             open_calls,
-            turn_terminal: session.turn_terminal,
-            guard_trace_line: session.guard_trace_line,
-            observed_tool_calls: session.observed_tool_calls,
-            guard_records_seen: session.guard_records_seen,
+            turn: TurnResumeState {
+                terminal: session.turn_terminal,
+                observed_tool_calls: session.observed_tool_calls,
+            },
+            guards: GuardResumeState {
+                trace_line: session.guard_trace_line,
+                records_seen: session.guard_records_seen,
+            },
         }
     }
 
@@ -575,10 +607,10 @@ impl RolloutResumeState {
             .map(|(call_id, call)| (call_id.clone(), call.clone()))
             .collect();
         session.call_order = self.open_calls.into_iter().map(|(call_id, _)| call_id).collect();
-        session.turn_terminal = self.turn_terminal;
-        session.guard_trace_line = self.guard_trace_line;
-        session.observed_tool_calls = self.observed_tool_calls;
-        session.guard_records_seen = self.guard_records_seen;
+        session.turn_terminal = self.turn.terminal;
+        session.observed_tool_calls = self.turn.observed_tool_calls;
+        session.guard_trace_line = self.guards.trace_line;
+        session.guard_records_seen = self.guards.records_seen;
     }
 }
 
@@ -1286,6 +1318,52 @@ mod tests {
             ),
             "the restored session must still know both the thread and the open call: {events:?}"
         );
+    }
+
+    /// A snapshot that lost fields — a truncated write, an older shape — must
+    /// fail deserialization rather than default its way to an all-zero
+    /// session. Accepting `{}` would hand `apply` exactly the state the type's
+    /// own doc calls fatal (no thread id, a zero guard cursor, no guard
+    /// records seen) and report `Ok` while doing it, so the caller's loud
+    /// path — the attention item — would never fire.
+    #[test]
+    fn a_degenerate_resume_snapshot_is_rejected_rather_than_defaulted() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        let err = session
+            .restore_resume_state(&json!({}))
+            .expect_err("an empty object is not a session snapshot");
+        assert!(err.contains("rollout resume state"), "got {err}");
+
+        // A real snapshot with one field dropped is the truncation case, and
+        // must be refused for the same reason.
+        let mut full = CodexRolloutProgressSession::new(None, None, None);
+        full.normalize_progress_events(&json!({
+            "type":"session_meta",
+            "payload":{"id":"thread-partial","cwd":"/tmp/workspace"}
+        }))
+        .unwrap();
+        let mut state = full.resume_state().unwrap();
+        state
+            .as_object_mut()
+            .expect("the snapshot is an object")
+            .remove("guards")
+            .expect("precondition: the field was there to drop");
+        assert!(
+            session.restore_resume_state(&state).is_err(),
+            "a snapshot missing a field must not silently resume with that field zeroed",
+        );
+
+        // `current_thread_id` is the one genuine exception: `None` is a state
+        // a session really holds, before its `session_meta` record.
+        let mut without_thread = full.resume_state().unwrap();
+        without_thread
+            .as_object_mut()
+            .unwrap()
+            .remove("current_thread_id")
+            .unwrap();
+        session
+            .restore_resume_state(&without_thread)
+            .expect("an absent thread id is a meaningful value, not a lost field");
     }
 
     #[test]

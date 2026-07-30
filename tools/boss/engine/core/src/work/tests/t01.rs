@@ -1414,6 +1414,27 @@ fn starts_ready_execution_run_and_attaches_workspace() {
         db.get_run_progress_ingress_checkpoint(&execution.id).unwrap(),
         Some(r#"{"kind":"attached","consumed_bytes":4096}"#.to_owned()),
     );
+    // The per-event write path resolves that same row once and then writes to
+    // it by key. It must land on the row the run-id keyed form picks —
+    // resolving to a different row would send every checkpoint after the
+    // first event somewhere nothing ever reads back.
+    let row = db
+        .resolve_run_row_for_execution(&execution.id)
+        .unwrap()
+        .expect("the started run has a row");
+    db.set_run_progress_ingress_checkpoint_by_row(&row, r#"{"kind":"attached","consumed_bytes":8192}"#)
+        .unwrap();
+    assert_eq!(
+        db.get_run_progress_ingress_checkpoint(&execution.id).unwrap(),
+        Some(r#"{"kind":"attached","consumed_bytes":8192}"#.to_owned()),
+    );
+    // A row that has gone is an error, not a silent no-op: a resume point
+    // that went nowhere reads back exactly like a run that never had one.
+    assert!(
+        db.set_run_progress_ingress_checkpoint_by_row("no-such-row", "{}")
+            .is_err()
+    );
+
     assert!(db.clear_run_progress_ingress_checkpoint(&execution.id).unwrap());
     assert!(db.get_run_progress_ingress_checkpoint(&execution.id).unwrap().is_none());
 

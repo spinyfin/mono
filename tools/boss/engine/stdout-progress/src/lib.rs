@@ -304,8 +304,31 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// names the end of the line that produced that envelope — including any
     /// blank, non-JSON or driver-declined lines skipped on the way to it,
     /// which is correct, because a skipped line produced nothing to replay.
+    ///
+    /// It advances a whole *line* at a time, while [`Self::next_event`] yields
+    /// one *envelope* at a time, so it is only a truthful resume point when
+    /// [`Self::at_record_boundary`] agrees — see that method.
     pub fn consumed_bytes(&self) -> u64 {
         self.consumed_bytes
+    }
+
+    /// Whether the reader holds no further envelopes from the line it last
+    /// framed.
+    ///
+    /// One record can normalise to several [`WorkerEvent`]s — a Codex
+    /// `task_complete` that also drains queued notifications yields
+    /// `[Notification.., Stop]` — and they are handed out one call at a time
+    /// from a buffer this drains. [`Self::consumed_bytes`] is already at the
+    /// end of that whole line from the *first* of them, so a caller that
+    /// persisted it there would name a position past envelopes it has not
+    /// dispatched yet: a crash in that window skips the rest of the line,
+    /// including a `Stop`.
+    ///
+    /// Read immediately after [`Self::next_event`] returns `Some`, this is
+    /// `true` exactly when that envelope was the line's last, which is the
+    /// only moment `consumed_bytes` is safe to make durable.
+    pub fn at_record_boundary(&self) -> bool {
+        self.pending_events.is_empty()
     }
 
     /// The driver session's resumable state as of the last line consumed.

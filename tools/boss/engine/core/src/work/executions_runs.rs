@@ -2057,6 +2057,39 @@ impl WorkDb {
         Ok(())
     }
 
+    /// Resolve the `work_runs` row an execution's agent-session state lives
+    /// on, for a caller that is about to write to it repeatedly.
+    ///
+    /// Same row [`Self::set_run_progress_ingress_checkpoint`] picks, exposed
+    /// separately so the file-progress ingress — which writes after every
+    /// dispatched event — resolves it once at attach time instead of on each
+    /// write. The derivation is an ordered scan over `work_runs` under the
+    /// shared connection lock, and its answer is fixed for the life of a run.
+    pub fn resolve_run_row_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        resolve_run_id_for_execution_hooks(&conn, execution_id)
+    }
+
+    /// [`Self::set_run_progress_ingress_checkpoint`] against an already
+    /// resolved [`Self::resolve_run_row_for_execution`] row: one keyed UPDATE,
+    /// one acquisition of the shared connection.
+    ///
+    /// Errors when the row has gone (an execution whose run rows were pruned
+    /// mid-flight), for the same reason the run-id keyed form does: a resume
+    /// point that silently went nowhere reads back exactly like a run that
+    /// never had an ingress.
+    pub fn set_run_progress_ingress_checkpoint_by_row(&self, run_row_id: &str, checkpoint_json: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = ?2 WHERE id = ?1",
+            params![run_row_id, checkpoint_json],
+        )?;
+        if updated == 0 {
+            bail!("no work_runs row {run_row_id}");
+        }
+        Ok(())
+    }
+
     /// Read back the run's file-progress ingress resume point.
     ///
     /// `Ok(None)` means "this run never recorded one" — a legitimate answer
