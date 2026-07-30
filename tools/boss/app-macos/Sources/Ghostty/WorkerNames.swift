@@ -2,16 +2,19 @@ import Foundation
 
 /// Deterministic mapping from worker slot index → display label.
 ///
-/// We pick a fixed roster of Starfleet crew (TNG/DS9/VOY) and index
-/// it modulo the roster size, so slot 1 always renders as "Riker",
-/// slot 2 as "Data", etc. The roster comfortably exceeds the current
-/// `WorkersWorkspaceModel.workerSlotCount` (8) so we don't run out of
-/// names if the slot count grows. Captains (Picard, Sisko, Janeway)
-/// are intentionally omitted.
+/// We pick a fixed roster of Starfleet crew (TNG/DS9/VOY/ENT) and
+/// index it by slot id, so slot 1 always renders as "Riker", slot 2
+/// as "Data", etc. Slot ranges are disjoint across pools (interactive
+/// 1-16, automation 17-24, review 25-32), so as long as the roster
+/// has at least one entry per live slot (32), every concurrently live
+/// worker gets a distinct name regardless of which pool it's in.
+/// Captains (Picard, Sisko, Janeway) are intentionally omitted.
 enum WorkerNames {
     /// Order is load-bearing — slot 1 = roster[0], slot 2 = roster[1], …
     /// New names should be appended, not inserted, so existing slot
-    /// labels stay stable across releases.
+    /// labels stay stable across releases. Must have at least one
+    /// entry per live slot (currently 32) so no two concurrently live
+    /// workers ever collide on name.
     static let roster: [String] = [
         "Riker",      // TNG
         "Data",       // TNG
@@ -39,13 +42,20 @@ enum WorkerNames {
         "Kes",        // VOY
         "Seven",      // VOY
         "Doctor",     // VOY
+        "Guinan",     // TNG
+        "Pulaski",    // TNG
+        "Barclay",    // TNG
+        "Tucker",     // ENT
+        "Reed",       // ENT
+        "Sato",       // ENT
     ]
 
     /// Returns a stable display name for the given 1-based slot id.
     /// Falls back to "Worker N" if the slot id is non-positive
     /// (shouldn't happen — slot ids are assigned 1…N at workspace
-    /// init), and wraps modulo the roster for slot ids beyond the
-    /// roster length.
+    /// init). Wraps modulo the roster as a defensive fallback beyond
+    /// the roster length, but the roster is kept sized to cover every
+    /// live slot (see type docs) so this should never be exercised.
     static func name(forSlot slotId: Int) -> String {
         guard slotId > 0 else { return "Worker \(slotId)" }
         let index = (slotId - 1) % roster.count
