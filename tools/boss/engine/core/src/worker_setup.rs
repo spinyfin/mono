@@ -1064,8 +1064,11 @@ const CHECKLEFT_PUSH_GUARD_SCRIPT_NAME: &str = "boss-checkleft-push-guard.py";
 /// (`Bash`, and Codex's `apply_patch`) a payload it cannot read is
 /// **blocked**, not approved: at that point the guard cannot tell whether
 /// the call touches the data dir, and a gate that waves through what it
-/// cannot parse is not a gate. The positive prefix match remains the only
-/// path-based block.
+/// cannot parse is not a gate. The same holds one level up: a hook stdin
+/// that is not JSON, or a payload that is not a JSON object, blocks too —
+/// the gate cannot even read the tool name there, so "nothing to say about
+/// this tool" is not something it is in a position to conclude. The
+/// positive prefix match remains the only path-based block.
 ///
 /// Codex's `apply_patch` carries the whole patch body in
 /// `tool_input.command` with no `file_path` key, so the target paths live
@@ -1094,7 +1097,9 @@ Tools this gate has nothing to say about are approved: there is no candidate
 path to resolve, so silence is the right answer. The two tools it does read --
 Bash, and Codex's apply_patch -- fail CLOSED: an unreadable payload for those
 is blocked, because the guard then cannot tell whether the call targets the
-data directory. The positive prefix match is the only path-based block.
+data directory. A payload that is not JSON, or not a JSON object, fails closed
+too: the gate cannot read the tool name from it, so it cannot claim to have
+nothing to say. The positive prefix match is the only path-based block.
 """
 import json
 import os
@@ -1176,12 +1181,18 @@ def main():
         emit("approve")
     data_dir = os.path.realpath(os.path.expanduser(raw_dir))
 
+    # A payload the gate cannot read at all is blocked, not approved. In that
+    # state it cannot even determine the tool name, so the "a tool it has
+    # nothing to say about" justification for approving does not apply: this is
+    # an unanticipated payload shape, the exact condition the other Boss guards
+    # refuse. (BOSS_DATA_DIR being unset, above, stays an approve -- that is
+    # Boss's own configuration, not the agent's payload.)
     try:
         payload = json.load(sys.stdin)
-    except Exception:
-        emit("approve")
+    except Exception as error:
+        emit("block", MALFORMED + " Detail: hook stdin was not JSON (%s)." % error)
     if not isinstance(payload, dict):
-        emit("approve")
+        emit("block", MALFORMED + " Detail: hook payload was not a JSON object.")
 
     tool = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input")

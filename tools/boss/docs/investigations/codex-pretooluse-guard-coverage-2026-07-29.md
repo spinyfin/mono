@@ -46,7 +46,7 @@ A `gpt-5.6-terra` turn asked to run three commands in one cell produced this **r
 }
 ```
 
-So the brief's description of the rollout is exactly right: one `custom_tool_call` named `exec` whose input is JavaScript source. The **hook** for the same call was:
+So the rollout record on a code-mode model is one `custom_tool_call` named `exec` whose input is JavaScript source. The **hook** for the same call was:
 
 ```json
 {

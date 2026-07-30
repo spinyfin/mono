@@ -24,10 +24,15 @@
 //!    `$CODEX_HOME/`[`GUARD_TRACE_FILENAME`] — guard name, tool name,
 //!    decision, reason head,
 //! 3. re-emits the guard's own decision verbatim, and
-//! 4. **fails closed**: a guard that crashes, times out, exits non-zero or
-//!    prints something that is not a decision becomes a `block` with a loud
-//!    reason, recorded as `guard_error`. Codex would otherwise treat that
-//!    silence as approval.
+//! 4. **fails closed**: a guard that crashes, exceeds
+//!    `BOSS_GUARD_TIMEOUT_SECONDS`, exits non-zero or prints something that is
+//!    not a decision becomes a `block` with a loud reason, recorded as
+//!    `guard_error`. Codex would otherwise treat that silence as approval.
+//!
+//! The chain is anchored at both joints: the hook-trust attestation
+//! content-binds each wrapper, the wrapper verifies the shim's sha256 before
+//! `exec`ing it ([`GUARD_SHIM_SHA256_ENV`]), and the shim verifies the guard's
+//! sha256 on every invocation ([`GUARD_SHA256_ENV`]).
 //!
 //! The engine reads the file at each turn boundary
 //! ([`crate::codex::progress`]) and reports it as a `WorkerEvent::Notification`
@@ -60,15 +65,33 @@ const GUARD_NAME_ENV: &str = "BOSS_GUARD_NAME";
 ///
 /// Wrapping a guard would otherwise cost the hook-trust attestation its
 /// content binding: the gate hashes the file at the `command` path, which is
-/// now the wrapper, not the guard. Re-binding it here is strictly stronger
-/// than the static hash it replaces — the shim re-verifies the guard's bytes
-/// on **every invocation**, so a guard edited after arming is refused rather
-/// than merely un-attested.
+/// now the wrapper, not the guard. Re-binding it here restores that binding
+/// for the guard body and, for the guard body specifically, is stronger than
+/// the arming-time hash it replaces — the shim re-verifies the guard's bytes on
+/// **every invocation**, so a guard edited after arming is refused rather than
+/// merely un-attested.
 const GUARD_SHA256_ENV: &str = "BOSS_GUARD_SHA256";
+
+/// Env var carrying the expected `sha256:<hex>` of the trace shim itself,
+/// recorded for the trace line the wrapper writes when the check fails.
+///
+/// The shim sits between the attested wrapper and the content-bound guard, so
+/// without this check it would be the one link in the chain nothing covers:
+/// Codex's `trusted_hash` binds the hook *identity* (command path, matcher,
+/// timeout) and `verify_attestation`'s content hash binds the wrapper, neither
+/// of which says anything about `boss_guard_trace.py`'s bytes. Swapping the
+/// shim for `print('{"decision":"approve"}')` would neutralise every guard with
+/// both hashes still valid. The wrapper — which *is* attestation-bound —
+/// therefore verifies the shim's digest before `exec`ing it, which anchors the
+/// check in something that cannot itself be edited unnoticed.
+const GUARD_SHIM_SHA256_ENV: &str = "BOSS_GUARD_SHIM_SHA256";
 
 /// Cap on records read from one trace file, so a pathological run cannot make
 /// the engine's turn-boundary read unbounded. Records past the cap are counted
-/// as skipped in the summary rather than silently dropped.
+/// in [`GuardTraceSummary::skipped_over_cap`] and rendered in the summary
+/// rather than silently dropped, and the reported offset stops at the last
+/// record actually consumed — so the next turn's read picks them up instead of
+/// stepping over them.
 const MAX_RECORDS_PER_READ: usize = 2000;
 
 /// Absolute path of the guard trace for a run's `CODEX_HOME`.
@@ -87,11 +110,18 @@ guard that crashes, exits non-zero, or prints something that is not a decision
 becomes a hard `block`: Codex treats a broken hook as approval, so the shim is
 what turns a broken guard into a loud refusal instead of a silent hole.
 
+A guard that hangs is the same silent fail-open: Codex's own hook timeout
+would eventually give up and treat the hook as absent. The shim therefore
+imposes its own, shorter budget and converts an overrun into the same loud
+`block`.
+
 Usage: python3 boss_guard_trace.py <guard-executable>
 Env:   BOSS_GUARD_TRACE   path of the JSONL trace to append to (optional)
        BOSS_GUARD_NAME    label recorded for this guard (optional)
        BOSS_GUARD_SHA256  expected `sha256:<hex>` of the guard file; a mismatch
                           blocks (optional, but always set in production)
+       BOSS_GUARD_TIMEOUT_SECONDS  per-guard wall-clock budget; an overrun
+                          blocks (optional, default below)
 """
 import hashlib
 import json
@@ -102,6 +132,23 @@ import time
 
 APPROVE_DECISIONS = ("approve", "allow")
 BLOCK_DECISIONS = ("block", "deny")
+
+# Wall-clock budget for one guard. Deliberately between the slowest guard's own
+# budget (the checkleft pre-push gate allows checkleft 300s) and Codex's default
+# 600s command-hook timeout: high enough that a legitimately slow guard finishes
+# and reports, low enough that Boss -- not Codex's fail-open -- is what decides
+# what a hung guard means.
+DEFAULT_TIMEOUT_SECONDS = 420.0
+
+
+def timeout_seconds():
+    """The configured budget, or the default when unset/unparseable."""
+    try:
+        configured = float(os.environ.get("BOSS_GUARD_TIMEOUT_SECONDS", ""))
+    except ValueError:
+        return DEFAULT_TIMEOUT_SECONDS
+    return configured if configured > 0 else DEFAULT_TIMEOUT_SECONDS
+
 
 GUARD_ERROR = (
     "Blocked (fail-closed): the Boss guard {guard} did not return a usable "
@@ -196,14 +243,22 @@ def main():
 
     command = [sys.executable, guard] if guard.endswith(".py") else [guard]
 
+    budget = timeout_seconds()
     try:
         completed = subprocess.run(
             command,
             input=payload_text,
             capture_output=True,
             text=True,
+            timeout=budget,
         )
         stdout, stderr, code = completed.stdout, completed.stderr, completed.returncode
+    except subprocess.TimeoutExpired:
+        detail = "guard timed out after %gs and was killed" % budget
+        message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
+        record(payload_text, "guard_error", message, None, detail)
+        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        return 0
     except Exception as error:
         stdout, stderr, code = "", str(error), None
 
@@ -234,27 +289,71 @@ if __name__ == "__main__":
 /// environment: Codex's hook `command` is a single path with no argv, and the
 /// trust gate hashes that string, so the per-guard context has to live inside
 /// the file.
+///
+/// The wrapper is the only file in the chain the attestation content-binds, so
+/// it is also where the shim's own bytes are checked before it runs — see
+/// [`GUARD_SHIM_SHA256_ENV`].
 pub(super) fn wrapper_body(
     shim: &Path,
+    shim_sha256: &str,
     guard: &Path,
     guard_name: &str,
     guard_sha256: &str,
     trace_path: &Path,
     extra_env: &[(&str, String)],
 ) -> String {
+    let shim_display = shim.display().to_string();
+    let trace_display = trace_path.display().to_string();
+
     let mut body = String::from("#!/bin/sh\n");
     for (key, value) in extra_env {
         body.push_str(&format!("export {key}={}\n", shell_quote(value)));
     }
-    body.push_str(&format!(
-        "export {GUARD_TRACE_ENV}={}\n",
-        shell_quote(&trace_path.display().to_string())
-    ));
+    body.push_str(&format!("export {GUARD_TRACE_ENV}={}\n", shell_quote(&trace_display)));
     body.push_str(&format!("export {GUARD_NAME_ENV}={}\n", shell_quote(guard_name)));
     body.push_str(&format!("export {GUARD_SHA256_ENV}={}\n", shell_quote(guard_sha256)));
     body.push_str(&format!(
+        "export {GUARD_SHIM_SHA256_ENV}={}\n",
+        shell_quote(shim_sha256)
+    ));
+
+    // Verify the shim before exec'ing it. Blocks rather than approving when the
+    // digest cannot be computed at all: an unhashable shim is an unverified
+    // shim.
+    let detail = format!("the Boss guard-trace shim at {shim_display} does not match its attested content hash");
+    let message = format!(
+        "Blocked (fail-closed): {detail}, so Boss cannot confirm this tool call was \
+         guarded. A guard chain that cannot prove its own integrity is treated as a \
+         refusal, never as approval. Report this to the operator."
+    );
+    let decision = serde_json::json!({"decision": "block", "reason": message}).to_string();
+    let record = serde_json::json!({
+        "guard": guard_name,
+        "decision": "guard_error",
+        "reason": message,
+        "detail": detail,
+    })
+    .to_string();
+
+    body.push_str(&format!(
+        "shim_sha256=$(python3 -c 'import hashlib,sys;print(\"sha256:\"+hashlib.sha256(open(sys.argv[1],\"rb\").read()).hexdigest())' {} 2>/dev/null) || shim_sha256=''\n",
+        shell_quote(&shim_display),
+    ));
+    body.push_str(&format!(
+        "if [ \"$shim_sha256\" != {} ]; then\n",
+        shell_quote(shim_sha256)
+    ));
+    body.push_str(&format!(
+        "  printf '%s\\n' {} >> {} 2>/dev/null || true\n",
+        shell_quote(&record),
+        shell_quote(&trace_display),
+    ));
+    body.push_str(&format!("  printf '%s' {}\n", shell_quote(&decision)));
+    body.push_str("  exit 0\nfi\n");
+
+    body.push_str(&format!(
         "exec python3 {} {}\n",
-        shell_quote(&shim.display().to_string()),
+        shell_quote(&shim_display),
         shell_quote(&guard.display().to_string()),
     ));
     body
@@ -288,7 +387,8 @@ impl GuardTraceRecord {
 }
 
 /// Aggregate of the guard records observed for one turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, bon::Builder)]
+#[builder(on(String, into))]
 pub struct GuardTraceSummary {
     /// Records whose decision approved the call.
     pub approvals: usize,
@@ -299,6 +399,11 @@ pub struct GuardTraceSummary {
     /// Lines that were not parseable records — kept visible rather than
     /// dropped, because a corrupt trace is itself a signal.
     pub unparseable_lines: usize,
+    /// Records present in the trace but past [`MAX_RECORDS_PER_READ`] for this
+    /// read. Not lost: the reported offset does not advance over them, so the
+    /// next read consumes them — but they are reported here so a turn whose
+    /// guard activity is only partly summarised says so.
+    pub skipped_over_cap: usize,
     /// `guard: reason head` for each block / guard error, in order.
     pub notable: Vec<String>,
 }
@@ -311,18 +416,42 @@ impl GuardTraceSummary {
     }
 }
 
+/// One turn-boundary read of a trace file.
+pub(super) struct TraceRead {
+    /// Records parsed by this read.
+    pub records: Vec<GuardTraceRecord>,
+    /// Lines consumed, to resume from on the next read. Never advances past a
+    /// line this read did not consume.
+    pub next_line: usize,
+    /// Lines that were not parseable records.
+    pub unparseable_lines: usize,
+    /// Records left for the next read because this one hit the cap.
+    pub skipped_over_cap: usize,
+}
+
 /// Read trace records starting at line `from_line`.
 ///
 /// Returns the records and the line count consumed, so the caller can resume
 /// after the same offset on the next turn without re-reporting. A missing file
 /// is not an error: it means no guard has run yet (which is exactly what the
 /// caller wants to know).
-pub(super) fn read_records_from(path: &Path, from_line: usize) -> (Vec<GuardTraceRecord>, usize, usize) {
+///
+/// Reading stops at [`MAX_RECORDS_PER_READ`]; the offset then stays at the last
+/// consumed line and the remaining records are counted, so the cap defers work
+/// to the next read rather than dropping it.
+pub(super) fn read_records_from(path: &Path, from_line: usize) -> TraceRead {
     let Ok(file) = std::fs::File::open(path) else {
-        return (Vec::new(), from_line, 0);
+        return TraceRead {
+            records: Vec::new(),
+            next_line: from_line,
+            unparseable_lines: 0,
+            skipped_over_cap: 0,
+        };
     };
     let mut records = Vec::new();
-    let mut unparseable = 0usize;
+    let mut unparseable_lines = 0usize;
+    let mut skipped_over_cap = 0usize;
+    let mut consumed = from_line;
     let mut line_index = 0usize;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { break };
@@ -330,27 +459,39 @@ pub(super) fn read_records_from(path: &Path, from_line: usize) -> (Vec<GuardTrac
         if line_index <= from_line {
             continue;
         }
+        // Past the cap: count what is left and leave the offset behind it, so
+        // the next read starts on the first line this one did not parse.
         if records.len() >= MAX_RECORDS_PER_READ {
-            break;
+            if !line.trim().is_empty() {
+                skipped_over_cap += 1;
+            }
+            continue;
         }
+        consumed = line_index;
         if line.trim().is_empty() {
             continue;
         }
         match serde_json::from_str::<GuardTraceRecord>(&line) {
             Ok(record) => records.push(record),
-            Err(_) => unparseable += 1,
+            Err(_) => unparseable_lines += 1,
         }
     }
-    (records, line_index, unparseable)
+    TraceRead {
+        records,
+        next_line: consumed,
+        unparseable_lines,
+        skipped_over_cap,
+    }
 }
 
-/// Fold records into a summary.
-pub(super) fn summarize(records: &[GuardTraceRecord], unparseable_lines: usize) -> GuardTraceSummary {
+/// Fold one read's records into a summary.
+pub(super) fn summarize(read: &TraceRead) -> GuardTraceSummary {
     let mut summary = GuardTraceSummary {
-        unparseable_lines,
+        unparseable_lines: read.unparseable_lines,
+        skipped_over_cap: read.skipped_over_cap,
         ..Default::default()
     };
-    for record in records {
+    for record in &read.records {
         if record.is_guard_error() {
             summary.guard_errors += 1;
         } else if record.is_block() {
@@ -378,6 +519,12 @@ pub(super) fn render_summary(summary: &GuardTraceSummary) -> String {
     );
     if summary.unparseable_lines > 0 {
         text.push_str(&format!("; {} unreadable trace line(s)", summary.unparseable_lines));
+    }
+    if summary.skipped_over_cap > 0 {
+        text.push_str(&format!(
+            "; {} record(s) past the {MAX_RECORDS_PER_READ}-record read cap, reported next turn",
+            summary.skipped_over_cap
+        ));
     }
     for note in &summary.notable {
         text.push_str(&format!("; {note}"));
@@ -412,6 +559,16 @@ mod tests {
     /// Materialise the shim plus a stub guard, run it, and return
     /// (stdout decision, trace lines).
     fn run_shim(tag: &str, guard_body: &str, payload: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+        run_shim_with_env(tag, guard_body, payload, &[])
+    }
+
+    /// [`run_shim`] with extra environment for the shim process.
+    fn run_shim_with_env(
+        tag: &str,
+        guard_body: &str,
+        payload: &str,
+        extra_env: &[(&str, &str)],
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
         let dir = temp_dir(tag);
         let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
         std::fs::write(&shim, GUARD_TRACE_SHIM_SCRIPT).unwrap();
@@ -419,12 +576,17 @@ mod tests {
         std::fs::write(&guard, guard_body).unwrap();
         let trace = dir.join(GUARD_TRACE_FILENAME);
 
-        let mut child = std::process::Command::new("python3")
+        let mut command = std::process::Command::new("python3");
+        command
             .arg(&shim)
             .arg(&guard)
             .env(GUARD_TRACE_ENV, &trace)
             .env(GUARD_NAME_ENV, "stub_guard")
-            .env(GUARD_SHA256_ENV, sha256_of(&guard))
+            .env(GUARD_SHA256_ENV, sha256_of(&guard));
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
+        let mut child = command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -507,6 +669,40 @@ mod tests {
     }
 
     #[test]
+    fn a_hung_guard_times_out_into_a_block() {
+        // A guard that never answers is the same silent fail-open as one that
+        // crashes: Codex's own hook timeout would treat it as absent. The shim
+        // has to be what decides, on its own budget.
+        let (decision, lines) = run_shim_with_env(
+            "timeout",
+            "import sys,time\nsys.stdin.read()\ntime.sleep(30)\n",
+            PAYLOAD,
+            &[("BOSS_GUARD_TIMEOUT_SECONDS", "1")],
+        );
+        assert_eq!(decision["decision"], "block");
+        let reason = decision["reason"].as_str().unwrap();
+        assert!(reason.contains("timed out"), "reason must name the timeout: {reason}");
+        assert_eq!(lines[0]["decision"], "guard_error");
+        assert!(
+            lines[0]["detail"].as_str().unwrap().contains("timed out"),
+            "{:?}",
+            lines[0]
+        );
+    }
+
+    #[test]
+    fn an_unparseable_timeout_override_falls_back_to_the_default_budget() {
+        // A malformed override must not disable the budget or wedge the guard.
+        let (decision, _) = run_shim_with_env(
+            "timeout-bad-env",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
+            PAYLOAD,
+            &[("BOSS_GUARD_TIMEOUT_SECONDS", "not-a-number")],
+        );
+        assert_eq!(decision["decision"], "approve");
+    }
+
+    #[test]
     fn hook_specific_output_dialect_is_understood() {
         let (decision, lines) = run_shim(
             "dialect",
@@ -570,24 +766,25 @@ mod tests {
         )
         .unwrap();
 
-        let (records, offset, unparseable) = read_records_from(&path, 0);
-        assert_eq!(records.len(), 2);
-        assert_eq!(offset, 2);
-        assert_eq!(unparseable, 0);
+        let first = read_records_from(&path, 0);
+        assert_eq!(first.records.len(), 2);
+        assert_eq!(first.next_line, 2);
+        assert_eq!(first.unparseable_lines, 0);
+        assert_eq!(first.skipped_over_cap, 0);
 
         // A second turn must not re-report the same records.
-        let (again, offset_again, _) = read_records_from(&path, offset);
-        assert!(again.is_empty(), "already-reported records must not repeat");
-        assert_eq!(offset_again, 2);
+        let again = read_records_from(&path, first.next_line);
+        assert!(again.records.is_empty(), "already-reported records must not repeat");
+        assert_eq!(again.next_line, 2);
     }
 
     #[test]
     fn missing_trace_file_reads_as_no_records() {
         let dir = temp_dir("missing");
-        let (records, offset, unparseable) = read_records_from(&dir.join(GUARD_TRACE_FILENAME), 0);
-        assert!(records.is_empty());
-        assert_eq!(offset, 0);
-        assert_eq!(unparseable, 0);
+        let read = read_records_from(&dir.join(GUARD_TRACE_FILENAME), 0);
+        assert!(read.records.is_empty());
+        assert_eq!(read.next_line, 0);
+        assert_eq!(read.unparseable_lines, 0);
     }
 
     #[test]
@@ -595,9 +792,39 @@ mod tests {
         let dir = temp_dir("corrupt");
         let path = dir.join(GUARD_TRACE_FILENAME);
         std::fs::write(&path, "{\"guard\":\"a\",\"decision\":\"approve\"}\nnot-json\n").unwrap();
-        let (records, _, unparseable) = read_records_from(&path, 0);
-        assert_eq!(records.len(), 1);
-        assert_eq!(unparseable, 1);
+        let read = read_records_from(&path, 0);
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.unparseable_lines, 1);
+    }
+
+    #[test]
+    fn the_read_cap_defers_records_instead_of_dropping_them() {
+        // The cap used to advance the offset over a line it never parsed, so
+        // the record on that line was skipped forever. Nothing may be lost:
+        // what the cap holds back must arrive on the next read, and be counted
+        // in the meantime.
+        let dir = temp_dir("cap");
+        let path = dir.join(GUARD_TRACE_FILENAME);
+        let total = MAX_RECORDS_PER_READ + 2;
+        let body: String = (0..total)
+            .map(|index| format!("{{\"guard\":\"g{index}\",\"decision\":\"approve\"}}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+
+        let first = read_records_from(&path, 0);
+        assert_eq!(first.records.len(), MAX_RECORDS_PER_READ);
+        assert_eq!(first.next_line, MAX_RECORDS_PER_READ);
+        assert_eq!(first.skipped_over_cap, 2, "the held-back records must be counted");
+        assert!(
+            render_summary(&summarize(&first)).contains("2 record(s) past the"),
+            "the summary must say the turn is only partly reported"
+        );
+
+        let second = read_records_from(&path, first.next_line);
+        assert_eq!(second.records.len(), 2, "the held-back records must arrive next read");
+        assert_eq!(second.records[0].guard, format!("g{MAX_RECORDS_PER_READ}"));
+        assert_eq!(second.next_line, total);
+        assert_eq!(second.skipped_over_cap, 0);
     }
 
     #[test]
@@ -622,7 +849,12 @@ mod tests {
                 reason: "guard exited 3".into(),
             },
         ];
-        let summary = summarize(&records, 1);
+        let summary = summarize(&TraceRead {
+            records,
+            next_line: 4,
+            unparseable_lines: 1,
+            skipped_over_cap: 0,
+        });
         assert_eq!(summary.invocations(), 3);
         assert_eq!(summary.approvals, 1);
         assert_eq!(summary.blocks, 1);
@@ -641,6 +873,7 @@ mod tests {
     fn wrapper_body_carries_trace_env_and_extra_env() {
         let body = wrapper_body(
             Path::new("/home/guards/boss_guard_trace.py"),
+            "sha256:shim99",
             Path::new("/home/guards/00_path_guard.py"),
             "00_path_guard",
             "sha256:abc123",
@@ -655,9 +888,113 @@ mod tests {
         );
         assert!(body.contains("export BOSS_GUARD_NAME='00_path_guard'"), "{body}");
         assert!(body.contains("export BOSS_GUARD_SHA256='sha256:abc123'"), "{body}");
+        assert!(body.contains("export BOSS_GUARD_SHIM_SHA256='sha256:shim99'"), "{body}");
         assert!(
             body.contains("exec python3 '/home/guards/boss_guard_trace.py' '/home/guards/00_path_guard.py'"),
             "{body}"
         );
+    }
+
+    /// Run a materialised wrapper end-to-end and return
+    /// (stdout decision, trace lines).
+    ///
+    /// `shim_body` of `None` removes the shim entirely, so its digest cannot be
+    /// computed at all.
+    fn run_wrapper(tag: &str, shim_body: Option<&str>) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let dir = temp_dir(tag);
+        let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
+        // Hash the *real* shim, then materialise whatever body the test wants:
+        // that is exactly the "shim replaced after arming" shape.
+        std::fs::write(&shim, GUARD_TRACE_SHIM_SCRIPT).unwrap();
+        let real_shim_sha256 = sha256_of(&shim);
+        match shim_body {
+            Some(body) => std::fs::write(&shim, body).unwrap(),
+            None => std::fs::remove_file(&shim).unwrap(),
+        }
+        let guard = dir.join("stub_guard.py");
+        std::fs::write(
+            &guard,
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
+        )
+        .unwrap();
+        let trace = dir.join(GUARD_TRACE_FILENAME);
+
+        let wrapper = dir.join("00_stub_guard.sh");
+        std::fs::write(
+            &wrapper,
+            wrapper_body(
+                &shim,
+                &real_shim_sha256,
+                &guard,
+                "00_stub_guard",
+                &sha256_of(&guard),
+                &trace,
+                &[],
+            ),
+        )
+        .unwrap();
+
+        let mut child = std::process::Command::new("sh")
+            .arg(&wrapper)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh must be available");
+        child.stdin.as_mut().unwrap().write_all(PAYLOAD.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+            panic!(
+                "wrapper produced invalid JSON: {err}\nstdout={stdout}\nstderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        let lines = std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
+            .collect();
+        (decision, lines)
+    }
+
+    #[test]
+    fn the_wrapper_runs_the_guard_when_the_shim_matches_its_hash() {
+        let (decision, lines) = run_wrapper("wrapper-ok", Some(GUARD_TRACE_SHIM_SCRIPT));
+        assert_eq!(decision["decision"], "approve");
+        assert_eq!(lines.len(), 1, "the shim must still have recorded the invocation");
+        assert_eq!(lines[0]["decision"], "approve");
+    }
+
+    #[test]
+    fn a_shim_replaced_after_arming_blocks_instead_of_neutralising_every_guard() {
+        // The hole this closes: the attestation content-binds the wrapper and
+        // the shim re-checks the guard, but nothing covered the shim's own
+        // bytes. Swapping it for a blanket approve would disarm every guard
+        // with both hashes still valid, so the wrapper -- which *is* bound --
+        // verifies the shim before exec'ing it.
+        let (decision, lines) = run_wrapper(
+            "wrapper-tampered",
+            Some("import sys\nsys.stdin.read()\nprint('{\"decision\":\"approve\"}')\n"),
+        );
+        assert_eq!(decision["decision"], "block");
+        let reason = decision["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("shim") && reason.contains("content hash"),
+            "reason must name the shim hash mismatch: {reason}"
+        );
+        assert_eq!(lines.len(), 1, "the refusal must be recorded in the trace");
+        assert_eq!(lines[0]["decision"], "guard_error");
+        assert_eq!(lines[0]["guard"], "00_stub_guard");
+    }
+
+    #[test]
+    fn a_missing_shim_blocks_too() {
+        // A shim whose digest cannot be computed is an unverified shim, and the
+        // wrapper must not fall through to running it.
+        let (decision, _) = run_wrapper("wrapper-missing-shim", None);
+        assert_eq!(decision["decision"], "block");
     }
 }

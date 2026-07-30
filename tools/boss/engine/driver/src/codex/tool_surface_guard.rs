@@ -100,10 +100,13 @@ STDIN_CHANNEL_BLOCK = (
     "file-editing tool)."
 )
 
+# Shells. Separated from the other interpreters because their inline-program
+# flag is `-c` and it also appears inside short-flag clusters (`-lc`, `-ic`).
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash"}
+
 # Interpreters that read commands from stdin when handed no inline program.
 # Blocked only when the invocation carries no program/script to run.
-INTERPRETERS = {
-    "sh", "bash", "zsh", "dash", "ksh", "fish", "csh", "tcsh", "ash",
+INTERPRETERS = SHELLS | {
     "python", "python2", "python3", "node", "deno", "bun", "ruby", "irb",
     "perl", "php", "lua", "julia", "R", "ghci", "ipython", "bc", "gdb", "lldb",
 }
@@ -121,10 +124,42 @@ ALWAYS_INTERACTIVE = {
 # Flags that make an interpreter read stdin even when other arguments exist.
 STDIN_FLAGS = {"-i", "-s", "-", "--interactive", "--stdin"}
 
-# Flags that carry an inline program, so the invocation is not a REPL.
-INLINE_PROGRAM_FLAGS = (
-    "-c", "-lc", "-e", "-E", "-m", "-cmd", "--command", "--eval", "-init-command",
-)
+# Flags that carry an inline program, *per interpreter*. One shared set across
+# every interpreter was a hole: `-e`, `-E` and `-m` are ordinary shell options
+# that carry no program at all, so `bash -e`, `sh -E` and `zsh -m` -- each a
+# bare interpreter reading commands from stdin, exactly what `write_stdin` then
+# drives -- read as "has a program" and were approved. Every flag here needs an
+# operand (either a following argument or a `--flag=value` form); a flag with
+# no operand does not make the invocation a program run. A flag NOT listed for
+# an interpreter is not treated as carrying a program, so the REPL check below
+# still applies to it.
+INLINE_PROGRAM_FLAGS = {
+    "python": {"-c", "-m"},
+    "python2": {"-c", "-m"},
+    "python3": {"-c", "-m"},
+    "ipython": {"-c", "-m"},
+    "node": {"-e", "-E", "--eval", "-p", "--print"},
+    "deno": {"-e", "--eval"},
+    "bun": {"-e", "--eval"},
+    "ruby": {"-e", "--eval"},
+    "irb": {"-e"},
+    "perl": {"-e", "-E", "--eval"},
+    "php": {"-r", "-f"},
+    "lua": {"-e"},
+    "julia": {"-e", "-E"},
+    "R": {"-e"},
+    "ghci": {"-e"},
+    "gdb": {"-ex", "--eval-command", "-init-command", "--init-eval-command", "-x"},
+    "lldb": {"-o", "--one-line", "--source"},
+    "sqlite3": {"-cmd"},
+    "psql": {"-c", "--command", "-f", "--file"},
+    "mysql": {"-e", "--execute"},
+    # `bc` has no inline-program flag: it is a REPL or it reads a file.
+    "bc": set(),
+}
+
+# A short-flag cluster such as `-lc` or `-ic`, as shells accept it.
+SHELL_FLAG_CLUSTER = re.compile(r"^-[A-Za-z]+$")
 
 # Shell delimiters that separate independent commands.
 DELIMS = {"&&", "||", ";", "|", "&"}
@@ -182,6 +217,33 @@ def strip_prefixes(group):
     return group[index:]
 
 
+def has_inline_program(program, arguments):
+    """True when a flag *this interpreter* recognises carries a program to run.
+
+    Requires an operand: `python3 -m mod` and `node --eval=x` carry a program,
+    `python3 -m` alone does not (it is still a REPL reading stdin).
+    """
+    if program in SHELLS:
+        for index, argument in enumerate(arguments):
+            cluster = SHELL_FLAG_CLUSTER.match(argument) and "c" in argument[1:]
+            if (argument == "-c" or cluster) and index + 1 < len(arguments):
+                return True
+        return False
+
+    flags = INLINE_PROGRAM_FLAGS.get(program)
+    if not flags:
+        return False
+    for index, argument in enumerate(arguments):
+        if argument in flags:
+            if index + 1 < len(arguments):
+                return True
+            continue
+        head, separator, value = argument.partition("=")
+        if separator and value and head in flags:
+            return True
+    return False
+
+
 def stdin_channel_detail(group):
     """Why this argv opens a stdin-driven session, or None if it does not."""
     rest = strip_prefixes(group)
@@ -201,9 +263,8 @@ def stdin_channel_detail(group):
         if argument in STDIN_FLAGS:
             return "%s %s reads commands from stdin" % (program, argument)
 
-    for argument in arguments:
-        if argument in INLINE_PROGRAM_FLAGS or argument.startswith("--eval="):
-            return None
+    if has_inline_program(program, arguments):
+        return None
 
     non_flags = [a for a in arguments if not a.startswith("-")]
     required = 2 if program in INTERPRETERS_NEEDING_TWO_ARGS else 1
@@ -347,6 +408,17 @@ mod tests {
             "node",
             "/bin/bash",
             "python3 -",
+            // Option flags that carry no inline program. Each of these starts
+            // an interpreter reading commands from stdin, which is precisely
+            // what `write_stdin` then feeds; an interpreter-agnostic
+            // inline-program flag set approved all four.
+            "bash -e",
+            "sh -E",
+            "zsh -m",
+            "python3 -E",
+            // A recognised inline-program flag with no operand is still a REPL.
+            "python3 -m",
+            "bash -c",
         ] {
             let (decision, reason) = bash(command);
             assert_eq!(decision, "block", "{command:?} opens a stdin command channel");
@@ -377,10 +449,18 @@ mod tests {
     fn approves_non_interactive_interpreter_invocations() {
         for command in [
             "bash -lc 'echo hi'",
+            // A cluster carrying `c` is an inline program even with `i` in it:
+            // the shell runs the command and exits, so there is no session for
+            // `write_stdin` to drive.
+            "bash -ic 'echo hi'",
             "sh -c 'ls'",
+            "bash -e -c 'ls'",
             "python3 -c 'print(1)'",
+            "python3 -m pytest",
             "python3 script.py",
+            "python3 -E script.py",
             "node -e 'console.log(1)'",
+            "node --eval='console.log(1)'",
             "sqlite3 db.sqlite 'select 1'",
             "bazel test //tools/boss/engine/...",
             "jj diff -r @",

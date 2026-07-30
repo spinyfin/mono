@@ -139,6 +139,12 @@ fn heal_worker_settings_json_refreshes_path_guard_script() {
 /// Run the gate against `payload` with `data_dir` as the boundary and return
 /// `(decision, reason)`.
 fn run_path_guard(data_dir: &std::path::Path, payload: serde_json::Value) -> (String, String) {
+    run_path_guard_raw(data_dir, &payload.to_string())
+}
+
+/// As [`run_path_guard`], but writes `stdin` verbatim — so a payload that is
+/// not JSON at all can be exercised.
+fn run_path_guard_raw(data_dir: &std::path::Path, stdin: &str) -> (String, String) {
     use std::io::Write as _;
     let script_dir = TempDir::new().unwrap();
     let script = script_dir.path().join(PATH_GUARD_SCRIPT_NAME);
@@ -152,12 +158,7 @@ fn run_path_guard(data_dir: &std::path::Path, payload: serde_json::Value) -> (St
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("python3 must be available");
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(payload.to_string().as_bytes())
-        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(stdin.as_bytes()).unwrap();
     drop(child.stdin.take());
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -230,6 +231,46 @@ fn path_guard_fails_closed_on_an_unreadable_payload_for_a_tool_it_reads() {
         assert_eq!(decision, "block", "must fail closed for {payload}");
         assert!(reason.contains("fail-closed"), "{reason}");
     }
+
+    // A payload the gate cannot parse at all is the same hazard one level up:
+    // it cannot read the tool name, so it is in no position to conclude it has
+    // nothing to say about this call.
+    let (decision, reason) = run_path_guard_raw(data.path(), "const r = await tools.exec_command({})");
+    assert_eq!(decision, "block", "non-JSON hook stdin must fail closed: {reason}");
+    assert!(
+        reason.contains("fail-closed") && reason.contains("not JSON"),
+        "{reason}"
+    );
+
+    let (decision, reason) = run_path_guard(data.path(), serde_json::json!([{"tool_name": "Bash"}]));
+    assert_eq!(decision, "block", "a non-object payload must fail closed: {reason}");
+    assert!(
+        reason.contains("fail-closed") && reason.contains("not a JSON object"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn path_guard_with_no_data_dir_configured_approves() {
+    // BOSS_DATA_DIR unset is Boss's own configuration (a remote worker, where
+    // the gate is deliberately not armed), not an agent payload the gate failed
+    // to read — so it stays an approve while the payload cases above block.
+    use std::io::Write as _;
+    let script_dir = TempDir::new().unwrap();
+    let script = script_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+    std::fs::write(&script, PATH_GUARD_SCRIPT).unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(&script)
+        .env_remove("BOSS_DATA_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child.stdin.as_mut().unwrap().write_all(b"not json at all").unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["decision"], "approve");
 }
 
 #[test]

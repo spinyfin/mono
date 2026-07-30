@@ -90,8 +90,8 @@ pub(crate) fn unobserved_command_notification(command: &str) -> String {
 /// guard is invoked through.
 pub const GUARD_TRACE_MARKER: &str = "[codex-guard-trace]";
 
-/// Marker prefix on a [`WorkerEvent::Notification`] emitted when a turn
-/// executed tool calls but **no** guard invocation was recorded for it.
+/// Marker prefix on a [`WorkerEvent::Notification`] emitted when tool calls
+/// have run and **no** guard invocation has been recorded for this run at all.
 ///
 /// That is the observable signature of Codex's documented silent fail-open:
 /// an untrusted hook is skipped with no stream event, and a handler that
@@ -99,6 +99,11 @@ pub const GUARD_TRACE_MARKER: &str = "[codex-guard-trace]";
 /// healthy while every guardrail is inert. Boss asserts in the worker prompt
 /// that pushes are blocked, so this condition is a defect signal, not
 /// bookkeeping.
+///
+/// Run-scoped by construction: guards are armed once per run, so a single
+/// recorded guard invocation settles the question for the whole run. Scoping it
+/// per turn instead would fire on any code-mode cell that invokes no inner tool
+/// — see `CodexRolloutProgressSession::guard_records_seen`.
 pub const GUARDS_SILENT_MARKER: &str = "[codex-guards-silent]";
 
 /// Render the guard-activity notification for one turn.
@@ -106,12 +111,12 @@ pub(crate) fn guard_trace_notification(summary: &guard_trace::GuardTraceSummary)
     format!("{GUARD_TRACE_MARKER} {}", guard_trace::render_summary(summary))
 }
 
-/// Render the notification for a turn whose tool calls ran with no guard
+/// Render the notification for a run whose tool calls have produced no guard
 /// record at all. `observed` is the number of tool calls seen in the rollout.
 pub(crate) fn guards_silent_notification(observed: usize) -> String {
     format!(
-        "{GUARDS_SILENT_MARKER} {observed} tool call(s) ran this turn with no PreToolUse guard \
-         invocation recorded; Boss's Codex guardrails may be disarmed for this run (hook trust \
+        "{GUARDS_SILENT_MARKER} {observed} tool call(s) ran this turn and no PreToolUse guard \
+         invocation has been recorded for this run; Boss's Codex guardrails may be disarmed (hook trust \
          stale, guard handler unexecutable, or hooks not reached). Treat command guardrails as \
          unenforced until this is explained."
     )
@@ -897,6 +902,11 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
     // [`guard_trace`].
     let shim = guards_dir.join(GUARD_TRACE_SHIM_FILENAME);
     write_executable(&shim, GUARD_TRACE_SHIM_SCRIPT)?;
+    // The shim is the one file in the chain the attestation cannot bind (it
+    // hashes each wrapper, the `command` path). Each wrapper — which *is*
+    // bound — re-checks this digest before exec'ing the shim, so replacing the
+    // shim can no longer neutralise every guard with the hashes still valid.
+    let shim_sha256 = sha256_hex_prefixed(GUARD_TRACE_SHIM_SCRIPT.as_bytes());
     let trace_path = guard_trace_path(codex_home);
 
     let mut out = Vec::new();
@@ -1005,6 +1015,7 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
             &wrapper,
             &wrapper_body(
                 &shim,
+                &shim_sha256,
                 &guard_path,
                 &guard_name,
                 &guard_sha256,
@@ -2511,6 +2522,14 @@ else:
                 guard.command_path
             );
             assert!(body.contains("BOSS_GUARD_NAME="), "guard must be labelled: {body}");
+            // The wrapper is the only link the attestation content-binds, so it
+            // is what must vouch for the shim's bytes: otherwise replacing the
+            // shim disarms every guard with every hash still valid.
+            assert!(
+                body.contains(&sha256_hex_prefixed(GUARD_TRACE_SHIM_SCRIPT.as_bytes())),
+                "guard {:?} must verify the shim's content hash before running it: {body}",
+                guard.command_path
+            );
         }
     }
 

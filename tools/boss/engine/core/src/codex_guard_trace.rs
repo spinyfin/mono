@@ -11,8 +11,10 @@
 //!   failure. This is the signal that makes "did the guard fire for this
 //!   execution, and what did it decide?" answerable for a Codex run at all;
 //!   nothing in Codex's own stream carries it.
-//! - [`boss_engine_driver::codex::GUARDS_SILENT_MARKER`] — the turn ran tool
-//!   calls and **no** guard invocation was recorded. Codex's hook failures are
+//! - [`boss_engine_driver::codex::GUARDS_SILENT_MARKER`] — tool calls have run
+//!   and **no** guard invocation has been recorded for the run at all (guards
+//!   are armed once per run, so one recorded invocation settles it and the
+//!   signal goes quiet for good). Codex's hook failures are
 //!   documented as silent and fail-open (an untrusted hook is skipped with no
 //!   stream event; an unexecutable handler produces no diagnostic), so this is
 //!   the only observable difference between "guardrails enforced" and
@@ -33,9 +35,9 @@ crate::register_counter!(
 crate::register_counter!(
     CODEX_GUARDS_SILENT,
     "codex.guard_trace.silent",
-    "A Codex turn ran tool calls with no PreToolUse guard invocation recorded — the observable \
-     signature of Codex's silent hook fail-open. Command guardrails were not enforced for that \
-     turn.",
+    "A Codex run ran tool calls with no PreToolUse guard invocation recorded for the whole run — \
+     the observable signature of Codex's silent hook fail-open. Command guardrails were not being \
+     enforced.",
 );
 
 /// Register both guard-trace counters with `registry`. Called from
@@ -80,8 +82,8 @@ pub fn record(registry: &crate::metrics::Registry, run_id: Option<&str>, signal:
             tracing::error!(
                 run_id,
                 detail = %detail,
-                "codex: tool calls ran with no PreToolUse guard invocation recorded; command \
-                 guardrails were not enforced for this turn"
+                "codex: tool calls ran with no PreToolUse guard invocation recorded for this run; \
+                 command guardrails were not being enforced"
             );
         }
     }

@@ -348,9 +348,20 @@ pub(super) struct CodexRolloutProgressSession {
     /// Trace lines already reported, so a later turn does not re-report them.
     guard_trace_line: usize,
     /// Tool calls observed since the last turn boundary. Compared against the
-    /// guard records for that turn: calls with zero guard invocations is the
-    /// observable signature of Codex's silent hook fail-open.
+    /// guard records read for that turn.
     observed_tool_calls: usize,
+    /// Whether any guard record has ever been read for this run.
+    ///
+    /// Run-scoped, not per-turn, because "hooks inert" is a run-level property:
+    /// guards are armed once, at run start. A per-turn comparison produced a
+    /// structural false positive — `observed_tool_calls` counts every rollout
+    /// `custom_tool_call`, which on a code-mode model is the JavaScript cell
+    /// itself, and a cell that invokes no inner tool fires no `PreToolUse` at
+    /// all (verified in the investigation doc, section 3). So an ordinary turn
+    /// whose cell only computes, prints, or touches `store`/`load`/`notify`
+    /// used to log "command guardrails were not enforced" at `error`.
+    #[builder(default)]
+    guard_records_seen: bool,
 }
 
 impl CodexRolloutProgressSession {
@@ -370,6 +381,7 @@ impl CodexRolloutProgressSession {
             guard_trace_path: None,
             guard_trace_line: 0,
             observed_tool_calls: 0,
+            guard_records_seen: false,
         }
     }
 
@@ -390,10 +402,15 @@ impl CodexRolloutProgressSession {
     /// - records exist → one [`super::GUARD_TRACE_MARKER`] notification
     ///   summarising them, so "did the guard fire, and what did it decide?" is
     ///   answerable from the trace for every Codex execution;
-    /// - tool calls ran but no record exists → one
-    ///   [`super::GUARDS_SILENT_MARKER`] notification, the only signal Boss can
-    ///   get that Codex skipped its hooks (untrusted trust record, unexecutable
-    ///   handler) and every guardrail was inert while the run looked healthy.
+    /// - tool calls ran and **no guard record has been read for this run at
+    ///   all** → one [`super::GUARDS_SILENT_MARKER`] notification, the only
+    ///   signal Boss can get that Codex skipped its hooks (untrusted trust
+    ///   record, unexecutable handler) and every guardrail was inert while the
+    ///   run looked healthy.
+    ///
+    /// The second signal is deliberately run-scoped rather than per-turn: see
+    /// [`Self::guard_records_seen`] for why a per-turn comparison fires on
+    /// ordinary code-mode cells that invoke no tool.
     ///
     /// Called immediately before a `Stop`, mirroring
     /// [`Self::drain_abandoned_command_notifications`].
@@ -402,10 +419,13 @@ impl CodexRolloutProgressSession {
         let Some(path) = self.guard_trace_path.clone() else {
             return Vec::new();
         };
-        let (records, next_line, unparseable) = guard_trace::read_records_from(&path, self.guard_trace_line);
-        self.guard_trace_line = next_line;
-        if records.is_empty() && unparseable == 0 {
-            if observed == 0 {
+        let read = guard_trace::read_records_from(&path, self.guard_trace_line);
+        self.guard_trace_line = read.next_line;
+        if read.records.is_empty() && read.unparseable_lines == 0 {
+            // Once a guard has been seen to run, the hooks are armed and
+            // reachable for the rest of the run; a later quiet turn is a turn
+            // whose cells called no guarded tool, not a disarmed guardrail.
+            if observed == 0 || self.guard_records_seen {
                 return Vec::new();
             }
             return vec![WorkerEvent::Notification {
@@ -413,7 +433,8 @@ impl CodexRolloutProgressSession {
                 message: super::guards_silent_notification(observed),
             }];
         }
-        let summary = guard_trace::summarize(&records, unparseable);
+        self.guard_records_seen = true;
+        let summary = guard_trace::summarize(&read);
         vec![WorkerEvent::Notification {
             session_id: session_id.to_owned(),
             message: super::guard_trace_notification(&summary),
@@ -1633,6 +1654,112 @@ mod tests {
             }))
             .unwrap();
         assert_eq!(events.len(), 1, "got {events:?}");
+    }
+
+    /// Drive one rollout turn that runs a single code-mode cell, and return the
+    /// events emitted at the turn boundary.
+    fn guard_trace_turn(session: &mut CodexRolloutProgressSession, call_id: &str) -> Vec<WorkerEvent> {
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"exec",
+                    "call_id":call_id,
+                    "input":"text('hello');\n"
+                }
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":call_id,
+                    "output":[{"type":"input_text","text":"hello\n"}]
+                }
+            }))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_started"}}))
+            .unwrap();
+        events
+    }
+
+    fn started_rollout_session(trace: &Path) -> CodexRolloutProgressSession {
+        let mut session =
+            CodexRolloutProgressSession::new(None, None, None).with_guard_trace_path(Some(trace.to_path_buf()));
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-guards","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+    }
+
+    #[test]
+    fn a_turn_with_tool_calls_and_no_guard_record_anywhere_reports_guards_silent() {
+        let dir = TempDir::new().unwrap();
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        let mut session = started_rollout_session(&trace);
+
+        let events = guard_trace_turn(&mut session, "call-1");
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARDS_SILENT_MARKER))),
+            "got {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_quiet_turn_after_guards_have_been_seen_reports_nothing() {
+        // The structural false positive this closes: `observed_tool_calls`
+        // counts every rollout `custom_tool_call`, which on a code-mode model is
+        // the JavaScript cell itself. A cell that invokes no inner tool fires no
+        // PreToolUse at all, so a turn that only computes or prints yielded
+        // observed >= 1 with zero guard records and logged "command guardrails
+        // were not enforced" at error. Guards are armed once per run, so one
+        // record settles it for the run.
+        let dir = TempDir::new().unwrap();
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+        let mut session = started_rollout_session(&trace);
+
+        // First turn: the guard record is read and summarised.
+        let first = guard_trace_turn(&mut session, "call-1");
+        assert!(
+            first
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARD_TRACE_MARKER))),
+            "got {first:?}"
+        );
+
+        // Second turn: one cell ran, it called no tool, so no new guard record
+        // exists. That must be silence, not a guardrail alarm.
+        let second = guard_trace_turn(&mut session, "call-2");
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARDS_SILENT_MARKER))),
+            "a turn whose cell invoked no tool must not report disarmed guards: {second:?}"
+        );
+        assert_eq!(
+            second.len(),
+            1,
+            "only the Stop should remain for a quiet turn: {second:?}"
+        );
     }
 
     #[test]
