@@ -400,14 +400,19 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 
 // ─── Grok live-CLI version + posture pin ────────────────────────────────────
 //
-// Mirrors the Codex convention above: soft-skip when `grok` is not on PATH,
-// or when a live invocation exits non-zero for any reason (including "not
-// logged in" — `grok models` and `grok inspect --json` both require auth,
-// per the pane-viability spike's Q1/Q9, and a bare CI image has neither the
-// binary nor a login). Set `BOSS_REQUIRE_GROK_CLI=1` to require the binary
-// and a successful invocation, failing instead of skipping — use this on
-// hosts that claim the live Grok pin (dev machines re-running the
-// pane-viability spike / re-capturing fixtures).
+// Mirrors the Codex convention above, but with two distinct tiers rather
+// than one blanket skip:
+//   - Soft-skip when `grok` is not on PATH, or (for auth-gated assertions)
+//     when the CLI is present but not logged in — `grok models` and `grok
+//     inspect --json` both require auth per the pane-viability spike's
+//     Q1/Q9, and a bare CI image has neither the binary nor a login.
+//   - Hard-fail once availability (and, where required, auth) is
+//     established: a removed flag or subcommand on an otherwise-working
+//     installation must panic, not degrade to a silent skip.
+// Set `BOSS_REQUIRE_GROK_CLI=1` to require the binary and a successful
+// invocation, failing instead of skipping — use this on hosts that claim
+// the live Grok pin (dev machines re-running the pane-viability spike /
+// re-capturing fixtures).
 //
 // The hidden `--trust` flag (design D-3: absent from `--help`) and the
 // `grok models` menu are asserted here rather than folded into a `--help`
@@ -548,10 +553,17 @@ fn hidden_trust_flag_still_parses_on_installed_grok() {
 
 #[test]
 fn grok_models_menu_matches_pinned_descriptor() {
-    // Same availability-probe split as `hidden_trust_flag_still_parses_on_installed_grok`:
-    // a removed `models` subcommand also degrades to a non-zero exit, which
-    // `run_live_grok` would silently skip in the default mode.
-    if !grok_cli_available() {
+    // `grok models` requires auth (spike Q1/Q9), so an availability probe
+    // that only checks `--help` (which needs no login) is not sufficient
+    // here: on a host with the binary present but logged out, `--help`
+    // would succeed while `models` still fails, and routing that failure
+    // through `grok_cli_available()`'s soft-skip convention would turn it
+    // into a hard failure instead of the intended skip. Probe with `grok
+    // inspect --json` instead — it also requires auth, so a logged-out host
+    // (or one with no binary) skips here exactly as it would for `models`,
+    // while a logged-in host with `models` itself removed still reaches the
+    // strict assert below and panics.
+    if run_live_grok(&["inspect", "--json"]).is_none() {
         return;
     }
     let output = Command::new("grok")
