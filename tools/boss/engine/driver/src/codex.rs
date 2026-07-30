@@ -2198,27 +2198,7 @@ mod tests {
         fs::write(&auth_src, sample_auth_json()).unwrap();
 
         // Point homes + auth source at the temp tree; never touch ~/.codex.
-        // `_homes` owns CODEX_HOMES_ENV_TEST_LOCK for its lifetime; AUTH rides
-        // on the same lock (see module comment above).
-        let _homes = crate::test_support::codex_homes_override(&homes);
-        let prior_auth = std::env::var_os(CODEX_AUTH_SOURCE_ENV);
-        // SAFETY: lock held by `_homes` for the whole function.
-        unsafe {
-            std::env::set_var(CODEX_AUTH_SOURCE_ENV, &auth_src);
-        }
-        // Restore auth before `_homes` drops the lock (field drop order is
-        // reverse declaration order, so this guard is dropped first).
-        struct RestoreAuth(Option<std::ffi::OsString>);
-        impl Drop for RestoreAuth {
-            fn drop(&mut self) {
-                // SAFETY: still under the homes-override lock.
-                match self.0.take() {
-                    Some(v) => unsafe { std::env::set_var(CODEX_AUTH_SOURCE_ENV, v) },
-                    None => unsafe { std::env::remove_var(CODEX_AUTH_SOURCE_ENV) },
-                }
-            }
-        }
-        let _restore_auth = RestoreAuth(prior_auth);
+        let _auth = crate::test_support::codex_auth_source_override(&homes, &auth_src);
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

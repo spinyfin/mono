@@ -52,3 +52,42 @@ mod guard_conformance;
 mod ingress_equivalence;
 mod native_transcript;
 mod version_pin;
+
+/// Truthy-env-var parsing shared by every driver's "require the live CLI"
+/// gate (`BOSS_REQUIRE_CODEX_CLI`, `BOSS_REQUIRE_GROK_CLI`, …), so a future
+/// third driver's pin does not add yet another copy of the same parsing.
+fn truthy_env(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+fn require_codex_cli() -> bool {
+    truthy_env("BOSS_REQUIRE_CODEX_CLI")
+}
+
+fn require_grok_cli() -> bool {
+    truthy_env("BOSS_REQUIRE_GROK_CLI")
+}
+
+/// Resolve `bin` on `PATH` via `which`, same lookup every live-CLI pin needs
+/// before it can spawn the binary directly (rather than trusting ambient
+/// `PATH` resolution at spawn time). `None` when `which` fails or the binary
+/// is absent — never an error, since "not installed" is the caller's normal
+/// soft-skip case.
+fn which(bin: &str) -> Option<std::path::PathBuf> {
+    let out = std::process::Command::new("which").arg(bin).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if path.is_empty() {
+        None
+    } else {
+        Some(std::path::PathBuf::from(path))
+    }
+}

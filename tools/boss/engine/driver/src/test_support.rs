@@ -102,6 +102,51 @@ impl Drop for GrokHomesOverride {
     }
 }
 
+/// RAII override of both [`crate::codex::CODEX_HOMES_ROOT_ENV`] and
+/// [`crate::driver::codex::CODEX_AUTH_SOURCE_ENV`], obtained from
+/// [`codex_auth_source_override`].
+///
+/// `CODEX_AUTH_SOURCE_ENV` rides on the same
+/// [`crate::codex::CODEX_HOMES_ENV_TEST_LOCK`] a bare homes override
+/// takes (see that type's doc comment): both env vars gate the same
+/// per-run Codex-home resolution, so one lock, taken once, covers both.
+/// This type exists so a test that needs to point *both* at a temp tree
+/// does it through one call instead of hand-rolling the set/restore pair
+/// at each call site.
+pub struct CodexAuthSourceOverride {
+    auth_prior: Option<std::ffi::OsString>,
+    _homes: CodexHomesOverride,
+}
+
+/// Point per-run `CODEX_HOME` resolution at `homes_root` and the operator
+/// auth snapshot at `auth_source`, both for as long as the returned guard
+/// lives. See [`codex_homes_override`] for the locking/async caveats,
+/// which apply identically here.
+pub fn codex_auth_source_override(homes_root: &Path, auth_source: &Path) -> CodexAuthSourceOverride {
+    let homes = codex_homes_override(homes_root);
+    let auth_prior = std::env::var_os(crate::codex::CODEX_AUTH_SOURCE_ENV);
+    // SAFETY: `homes` holds the process-wide lock covering this key too
+    // (see the type doc above) for the lifetime of the returned guard.
+    unsafe { std::env::set_var(crate::codex::CODEX_AUTH_SOURCE_ENV, auth_source) };
+    CodexAuthSourceOverride {
+        auth_prior,
+        _homes: homes,
+    }
+}
+
+impl Drop for CodexAuthSourceOverride {
+    fn drop(&mut self) {
+        // Runs before the `_homes` field's own `Drop` (struct fields drop
+        // in declaration order, but this impl's body runs first), so the
+        // auth var is restored while the lock is still held.
+        // SAFETY: same as `codex_homes_override` — lock still held.
+        match self.auth_prior.take() {
+            Some(value) => unsafe { std::env::set_var(crate::codex::CODEX_AUTH_SOURCE_ENV, value) },
+            None => unsafe { std::env::remove_var(crate::codex::CODEX_AUTH_SOURCE_ENV) },
+        }
+    }
+}
+
 /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
 /// resolves everything to one `"stub-model"` slug, which is enough for
 /// tests that only exercise capability declaration or the seams a stub

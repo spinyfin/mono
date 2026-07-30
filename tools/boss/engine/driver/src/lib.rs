@@ -2096,10 +2096,6 @@ pub use codex::CodexDriver;
 pub use grok::GrokDriver;
 pub use registry::{DriverRegistry, UnknownDriverSlug};
 
-/// Shared test fixture for crates that need an [`AgentDriver`] stand-in
-/// without a second real driver implementation. Unconditionally compiled
-/// (not `#[cfg(test)]`) so downstream crates can depend on it from their own
-/// `[dev-dependencies]`; this crate's own unit tests use the same fixture.
 pub mod test_support;
 
 #[cfg(test)]
