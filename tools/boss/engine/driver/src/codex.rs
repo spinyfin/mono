@@ -36,24 +36,20 @@ mod tool_surface_guard;
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
 use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
-use progress::{
-    CodexProgressSession, CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout,
-    verified_sessions_root,
-};
+use progress::{CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout, verified_sessions_root};
 
 use super::claude::{BOSS_LAUNCH_GUARD_COMMAND, PR_REDIRECT_GUARD_COMMAND, REVISION_PR_GUARD_COMMAND};
 use super::{
     AgentDriver, AgentJsonlFileIngress, Capability, CapabilitySet, DriverDescriptor, DriverRuntimeState, EnvDirective,
     InterruptDelivery, MidTurnPaneInput, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
     ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressSessionConfig,
-    ProgressSessionNormalizer, ProgressStreamSource, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery,
-    StructuredOutputArtifacts, StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring,
-    TranscriptSessionNormalizer, TurnEnd, WorkerErrorClass, WorkerKind, WorkerProcessLifetime,
-    default_structured_output_wiring,
+    ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
+    TurnEnd, WorkerErrorClass, WorkerKind, WorkerProcessLifetime, default_structured_output_wiring,
 };
 
 /// Marker prefix on a [`WorkerEvent::Notification`] message emitted by this
-/// driver's stdout/rollout progress sessions when a `command_execution` item
+/// driver's rollout progress session when a `command_execution` item
 /// started (`item.started` / a rollout `function_call`) but never observed a
 /// completion (`item.completed` / `function_call_output`) before its turn
 /// boundary — reproduced in probe 6 of the exit-code investigation: a shell
@@ -73,8 +69,6 @@ pub const UNOBSERVED_COMMAND_MARKER: &str = "[codex-unobserved-command]";
 /// prose) so the engine-side consumer can recover the exact command with a
 /// plain `strip_prefix` + trim; a command can itself contain colons or other
 /// punctuation a more descriptive template might be split on ambiguously.
-/// Shared by both progress-session dialects so the message shape stays in
-/// one place.
 pub(crate) fn unobserved_command_notification(command: &str) -> String {
     format!("{UNOBSERVED_COMMAND_MARKER} {command}")
 }
@@ -1516,47 +1510,33 @@ impl AgentDriver for CodexDriver {
     }
 
     fn normalize_progress_event(&self, raw: &serde_json::Value) -> Result<WorkerEvent, NormalizeError> {
-        // Stateless compatibility path for direct callers. Stdout ingestion
+        // Stateless compatibility path for direct callers. Real ingestion
         // owns a durable per-reader session via `progress_session` below.
-        CodexProgressSession::new(None, None, None, None).normalize_progress_event(raw)
+        CodexRolloutProgressSession::new(None, None, None).normalize_progress_event(raw)
     }
 
     fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
-        // Root and home come from one read so they cannot disagree; fall back
-        // to a bare root read only when there is no run id to resolve.
-        let resolved = config
+        let codex_home = config
             .run_id
             .as_deref()
-            .and_then(|run_id| match codex_homes_root_and_home_for_run(run_id) {
-                Ok(pair) => Some(pair),
+            .and_then(|run_id| match codex_home_for_run(run_id) {
+                Ok(home) => Some(home),
                 Err(err) => {
-                    tracing::warn!(run_id, %err, "codex stdout: invalid run id for progress session");
+                    tracing::warn!(run_id, %err, "codex: invalid run id for progress session");
                     None
                 }
             });
-        let (homes_root, codex_home) = match resolved {
-            Some((root, home)) => (root, Some(home)),
-            None => (codex_homes_root(), None),
-        };
-        match config.source {
-            ProgressStreamSource::StdoutJsonl => Some(Box::new(CodexProgressSession::new(
-                codex_home,
-                Some(homes_root),
+        Some(Box::new(
+            CodexRolloutProgressSession::new(
                 config.run_id.clone(),
                 config.identity_store.clone(),
-            ))),
-            ProgressStreamSource::AgentJsonlFile => Some(Box::new(
-                CodexRolloutProgressSession::new(
-                    config.run_id.clone(),
-                    config.identity_store.clone(),
-                    config.transcript_path.clone(),
-                )
-                // The guard trace lives beside the rollout, under the same
-                // run-private CODEX_HOME the guards were armed in, so the
-                // reader can only ever see its own run's decisions.
-                .with_guard_trace_path(codex_home.as_deref().map(guard_trace_path)),
-            )),
-        }
+                config.transcript_path.clone(),
+            )
+            // The guard trace lives beside the rollout, under the same
+            // run-private CODEX_HOME the guards were armed in, so the
+            // reader can only ever see its own run's decisions.
+            .with_guard_trace_path(codex_home.as_deref().map(guard_trace_path)),
+        ))
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
@@ -2444,11 +2424,11 @@ else:
     }
 
     #[test]
-    fn normalize_progress_event_requires_thread_start_before_turn_events() {
-        let raw = serde_json::json!({"type": "turn.completed"});
+    fn normalize_progress_event_requires_session_meta_before_turn_events() {
+        let raw = serde_json::json!({"type": "event_msg", "payload": {"type": "task_started"}});
         assert!(matches!(
             CodexDriver::default().normalize_progress_event(&raw),
-            Err(NormalizeError::MissingField("thread_id"))
+            Err(NormalizeError::MissingField("session_meta.payload.id"))
         ));
     }
 
@@ -2657,9 +2637,9 @@ else:
     }
 
     /// The root/home pair must come from one read of the homes-root env, so
-    /// every containment comparison downstream (`verified_sessions_root`,
-    /// `CodexProgressSession::new`) sees a home that is genuinely a child of
-    /// the root it was handed. Pairing an independent `codex_homes_root()`
+    /// every containment comparison downstream (`verified_sessions_root`)
+    /// sees a home that is genuinely a child of the root it was handed.
+    /// Pairing an independent `codex_homes_root()`
     /// call with `codex_home_for_run()` is what made a sibling test's env
     /// mutation land between the two reads and reject a valid run id.
     #[test]
