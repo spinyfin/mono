@@ -140,3 +140,125 @@ Codex reported both blocks to the model and executed neither. A second turn atte
 - **`--dangerously-bypass-hook-trust` was used for these captures**, deliberately: the question under test was payload shape and guard behaviour, not trust provisioning, which has its own gate (`codex-hook-trust-provisioning-2026-07-26.md`) and its own live `hooks/list` attestation. The `[codex-guards-silent]` signal is what covers the trust failure mode at run time.
 - **The rollout normaliser mislabels a code-mode cell's command.** `canonical_rollout_tool_call` maps `name: "exec"` → `tool_name: "Bash"` and then looks for `cmd` in the input; for a code-mode cell the input is JS _source_, not JSON, so the whole JS body becomes the reported "command". That is a progress-display fidelity bug, not a guard bug (the guards read the hook payload, which is correct), and it is left as-is here.
 - **The interactive-interpreter list is a list.** It covers the shells, the common REPLs, and the editors/pagers with shell escapes; a determined agent could find an interactive stdin consumer that is not on it. The structural fix would be Codex disabling `write_stdin` per-config, which `--strict-config` shows no key for on 0.145.0 (`tools.write_stdin` is rejected as unknown).
+
+---
+
+# Addendum, 2026-07-30 — do the guards fire in the interactive TUI?
+
+- **Date:** 2026-07-30
+- **Code sha:** every `file:line` below is against `main` @ `19473a98`.
+- **CLI pin:** `codex-cli 0.145.0` (unchanged from the original capture).
+- **Occasion:** the TUI-pivot spike ([`codex-tui-pivot-pricing-2026-07-30.md`](codex-tui-pivot-pricing-2026-07-30.md)) recommends making the bare interactive `codex` TUI the only Codex execution path. Everything above was measured under `codex exec` only. Codex's hook failures are silent and fail-open (`designs/codex-as-a-first-class-agent-driver.md:322-326`), so shipping the shape change without re-measuring would have put a believed-on, inert guardrail in front of every Codex worker.
+
+## Verdict
+
+**The guards fire in the interactive TUI, identically, and their blocks are enforced. The guard materialisation and the guard scripts needed no change.**
+
+**One thing did need fixing, and it is not in the guards.** The engine's silent-guards detector was reasoned for a run that lasts one turn. Under a session it is wrong, and that was demonstrated live: a TUI session whose guard chain was removed between two turns ran turn 2's command **unguarded**, and every Boss signal stayed quiet.
+
+## Apparatus — stronger than the original capture in two ways
+
+1. **The `CODEX_HOME` was materialised by production code, not by hand.** A throwaway `#[test]` (added, run, reverted — the working tree carries no trace of it) called `write_hooks_and_attest` (`engine/driver/src/codex.rs:1125`) directly, with a `ToolUseInterceptionConfig` for a local Standard worker. That materialised the trace shim, five wrappers, and `config.toml`, and ran the real `arm_and_attest` — including the live `codex app-server` `hooks/list` observation. The two `GuardSource::Existing` scripts were the real `PATH_GUARD_SCRIPT` / `CHECKLEFT_PUSH_GUARD_SCRIPT` bodies extracted verbatim from `engine/core/src/worker_setup.rs:1081` and `:1315`.
+
+2. **No `--dangerously-bypass-hook-trust`.** The original capture used it deliberately, leaving trust provisioning out of scope. These runs did not: all five hooks were stamped and observed `trusted` through Boss's own gate before a single turn ran.
+
+```text
+.* trusted 00_path_guard.sh
+Bash trusted 01_boss_launch_guard.sh
+.* trusted 02_codex_tool_surface_guard.sh
+Bash trusted 03_pr_redirect_guard.sh
+Bash trusted 04_checkleft_push_guard.sh
+```
+
+The TUI was driven under a real pty (`pty.fork`, 160×50), with **no `exec` subcommand**:
+
+```sh
+codex --no-alt-screen --strict-config -s workspace-write -a never -m gpt-5.6-terra '<prompt>'
+```
+
+`gpt-5.6-terra` is what Boss dispatches for Standard work, and is `code_mode_only` — the model class the original investigation established is the hard case. The payload tee was installed as the `.*` path guard, so it saw every tool call and then delegated to the real guard.
+
+## Measurement 1 — the shell surface
+
+Raw `PreToolUse` payload, verbatim from the tee, on the bare TUI:
+
+```json
+{
+  "session_id": "019fb33a-97fb-7fa3-8026-c89044690743",
+  "turn_id": "019fb33a-99e2-7451-92a0-a2e2ebee744c",
+  "transcript_path": "…/sessions/2026/07/30/rollout-2026-07-30T08-33-09-019fb33a-….jsonl",
+  "cwd": "…/ws",
+  "hook_event_name": "PreToolUse",
+  "model": "gpt-5.6-terra",
+  "permission_mode": "bypassPermissions",
+  "tool_name": "Bash",
+  "tool_input": { "command": "jj git push --dry-run" },
+  "tool_use_id": "exec-e0ae3234-84bb-401b-8503-d0af8517caa3"
+}
+```
+
+Same key set, same `tool_name`, same `tool_input` shape as the `exec` capture in section 2 above. The block was enforced pre-execution — from the session's own rollout:
+
+```text
+Script failed
+Script error:
+Command blocked by PreToolUse hook: Workers must not push branches or open PRs with bare
+VCS commands (blocked: jj git push). … Command: jj git push --dry-run
+```
+
+And all five guards recorded their decision in `$CODEX_HOME/guard-trace.jsonl`, so the engine-side observability path works unchanged on the TUI.
+
+## Measurement 2 — the non-shell surface
+
+A second session exercised the two routes a `matcher = "Bash"` guard structurally cannot reach. Both behave exactly as under `exec`:
+
+| route           | `tool_name`                               | `tool_input`                      | outcome                     |
+| --------------- | ----------------------------------------- | --------------------------------- | --------------------------- |
+| file edit       | `apply_patch`                             | `{"command": "*** Begin Patch…"}` | approved, file written      |
+| GitHub app tool | `mcp__codex_apps__github__get_user_login` | `{}`                              | **blocked**, never executed |
+
+```text
+Script error:
+Tool call blocked by PreToolUse hook: Blocked: Boss workers must not act through Codex
+app/MCP tools (matched tool: mcp__codex_apps__github__get_user_login). …
+```
+
+So the corrections this document's section 5 shipped — the `.*` matcher on the data-directory gate, and the tool-surface guard — carry over to the TUI with nothing to change.
+
+**Deliverable step 2 therefore has no work in it.** Neither the materialisation nor the guard scripts differ by shape, and manufacturing a change to prove otherwise would be dishonest.
+
+## Measurement 3 — the one that found a real defect
+
+`drain_guard_trace_notifications` (`engine/driver/src/codex/progress.rs:421`, called immediately before every `Stop` at `:590`, `:604`, `:621`) suppresses the silent-guards signal once any guard record has been read, on the stated reasoning that _"once a guard has been seen to run, the hooks are armed and reachable for the rest of the run"_ (`guard_records_seen`, `progress.rs:368`, set at `:440`).
+
+Under `codex exec` — `WorkerProcessLifetime::OneTurnPerProcess` (`codex.rs:1589`) — "the rest of the run" is the tail of one turn. Under the TUI it is the whole session. **That is not a widening of a safe assumption; it is a different assumption, and it is false.**
+
+One live TUI session, two real turns (`task_started` ×2, `task_complete` ×2 in one rollout), with `$CODEX_HOME/guards` removed between them:
+
+```text
+turn 1   `echo one-canary`   → 5 guard records, command runs
+(between turns: rm -rf $CODEX_HOME/guards)
+turn 2   `echo two-canary`   → 0 guard records, command runs anyway
+```
+
+Turn 2's `custom_tool_call_output` reads `Script completed … two-canary`. `guard-trace.jsonl` still held exactly the five lines from turn 1. Codex skipped the hook silently and failed open, precisely as the design doc describes — and because `guard_records_seen` was already latched by turn 1, the only Boss signal that names this condition would have stayed quiet for the remaining life of the session.
+
+This is not hypothetical for a persistent worker: each run's `CODEX_HOME` sits under a temp root (`codex.rs:283-290`), `reclaim_codex_home` (`:405`) deletes those trees on retention policy, and the shim and wrapper already carry per-invocation sha256 self-checks (`guard_trace.rs:64-87`) — machinery that exists precisely because guard bytes _can_ change after arming.
+
+## What changed in the tree
+
+Nothing in the guards. One change in the engine's observability, and it **adds** a firing condition rather than moving one:
+
+1. **New `verify_armed_chain_on_disk` + `read_attestation_file`** (`engine/codex-hook-trust/src/lib.rs`). Re-checks both halves of "Codex will invoke this guard", because both can be lost silently: `$CODEX_HOME/config.toml` must still declare each attested hook command and still stamp its `trusted_hash` under `[hooks.state]` (an untrusted or undeclared hook is skipped with no stream event, and every fresh-process turn re-reads the config), and every hook `command` must still be a regular executable file whose bytes still hash to the attested `guard_content_sha256`. An entry with no attested content hash is rejected rather than passed through — every hook Boss arms is content-bound. Not re-checked: the shim and the guard bodies behind each wrapper, which already fail **closed** with a recorded decision.
+
+2. **New `codex/guard_chain.rs`** in the driver. Resolves the attestation under a run's `CODEX_HOME` and answers `Unknown` / `Intact` / `Broken(detail)`. A missing or unparseable attestation is `Broken`, not `Unknown` — `write_permission_config` (`codex.rs:1457`) arms and attests on every Codex spawn or fails the spawn, so for a live run its absence means Boss can no longer prove anything about its own guardrails. Fail closed, as the guards do.
+
+3. **`drain_guard_trace_notifications` asks disk, not history.** At every turn boundary it re-checks the chain before reading the trace, and reports `[codex-guards-silent]` whenever the chain is broken — every turn it stays broken, and whether or not that turn ran a tool call. The broken-chain report is **added to** the turn's guard-trace summary, not substituted for it: verification stops at the first bad entry, so a run that lost one wrapper of five still has four guards running and recording, and a `block` they issue while the chain is degraded is exactly what an operator needs. `guard_records_seen` keeps its original and only justified job: stopping a code-mode cell that invokes no inner tool from alarming. It no longer carries the claim that the guards are still armed, because that claim is now established rather than remembered.
+
+The signal was not narrowed, downgraded, or suppressed: every condition that fired before still fires, and the mid-session case that was invisible now fires too. The reader was switched from holding a guard-trace path to holding the run's `CODEX_HOME`, since both the trace and the attestation are resolved from it.
+
+## What remains open
+
+- **`write_stdin` is still unhookable on the TUI**, exactly as on `exec` — nothing in these runs changes section 4's finding or the interactive-interpreter denial that answers it.
+- **Readoption is still the pivot's real gap.** The chain re-check is per-turn-boundary, so it depends on progress ingress being live. The TUI-pivot spike's gap 1 — `readopt_live_worker` never re-establishes progress ingress (`engine/core/src/app/readoption.rs:119-238`) — means a session that outlives an engine restart has no turn boundaries at all, and therefore no guard reporting of any kind. That is scoped to the pivot, not fixed here.
+- **A broken chain is reported, not repaired.** Re-arming mid-session would need a live `hooks/list` observation and a Codex config reload; the engine has no such path today, and inventing one behind a detector would be the wrong order.

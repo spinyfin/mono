@@ -538,6 +538,168 @@ fn write_attestation_round_trips() {
     assert_eq!(loaded.config_path, att.config_path);
 }
 
+// ── Per-turn re-check (`read_attestation_file` / `verify_armed_chain_on_disk`) ─
+
+/// Arm a fixture the way a real run does, returning the fixture and the
+/// attestation a worker would later re-check at each turn boundary.
+fn armed_fixture() -> (Fixture, HookTrustAttestation) {
+    let fx = setup_fixture("#!/bin/sh\nexit 0\n");
+    let hooks = standard_hooks(&fx);
+    let observer = FakeObserver::new();
+    for hook in &hooks {
+        let key = hook_state_key(&fx.config_path, hook.event, hook.group_index, hook.handler_index);
+        observer.set(
+            &key,
+            "trusted",
+            &expected_hash(&fx, hook.event, hook.matcher.as_deref()),
+        );
+    }
+    let req = ArmRequest {
+        codex_home: fx.codex_home.clone(),
+        config_path: fx.config_path.clone(),
+        cwd: fx.cwd.clone(),
+        hooks,
+        codex_bin: PathBuf::from("codex"),
+    };
+    let att = arm_and_attest_with_observer(&req, &observer).expect("arm should succeed");
+    (fx, att)
+}
+
+#[test]
+fn a_freshly_armed_chain_verifies_on_disk() {
+    let (_fx, att) = armed_fixture();
+    verify_armed_chain_on_disk(&att).expect("a chain still as armed must verify");
+}
+
+#[test]
+fn read_attestation_file_round_trips_and_fails_closed() {
+    let (fx, att) = armed_fixture();
+    let path = fx.codex_home.join("hook-trust-attestation.json");
+    write_attestation_file(&path, &att).unwrap();
+    let loaded = read_attestation_file(&path).expect("written attestation must read back");
+    assert_eq!(loaded, att);
+
+    // Truncated / corrupted JSON is stale, not an absence to shrug at.
+    fs::write(&path, "{\"codex_home\":").unwrap();
+    assert!(matches!(
+        read_attestation_file(&path).unwrap_err(),
+        TrustGateError::AttestationStale { .. }
+    ));
+
+    fs::remove_file(&path).unwrap();
+    assert!(matches!(
+        read_attestation_file(&path).unwrap_err(),
+        TrustGateError::AttestationStale { .. }
+    ));
+}
+
+#[test]
+fn an_attestation_with_no_hook_entries_is_rejected() {
+    // An attestation naming nothing proves nothing; treating it as "chain
+    // intact" would report armed guardrails for a run that has none.
+    let (_fx, mut att) = armed_fixture();
+    att.hooks.clear();
+    assert!(matches!(
+        verify_armed_chain_on_disk(&att).unwrap_err(),
+        TrustGateError::AttestationIncomplete { .. }
+    ));
+}
+
+#[test]
+fn an_entry_with_no_attested_content_hash_is_rejected() {
+    // Every hook Boss arms is content-bound, so an entry with no hash cannot
+    // answer "are these the bytes we attested?". Fail closed rather than pass
+    // the entry through unchecked.
+    let (_fx, mut att) = armed_fixture();
+    att.hooks[0].guard_content_sha256 = None;
+    assert!(matches!(
+        verify_armed_chain_on_disk(&att).unwrap_err(),
+        TrustGateError::AttestationIncomplete { .. }
+    ));
+}
+
+#[test]
+fn a_removed_guard_command_breaks_the_chain() {
+    let (fx, att) = armed_fixture();
+    fs::remove_file(&fx.guard).unwrap();
+    assert!(verify_armed_chain_on_disk(&att).is_err());
+}
+
+#[test]
+fn an_edited_guard_command_breaks_the_chain() {
+    let (fx, att) = armed_fixture();
+    fs::write(&fx.guard, "#!/bin/sh\necho '{\"decision\":\"approve\"}'\n").unwrap();
+    let mut perms = fs::metadata(&fx.guard).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fx.guard, perms).unwrap();
+    assert!(matches!(
+        verify_armed_chain_on_disk(&att).unwrap_err(),
+        TrustGateError::AttestationStale { .. }
+    ));
+}
+
+#[test]
+fn a_config_that_lost_its_trust_state_breaks_the_chain() {
+    // Codex skips an untrusted hook silently, so the wrappers can all still be
+    // on disk with the attested bytes while nothing invokes them.
+    let (fx, att) = armed_fixture();
+    let stripped: String = fs::read_to_string(&fx.config_path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("trusted_hash"))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&fx.config_path, stripped).unwrap();
+    let err = verify_armed_chain_on_disk(&att).unwrap_err();
+    assert!(
+        matches!(&err, TrustGateError::AttestationStale { detail } if detail.contains("trusted_hash")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_config_whose_trust_state_was_rewritten_breaks_the_chain() {
+    let (fx, att) = armed_fixture();
+    let raw = fs::read_to_string(&fx.config_path).unwrap();
+    let rewritten = raw.replace(&att.hooks[0].trusted_hash, "sha256:0000");
+    assert_ne!(rewritten, raw, "the stamped hash must appear in the config");
+    fs::write(&fx.config_path, rewritten).unwrap();
+    assert!(matches!(
+        verify_armed_chain_on_disk(&att).unwrap_err(),
+        TrustGateError::AttestationStale { .. }
+    ));
+}
+
+#[test]
+fn a_config_that_lost_its_hook_definitions_breaks_the_chain() {
+    // Deleting the `[[hooks.PreToolUse]]` blocks leaves the `[hooks.state]`
+    // rows behind, so trust alone cannot see it — Codex simply has no hook to
+    // invoke, in silence.
+    let (fx, att) = armed_fixture();
+    let stripped: String = fs::read_to_string(&fx.config_path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.contains(fx.guard.to_str().unwrap()))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    fs::write(&fx.config_path, stripped).unwrap();
+    let err = verify_armed_chain_on_disk(&att).unwrap_err();
+    assert!(
+        matches!(&err, TrustGateError::AttestationStale { detail } if detail.contains("no longer declares")),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_missing_config_breaks_the_chain() {
+    let (fx, att) = armed_fixture();
+    fs::remove_file(&fx.config_path).unwrap();
+    assert!(matches!(
+        verify_armed_chain_on_disk(&att).unwrap_err(),
+        TrustGateError::AttestationStale { .. }
+    ));
+}
+
 /// Live integration: when `codex` is on PATH, the real observer must report
 /// `trusted` after stamping. Skipped cleanly when codex is unavailable so CI
 /// without the binary stays green.

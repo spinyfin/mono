@@ -29,6 +29,7 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
+mod guard_chain;
 pub mod guard_trace;
 mod progress;
 mod tool_surface_guard;
@@ -94,10 +95,16 @@ pub const GUARD_TRACE_MARKER: &str = "[codex-guard-trace]";
 /// that pushes are blocked, so this condition is a defect signal, not
 /// bookkeeping.
 ///
-/// Run-scoped by construction: guards are armed once per run, so a single
-/// recorded guard invocation settles the question for the whole run. Scoping it
-/// per turn instead would fire on any code-mode cell that invokes no inner tool
-/// — see `CodexRolloutProgressSession::guard_records_seen`.
+/// Fires on either of two conditions, both meaning "guardrails not enforced":
+///
+/// - the armed guard chain is no longer on disk with the bytes Boss attested
+///   ([`guard_chain`]), checked at every turn boundary. This is the condition a
+///   long-lived session needs and a one-turn-per-process run never could:
+///   arming happens once, and a session outlives it by hours;
+/// - no guard invocation has been recorded for the run at all, while tool calls
+///   ran. Kept run-scoped rather than per-turn because a code-mode cell that
+///   invokes no inner tool fires no `PreToolUse` and would otherwise alarm on
+///   every quiet turn — see `CodexRolloutProgressSession::guard_records_seen`.
 pub const GUARDS_SILENT_MARKER: &str = "[codex-guards-silent]";
 
 /// Render the guard-activity notification for one turn.
@@ -113,6 +120,23 @@ pub(crate) fn guards_silent_notification(observed: usize) -> String {
          invocation has been recorded for this run; Boss's Codex guardrails may be disarmed (hook trust \
          stale, guard handler unexecutable, or hooks not reached). Treat command guardrails as \
          unenforced until this is explained."
+    )
+}
+
+/// Render the notification for a run whose armed guard chain is no longer on
+/// disk as attested.
+///
+/// Distinct from [`guards_silent_notification`] in detail only — same marker,
+/// so the engine routes both to the same counter and the same `error` line —
+/// because the operator action differs: this one names a chain that *was*
+/// verified at arming and has since changed underneath a live session, and it
+/// is true whether or not the turn happened to run a tool call.
+pub(crate) fn guard_chain_broken_notification(detail: &str) -> String {
+    format!(
+        "{GUARDS_SILENT_MARKER} the armed PreToolUse guard chain is no longer intact on disk: \
+         {detail}. Codex skips a hook it cannot execute silently and fails open, so every command \
+         guardrail this run believes it has — push/PR redirection, the Boss-launch gate, the \
+         checkleft pre-push gate, the data-directory gate — must be treated as unenforced from now on."
     )
 }
 
@@ -1162,7 +1186,10 @@ pub fn write_hooks_and_attest(
     let attestation = arm_and_attest(&request)
         .map_err(|err| anyhow!("Codex hook-trust gate refused to arm PreToolUse guards: {err}"))?;
 
-    let attestation_path = codex_home.join(HOOK_TRUST_ATTESTATION_FILENAME);
+    // One derivation, shared with the per-turn re-check that reads it back: a
+    // writer and reader that each build this path would drift into reporting
+    // every turn boundary as a broken chain.
+    let attestation_path = guard_chain::attestation_path(codex_home);
     write_attestation_file(&attestation_path, &attestation)
         .map_err(|err| anyhow!("writing hook-trust attestation: {err}"))?;
 
@@ -1532,10 +1559,11 @@ impl AgentDriver for CodexDriver {
                 config.identity_store.clone(),
                 config.transcript_path.clone(),
             )
-            // The guard trace lives beside the rollout, under the same
-            // run-private CODEX_HOME the guards were armed in, so the
-            // reader can only ever see its own run's decisions.
-            .with_guard_trace_path(codex_home.as_deref().map(guard_trace_path)),
+            // The guard trace and the arming attestation both live under
+            // the same run-private CODEX_HOME the guards were armed in, so
+            // the reader can only ever see its own run's decisions and can
+            // only ever re-check its own run's chain.
+            .with_codex_home(codex_home),
         ))
     }
 

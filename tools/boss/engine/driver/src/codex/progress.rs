@@ -26,6 +26,7 @@ use boss_engine_codex_rollout::{
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
 
+use super::guard_chain::{self, ArmedChainStatus};
 use super::guard_trace;
 use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionNormalizer};
 
@@ -78,9 +79,10 @@ pub(super) struct CodexRolloutProgressSession {
     calls: HashMap<String, RolloutToolCall>,
     call_order: VecDeque<String>,
     turn_terminal: bool,
-    /// Per-run `PreToolUse` guard decision log, when the reader knows which
-    /// run it belongs to. Absent in fixtures and for the stateless path.
-    guard_trace_path: Option<PathBuf>,
+    /// The run's Boss-owned `CODEX_HOME`, when the reader knows which run it
+    /// belongs to. Absent in fixtures and for the stateless path. Both the
+    /// guard decision log and the arming attestation are resolved from it.
+    codex_home: Option<PathBuf>,
     /// Trace lines already reported, so a later turn does not re-report them.
     guard_trace_line: usize,
     /// Tool calls observed since the last turn boundary. Compared against the
@@ -88,14 +90,18 @@ pub(super) struct CodexRolloutProgressSession {
     observed_tool_calls: usize,
     /// Whether any guard record has ever been read for this run.
     ///
-    /// Run-scoped, not per-turn, because "hooks inert" is a run-level property:
-    /// guards are armed once, at run start. A per-turn comparison produced a
-    /// structural false positive — `observed_tool_calls` counts every rollout
-    /// `custom_tool_call`, which on a code-mode model is the JavaScript cell
-    /// itself, and a cell that invokes no inner tool fires no `PreToolUse` at
-    /// all (verified in the investigation doc, section 3). So an ordinary turn
-    /// whose cell only computes, prints, or touches `store`/`load`/`notify`
-    /// used to log "command guardrails were not enforced" at `error`.
+    /// Run-scoped, not per-turn, because of a structural false positive:
+    /// `observed_tool_calls` counts every rollout `custom_tool_call`, which on
+    /// a code-mode model is the JavaScript cell itself, and a cell that invokes
+    /// no inner tool fires no `PreToolUse` at all (verified in the
+    /// investigation doc, section 3). So an ordinary turn whose cell only
+    /// computes, prints, or touches `store`/`load`/`notify` used to log
+    /// "command guardrails were not enforced" at `error`.
+    ///
+    /// What this flag must **not** be read as is "the guards are still armed".
+    /// Liveness is re-checked against disk at every turn boundary by
+    /// [`guard_chain::armed_chain_status`]. This flag's only job is to keep a
+    /// turn whose cell invoked no inner tool from alarming.
     #[builder(default)]
     guard_records_seen: bool,
 }
@@ -114,67 +120,102 @@ impl CodexRolloutProgressSession {
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             turn_terminal: false,
-            guard_trace_path: None,
+            codex_home: None,
             guard_trace_line: 0,
             observed_tool_calls: 0,
             guard_records_seen: false,
         }
     }
 
-    /// Point this reader at the run's guard-decision trace.
+    /// Point this reader at the run's Boss-owned `CODEX_HOME`.
     ///
     /// Separate from [`Self::new`] so the many fixtures constructing a bare
-    /// session stay untouched: a reader with no trace path simply reports no
-    /// guard activity, which is the correct answer for a synthetic rollout.
-    pub(super) fn with_guard_trace_path(mut self, path: Option<PathBuf>) -> Self {
-        self.guard_trace_path = path;
+    /// session stay untouched: a reader with no `CODEX_HOME` reports no guard
+    /// activity and makes no claim about arming, which is the correct answer
+    /// for a synthetic rollout.
+    pub(super) fn with_codex_home(mut self, codex_home: Option<PathBuf>) -> Self {
+        self.codex_home = codex_home;
         self
     }
 
     /// Guard-activity notifications for the turn that is ending.
     ///
-    /// Two outcomes, both engine-visible:
+    /// Three conditions, all engine-visible, and they compose — a turn can
+    /// report a broken chain *and* what the guards still armed decided:
     ///
+    /// - the armed chain is no longer intact on disk → one
+    ///   [`super::GUARDS_SILENT_MARKER`] notification, **every** turn it stays
+    ///   broken and regardless of whether this turn ran a tool call. Arming is
+    ///   a one-time act and a session outlives it, so "armed" is
+    ///   re-established rather than remembered. See [`guard_chain`];
     /// - records exist → one [`super::GUARD_TRACE_MARKER`] notification
     ///   summarising them, so "did the guard fire, and what did it decide?" is
-    ///   answerable from the trace for every Codex execution;
+    ///   answerable from the trace for every Codex execution. Emitted whether
+    ///   or not the chain check passed: verification stops at the first bad
+    ///   entry, so the guards behind it keep running and recording;
     /// - tool calls ran and **no guard record has been read for this run at
-    ///   all** → one [`super::GUARDS_SILENT_MARKER`] notification, the only
-    ///   signal Boss can get that Codex skipped its hooks (untrusted trust
+    ///   all** → one [`super::GUARDS_SILENT_MARKER`] notification, the signal
+    ///   that Codex skipped its hooks from the very start (untrusted trust
     ///   record, unexecutable handler) and every guardrail was inert while the
-    ///   run looked healthy.
+    ///   run looked healthy. Suppressed when the chain check already reported
+    ///   a break, which carries the same marker with a more specific detail.
     ///
-    /// The second signal is deliberately run-scoped rather than per-turn: see
+    /// The third condition is run-scoped rather than per-turn: see
     /// [`Self::guard_records_seen`] for why a per-turn comparison fires on
-    /// ordinary code-mode cells that invoke no tool.
+    /// ordinary code-mode cells that invoke no tool. The first is what keeps
+    /// that scoping honest over a run that can span hours — it is a fresh
+    /// check, not a widened window, so a chain that breaks after the latch is
+    /// set is still reported.
     ///
     /// Called immediately before a `Stop`, mirroring
     /// [`Self::drain_abandoned_command_notifications`].
     fn drain_guard_trace_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
         let observed = std::mem::take(&mut self.observed_tool_calls);
-        let Some(path) = self.guard_trace_path.clone() else {
+        let Some(codex_home) = self.codex_home.clone() else {
             return Vec::new();
         };
-        let read = guard_trace::read_records_from(&path, self.guard_trace_line);
+
+        let mut events = Vec::new();
+
+        // Ask disk, not history, whether the guards are still reachable:
+        // records from earlier turns do not make the current turn guarded.
+        let chain_broken = match guard_chain::armed_chain_status(Some(&codex_home)) {
+            ArmedChainStatus::Broken(detail) => {
+                events.push(WorkerEvent::Notification {
+                    session_id: session_id.to_owned(),
+                    message: super::guard_chain_broken_notification(&detail),
+                });
+                true
+            }
+            ArmedChainStatus::Intact | ArmedChainStatus::Unknown => false,
+        };
+
+        // Drain the trace either way. A broken chain is broken at its first bad
+        // entry, so a run that lost one wrapper of five still has four guards
+        // recording — and a `block` they issue while the chain is degraded is
+        // exactly what an operator needs to see.
+        let read = guard_trace::read_records_from(&guard_trace::guard_trace_path(&codex_home), self.guard_trace_line);
         self.guard_trace_line = read.next_line;
         if read.records.is_empty() && read.unparseable_lines == 0 {
-            // Once a guard has been seen to run, the hooks are armed and
-            // reachable for the rest of the run; a later quiet turn is a turn
-            // whose cells called no guarded tool, not a disarmed guardrail.
-            if observed == 0 || self.guard_records_seen {
-                return Vec::new();
+            // With the chain intact, a turn with no new record is a turn whose
+            // cells called no guarded tool — not a disarmed guardrail. With the
+            // chain broken it is already reported above, and a second
+            // notification under the same marker adds nothing.
+            if !chain_broken && observed > 0 && !self.guard_records_seen {
+                events.push(WorkerEvent::Notification {
+                    session_id: session_id.to_owned(),
+                    message: super::guards_silent_notification(observed),
+                });
             }
-            return vec![WorkerEvent::Notification {
-                session_id: session_id.to_owned(),
-                message: super::guards_silent_notification(observed),
-            }];
+            return events;
         }
         self.guard_records_seen = true;
         let summary = guard_trace::summarize(&read);
-        vec![WorkerEvent::Notification {
+        events.push(WorkerEvent::Notification {
             session_id: session_id.to_owned(),
             message: super::guard_trace_notification(&summary),
-        }]
+        });
+        events
     }
 
     fn classify_thread_start(&self, thread_id: &str) -> SessionStartSource {
@@ -906,9 +947,63 @@ mod tests {
         events
     }
 
-    fn started_rollout_session(trace: &Path) -> CodexRolloutProgressSession {
-        let mut session =
-            CodexRolloutProgressSession::new(None, None, None).with_guard_trace_path(Some(trace.to_path_buf()));
+    /// A `CODEX_HOME` shaped like one `write_hooks_and_attest` leaves behind: a
+    /// config that declares and trusts one hook, an executable wrapper, and an
+    /// attestation binding its bytes. Returns the wrapper so a test can break
+    /// the chain the way a live session can.
+    fn armed_codex_home(home: &Path) -> PathBuf {
+        use boss_engine_codex_hook_trust::{
+            HookAttestationEntry, HookTrustAttestation, ObservationProof, sha256_hex_prefixed, write_attestation_file,
+        };
+
+        let guards = home.join("guards");
+        std::fs::create_dir_all(&guards).unwrap();
+        let wrapper = guards.join("00_path_guard.sh");
+        let body = "#!/bin/sh\nexit 0\n";
+        std::fs::write(&wrapper, body).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            format!(
+                "[[hooks.PreToolUse]]\n\
+                 matcher = \".*\"\n\
+                 [[hooks.PreToolUse.hooks]]\n\
+                 type = \"command\"\n\
+                 command = \"{}\"\n\
+                 \n\
+                 [hooks.state.\"k\"]\n\
+                 trusted_hash = \"sha256:whatever\"\n",
+                wrapper.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let attestation = HookTrustAttestation {
+            codex_home: home.display().to_string(),
+            config_path: home.join("config.toml").display().to_string(),
+            generated_at_unix: 0,
+            hooks: vec![
+                HookAttestationEntry::builder()
+                    .key("k")
+                    .event("pre_tool_use")
+                    .command(wrapper.display().to_string())
+                    .matcher(".*")
+                    .trusted_hash("sha256:whatever")
+                    .guard_content_sha256(sha256_hex_prefixed(body.as_bytes()))
+                    .observed_trust_status("trusted")
+                    .build(),
+            ],
+            observation: ObservationProof::HooksList { codex_version: None },
+        };
+        write_attestation_file(&super::super::guard_chain::attestation_path(home), &attestation).unwrap();
+        wrapper
+    }
+
+    fn started_rollout_session(home: &Path) -> CodexRolloutProgressSession {
+        let mut session = CodexRolloutProgressSession::new(None, None, None).with_codex_home(Some(home.to_path_buf()));
         session
             .normalize_progress_events(&json!({
                 "type":"session_meta",
@@ -918,20 +1013,21 @@ mod tests {
         session
     }
 
+    fn is_silent_signal(events: &[WorkerEvent]) -> bool {
+        events.iter().any(|event| {
+            matches!(event, WorkerEvent::Notification { message, .. }
+                if message.starts_with(super::super::GUARDS_SILENT_MARKER))
+        })
+    }
+
     #[test]
     fn a_turn_with_tool_calls_and_no_guard_record_anywhere_reports_guards_silent() {
         let dir = TempDir::new().unwrap();
-        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
-        let mut session = started_rollout_session(&trace);
+        armed_codex_home(dir.path());
+        let mut session = started_rollout_session(dir.path());
 
         let events = guard_trace_turn(&mut session, "call-1");
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
-                    if message.starts_with(super::super::GUARDS_SILENT_MARKER))),
-            "got {events:?}"
-        );
+        assert!(is_silent_signal(&events), "got {events:?}");
     }
 
     #[test]
@@ -941,16 +1037,16 @@ mod tests {
         // the JavaScript cell itself. A cell that invokes no inner tool fires no
         // PreToolUse at all, so a turn that only computes or prints yielded
         // observed >= 1 with zero guard records and logged "command guardrails
-        // were not enforced" at error. Guards are armed once per run, so one
-        // record settles it for the run.
+        // were not enforced" at error. With the chain re-verified intact this
+        // turn, one earlier record is enough to explain the quiet.
         let dir = TempDir::new().unwrap();
-        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        armed_codex_home(dir.path());
         std::fs::write(
-            &trace,
+            dir.path().join(guard_trace::GUARD_TRACE_FILENAME),
             "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
         )
         .unwrap();
-        let mut session = started_rollout_session(&trace);
+        let mut session = started_rollout_session(dir.path());
 
         // First turn: the guard record is read and summarised.
         let first = guard_trace_turn(&mut session, "call-1");
@@ -966,10 +1062,7 @@ mod tests {
         // exists. That must be silence, not a guardrail alarm.
         let second = guard_trace_turn(&mut session, "call-2");
         assert!(
-            !second
-                .iter()
-                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
-                    if message.starts_with(super::super::GUARDS_SILENT_MARKER))),
+            !is_silent_signal(&second),
             "a turn whose cell invoked no tool must not report disarmed guards: {second:?}"
         );
         assert_eq!(
@@ -977,6 +1070,117 @@ mod tests {
             1,
             "only the Stop should remain for a quiet turn: {second:?}"
         );
+    }
+
+    #[test]
+    fn a_chain_broken_after_guards_were_seen_still_reports_guards_silent() {
+        // The session-lifetime defect, measured live on codex-cli 0.145.0: a
+        // TUI session whose `$CODEX_HOME/guards` was removed between two turns
+        // ran turn 2's shell command with zero guard records, and Codex said
+        // nothing. `guard_records_seen` was already latched by turn 1, so the
+        // one signal that names this condition stayed silent for good.
+        let dir = TempDir::new().unwrap();
+        armed_codex_home(dir.path());
+        std::fs::write(
+            dir.path().join(guard_trace::GUARD_TRACE_FILENAME),
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+        let mut session = started_rollout_session(dir.path());
+
+        let first = guard_trace_turn(&mut session, "call-1");
+        assert!(!is_silent_signal(&first), "turn 1 is guarded: {first:?}");
+
+        std::fs::remove_dir_all(dir.path().join("guards")).unwrap();
+
+        let second = guard_trace_turn(&mut session, "call-2");
+        assert!(
+            is_silent_signal(&second),
+            "a chain removed mid-session must still be reported: {second:?}"
+        );
+
+        // And it keeps firing: a guardrail that is still inert on the next turn
+        // is still a defect, not a one-shot notice.
+        let third = guard_trace_turn(&mut session, "call-3");
+        assert!(is_silent_signal(&third), "got {third:?}");
+    }
+
+    #[test]
+    fn a_broken_chain_does_not_suppress_the_surviving_guards_trace() {
+        // `verify_armed_chain_on_disk` stops at the first bad entry, so one
+        // wrapper removed of several leaves the rest live and recording. Their
+        // decisions — a block, a guard error — are exactly what an operator
+        // needs while the chain is degraded, so the turn must report both.
+        let dir = TempDir::new().unwrap();
+        armed_codex_home(dir.path());
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+        let mut session = started_rollout_session(dir.path());
+
+        let first = guard_trace_turn(&mut session, "call-1");
+        assert!(!is_silent_signal(&first), "turn 1 is guarded: {first:?}");
+
+        std::fs::remove_dir_all(dir.path().join("guards")).unwrap();
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n\
+             {\"guard\":\"02_push_guard\",\"decision\":\"block\",\"reason\":\"jj git push\"}\n",
+        )
+        .unwrap();
+
+        let second = guard_trace_turn(&mut session, "call-2");
+        assert!(
+            is_silent_signal(&second),
+            "the broken chain must be reported: {second:?}"
+        );
+        let trace_summary = second
+            .iter()
+            .find_map(|event| match event {
+                WorkerEvent::Notification { message, .. } if message.starts_with(super::super::GUARD_TRACE_MARKER) => {
+                    Some(message.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the surviving guards' decisions must still be reported: {second:?}"));
+        assert!(
+            trace_summary.contains("jj git push"),
+            "the block a live guard recorded must reach the operator: {trace_summary}"
+        );
+    }
+
+    #[test]
+    fn a_broken_chain_is_reported_even_on_a_turn_that_ran_no_tool_call() {
+        // A broken chain is broken whether or not the model happened to call a
+        // tool, and reporting it early is what gives an operator a chance to
+        // act before the next command runs unguarded.
+        let dir = TempDir::new().unwrap();
+        armed_codex_home(dir.path());
+        let mut session = started_rollout_session(dir.path());
+        std::fs::remove_dir_all(dir.path().join("guards")).unwrap();
+
+        let events = session
+            .normalize_progress_events(&json!({"type":"event_msg","payload":{"type":"task_complete"}}))
+            .unwrap();
+        assert!(is_silent_signal(&events), "got {events:?}");
+    }
+
+    #[test]
+    fn a_reader_with_no_codex_home_makes_no_claim_about_arming() {
+        // Fixtures and the stateless path have no run-private CODEX_HOME. They
+        // must not manufacture a guardrail alarm out of that absence.
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-guards","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        let events = guard_trace_turn(&mut session, "call-1");
+        assert!(!is_silent_signal(&events), "got {events:?}");
     }
 
     #[test]
