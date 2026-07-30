@@ -444,7 +444,11 @@ fn load_persisted_pause_reason(work_db: &WorkDb, key: &str, paused: bool) -> Opt
     if !paused {
         return None;
     }
-    let stored = work_db.get_metadata(key).ok().flatten().filter(|v| !v.is_empty());
+    let stored = work_db
+        .get_metadata(key)
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
     Some(stored.unwrap_or_else(|| LEGACY_PAUSE_REASON_FALLBACK.to_owned()))
 }
 

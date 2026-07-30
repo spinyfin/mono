@@ -1839,8 +1839,8 @@ pub struct ExecutionCoordinator {
     /// `drain_ready_queue`'s pause gate — `true` when the pause originated
     /// from [`DispatchPauseOrigin::Operator`], `false` for
     /// [`DispatchPauseOrigin::Breaker`]. Only meaningful while
-    /// `dispatch_paused` is `true`; set on every `set_dispatch_paused(true, …)`
-    /// call and otherwise left at its last value.
+    /// `dispatch_paused` is `true`; set on every `pause_dispatch` call and
+    /// otherwise left at its last value.
     #[builder(default)]
     dispatch_pause_exempts_reviews: AtomicBool,
     /// Why dispatch is currently paused. `None` whenever `dispatch_paused`

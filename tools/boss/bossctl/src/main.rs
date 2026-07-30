@@ -1241,7 +1241,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 pause::unified_state(&cli.socket_path, cli.json).await
             } else {
                 let targets = pause::pause_arg_targets(&systems);
-                let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+                let reason = pause::operator_pause_reason(reason);
                 pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason)).await
             }
         }
@@ -1257,7 +1257,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Dispatch {
             action: DispatchAction::Pause { reason },
         } => {
-            let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+            let reason = pause::operator_pause_reason(reason);
             pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await
         }
         Command::Dispatch {
@@ -1281,7 +1281,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Automation {
             action: AutomationAction::Pause { reason },
         } => {
-            let reason = reason.unwrap_or_else(|| pause::DEFAULT_OPERATOR_PAUSE_REASON.to_owned());
+            let reason = pause::operator_pause_reason(reason);
             pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await
         }
         Command::Automation {

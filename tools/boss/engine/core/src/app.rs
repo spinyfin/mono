@@ -1318,11 +1318,15 @@ impl ServerState {
         if dispatch_paused {
             // `load_dispatch_paused_state` already substitutes
             // `LEGACY_PAUSE_REASON_FALLBACK` when `dispatch_paused` is
-            // `true` but no reason was persisted, so this is always
-            // `Some` and always non-empty here.
+            // `true` but no reason was persisted. A garbage persisted value
+            // (e.g. whitespace-only, from a future writer bug) still falls
+            // back here rather than aborting engine startup.
             let reason = dispatch_paused_reason
                 .and_then(|r| boss_protocol::PauseReason::new(r).ok())
-                .expect("load_dispatch_paused_state guarantees a non-empty reason while paused");
+                .unwrap_or_else(|| {
+                    boss_protocol::PauseReason::new(handler_helpers::LEGACY_PAUSE_REASON_FALLBACK)
+                        .expect("LEGACY_PAUSE_REASON_FALLBACK is a non-empty literal")
+                });
             server_state
                 .execution_coordinator
                 .pause_dispatch(dispatch_paused_since, dispatch_pause_origin, reason);
@@ -1343,9 +1347,15 @@ impl ServerState {
         let (automation_paused, automation_paused_since, automation_paused_reason) =
             load_automation_paused_state(&server_state.work_db);
         if automation_paused {
+            // Same graceful-fallback rationale as the dispatch-pause restore
+            // above: a garbage persisted reason must not abort engine
+            // startup.
             let reason = automation_paused_reason
                 .and_then(|r| boss_protocol::PauseReason::new(r).ok())
-                .expect("load_automation_paused_state guarantees a non-empty reason while paused");
+                .unwrap_or_else(|| {
+                    boss_protocol::PauseReason::new(handler_helpers::LEGACY_PAUSE_REASON_FALLBACK)
+                        .expect("LEGACY_PAUSE_REASON_FALLBACK is a non-empty literal")
+                });
             server_state
                 .execution_coordinator
                 .pause_automation(automation_paused_since, reason);

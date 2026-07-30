@@ -334,3 +334,13 @@ fn points_per_hour_refuses_a_span_shorter_than_a_minute() {
 fn points_per_hour_handles_zero_spend_over_a_real_span() {
     assert_eq!(points_per_hour(0, 3_600_000), Some(0.0));
 }
+
+#[test]
+fn operator_pause_reason_falls_back_to_the_client_side_default_when_omitted() {
+    assert_eq!(pause::operator_pause_reason(None), pause::DEFAULT_OPERATOR_PAUSE_REASON);
+}
+
+#[test]
+fn operator_pause_reason_passes_through_an_explicit_reason() {
+    assert_eq!(pause::operator_pause_reason(Some("disk full".to_owned())), "disk full");
+}

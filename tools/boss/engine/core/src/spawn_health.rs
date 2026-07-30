@@ -680,6 +680,9 @@ pub async fn trip_spawn_capability_circuit(
         now_epoch_secs,
     } = trip;
     let breaker_enabled = spawn_health.breaker_enabled();
+    let window_secs = SPAWN_HEALTH_WINDOW_SECS;
+    let threshold = SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD;
+    let rule = format!("{threshold} distinct work items failed to spawn a worker shell within {window_secs}s");
 
     if breaker_enabled {
         if coordinator.is_dispatch_paused() && !coordinator.dispatch_pause_exempts_reviews() {
@@ -692,15 +695,11 @@ pub async fn trip_spawn_capability_circuit(
         let now_u64 = now_epoch_secs.max(0) as u64;
         // The breaker is a programmatic pauser — it must supply its own
         // specific reason describing what tripped, never a generic
-        // fallback (see the incident this row exists to prevent: dispatch
-        // found paused with no record of why). `distinct_work_items` and
-        // `SPAWN_HEALTH_WINDOW_SECS` are the exact threshold/window that
-        // fired; `tripping_execution_id`/`tripping_work_item_id` are the
-        // straw that broke it.
+        // fallback — dispatch must never be found paused with no record
+        // of what paused it or why. `tripping_execution_id`/
+        // `tripping_work_item_id` are the straw that broke it.
         let reason_text = format!(
-            "spawn-capability circuit breaker tripped: {distinct_work_items} distinct work items \
-             failed to start a worker shell within {SPAWN_HEALTH_WINDOW_SECS}s (threshold \
-             {SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD}), most recently execution \
+            "spawn-capability circuit breaker tripped: {rule}; most recently execution \
              {tripping_execution_id} (work item {tripping_work_item_id})",
         );
         let reason = boss_protocol::PauseReason::new(reason_text).expect("format! output is never empty");
@@ -735,7 +734,6 @@ pub async fn trip_spawn_capability_circuit(
         return;
     }
 
-    let window_secs = SPAWN_HEALTH_WINDOW_SECS;
     if breaker_enabled {
         tracing::error!(
             distinct_work_items,
@@ -812,8 +810,6 @@ pub async fn trip_spawn_capability_circuit(
     // separately grepping `spawn_nack` / `spawn_ack_timeout` events out of
     // the stream by hand.
     let triggering_events = spawn_health.evidence_in_window(now_epoch_secs);
-    let threshold = SPAWN_HEALTH_DISTINCT_WORK_ITEM_THRESHOLD;
-    let rule = format!("{threshold} distinct work items failed to spawn a worker shell within {window_secs}s");
 
     dispatch_events
         .emit(
@@ -1535,6 +1531,87 @@ mod tests {
         let unhealthy = &events[0];
         assert_eq!(unhealthy.details["breaker_enabled"], serde_json::json!(true));
         assert_eq!(unhealthy.details["dispatch_paused"], serde_json::json!(true));
+
+        let reason = coordinator
+            .dispatch_paused_reason()
+            .expect("breaker trip must record its own reason");
+        assert!(
+            reason.contains("spawn-capability circuit breaker tripped"),
+            "reason should name the breaker, got: {reason}",
+        );
+        assert_eq!(
+            db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON).unwrap().as_deref(),
+            Some(reason.as_str()),
+            "the persisted metadata must match the in-memory reason",
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_breaker_recovery_clears_the_reason_and_a_later_trip_gets_a_fresh_one() {
+        let (_dir, db) = open_db_arc();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution = create_ready_chore_execution(&db, &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+
+        let spawn_health = SpawnHealthTracker::with_config(3, 300).with_breaker_enabled(true);
+        let sink = RecordingDispatchEventSink::new();
+
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &execution.id,
+                tripping_work_item_id: &work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 1000,
+            },
+        )
+        .await;
+        let first_reason = coordinator.dispatch_paused_reason().expect("trip records a reason");
+
+        let resumed =
+            resume_dispatch_after_breaker_recovery(&db, &coordinator, &sink, Some(&execution.id), "test recovery")
+                .await;
+        assert!(resumed, "recovery resumes a breaker-originated pause");
+        assert!(
+            coordinator.dispatch_paused_reason().is_none(),
+            "resume must clear the stored reason so a later pause can't inherit it",
+        );
+        assert_eq!(
+            db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_REASON).unwrap().as_deref(),
+            Some(""),
+            "the persisted reason metadata is cleared too",
+        );
+
+        let second_work_item_id = create_active_chore(&db, &product_id, "second test chore");
+        let second_execution = create_ready_chore_execution(&db, &second_work_item_id);
+        trip_spawn_capability_circuit(
+            &db,
+            &coordinator,
+            &sink,
+            &spawn_health,
+            TripSignal {
+                tripping_execution_id: &second_execution.id,
+                tripping_work_item_id: &second_work_item_id,
+                distinct_work_items: 3,
+                now_epoch_secs: 2000,
+            },
+        )
+        .await;
+        let second_reason = coordinator
+            .dispatch_paused_reason()
+            .expect("second trip records a reason");
+        assert_ne!(
+            first_reason, second_reason,
+            "the new pause gets a reason describing the new trip, not the stale one",
+        );
+        assert!(
+            second_reason.contains(&second_execution.id),
+            "the fresh reason names the execution that actually tripped it, got: {second_reason}",
+        );
     }
 
     // ─── evidence tracking (audit trail) ───────────────────────────────────

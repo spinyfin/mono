@@ -535,6 +535,16 @@ pub struct TruncationInfo {
 /// `Option<String>` specifically so a pause can never be entered without
 /// one: see the incident this exists to prevent, where dispatch was found
 /// paused with no record of who paused it or why.
+///
+/// The wire protocol (`FrontendRequest::SetDispatchPaused`/
+/// `SetAutomationPaused`, and the `*StateResult` events) deliberately keeps
+/// this as a bare `Option<String>` rather than `Option<PauseReason>`: the
+/// handler validates it explicitly and replies with
+/// [`crate::FrontendEvent::WorkError`] on an empty/whitespace reason, which
+/// gives a normal application-level error a client can display, instead of
+/// a frame-level deserialization failure. `Serialize`/`Deserialize` are
+/// still derived here so the type can be used directly wherever an
+/// internal (non-wire) API wants the same enforced-non-empty guarantee.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct PauseReason(String);

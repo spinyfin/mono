@@ -19,6 +19,12 @@ use super::{PauseArg, PauseSystem, connect, resolve_state_root};
 /// [`FrontendRequest::SetDispatchPaused`].
 pub(super) const DEFAULT_OPERATOR_PAUSE_REASON: &str = "the operator asked me to";
 
+/// Fills in [`DEFAULT_OPERATOR_PAUSE_REASON`] when the operator omits
+/// `--reason` on a human pause verb; otherwise returns what they passed.
+pub(super) fn operator_pause_reason(reason: Option<String>) -> String {
+    reason.unwrap_or_else(|| DEFAULT_OPERATOR_PAUSE_REASON.to_owned())
+}
+
 /// Current dispatch-pause state as returned by
 /// [`FrontendRequest::SetDispatchPaused`] / [`FrontendRequest::GetDispatchState`].
 pub(super) struct DispatchPauseState {
