@@ -373,6 +373,25 @@ pub enum EngineToAppError {
     /// Engine-side timeout. Synthesised by the engine.
     #[error("engine→app request timed out")]
     Timeout,
+    /// The app measured a **host environment** condition that makes worker
+    /// -pane creation impossible right now, and rejected the spawn before
+    /// allocating a slot or creating any session.
+    ///
+    /// Today the only such condition is "no active display": libghostty's
+    /// renderer builds its frame clock with
+    /// `CVDisplayLinkCreateWithCGDisplays`, and CoreVideo returns
+    /// `kCVReturnInvalidArgument` (-6661) for a display count of 0 —
+    /// measured, see `SpawnCapability` app-side — so `ghostty_surface_new`
+    /// cannot succeed no matter which work item is being dispatched.
+    ///
+    /// Semantically this is **not** a failure of the execution: nothing was
+    /// consumed, no shell was started, no workspace was touched. The engine
+    /// must return the execution to the queue re-dispatchable and stop
+    /// dispatching until the condition clears, rather than terminalizing the
+    /// row. Distinct from [`Self::Internal`] precisely so that a genuine
+    /// app-side bug still fails loudly instead of being silently requeued.
+    #[error("host environment cannot host a worker pane: {reason}")]
+    HostEnvironmentUnavailable { reason: String },
     /// App-side failure with detail.
     #[error("app internal error: {message}")]
     Internal { message: String },

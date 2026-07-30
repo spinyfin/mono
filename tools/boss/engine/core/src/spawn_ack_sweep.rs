@@ -507,12 +507,20 @@ pub(crate) enum ReapCause<'a> {
     /// The periodic sweep found total silence past the grace window.
     SpawnAckTimeout { grace_secs: i64 },
     /// The app proactively reported the spawn failed (fast-fail NACK).
-    AppNack { reason: &'a str },
-    /// The app reported the worker pane died (`WorkerPaneDied`), but the
-    /// slot had never shown any proof of life — see [`slot_never_started`].
-    /// The pane never came up, so this is a never-started spawn wearing a
-    /// death report's clothing, and it is reaped as one.
-    PaneDiedBeforeStart { detail: &'a str },
+    /// `environmental` is the app's **measured** verdict that the host
+    /// itself could not have hosted any pane (no active display). It flips
+    /// this reap from "terminalize the execution" to "return it to the
+    /// queue" — see [`WorkDb::requeue_execution_after_environmental_failure`]
+    /// for why a host condition must not spend the work item's churn budget.
+    /// Never inferred engine-side: an unclassified NACK stays a hard
+    /// failure, because silently requeueing a cause we cannot name is how a
+    /// real defect turns into an infinite retry.
+    AppNack { reason: &'a str, environmental: bool },
++    /// The app reported the worker pane died (`WorkerPaneDied`), but the
++    /// slot had never shown any proof of life — see [`slot_never_started`].
++    /// The pane never came up, so this is a never-started spawn wearing a
++    /// death report's clothing, and it is reaped as one.
++    PaneDiedBeforeStart { detail: &'a str },
     /// A pane came up — possibly with a live shell pid — but no
     /// driver-originated signal ever arrived, so the driver binary never
     /// executed. Unlike the two above, this one also raises a
@@ -545,7 +553,10 @@ fn reap_narrative(cause: &ReapCause<'_>, execution_id: &str) -> (String, String,
             ),
             Stage::SpawnAckTimeout,
         ),
-        ReapCause::AppNack { reason } => (
+        ReapCause::AppNack {
+            reason,
+            environmental: false,
+        } => (
             format!("app reported spawn failure (no shell): {reason}"),
             format!(
                 "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
@@ -563,6 +574,18 @@ fn reap_narrative(cause: &ReapCause<'_>, execution_id: &str) -> (String, String,
                  for redispatch."
             ),
             Stage::PaneDeathBeforeStart,
+        ),
+        ReapCause::AppNack {
+            reason,
+            environmental: true,
+        } => (
+            format!("host environment cannot host a worker pane (no shell): {reason}"),
+            format!(
+                "worker-pane spawn deferred for a host-environment reason (exec {execution_id}): {reason}; \
+                 execution returned to the queue re-dispatchable — this is NOT a failure of this work item \
+                 and is not counted against its churn budget."
+            ),
+            Stage::SpawnNack,
         ),
         ReapCause::DriverStartTimeout {
             grace_secs,
@@ -611,11 +634,34 @@ pub(crate) async fn reap_never_started_spawn(
 
     let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id);
 
-    if let Err(err) = ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason) {
+    // An environmental cause reaches the same teardown (the slot, pane and
+    // cube lease must be freed either way) but a different *record*: the
+    // execution goes back to `ready` instead of terminal, so the work item
+    // survives the host's bad weather. Everything below this branch is
+    // identical for both, which is deliberate — the resource cleanup was
+    // never the bug.
+    let environmental = matches!(
+        cause,
+        ReapCause::AppNack {
+            environmental: true,
+            ..
+        }
+    );
+    let record_result = if environmental {
+        ctx.work_db
+            .requeue_execution_after_environmental_failure(execution_id, &orphan_reason)
+            .map(|_| ())
+    } else {
+        ctx.work_db
+            .mark_execution_orphaned(execution_id, &orphan_reason)
+            .map(|_| ())
+    };
+    if let Err(err) = record_result {
         tracing::warn!(
             execution_id,
+            environmental,
             ?err,
-            "reap-never-started-spawn: failed to mark execution orphaned; skipping reap",
+            "reap-never-started-spawn: failed to record the spawn failure; skipping reap",
         );
         return false;
     }
@@ -704,8 +750,12 @@ pub(crate) async fn reap_never_started_spawn(
         ReapCause::SpawnAckTimeout { grace_secs } => {
             details["threshold_secs"] = serde_json::json!(grace_secs);
         }
-        ReapCause::AppNack { reason } => {
+        ReapCause::AppNack { reason, environmental } => {
             details["reason"] = serde_json::json!(reason);
+            // The field a future incident greps to tell "we deferred this
+            // safely" from "we burned it".
+            details["environmental"] = serde_json::json!(environmental);
+            details["deferred"] = serde_json::json!(environmental);
         }
         ReapCause::PaneDiedBeforeStart { detail } => {
             details["detail"] = serde_json::json!(detail);
@@ -1465,6 +1515,167 @@ mod tests {
         );
     }
 
+    /// **The work-destruction regression.** An environmental NACK must free
+    /// the resources exactly like any other reap, but must NOT terminalize
+    /// the execution — because a terminal row is what the orphan sweep's
+    /// churn guard counts, and three of them park the work item as if the
+    /// *work* were broken.
+    ///
+    /// Asserts the row state before and after, and — the load-bearing part —
+    /// that the churn-guard query that parked the incident's work items
+    /// still counts zero.
+    #[tokio::test]
+    async fn environmental_nack_requeues_instead_of_burning_the_work_item() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let execution = db.get_execution(&execution_id).unwrap();
+
+        // BEFORE: live, non-terminal, nothing counted against the work item.
+        assert!(!execution.status.is_terminal(), "precondition: execution is live");
+        assert_eq!(
+            db.count_recent_terminal_executions(&work_item_id, 0, None).unwrap(),
+            0,
+            "precondition: no terminal executions counted yet",
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let spawn_health = SpawnHealthTracker::new();
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let ctx = SpawnReapCtx::builder()
+            .work_db(db.as_ref())
+            .coordinator(coordinator.clone())
+            .dispatch_events(sink.as_ref())
+            .reaper(reaper.as_ref())
+            .spawn_health(&spawn_health)
+            .cube_client(&NoopCube)
+            .build();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let reason = "no active display, so libghostty cannot create a worker-pane surface";
+        let reaped = reap_never_started_spawn(
+            &ctx,
+            &execution,
+            1,
+            0,
+            ReapCause::AppNack {
+                reason,
+                environmental: true,
+            },
+            now,
+        )
+        .await;
+        assert!(reaped);
+
+        // AFTER: back in the queue, re-dispatchable, and invisible to the
+        // churn guard. This is the whole fix.
+        let after = db.get_execution(&execution_id).unwrap();
+        assert_eq!(
+            after.status,
+            ExecutionStatus::Ready,
+            "an environmental spawn failure must return the execution to the queue, not burn it",
+        );
+        assert!(!after.status.is_terminal());
+        assert_eq!(
+            db.count_recent_terminal_executions(&work_item_id, 0, None).unwrap(),
+            0,
+            "an environmental failure must not spend the work item's churn budget — three of \
+             these is what parked the incident's work items",
+        );
+        // The lease columns are cleared because this path force-releases the
+        // lease; a stale pointer would send the redispatch at a workspace
+        // this execution no longer holds.
+        assert!(after.cube_lease_id.is_none());
+        assert!(after.workspace_path.is_none());
+
+        // Resource cleanup is unchanged — the reap was never the bug.
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the pool slot must still be released",
+        );
+        assert_eq!(reaper.reaped().len(), 1, "the pane must still be torn down");
+
+        let events = sink.events().await;
+        let nack: Vec<_> = events.iter().filter(|e| e.stage == "spawn_nack").collect();
+        assert_eq!(nack.len(), 1);
+        assert_eq!(
+            nack[0].details["environmental"],
+            serde_json::json!(true),
+            "the event must record that this was deferred, not burned",
+        );
+    }
+
+    /// Three environmental failures against three distinct work items — the
+    /// exact shape of the incident — must leave all three re-dispatchable.
+    /// Under the old behaviour each one wrote a terminal row, and the third
+    /// tripped the churn guard that parked them.
+    #[tokio::test]
+    async fn three_environmental_failures_leave_every_work_item_redispatchable() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 3);
+        let spawn_health = SpawnHealthTracker::new();
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+
+        let mut rows = Vec::new();
+        for i in 0..3 {
+            let work_item_id = create_active_chore(&db, &product_id, &format!("chore {i}"));
+            let execution_id = create_old_execution(&db, &work_item_id);
+            rows.push((work_item_id, execution_id));
+        }
+
+        for (slot, (_, execution_id)) in rows.iter().enumerate() {
+            let execution = db.get_execution(execution_id).unwrap();
+            coordinator.worker_pool().claim_worker(execution_id, None).await;
+            let ctx = SpawnReapCtx::builder()
+                .work_db(db.as_ref())
+                .coordinator(coordinator.clone())
+                .dispatch_events(sink.as_ref())
+                .reaper(reaper.as_ref())
+                .spawn_health(&spawn_health)
+                .cube_client(&NoopCube)
+                .build();
+            reap_never_started_spawn(
+                &ctx,
+                &execution,
+                slot as u8 + 1,
+                0,
+                ReapCause::AppNack {
+                    reason: "no active display",
+                    environmental: true,
+                },
+                now,
+            )
+            .await;
+        }
+
+        for (work_item_id, execution_id) in &rows {
+            assert_eq!(
+                db.get_execution(execution_id).unwrap().status,
+                ExecutionStatus::Ready,
+                "work item {work_item_id} must still be re-dispatchable",
+            );
+            assert!(
+                db.count_recent_terminal_executions(work_item_id, 0, None).unwrap()
+                    < crate::work::ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD,
+                "work item {work_item_id} must stay below the churn guard that parked the \
+                 incident's rows",
+            );
+        }
+    }
+
     /// The fast-fail NACK path: `reap_never_started_spawn` with the `AppNack`
     /// cause (what `handle_report_worker_spawn_failed` calls) reaps the
     /// execution immediately, orphans it, releases the slot, and emits a
@@ -1496,7 +1707,18 @@ mod tests {
             .build();
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let reason = "ghostty_surface_new returned NULL (no active display)";
-        let reaped = reap_never_started_spawn(&ctx, &execution, 1, 0, ReapCause::AppNack { reason }, now).await;
+        let reaped = reap_never_started_spawn(
+            &ctx,
+            &execution,
+            1,
+            0,
+            ReapCause::AppNack {
+                reason,
+                environmental: false,
+            },
+            now,
+        )
+        .await;
 
         assert!(reaped, "app NACK must reap the never-started spawn");
         assert_eq!(

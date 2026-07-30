@@ -1335,6 +1335,15 @@ pub async fn serve_with_merge_probe(
     // false-live incident, where such a slot instead sat at
     // `activity=waiting_for_input, shell_pid=0` forever and had to be
     // noticed and manually reaped. Runs every 60s and fires on boot.
+    // Let every dispatch pause/resume — whatever its origin — push a fresh
+    // health snapshot to connected frontends. Registered here because it is
+    // the first point at which `ServerState` exists as an `Arc`; stored
+    // weakly inside the coordinator so this does not create a reference
+    // cycle with `server_state.execution_coordinator`.
+    server_state.execution_coordinator.set_health_notifier(Arc::downgrade(
+        &(server_state.clone() as Arc<dyn crate::coordinator::EngineHealthNotifier>),
+    ));
+
     let _spawn_ack_sweep_handle = crate::spawn_ack_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
