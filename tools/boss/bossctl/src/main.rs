@@ -30,6 +30,7 @@ mod logs;
 mod pause;
 mod probe;
 mod review;
+mod stream_integrity;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
@@ -1097,7 +1098,11 @@ fn main() -> ExitCode {
         }
     };
     match runtime.block_on(dispatch(cli)) {
-        Ok(()) => ExitCode::SUCCESS,
+        // Not unconditionally SUCCESS: a verb that read a dispatch stream from
+        // which records were lost produced a usable report over incomplete
+        // evidence, and an automated caller that only checks the exit status
+        // must be able to tell. See `stream_integrity::EXIT_UNRECOVERED_RECORDS`.
+        Ok(()) => stream_integrity::exit_code(),
         Err(err) => {
             eprintln!("bossctl: {err:#}");
             ExitCode::from(1)
@@ -1449,16 +1454,27 @@ fn dispatch_tail(
     outcome_filter: Option<String>,
 ) -> Result<()> {
     let root = resolve_state_root(state_root)?;
-    let events = dispatch_reader::read_current(&root)?;
+    let read = dispatch_reader::read_current(&root)?;
+    let integrity = stream_integrity::IntegrityReport::new(read.damage);
+    let events = read.events;
     let slice = filter_and_tail(&events, n, stage_filter.as_deref(), outcome_filter.as_deref());
 
     if json {
-        println!("{}", build_tail_json(slice));
-    } else if slice.is_empty() {
-        println!("no dispatch events");
+        println!(
+            "{}",
+            serde_json::json!({
+                "events": build_tail_json(slice),
+                "stream_integrity": integrity.to_json(),
+            })
+        );
     } else {
-        for event in slice {
-            print_dispatch_event_short(event);
+        integrity.print_notice();
+        if slice.is_empty() {
+            println!("no dispatch events");
+        } else {
+            for event in slice {
+                print_dispatch_event_short(event);
+            }
         }
     }
     Ok(())
@@ -1481,7 +1497,11 @@ fn dispatch_ghost_active(
     let root = resolve_state_root(state_root)?;
     let now = now_epoch_ms();
     let threshold_ms = (stalled_after_secs as u128).saturating_mul(1000);
-    let mut entries = dispatch_reader::ghost_active(&root, now, threshold_ms)?;
+    let report = dispatch_reader::ghost_active(&root, now, threshold_ms)?;
+    // Every entry here is an absence claim ("never reached a terminal stage"),
+    // so the integrity of the mirrors it was derived from is part of the answer.
+    let integrity = stream_integrity::IntegrityReport::new(report.damage);
+    let mut entries = report.entries;
     if include_stalled {
         entries.retain(|e| e.stalled);
     }
@@ -1491,9 +1511,13 @@ fn dispatch_ghost_active(
             "{}",
             serde_json::json!({
                 "ghost_active": entries,
+                "stream_integrity": integrity.to_json(),
             })
         );
-    } else if entries.is_empty() {
+        return Ok(());
+    }
+    integrity.print_notice();
+    if entries.is_empty() {
         println!("no ghost-active executions");
     } else {
         for entry in &entries {

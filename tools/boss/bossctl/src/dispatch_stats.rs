@@ -26,6 +26,9 @@ struct DispatchStatsOutput {
     report: DispatchWaitReport,
     queue_summary: Vec<PoolQueueSummary>,
     dispatched_last_15m: usize,
+    /// Integrity of the stream these numbers were computed over. See
+    /// [`crate::stream_integrity`].
+    stream_integrity: serde_json::Value,
 }
 
 /// Parse a `--since` value into an absolute epoch-ms cutoff. Accepts a
@@ -50,7 +53,12 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
     let root = resolve_state_root(state_root)?;
     let now = now_epoch_ms();
     let since_ms = since.map(|s| parse_since(s, now)).transpose()?;
-    let events = dispatch_reader::read_current(&root)?;
+    let read = dispatch_reader::read_current(&root)?;
+    // Wait stats are derived by *not* finding a `worker_claimed`/ok for a
+    // timeline, so an unreadable record can turn a dispatched execution into a
+    // phantom blocked one. Report the stream's integrity alongside the numbers.
+    let integrity = crate::stream_integrity::IntegrityReport::new(read.damage);
+    let events = read.events;
     let report = dispatch_reader::compute_wait_stats(&events, now, since_ms);
     let queue_summary = dispatch_reader::summarize_queue_by_pool(&report.blocked_now);
     let dispatched_last_15m = dispatch_reader::dispatches_in_window(&events, now, DISPATCH_RATE_WINDOW_MS);
@@ -60,11 +68,13 @@ pub(crate) fn dispatch_stats(json: bool, state_root: Option<PathBuf>, since: Opt
             report,
             queue_summary,
             dispatched_last_15m,
+            stream_integrity: integrity.to_json(),
         };
         println!("{}", serde_json::to_string(&output)?);
         return Ok(());
     }
 
+    integrity.print_notice();
     println!("queue summary (per pool):");
     if queue_summary.is_empty() {
         println!("  nothing queued");

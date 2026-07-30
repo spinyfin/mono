@@ -14,6 +14,7 @@ rust_binary(
         "src/pause.rs",
         "src/probe.rs",
         "src/review.rs",
+        "src/stream_integrity.rs",
         "src/tests.rs",
     ],
     compile_data = [

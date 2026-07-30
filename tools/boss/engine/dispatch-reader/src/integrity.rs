@@ -1,0 +1,478 @@
+//! Accounting for dispatch-JSONL lines that are not exactly one record.
+//!
+//! Every reader of the dispatch stream used to handle a line that failed to
+//! parse the same way: print a warning to stderr and move on. That is wrong in
+//! two independent ways, and this module exists to fix both.
+//!
+//! **The events were usually still there.** The writer's historical defect
+//! (fixed in `boss_engine_jsonl_append` — see that crate's docs) issued a
+//! record's body and its trailing newline as two separate `write()` calls.
+//! `O_APPEND` makes each individual write atomic but not the pair, so two
+//! interleaved appenders produced `bodyA` `bodyB` `\n` `\n` on disk: ONE line
+//! holding two complete records, followed by a blank line. A JSON parser reads
+//! that as `trailing characters at line 1 column <len(bodyA)+1>` — which is
+//! exactly the error, and exactly the column distribution (clustered at
+//! whole-record lengths, never mid-token), observed in production. Both
+//! records are fully present; dropping the line discarded recoverable events.
+//! [`salvage_damaged_line`] recovers them.
+//!
+//! **A warning is not an accounting.** A diagnostic tool whose whole purpose
+//! is to answer "why did nothing happen here" cannot treat "some records in
+//! this file were unreadable" as a side note: an absence in the timeline is
+//! its primary evidence, and unreadable records make absence unprovable. So
+//! every line that was not exactly one clean record is reported as a
+//! structured [`DamagedLine`] — carrying where it was, how big it was, how
+//! much was recovered, how much is genuinely gone, and the timestamps of the
+//! records either side of it, so a caller can say which part of a timeline is
+//! untrustworthy rather than which stderr line scrolled past.
+
+use std::path::{Path, PathBuf};
+
+use boss_dispatch_events::DispatchEvent;
+use serde::Serialize;
+
+/// Longest excerpt of unrecoverable bytes carried on a [`DamagedLine`].
+/// Enough to recognise the shape of what was lost without reproducing a whole
+/// record's `details` payload in a report.
+pub const LOST_EXCERPT_MAX_BYTES: usize = 120;
+
+/// Cap on resync attempts within one damaged line. A line whose bytes defeat
+/// this many restarts is reported as unrecoverable rather than scanned
+/// quadratically; in the dominant real case (whole records concatenated) the
+/// first attempt consumes the entire line.
+const MAX_RESYNC_ATTEMPTS: usize = 64;
+
+/// What a damaged line turned out to be, once salvage had run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DamageShape {
+    /// Two or more complete records on one line, every byte accounted for.
+    /// The historical two-write interleave produces exactly this. No event is
+    /// lost — but the line is still reported, because a stream that can
+    /// interleave is a stream whose completeness must be stated, not assumed.
+    Concatenated,
+    /// Some records recovered; some bytes could not be turned into a record.
+    PartiallyRecovered,
+    /// Nothing on the line parsed as a record. This is the only shape that
+    /// means events are definitively missing from the timeline.
+    Unrecoverable,
+}
+
+impl DamageShape {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Concatenated => "concatenated",
+            Self::PartiallyRecovered => "partially_recovered",
+            Self::Unrecoverable => "unrecoverable",
+        }
+    }
+
+    /// True when at least one record on this line is gone for good.
+    pub fn lost_records(self) -> bool {
+        matches!(self, Self::PartiallyRecovered | Self::Unrecoverable)
+    }
+}
+
+/// One JSONL line that did not parse as exactly one dispatch record.
+///
+/// `prev_ts_epoch_ms` / `next_ts_epoch_ms` bracket the damage in time, taken
+/// from the records parsed immediately before and after this line in the same
+/// file. They are what lets a caller decide whether damage is relevant to a
+/// particular conclusion: a timeline claim about a window that does not
+/// overlap `[prev, next]` is unaffected by this line, and one that does
+/// overlap it cannot be stated as fact. `None` means the damage sits at the
+/// start (or end) of the file with no neighbouring record to anchor it, which
+/// is the *least* bounded case, not the most benign — treat it as overlapping
+/// everything.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, bon::Builder)]
+#[builder(on(String, into))]
+pub struct DamagedLine {
+    pub path: PathBuf,
+    /// 1-based line number, matching what an editor or `sed -n Np` shows.
+    pub line_number: u64,
+    pub byte_len: usize,
+    /// Records salvaged from this line.
+    pub recovered: usize,
+    /// Bytes on this line that no resync could turn into a record.
+    pub lost_bytes: usize,
+    /// Control-stripped, clipped sample of those bytes.
+    pub lost_excerpt: String,
+    pub shape: DamageShape,
+    pub prev_ts_epoch_ms: Option<u128>,
+    pub next_ts_epoch_ms: Option<u128>,
+}
+
+impl DamagedLine {
+    /// True when this damage could hide an event at `ts`. Unbracketed damage
+    /// (no neighbouring record on one side) covers everything on that side —
+    /// deliberately conservative: over-qualifying a conclusion costs an
+    /// operator a sentence, under-qualifying one costs them the incident.
+    pub fn could_hide_ts(&self, ts: u128) -> bool {
+        self.prev_ts_epoch_ms.is_none_or(|prev| ts >= prev) && self.next_ts_epoch_ms.is_none_or(|next| ts <= next)
+    }
+
+    /// True when this damage overlaps the inclusive window `[from, to]`.
+    pub fn overlaps_window(&self, from: u128, to: u128) -> bool {
+        let start = self.prev_ts_epoch_ms.unwrap_or(0);
+        let end = self.next_ts_epoch_ms.unwrap_or(u128::MAX);
+        start <= to && from <= end
+    }
+}
+
+/// Events read from one or more dispatch-JSONL files, together with every line
+/// that could not be read cleanly.
+///
+/// Returning damage alongside events — rather than warning about it on stderr
+/// — is the whole point: a caller physically cannot render a timeline from
+/// this type without having been handed the reasons it might be incomplete.
+#[derive(Debug, Clone, Default)]
+pub struct StreamRead {
+    pub events: Vec<DispatchEvent>,
+    pub damage: Vec<DamagedLine>,
+}
+
+impl StreamRead {
+    /// Fold `other` in, keeping event order (callers read files
+    /// oldest-segment-first) and accumulating damage.
+    pub fn absorb(&mut self, other: StreamRead) {
+        self.events.extend(other.events);
+        self.damage.extend(other.damage);
+    }
+
+    /// True when every line in every file scanned was exactly one record.
+    pub fn is_intact(&self) -> bool {
+        self.damage.is_empty()
+    }
+
+    /// Damaged lines from which at least one record is definitively gone.
+    pub fn lines_with_lost_records(&self) -> impl Iterator<Item = &DamagedLine> {
+        self.damage.iter().filter(|d| d.shape.lost_records())
+    }
+
+    pub fn recovered_records(&self) -> usize {
+        self.damage.iter().map(|d| d.recovered).sum()
+    }
+
+    /// Discard the integrity report and keep only the events.
+    ///
+    /// Named to be unpleasant on purpose. It is correct for callers that are
+    /// not presenting evidence to a human — the engine's own stall sweeps,
+    /// which reduce a timeline to "has this stage moved recently" and re-run
+    /// every 15 seconds — and wrong for anything that prints a timeline.
+    pub fn into_events_ignoring_damage(self) -> Vec<DispatchEvent> {
+        self.events
+    }
+}
+
+/// Recovered records and unrecoverable remainder from one damaged line.
+#[derive(Debug, Clone, Default)]
+pub struct Salvage {
+    pub records: Vec<DispatchEvent>,
+    pub lost_bytes: usize,
+    pub lost_excerpt: String,
+}
+
+impl Salvage {
+    pub fn shape(&self) -> DamageShape {
+        match (self.records.len(), self.lost_bytes) {
+            (0, _) => DamageShape::Unrecoverable,
+            (_, 0) => DamageShape::Concatenated,
+            _ => DamageShape::PartiallyRecovered,
+        }
+    }
+}
+
+/// Pull every record salvageable from `line`, which is known not to parse as
+/// exactly one record.
+///
+/// Walks `line` with a streaming deserializer, which handles the dominant
+/// corruption shape (complete records concatenated) in a single pass. On a
+/// parse error it resyncs to the next plausible record start and tries again,
+/// so a truncated record followed by a whole one still yields the whole one.
+/// Every byte not consumed by a recovered record is counted in `lost_bytes` —
+/// salvage never quietly improves the accounting for itself.
+pub fn salvage_damaged_line(line: &str) -> Salvage {
+    let mut records = Vec::new();
+    let mut lost: Vec<&str> = Vec::new();
+    let mut cursor = 0usize;
+
+    for _ in 0..MAX_RESYNC_ATTEMPTS {
+        if cursor >= line.len() {
+            break;
+        }
+        let rest = &line[cursor..];
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<DispatchEvent>();
+        // Bytes of `rest` consumed by records that actually parsed. Advanced
+        // only on a successful yield, so an error leaves it pointing at the end
+        // of the last good record rather than wherever the parser gave up.
+        let mut consumed = 0usize;
+        let mut failed = false;
+        loop {
+            match stream.next() {
+                Some(Ok(record)) => {
+                    records.push(record);
+                    consumed = stream.byte_offset();
+                }
+                Some(Err(_)) => {
+                    failed = true;
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        let stopped_at = cursor + consumed;
+        if !failed {
+            // The stream ended cleanly. Anything after the last record is
+            // trailing whitespace (harmless) or bytes serde skipped over.
+            let tail = &line[stopped_at..];
+            if !tail.trim().is_empty() {
+                lost.push(tail);
+            }
+            cursor = line.len();
+            break;
+        }
+
+        // Resync: give up on the bytes from the last good record to the next
+        // plausible record start, and restart the stream there.
+        match next_record_start(line, stopped_at) {
+            Some(next) => {
+                lost.push(&line[stopped_at..next]);
+                cursor = next;
+            }
+            None => {
+                lost.push(&line[stopped_at..]);
+                cursor = line.len();
+                break;
+            }
+        }
+    }
+
+    // Whatever the attempt cap left unexamined is lost too, by definition.
+    if cursor < line.len() {
+        lost.push(&line[cursor..]);
+    }
+
+    let lost_bytes = lost.iter().map(|span| span.trim().len()).sum();
+    Salvage {
+        records,
+        lost_bytes,
+        lost_excerpt: clip_excerpt(&lost),
+    }
+}
+
+/// First plausible start of a JSON object strictly after `from`.
+///
+/// "Plausible" is only `{` — deliberately weak, because a stricter anchor
+/// (say, `{"ts_epoch_ms"`) would silently stop recovering the moment the
+/// writer's field order changed. A `{` that turns out to be inside a truncated
+/// record's string literal simply costs one more failed attempt.
+fn next_record_start(line: &str, from: usize) -> Option<usize> {
+    let search_from = line[from..].char_indices().nth(1).map(|(offset, _)| from + offset)?;
+    line[search_from..].find('{').map(|offset| search_from + offset)
+}
+
+/// Join the unrecoverable spans into one clipped, control-free excerpt safe to
+/// print to a terminal.
+fn clip_excerpt(lost: &[&str]) -> String {
+    let mut out = String::new();
+    for span in lost {
+        let span = span.trim();
+        if span.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str(" … ");
+        }
+        for ch in span.chars() {
+            if out.len() >= LOST_EXCERPT_MAX_BYTES {
+                break;
+            }
+            out.push(if ch.is_control() { '·' } else { ch });
+        }
+        if out.len() >= LOST_EXCERPT_MAX_BYTES {
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+/// Build a [`DamagedLine`] for `line_number` in `path` from a [`Salvage`],
+/// bracketed by the records parsed either side of it.
+///
+/// `events` is the accumulating output for this file and `events_before` is its
+/// length as of just before this line was salvaged — which is all that is
+/// needed to find both neighbours: the record before the damage is the last one
+/// pushed before it, and the record after is the first one pushed after this
+/// line's own recovered records.
+pub(crate) fn damaged_line(
+    path: &Path,
+    line_number: u64,
+    byte_len: usize,
+    salvage: &Salvage,
+    events: &[DispatchEvent],
+    events_before: usize,
+) -> DamagedLine {
+    let prev_ts_epoch_ms = events_before
+        .checked_sub(1)
+        .and_then(|idx| events.get(idx))
+        .map(|event| event.ts_epoch_ms);
+    let next_ts_epoch_ms = events
+        .get(events_before + salvage.records.len())
+        .map(|event| event.ts_epoch_ms);
+    DamagedLine {
+        path: path.to_path_buf(),
+        line_number,
+        byte_len,
+        recovered: salvage.records.len(),
+        lost_bytes: salvage.lost_bytes,
+        lost_excerpt: salvage.lost_excerpt.clone(),
+        shape: salvage.shape(),
+        prev_ts_epoch_ms,
+        next_ts_epoch_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(ts: u128, stage: &str) -> String {
+        format!(
+            "{{\"ts_epoch_ms\":{ts},\"stage\":\"{stage}\",\"outcome\":\"ok\",\
+             \"execution_id\":\"exec-1\",\"work_item_id\":null,\"worker_id\":null,\
+             \"cube_repo_id\":null,\"cube_lease_id\":null,\"cube_workspace_id\":null,\
+             \"details\":null}}"
+        )
+    }
+
+    /// The production corruption shape: two complete records on one line. Both
+    /// must come back, and nothing may be reported lost.
+    #[test]
+    fn salvages_both_records_from_a_concatenated_line() {
+        let line = format!("{}{}", record(1, "request_recorded"), record(2, "worker_claimed"));
+        let salvage = salvage_damaged_line(&line);
+        assert_eq!(salvage.records.len(), 2);
+        assert_eq!(salvage.records[0].stage, "request_recorded");
+        assert_eq!(salvage.records[1].stage, "worker_claimed");
+        assert_eq!(salvage.lost_bytes, 0);
+        assert_eq!(salvage.shape(), DamageShape::Concatenated);
+    }
+
+    #[test]
+    fn salvages_three_concatenated_records() {
+        let line = format!(
+            "{}{}{}",
+            record(1, "request_recorded"),
+            record(2, "worker_claimed"),
+            record(3, "pane_spawned")
+        );
+        let salvage = salvage_damaged_line(&line);
+        assert_eq!(salvage.records.len(), 3);
+        assert_eq!(salvage.lost_bytes, 0);
+    }
+
+    /// A truncated record followed by a whole one: the whole one is recoverable
+    /// and must be recovered, and the truncated bytes must be reported lost
+    /// rather than rounded away by the recovery succeeding.
+    #[test]
+    fn recovers_the_whole_record_after_a_truncated_one() {
+        let whole = record(9, "pane_spawned");
+        let line = format!("{{\"ts_epoch_ms\":8,\"stage\":\"worker_cla{whole}");
+        let salvage = salvage_damaged_line(&line);
+        assert_eq!(salvage.records.len(), 1, "the intact trailing record must survive");
+        assert_eq!(salvage.records[0].ts_epoch_ms, 9);
+        assert!(salvage.lost_bytes > 0, "the truncated prefix must be counted as lost");
+        assert_eq!(salvage.shape(), DamageShape::PartiallyRecovered);
+    }
+
+    #[test]
+    fn reports_a_trailing_truncated_record_as_partially_recovered() {
+        let line = format!(
+            "{}{{\"ts_epoch_ms\":3,\"stage\":\"pane_spa",
+            record(2, "worker_claimed")
+        );
+        let salvage = salvage_damaged_line(&line);
+        assert_eq!(salvage.records.len(), 1);
+        assert!(salvage.lost_bytes > 0);
+        assert_eq!(salvage.shape(), DamageShape::PartiallyRecovered);
+    }
+
+    #[test]
+    fn reports_a_line_with_no_recoverable_record_as_unrecoverable() {
+        let salvage = salvage_damaged_line("not-json-at-all");
+        assert!(salvage.records.is_empty());
+        assert_eq!(salvage.shape(), DamageShape::Unrecoverable);
+        assert_eq!(salvage.lost_bytes, "not-json-at-all".len());
+    }
+
+    /// Well-formed JSON that is not a dispatch record must not be silently
+    /// accepted as one, and must be accounted as lost.
+    #[test]
+    fn a_json_object_that_is_not_a_dispatch_record_is_lost_not_recovered() {
+        let salvage = salvage_damaged_line("{\"unrelated\":true}{\"also\":1}");
+        assert!(salvage.records.is_empty());
+        assert_eq!(salvage.shape(), DamageShape::Unrecoverable);
+        assert!(salvage.lost_bytes > 0);
+    }
+
+    #[test]
+    fn lost_excerpt_is_clipped_and_control_free() {
+        let noisy = format!("\u{1}\u{2}{}", "q".repeat(400));
+        let salvage = salvage_damaged_line(&noisy);
+        assert!(salvage.lost_excerpt.len() <= LOST_EXCERPT_MAX_BYTES + 4);
+        assert!(!salvage.lost_excerpt.chars().any(char::is_control));
+        assert!(salvage.lost_excerpt.contains('·'), "control bytes are substituted");
+    }
+
+    /// Salvage must terminate on adversarial input rather than scanning
+    /// forever, and must still account for every byte.
+    #[test]
+    fn salvage_terminates_on_a_line_of_nothing_but_braces() {
+        let line = "{".repeat(500);
+        let salvage = salvage_damaged_line(&line);
+        assert!(salvage.records.is_empty());
+        assert_eq!(salvage.lost_bytes, line.len());
+    }
+
+    #[test]
+    fn could_hide_ts_treats_an_unbracketed_side_as_open() {
+        let mut damage = DamagedLine {
+            path: PathBuf::from("current.jsonl"),
+            line_number: 1,
+            byte_len: 10,
+            recovered: 0,
+            lost_bytes: 10,
+            lost_excerpt: String::new(),
+            shape: DamageShape::Unrecoverable,
+            prev_ts_epoch_ms: Some(100),
+            next_ts_epoch_ms: Some(200),
+        };
+        assert!(damage.could_hide_ts(150));
+        assert!(!damage.could_hide_ts(99));
+        assert!(!damage.could_hide_ts(201));
+
+        damage.next_ts_epoch_ms = None;
+        assert!(damage.could_hide_ts(u128::MAX), "no following record means open-ended");
+    }
+
+    #[test]
+    fn overlaps_window_is_inclusive_at_both_ends() {
+        let damage = DamagedLine {
+            path: PathBuf::from("current.jsonl"),
+            line_number: 1,
+            byte_len: 10,
+            recovered: 0,
+            lost_bytes: 10,
+            lost_excerpt: String::new(),
+            shape: DamageShape::Unrecoverable,
+            prev_ts_epoch_ms: Some(100),
+            next_ts_epoch_ms: Some(200),
+        };
+        assert!(damage.overlaps_window(200, 300));
+        assert!(damage.overlaps_window(0, 100));
+        assert!(!damage.overlaps_window(201, 300));
+        assert!(!damage.overlaps_window(0, 99));
+    }
+}

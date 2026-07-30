@@ -11,11 +11,20 @@
 //!
 //! All readers here are synchronous: the JSONL files are append-only
 //! and small enough to scan in one pass per call. Each `read_current` /
-//! `read_execution` returns a `Vec<DispatchEvent>` in the order they
-//! were appended (lines that fail to parse are skipped with a
-//! diagnostic on stderr — a half-written line at the tail of the
-//! file is the common failure mode and we'd rather show what we have
-//! than blow up).
+//! `read_execution` returns a [`StreamRead`] — the events in the order
+//! they were appended, **plus** a structured [`DamagedLine`] for every
+//! line that was not exactly one record.
+//!
+//! That pairing is load-bearing, not tidiness. These readers used to
+//! drop an unparseable line with a `warning:` on stderr and return
+//! events alone, which made every timeline they produced of unknown
+//! completeness while looking complete — and `bossctl dispatch
+//! diagnose`, whose primary evidence is the *absence* of an event,
+//! reads through here. Most such lines are also recoverable rather
+//! than lost (see [`integrity`] for the writer defect that produced
+//! them and why); they are now recovered. A caller that genuinely
+//! needs events only says so explicitly via
+//! [`StreamRead::into_events_ignoring_damage`].
 //!
 //! ## Two read paths, one definition of "stalled"
 //!
@@ -33,6 +42,7 @@
 //! available as the file-scan-only equivalents and are asserted to agree.
 
 mod index;
+pub mod integrity;
 mod timeline;
 
 use std::collections::BTreeMap;
@@ -48,6 +58,7 @@ use serde::Serialize;
 use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
 pub use index::{RefreshStats, SharedTimelineIndex, TimelineIndex};
+pub use integrity::{DamageShape, DamagedLine, StreamRead};
 pub use timeline::{StageThresholds, StalledStage, TimelineState, is_terminal_event};
 
 /// Default Boss state root used by the file-scan readers when the
@@ -74,46 +85,71 @@ pub fn execution_path(root: &Path, execution_id: &str) -> PathBuf {
 /// followed by the live `current.jsonl`. A missing file (rotated or live) is
 /// treated as "no events" so callers can run against a state root that
 /// hasn't been populated yet, or that has rotated segments only.
-pub fn read_current(root: &Path) -> Result<Vec<DispatchEvent>> {
-    let mut events = Vec::new();
+///
+/// The returned [`StreamRead`] carries every unreadable line alongside the
+/// events; see the module docs for why that is not optional.
+pub fn read_current(root: &Path) -> Result<StreamRead> {
+    let mut out = StreamRead::default();
     for path in boss_log_files::segments_with_live(&current_path(root)) {
-        events.extend(read_jsonl(&path)?);
+        out.absorb(read_jsonl(&path)?);
     }
-    Ok(events)
+    Ok(out)
 }
 
 /// Read every event in the per-execution mirror for `execution_id`.
 /// Missing file is treated as "no events".
-pub fn read_execution(root: &Path, execution_id: &str) -> Result<Vec<DispatchEvent>> {
+pub fn read_execution(root: &Path, execution_id: &str) -> Result<StreamRead> {
     read_jsonl(&execution_path(root, execution_id))
 }
 
-fn read_jsonl(path: &Path) -> Result<Vec<DispatchEvent>> {
+fn read_jsonl(path: &Path) -> Result<StreamRead> {
     match fs::File::open(path) {
-        Ok(file) => parse_lines(BufReader::new(file)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Ok(file) => parse_lines(path, BufReader::new(file)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(StreamRead::default()),
         Err(err) => Err(err).with_context(|| format!("opening {}", path.display())),
     }
 }
 
-fn parse_lines<R: BufRead>(reader: R) -> Result<Vec<DispatchEvent>> {
-    let mut out = Vec::new();
+/// Parse one dispatch-JSONL file, recovering what a damaged line still holds
+/// and recording what it does not.
+///
+/// A line that is exactly one record is the fast path and costs one
+/// `from_str`. Anything else goes through [`integrity::salvage_damaged_line`]
+/// and is reported — including the fully-recoverable concatenated case, so
+/// "this file interleaved" never reaches a caller as silence.
+fn parse_lines<R: BufRead>(path: &Path, reader: R) -> Result<StreamRead> {
+    let mut events: Vec<DispatchEvent> = Vec::new();
+    // Salvage results are recorded with the event index they were seen at, then
+    // resolved into time-bracketed `DamagedLine`s once the whole file is read —
+    // the record *after* the damage does not exist yet at the point the damage
+    // is found.
+    let mut pending: Vec<(u64, usize, usize, integrity::Salvage)> = Vec::new();
+
     for (idx, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("reading line {} from dispatch jsonl", idx + 1))?;
-        if line.trim().is_empty() {
+        let line_number = idx as u64 + 1;
+        let line = line.with_context(|| format!("reading line {line_number} from {}", path.display()))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<DispatchEvent>(&line) {
-            Ok(event) => out.push(event),
-            Err(err) => {
-                eprintln!(
-                    "warning: dropping unparseable dispatch event on line {}: {err}",
-                    idx + 1
-                );
+        match serde_json::from_str::<DispatchEvent>(trimmed) {
+            Ok(event) => events.push(event),
+            Err(_) => {
+                let events_before = events.len();
+                let salvage = integrity::salvage_damaged_line(trimmed);
+                events.extend(salvage.records.iter().cloned());
+                pending.push((line_number, trimmed.len(), events_before, salvage));
             }
         }
     }
-    Ok(out)
+
+    let damage = pending
+        .into_iter()
+        .map(|(line_number, byte_len, events_before, salvage)| {
+            integrity::damaged_line(path, line_number, byte_len, &salvage, &events, events_before)
+        })
+        .collect();
+    Ok(StreamRead { events, damage })
 }
 
 /// One entry in the `ghost-active` listing: an execution whose
@@ -139,6 +175,20 @@ pub struct GhostActiveEntry {
     pub stalled: bool,
 }
 
+/// A `ghost-active` listing plus the integrity of the mirrors it was derived
+/// from.
+///
+/// "This timeline never reached a terminal stage" is an absence claim, so the
+/// listing is only as trustworthy as the files behind it: an unreadable record
+/// in a mirror could be the very terminal event whose absence put an execution
+/// on this list. Callers must surface `damage` rather than print the entries
+/// as settled fact.
+#[derive(Debug, Clone, Default)]
+pub struct GhostActiveReport {
+    pub entries: Vec<GhostActiveEntry>,
+    pub damage: Vec<DamagedLine>,
+}
+
 /// Return every per-execution timeline that hasn't reached a
 /// terminal stage. `now_ms` is the wall-clock anchor used for
 /// `elapsed_since_last_ms`; `stalled_threshold_ms` flips the
@@ -149,8 +199,9 @@ pub struct GhostActiveEntry {
 /// execution_id directory. The `current.jsonl` could be used too,
 /// but the per-execution mirrors are cheaper to bucket and survive
 /// rotation of the flat stream (if we ever add that).
-pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Result<Vec<GhostActiveEntry>> {
-    let mut entries = for_each_timeline(root, |execution_id, events| {
+pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Result<GhostActiveReport> {
+    let mut damage = Vec::new();
+    let mut entries = for_each_timeline(root, &mut damage, |execution_id, events| {
         let last = events.last()?;
         if is_terminal_event(last) {
             return None;
@@ -167,19 +218,25 @@ pub fn ghost_active(root: &Path, now_ms: u128, stalled_threshold_ms: u128) -> Re
         })
     })?;
     entries.sort_by_key(|e| std::cmp::Reverse(e.elapsed_since_last_ms));
-    Ok(entries)
+    Ok(GhostActiveReport { entries, damage })
 }
 
 /// Walk every per-execution mirror under `root` and collect whatever `visit`
 /// returns for each timeline. Directories with no `dispatch.jsonl` (and
-/// non-directory entries) are skipped.
+/// non-directory entries) are skipped. Any unreadable line encountered on the
+/// walk is appended to `damage` — a sweep that reduces timelines to absence
+/// claims must be able to say which mirrors it could not read in full.
 ///
 /// Shared by all three file-scan sweeps so the walk, the missing-file
 /// handling, and the id-from-directory-name rule are defined once. Note that
 /// this is O(every execution ever dispatched) by construction — that is
 /// exactly why the engine's periodic detectors no longer come through here;
 /// see [`TimelineIndex`].
-fn for_each_timeline<T>(root: &Path, mut visit: impl FnMut(&str, &[DispatchEvent]) -> Option<T>) -> Result<Vec<T>> {
+fn for_each_timeline<T>(
+    root: &Path,
+    damage: &mut Vec<DamagedLine>,
+    mut visit: impl FnMut(&str, &[DispatchEvent]) -> Option<T>,
+) -> Result<Vec<T>> {
     let executions_dir = root.join("executions");
     let read_dir = match fs::read_dir(&executions_dir) {
         Ok(rd) => rd,
@@ -203,8 +260,9 @@ fn for_each_timeline<T>(root: &Path, mut visit: impl FnMut(&str, &[DispatchEvent
         if !dispatch_path.exists() {
             continue;
         }
-        let events = read_jsonl(&dispatch_path)?;
-        if let Some(item) = visit(execution_id, &events) {
+        let read = read_jsonl(&dispatch_path)?;
+        damage.extend(read.damage);
+        if let Some(item) = visit(execution_id, &read.events) {
             out.push(item);
         }
     }
@@ -517,7 +575,13 @@ fn percentile_ms(sorted_ascending: &[u128], pct: f64) -> u128 {
 /// [`TimelineIndex::pending_stalls`] instead, which answers the same question
 /// incrementally; the two are asserted to agree.
 pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -> Result<Vec<StalledStage>> {
-    for_each_timeline(root, |execution_id, events| {
+    // Damage is collected but not returned: this is the write-only
+    // `stage_stalled` telemetry path with no operator-facing report behind it,
+    // and it is asserted to agree with `TimelineIndex::pending_stalls`, whose
+    // own `RefreshStats::malformed_lines` is the surface where the engine
+    // already logs stream damage every pass.
+    let mut damage = Vec::new();
+    for_each_timeline(root, &mut damage, |execution_id, events| {
         TimelineState::from_events(events)?.stall_to_emit(execution_id, now_ms, thresholds)
     })
 }
@@ -542,7 +606,9 @@ pub fn pending_stalls(root: &Path, now_ms: u128, thresholds: &StageThresholds) -
 /// As with [`pending_stalls`], this is the file-scan-only form; the engine's
 /// escalation sweep uses [`TimelineIndex::persistently_stalled`].
 pub fn persistently_stalled(root: &Path, now_ms: u128, threshold_ms: u128) -> Result<Vec<StalledStage>> {
-    for_each_timeline(root, |execution_id, events| {
+    // See [`pending_stalls`] for why damage is not propagated from this path.
+    let mut damage = Vec::new();
+    for_each_timeline(root, &mut damage, |execution_id, events| {
         TimelineState::from_events(events)?.persistent_stall(execution_id, now_ms, threshold_ms)
     })
 }
@@ -660,7 +726,7 @@ mod tests {
         write(&sink, DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-1")).await;
         write(&sink, DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-1")).await;
 
-        let events = read_current(dir.path()).unwrap();
+        let events = read_current(dir.path()).unwrap().events;
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].stage, "request_recorded");
         assert_eq!(events[2].stage, "pane_spawned");
@@ -688,7 +754,7 @@ mod tests {
         let sink = JsonlFileSink::new(dir.path());
         write(&sink, DispatchEvent::new(Stage::PaneSpawned, Outcome::Ok, "exec-new")).await;
 
-        let events = read_current(dir.path()).unwrap();
+        let events = read_current(dir.path()).unwrap().events;
         assert_eq!(
             events.len(),
             2,
@@ -706,8 +772,8 @@ mod tests {
         write(&sink, DispatchEvent::new(Stage::RequestRecorded, Outcome::Ok, "exec-b")).await;
         write(&sink, DispatchEvent::new(Stage::WorkerClaimed, Outcome::Ok, "exec-a")).await;
 
-        let a = read_execution(dir.path(), "exec-a").unwrap();
-        let b = read_execution(dir.path(), "exec-b").unwrap();
+        let a = read_execution(dir.path(), "exec-a").unwrap().events;
+        let b = read_execution(dir.path(), "exec-b").unwrap().events;
         assert_eq!(a.len(), 2);
         assert_eq!(b.len(), 1);
     }
@@ -715,18 +781,151 @@ mod tests {
     #[test]
     fn read_current_on_missing_root_yields_empty() {
         let dir = TempDir::new().unwrap();
-        let events = read_current(dir.path()).unwrap();
+        let events = read_current(dir.path()).unwrap().events;
         assert!(events.is_empty());
     }
 
+    fn record_line(ts: u128, stage: &str) -> String {
+        format!(
+            "{{\"ts_epoch_ms\":{ts},\"stage\":\"{stage}\",\"outcome\":\"ok\",\
+             \"execution_id\":\"e\",\"work_item_id\":null,\"worker_id\":null,\
+             \"cube_repo_id\":null,\"cube_lease_id\":null,\"cube_workspace_id\":null,\
+             \"details\":null}}"
+        )
+    }
+
+    fn parse_str(text: &str) -> StreamRead {
+        parse_lines(Path::new("current.jsonl"), std::io::BufReader::new(text.as_bytes())).unwrap()
+    }
+
     #[test]
-    fn parse_lines_skips_blank_and_unparseable() {
-        let input = b"\n\
-            {\"ts_epoch_ms\":1,\"stage\":\"request_recorded\",\"outcome\":\"ok\",\"execution_id\":\"e\",\"details\":null}\n\
-            not-a-json-line\n\
-            {\"ts_epoch_ms\":2,\"stage\":\"worker_claimed\",\"outcome\":\"ok\",\"execution_id\":\"e\",\"details\":null}\n";
-        let events = parse_lines(std::io::BufReader::new(&input[..])).unwrap();
-        assert_eq!(events.len(), 2);
+    fn parse_lines_skips_blank_lines_without_reporting_damage() {
+        let text = format!(
+            "\n{}\n\n{}\n",
+            record_line(1, "request_recorded"),
+            record_line(2, "worker_claimed")
+        );
+        let read = parse_str(&text);
+        assert_eq!(read.events.len(), 2);
+        assert!(read.is_intact(), "a blank line is not damage");
+    }
+
+    /// The production defect, end to end through the file reader: a line
+    /// holding two whole records must yield BOTH events (they were never lost,
+    /// only unparseable as one value) and must still be reported as damage.
+    #[test]
+    fn parse_lines_recovers_concatenated_records_and_still_reports_the_line() {
+        let text = format!(
+            "{}\n{}{}\n{}\n",
+            record_line(1, "request_recorded"),
+            record_line(2, "worker_claimed"),
+            record_line(3, "host_selected"),
+            record_line(4, "pane_spawned"),
+        );
+        let read = parse_str(&text);
+        let stages: Vec<&str> = read.events.iter().map(|e| e.stage.as_str()).collect();
+        assert_eq!(
+            stages,
+            vec!["request_recorded", "worker_claimed", "host_selected", "pane_spawned"],
+            "both concatenated records must be recovered, in order, in place"
+        );
+        assert_eq!(read.damage.len(), 1);
+        let damage = &read.damage[0];
+        assert_eq!(damage.line_number, 2);
+        assert_eq!(damage.recovered, 2);
+        assert_eq!(damage.lost_bytes, 0);
+        assert_eq!(damage.shape, DamageShape::Concatenated);
+        assert_eq!(damage.prev_ts_epoch_ms, Some(1), "bracketed by the record before");
+        assert_eq!(damage.next_ts_epoch_ms, Some(4), "and the record after");
+        assert!(
+            read.lines_with_lost_records().next().is_none(),
+            "a fully-recovered line must not be reported as having lost records"
+        );
+    }
+
+    /// A truncated record must be reported as an actual loss — the case where
+    /// an absence in the timeline genuinely cannot be trusted.
+    #[test]
+    fn parse_lines_reports_a_truncated_record_as_lost() {
+        let text = format!(
+            "{}\n{{\"ts_epoch_ms\":2,\"stage\":\"worker_cla\n{}\n",
+            record_line(1, "request_recorded"),
+            record_line(3, "pane_spawned"),
+        );
+        let read = parse_str(&text);
+        assert_eq!(read.events.len(), 2, "only the two intact records survive");
+        assert_eq!(read.damage.len(), 1);
+        assert_eq!(read.damage[0].shape, DamageShape::Unrecoverable);
+        assert!(read.damage[0].lost_bytes > 0);
+        assert_eq!(read.lines_with_lost_records().count(), 1);
+        assert!(
+            read.damage[0].could_hide_ts(2),
+            "the damaged region must claim the timestamp gap it spans"
+        );
+    }
+
+    /// A stream carrying both corruption shapes must not report itself intact,
+    /// and must keep them distinguishable: one lost records, one did not.
+    #[test]
+    fn parse_lines_distinguishes_recovered_from_lost_across_one_file() {
+        let text = format!(
+            "{}{}\nnot-json-at-all\n{}\n",
+            record_line(1, "request_recorded"),
+            record_line(2, "worker_claimed"),
+            record_line(4, "pane_spawned"),
+        );
+        let read = parse_str(&text);
+        assert!(!read.is_intact());
+        assert_eq!(read.damage.len(), 2);
+        assert_eq!(read.recovered_records(), 2);
+        assert_eq!(read.lines_with_lost_records().count(), 1);
+        assert_eq!(read.events.len(), 3);
+    }
+
+    /// `read_current` spans several files; damage must stay attributed to the
+    /// file it was found in rather than collapsing into one count.
+    #[tokio::test]
+    async fn read_current_attributes_damage_to_the_segment_it_came_from() {
+        let dir = TempDir::new().unwrap();
+        let current = current_path(dir.path());
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::write(
+            boss_log_files::rotated_segment_path(&current, 1_000),
+            format!(
+                "{}{}\n",
+                record_line(1, "request_recorded"),
+                record_line(2, "worker_claimed")
+            ),
+        )
+        .unwrap();
+        fs::write(&current, "garbage-line\n").unwrap();
+
+        let read = read_current(dir.path()).unwrap();
+        assert_eq!(read.events.len(), 2);
+        assert_eq!(read.damage.len(), 2);
+        assert!(read.damage[0].path.to_string_lossy().contains("current.jsonl.1000"));
+        assert_eq!(read.damage[0].shape, DamageShape::Concatenated);
+        assert!(read.damage[1].path.ends_with("current.jsonl"));
+        assert_eq!(read.damage[1].shape, DamageShape::Unrecoverable);
+    }
+
+    /// `ghost-active` decides purely on the absence of a terminal event, so it
+    /// must hand back the integrity of the mirrors it read.
+    #[tokio::test]
+    async fn ghost_active_reports_damage_from_the_mirrors_it_scanned() {
+        let dir = TempDir::new().unwrap();
+        let mirror = execution_path(dir.path(), "exec-torn");
+        fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        fs::write(&mirror, format!("{}\ntorn-record\n", record_line(1, "worker_claimed"))).unwrap();
+
+        let report = ghost_active(dir.path(), 10_000, 5_000).unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(
+            report.damage.len(),
+            1,
+            "the unreadable mirror line must reach the caller"
+        );
+        assert_eq!(report.damage[0].shape, DamageShape::Unrecoverable);
     }
 
     #[tokio::test]
@@ -764,7 +963,7 @@ mod tests {
         event.ts_epoch_ms = 3000;
         write(&sink, event).await;
 
-        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap();
+        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].execution_id, "exec-stuck");
         assert_eq!(entries[0].last_stage, "cube_change_created");
@@ -787,7 +986,7 @@ mod tests {
         event.ts_epoch_ms = 9_000;
         write(&sink, event).await;
 
-        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap();
+        let entries = ghost_active(dir.path(), 10_000, 5_000).unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].elapsed_since_last_ms, 1_000);
         assert!(!entries[0].stalled);
@@ -807,7 +1006,7 @@ mod tests {
         c.ts_epoch_ms = 700;
         write(&sink, c).await;
 
-        let events = read_execution(dir.path(), "e").unwrap();
+        let events = read_execution(dir.path(), "e").unwrap().events;
         let durations = stage_durations_ms(&events, 1_500);
         assert_eq!(durations, vec![150, 450, 800]);
     }
@@ -823,7 +1022,7 @@ mod tests {
         b.ts_epoch_ms = 250;
         write(&sink, b).await;
 
-        let events = read_execution(dir.path(), "e").unwrap();
+        let events = read_execution(dir.path(), "e").unwrap().events;
         let durations = stage_durations_ms(&events, 9_999_999);
         // Terminal event => duration is 0, not 9_999_999 - 250.
         assert_eq!(durations, vec![150, 0]);
@@ -1347,9 +1546,9 @@ mod tests {
             1
         );
 
-        let mirror = read_execution(dir.path(), "exec-wedged").unwrap();
+        let mirror = read_execution(dir.path(), "exec-wedged").unwrap().events;
         assert_eq!(mirror.len(), 2, "the flag must reach the per-execution mirror");
-        assert_eq!(read_current(dir.path()).unwrap().len(), 2, "and the flat stream");
+        assert_eq!(read_current(dir.path()).unwrap().events.len(), 2, "and the flat stream");
 
         let flagged = &mirror[1];
         assert_eq!(flagged.stage, "stage_stalled");
@@ -1390,7 +1589,7 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert_eq!(read_execution(dir.path(), "exec-wedged").unwrap().len(), 2);
+        assert_eq!(read_execution(dir.path(), "exec-wedged").unwrap().events.len(), 2);
     }
 
     /// A stall that appears *after* the index is already tailing must be
@@ -1420,7 +1619,7 @@ mod tests {
                 .unwrap(),
             1
         );
-        let mirror = read_execution(dir.path(), "exec-late").unwrap();
+        let mirror = read_execution(dir.path(), "exec-late").unwrap().events;
         assert_eq!(mirror[1].stage, "stage_stalled");
         assert_eq!(
             mirror[1].details["stalled_stage"],

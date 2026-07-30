@@ -29,15 +29,28 @@
 //! execution) — caching a handle per path would leak file descriptors.
 //! Each [`JsonlAppender::append`] call opens, writes, and closes.
 //!
-//! This utility serializes writers **within one process**. It does not
-//! provide cross-process exclusion (that needs a real file lock, e.g.
-//! `flock`) — `tools/boss/event-shim` already does that correctly for its
-//! own multi-process use case and is not a caller of this crate.
+//! Serializing through a process-wide mutex is not sufficient on its own:
+//! `<state-root>/dispatch-events/current.jsonl` has more than one potential
+//! writer *process* (an app-autostarted engine plus a hand-started one, or an
+//! engine outliving a crash-recovery relaunch), and a mutex in one address
+//! space says nothing about the other. So each append also takes an
+//! **exclusive advisory lock on the target file** for the duration of the
+//! write, via `fs4` — the same `flock` mechanism `tools/boss/event-shim`,
+//! `tools/cube`, and `tools/repobin` already use for their multi-process
+//! buffers. Both layers are kept: the mutex is what keeps the *set* of paths
+//! in one `append_to_all` call from interleaving with another task's set, and
+//! the file lock is what makes each individual append atomic against other
+//! processes.
+//!
+//! The lock is advisory, so it only excludes writers that also take it. Every
+//! writer of these files goes through this crate; anything that appends to a
+//! Boss `.jsonl` by hand is outside the guarantee and must not.
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
+use fs4::fs_std::FileExt;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -116,7 +129,15 @@ fn append_locked(path: &Path, line: &[u8]) -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
-    file.write_all(line)
+    // Exclusive for the duration of the write, so a second *process* appending
+    // to the same file cannot land bytes in the middle of this record. Unlock
+    // explicitly rather than relying on the handle's close: the write result is
+    // the one thing that must survive, so it is captured first and the unlock's
+    // own (uninteresting) failure never masks it.
+    FileExt::lock_exclusive(&file)?;
+    let written = file.write_all(line);
+    let _ = FileExt::unlock(&file);
+    written
 }
 
 #[cfg(test)]
@@ -234,5 +255,62 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), WRITERS * PER_WRITER);
+    }
+
+    /// The process-wide mutex cannot exclude another *process*, and
+    /// `dispatch-events/current.jsonl` genuinely has more than one potential
+    /// writer process. This asserts the second layer is real: while a foreign
+    /// holder owns the file's advisory lock, an append must block rather than
+    /// write, and must complete once the lock is released.
+    ///
+    /// `flock` is per open-file-description, not per process, so a second
+    /// `File` opened here contends exactly as another process's handle would —
+    /// which is what makes this testable in-process at all.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn append_waits_for_a_foreign_holder_of_the_file_lock() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("current.jsonl");
+        std::fs::write(&path, b"").unwrap();
+
+        let foreign = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        FileExt::lock_exclusive(&foreign).unwrap();
+
+        let appender = JsonlAppender::new();
+        let append_path = path.clone();
+        let appending = tokio::spawn(async move {
+            let appender = appender;
+            appender
+                .append(
+                    &append_path,
+                    &Record {
+                        writer: 1,
+                        seq: 1,
+                        padding: "z".repeat(256),
+                    },
+                )
+                .await
+        });
+
+        // Give the append every chance to run to completion if the lock were
+        // not being honoured: it is on a multi-thread runtime with a free
+        // worker, so the only thing that can hold it up is the `flock`.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(
+            !appending.is_finished(),
+            "append completed while a foreign process held the file lock — cross-process appends can interleave"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "",
+            "no bytes may land while the lock is held elsewhere"
+        );
+
+        FileExt::unlock(&foreign).unwrap();
+        appending.await.unwrap().unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents.lines().count(), 1, "the append must land once unblocked");
+        let parsed: Record = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(parsed.seq, 1);
     }
 }

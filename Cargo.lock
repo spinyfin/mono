@@ -606,6 +606,7 @@ dependencies = [
 name = "boss-engine-jsonl-append"
 version = "0.1.0"
 dependencies = [
+ "fs4",
  "serde",
  "serde_json",
  "tempfile",
