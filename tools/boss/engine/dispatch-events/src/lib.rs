@@ -541,6 +541,36 @@ pub enum Stage {
     /// produced 19 orphaned executions and 26 churn-guard parks for a single
     /// chore that had, in fact, completed its turn every time.
     OneShotWorkerExit,
+    /// A worker the engine had already terminalized proved itself alive, and
+    /// the engine put it back under tracking instead of leaving it stranded.
+    ///
+    /// This is the *re-adoption* half of the convergence rule "a live worker
+    /// for an execution the engine believes is dead must either be re-adopted
+    /// or reaped." Before it existed, the engine had only the reaping half:
+    /// `husk_pane_reconcile` could kill such a pane, and it correctly refuses
+    /// to when the process is demonstrably alive — so the one case where the
+    /// ENGINE was wrong (not the worker) had no resolution at all. The run
+    /// stayed alive, untracked, invisible to `bossctl agents list`, unstoppable
+    /// by `bossctl agents stop`, and — because its pool claim was gone — its
+    /// work item stayed eligible for re-dispatch, which is how one chore
+    /// accumulated three concurrent workers on 2026-07-28.
+    ///
+    /// `details` carries `trigger` (which signal proved liveness:
+    /// `hook_after_terminal` or `redispatch_guard`), `prior_status` (the
+    /// terminal status being reversed), `shell_pid` when a durable pid backed
+    /// the decision, and `slot_id` when the app's hosted-pane list let the
+    /// engine restore the live-state slot mapping too.
+    LiveWorkerReadopted,
+    /// A re-dispatch was declined because the row's previous worker process is
+    /// still running — the durable-pid guard in `boss_engine::orphan_sweep`.
+    ///
+    /// Distinct from `dispatch_decision` with `live_execution_claimed=false`:
+    /// that event records what the engine's own bookkeeping believed, which in
+    /// this exact failure is wrong. This one records what the OS said. Its
+    /// presence means a duplicate worker was prevented; `details` carries the
+    /// `blocking_execution_id`, its `blocking_execution_status` (normally a
+    /// TERMINAL one — that is the whole point), and the probed `shell_pid`.
+    RedispatchBlockedLiveProcess,
 }
 
 impl Stage {
@@ -591,6 +621,8 @@ impl Stage {
             Stage::WorkspaceRecovery => "workspace_recovery",
             Stage::AbandonedBranchPrRecovery => "abandoned_branch_pr_recovery",
             Stage::OneShotWorkerExit => "one_shot_worker_exit",
+            Stage::LiveWorkerReadopted => "live_worker_readopted",
+            Stage::RedispatchBlockedLiveProcess => "redispatch_blocked_live_process",
         }
     }
 }

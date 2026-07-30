@@ -81,6 +81,31 @@ async fn retire_pane_sends_slot_keyed_release_request_with_no_run_id_resolution(
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(7).await });
 
+    // With no live-state entry for the slot, the durable-liveness guard runs
+    // first: it asks the app which run occupies slot 7 so it can probe that
+    // run's recorded pid. Answering "nothing hosted" leaves the guard inert
+    // and the retirement proceeds, which is the path this test is about.
+    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let probe_id = match probe.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
+                "expected the liveness probe first, got {request:?}"
+            );
+            request_id
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &probe_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult { panes: vec![] }),
+            },
+        )
+        .await;
+
     let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
     let (request_id, request) = match envelope.payload {
         FrontendEvent::EngineRequest { request_id, request } => (request_id, request),
@@ -381,5 +406,198 @@ async fn list_husk_panes_flags_a_recycled_slot_even_though_its_entry_looks_alive
         panes.iter().map(|pane| pane.run_id.as_str()).collect::<Vec<_>>(),
         vec!["run-old"],
         "a stray pane for a recycled run is still a husk: {panes:?}"
+    );
+}
+
+// ─── 2026-07-28 regression: no live-state entry is not proof of death either ──
+//
+// The 2026-07-26 fix taught the classifier to distrust a TERMINAL live-state
+// entry. It could not help when there is no entry at all — which is the state
+// every wrongly-terminalized worker ends up in, because `release_worker_pane`
+// drops the entry unconditionally on its way out. Those six workers were alive,
+// untracked, and (had the mass-retirement breaker not declined) one sweep pass
+// away from being SIGTERMed.
+//
+// The classifier now falls back to durable state — `work_runs.shell_pid` plus
+// the execution's status — for exactly the slots its in-memory corroboration
+// cannot reach.
+
+/// Drive the app's `ListHostedPanes` round-trip for `panes` and return the
+/// classifier's verdict. Factors out the request/response dance the husk tests
+/// above all repeat.
+async fn husk_panes_for(
+    server_state: &Arc<ServerState>,
+    sink: &Arc<SessionSink>,
+    panes: Vec<crate::protocol::HostedPaneEntry>,
+) -> Vec<crate::protocol::HostedPaneEntry> {
+    let server_clone = server_state.clone();
+    let list = tokio::spawn(async move { server_clone.list_husk_panes().await });
+
+    let envelope = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let request_id = match envelope.payload {
+        FrontendEvent::EngineRequest { request_id, .. } => request_id,
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &request_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult { panes }),
+            },
+        )
+        .await;
+    list.await.expect("list task").expect("expected Ok")
+}
+
+fn hosted(slot_id: u8, run_id: &str) -> crate::protocol::HostedPaneEntry {
+    crate::protocol::HostedPaneEntry {
+        slot_id,
+        run_id: run_id.to_owned(),
+        summary: None,
+        task_title: None,
+    }
+}
+
+#[tokio::test]
+async fn list_husk_panes_spares_an_untracked_slot_whose_durable_process_is_alive() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // Our own pid: `kill(pid, 0)` genuinely reports it alive.
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "spawn-ack timeout; presumed dead")
+        .unwrap();
+
+    // The engine tracks NOTHING for this slot — the terminal path cleared it.
+    assert!(server_state.live_worker_states.get(4).is_none());
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    assert!(
+        panes.is_empty(),
+        "a slot the engine forgot, whose execution was orphaned by INFERENCE and whose recorded \
+         process is alive, is a re-adoption candidate — not a husk to SIGTERM: {panes:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_husk_panes_still_retires_an_untracked_slot_whose_process_is_gone() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    // A pid that cannot exist: `kill(pid, 0)` returns ESRCH.
+    let execution_id = create_spawned_execution(db, &work_item_id, 4_194_303);
+    db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    assert_eq!(
+        panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
+        vec![4],
+        "the guard must not disable the sweep: a dead process is still a husk",
+    );
+}
+
+#[tokio::test]
+async fn list_husk_panes_still_retires_a_lingering_shell_under_a_cancelled_run() {
+    use crate::test_support::*;
+
+    // The shape the durable guard must NOT protect, and the reason it keys on
+    // the terminal status as well as the pid: a genuine husk keeps its shell
+    // alive after `claude` exits inside it. Its execution was cancelled — a
+    // decided outcome, not an inference — so the pane is stray and must be
+    // reclaimed.
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.cancel_execution(&execution_id).unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let panes = husk_panes_for(&server_state, &sink, vec![hosted(4, &execution_id)]).await;
+    assert_eq!(
+        panes.iter().map(|pane| pane.slot_id).collect::<Vec<_>>(),
+        vec![4],
+        "a lingering shell under a DECIDED terminal status is a husk even though its pid is alive",
+    );
+}
+
+/// The break-glass verb must inherit the same durable guard the classifier
+/// got. `bossctl agents retire-pane <slot>` is a slot-keyed kill with no run
+/// id, so before this it had literally nothing to check for a slot the engine
+/// tracked nothing in — the operator's own recovery tool could destroy the
+/// in-flight work of a worker the engine had merely lost track of.
+#[tokio::test]
+async fn retire_pane_refuses_an_untracked_slot_whose_durable_process_is_alive() {
+    use crate::test_support::*;
+
+    let (server_state, _dir) = test_server_state();
+    let db = server_state.work_db.as_ref();
+    let product_id = create_product(db);
+    let work_item_id = create_active_chore(db, &product_id, "test chore");
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+    db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
+
+    let sink = make_session_sink();
+    server_state
+        .register_app_session("session-app".into(), sink.clone())
+        .await;
+
+    let server_clone = server_state.clone();
+    let retire = tokio::spawn(async move { server_clone.retire_pane(4).await });
+
+    let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
+    let probe_id = match probe.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
+                "expected the liveness probe, got {request:?}"
+            );
+            request_id
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    };
+    server_state
+        .deliver_app_response(
+            "session-app",
+            &probe_id,
+            EngineToAppResponse::ListHostedPanes {
+                result: Ok(crate::protocol::ListHostedPanesResult {
+                    panes: vec![hosted(4, &execution_id)],
+                }),
+            },
+        )
+        .await;
+
+    let result = retire.await.expect("retire task");
+    assert!(
+        matches!(result, Err(RetirePaneError::LiveProcessCorroborated { .. })),
+        "a live untracked worker must not be retired: {result:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), sink.next())
+            .await
+            .is_err(),
+        "no ReleaseWorkerPane may be sent once the guard has refused",
     );
 }

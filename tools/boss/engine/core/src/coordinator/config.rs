@@ -223,6 +223,31 @@ impl ExecutionCoordinator {
         claimed
     }
 
+    /// Re-claim `worker_id` for `execution_id` in whichever pool owns that
+    /// slot — the union-of-pools counterpart to
+    /// [`Self::all_claimed_execution_ids`], used by the re-adoption path.
+    ///
+    /// A slot id names a physical pane workspace slot, and any of the three
+    /// pools may be the one holding it (an automation run that spilled into
+    /// the interactive pool, a reviewer in the review pool). Restoring the
+    /// claim in only the main pool would leave a re-adopted reviewer still
+    /// reading as unclaimed to `all_claimed_execution_ids` — the exact
+    /// main-pool-only blind spot that made the orphan sweep abandon live
+    /// reviewers before the union fix.
+    ///
+    /// Returns `true` as soon as some pool holds the claim for
+    /// `execution_id`; `false` when no pool has that slot free (or it belongs
+    /// to a different execution), which the caller treats as "the row's status
+    /// is the only re-dispatch protection".
+    pub async fn reclaim_slot(&self, worker_id: &str, execution_id: &str) -> bool {
+        for pool in [&self.worker_pool, &self.automation_pool, &self.review_pool] {
+            if pool.reclaim_slot(worker_id, execution_id).await {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Wire the execution-started hook. Production installs the
     /// `WorkerCompletionHandler` here so it can snapshot the bound
     /// chore PR's head SHA into `work_executions.pr_head_before`

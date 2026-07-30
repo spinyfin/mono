@@ -29,11 +29,17 @@
 //!    [`ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD`] terminal executions
 //!    in the last [`ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS`], it
 //!    is skipped and a warning is logged.
-//! 5. Calls [`WorkDb::request_execution_with_live_check`] (the same
+//! 5. Applies the **durable-process guard**: probes the pid recorded on the
+//!    item's most recent local run ([`crate::durable_liveness`]) and refuses
+//!    to redispatch while that process is alive, then hands the contradiction
+//!    to [`crate::worker_readoption`] to be resolved. Every guard above this
+//!    one reads engine bookkeeping, which is exactly what is wrong in the
+//!    failure this guards — see the comment at the call site.
+//! 6. Calls [`WorkDb::request_execution_with_live_check`] (the same
 //!    path `bossctl work start` uses) to mark the stale execution
 //!    `abandoned` and insert a fresh `ready` execution, then kicks
 //!    the coordinator's scheduler.
-//! 6. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
+//! 7. Emits an [`Stage::OrphanActiveRedispatch`] dispatch event so
 //!    the redispatch is visible in `bossctl dispatch tail`.
 
 use std::collections::HashSet;
@@ -45,6 +51,7 @@ use boss_protocol::{ExecutionKind, ExecutionStatus, RequestExecutionInput};
 use crate::coordinator::ExecutionCoordinator;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::work::{ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHURN_GUARD_WINDOW_SECS, WorkDb};
+use crate::worker_readoption::LiveWorkerConvergence;
 
 /// Minimum age of `tasks.updated_at` before an active work item with
 /// no live execution is treated as an orphan. Guards against racing a
@@ -53,7 +60,12 @@ use crate::work::{ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD, ORPHAN_REDISPATCH_CHU
 pub const ORPHAN_MIN_AGE_SECS: i64 = 90;
 
 /// Counts from one pass of the sweep; logged at `info` when non-zero.
-#[derive(Debug, Default)]
+///
+/// Carries `bon::Builder` per the repo's >5-field convention. Production
+/// builds it with `Default::default()` and increments in place — the builder
+/// exists so a future field cannot force every construction site (including
+/// each test's assertions) to be rewritten.
+#[derive(Debug, Default, bon::Builder)]
 pub struct OrphanSweepOutcome {
     pub redispatched: usize,
     pub churn_skipped: usize,
@@ -67,6 +79,17 @@ pub struct OrphanSweepOutcome {
     /// should never fire; a non-zero count here means the pool snapshot did
     /// not include the review pool — worth investigating.
     pub running_reviewer_skipped: usize,
+    /// Items skipped because the OS says the row's previous worker process is
+    /// STILL RUNNING, whatever the engine's own bookkeeping believes. Each one
+    /// is a duplicate worker that was not spawned.
+    ///
+    /// A non-zero count is not a health signal on its own — it means the
+    /// durable-pid guard did its job — but a *sustained* non-zero count means
+    /// executions are being terminalized while their workers live, and the
+    /// convergence path ([`crate::worker_readoption`]) should have re-adopted
+    /// or reaped them by now. Look at the paired `live_worker_readopted` /
+    /// `husk_pane_reconcile` events before assuming the guard alone is enough.
+    pub live_process_skipped: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
@@ -75,6 +98,7 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
             || self.churn_skipped > 0
             || self.waiting_human_skipped > 0
             || self.running_reviewer_skipped > 0
+            || self.live_process_skipped > 0
     }
 
     fn log(&self) {
@@ -84,6 +108,7 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
             no_worker_skipped = self.no_worker_skipped,
             waiting_human_skipped = self.waiting_human_skipped,
             running_reviewer_skipped = self.running_reviewer_skipped,
+            live_process_skipped = self.live_process_skipped,
             "orphan sweep: pass complete",
         );
     }
@@ -92,19 +117,33 @@ impl crate::sweep_loop::SweepOutcome for OrphanSweepOutcome {
 /// Spawn a tokio task that runs [`run_one_pass`] forever at `interval`.
 /// Fires immediately on spawn so post-crash orphans are resolved on
 /// engine boot without waiting for the first interval.
+///
+/// `convergence` resolves the contradiction the durable-process guard
+/// detects. Passing [`NoopLiveWorkerConvergence`] leaves the guard in place
+/// (no duplicate worker is ever created) but never resolves the underlying
+/// state, so production must pass the real `ServerState`.
 pub fn spawn_loop(
     work_db: Arc<WorkDb>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    convergence: Arc<dyn LiveWorkerConvergence>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    crate::sweep_loop::spawn_work_sweep_loop(
-        work_db,
-        coordinator,
-        dispatch_events,
-        interval,
-        |work_db, coordinator, dispatch_events| Box::pin(run_one_pass(work_db, coordinator, dispatch_events)),
-    )
+    crate::sweep_loop::spawn_sweep_loop(interval, move || {
+        let work_db = Arc::clone(&work_db);
+        let coordinator = Arc::clone(&coordinator);
+        let dispatch_events = Arc::clone(&dispatch_events);
+        let convergence = Arc::clone(&convergence);
+        async move {
+            run_one_pass(
+                work_db.as_ref(),
+                coordinator,
+                dispatch_events.as_ref(),
+                convergence.as_ref(),
+            )
+            .await
+        }
+    })
 }
 
 /// Run a single orphan-active sweep pass. Returns a summary of what
@@ -117,6 +156,7 @@ pub async fn run_one_pass(
     work_db: &WorkDb,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
+    convergence: &dyn LiveWorkerConvergence,
 ) -> OrphanSweepOutcome {
     let mut outcome = OrphanSweepOutcome::default();
 
@@ -270,6 +310,83 @@ pub async fn run_one_pass(
             continue;
         }
 
+        // Durable-process guard — the last thing checked before a duplicate
+        // worker could be created, and the only check here that consults
+        // something other than the engine's own opinion.
+        //
+        // Every guard above this point reads engine bookkeeping: the DB status
+        // of the item's live execution, and `claimed` (the worker pool's claim
+        // table). That is sound only while the bookkeeping is right. The
+        // 2026-07-28 storm is what it looks like when it is wrong: six
+        // executions were terminalized seconds after start while their `claude`
+        // processes ran on for another nine minutes. Terminal status means no
+        // "live execution" lookup finds them; a released pool claim means
+        // `claimed` does not contain them; so every guard above says "orphan,
+        // redispatch" — and a second, then third worker lands on a row the
+        // first is still editing.
+        //
+        // `work_runs.shell_pid` outlives all of that. It is written when the
+        // app reports the pane's shell pid, it survives an engine restart, and
+        // it survives the execution going terminal. Probing it asks the OS
+        // rather than the engine, which is the only way to break a tie where
+        // the engine is the thing that is wrong.
+        //
+        // Skipping is not the end of the story: a row that is permanently
+        // skipped is a row that never progresses. Convergence is
+        // `worker_readoption`'s job (re-adopt or reap), and this guard's `Some`
+        // branch is one of the two triggers that starts it. What this guard
+        // guarantees on its own is narrower and is the point: no duplicate
+        // worker is created while the previous one is alive.
+        if let Some((blocking_execution_id, process)) =
+            crate::durable_liveness::probe_work_item_worker(work_db, &work_item_id, now_epoch_secs)
+            && process.is_alive()
+        {
+            let blocking_status = work_db
+                .get_execution(&blocking_execution_id)
+                .map(|exec| exec.status.to_string())
+                .unwrap_or_else(|_| "unknown".to_owned());
+            tracing::warn!(
+                work_item_id = %work_item_id,
+                blocking_execution_id = %blocking_execution_id,
+                blocking_status = %blocking_status,
+                shell_pid = process.shell_pid().unwrap_or(0),
+                "orphan sweep: refusing to redispatch — the row's previous worker process is still \
+                 running. The engine's bookkeeping disagrees with the OS; the OS wins.",
+            );
+            dispatch_events
+                .emit(
+                    DispatchEvent::new(
+                        Stage::RedispatchBlockedLiveProcess,
+                        Outcome::Skipped,
+                        &blocking_execution_id,
+                    )
+                    .with_work_item(&work_item_id)
+                    .with_details(serde_json::json!({
+                        "loop": "orphan_active_sweep",
+                        "blocking_execution_id": blocking_execution_id,
+                        "blocking_execution_status": blocking_status,
+                        "shell_pid": process.shell_pid(),
+                        "recent_terminal_executions": recent_terminal,
+                    })),
+                )
+                .await;
+            outcome.live_process_skipped += 1;
+            // Skipping alone would leave the row parked forever: never
+            // redispatched (a live process blocks it) and never progressed
+            // (the engine still believes its worker is dead). Hand the
+            // contradiction to the convergence path, which re-adopts the run
+            // if the terminal status was only an inference or reaps the
+            // process if it was a decision. This is the trigger that covers
+            // the case the hook fan-out cannot: a worker that is alive but
+            // currently quiet — parked inside a long foreground build, say —
+            // emits no hook to converge on, so without this the guard would
+            // hold the row indefinitely.
+            convergence
+                .converge_live_worker(&blocking_execution_id, "redispatch_guard")
+                .await;
+            continue;
+        }
+
         // Request a fresh execution. The `is_live` closure treats an
         // execution as live only if a worker slot currently claims it.
         // A non-terminal execution that is NOT claimed means the worker
@@ -332,6 +449,7 @@ mod tests {
     use crate::dispatch_events::RecordingDispatchEventSink;
     use crate::test_support::*;
     use crate::work::{ExecutionStatus, WorkDb};
+    use crate::worker_readoption::NoopLiveWorkerConvergence;
 
     /// Stamp tasks.updated_at to 10 minutes ago so the age guard passes.
     fn make_old(db: &WorkDb, work_item_id: &str) {
@@ -353,7 +471,178 @@ mod tests {
         (Arc::new(coordinator), review_pool)
     }
 
+    /// A pid guaranteed not to exist, so `kill(pid, 0)` returns `ESRCH`.
+    /// Mirrors the same helper in `dead_pid_sweep`'s tests.
+    fn dead_pid() -> i64 {
+        4_194_303
+    }
+
+    /// Records every convergence trigger so a test can assert the sweep did
+    /// not merely *skip* the row but handed the contradiction on to be
+    /// resolved.
+    #[derive(Default)]
+    struct RecordingConvergence {
+        converged: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl RecordingConvergence {
+        fn converged(&self) -> Vec<(String, String)> {
+            self.converged.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LiveWorkerConvergence for RecordingConvergence {
+        async fn converge_live_worker(&self, execution_id: &str, trigger: &str) {
+            self.converged
+                .lock()
+                .unwrap()
+                .push((execution_id.to_owned(), trigger.to_owned()));
+        }
+    }
+
     // ─── tests ──────────────────────────────────────────────────────────────
+
+    /// **The 2026-07-28 duplicate-dispatch regression.**
+    ///
+    /// Reproduces the exact production shape: an execution the engine
+    /// terminalized (`orphaned`) whose worker process is still running, on an
+    /// item that every pre-existing guard reads as a legitimate orphan — its
+    /// status is terminal so no live-execution lookup finds it, its pool claim
+    /// was released so `claimed` does not contain it, and the churn window is
+    /// empty. Before the durable-pid guard this redispatched, which is how one
+    /// chore ended up with three concurrent workers.
+    ///
+    /// The invariant under test is the one the brief states: a redispatch
+    /// attempt for a row whose prior process is still running must not produce
+    /// a second live worker.
+    #[tokio::test]
+    async fn does_not_redispatch_over_a_still_running_worker_process() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        // Our own pid stands in for the worker's still-running shell.
+        let execution_id = create_spawned_execution(&db, &work_item_id, i64::from(std::process::id()));
+        db.mark_execution_orphaned(&execution_id, "spawn-ack timeout; worker presumed dead")
+            .unwrap();
+        // Age the item LAST: the execution/run writes above touch
+        // `tasks.updated_at`, so ageing first would be undone by them and the
+        // item would never clear ORPHAN_MIN_AGE_SECS.
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        // Nothing claimed: the pool released the slot when the execution was
+        // terminalized, which is precisely why the sweep used to proceed.
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 0,
+            "a second worker must never be dispatched onto a row whose first worker is alive",
+        );
+        assert_eq!(outcome.live_process_skipped, 1);
+
+        // No new execution row at all — a `ready` row here would be dispatched
+        // by the scheduler on its next drain, which is the duplicate.
+        let executions = db.list_executions(Some(&work_item_id)).unwrap();
+        assert!(
+            executions.iter().all(|e| e.status != ExecutionStatus::Ready),
+            "no fresh ready execution may be created while the prior process lives",
+        );
+
+        let events = sink.events().await;
+        let blocked: Vec<_> = events
+            .iter()
+            .filter(|e| e.stage == "redispatch_blocked_live_process")
+            .collect();
+        assert_eq!(blocked.len(), 1, "the prevented duplicate must be observable");
+        assert_eq!(blocked[0].outcome, "skipped");
+        assert_eq!(
+            blocked[0].details["blocking_execution_id"],
+            serde_json::json!(execution_id)
+        );
+        assert_eq!(
+            blocked[0].details["blocking_execution_status"],
+            serde_json::json!("orphaned"),
+            "the blocking row being TERMINAL is the whole point — that is what every other \
+             guard reads as 'safe to redispatch'",
+        );
+        assert!(
+            events.iter().all(|e| e.stage != "orphan_active_redispatch"),
+            "no redispatch event may fire",
+        );
+
+        // Blocking alone would park the row forever; the contradiction must be
+        // handed on for resolution.
+        assert_eq!(
+            convergence.converged(),
+            vec![(execution_id, "redispatch_guard".to_owned())],
+            "the guard must trigger convergence, not just decline",
+        );
+    }
+
+    /// The guard must not become a permanent block. Once the worker process is
+    /// genuinely gone, the same row redispatches exactly as before — this is
+    /// what keeps the post-crash recovery the sweep exists for working.
+    #[tokio::test]
+    async fn redispatches_normally_once_the_prior_process_is_gone() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_spawned_execution(&db, &work_item_id, dead_pid());
+        db.mark_execution_orphaned(&execution_id, "worker died").unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let convergence = RecordingConvergence::default();
+
+        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref(), &convergence).await;
+
+        assert_eq!(
+            outcome.redispatched, 1,
+            "a dead prior process must not block recovery — that is what this sweep is for",
+        );
+        assert_eq!(outcome.live_process_skipped, 0);
+        assert!(
+            convergence.converged().is_empty(),
+            "there is no contradiction to converge when the process is really gone",
+        );
+    }
+
+    /// A worker that never reported a pid (mid-spawn, or a spawn that never
+    /// produced a shell) must not be treated as alive. `Unknown` is not
+    /// `Alive`: reading it as such would disable orphan recovery for every
+    /// execution that dies before `UpdateWorkerShellPid`.
+    #[tokio::test]
+    async fn a_never_reported_pid_does_not_block_redispatch() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        db.mark_execution_orphaned(&execution_id, "spawn produced no shell")
+            .unwrap();
+        make_old(&db, &work_item_id);
+
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
+
+        assert_eq!(outcome.live_process_skipped, 0);
+        assert_eq!(outcome.redispatched, 1);
+    }
 
     /// Orphan with NO execution → gets redispatched; dispatch event emitted.
     #[tokio::test]
@@ -367,7 +656,13 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
 
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 1, "should have redispatched one item");
 
@@ -407,7 +702,13 @@ mod tests {
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
         // With a `ready` execution the DB query filters the item out.
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 0);
         assert!(sink.events().await.is_empty());
@@ -426,7 +727,13 @@ mod tests {
         coordinator.worker_pool().claim_worker("dummy-exec-id", None).await;
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 0);
         assert_eq!(outcome.no_worker_skipped, 1);
@@ -450,7 +757,13 @@ mod tests {
         let db = Arc::new(db);
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(outcome.churn_skipped, 1, "churn guard should have fired");
         assert_eq!(outcome.redispatched, 0);
@@ -478,7 +791,13 @@ mod tests {
         let db = Arc::new(db);
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
         assert_eq!(outcome.churn_skipped, 1);
 
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
@@ -524,7 +843,13 @@ mod tests {
         let db = Arc::new(db);
         let coordinator = make_coordinator(db.clone(), 1);
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(outcome.redispatched, 0, "should skip recently activated item");
         assert!(sink.events().await.is_empty());
@@ -563,7 +888,13 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(
             outcome.redispatched, 0,
@@ -638,7 +969,13 @@ mod tests {
         // claimed_execution_ids() didn't include the reviewer exec id.
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(
             outcome.redispatched, 0,
@@ -696,7 +1033,13 @@ mod tests {
         let coordinator = make_coordinator(db.clone(), 1);
 
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(db.as_ref(), coordinator.clone(), sink.as_ref()).await;
+        let outcome = run_one_pass(
+            db.as_ref(),
+            coordinator.clone(),
+            sink.as_ref(),
+            &NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(
             outcome.redispatched, 0,

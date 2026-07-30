@@ -1002,9 +1002,15 @@ fn match_sig4b_hook_after_terminal(
                 "target={target} kind=session_end message={}",
                 &msg[..msg.len().min(120)]
             )],
-            recovery: "A terminalized execution still has a worker emitting hooks. Do not \
-                       resurrect silently — inspect why the run was terminalized early \
-                       (spawn_ack_timeout path) and reap the live pane / clear the contradiction."
+            recovery: "A terminalized execution still has a worker emitting hooks. The engine \
+                       now resolves this itself — it re-adopts the run when the terminal status \
+                       was only an inference (orphaned/abandoned), or reaps the surviving \
+                       process when it was a decision (cancelled/completed/failed). Look for the \
+                       paired `live_worker_readopted` or `husk_pane_reconcile` event in \
+                       `bossctl dispatch tail`: if neither is present the convergence path did \
+                       not run and this IS still an open contradiction. Either way, the \
+                       underlying question stands — why was the run terminalized early? Check \
+                       the spawn_ack_timeout path and the network conditions around it."
                 .into(),
             details: fields.clone(),
         });

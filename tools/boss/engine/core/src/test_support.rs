@@ -200,6 +200,33 @@ pub fn create_old_execution(db: &WorkDb, work_item_id: &str) -> String {
     create_execution_started_secs_ago(db, work_item_id, 300)
 }
 
+/// Build the full **post-spawn** shape a healthy pane-hosted worker leaves in
+/// the DB: an execution aged past the sweep grace windows, a started
+/// `work_runs` row on the local host, `shell_pid` recorded on that row, and
+/// the execution parked in `waiting_human` with its run `completed` — exactly
+/// the sequence `PaneSpawnRunner` drives (`start_execution_run` →
+/// `UpdateWorkerShellPid` → `finish_execution_run`).
+///
+/// Returns the execution id.
+///
+/// [`create_old_execution`] deliberately stops short of this: it creates a
+/// `ready` execution with NO run row, which is the pre-dispatch shape. Any
+/// test about a worker *process* needs the run row, because
+/// `work_runs.shell_pid` is where the durable pid lives — see
+/// [`crate::durable_liveness`].
+pub fn create_spawned_execution(db: &WorkDb, work_item_id: &str, shell_pid: i64) -> String {
+    let execution_id = create_old_execution(db, work_item_id);
+    let (_exec, run) = db
+        .start_execution_run(&execution_id, "worker-1", "repo-1", "lease-1", "ws-1", "/tmp/ws")
+        .unwrap();
+    assert!(
+        db.set_run_shell_pid_for_execution(&execution_id, shell_pid).unwrap(),
+        "the run row must exist before a shell pid can be recorded against it",
+    );
+    finish_run_waiting_human(db, &execution_id, &run.id, Some("Spawned worker pane in slot 1."));
+    execution_id
+}
+
 /// Finish an execution's active run the way `PaneSpawnRunner` does: record
 /// the run as `completed` while parking the execution in `waiting_human`
 /// with its workspace lease still held. This is the post-spawn state the

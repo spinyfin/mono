@@ -35,6 +35,9 @@ root-cause rule as the section below.
   [`tools/boss/docs/mac-toolchain-xcode-pinning.md`](tools/boss/docs/mac-toolchain-xcode-pinning.md)
 - Boss forensic surfaces (`engine-audit.log`, per-task cost / transcripts):
   [`tools/boss/docs/forensic-surfaces.md`](tools/boss/docs/forensic-surfaces.md)
+- Worker liveness contract (what the agent indicator derives from; how the
+  engine converges when it has lost track of a live worker):
+  [`tools/boss/docs/worker-liveness-contract.md`](tools/boss/docs/worker-liveness-contract.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
 - Crash watchdog (why an abort always kills the app, and

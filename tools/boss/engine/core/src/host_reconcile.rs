@@ -703,7 +703,13 @@ mod tests {
             Arc::new(NoopRunner),
         ));
         let sweep_sink = RecordingDispatchEventSink::new();
-        let sweep_outcome = crate::orphan_sweep::run_one_pass(db.as_ref(), coordinator, &sweep_sink).await;
+        let sweep_outcome = crate::orphan_sweep::run_one_pass(
+            db.as_ref(),
+            coordinator,
+            &sweep_sink,
+            &crate::worker_readoption::NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(
             sweep_outcome.redispatched, 1,
@@ -767,7 +773,13 @@ mod tests {
             Arc::new(NoopRunner),
         ));
         let sweep_sink = RecordingDispatchEventSink::new();
-        let sweep_outcome = crate::orphan_sweep::run_one_pass(db.as_ref(), coordinator, &sweep_sink).await;
+        let sweep_outcome = crate::orphan_sweep::run_one_pass(
+            db.as_ref(),
+            coordinator,
+            &sweep_sink,
+            &crate::worker_readoption::NoopLiveWorkerConvergence,
+        )
+        .await;
 
         assert_eq!(
             sweep_outcome.churn_skipped, 1,

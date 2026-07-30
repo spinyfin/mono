@@ -417,6 +417,30 @@ impl ServerState {
                     evidence,
                 });
             }
+        } else if let Some(run_id) = self.hosted_pane_run_for_slot(slot_id).await
+            && let Some(evidence) = self.durable_live_process_evidence(&run_id)
+        {
+            // Guard 3 (reality, with NO bookkeeping at all): the engine has no
+            // live-state entry for this slot, so guards 1 and 2 both had
+            // nothing to read — which is the state a wrongly-terminalized
+            // worker is always in, since the terminal path clears the entry.
+            // Ask durable state and the OS instead. Same reasoning as the
+            // no-entry branch of `list_husk_panes`, applied here too so the
+            // break-glass verb and the automated sweep cannot disagree about
+            // whether a pane is safe to kill.
+            tracing::warn!(
+                slot_id,
+                run_id = %run_id,
+                %evidence,
+                "retire_pane: refusing to retire — the engine tracks nothing in this slot, but the \
+                 hosted run's durably-recorded process is alive and its execution was terminalized \
+                 by inference; killing it would destroy in-flight work",
+            );
+            return Err(RetirePaneError::LiveProcessCorroborated {
+                slot_id,
+                run_id,
+                evidence,
+            });
         }
         let request = EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput {
             slot_id,
@@ -514,9 +538,104 @@ impl ServerState {
                 }
                 // No entry at all, or an entry for a different run: the
                 // classic husk shape this sweep exists for.
-                _ => husks.push(pane),
+                //
+                // But "the engine has no live-state entry" is the WEAKEST
+                // possible evidence of death, because that entry is dropped
+                // unconditionally by `release_worker_pane` on every terminal
+                // path — including the ones that fire on a wrong inference.
+                // The corroboration above cannot help here: it reads a
+                // `LiveWorkerState` that by definition does not exist in this
+                // branch. So take the second opinion from durable state
+                // instead, which survives exactly the teardown that emptied
+                // the registry.
+                //
+                // Without this, the two halves of convergence fight: a worker
+                // that is alive but quiet (parked in a long build, emitting no
+                // hook to converge on) can be confirmed a husk across two
+                // passes and SIGTERMed before the re-adoption path — running
+                // on the same 60 s cadence — gets to it. Re-adoption and
+                // retirement must not race for the same pane.
+                _ => {
+                    if let Some(evidence) = self.durable_live_process_evidence(&pane.run_id) {
+                        tracing::warn!(
+                            slot_id = pane.slot_id,
+                            run_id = %pane.run_id,
+                            %evidence,
+                            "husk classification: the engine has no live-state entry for this slot, but the \
+                             run's durably-recorded worker process is still alive; NOT a husk. This is a \
+                             re-adoption candidate, not a retirement candidate — see \
+                             `boss_engine::worker_readoption`.",
+                        );
+                        continue;
+                    }
+                    husks.push(pane);
+                }
             }
         }
         Ok(husks)
+    }
+
+    /// The run id the app hosts a pane for in `slot_id`, or `None` when it
+    /// hosts none (or cannot be asked). The slot-keyed inverse of
+    /// [`ServerState::hosted_pane_slot_for_run`], needed by `retire_pane`,
+    /// whose input is a slot rather than a run.
+    ///
+    /// Best-effort: a `None` here means the durable-liveness guard simply does
+    /// not fire, leaving the pre-existing behaviour intact.
+    async fn hosted_pane_run_for_slot(&self, slot_id: u8) -> Option<String> {
+        let request = EngineToAppRequest::ListHostedPanes(ListHostedPanesInput {});
+        match self.send_to_app(request, Duration::from_secs(5)).await {
+            Ok(EngineToAppResponse::ListHostedPanes { result: Ok(result) }) => result
+                .panes
+                .into_iter()
+                .find(|pane| pane.slot_id == slot_id)
+                .map(|pane| pane.run_id),
+            other => {
+                tracing::debug!(
+                    slot_id,
+                    ?other,
+                    "retire_pane: app could not be asked what it hosts in this slot",
+                );
+                None
+            }
+        }
+    }
+
+    /// Restart-robust counterpart to
+    /// [`crate::husk_pane_sweep::live_process_evidence`] for a run the engine
+    /// has no `LiveWorkerState` for at all.
+    ///
+    /// `live_process_evidence` corroborates a pid against the worker's hook
+    /// stream, and deliberately requires both halves — for a slot whose
+    /// live-state entry still exists, "pid alive" alone would match a genuine
+    /// husk (the pane's shell lingers after `claude` exits) and disable the
+    /// sweep. Here there is no entry to read a hook stream from, so the test is
+    /// different and narrower: the pid is alive AND the execution row is
+    /// terminal *by inference* (`orphaned` / `abandoned`).
+    ///
+    /// That pairing is what distinguishes the two cases. A genuine husk's
+    /// execution went terminal for a real reason — it completed, it was
+    /// cancelled — and those statuses are excluded, so a lingering shell under
+    /// a finished run is still retired exactly as before. An `orphaned` row
+    /// with a live process is the engine's own guess contradicted by the OS,
+    /// and killing it is how in-flight work is destroyed.
+    ///
+    /// `Some(evidence)` means "do not retire", with `evidence` naming the
+    /// contradicting signal for the log.
+    fn durable_live_process_evidence(&self, run_id: &str) -> Option<String> {
+        let process = crate::durable_liveness::probe_execution_worker(&self.work_db, run_id);
+        let shell_pid = process.alive_pid()?;
+        let execution = self.work_db.get_execution(run_id).ok()?;
+        if !matches!(
+            execution.status,
+            boss_protocol::ExecutionStatus::Orphaned | boss_protocol::ExecutionStatus::Abandoned
+        ) {
+            return None;
+        }
+        Some(format!(
+            "durably-recorded shell pid {shell_pid} is alive and execution status `{}` was \
+             inferred, not decided",
+            execution.status,
+        ))
     }
 }

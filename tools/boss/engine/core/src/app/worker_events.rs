@@ -423,7 +423,7 @@ pub(super) async fn dispatch_live_worker_state(
                     // demonstrably alive (its worker is still emitting
                     // hooks). If so, make it LOUD and countable instead
                     // of swallowing it silently.
-                    if !note_hook_for_terminal_execution(server_state, run_id, event_kind) {
+                    if !converge_terminal_execution_contradiction(server_state, run_id, event_kind).await {
                         tracing::warn!(
                             run_id,
                             kind = event_kind,
@@ -718,29 +718,35 @@ async fn register_remote_worker_slot(server_state: &Arc<ServerState>, run_id: &s
     Some(slot_id)
 }
 
-/// When a hook event arrives for a run with no live slot mapping,
-/// determine whether the engine already considers that execution
-/// terminal. A terminal execution that is *still emitting worker hook
-/// events* is a contradiction: the engine believed the run dead — because
-/// an ack-timeout was once mis-handled as a spawn failure, or a sweep
-/// reaped it — yet its worker is demonstrably alive. Emit a
-/// loud `[engine-reconcile]` diagnostic and bump the
-/// `dispatcher.hook_events.for_terminal_execution` counter so the
-/// mismatch is observable rather than silently swallowed (the "engine has
-/// fresher liveness signals but doesn't consult them" failure class).
+/// Resolve a hook event that arrived for a run the engine has already
+/// terminalized.
 ///
-/// Returns `true` when it logged a terminal-execution hook, so the caller
-/// skips the ordinary "dropping hook" warning (this is the more specific,
-/// louder signal). Returns `false` for a healthy not-yet-terminal run
-/// whose hook merely raced ahead of `register_run_slot`, or for a run id
-/// with no matching execution row (a non-worker token) — those fall
-/// through to the ordinary drop path.
+/// A terminal execution that is *still emitting worker hook events* is a
+/// contradiction: the engine believed the run dead — because an ack-timeout
+/// was mis-handled as a spawn failure, or a sweep reaped it — yet its worker
+/// is demonstrably alive. A hook is the strongest liveness evidence the engine
+/// ever gets: it is produced by the worker's own process, in-band, and cannot
+/// be forged by stale bookkeeping the way a pool claim or a registry entry can.
 ///
-/// This deliberately does NOT resurrect the row: reconciliation of the
-/// actual liveness state belongs to the sweeps (`spawn_ack_sweep`,
-/// `dead_pid_sweep`, the lease heartbeat). The job here is to stop the
-/// contradiction from being silent.
-fn note_hook_for_terminal_execution(server_state: &Arc<ServerState>, run_id: &str, event_kind: &str) -> bool {
+/// Convergence happens here rather than being left to the sweeps. Every
+/// sweep's only verb is reap, and each correctly refuses to reap a live
+/// worker, so the case where the engine — not the worker — is wrong has no
+/// other resolution: left to them the contradiction is re-detected on every
+/// hook, filed as a diagnostic, and stands indefinitely while the row goes on
+/// being re-dispatched. See [`crate::worker_readoption`] for the full
+/// argument; this is the call site that acts on it.
+///
+/// Returns `true` when the event belonged to a terminal execution (so the
+/// caller skips the ordinary "dropping hook" warning — this path is the more
+/// specific signal). Returns `false` for a healthy not-yet-terminal run whose
+/// hook merely raced ahead of `register_run_slot`, or for a run id with no
+/// matching execution row (a non-worker token); those fall through to the
+/// ordinary drop path.
+pub(super) async fn converge_terminal_execution_contradiction(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    event_kind: &str,
+) -> bool {
     let execution = match server_state.work_db.get_execution(run_id) {
         Ok(execution) => execution,
         Err(_) => return false,
@@ -756,9 +762,18 @@ fn note_hook_for_terminal_execution(server_state: &Arc<ServerState>, run_id: &st
         work_item_id = %execution.work_item_id,
         "[engine-reconcile] live hook event arrived for a TERMINAL execution — the engine believes \
          this run is dead but its worker is still emitting hooks. This is the ack-timeout / \
-         stale-reap contradiction (a run that should have stayed tracked was terminalized). Not \
-         resurrecting the row here; surfacing the live-liveness signal so the reconcilers and \
-         operators can act instead of silently dropping it.",
+         stale-reap contradiction (a run that should have stayed tracked was terminalized). \
+         Converging: the run will be re-adopted or reaped.",
+    );
+
+    let outcome = server_state
+        .converge_terminal_execution(&execution, "hook_after_terminal")
+        .await;
+    tracing::info!(
+        run_id,
+        work_item_id = %execution.work_item_id,
+        verdict = outcome,
+        "[engine-reconcile] terminal-execution contradiction resolved",
     );
     true
 }

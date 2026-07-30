@@ -81,6 +81,30 @@
 //! `bossctl agents list --all` as a husk) and again inside `retire_pane`
 //! (so the break-glass verb and any future caller inherit it too).
 //!
+//! ## Corroboration when there is NO live-state entry at all
+//!
+//! [`live_process_evidence`] reads a `LiveWorkerState`, so it can only help
+//! for a slot that still has one. The 2026-07-28 incident was the other
+//! shape: six executions were terminalized while their workers ran on, and
+//! `release_worker_pane` drops the live-state entry unconditionally on every
+//! terminal path — so the entry those workers would have been judged by no
+//! longer existed. "The engine has no entry for this slot" is the weakest
+//! possible evidence of death precisely because it is what a wrong
+//! terminalization produces.
+//!
+//! `ServerState::durable_live_process_evidence` covers that branch from
+//! durable state instead: `work_runs.shell_pid` (which survives the teardown
+//! that emptied the registry) plus the execution's status. It spares a pane
+//! only when the pid is alive AND the status is terminal *by inference*
+//! (`orphaned` / `abandoned`) — a lingering shell under a `completed` or
+//! `cancelled` run is still the genuine husk this sweep exists to reclaim.
+//!
+//! Those spared panes are not abandoned: they are re-adoption candidates, and
+//! [`crate::worker_readoption`] is what resolves them. Without this branch the
+//! two halves of convergence would race — a worker that is alive but quiet
+//! could be confirmed a husk across two passes and SIGTERMed before the
+//! re-adoption path, running on the same 60 s cadence, reached it.
+//!
 //! ## Mass-retirement circuit breaker
 //!
 //! Even with corroboration, a pass that wants to retire many panes at once
