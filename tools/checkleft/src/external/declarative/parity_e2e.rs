@@ -51,27 +51,13 @@ const UNFORMATTED_FIXTURE: &str = include_str!("../../../tests/fixtures/buildifi
 /// assertions below always run in CI. Outside Bazel there are no runfiles, so the
 /// test no-ops rather than failing — but we assert we are genuinely outside Bazel
 /// (no `TEST_SRCDIR`) so a misconfigured `data`/`env` wiring can never silently
-/// skip the parity check in CI.
+/// skip the parity check in CI. See [`crate::external::test_support::staged_path_from_runfiles`].
 fn buildifier_from_runfiles() -> Option<PathBuf> {
-    match std::env::var("CHECKLEFT_E2E_BUILDIFIER") {
-        Ok(rlocationpath) => {
-            let runfiles = runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
-            let path = runfiles
-                .rlocation(&rlocationpath)
-                .expect("buildifier rlocation must resolve");
-            assert!(path.exists(), "staged buildifier must exist at {}", path.display());
-            Some(path)
-        }
-        Err(_) => {
-            assert!(
-                std::env::var_os("TEST_SRCDIR").is_none(),
-                "running under `bazel test` but CHECKLEFT_E2E_BUILDIFIER is unset — the \
-                 buildifier `data`/`env` wiring on checkleft_lib_test is broken; refusing to \
-                 silently skip the parity check"
-            );
-            None
-        }
-    }
+    crate::external::test_support::staged_path_from_runfiles(
+        "CHECKLEFT_E2E_BUILDIFIER",
+        "buildifier",
+        crate::external::test_support::StagedPathKind::File,
+    )
 }
 
 /// Run the declarative check (the committed manifest) over `changeset`, with a

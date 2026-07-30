@@ -174,6 +174,17 @@ _CHECKLEFT_LIB_TEST_COMPILE_DATA = [
 # against the built-in BuildifierCheck. parity_e2e.rs resolves it from the
 # CHECKLEFT_E2E_BUILDIFIER runfiles path via @rules_rust//rust/runfiles.
 #
+# The real, pinned-toolchain rustfmt (the same `@rules_rust//tools/upstream_wrapper:rustfmt`
+# label the format/rust check's `bazel` default binding resolves in production),
+# staged the same way so rustfmt_skip_children_fix_e2e.rs can drive the actual
+# fix path against the hermetic 1.95.0-toolchain rustfmt rather than whatever
+# `rustfmt` happens to be on the host PATH. The wrapper is itself a rust_binary
+# that resolves its wrapped tool via runfiles (see its rustc_env
+# WRAPPED_TOOL_TARGET); because `spawn()` (executor.rs) never clears the child
+# env, the RUNFILES_DIR bazel sets for this test binary is inherited by the
+# spawned wrapper subprocess unchanged, which is enough for it to resolve its
+# own wrapped-tool rlocation — no extra env wiring needed here.
+#
 # :precompiled_cwasm stages the build-time AOT `.cwasm` fixtures; the heavy
 # rust/giant-structs tests (both external::runtime:: and the exclusion-audit
 # tests in runner::tests::) point their executor cache at this directory
@@ -187,10 +198,12 @@ _CHECKLEFT_LIB_TEST_COMPILE_DATA = [
 _CHECKLEFT_LIB_TEST_DATA = [
     ":precompiled_cwasm",
     "@buildifier_prebuilt//:buildifier",
+    "@rules_rust//tools/upstream_wrapper:rustfmt",
 ]
 
 _CHECKLEFT_LIB_TEST_ENV = {
     "CHECKLEFT_E2E_BUILDIFIER": "$(rlocationpath @buildifier_prebuilt//:buildifier)",
+    "CHECKLEFT_E2E_RUSTFMT": "$(rlocationpath @rules_rust//tools/upstream_wrapper:rustfmt)",
     "CHECKLEFT_PRECOMPILED_CWASM_DIR": "$(rlocationpath :precompiled_cwasm)",
 }
 
