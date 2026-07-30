@@ -3,6 +3,32 @@ import os.log
 import SwiftUI
 import UpdateCore
 
+/// Whether a collapsible board section is currently showing its cards.
+///
+/// The state is one sticky bit per section in `BossDefaults`, written by the
+/// header's disclosure button. It lives here rather than inside
+/// `CollapsibleWorkBoardSection` because two callers need the same answer:
+/// the section view, which renders it, and the board's drop wiring, which
+/// reads it to decide whether a drop landed on a group the user could
+/// actually see (`WorkBoardSection.dropGroupKey`). Two copies of this
+/// derivation could disagree about whether a section is open.
+enum WorkBoardSectionCollapse {
+    static func storageKey(sectionID: String) -> String {
+        "boss.kanban.section.\(sectionID).userToggled"
+    }
+
+    /// `true` once the user has flipped this section away from its default,
+    /// which is what the header persists — not the expanded state itself, so
+    /// a section whose default changes still honours an explicit choice.
+    static func userToggled(sectionID: String) -> Bool {
+        BossDefaults.store.object(forKey: storageKey(sectionID: sectionID)) as? Bool ?? false
+    }
+
+    static func isExpanded(sectionID: String, defaultExpanded: Bool) -> Bool {
+        userToggled(sectionID: sectionID) ? !defaultExpanded : defaultExpanded
+    }
+}
+
 struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
     let sectionID: String
     let title: String
@@ -36,10 +62,9 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
         self.banner = banner
         self.accessory = accessory
         self.content = content
-        let stored = BossDefaults.store.object(
-            forKey: "boss.kanban.section.\(sectionID).userToggled"
-        ) as? Bool
-        self._userToggled = State(initialValue: stored ?? false)
+        self._userToggled = State(
+            initialValue: WorkBoardSectionCollapse.userToggled(sectionID: sectionID)
+        )
     }
 
     private var isExpanded: Bool {
@@ -53,7 +78,7 @@ struct CollapsibleWorkBoardSection<Accessory: View, Content: View>: View {
                     let next = !userToggled
                     userToggled = next
                     BossDefaults.store.set(
-                        next, forKey: "boss.kanban.section.\(sectionID).userToggled"
+                        next, forKey: WorkBoardSectionCollapse.storageKey(sectionID: sectionID)
                     )
                 } label: {
                     HStack(spacing: 6) {

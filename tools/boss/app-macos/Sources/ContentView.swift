@@ -1028,9 +1028,16 @@ struct ContentView: View {
             RoundedRectangle(cornerRadius: 16, style: .continuous)
                 .stroke(columnBorderColor, lineWidth: 1)
         )
+        // Column-level fallback: a drop that missed every section — the
+        // column's padding, or a column with no groups. Reported with no
+        // group, which carries strictly less intent than a group-qualified
+        // drop; the engine will not read it as a transition for a card
+        // already in this column. Sections install their own, narrower drop
+        // targets (see `workSectionView`) and SwiftUI prefers the innermost,
+        // so a drop that does land on a group is group-qualified.
         .dropDestination(for: String.self) { items, _ in
             guard let taskID = items.first else { return false }
-            return model.attemptMoveTask(taskID, to: column)
+            return model.attemptDrop(taskID, onColumn: column, group: nil)
         }
     }
 
@@ -1077,26 +1084,48 @@ struct ContentView: View {
     @ViewBuilder
     private func workSectionView(_ section: WorkBoardSection, column: WorkBoardColumnKey) -> some View {
         let sectionProject = section.projectID.flatMap { model.project(withID: $0) }
-        if section.isCollapsible {
-            CollapsibleWorkBoardSection(
-                sectionID: section.id,
-                title: section.title,
-                count: section.items.count,
-                defaultExpanded: section.defaultExpanded,
-                shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
-                banner: section.queueBannerText
-            ) {
-                if let sectionProject {
-                    HStack(spacing: 6) {
-                        ProjectDesignDocAffordance(model: model, project: sectionProject)
-                        PlannerRunAffordance(model: model, project: sectionProject)
+        Group {
+            if section.isCollapsible {
+                CollapsibleWorkBoardSection(
+                    sectionID: section.id,
+                    title: section.title,
+                    count: section.items.count,
+                    defaultExpanded: section.defaultExpanded,
+                    shortIDLabel: sectionProject?.shortID.map { "P" + String($0) },
+                    banner: section.queueBannerText
+                ) {
+                    if let sectionProject {
+                        HStack(spacing: 6) {
+                            ProjectDesignDocAffordance(model: model, project: sectionProject)
+                            PlannerRunAffordance(model: model, project: sectionProject)
+                        }
                     }
+                } content: {
+                    workSectionItems(section.items, column: column)
                 }
-            } content: {
+            } else {
                 workSectionItems(section.items, column: column)
             }
-        } else {
-            workSectionItems(section.items, column: column)
+        }
+        // Group-qualified drop target. `section.dropGroupKey` is non-nil only
+        // for sections that are real named groups (Done's "Merging" and its
+        // completion buckets) *and* currently expanded; whole-column and
+        // project-rollup sections carry no status meaning, and a collapsed
+        // section shows no cards to aim between, so both report `nil` and
+        // behave exactly like the column-level fallback above. Naming the
+        // group is what lets the engine tell a reorder inside Done ▸ Merging
+        // (a no-op) from a genuine Merging → completed transition (a
+        // completion), without either gesture having to be disabled.
+        //
+        // Read inside the closure, not captured: the disclosure state can
+        // change between laying the section out and the drop landing on it.
+        //
+        // SwiftUI routes a drop to the innermost matching destination, so this
+        // wins over the column's whenever the pointer is actually over a
+        // section.
+        .dropDestination(for: String.self) { items, _ in
+            guard let taskID = items.first else { return false }
+            return model.attemptDrop(taskID, onColumn: column, group: section.dropGroupKey)
         }
     }
 

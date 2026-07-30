@@ -2321,6 +2321,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UnpopulateProject { .. } => planner_ops::handle_unpopulate_project(ctx, r).await,
             r @ FrontendRequest::Unsubscribe { .. } => subscriptions::handle_unsubscribe(ctx, r).await,
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
+            r @ FrontendRequest::MoveWorkItemOnBoard { .. } => work_items::handle_move_work_item_on_board(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
             r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
                 sessions::handle_report_worker_spawn_failed(ctx, r).await

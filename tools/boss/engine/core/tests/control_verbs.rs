@@ -33,8 +33,8 @@ use boss_engine::merge_poller::{
 };
 use boss_engine::work::WorkDb;
 use boss_protocol::{
-    CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus, FrontendEvent, FrontendRequest,
-    RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
+    BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus,
+    FrontendEvent, FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 mod common;
@@ -114,6 +114,13 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
 }
 
 async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Result<TaskStatus> {
+    Ok(fetch_task(client, work_item_id).await?.status)
+}
+
+/// Re-read a task/chore row. Use over [`fetch_task_status`] when the
+/// assertion is about a field other than `status` — or about `status`
+/// *staying put* while another field moves.
+async fn fetch_task(client: &mut BossClient, work_item_id: &str) -> Result<Task> {
     let response = client
         .send_request(&FrontendRequest::GetWorkItem {
             id: work_item_id.to_owned(),
@@ -125,7 +132,7 @@ async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Resul
         }
         | FrontendEvent::WorkItemResult {
             item: WorkItem::Task(t),
-        } => Ok(t.status),
+        } => Ok(t),
         other => Err(anyhow!("unexpected GetWorkItem response: {other:?}")),
     }
 }
@@ -2528,5 +2535,379 @@ async fn request_execution_accepts_tnnn_friendly_id() -> Result<()> {
         }
         other => return Err(anyhow!("unexpected response: {other:?}")),
     }
+    Ok(())
+}
+
+/// Regression: reordering a card *inside* the Done column's "Merging"
+/// group must not mark it `done`.
+///
+/// The Done column is not a flat list of completed work. Its "Merging"
+/// group holds `in_review` rows whose PR is in a merge queue or has Merge
+/// When Ready armed — in flight, deliberately rendered where the merge will
+/// land. The macOS client used to translate a drop into that column
+/// straight into `UpdateWorkItem { status: "done" }`, and its only guard
+/// was `status != target_status`; `in_review != done`, so the patch landed
+/// and an ordinary reorder gesture silently completed a live merge. The
+/// consequence was not cosmetic: the merge poller only watches
+/// `status = 'in_review'` rows, so a wrongly-`done` row stops being tracked
+/// and a later queue CI failure is never observed.
+///
+/// The drag now reports its drop target and the engine resolves the
+/// meaning. Acceptance, all against one queued row:
+/// - dropped on Done ▸ Merging (the group it is already in): still
+///   `in_review`, merge-queue state intact,
+/// - dropped on the Done column with no group named (a drop that missed
+///   every section): still `in_review`,
+/// - dropped on Done ▸ a completion group: `done`, because crossing out of
+///   Merging into completed work is the one gesture there that does mean
+///   "this is finished".
+#[tokio::test]
+async fn board_drop_inside_merging_group_does_not_complete_the_merge() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Migrate stranded runbooks")
+                .autostart(false)
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    // Put the row in the exact state that renders in Done ▸ Merging: PR
+    // open (`in_review`) and sitting in the merge queue.
+    client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("in_review".to_owned()),
+                pr_url: Some("https://github.com/spinyfin/mono/pull/1".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    assert!(
+        work_db.set_task_merge_queue_state(&chore.id, Some("queued"), None)?,
+        "queue-state seed must land or the row would not render in Merging"
+    );
+    assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::InReview);
+
+    // The gesture from the bug report: a reorder inside the group.
+    match client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemUpdated { item } => match item {
+            WorkItem::Chore(t) | WorkItem::Task(t) => {
+                assert_eq!(
+                    t.status,
+                    TaskStatus::InReview,
+                    "a reorder inside Merging must not change status"
+                );
+                assert_eq!(
+                    t.merge_queue_state.as_deref(),
+                    Some("queued"),
+                    "the row must still be tracked as an in-flight merge"
+                );
+            }
+            other => return Err(anyhow!("unexpected item kind: {other:?}")),
+        },
+        other => return Err(anyhow!("unexpected response to MoveWorkItemOnBoard: {other:?}")),
+    }
+
+    // A drop that missed every section names the column only. Less intent,
+    // not more — it must not be read as a completion either.
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Done, None),
+        })
+        .await?;
+    assert_eq!(
+        fetch_task_status(&mut client, &chore.id).await?,
+        TaskStatus::InReview,
+        "an unqualified drop on the card's own column must not change status"
+    );
+
+    // Crossing out of Merging into a completion group is a real completion
+    // and must keep working — the fix must not blanket-disable Done.
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Completed)),
+        })
+        .await?;
+    assert_eq!(
+        fetch_task_status(&mut client, &chore.id).await?,
+        TaskStatus::Done,
+        "Merging → a completion group must still complete the row"
+    );
+    Ok(())
+}
+
+/// Companion to the test above, for a column with no groups: dropping a
+/// card back onto the column it already occupies is a reorder, so it must
+/// not fire the transition that column would otherwise assert. Before the
+/// engine owned this decision, a `blocked` row reordered inside its own
+/// column flipped to that column's status — clearing the block as a side
+/// effect of a gesture that only meant "move this up a bit".
+#[tokio::test]
+async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Parked and blocked")
+                .autostart(false)
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    // `blocked` for a non-review reason renders in Backlog.
+    client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                status: Some("blocked".to_owned()),
+                blocked_reason: Some("waiting_on_human".to_owned()),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    assert_eq!(fetch_task_status(&mut client, &chore.id).await?, TaskStatus::Blocked);
+
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Backlog, None),
+        })
+        .await?;
+    assert_eq!(
+        fetch_task_status(&mut client, &chore.id).await?,
+        TaskStatus::Blocked,
+        "reordering inside Backlog must not clear the block"
+    );
+
+    // Leaving the column is still a real transition.
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Review, None),
+        })
+        .await?;
+    assert_eq!(
+        fetch_task_status(&mut client, &chore.id).await?,
+        TaskStatus::InReview,
+        "Backlog → Review must still transition"
+    );
+    Ok(())
+}
+
+/// Nothing can be dragged *into* the Merging group: a row is there because
+/// the engine observed its PR in a merge queue, so the gesture asserts a
+/// fact the client cannot know. The engine refuses rather than picking
+/// the nearest plausible transition, and mutates nothing.
+#[tokio::test]
+async fn board_drop_into_merging_group_is_refused() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Not in any queue")
+                .autostart(false)
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+
+    match client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Done, Some(BoardGroup::Merging)),
+        })
+        .await?
+    {
+        FrontendEvent::WorkError { message } => {
+            assert!(
+                message.contains("Merging"),
+                "refusal must name the group it is about, got: {message}"
+            );
+        }
+        other => return Err(anyhow!("expected WorkError, got: {other:?}")),
+    }
+    assert_eq!(
+        fetch_task_status(&mut client, &chore.id).await?,
+        TaskStatus::Todo,
+        "a refused drop must mutate nothing"
+    );
+    Ok(())
+}
+
+/// Doing → Backlog for a row that is queued to dispatch but has not started.
+/// This is the one drag whose *status* does not change: `todo` + `autostart`
+/// renders in Doing, plain `todo` renders in Backlog, so both columns map to
+/// `todo` and a status patch would be a no-op that snapped the card back.
+/// Clearing `autostart` is what parks it.
+///
+/// Covered here and not only at the resolver level because this branch
+/// changed layers: the drag used to send `update_work_item { autostart:
+/// false }` from the app, and now the engine derives it. The end-to-end
+/// assertion is that the patch actually lands on the row — resolver unit
+/// tests and the client's optimistic-column test can both pass while the
+/// verb writes nothing.
+#[tokio::test]
+async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending_row() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    // Created parked so no creation-time dispatch races the assertion, then
+    // armed — leaving exactly the `todo` + `autostart` shape that renders in
+    // Doing with no execution row.
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Queued to dispatch")
+                .autostart(false)
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+    client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                autostart: Some(true),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    let armed = fetch_task(&mut client, &chore.id).await?;
+    assert_eq!(armed.status, TaskStatus::Todo);
+    assert!(armed.autostart, "the row must be dispatch-pending to render in Doing");
+
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Backlog, None),
+        })
+        .await?;
+
+    let parked = fetch_task(&mut client, &chore.id).await?;
+    assert_eq!(
+        parked.status,
+        TaskStatus::Todo,
+        "both columns are `todo`; the drag must not invent a status change"
+    );
+    assert!(
+        !parked.autostart,
+        "Doing → Backlog must clear autostart, or the card snaps back to Doing"
+    );
     Ok(())
 }

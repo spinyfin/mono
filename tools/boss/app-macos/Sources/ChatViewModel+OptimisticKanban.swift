@@ -6,34 +6,36 @@ extension ChatViewModel {
         let message: String
     }
 
-    /// Variant of `moveTask` that returns whether the drop was
-    /// accepted. Used by the kanban's `dropDestination` so the source
-    /// lane can render an inline warning when the engine would refuse
-    /// the underlying status change.
-    func attemptMoveTask(_ taskID: String, to column: WorkBoardColumnKey) -> Bool {
+    /// Handle a kanban drop. Reports **where** the card landed and lets the
+    /// engine decide what that drop meant; returns whether the drop was
+    /// forwarded at all, so the source lane can render an inline warning for
+    /// the one refusal the client can answer without a round trip.
+    ///
+    /// This does not compute a status, and deliberately so. Both board levels
+    /// — column, and group within the Done column — are derived from engine
+    /// state, so the same drop target means different things depending on
+    /// where the card already was, and the client sees only the layout. See
+    /// the `boss-engine-board-gesture` crate docs for the full argument and
+    /// the resolution matrix.
+    ///
+    /// `group` is `nil` when the drop landed on the column but not on one of
+    /// its groups. That is strictly less intent than a group-qualified drop,
+    /// and the engine treats it as such.
+    func attemptDrop(_ taskID: String, onColumn column: WorkBoardColumnKey, group: WorkBoardGroupKey?) -> Bool {
         guard let task = task(withID: taskID) else { return false }
-        let targetStatus = column.targetStatus
 
-        // Dispatch-pending rows (status=todo, autostart=true) show in the
-        // Doing column but their status is already "todo" — same as Backlog's
-        // targetStatus. The normal status-equality guard would silently refuse
-        // the drop. Instead, accept Doing→Backlog for these rows and flip
-        // autostart=false; lane routing then moves the card to Backlog.
-        let isDispatchPending = task.status == "todo" && task.autostart
-        if isDispatchPending && column == .backlog {
-            // Dispatch-pending tasks show in Doing (todo+autostart). Flipping
-            // autostart=false moves them to Backlog; optimistically reflect that.
-            pendingMoveOriginByTaskID[task.id] = .doing
-            optimisticColumnByTaskID[task.id] = .backlog
-            invalidateWorkCache()
-            engine.sendUpdateWorkItem(id: task.id, patch: ["autostart": false])
-            return true
-        }
+        // Whether the card visibly moved. This is a *rendering* fact the
+        // client already owns (it is how the board lays sections out), not a
+        // status decision — it gates the pre-flight warning and the
+        // optimistic reposition below, never what gets sent. A drop that
+        // leaves the card where it is has nothing to warn about and nothing
+        // to animate; the engine still resolves it (and logs the reorder).
+        let origin = effectiveBoardColumn(for: task)
+        let originGroup = boardGroup(for: task)
+        let staysPut = origin == column && (group == nil || originGroup == group)
 
-        guard task.status != targetStatus else { return false }
-
-        if task.status == "blocked",
-           targetStatus != "blocked",
+        if !staysPut,
+           task.status == "blocked",
            hasGatingPrereqs(task)
         {
             let count = gatingPrereqs(for: task.id).count
@@ -46,8 +48,45 @@ extension ChatViewModel {
             return false
         }
 
-        moveTask(taskID, to: column)
+        // Moving out of Doing while a live worker is attached is blocked
+        // except for two intentional gestures — see `moveTask`, which applies
+        // the same rule to the popover's explicit Move buttons.
+        if !staysPut,
+           origin == .doing,
+           column != .backlog,
+           column != .done,
+           hasLiveWorker(forTaskID: taskID)
+        {
+            appendSystemMessage(
+                "\(task.name) is being worked on by a live worker. Stop the worker before moving the card out of Doing.",
+                alwaysShow: true
+            )
+            return false
+        }
+
+        if !staysPut {
+            // Optimistic reposition: draw the card at the drop site until the
+            // engine's answer arrives. `bounceBackOptimisticMoves` returns it
+            // to `origin` if the engine refuses, and
+            // `reconcileOptimisticOverrides` drops the override once real
+            // state agrees — including when the engine resolved the drop to a
+            // reorder and the real column never changed.
+            pendingMoveOriginByTaskID[taskID] = origin
+            optimisticColumnByTaskID[taskID] = column
+            invalidateWorkCache()
+        }
+
+        engine.sendMoveWorkItemOnBoard(id: taskID, column: column, group: group)
         return true
+    }
+
+    /// Which of its column's named groups `task` currently renders in, or
+    /// `nil` for a column with no groups. Mirrors the Done-column split in
+    /// `computeWorkSections`; kept here so the drop path and the section
+    /// builder cannot drift.
+    func boardGroup(for task: WorkTask) -> WorkBoardGroupKey? {
+        guard effectiveBoardColumn(for: task) == .done else { return nil }
+        return task.isInMergingSection ? .merging : .completed
     }
 
     func clearDragRefusal() {

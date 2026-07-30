@@ -483,6 +483,28 @@ extension EngineClient {
         ])
     }
 
+    /// Report where a kanban drag ended and let the engine decide what the
+    /// drop meant. We send the observed drop target — never a status —
+    /// because the board's columns and groups are both *derived* from engine
+    /// state, so the same target is a reorder for a card already there and a
+    /// transition for one arriving from elsewhere, and only the engine holds
+    /// the state that tells them apart. See the `boss-engine-board-gesture`
+    /// crate docs.
+    ///
+    /// `group` is `nil` when the drop landed on the column but not on one of
+    /// its groups — the column's padding, or a column with no groups.
+    func sendMoveWorkItemOnBoard(id: String, column: WorkBoardColumnKey, group: WorkBoardGroupKey?) {
+        var target: [String: Any] = ["column": column.rawValue]
+        if let group {
+            target["group"] = group.rawValue
+        }
+        sendLine([
+            "type": "move_work_item_on_board",
+            "id": id,
+            "target": target,
+        ])
+    }
+
     /// Ask the engine to schedule an execution for `workItemId`.
     /// Mirrors the bossctl `work start` path. Idempotent — the
     /// engine treats a non-terminal latest execution as the current

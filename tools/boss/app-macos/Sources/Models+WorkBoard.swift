@@ -30,6 +30,18 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
         }
     }
 
+    /// The status this column asserts for a card moved into it by an
+    /// **explicit** affordance — the work-card popover's "Move" buttons,
+    /// where "put this row in that status" is exactly what the click
+    /// meant.
+    ///
+    /// Deliberately NOT used by the drag path: a column does not determine
+    /// its rows' statuses, so this mapping is only sound where the status
+    /// was named directly. A drag reports its drop target to the
+    /// engine (`sendMoveWorkItemOnBoard`) and the engine resolves what it
+    /// meant against the row's own board position — see the
+    /// `boss-engine-board-gesture` crate docs for why that is the only place
+    /// the question can be answered.
     var targetStatus: String {
         switch self {
         case .backlog:
@@ -42,6 +54,21 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
             return "done"
         }
     }
+}
+
+/// A named group *inside* a column, as a drop target. Only the Done column
+/// has groups; see `WorkBoardSection.groupKey` for which sections carry one.
+///
+/// Mirrors `boss_protocol::BoardGroup` — the raw values go on the wire.
+enum WorkBoardGroupKey: String {
+    /// Done ▸ "Merging": `in_review` rows whose PR is in a merge queue or has
+    /// Merge When Ready armed. In flight, **not** complete.
+    case merging
+    /// Any of Done's completion-recency groups ("Today", "Yesterday", weekday
+    /// names, "Last Week", "Earlier"). All `done`. They collapse into one
+    /// wire value because a drop cannot choose which bucket a card lands in —
+    /// that is derived from `completed_at`.
+    case completed
 }
 
 enum WorkBoardGrouping: String, CaseIterable, Identifiable {
@@ -259,11 +286,46 @@ struct WorkBoardSection: Identifiable {
     /// icon) reads this to look up the resolved
     /// `ProjectDesignDocState` for the section's header row.
     var projectID: String? = nil
+    /// Which of its column's named groups this section is, when the section
+    /// is a real group rather than a whole-column or project rollup. `nil`
+    /// for the flat single-section columns and for project groupings — those
+    /// carry no status meaning, so a drop on them names only the column.
+    ///
+    /// Read by the kanban's per-section drop target: it is what lets the
+    /// engine tell a reorder inside Done ▸ Merging from a genuine
+    /// Merging → completed transition.
+    var groupKey: WorkBoardGroupKey? = nil
     /// "Trunk queue paused/draining" banner shown in the section header
     /// (`ChatViewModel.mergingSection`'s `MergeQueueDetail.queueStateBanner`
     /// rollup). `nil` for every section except "Merging" while a tracked
     /// Trunk queue is non-`running`.
     var queueBannerText: String? = nil
+
+    /// The group a drop landing on this section should report to the engine:
+    /// [`groupKey`], except that a **collapsed** section reports `nil`.
+    ///
+    /// A collapsed section is a header row and nothing else — a thin strip
+    /// stacked directly beneath the section above it, whose cards are not on
+    /// screen. A drop there cannot mean "put this card among those": the user
+    /// cannot see what "those" are, and the strip is a few points tall
+    /// immediately below a full-height expanded section. Naming only the
+    /// column downgrades it to the same unqualified drop as a landing on the
+    /// column's padding, which the engine never reads as a transition for a
+    /// card already in that column.
+    ///
+    /// This narrows one specific accident — reordering inside Done ▸ Merging
+    /// while a collapsed completion group sits underneath it — without
+    /// disabling anything: an expanded completion group still carries its
+    /// key, so the deliberate Merging → completed drop still completes the
+    /// row. Non-collapsible sections are always visible and unaffected.
+    var dropGroupKey: WorkBoardGroupKey? {
+        guard isCollapsible else { return groupKey }
+        let expanded = WorkBoardSectionCollapse.isExpanded(
+            sectionID: id,
+            defaultExpanded: defaultExpanded
+        )
+        return expanded ? groupKey : nil
+    }
 }
 
 /// Swift mirror of `boss_protocol::short_name_for(url)` from the

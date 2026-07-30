@@ -24,6 +24,7 @@
 
 mod attention;
 mod automation;
+mod board;
 mod ci;
 mod comment;
 mod common;
@@ -47,6 +48,7 @@ mod tests;
 
 pub use attention::*;
 pub use automation::*;
+pub use board::*;
 pub use ci::*;
 pub use comment::*;
 pub use common::*;

@@ -1617,16 +1617,19 @@ final class ChatViewModel: ObservableObject {
         engine.sendReorderProjectTasks(projectId: projectID, taskIds: tasks.map(\.id))
     }
 
-    /// Move a card between kanban columns. Two extra concerns vs. a
-    /// pure status edit, both per `tools/boss/docs/designs/work-kanban.md`:
+    /// Apply an explicit column choice from the work-card popover's "Move"
+    /// buttons. The drag path does not come through here — it reports its
+    /// drop target and the engine resolves it
+    /// (`sendMoveWorkItemOnBoard`). Two extra concerns vs. a pure status
+    /// edit, both per `tools/boss/docs/designs/work-kanban.md`:
     ///
-    /// - Drop into Doing (target status `active`) also fires
+    /// - Choosing Doing (target status `active`) also fires
     ///   `RequestExecution` so the engine schedules a worker. The
     ///   engine is idempotent — a non-terminal execution already
     ///   running for this work item won't get a duplicate.
     /// - Move OUT of Doing while a live worker is attached is
     ///   blocked — except for two intentional gestures:
-    ///   (a) Dragging back to Backlog (`todo`): engine stops the worker,
+    ///   (a) Choosing Backlog (`todo`): engine stops the worker,
     ///       releases the lease, and parks the card — no autostart.
     ///   (b) Terminal transitions (`done`, `archived`): these mirror the
     ///       engine's own lifecycle resolutions and are always allowed.
@@ -1672,10 +1675,12 @@ final class ChatViewModel: ObservableObject {
     ]
 
     /// True iff the work item has a non-terminal worker currently
-    /// attached (running, paused on input, or idle between turns).
+    /// attached (running, paused on input, or idle between turns). Shared
+    /// with the kanban drop path (`attemptDrop`), which applies the same
+    /// out-of-Doing rule as the popover's explicit Move buttons.
     /// `WorkerActivity.terminated` and `.errored` count as "no live
     /// worker" — the slot is no longer holding the run open.
-    private func hasLiveWorker(forTaskID taskID: String) -> Bool {
+    func hasLiveWorker(forTaskID taskID: String) -> Bool {
         guard let live = workerLiveState(forTaskID: taskID) else {
             return false
         }
