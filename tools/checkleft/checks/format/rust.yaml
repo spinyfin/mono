@@ -53,7 +53,7 @@ invocations:
       kind: linelist
       message: "file needs rustfmt formatting"
       remediations:
-        - "Run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{input.file}}`."
+        - "If `checkleft fix` cannot resolve it, run `cargo fmt` to reformat, or apply the expected diff shown by `rustfmt --check {{input.file}}`."
     fix:
       # Drop --check and -l; rustfmt writes the file in place and exits 0 on success.
       # --config-path pin is kept so the repo's rustfmt.toml governs the rewrite.

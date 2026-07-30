@@ -35,7 +35,7 @@ invocations:
         message: "file needs buildifier formatting"
         severity: warning
         remediations:
-          - "Run `buildifier {{item.filename}}` to auto-format."
+          - "If `checkleft fix` cannot resolve it, run `buildifier {{item.filename}}` to auto-format."
     fix:
       # -mode=fix rewrites each file in place; exits 0 on success.
       args:

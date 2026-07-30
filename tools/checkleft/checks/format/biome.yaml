@@ -84,7 +84,7 @@ invocations:
         message: "file needs biome formatting"
         severity: warning
         remediations:
-          - "Run `{{needs.biome.invocation}} format --write {{item.path}}` to auto-format."
+          - "If `checkleft fix` cannot resolve it, run `{{needs.biome.invocation}} format --write {{item.path}}` to auto-format."
     fix:
       # biome format --write rewrites each file in place and exits 0 on success.
       # --files-ignore-unknown=true carried over so stray files are skipped silently.

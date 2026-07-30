@@ -109,7 +109,7 @@ invocations:
         message: "{{item.msg}}"
         severity: "{{item.sev}}"
         remediations:
-          - "Fix the oxlint violation, or suppress it with a justified `// oxlint-disable-next-line <rule>` comment."
+          - "For error and warning findings, `checkleft fix` applies oxlint's auto-fixable violations. If the violation remains afterward, fix it manually, or suppress it with a justified `// oxlint-disable-next-line <rule>` comment."
     fix:
       # --fix applies auto-fixable violations in place. Exit 1 means unfixable
       # diagnostics remain — that is not a fix error (the fixable ones were applied);

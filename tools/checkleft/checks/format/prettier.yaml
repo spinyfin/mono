@@ -71,7 +71,7 @@ invocations:
       kind: linelist
       message: "file needs prettier formatting"
       remediations:
-        - "Run `{{needs.prettier.invocation}} --write {{input.file}}` to auto-format."
+        - "If `checkleft fix` cannot resolve it, run `{{needs.prettier.invocation}} --write {{input.file}}` to auto-format."
     fix:
       # prettier --write rewrites each file in place and exits 0 on success.
       # Exit 2 (parse error) is a genuine failure — abort copy-back.

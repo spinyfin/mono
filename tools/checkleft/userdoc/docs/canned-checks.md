@@ -244,7 +244,7 @@ checks:
 
 Notes:
 
-- Each finding's remediation is ``Run `prettier --write <file>` to auto-format.``
+- Each fixable finding's remediation leads with ``Run `checkleft fix` to apply this automatically.``, followed by ``If `checkleft fix` cannot resolve it, run `prettier --write <file>` to auto-format.``
 - A file Prettier has no parser for is skipped (`--ignore-unknown`) rather than reported as an error.
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
@@ -283,7 +283,7 @@ checks:
 
 Notes:
 
-- Each finding's remediation is ``Run `<biome invocation> format --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
+- Each fixable finding's remediation leads with ``Run `checkleft fix` to apply this automatically.``, followed by ``If `checkleft fix` cannot resolve it, run `<biome invocation> format --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
@@ -324,7 +324,7 @@ checks:
 
 Notes:
 
-- Each finding's remediation is ``Run `<oxfmt invocation> --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
+- Each fixable finding's remediation leads with ``Run `checkleft fix` to apply this automatically.``, followed by ``If `checkleft fix` cannot resolve it, run `<oxfmt invocation> --write <file>` to auto-format`` (the invocation prefix tracks whatever `needs` binding resolved, including any per-repo version override).
 - A file oxfmt cannot parse exits with an operational error (exit 2) and is reported as a per-file **error** finding rather than masquerading as clean; other files in the changeset are unaffected.
 - Findings take the configured policy severity, which defaults to `error` when unset (like the other format checks). Set `[checks.policy].severity: warning` for a non-blocking instance.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
@@ -431,7 +431,7 @@ checks:
 Notes:
 
 - Biome is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
-- Each finding's remediation is to fix the violation or suppress it with a justified `// biome-ignore lint: <reason>` comment.
+- Each fixable finding's remediation leads with ``Run `checkleft fix` to apply this automatically.``, followed by ``For error and warning findings, `checkleft fix` applies Biome's safe auto-fixes. If the violation remains afterward, fix it manually, or suppress it with a justified `// biome-ignore lint: <reason>` comment.`` `checkleft fix` only ever acts on `Error`/`Warning` findings — an `Info` finding (Biome's `information`/`hint` severities) never gets the leading bullet, since `checkleft fix` will not touch it.
 - Biome's per-finding severity is preserved end-to-end, so no policy configuration is needed to get the error/warning/info distinction. To make all findings non-blocking, set `policy.severity: warning`, which overrides every finding's severity regardless of what Biome reported.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
@@ -472,7 +472,7 @@ checks:
 Notes:
 
 - oxlint is invoked in batch mode (once per changed-file set, not once per file), which is more efficient for large changesets.
-- Each finding's remediation is to fix the violation or suppress it with a justified `// oxlint-disable-next-line <rule>` comment.
+- Each fixable finding's remediation leads with ``Run `checkleft fix` to apply this automatically.``, followed by ``For error and warning findings, `checkleft fix` applies oxlint's auto-fixable violations. If the violation remains afterward, fix it manually, or suppress it with a justified `// oxlint-disable-next-line <rule>` comment.`` `checkleft fix` only ever acts on `Error`/`Warning` findings — an `Info` finding (oxlint severities other than `error`/`warning`) never gets the leading bullet, since `checkleft fix` will not touch it.
 - oxlint's per-finding severity is preserved end-to-end, so no policy configuration is needed to get the error/warning/info distinction. To make all findings non-blocking, set `policy.severity: warning`, which overrides every finding's severity regardless of what oxlint reported.
 - See [needs version pinning](external-check-package-contract.md#declarative-mode-fields) for the full `needs` binding schema.
 
