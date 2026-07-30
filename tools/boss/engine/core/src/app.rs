@@ -1500,6 +1500,15 @@ impl ServerState {
             // worker is about to occupy.
             return self.reap_untracked_worker_process(run_id).await;
         };
+        // Between the drain above and `take_slot_for_run` just now, the slot
+        // mapping still read `Some`: a concurrent probe insert guarded on
+        // `slot_for_run(...).is_none()` (`requeue_probe_front`,
+        // `handle_probe_run`'s post-insert re-check) could have passed that
+        // guard and landed a probe on this run's queue in that window. Now
+        // that the slot mapping is actually gone, re-run the drain so that
+        // probe does not strand reading `queued` forever. Idempotent: a no-op
+        // when nothing landed in the window.
+        self.abandon_pending_probes_for_terminated_run(run_id, "worker pane released");
         // Snapshot the worker's recorded shell pid *before* we drop the
         // live-state entry further down — the engine-side reap backstop
         // below needs it. `0` means "pid not reported by the app yet",

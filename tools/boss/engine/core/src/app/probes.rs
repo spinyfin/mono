@@ -109,7 +109,10 @@ pub(super) enum ProbeDispatchOutcome {
     /// winner owns the probe and records its outcome.
     RacedToEmpty,
     /// A probe was popped and dispatched; the value is the delivery state
-    /// recorded for it.
+    /// recorded for it. That state may be an undeliverable one (e.g.
+    /// `Abandoned`) recorded without a successful delivery — this variant
+    /// only means the probe left the queue through this call, not that it
+    /// reached the pane.
     Dispatched(ProbeDeliveryState),
     /// A probe was popped, the write failed, and it was pushed back onto the
     /// front of the queue with its id intact for the next boundary.

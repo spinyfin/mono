@@ -349,11 +349,38 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // probe was not queued yet), and the insert above then landed against
         // a run nothing will ever revisit. Re-check right after inserting and
         // settle immediately rather than leaving it reading `queued` forever.
-        if server_state.worker_registry.slot_for_run(&run_id).is_none() {
-            server_state.abandon_pending_probes_for_terminated_run(
+        //
+        // Drain directly (rather than going through
+        // `abandon_pending_probes_for_terminated_run`) so this call site can
+        // see whether the probe it just minted is among the ones settled
+        // `Abandoned` — deciding before answering, per the doc above, rather
+        // than answering `ProbeQueued` for a probe already known dead.
+        let just_abandoned = if server_state.worker_registry.slot_for_run(&run_id).is_none() {
+            let ids = server_state.drain_pending_probes(
                 &run_id,
-                "run's pane was released between the delivery-expectation check and the probe being queued",
+                ProbeDeliveryState::Abandoned,
+                "run's pane was released between the delivery-expectation check and the probe being \
+                 queued; the worker was gone before the probe's delivery boundary arrived",
             );
+            if !ids.is_empty() {
+                tracing::warn!(
+                    run_id = %run_id,
+                    probe_ids = %ids.join(","),
+                    "run terminated with probes still queued; the accepted delivery commitment could \
+                     not be honoured — recorded as abandoned rather than left queued",
+                );
+            }
+            ids.contains(&probe_id)
+        } else {
+            false
+        };
+        if just_abandoned {
+            let reason = "run's pane was released between the delivery-expectation check and the probe \
+                           being queued; the probe cannot be delivered"
+                .to_owned();
+            tracing::warn!(run_id = %run_id, probe_id = %probe_id, %reason, "probe refused: abandoned before response");
+            send_response(&sink, &request_id, FrontendEvent::ProbeRefused { run_id, reason });
+            return;
         }
         tracing::info!(
             run_id = %run_id,
@@ -402,7 +429,8 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
             // immediate path then declined to deliver, which is the engine
             // breaking a commitment it made in the response it already sent.
             let promised_now = expected_delivery == ProbeDeliveryExpectation::Immediate;
-            if promised_now && !matches!(outcome, ProbeDispatchOutcome::Dispatched(_)) {
+            if promised_now && !matches!(outcome, ProbeDispatchOutcome::Dispatched(state) if !state.is_undeliverable())
+            {
                 tracing::warn!(
                     run_id = %run_id_for_now,
                     probe_id = %probe_id_for_now,

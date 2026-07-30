@@ -1161,10 +1161,10 @@ async fn stop_drain_names_raced_to_empty_when_another_path_holds_the_slot() {
 }
 
 /// A pane write that fails (no app session registered, so `SendToPane`
-/// errors immediately) pushes the probe back to the front of the queue with
-/// its id intact and reports `RequeuedAfterFailure` — the specific defect
-/// the brief called out (the original `pop -> None` / silent-failure shape
-/// this drain path replaced).
+/// errors immediately) must push the probe back to the front of the queue
+/// with its id intact and report `RequeuedAfterFailure`, rather than exiting
+/// silently — a probe that is popped and then lost is indistinguishable in
+/// the trace from one that was never queued.
 #[tokio::test]
 async fn stop_drain_requeues_after_a_failed_pane_write() {
     let (server_state, _dir) = test_server_state();
