@@ -42,14 +42,21 @@ fn parse_codex_version(stdout: &str) -> Option<String> {
     }
 }
 
-fn require_codex_cli() -> bool {
-    match std::env::var("BOSS_REQUIRE_CODEX_CLI") {
+/// Truthy-env-var parsing shared by every driver's "require the live CLI"
+/// gate (`BOSS_REQUIRE_CODEX_CLI`, `BOSS_REQUIRE_GROK_CLI`, …), so a future
+/// third driver's pin does not add yet another copy of the same parsing.
+fn require_cli(var: &str) -> bool {
+    match std::env::var(var) {
         Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         }
         Err(_) => false,
     }
+}
+
+fn require_codex_cli() -> bool {
+    require_cli("BOSS_REQUIRE_CODEX_CLI")
 }
 
 #[test]
@@ -412,13 +419,18 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // the single `grok-4.5` SKU).
 
 fn require_grok_cli() -> bool {
-    match std::env::var("BOSS_REQUIRE_GROK_CLI") {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+    require_cli("BOSS_REQUIRE_GROK_CLI")
+}
+
+/// Probe grok availability with a flag guaranteed to be present (`--help`).
+/// Soft-skip (return `false`, meaning "test body should return early") when
+/// the binary is absent or `--help` itself fails, unless `BOSS_REQUIRE_GROK_CLI`
+/// is set, in which case that failure panics. Once this returns `true`, the
+/// binary is established present and working, so callers must invoke their
+/// real assertion directly (not through [`run_live_grok`]'s soft-skip path)
+/// so a removed flag/subcommand fails loudly instead of degrading to a skip.
+fn grok_cli_available() -> bool {
+    run_live_grok(&["--help"]).is_some()
 }
 
 /// Run `grok` with `args`; soft-skip (return `None`) on spawn failure or a
@@ -500,9 +512,23 @@ fn hidden_trust_flag_still_parses_on_installed_grok() {
     // `--help` action fires, so an unrecognised `--trust` fails the whole
     // invocation regardless of where `--help` sits on the command line —
     // this catches the removal a `--help` diff cannot.
-    let Some(output) = run_live_grok(&["--trust", "--help"]) else {
+    //
+    // Availability (binary present, `--help` works) is probed separately
+    // from the assertion itself. `run_live_grok` soft-skips on ANY non-zero
+    // exit, and a removed `--trust` IS a non-zero exit (verified: an unknown
+    // flag exits 2 with "unexpected argument" on stderr) — routing the
+    // assertion through it would make the mandatory hidden-flag check a
+    // silent no-op in the default (non-`BOSS_REQUIRE_GROK_CLI`) mode, which
+    // is exactly the mode every dev host and CI run uses. So once the binary
+    // is confirmed present and working, invoke `--trust --help` directly and
+    // panic on failure — never skip.
+    if !grok_cli_available() {
         return;
-    };
+    }
+    let output = Command::new("grok")
+        .args(["--trust", "--help"])
+        .output()
+        .expect("grok confirmed available by grok_cli_available()");
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -510,19 +536,34 @@ fn hidden_trust_flag_still_parses_on_installed_grok() {
     )
     .to_lowercase();
     assert!(
-        !combined.contains("unrecognized")
+        output.status.success()
+            && !combined.contains("unrecognized")
             && !combined.contains("unexpected argument")
             && !combined.contains("unknown flag"),
         "`grok --trust --help` must still accept the hidden --trust flag; a worker spawn that \
-         loses it hangs on the folder-trust dialog (spike Q3). got: {combined}",
+         loses it hangs on the folder-trust dialog (spike Q3). status={:?} got: {combined}",
+        output.status,
     );
 }
 
 #[test]
 fn grok_models_menu_matches_pinned_descriptor() {
-    let Some(output) = run_live_grok(&["models"]) else {
+    // Same availability-probe split as `hidden_trust_flag_still_parses_on_installed_grok`:
+    // a removed `models` subcommand also degrades to a non-zero exit, which
+    // `run_live_grok` would silently skip in the default mode.
+    if !grok_cli_available() {
         return;
-    };
+    }
+    let output = Command::new("grok")
+        .arg("models")
+        .output()
+        .expect("grok confirmed available by grok_cli_available()");
+    assert!(
+        output.status.success(),
+        "`grok models` must still exist and succeed on the installed CLI; status={:?} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let default_model = stdout
         .lines()

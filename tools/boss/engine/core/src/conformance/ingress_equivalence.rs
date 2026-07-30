@@ -6,7 +6,7 @@
 
 use crate::conformance::fixtures::{
     CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, GROK_HOOK_SESSION_JSONL,
-    codex_shaped_driver, decode_jsonl, expected_session_events, normalize_session_id,
+    codex_shaped_driver, decode_jsonl, expected_session_events, normalize_session_id, normalize_session_start_source,
 };
 use crate::driver::{ClaudeDriver, GrokDriver};
 
@@ -58,6 +58,7 @@ fn grok_hook_ingress_matches_expected_session_sequence() {
     let events: Vec<_> = decode_jsonl(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(normalize_session_start_source)
         .collect();
     assert_eq!(
         events,
@@ -79,6 +80,7 @@ fn claude_and_grok_hook_ingress_produce_identical_worker_event_sequences() {
     let grok_events: Vec<_> = decode_jsonl(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL)
         .into_iter()
         .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(normalize_session_start_source)
         .collect();
     assert_eq!(
         claude_events, grok_events,

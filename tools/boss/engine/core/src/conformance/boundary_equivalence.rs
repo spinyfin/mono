@@ -63,8 +63,13 @@ fn hook_stop_and_native_turn_completed_produce_identical_turn_end() {
 
 #[test]
 fn hook_stop_and_grok_stop_produce_identical_turn_end() {
-    // Grok's Stop hook is structurally identical to Claude's (design G-7):
-    // `stopHookActive` canonicalises to `stop_hook_active` / `continuation`.
+    // Grok's Stop hook is structurally identical to Claude's for a completed
+    // turn (design G-7): `stopHookActive` canonicalises to
+    // `stop_hook_active` / `continuation`. This parity holds only for
+    // completed turns — G-7 itself reads "maps directly, except after an
+    // interrupt", and per design §Interrupt (spike Q8) an Esc-cancelled Grok
+    // turn emits no Stop hook at all. That divergent path is covered by the
+    // narrow interrupt observer, not this seam.
     let from_claude_hooks = last_turn_end(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL);
     let from_grok_hooks = last_turn_end(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL);
 
