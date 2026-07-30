@@ -931,10 +931,16 @@ fn build_large_rs_source_with_violation(line_count: usize) -> String {
 // `narrow_by_applies_to` (defined in `runtime.rs`, exercised here via `super::`
 // since `tests` is a child module) is the pure host-side function that gives
 // component checks the same `applies_to` config-override narrowing the
-// declarative path already had. These pin its two outcomes directly — no glob
+// declarative path already had. These pin its outcomes directly — no glob
 // override narrows nothing (`Ok(None)`), a matching override narrows
-// (`Ok(Some(_))`) — before the slower end-to-end tests below prove it is
-// actually wired into `execute`/`execute_with_progress`/`eligible_file_count`.
+// (`Ok(Some(_))`), and every flavor of zero-match returns a clean empty
+// result rather than an error — before the slower end-to-end tests below
+// prove it is actually wired into `execute`/`execute_with_progress`/
+// `eligible_file_count`.
+//
+// A glob that is structurally unsatisfiable in any repo (leading `./`,
+// trailing `/`, `!` prefix) is a distinct, config-resolution-time error case
+// handled elsewhere and is out of scope for these tests.
 
 #[test]
 fn narrow_by_applies_to_absent_override_is_a_noop() {
@@ -945,7 +951,7 @@ fn narrow_by_applies_to_absent_override_is_a_noop() {
     }]);
     let config = toml::Value::Table(Default::default());
 
-    let narrowed = super::narrow_by_applies_to(&changeset, &config, None).expect("no override present");
+    let narrowed = super::narrow_by_applies_to(&changeset, &config).expect("no override present");
     assert!(
         narrowed.is_none(),
         "absent `applies_to` must leave the changeset untouched"
@@ -970,64 +976,42 @@ fn narrow_by_applies_to_filters_to_matching_files_only() {
         applies_to = ["only/*.rs"]
     });
 
-    let narrowed = super::narrow_by_applies_to(&changeset, &config, None)
+    let narrowed = super::narrow_by_applies_to(&changeset, &config)
         .expect("valid override")
         .expect("override present");
     assert_eq!(narrowed.changed_files.len(), 1);
     assert_eq!(narrowed.changed_files[0].path, PathBuf::from("only/here.rs"));
 }
 
-/// A [`SourceTree`] whose `glob` reports whatever fixed match set the test
-/// wires up, independent of any real filesystem — used to pin the repo-wide
-/// unsatisfiability audit `narrow_by_applies_to` performs when its caller
-/// passes `Some(source_tree)`.
-struct StubGlobSourceTree {
-    matches: Vec<PathBuf>,
-}
-
-impl SourceTree for StubGlobSourceTree {
-    fn read_file(&self, _path: &std::path::Path) -> anyhow::Result<Vec<u8>> {
-        anyhow::bail!("StubGlobSourceTree: no files available")
-    }
-
-    fn exists(&self, _path: &std::path::Path) -> bool {
-        false
-    }
-
-    fn list_dir(&self, _path: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
-        Ok(vec![])
-    }
-
-    fn glob(&self, _pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
-        Ok(self.matches.clone())
-    }
-}
-
 #[test]
-fn narrow_by_applies_to_zero_match_against_nonempty_changeset_and_repo_errors() {
-    // The override matches nothing in this changeset AND nothing anywhere in
-    // the repo (per the stub's empty match set) — the typo case. Must error.
+fn narrow_by_applies_to_repo_wide_zero_match_does_not_error() {
+    // The override (`**/*.kt`) matches nothing in this changeset, and — unlike
+    // the changeset-only case below — nothing anywhere in the repo either
+    // (there is no way for this pure, changeset-only function to know that,
+    // and it must not try). E.g. a guard check scoped to a file type the repo
+    // does not yet contain. Must return a clean, empty result, never an error.
     let changeset = ChangeSet::new(vec![ChangedFile {
         path: PathBuf::from("src.rs"),
         kind: ChangeKind::Modified,
         old_path: None,
     }]);
     let config = toml::Value::Table(toml::toml! {
-        applies_to = ["**/*.swift"]
+        applies_to = ["**/*.kt"]
     });
-    let repo = StubGlobSourceTree { matches: vec![] };
 
-    let err = super::narrow_by_applies_to(&changeset, &config, Some(&repo))
-        .expect_err("a glob matching nothing in the repo must error, not silently pass");
-    let message = format!("{err:#}");
-    assert!(message.contains("applies_to"), "got: {message}");
-    assert!(message.contains("no tracked file in the repo"), "got: {message}");
+    let narrowed = super::narrow_by_applies_to(&changeset, &config)
+        .expect("a glob matching nothing anywhere in the repo must not error")
+        .expect("override present");
+    assert!(
+        narrowed.changed_files.is_empty(),
+        "narrowed changeset must be empty, not an error, when the glob matches nothing repo-wide"
+    );
 }
 
 #[test]
-fn narrow_by_applies_to_zero_match_against_changeset_but_repo_has_match_does_not_error() {
-    // The override matches nothing in THIS changeset but does match a tracked
-    // file elsewhere in the repo (per the stub) — e.g. a Swift-only override
+fn narrow_by_applies_to_changeset_only_zero_match_does_not_error() {
+    // The override matches nothing in THIS changeset but (conceptually) does
+    // match a tracked file elsewhere in the repo — e.g. a Swift-only override
     // scheduled for a Rust-only PR's changeset. This is the ordinary case and
     // must return a clean, empty narrowed changeset rather than erroring.
     let changeset = ChangeSet::new(vec![ChangedFile {
@@ -1038,12 +1022,9 @@ fn narrow_by_applies_to_zero_match_against_changeset_but_repo_has_match_does_not
     let config = toml::Value::Table(toml::toml! {
         applies_to = ["**/*.swift"]
     });
-    let repo = StubGlobSourceTree {
-        matches: vec![PathBuf::from("app/Foo.swift")],
-    };
 
-    let narrowed = super::narrow_by_applies_to(&changeset, &config, Some(&repo))
-        .expect("a glob satisfiable elsewhere in the repo must not error")
+    let narrowed = super::narrow_by_applies_to(&changeset, &config)
+        .expect("a changeset-only zero match must not error")
         .expect("override present");
     assert!(
         narrowed.changed_files.is_empty(),
@@ -1052,30 +1033,9 @@ fn narrow_by_applies_to_zero_match_against_changeset_but_repo_has_match_does_not
 }
 
 #[test]
-fn narrow_by_applies_to_zero_match_without_source_tree_does_not_error() {
-    // Callers with no SourceTree (e.g. eligible_file_count) skip the repo
-    // audit entirely and just get the narrowed (empty) result back.
-    let changeset = ChangeSet::new(vec![ChangedFile {
-        path: PathBuf::from("src.rs"),
-        kind: ChangeKind::Modified,
-        old_path: None,
-    }]);
-    let config = toml::Value::Table(toml::toml! {
-        applies_to = ["**/*.swift"]
-    });
-
-    let narrowed = super::narrow_by_applies_to(&changeset, &config, None)
-        .expect("must not error when no source_tree is provided")
-        .expect("override present");
-    assert!(narrowed.changed_files.is_empty());
-}
-
-#[test]
 fn narrow_by_applies_to_zero_match_against_all_deleted_changeset_does_not_error() {
     // A changeset containing only deleted files has zero *non-deleted* files to
-    // begin with, so a zero-match narrowing is not a sign of a typo'd glob —
-    // there was nothing to select in the first place. Must not error, and must
-    // not even consult the repo audit (the stub would error if it were asked).
+    // begin with; a zero-match narrowing here must not error either.
     let changeset = ChangeSet::new(vec![ChangedFile {
         path: PathBuf::from("gone.rs"),
         kind: ChangeKind::Deleted,
@@ -1084,10 +1044,9 @@ fn narrow_by_applies_to_zero_match_against_all_deleted_changeset_does_not_error(
     let config = toml::Value::Table(toml::toml! {
         applies_to = ["**/*.swift"]
     });
-    let repo = StubGlobSourceTree { matches: vec![] };
 
-    let narrowed = super::narrow_by_applies_to(&changeset, &config, Some(&repo))
-        .expect("must not error on an all-deleted changeset");
+    let narrowed =
+        super::narrow_by_applies_to(&changeset, &config).expect("must not error on an all-deleted changeset");
     assert!(narrowed.is_some());
 }
 
@@ -1098,7 +1057,7 @@ fn narrow_by_applies_to_invalid_glob_errors() {
         applies_to = ["["]
     });
 
-    let err = super::narrow_by_applies_to(&changeset, &config, None).expect_err("an invalid glob must be rejected");
+    let err = super::narrow_by_applies_to(&changeset, &config).expect_err("an invalid glob must be rejected");
     assert!(format!("{err:#}").contains("applies_to"));
 }
 
@@ -1221,10 +1180,12 @@ fn applies_to_config_override_double_star_glob_matches_root_and_nested_files() {
 }
 
 /// End-to-end zero-match: a valid but non-matching `applies_to` override run
-/// through the real component path must fail the check run loudly rather than
-/// silently reporting zero findings.
+/// through the real component path — where the glob also matches nothing
+/// anywhere in the repo, e.g. a guard check scoped to a file type the repo
+/// does not yet contain — must run cleanly with zero findings, not fail the
+/// check. Config validity must not depend on the repo's current contents.
 #[test]
-fn applies_to_config_override_zero_match_fails_component_execution() {
+fn applies_to_config_override_repo_wide_zero_match_succeeds() {
     let temp = tempdir().expect("temp dir");
     write_file(temp.path(), "src.rs", BIG_STRUCT_SOURCE);
 
@@ -1239,7 +1200,7 @@ fn applies_to_config_override_zero_match_fails_component_execution() {
     });
 
     let executor = crate::external::test_support::executor_with_precompiled_cache(temp.path());
-    let err = executor
+    let result = executor
         .execute(
             &bundled_package("rust/giant-structs"),
             &changeset,
@@ -1249,9 +1210,12 @@ fn applies_to_config_override_zero_match_fails_component_execution() {
             None,
             &crate::exclusion_matcher::ExclusionMatcher::default(),
         )
-        .expect_err("a non-matching applies_to override against a non-empty changeset must fail the run");
-    let message = format!("{err:#}");
-    assert!(message.contains("applies_to"), "got: {message}");
+        .expect("a glob matching nothing anywhere in the repo must not fail the run");
+    assert!(
+        result.findings.is_empty(),
+        "no file matched the override, so there is nothing to scan; got {:?}",
+        result.findings
+    );
 }
 
 /// End-to-end: an `applies_to` override (e.g.

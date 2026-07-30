@@ -294,7 +294,7 @@ checks:
         - "**/*.swift"
 ```
 
-**Zero-match semantics differ from the declarative path in one respect.** For a declarative check, `applies_to` narrows the file list a single invocation is handed; if the glob(s) select none of the current changeset's files, the check simply reports a clean, empty result for this run. Component checks behave the same way for an ordinary, non-matching changeset (e.g. a Swift-only override running against an all-Rust PR) — a clean, empty result, not a failure. The check only fails loudly when the override doesn't match _any tracked file anywhere in the repo_ — that condition is treated as evidence of a typo'd glob (nothing under that pattern could ever run), and it is reported the same way an invalid `applies_to` value is: as a failed check execution.
+**Zero-match semantics are the same as the declarative path's.** `applies_to` narrows the file list a check invocation is handed; if the glob(s) select none of the current changeset's files, the check simply reports a clean, empty result for this run — in every run mode, whether that's because the changeset happens not to touch a matching file (e.g. a Swift-only override running against an all-Rust PR) or because the repo doesn't contain any matching file yet (e.g. a guard check scoped ahead of time to a file type not yet in the repo). A malformed override — a non-list value, an empty list, a blank string, or invalid glob syntax — still fails loudly; that is a genuinely decidable configuration error, unrelated to what the glob(s) happen to match.
 
 ## Pattern: First-party (bundled) check — zero install
 
