@@ -20,14 +20,21 @@ use async_trait::async_trait;
 use boss_codex_auth::{
     AuthSnapshot, adopt_refresh_if_newer, resolve_operator_auth_path, snapshot_auth_into_codex_home,
 };
-use boss_engine_codex_hook_trust::{ArmRequest, CommandHookSpec, HookEvent, arm_and_attest, write_attestation_file};
+use boss_engine_codex_hook_trust::{
+    ArmRequest, CommandHookSpec, HookEvent, arm_and_attest, sha256_hex_prefixed, write_attestation_file,
+};
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
+pub mod guard_trace;
 mod progress;
+mod tool_surface_guard;
+
+use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
+use tool_surface_guard::CODEX_TOOL_SURFACE_GUARD_SCRIPT;
 
 use progress::{
     CodexProgressSession, CodexRolloutProgressSession, CodexTranscriptSession, normalize_rollout,
@@ -70,6 +77,49 @@ pub const UNOBSERVED_COMMAND_MARKER: &str = "[codex-unobserved-command]";
 /// one place.
 pub(crate) fn unobserved_command_notification(command: &str) -> String {
     format!("{UNOBSERVED_COMMAND_MARKER} {command}")
+}
+
+/// Marker prefix on a [`WorkerEvent::Notification`] carrying this turn's
+/// `PreToolUse` guard activity: how many guards ran, what they decided, and
+/// the reason head of every block or guard failure.
+///
+/// This is the answer to "did the guard fire for this execution?", which had
+/// no answer at all on the Codex path before — Codex's rollout carries no hook
+/// record, so an approved guard left no trace anywhere. Records come from
+/// [`guard_trace`]'s per-run JSONL, written by the shim every materialised
+/// guard is invoked through.
+pub const GUARD_TRACE_MARKER: &str = "[codex-guard-trace]";
+
+/// Marker prefix on a [`WorkerEvent::Notification`] emitted when tool calls
+/// have run and **no** guard invocation has been recorded for this run at all.
+///
+/// That is the observable signature of Codex's documented silent fail-open:
+/// an untrusted hook is skipped with no stream event, and a handler that
+/// cannot be executed produces no diagnostic. Both leave a run that looks
+/// healthy while every guardrail is inert. Boss asserts in the worker prompt
+/// that pushes are blocked, so this condition is a defect signal, not
+/// bookkeeping.
+///
+/// Run-scoped by construction: guards are armed once per run, so a single
+/// recorded guard invocation settles the question for the whole run. Scoping it
+/// per turn instead would fire on any code-mode cell that invokes no inner tool
+/// — see `CodexRolloutProgressSession::guard_records_seen`.
+pub const GUARDS_SILENT_MARKER: &str = "[codex-guards-silent]";
+
+/// Render the guard-activity notification for one turn.
+pub(crate) fn guard_trace_notification(summary: &guard_trace::GuardTraceSummary) -> String {
+    format!("{GUARD_TRACE_MARKER} {}", guard_trace::render_summary(summary))
+}
+
+/// Render the notification for a run whose tool calls have produced no guard
+/// record at all. `observed` is the number of tool calls seen in the rollout.
+pub(crate) fn guards_silent_notification(observed: usize) -> String {
+    format!(
+        "{GUARDS_SILENT_MARKER} {observed} tool call(s) ran this turn and no PreToolUse guard \
+         invocation has been recorded for this run; Boss's Codex guardrails may be disarmed (hook trust \
+         stale, guard handler unexecutable, or hooks not reached). Treat command guardrails as \
+         unenforced until this is explained."
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -176,12 +226,31 @@ static CODEX_DESCRIPTOR: DriverDescriptor = DriverDescriptor {
 /// Preamble for the agent-rules file (`AGENTS.md`). Names Codex observability
 /// rather than Claude hooks so the shared body below it is not lying about
 /// the mechanism this session uses.
+///
+/// The two Codex-specific tool rules are stated here because they are enforced
+/// by a guard that can only refuse, never explain in advance
+/// ([`tool_surface_guard`]): both routes are ones Boss's command guardrails
+/// cannot observe, so a worker that reaches for them gets a hard block. Saying
+/// so up front turns a wasted turn into a known constraint.
 const CODEX_AGENT_RULES_PREAMBLE: &str = "You are running inside a Boss-managed worker session. The engine\n\
      spawned you in a leased cube workspace and observes this session\n\
      via the Codex rollout JSONL file in this run's isolated CODEX_HOME.\n\
      For ordinary pre-push validation, run `checkleft run` with no flags; use\n\
      `checkleft --all` only in CI, when modifying checkleft itself, or with a\n\
-     strong stated justification.";
+     strong stated justification.\n\
+     \n\
+     Two tool routes are blocked in this session, because Boss's command\n\
+     guardrails cannot see them:\n\
+     \n\
+     - **Do not use `mcp__*` app tools** (the Codex GitHub/Gmail/Drive\n\
+     connectors). Use the shell instead: `gh` for GitHub reads,\n\
+     `cube pr create` / `cube pr update` for pull requests, `jj` for VCS.\n\
+     - **Do not start interactive, stdin-driven sessions** (a bare `bash` /\n\
+     `sh -s` / `python3` REPL, an editor, a pager) and drive them with\n\
+     `write_stdin`; commands typed into one are invisible to the guardrails.\n\
+     Run each command as its own shell invocation instead:\n\
+     `bash -lc '<command>'`, `python3 -c '<code>'`, `python3 <script.py>`,\n\
+     `sqlite3 <db> '<sql>'`.";
 
 /// Single-pattern gitignore for the workspace-local `.codex/` config dir
 /// (prompt + agent-rules copies). Engine-injected files must not appear in
@@ -845,72 +914,136 @@ fn materialize_guards(codex_home: &Path, config: &ToolUseInterceptionConfig) -> 
     let guards_dir = codex_home.join("guards");
     fs::create_dir_all(&guards_dir).with_context(|| format!("creating {}", guards_dir.display()))?;
 
+    // Every guard below is invoked through this shim rather than directly, so
+    // each decision lands in the run's guard trace and a guard that cannot
+    // answer becomes a block instead of Codex's silent approval. See
+    // [`guard_trace`].
+    let shim = guards_dir.join(GUARD_TRACE_SHIM_FILENAME);
+    write_executable(&shim, GUARD_TRACE_SHIM_SCRIPT)?;
+    // The shim is the one file in the chain the attestation cannot bind (it
+    // hashes each wrapper, the `command` path). Each wrapper — which *is*
+    // bound — re-checks this digest before exec'ing the shim, so replacing the
+    // shim can no longer neutralise every guard with the hashes still valid.
+    let shim_sha256 = sha256_hex_prefixed(GUARD_TRACE_SHIM_SCRIPT.as_bytes());
+    let trace_path = guard_trace_path(codex_home);
+
     let mut out = Vec::new();
-    let mut index = 0usize;
+
+    /// One guard to materialise: the Python that decides, plus how it is armed.
+    struct Planned {
+        name: &'static str,
+        source: GuardSource,
+        matcher: &'static str,
+        extra_env: Vec<(&'static str, String)>,
+    }
+    /// Where a guard's executable comes from.
+    enum GuardSource {
+        /// Inline Python that must be written into `CODEX_HOME` first.
+        Inline(String),
+        /// A script the engine already wrote outside `CODEX_HOME` (the shared
+        /// path / checkleft gates, which are not Codex-specific).
+        Existing(PathBuf),
+    }
+
+    let mut planned: Vec<Planned> = Vec::new();
 
     // 1. Path guard — local workers only (script never ships to remotes).
+    //    `.*` because it must also see Codex's `apply_patch` file edits, whose
+    //    target paths live in the patch body rather than a `file_path` key.
     if let (Some(data_dir), Some(guard_script)) = (&config.data_dir, &config.path_guard_script) {
-        let wrapper = guards_dir.join(format!("{index:02}_path_guard.sh"));
-        let body = format!(
-            "#!/bin/sh\nexport BOSS_DATA_DIR={dir}\nexec python3 {script}\n",
-            dir = shell_quote(&data_dir.display().to_string()),
-            script = shell_quote(&guard_script.display().to_string()),
-        );
-        write_executable(&wrapper, &body)?;
-        out.push(MaterializedGuard {
-            command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
-            matcher: Some(".*"),
+        planned.push(Planned {
+            name: "path_guard",
+            source: GuardSource::Existing(guard_script.clone()),
+            matcher: ".*",
+            extra_env: vec![("BOSS_DATA_DIR", data_dir.display().to_string())],
         });
-        index += 1;
     }
 
     // 2. Boss-launch guard — always on. Materialise the Claude inline
     //    `python3 -c` body as a real .py so the trust gate can path-check it.
-    {
-        let script = guards_dir.join(format!("{index:02}_boss_launch_guard.py"));
-        write_executable(&script, &python_c_to_script(BOSS_LAUNCH_GUARD_COMMAND)?)?;
-        out.push(MaterializedGuard {
-            command_path: fs::canonicalize(&script).unwrap_or(script),
-            matcher: Some("Bash"),
-        });
-        index += 1;
-    }
+    planned.push(Planned {
+        name: "boss_launch_guard",
+        source: GuardSource::Inline(python_c_to_script(BOSS_LAUNCH_GUARD_COMMAND)?),
+        matcher: "Bash",
+        extra_env: Vec::new(),
+    });
 
-    // 3. PR redirect — Standard workers only.
+    // 3. Codex tool-surface guard — always on, and `.*` by necessity: it is
+    //    the only guard that sees non-`Bash` tool names. Closes the two routes
+    //    a command matcher structurally cannot reach — `mcp__*` app tools, and
+    //    interactive sessions that `write_stdin` would drive with no hook of
+    //    its own. See [`tool_surface_guard`].
+    planned.push(Planned {
+        name: "codex_tool_surface_guard",
+        source: GuardSource::Inline(CODEX_TOOL_SURFACE_GUARD_SCRIPT.to_owned()),
+        matcher: ".*",
+        extra_env: Vec::new(),
+    });
+
+    // 4. PR redirect — Standard workers only.
     if config.is_standard_worker {
-        let script = guards_dir.join(format!("{index:02}_pr_redirect_guard.py"));
-        write_executable(&script, &python_c_to_script(PR_REDIRECT_GUARD_COMMAND)?)?;
-        out.push(MaterializedGuard {
-            command_path: fs::canonicalize(&script).unwrap_or(script),
-            matcher: Some("Bash"),
+        planned.push(Planned {
+            name: "pr_redirect_guard",
+            source: GuardSource::Inline(python_c_to_script(PR_REDIRECT_GUARD_COMMAND)?),
+            matcher: "Bash",
+            extra_env: Vec::new(),
         });
-        index += 1;
     }
 
-    // 4. Checkleft push guard — local Standard workers only.
+    // 5. Checkleft push guard — local Standard workers only.
     if config.is_standard_worker
         && let Some(checkleft_script) = &config.checkleft_guard_script
     {
-        let wrapper = guards_dir.join(format!("{index:02}_checkleft_push_guard.sh"));
-        let body = format!(
-            "#!/bin/sh\nexec python3 {script}\n",
-            script = shell_quote(&checkleft_script.display().to_string()),
-        );
-        write_executable(&wrapper, &body)?;
-        out.push(MaterializedGuard {
-            command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
-            matcher: Some("Bash"),
+        planned.push(Planned {
+            name: "checkleft_push_guard",
+            source: GuardSource::Existing(checkleft_script.clone()),
+            matcher: "Bash",
+            extra_env: Vec::new(),
         });
-        index += 1;
     }
 
-    // 5. Revision PR guard.
+    // 6. Revision PR guard.
     if config.is_revision {
-        let script = guards_dir.join(format!("{index:02}_revision_pr_guard.py"));
-        write_executable(&script, &python_c_to_script(REVISION_PR_GUARD_COMMAND)?)?;
+        planned.push(Planned {
+            name: "revision_pr_guard",
+            source: GuardSource::Inline(python_c_to_script(REVISION_PR_GUARD_COMMAND)?),
+            matcher: "Bash",
+            extra_env: Vec::new(),
+        });
+    }
+
+    for (index, guard) in planned.into_iter().enumerate() {
+        let guard_name = format!("{index:02}_{}", guard.name);
+        let guard_path = match guard.source {
+            GuardSource::Inline(source) => {
+                let script = guards_dir.join(format!("{guard_name}.py"));
+                write_executable(&script, &source)?;
+                script
+            }
+            GuardSource::Existing(path) => path,
+        };
+        // Content-bind the guard the shim will run. The trust gate hashes the
+        // wrapper (the `command` path); this is what keeps the guard itself
+        // bound, and the shim re-checks it on every invocation.
+        let guard_sha256 = sha256_hex_prefixed(
+            &fs::read(&guard_path).with_context(|| format!("reading guard {}", guard_path.display()))?,
+        );
+        let wrapper = guards_dir.join(format!("{guard_name}.sh"));
+        write_executable(
+            &wrapper,
+            &wrapper_body(
+                &shim,
+                &shim_sha256,
+                &guard_path,
+                &guard_name,
+                &guard_sha256,
+                &trace_path,
+                &guard.extra_env,
+            ),
+        )?;
         out.push(MaterializedGuard {
-            command_path: fs::canonicalize(&script).unwrap_or(script),
-            matcher: Some("Bash"),
+            command_path: fs::canonicalize(&wrapper).unwrap_or(wrapper),
+            matcher: Some(guard.matcher),
         });
     }
 
@@ -1412,11 +1545,17 @@ impl AgentDriver for CodexDriver {
                 config.run_id.clone(),
                 config.identity_store.clone(),
             ))),
-            ProgressStreamSource::AgentJsonlFile => Some(Box::new(CodexRolloutProgressSession::new(
-                config.run_id.clone(),
-                config.identity_store.clone(),
-                config.transcript_path.clone(),
-            ))),
+            ProgressStreamSource::AgentJsonlFile => Some(Box::new(
+                CodexRolloutProgressSession::new(
+                    config.run_id.clone(),
+                    config.identity_store.clone(),
+                    config.transcript_path.clone(),
+                )
+                // The guard trace lives beside the rollout, under the same
+                // run-private CODEX_HOME the guards were armed in, so the
+                // reader can only ever see its own run's decisions.
+                .with_guard_trace_path(codex_home.as_deref().map(guard_trace_path)),
+            )),
         }
     }
 
@@ -2350,11 +2489,161 @@ else:
             workspace_path: Some(tmp.path().to_path_buf()),
         };
         let guards = materialize_guards(&home, &config).unwrap();
-        // path + boss-launch at minimum
-        assert!(guards.len() >= 2);
+        // path + boss-launch + codex tool-surface at minimum
+        assert!(guards.len() >= 3);
         for g in &guards {
             assert!(g.command_path.is_file(), "{:?}", g.command_path);
         }
+    }
+
+    /// Interception config for a local Standard worker with every guard
+    /// available, so a test sees the full materialised set.
+    fn full_interception(tmp: &Path) -> (PathBuf, ToolUseInterceptionConfig) {
+        let path_guard = tmp.join("boss-path-guard.py");
+        fs::write(&path_guard, "print('ok')\n").unwrap();
+        let checkleft = tmp.join("boss-checkleft-push-guard.py");
+        fs::write(&checkleft, "print('ok')\n").unwrap();
+        let home = tmp.join("home");
+        fs::create_dir_all(&home).unwrap();
+        (
+            home,
+            ToolUseInterceptionConfig {
+                data_dir: Some(tmp.to_path_buf()),
+                path_guard_script: Some(path_guard),
+                checkleft_guard_script: Some(checkleft),
+                is_revision: true,
+                is_standard_worker: true,
+                run_id: Some("r".into()),
+                workspace_path: Some(tmp.to_path_buf()),
+            },
+        )
+    }
+
+    #[test]
+    fn every_guard_is_armed_through_the_trace_shim() {
+        // Observability contract: Codex's rollout carries no hook record, so
+        // the only way "did the guard fire?" is answerable is for every guard
+        // to run under the trace shim, which records each decision and turns a
+        // broken guard into a block rather than Codex's silent approval.
+        let tmp = TempDir::new().unwrap();
+        let (home, config) = full_interception(tmp.path());
+        let guards = materialize_guards(&home, &config).unwrap();
+
+        let shim = home.join("guards").join(GUARD_TRACE_SHIM_FILENAME);
+        assert!(shim.is_file(), "the trace shim must be materialised");
+        let trace = guard_trace_path(&home);
+        for guard in &guards {
+            let body = fs::read_to_string(&guard.command_path).unwrap();
+            assert!(
+                body.contains(&shim.display().to_string()),
+                "guard {:?} must be invoked through the trace shim: {body}",
+                guard.command_path
+            );
+            assert!(
+                body.contains(&trace.display().to_string()),
+                "guard {:?} must be told where to record: {body}",
+                guard.command_path
+            );
+            assert!(body.contains("BOSS_GUARD_NAME="), "guard must be labelled: {body}");
+            // The wrapper is the only link the attestation content-binds, so it
+            // is what must vouch for the shim's bytes: otherwise replacing the
+            // shim disarms every guard with every hash still valid.
+            assert!(
+                body.contains(&sha256_hex_prefixed(GUARD_TRACE_SHIM_SCRIPT.as_bytes())),
+                "guard {:?} must verify the shim's content hash before running it: {body}",
+                guard.command_path
+            );
+        }
+    }
+
+    #[test]
+    fn codex_tool_surface_guard_is_always_armed_on_every_tool() {
+        // It is the only guard that sees non-Bash tool names, which is what
+        // makes the `mcp__*` route reachable at all — a `matcher = "Bash"`
+        // guard never sees a GitHub app tool call.
+        let tmp = TempDir::new().unwrap();
+        let (home, mut config) = full_interception(tmp.path());
+        config.is_standard_worker = false;
+        config.is_revision = false;
+        config.data_dir = None;
+        config.path_guard_script = None;
+        config.checkleft_guard_script = None;
+
+        let guards = materialize_guards(&home, &config).unwrap();
+        let surface = guards
+            .iter()
+            .find(|guard| {
+                guard
+                    .command_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("codex_tool_surface_guard"))
+            })
+            .expect("the tool-surface guard must be armed for every Codex worker kind");
+        assert_eq!(
+            surface.matcher,
+            Some(".*"),
+            "it must see every tool name, not just Bash"
+        );
+    }
+
+    #[test]
+    fn path_guard_keeps_its_data_dir_env_through_the_wrapper() {
+        // The path gate reads BOSS_DATA_DIR from its environment; wrapping it
+        // in the trace shim must not drop that.
+        let tmp = TempDir::new().unwrap();
+        let (home, config) = full_interception(tmp.path());
+        let guards = materialize_guards(&home, &config).unwrap();
+        let path_guard = guards
+            .iter()
+            .find(|guard| {
+                guard
+                    .command_path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("path_guard"))
+            })
+            .expect("path guard must be armed for a local worker");
+        let body = fs::read_to_string(&path_guard.command_path).unwrap();
+        assert!(body.contains("export BOSS_DATA_DIR="), "{body}");
+    }
+
+    #[test]
+    fn guard_matchers_match_the_tool_names_codex_actually_emits() {
+        // Empirically (codex-cli 0.145.0, gpt-5.6-terra) a code-mode cell's
+        // `tools.exec_command` reaches PreToolUse as `tool_name: "Bash"`, so
+        // the command guards keep Claude's matcher; `apply_patch` and `mcp__*`
+        // arrive under their own names, which only a `.*` guard sees.
+        let tmp = TempDir::new().unwrap();
+        let (home, config) = full_interception(tmp.path());
+        let guards = materialize_guards(&home, &config).unwrap();
+        let by_name: Vec<(String, Option<&str>)> = guards
+            .iter()
+            .map(|guard| {
+                (
+                    guard.command_path.file_name().unwrap().to_string_lossy().into_owned(),
+                    guard.matcher,
+                )
+            })
+            .collect();
+        for (name, matcher) in &by_name {
+            let expected = if name.contains("path_guard") || name.contains("tool_surface") {
+                ".*"
+            } else {
+                "Bash"
+            };
+            assert_eq!(matcher.unwrap(), expected, "unexpected matcher for {name}");
+        }
+        assert!(
+            by_name.iter().any(|(name, _)| name.contains("pr_redirect_guard")),
+            "a Standard worker must carry the PR-redirect guard: {by_name:?}"
+        );
+        assert!(
+            by_name.iter().any(|(name, _)| name.contains("revision_pr_guard")),
+            "a revision worker must carry the revision guard: {by_name:?}"
+        );
+        assert!(
+            by_name.iter().any(|(name, _)| name.contains("checkleft_push_guard")),
+            "a local Standard worker must carry the checkleft gate: {by_name:?}"
+        );
     }
 
     #[test]

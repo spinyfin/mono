@@ -126,3 +126,161 @@ fn heal_worker_settings_json_refreshes_path_guard_script() {
     assert!(script.exists(), "heal must refresh the gate script");
     assert_eq!(std::fs::read_to_string(&script).unwrap(), PATH_GUARD_SCRIPT);
 }
+
+// ── PATH_GUARD_SCRIPT execution tests ─────────────────────────────────
+//
+// These run the actual gate script against simulated PreToolUse payloads,
+// with BOSS_DATA_DIR pointed at a temp directory so no test ever needs the
+// real Boss data dir on the host. The Codex cases matter because Codex's
+// file-edit tool is `apply_patch`, whose payload carries the whole patch
+// body in `tool_input.command` and no `file_path` key at all — before the
+// script learned that shape every Codex file edit was approved unread.
+
+/// Run the gate against `payload` with `data_dir` as the boundary and return
+/// `(decision, reason)`.
+fn run_path_guard(data_dir: &std::path::Path, payload: serde_json::Value) -> (String, String) {
+    run_path_guard_raw(data_dir, &payload.to_string())
+}
+
+/// As [`run_path_guard`], but writes `stdin` verbatim — so a payload that is
+/// not JSON at all can be exercised.
+fn run_path_guard_raw(data_dir: &std::path::Path, stdin: &str) -> (String, String) {
+    use std::io::Write as _;
+    let script_dir = TempDir::new().unwrap();
+    let script = script_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+    std::fs::write(&script, PATH_GUARD_SCRIPT).unwrap();
+
+    let mut child = std::process::Command::new("python3")
+        .arg(&script)
+        .env("BOSS_DATA_DIR", data_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child.stdin.as_mut().unwrap().write_all(stdin.as_bytes()).unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+        panic!(
+            "path guard produced invalid JSON: {err}\nstdout={stdout}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (
+        parsed["decision"].as_str().unwrap_or("missing").to_owned(),
+        parsed["reason"].as_str().unwrap_or_default().to_owned(),
+    )
+}
+
+#[test]
+fn path_guard_blocks_apply_patch_writing_into_the_data_dir() {
+    let data = TempDir::new().unwrap();
+    let target = data.path().join("state.db");
+    let patch = format!(
+        "*** Begin Patch\n*** Update File: {}\n+tampered\n*** End Patch",
+        target.display()
+    );
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": patch}}),
+    );
+    assert_eq!(decision, "block", "apply_patch into the data dir must be blocked");
+    assert!(reason.contains("engine-owned"), "{reason}");
+}
+
+#[test]
+fn path_guard_blocks_apply_patch_add_and_move_headers() {
+    let data = TempDir::new().unwrap();
+    for header in ["*** Add File:", "*** Delete File:", "*** Move to:"] {
+        let patch = format!(
+            "*** Begin Patch\n{header} {}/leak.txt\n+x\n*** End Patch",
+            data.path().display()
+        );
+        let (decision, _) = run_path_guard(
+            data.path(),
+            serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": patch}}),
+        );
+        assert_eq!(decision, "block", "{header} must be read for its target path");
+    }
+}
+
+#[test]
+fn path_guard_approves_apply_patch_outside_the_data_dir() {
+    let data = TempDir::new().unwrap();
+    let patch = "*** Begin Patch\n*** Add File: src/main.rs\n+fn main() {}\n*** End Patch";
+    let (decision, reason) = run_path_guard(
+        data.path(),
+        serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": patch}}),
+    );
+    assert_eq!(decision, "approve", "ordinary edits must not be disturbed: {reason}");
+}
+
+#[test]
+fn path_guard_fails_closed_on_an_unreadable_payload_for_a_tool_it_reads() {
+    // The hazard this exists for: a Codex payload shape Boss did not
+    // anticipate must block, not fall through to approve.
+    let data = TempDir::new().unwrap();
+    for payload in [
+        serde_json::json!({"tool_name": "Bash", "tool_input": "const r = await tools.exec_command({})"}),
+        serde_json::json!({"tool_name": "apply_patch", "tool_input": {"command": 42}}),
+        serde_json::json!({"tool_name": "Bash", "tool_input": {}}),
+    ] {
+        let (decision, reason) = run_path_guard(data.path(), payload.clone());
+        assert_eq!(decision, "block", "must fail closed for {payload}");
+        assert!(reason.contains("fail-closed"), "{reason}");
+    }
+
+    // A payload the gate cannot parse at all is the same hazard one level up:
+    // it cannot read the tool name, so it is in no position to conclude it has
+    // nothing to say about this call.
+    let (decision, reason) = run_path_guard_raw(data.path(), "const r = await tools.exec_command({})");
+    assert_eq!(decision, "block", "non-JSON hook stdin must fail closed: {reason}");
+    assert!(
+        reason.contains("fail-closed") && reason.contains("not JSON"),
+        "{reason}"
+    );
+
+    let (decision, reason) = run_path_guard(data.path(), serde_json::json!([{"tool_name": "Bash"}]));
+    assert_eq!(decision, "block", "a non-object payload must fail closed: {reason}");
+    assert!(
+        reason.contains("fail-closed") && reason.contains("not a JSON object"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn path_guard_with_no_data_dir_configured_approves() {
+    // BOSS_DATA_DIR unset is Boss's own configuration (a remote worker, where
+    // the gate is deliberately not armed), not an agent payload the gate failed
+    // to read — so it stays an approve while the payload cases above block.
+    use std::io::Write as _;
+    let script_dir = TempDir::new().unwrap();
+    let script = script_dir.path().join(PATH_GUARD_SCRIPT_NAME);
+    std::fs::write(&script, PATH_GUARD_SCRIPT).unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg(&script)
+        .env_remove("BOSS_DATA_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("python3 must be available");
+    child.stdin.as_mut().unwrap().write_all(b"not json at all").unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    assert_eq!(parsed["decision"], "approve");
+}
+
+#[test]
+fn path_guard_still_approves_tools_it_has_nothing_to_say_about() {
+    // Armed with `.*` on the Codex path, the gate sees every tool. Silence
+    // for a tool with no candidate path is correct — that is not the same as
+    // failing open on a payload it should have read.
+    let data = TempDir::new().unwrap();
+    for tool in ["view_image", "update_plan", "web__run"] {
+        let (decision, _) = run_path_guard(data.path(), serde_json::json!({"tool_name": tool, "tool_input": {}}));
+        assert_eq!(decision, "approve", "{tool} must be approved");
+    }
+}

@@ -96,6 +96,11 @@ pub(super) async fn dispatch_worker_event_fanout(
     // `on_stop`'s NO_CHANGES_NEEDED gate (dispatched later in this same
     // fan-out chain, on the following Stop event) sees it.
     dispatch_codex_unobserved_command_on_notification(server_state, incoming);
+    // Codex guard-trace observation: record whether this turn's PreToolUse
+    // guards ran and what they decided — and, when tool calls ran with no
+    // guard invocation at all, that Boss's command guardrails were not
+    // enforced for it. Nothing in Codex's own stream carries either fact.
+    dispatch_codex_guard_trace_on_notification(server_state, incoming);
     // Editorial PreToolUse audit: evaluate every
     // `gh pr|issue` Bash invocation against the
     // product's editorial rules and record the
@@ -213,6 +218,31 @@ pub(super) fn dispatch_codex_unobserved_command_on_notification(
              item.completed observed before the turn boundary)",
         );
     }
+}
+
+/// Record a Codex guard-trace notification (see [`crate::codex_guard_trace`]).
+///
+/// Unlike the unobserved-command handler this stages nothing: the question it
+/// answers — "did this execution's PreToolUse guards run, and what did they
+/// decide?" — is a forensic one, answered from the engine log and the run's
+/// `guard-trace.jsonl`. The silent-guard case is logged at `error` because it
+/// means the worker prompt's "pushes are blocked" assertion was not being
+/// enforced for that turn.
+///
+/// A no-op for every event that isn't a matching `Notification` — in
+/// particular every hook-shaped event Claude and every other driver emits.
+pub(super) fn dispatch_codex_guard_trace_on_notification(
+    server_state: &Arc<ServerState>,
+    incoming: &crate::events_socket::IncomingHookEvent,
+) {
+    use crate::protocol::WorkerEvent;
+    let WorkerEvent::Notification { message, .. } = &incoming.event else {
+        return;
+    };
+    let Some(signal) = crate::codex_guard_trace::classify(message) else {
+        return;
+    };
+    crate::codex_guard_trace::record(&server_state.metrics, incoming.run_id.as_deref(), &signal);
 }
 
 pub(super) async fn dispatch_live_worker_state(

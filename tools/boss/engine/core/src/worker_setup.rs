@@ -1058,10 +1058,26 @@ const CHECKLEFT_PUSH_GUARD_SCRIPT_NAME: &str = "boss-checkleft-push-guard.py";
 /// whether the session model notices the path string.
 ///
 /// The data dir is supplied via the `BOSS_DATA_DIR` env var (set by the
-/// hook command). The script is fail-open: anything it cannot positively
-/// resolve to a path under the data dir is approved, so a payload-shape
-/// change can never wedge a session — the positive prefix match is the
-/// only deterministic block.
+/// hook command). For a tool the script has nothing to say about (a read,
+/// an image view, a plan update) it approves — there is no path to check,
+/// so silence is correct. For the two tools it *does* reason about
+/// (`Bash`, and Codex's `apply_patch`) a payload it cannot read is
+/// **blocked**, not approved: at that point the guard cannot tell whether
+/// the call touches the data dir, and a gate that waves through what it
+/// cannot parse is not a gate. The same holds one level up: a hook stdin
+/// that is not JSON, or a payload that is not a JSON object, blocks too —
+/// the gate cannot even read the tool name there, so "nothing to say about
+/// this tool" is not something it is in a position to conclude. The
+/// positive prefix match remains the only path-based block.
+///
+/// Codex's `apply_patch` carries the whole patch body in
+/// `tool_input.command` with no `file_path` key, so the target paths live
+/// in the patch's own `*** Add File:` / `*** Update File:` /
+/// `*** Delete File:` / `*** Move to:` headers. Extracting them is what
+/// makes the boundary hold for a Codex worker's file edits; before that,
+/// every `apply_patch` fell through the `tool == "Bash"` branch and was
+/// approved unread (evidence:
+/// `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`).
 const PATH_GUARD_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Deterministic Boss data-directory access gate (Claude Code PreToolUse hook).
 
@@ -1077,14 +1093,50 @@ The data directory is supplied via the BOSS_DATA_DIR environment variable,
 set by the engine in the hook command. The PreToolUse payload arrives as JSON
 on stdin; a decision JSON is written to stdout.
 
-Fail-open by design: anything that cannot be positively resolved to a path
-under the data directory is approved, so a payload-shape change can never
-wedge a session. The positive prefix match is the only deterministic block.
+Tools this gate has nothing to say about are approved: there is no candidate
+path to resolve, so silence is the right answer. The two tools it does read --
+Bash, and Codex's apply_patch -- fail CLOSED: an unreadable payload for those
+is blocked, because the guard then cannot tell whether the call targets the
+data directory. A payload that is not JSON, or not a JSON object, fails closed
+too: the gate cannot read the tool name from it, so it cannot claim to have
+nothing to say. The positive prefix match is the only path-based block.
 """
 import json
 import os
 import shlex
 import sys
+
+MALFORMED = (
+    "Blocked (fail-closed): the Boss data-directory gate could not read this "
+    "tool call's payload, so it cannot tell whether the call targets the "
+    "engine-owned data directory. Guards deny what they cannot parse rather "
+    "than approving by default. Re-issue the operation as an ordinary shell "
+    "command or file edit, and report this payload shape to the operator -- it "
+    "means Boss guard wiring needs updating for this agent driver."
+)
+
+# Codex `apply_patch` header lines that name a target path. The patch body
+# arrives as `tool_input.command` (no `file_path` key), so these headers are
+# the only place the touched paths appear.
+PATCH_PATH_HEADERS = (
+    "*** Add File:",
+    "*** Update File:",
+    "*** Delete File:",
+    "*** Move to:",
+)
+
+
+def patch_target_paths(patch):
+    """Every path named by an apply_patch header, in document order."""
+    found = []
+    for line in patch.splitlines():
+        stripped = line.strip()
+        for header in PATCH_PATH_HEADERS:
+            if stripped.startswith(header):
+                value = stripped[len(header):].strip()
+                if value:
+                    found.append(value)
+    return found
 
 RECOVERY = (
     "Blocked: direct access to the Boss data directory "
@@ -1129,12 +1181,18 @@ def main():
         emit("approve")
     data_dir = os.path.realpath(os.path.expanduser(raw_dir))
 
+    # A payload the gate cannot read at all is blocked, not approved. In that
+    # state it cannot even determine the tool name, so the "a tool it has
+    # nothing to say about" justification for approving does not apply: this is
+    # an unanticipated payload shape, the exact condition the other Boss guards
+    # refuse. (BOSS_DATA_DIR being unset, above, stays an approve -- that is
+    # Boss's own configuration, not the agent's payload.)
     try:
         payload = json.load(sys.stdin)
-    except Exception:
-        emit("approve")
+    except Exception as error:
+        emit("block", MALFORMED + " Detail: hook stdin was not JSON (%s)." % error)
     if not isinstance(payload, dict):
-        emit("approve")
+        emit("block", MALFORMED + " Detail: hook payload was not a JSON object.")
 
     tool = payload.get("tool_name") or ""
     tool_input = payload.get("tool_input")
@@ -1151,13 +1209,25 @@ def main():
     raw_command = ""
     if tool == "Bash":
         command = tool_input.get("command")
-        if isinstance(command, str):
-            raw_command = command
-            try:
-                tokens = shlex.split(command)
-            except Exception:
-                tokens = command.split()
-            candidates.extend(tokens)
+        if not isinstance(command, str):
+            emit("block", MALFORMED)
+        raw_command = command
+        try:
+            tokens = shlex.split(command)
+        except Exception:
+            tokens = command.split()
+        candidates.extend(tokens)
+    elif tool == "apply_patch":
+        # Codex's freeform apply_patch: the patch body is the "command".
+        patch = tool_input.get("command")
+        if patch is None:
+            patch = tool_input.get("input")
+        if not isinstance(patch, str):
+            emit("block", MALFORMED)
+        # The substring belt below applies to the patch text too: a path
+        # written with ~ or a $VAR is not resolvable but is still readable.
+        raw_command = patch
+        candidates.extend(patch_target_paths(patch))
 
     for candidate in candidates:
         try:
