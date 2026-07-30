@@ -15,6 +15,7 @@ use crate::{audit, config, paths};
 
 use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
+use crate::app::gh_pr;
 use crate::app::health::probe_workspace_reuse;
 use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
@@ -219,25 +220,13 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
             let Some(pr_num) = bookmark.strip_prefix("pr/") else {
                 return false;
             };
-            let state = match runner.run(&RealCommandRunner::invocation(
-                workspace_path,
-                "gh",
-                &[
-                    "pr",
-                    "view",
-                    pr_num,
-                    "-R",
-                    &owner_repo,
-                    "--json",
-                    "state",
-                    "--jq",
-                    ".state",
-                ],
-            )) {
-                Ok(out) => out,
-                Err(_) => return false,
+            let Ok(pr_number) = pr_num.parse::<u64>() else {
+                return false;
             };
-            matches!(state.trim(), "MERGED" | "CLOSED")
+            let Ok(pr_info) = gh_pr::fetch_pr_json(runner, workspace_path, &owner_repo, pr_number) else {
+                return false;
+            };
+            matches!(gh_pr::state(&pr_info).as_str(), "MERGED" | "CLOSED")
         })
         .collect()
 }

@@ -13,6 +13,7 @@ mod display;
 mod errors;
 mod excludes;
 mod gc;
+mod gh_pr;
 mod health;
 mod jj;
 mod pr;

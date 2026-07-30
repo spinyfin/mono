@@ -5,6 +5,7 @@ mod checkleft_tests;
 mod dispatch_tests;
 mod excludes_tests;
 mod gc_tests;
+mod gh_pr_tests;
 mod goto_tests;
 mod health_recovery_tests;
 mod jj_tests;

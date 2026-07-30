@@ -11,6 +11,7 @@ use crate::store::Store;
 
 use crate::app::checkleft_gate::run_checkleft_gate;
 use crate::app::errors::{CubeError, Result, RunResult};
+use crate::app::gh_pr;
 use crate::app::jj::{run_jj, run_jj_network};
 use crate::app::pr::verify_push_reached_github;
 use crate::app::provision::find_workspace_record;
@@ -482,27 +483,18 @@ pub(super) fn workspace_goto(
     let branch: String = if let Some(b) = bookmark {
         strip_remote_suffix(&b).to_string()
     } else if let Some(n) = pr {
-        let n_str = n.to_string();
-        let json = runner
-            .run(&RealCommandRunner::invocation(
-                &cwd,
-                "gh",
-                &["pr", "view", &n_str, "-R", &owner_repo, "--json", "headRefName,state"],
-            ))
+        let pr_info = gh_pr::fetch_pr_json(runner, &cwd, &owner_repo, n)
             .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo}: {e}")))?;
-        let pr_info: serde_json::Value = serde_json::from_str(&json)?;
-        let state = pr_info.get("state").and_then(|v| v.as_str()).unwrap_or("UNKNOWN");
+        let state = gh_pr::state(&pr_info);
         if state == "MERGED" || state == "CLOSED" {
             return Err(CubeError::InvalidArgument(format!(
                 "PR {n} ({owner_repo}) is {state} — cannot position on a non-open PR. \
                  Use `cube workspace lease` for a fresh task (don't run `cube workspace goto`), or verify the PR number."
             )));
         }
-        pr_info
-            .get("headRefName")
-            .and_then(|v| v.as_str())
+        gh_pr::head_ref(&pr_info)
             .ok_or_else(|| {
-                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no headRefName from GitHub"))
+                CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from GitHub"))
             })?
             .to_string()
     } else {
@@ -651,18 +643,10 @@ fn resolve_boss_branch(runner: &dyn CommandRunner, cwd: &Path, owner_repo: &str,
     }
 
     if let Some(n) = opts.explicit_pr {
-        let n_str = n.to_string();
-        let json = runner
-            .run(&RealCommandRunner::invocation(
-                cwd,
-                "gh",
-                &["pr", "view", &n_str, "-R", owner_repo, "--json", "headRefName"],
-            ))
+        let value = gh_pr::fetch_pr_json(runner, cwd, owner_repo, n)
             .map_err(|e| CubeError::InvalidArgument(format!("failed to resolve PR {n} in {owner_repo} via gh: {e}")))?;
-        let value: serde_json::Value = serde_json::from_str(&json)?;
-        let head = value.get("headRefName").and_then(|v| v.as_str()).ok_or_else(|| {
-            CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no headRefName from gh"))
-        })?;
+        let head = gh_pr::head_ref(&value)
+            .ok_or_else(|| CubeError::InvalidArgument(format!("PR {n} ({owner_repo}) returned no head.ref from gh")))?;
         return Ok(head.to_string());
     }
 
