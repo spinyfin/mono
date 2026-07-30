@@ -168,6 +168,64 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionEnd",
 ];
 
+/// Python preamble shared by every inline command-inspecting decision hook.
+///
+/// Establishes two things every guard body below relies on:
+///
+/// 1. `cmd` — the shell command string, guaranteed to be a `str`.
+/// 2. `_block(msg)` / `_approve()` — the decision emitters.
+///
+/// **It fails closed.** A payload the guard cannot parse into a command
+/// string is *blocked*, not approved: an unrecognised payload shape means the
+/// guard cannot prove the call is safe, and a guardrail that approves what it
+/// cannot read is worse than no guardrail, because the worker prompt asserts
+/// the protection is real. This matters specifically for drivers whose tool
+/// vocabulary is not Claude's — Codex reaches these same scripts through its
+/// own `PreToolUse` wire (see
+/// [`crate::codex::write_hooks_and_attest`]), and a future payload change
+/// there must surface as a loud block rather than as silent approval. The
+/// empirical basis for the shapes handled here is
+/// `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`.
+///
+/// Emitted as a `macro_rules!` expansion rather than a `const` because the
+/// guard bodies are `concat!`-built string literals, which cannot interpolate
+/// a `const`. Every line avoids `"`, `$` and backticks: the whole command is
+/// itself embedded in a double-quoted `sh -c` string.
+macro_rules! python_command_guard {
+    ($($body:expr),+ $(,)?) => {
+        concat!(
+            "python3 -c \"\n",
+            "import json,os,sys,re,shlex\n",
+            "def _emit(d):\n",
+            "    print(json.dumps(d))\n",
+            "    sys.exit(0)\n",
+            "def _approve():\n",
+            "    _emit({'decision':'approve'})\n",
+            "def _block(msg):\n",
+            "    _emit({'decision':'block','reason':msg})\n",
+            "_SHAPE=('Blocked (fail-closed): a Boss PreToolUse guard could not read this tool ",
+            "call as a shell command, so it cannot prove the call is allowed. Guards deny what ",
+            "they cannot parse rather than approving by default. Re-issue the work as an ordinary ",
+            "shell command, and report this payload shape to the operator -- it means Boss guard ",
+            "wiring needs updating for this agent driver. Detail: ')\n",
+            "try:\n",
+            "    inp=json.load(sys.stdin)\n",
+            "except Exception as _e:\n",
+            "    _block(_SHAPE+'hook stdin was not JSON ('+str(_e)+')')\n",
+            "if not isinstance(inp,dict):\n",
+            "    _block(_SHAPE+'hook payload was not a JSON object')\n",
+            "_ti=inp.get('tool_input')\n",
+            "if not isinstance(_ti,dict):\n",
+            "    _block(_SHAPE+'tool_input was '+type(_ti).__name__+', not an object')\n",
+            "cmd=_ti.get('command')\n",
+            "if not isinstance(cmd,str):\n",
+            "    _block(_SHAPE+'tool_input.command was '+type(cmd).__name__+', not a string')\n",
+            $($body),+,
+            "\""
+        )
+    };
+}
+
 /// Inline Python decision hook that blocks workers from launching the Boss
 /// macOS app or a Boss engine. Always applied (matcher `Bash`).
 ///
@@ -202,11 +260,7 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 /// and isolated capture launches of the app
 /// (`BOSS_SOCKET_PATH=/tmp/boss-shot-<id>.sock BOSS_ENGINE_AUTOSTART=0 bazel
 /// run //tools/boss/app-macos:Boss -- --capture-to <path>.png`).
-pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"\n",
-    "import json,os,sys,re,shlex\n",
-    "inp=json.load(sys.stdin)\n",
-    "cmd=inp.get('tool_input',{}).get('command','')\n",
+pub const BOSS_LAUNCH_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "WRAP={'nohup','env','sudo','exec','command','stdbuf','setsid','caffeinate','xargs'}\n",
     "ASSIGN=re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', re.S)\n",
@@ -307,10 +361,8 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
     "via cacheDisplay and exits; it never shows a window, never takes focus, and needs no ",
     "screen-recording permission. Read the PNG back and state in the PR what you verified. ",
     "Building and testing are unaffected (bazel build, bazel test).')\n",
-    "    print(json.dumps({'decision':'block','reason':msg}))\n",
-    "else:\n",
-    "    print(json.dumps({'decision':'approve'}))\n",
-    "\""
+    "    _block(msg)\n",
+    "_approve()\n",
 );
 
 /// Inline Python decision hook that blocks all Standard workers from pushing
@@ -321,11 +373,7 @@ pub const BOSS_LAUNCH_GUARD_COMMAND: &str = concat!(
 /// Applies to ALL `WorkerKind::Standard` workers (local and remote). The
 /// revision-specific guard ([`REVISION_PR_GUARD_COMMAND`]) stacks on top for
 /// revision workers and adds additional blocks.
-pub const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"\n",
-    "import json,os,sys,re,shlex\n",
-    "inp=json.load(sys.stdin)\n",
-    "cmd=inp.get('tool_input',{}).get('command','')\n",
+pub const PR_REDIRECT_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
     "    toks=shlex.split(cmd,posix=True)\n",
@@ -360,21 +408,15 @@ pub const PR_REDIRECT_GUARD_COMMAND: &str = concat!(
     "        break\n",
     "if matched:\n",
     "    msg='Workers must not push branches or open PRs with bare VCS commands (blocked: '+matched+'). Use cube instead: cube pr create --branch <branch> (new PR: pushes the branch and opens the PR in one step, jj-aware, no GIT_DIR) or cube pr update --branch <branch> (existing PR: pushes new commits to it). Never use jj git push, git push, or gh pr create directly.'\n",
-    "    print(json.dumps({'decision':'block','reason':msg}))\n",
-    "else:\n",
-    "    print(json.dumps({'decision':'approve'}))\n",
-    "\""
+    "    _block(msg)\n",
+    "_approve()\n",
 );
 
 /// Inline Python decision hook that guards revision tasks from opening new PRs.
 /// Uses `shlex.split()` to tokenise the Bash command so PR-creation phrases
 /// inside quoted arguments do NOT trigger the block. Blocks `gh pr create`,
 /// `cube pr create`, and the deprecated `cube pr ensure`; allows `cube pr update`.
-pub const REVISION_PR_GUARD_COMMAND: &str = concat!(
-    "python3 -c \"\n",
-    "import json,sys,re,shlex\n",
-    "inp=json.load(sys.stdin)\n",
-    "cmd=inp.get('tool_input',{}).get('command','')\n",
+pub const REVISION_PR_GUARD_COMMAND: &str = python_command_guard!(
     "DELIMS={'&&','||',';','|','&'}\n",
     "try:\n",
     "    toks=shlex.split(cmd,posix=True)\n",
@@ -416,10 +458,8 @@ pub const REVISION_PR_GUARD_COMMAND: &str = concat!(
     "if matched:\n",
     "    sug='cube pr update --branch '+br if br else 'cube pr update --branch <your-pr-bookmark>'\n",
     "    msg='Revision tasks push commits to the existing parent PR; they must not open a new PR (matched command: '+matched+'). Push your commits to the existing PR with: '+sug\n",
-    "    print(json.dumps({'decision':'block','reason':msg}))\n",
-    "else:\n",
-    "    print(json.dumps({'decision':'approve'}))\n",
-    "\""
+    "    _block(msg)\n",
+    "_approve()\n",
 );
 
 /// The driver-specific preamble for the agent-rules file. Names the hook

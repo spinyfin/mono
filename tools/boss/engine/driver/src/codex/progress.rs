@@ -23,6 +23,7 @@ use boss_engine_codex_rollout::{
 use boss_protocol::{NormalizeError, SessionStartSource, StopReason, WorkerEvent};
 use serde_json::{Map, Value, json};
 
+use super::guard_trace;
 use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionNormalizer};
 
 const MAX_TRACKED_ROLLOUT_CALLS: usize = 256;
@@ -341,6 +342,15 @@ pub(super) struct CodexRolloutProgressSession {
     calls: HashMap<String, RolloutToolCall>,
     call_order: VecDeque<String>,
     turn_terminal: bool,
+    /// Per-run `PreToolUse` guard decision log, when the reader knows which
+    /// run it belongs to. Absent in fixtures and for the stateless path.
+    guard_trace_path: Option<PathBuf>,
+    /// Trace lines already reported, so a later turn does not re-report them.
+    guard_trace_line: usize,
+    /// Tool calls observed since the last turn boundary. Compared against the
+    /// guard records for that turn: calls with zero guard invocations is the
+    /// observable signature of Codex's silent hook fail-open.
+    observed_tool_calls: usize,
 }
 
 impl CodexRolloutProgressSession {
@@ -357,7 +367,57 @@ impl CodexRolloutProgressSession {
             calls: HashMap::new(),
             call_order: VecDeque::new(),
             turn_terminal: false,
+            guard_trace_path: None,
+            guard_trace_line: 0,
+            observed_tool_calls: 0,
         }
+    }
+
+    /// Point this reader at the run's guard-decision trace.
+    ///
+    /// Separate from [`Self::new`] so the many fixtures constructing a bare
+    /// session stay untouched: a reader with no trace path simply reports no
+    /// guard activity, which is the correct answer for a synthetic rollout.
+    pub(super) fn with_guard_trace_path(mut self, path: Option<PathBuf>) -> Self {
+        self.guard_trace_path = path;
+        self
+    }
+
+    /// Guard-activity notifications for the turn that is ending.
+    ///
+    /// Two outcomes, both engine-visible:
+    ///
+    /// - records exist → one [`super::GUARD_TRACE_MARKER`] notification
+    ///   summarising them, so "did the guard fire, and what did it decide?" is
+    ///   answerable from the trace for every Codex execution;
+    /// - tool calls ran but no record exists → one
+    ///   [`super::GUARDS_SILENT_MARKER`] notification, the only signal Boss can
+    ///   get that Codex skipped its hooks (untrusted trust record, unexecutable
+    ///   handler) and every guardrail was inert while the run looked healthy.
+    ///
+    /// Called immediately before a `Stop`, mirroring
+    /// [`Self::drain_abandoned_command_notifications`].
+    fn drain_guard_trace_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
+        let observed = std::mem::take(&mut self.observed_tool_calls);
+        let Some(path) = self.guard_trace_path.clone() else {
+            return Vec::new();
+        };
+        let (records, next_line, unparseable) = guard_trace::read_records_from(&path, self.guard_trace_line);
+        self.guard_trace_line = next_line;
+        if records.is_empty() && unparseable == 0 {
+            if observed == 0 {
+                return Vec::new();
+            }
+            return vec![WorkerEvent::Notification {
+                session_id: session_id.to_owned(),
+                message: super::guards_silent_notification(observed),
+            }];
+        }
+        let summary = guard_trace::summarize(&records, unparseable);
+        vec![WorkerEvent::Notification {
+            session_id: session_id.to_owned(),
+            message: super::guard_trace_notification(&summary),
+        }]
     }
 
     fn classify_thread_start(&self, thread_id: &str) -> SessionStartSource {
@@ -458,6 +518,7 @@ impl CodexRolloutProgressSession {
                 self.turn_terminal = false;
                 self.calls.clear();
                 self.call_order.clear();
+                self.observed_tool_calls = 0;
                 Ok(vec![WorkerEvent::SessionStart {
                     session_id: thread_id.to_owned(),
                     source,
@@ -494,6 +555,7 @@ impl CodexRolloutProgressSession {
                         match rollout_task_complete_error_message(payload) {
                             Some(message) => {
                                 let mut events = self.drain_abandoned_command_notifications(&session_id);
+                                events.extend(self.drain_guard_trace_notifications(&session_id));
                                 events.push(WorkerEvent::Notification {
                                     session_id: session_id.clone(),
                                     message: message.clone(),
@@ -507,6 +569,7 @@ impl CodexRolloutProgressSession {
                             }
                             None => {
                                 let mut events = self.drain_abandoned_command_notifications(&session_id);
+                                events.extend(self.drain_guard_trace_notifications(&session_id));
                                 events.push(WorkerEvent::Stop {
                                     session_id,
                                     stop_hook_active: false,
@@ -523,6 +586,7 @@ impl CodexRolloutProgressSession {
                         self.turn_terminal = true;
                         let reason = payload.get("reason").and_then(Value::as_str).unwrap_or("interrupted");
                         let mut events = self.drain_abandoned_command_notifications(&session_id);
+                        events.extend(self.drain_guard_trace_notifications(&session_id));
                         events.push(WorkerEvent::Notification {
                             session_id: session_id.clone(),
                             message: format!("turn aborted: {reason}"),
@@ -559,6 +623,10 @@ impl CodexRolloutProgressSession {
                         tool_name: call.tool_name.clone(),
                         tool_input: call.tool_input.clone(),
                     };
+                    // Counted for the guard-trace cross-check: a turn that ran
+                    // tool calls with zero guard invocations means the hooks
+                    // did not execute.
+                    self.observed_tool_calls = self.observed_tool_calls.saturating_add(1);
                     self.remember_call(call_id, call);
                     return Ok(vec![event]);
                 }

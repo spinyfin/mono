@@ -1,0 +1,663 @@
+//! Per-run record of what Boss's Codex `PreToolUse` guards actually did.
+//!
+//! # The gap this closes
+//!
+//! On the Claude path, "did the guard run, and what did it decide?" is
+//! answerable after the fact: `hook_success`, `PreToolUse:Bash` and the
+//! `{"decision": …}` attachment all land in the session transcript. On the
+//! Codex path there was **no such signal anywhere** — the rollout JSONL the
+//! engine tails carries no hook record, an approved call leaves no trace at
+//! all, and a blocked one shows up only as prose inside the cell's
+//! `custom_tool_call_output`. Codex's own hook failures are silent and
+//! fail-open (an untrusted hook is skipped, a missing handler produces no
+//! diagnostic), so "guards armed" and "guards inert" were indistinguishable
+//! from anything Boss could observe.
+//!
+//! # Mechanism
+//!
+//! Every guard the Codex driver materialises is invoked through a shell
+//! wrapper that runs [`GUARD_TRACE_SHIM_SCRIPT`] instead of the guard
+//! directly. The shim:
+//!
+//! 1. runs the real guard with the payload on stdin,
+//! 2. appends one JSON line per invocation to
+//!    `$CODEX_HOME/`[`GUARD_TRACE_FILENAME`] — guard name, tool name,
+//!    decision, reason head,
+//! 3. re-emits the guard's own decision verbatim, and
+//! 4. **fails closed**: a guard that crashes, times out, exits non-zero or
+//!    prints something that is not a decision becomes a `block` with a loud
+//!    reason, recorded as `guard_error`. Codex would otherwise treat that
+//!    silence as approval.
+//!
+//! The engine reads the file at each turn boundary
+//! ([`crate::codex::progress`]) and reports it as a `WorkerEvent::Notification`
+//! — a summary when guards ran, and a distinct, loud marker when tool calls
+//! were observed but **no** guard record exists, which is the observable
+//! signature of the silent fail-open the design doc could only describe.
+//!
+//! Evidence and payload captures:
+//! `tools/boss/docs/investigations/codex-pretooluse-guard-coverage-2026-07-29.md`.
+
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
+
+use boss_ssh_transport::shell_quote;
+use serde::Deserialize;
+
+/// Filename of the per-run guard-decision log, written under `CODEX_HOME`.
+pub const GUARD_TRACE_FILENAME: &str = "guard-trace.jsonl";
+
+/// Filename of the shim under `$CODEX_HOME/guards/`.
+pub(super) const GUARD_TRACE_SHIM_FILENAME: &str = "boss_guard_trace.py";
+
+/// Env var naming the trace file, set by each guard's wrapper.
+const GUARD_TRACE_ENV: &str = "BOSS_GUARD_TRACE";
+
+/// Env var naming the guard whose decision is being recorded.
+const GUARD_NAME_ENV: &str = "BOSS_GUARD_NAME";
+
+/// Env var carrying the expected `sha256:<hex>` of the guard executable.
+///
+/// Wrapping a guard would otherwise cost the hook-trust attestation its
+/// content binding: the gate hashes the file at the `command` path, which is
+/// now the wrapper, not the guard. Re-binding it here is strictly stronger
+/// than the static hash it replaces — the shim re-verifies the guard's bytes
+/// on **every invocation**, so a guard edited after arming is refused rather
+/// than merely un-attested.
+const GUARD_SHA256_ENV: &str = "BOSS_GUARD_SHA256";
+
+/// Cap on records read from one trace file, so a pathological run cannot make
+/// the engine's turn-boundary read unbounded. Records past the cap are counted
+/// as skipped in the summary rather than silently dropped.
+const MAX_RECORDS_PER_READ: usize = 2000;
+
+/// Absolute path of the guard trace for a run's `CODEX_HOME`.
+pub fn guard_trace_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(GUARD_TRACE_FILENAME)
+}
+
+/// The trace shim, materialised verbatim as an executable `.py`. Invoked as
+/// `python3 <shim> <guard-executable>`; reads the hook payload on stdin and
+/// writes the guard's decision to stdout.
+pub(super) const GUARD_TRACE_SHIM_SCRIPT: &str = r#"#!/usr/bin/env python3
+"""Boss guard-trace shim for Codex PreToolUse hooks.
+
+Runs one Boss guard, records what it decided, and re-emits that decision. A
+guard that crashes, exits non-zero, or prints something that is not a decision
+becomes a hard `block`: Codex treats a broken hook as approval, so the shim is
+what turns a broken guard into a loud refusal instead of a silent hole.
+
+Usage: python3 boss_guard_trace.py <guard-executable>
+Env:   BOSS_GUARD_TRACE   path of the JSONL trace to append to (optional)
+       BOSS_GUARD_NAME    label recorded for this guard (optional)
+       BOSS_GUARD_SHA256  expected `sha256:<hex>` of the guard file; a mismatch
+                          blocks (optional, but always set in production)
+"""
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+
+APPROVE_DECISIONS = ("approve", "allow")
+BLOCK_DECISIONS = ("block", "deny")
+
+GUARD_ERROR = (
+    "Blocked (fail-closed): the Boss guard {guard} did not return a usable "
+    "decision, so Boss cannot confirm this tool call is allowed. A guard that "
+    "cannot answer is treated as a refusal, never as approval. Detail: {detail}"
+)
+
+
+def record(payload_text, decision, reason, exit_code, detail):
+    """Append one line to the trace. Never raises: tracing must not break a hook."""
+    path = os.environ.get("BOSS_GUARD_TRACE", "")
+    if not path:
+        return
+    tool = None
+    session = None
+    try:
+        payload = json.loads(payload_text)
+        if isinstance(payload, dict):
+            tool = payload.get("tool_name")
+            session = payload.get("session_id")
+    except Exception:
+        pass
+    line = {
+        "ts": round(time.time(), 3),
+        "guard": os.environ.get("BOSS_GUARD_NAME") or "unknown",
+        "tool": tool if isinstance(tool, str) else None,
+        "session_id": session if isinstance(session, str) else None,
+        "decision": decision,
+        "reason": (reason or "")[:400],
+        "exit_code": exit_code,
+    }
+    if detail:
+        line["detail"] = detail[:400]
+    try:
+        with open(path, "a") as trace_file:
+            trace_file.write(json.dumps(line) + "\n")
+    except Exception:
+        pass
+
+
+def classify(stdout):
+    """(decision, reason) from a guard's stdout, or (None, detail) if unusable."""
+    text = (stdout or "").strip()
+    if not text:
+        return None, "guard produced no output"
+    try:
+        parsed = json.loads(text)
+    except Exception as error:
+        return None, "guard output was not JSON (%s)" % error
+    if not isinstance(parsed, dict):
+        return None, "guard output was not a JSON object"
+    decision = parsed.get("decision")
+    if not isinstance(decision, str):
+        hook_output = parsed.get("hookSpecificOutput")
+        if isinstance(hook_output, dict):
+            decision = hook_output.get("permissionDecision")
+    if not isinstance(decision, str):
+        return None, "guard output carried no decision field"
+    lowered = decision.lower()
+    if lowered in APPROVE_DECISIONS or lowered in BLOCK_DECISIONS:
+        reason = parsed.get("reason")
+        if not isinstance(reason, str):
+            reason = ""
+        return lowered, reason
+    return None, "guard decision %r is not approve/block" % decision
+
+
+def main():
+    if len(sys.argv) < 2:
+        # No guard to run: refuse rather than approve an unguarded call.
+        detail = "shim invoked with no guard path"
+        message = GUARD_ERROR.format(guard="(unknown)", detail=detail)
+        record("", "guard_error", message, None, detail)
+        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        return 0
+
+    guard = sys.argv[1]
+    payload_text = sys.stdin.read()
+
+    expected = os.environ.get("BOSS_GUARD_SHA256", "")
+    if expected:
+        try:
+            digest = "sha256:" + hashlib.sha256(open(guard, "rb").read()).hexdigest()
+        except Exception as error:
+            digest = "unreadable (%s)" % error
+        if digest != expected:
+            detail = "guard bytes do not match the attested content hash (%s)" % digest
+            message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
+            record(payload_text, "guard_error", message, None, detail)
+            sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+            return 0
+
+    command = [sys.executable, guard] if guard.endswith(".py") else [guard]
+
+    try:
+        completed = subprocess.run(
+            command,
+            input=payload_text,
+            capture_output=True,
+            text=True,
+        )
+        stdout, stderr, code = completed.stdout, completed.stderr, completed.returncode
+    except Exception as error:
+        stdout, stderr, code = "", str(error), None
+
+    decision, reason_or_detail = classify(stdout)
+    if decision is None or code != 0:
+        detail = reason_or_detail if decision is None else "guard exited %s" % code
+        if stderr:
+            detail = "%s; stderr: %s" % (detail, stderr.strip()[:200])
+        message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
+        record(payload_text, "guard_error", message, code, detail)
+        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        return 0
+
+    record(payload_text, decision, reason_or_detail, code, None)
+    # Re-emit the guard's own output byte-for-byte: it may carry fields beyond
+    # `decision`/`reason` that Codex understands.
+    print(stdout, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+"#;
+
+/// Body of the `sh` wrapper Codex invokes for one guard.
+///
+/// A wrapper (rather than a bare guard path) is what carries the trace
+/// environment: Codex's hook `command` is a single path with no argv, and the
+/// trust gate hashes that string, so the per-guard context has to live inside
+/// the file.
+pub(super) fn wrapper_body(
+    shim: &Path,
+    guard: &Path,
+    guard_name: &str,
+    guard_sha256: &str,
+    trace_path: &Path,
+    extra_env: &[(&str, String)],
+) -> String {
+    let mut body = String::from("#!/bin/sh\n");
+    for (key, value) in extra_env {
+        body.push_str(&format!("export {key}={}\n", shell_quote(value)));
+    }
+    body.push_str(&format!(
+        "export {GUARD_TRACE_ENV}={}\n",
+        shell_quote(&trace_path.display().to_string())
+    ));
+    body.push_str(&format!("export {GUARD_NAME_ENV}={}\n", shell_quote(guard_name)));
+    body.push_str(&format!("export {GUARD_SHA256_ENV}={}\n", shell_quote(guard_sha256)));
+    body.push_str(&format!(
+        "exec python3 {} {}\n",
+        shell_quote(&shim.display().to_string()),
+        shell_quote(&guard.display().to_string()),
+    ));
+    body
+}
+
+/// One recorded guard invocation.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GuardTraceRecord {
+    /// Guard label (the materialised wrapper's stem).
+    #[serde(default)]
+    pub guard: String,
+    /// Tool name from the hook payload, when it carried one.
+    #[serde(default)]
+    pub tool: Option<String>,
+    /// `approve`, `block`, or `guard_error`.
+    #[serde(default)]
+    pub decision: String,
+    /// Head of the guard's reason, as recorded.
+    #[serde(default)]
+    pub reason: String,
+}
+
+impl GuardTraceRecord {
+    fn is_block(&self) -> bool {
+        self.decision == "block" || self.decision == "deny"
+    }
+
+    fn is_guard_error(&self) -> bool {
+        self.decision == "guard_error"
+    }
+}
+
+/// Aggregate of the guard records observed for one turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuardTraceSummary {
+    /// Records whose decision approved the call.
+    pub approvals: usize,
+    /// Records whose decision blocked the call.
+    pub blocks: usize,
+    /// Records where the guard itself failed and the shim blocked for it.
+    pub guard_errors: usize,
+    /// Lines that were not parseable records — kept visible rather than
+    /// dropped, because a corrupt trace is itself a signal.
+    pub unparseable_lines: usize,
+    /// `guard: reason head` for each block / guard error, in order.
+    pub notable: Vec<String>,
+}
+
+impl GuardTraceSummary {
+    /// Total guard invocations recorded. Derived rather than stored so the
+    /// count can never disagree with the three decision buckets it sums.
+    pub fn invocations(&self) -> usize {
+        self.approvals + self.blocks + self.guard_errors
+    }
+}
+
+/// Read trace records starting at line `from_line`.
+///
+/// Returns the records and the line count consumed, so the caller can resume
+/// after the same offset on the next turn without re-reporting. A missing file
+/// is not an error: it means no guard has run yet (which is exactly what the
+/// caller wants to know).
+pub(super) fn read_records_from(path: &Path, from_line: usize) -> (Vec<GuardTraceRecord>, usize, usize) {
+    let Ok(file) = std::fs::File::open(path) else {
+        return (Vec::new(), from_line, 0);
+    };
+    let mut records = Vec::new();
+    let mut unparseable = 0usize;
+    let mut line_index = 0usize;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        line_index += 1;
+        if line_index <= from_line {
+            continue;
+        }
+        if records.len() >= MAX_RECORDS_PER_READ {
+            break;
+        }
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<GuardTraceRecord>(&line) {
+            Ok(record) => records.push(record),
+            Err(_) => unparseable += 1,
+        }
+    }
+    (records, line_index, unparseable)
+}
+
+/// Fold records into a summary.
+pub(super) fn summarize(records: &[GuardTraceRecord], unparseable_lines: usize) -> GuardTraceSummary {
+    let mut summary = GuardTraceSummary {
+        unparseable_lines,
+        ..Default::default()
+    };
+    for record in records {
+        if record.is_guard_error() {
+            summary.guard_errors += 1;
+        } else if record.is_block() {
+            summary.blocks += 1;
+        } else {
+            summary.approvals += 1;
+        }
+        if record.is_block() || record.is_guard_error() {
+            let head: String = record.reason.chars().take(160).collect();
+            let tool = record.tool.as_deref().unwrap_or("?");
+            summary.notable.push(format!("{} on {tool}: {head}", record.guard));
+        }
+    }
+    summary
+}
+
+/// One-line rendering of a summary, for the notification body.
+pub(super) fn render_summary(summary: &GuardTraceSummary) -> String {
+    let mut text = format!(
+        "{} guard invocation(s): {} approved, {} blocked, {} guard error(s)",
+        summary.invocations(),
+        summary.approvals,
+        summary.blocks,
+        summary.guard_errors
+    );
+    if summary.unparseable_lines > 0 {
+        text.push_str(&format!("; {} unreadable trace line(s)", summary.unparseable_lines));
+    }
+    for note in &summary.notable {
+        text.push_str(&format!("; {note}"));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// `sha256:<hex>` of a file, mirroring what the driver bakes into the
+    /// wrapper. Computed with python so the test needs no hashing dependency.
+    fn sha256_of(path: &Path) -> String {
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import hashlib,sys;print('sha256:'+hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())")
+            .arg(path)
+            .output()
+            .expect("python3 must be available");
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("boss-guard-trace-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Materialise the shim plus a stub guard, run it, and return
+    /// (stdout decision, trace lines).
+    fn run_shim(tag: &str, guard_body: &str, payload: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let dir = temp_dir(tag);
+        let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
+        std::fs::write(&shim, GUARD_TRACE_SHIM_SCRIPT).unwrap();
+        let guard = dir.join("stub_guard.py");
+        std::fs::write(&guard, guard_body).unwrap();
+        let trace = dir.join(GUARD_TRACE_FILENAME);
+
+        let mut child = std::process::Command::new("python3")
+            .arg(&shim)
+            .arg(&guard)
+            .env(GUARD_TRACE_ENV, &trace)
+            .env(GUARD_NAME_ENV, "stub_guard")
+            .env(GUARD_SHA256_ENV, sha256_of(&guard))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 must be available");
+        child.stdin.as_mut().unwrap().write_all(payload.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
+            panic!(
+                "shim produced invalid JSON: {err}\nstdout={stdout}\nstderr={}",
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        let lines = std::fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
+            .collect();
+        (decision, lines)
+    }
+
+    const PAYLOAD: &str = r#"{"tool_name":"Bash","session_id":"sess-1","tool_input":{"command":"echo hi"}}"#;
+
+    #[test]
+    fn approval_is_passed_through_and_recorded() {
+        let (decision, lines) = run_shim(
+            "approve",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
+            PAYLOAD,
+        );
+        assert_eq!(decision["decision"], "approve");
+        assert_eq!(lines.len(), 1, "one invocation must be recorded");
+        assert_eq!(lines[0]["decision"], "approve");
+        assert_eq!(lines[0]["tool"], "Bash");
+        assert_eq!(lines[0]["guard"], "stub_guard");
+        assert_eq!(lines[0]["session_id"], "sess-1");
+    }
+
+    #[test]
+    fn block_reason_is_preserved_verbatim() {
+        let (decision, lines) = run_shim(
+            "block",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'block','reason':'nope'}))\n",
+            PAYLOAD,
+        );
+        assert_eq!(decision["decision"], "block");
+        assert_eq!(decision["reason"], "nope");
+        assert_eq!(lines[0]["decision"], "block");
+        assert_eq!(lines[0]["reason"], "nope");
+    }
+
+    #[test]
+    fn crashing_guard_becomes_a_block_not_an_approval() {
+        // The whole point: Codex treats a broken hook as approval. The shim
+        // must convert that into a refusal and say so.
+        let (decision, lines) = run_shim("crash", "import sys\nsys.stdin.read()\nraise SystemExit(3)\n", PAYLOAD);
+        assert_eq!(decision["decision"], "block");
+        assert!(
+            decision["reason"].as_str().unwrap().contains("fail-closed"),
+            "reason must be explicit about failing closed: {decision}"
+        );
+        assert_eq!(lines[0]["decision"], "guard_error");
+    }
+
+    #[test]
+    fn guard_printing_garbage_becomes_a_block() {
+        let (decision, lines) = run_shim("garbage", "import sys\nsys.stdin.read()\nprint('not json')\n", PAYLOAD);
+        assert_eq!(decision["decision"], "block");
+        assert_eq!(lines[0]["decision"], "guard_error");
+    }
+
+    #[test]
+    fn silent_guard_becomes_a_block() {
+        let (decision, lines) = run_shim("silent", "import sys\nsys.stdin.read()\n", PAYLOAD);
+        assert_eq!(decision["decision"], "block");
+        assert_eq!(lines[0]["decision"], "guard_error");
+    }
+
+    #[test]
+    fn hook_specific_output_dialect_is_understood() {
+        let (decision, lines) = run_shim(
+            "dialect",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'hookSpecificOutput':{'permissionDecision':'deny'}}))\n",
+            PAYLOAD,
+        );
+        assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(lines[0]["decision"], "deny");
+    }
+
+    #[test]
+    fn a_guard_whose_bytes_do_not_match_the_attested_hash_is_refused() {
+        // Wrapping cost the trust gate its content binding on the guard file
+        // itself (it hashes the wrapper now), so the shim re-checks the guard's
+        // bytes on every invocation. A guard edited after arming must block,
+        // not run.
+        let dir = temp_dir("tamper");
+        let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
+        std::fs::write(&shim, GUARD_TRACE_SHIM_SCRIPT).unwrap();
+        let guard = dir.join("stub_guard.py");
+        std::fs::write(
+            &guard,
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
+        )
+        .unwrap();
+        let trace = dir.join(GUARD_TRACE_FILENAME);
+
+        let mut child = std::process::Command::new("python3")
+            .arg(&shim)
+            .arg(&guard)
+            .env(GUARD_TRACE_ENV, &trace)
+            .env(GUARD_NAME_ENV, "stub_guard")
+            .env(
+                GUARD_SHA256_ENV,
+                "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 must be available");
+        child.stdin.as_mut().unwrap().write_all(PAYLOAD.as_bytes()).unwrap();
+        drop(child.stdin.take());
+        let out = child.wait_with_output().unwrap();
+        let decision: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(decision["decision"], "block");
+        assert!(
+            decision["reason"].as_str().unwrap().contains("content hash"),
+            "reason must name the content-hash mismatch: {decision}"
+        );
+        let recorded = std::fs::read_to_string(&trace).unwrap();
+        assert!(recorded.contains("guard_error"), "{recorded}");
+    }
+
+    #[test]
+    fn reading_resumes_after_the_reported_offset() {
+        let dir = temp_dir("read");
+        let path = dir.join(GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &path,
+            "{\"guard\":\"a\",\"decision\":\"approve\"}\n{\"guard\":\"b\",\"decision\":\"block\",\"reason\":\"no\",\"tool\":\"Bash\"}\n",
+        )
+        .unwrap();
+
+        let (records, offset, unparseable) = read_records_from(&path, 0);
+        assert_eq!(records.len(), 2);
+        assert_eq!(offset, 2);
+        assert_eq!(unparseable, 0);
+
+        // A second turn must not re-report the same records.
+        let (again, offset_again, _) = read_records_from(&path, offset);
+        assert!(again.is_empty(), "already-reported records must not repeat");
+        assert_eq!(offset_again, 2);
+    }
+
+    #[test]
+    fn missing_trace_file_reads_as_no_records() {
+        let dir = temp_dir("missing");
+        let (records, offset, unparseable) = read_records_from(&dir.join(GUARD_TRACE_FILENAME), 0);
+        assert!(records.is_empty());
+        assert_eq!(offset, 0);
+        assert_eq!(unparseable, 0);
+    }
+
+    #[test]
+    fn corrupt_lines_are_counted_not_dropped() {
+        let dir = temp_dir("corrupt");
+        let path = dir.join(GUARD_TRACE_FILENAME);
+        std::fs::write(&path, "{\"guard\":\"a\",\"decision\":\"approve\"}\nnot-json\n").unwrap();
+        let (records, _, unparseable) = read_records_from(&path, 0);
+        assert_eq!(records.len(), 1);
+        assert_eq!(unparseable, 1);
+    }
+
+    #[test]
+    fn summary_counts_and_names_the_notable_decisions() {
+        let records = vec![
+            GuardTraceRecord {
+                guard: "01_boss_launch_guard".into(),
+                tool: Some("Bash".into()),
+                decision: "approve".into(),
+                reason: String::new(),
+            },
+            GuardTraceRecord {
+                guard: "02_pr_redirect_guard".into(),
+                tool: Some("Bash".into()),
+                decision: "block".into(),
+                reason: "use cube".into(),
+            },
+            GuardTraceRecord {
+                guard: "03_checkleft_push_guard".into(),
+                tool: Some("Bash".into()),
+                decision: "guard_error".into(),
+                reason: "guard exited 3".into(),
+            },
+        ];
+        let summary = summarize(&records, 1);
+        assert_eq!(summary.invocations(), 3);
+        assert_eq!(summary.approvals, 1);
+        assert_eq!(summary.blocks, 1);
+        assert_eq!(summary.guard_errors, 1);
+        assert_eq!(summary.unparseable_lines, 1);
+        let rendered = render_summary(&summary);
+        assert!(rendered.contains("3 guard invocation(s)"), "{rendered}");
+        assert!(
+            rendered.contains("02_pr_redirect_guard on Bash: use cube"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("unreadable trace line"), "{rendered}");
+    }
+
+    #[test]
+    fn wrapper_body_carries_trace_env_and_extra_env() {
+        let body = wrapper_body(
+            Path::new("/home/guards/boss_guard_trace.py"),
+            Path::new("/home/guards/00_path_guard.py"),
+            "00_path_guard",
+            "sha256:abc123",
+            Path::new("/home/guard-trace.jsonl"),
+            &[("BOSS_DATA_DIR", "/data/Boss dir".to_owned())],
+        );
+        assert!(body.starts_with("#!/bin/sh\n"), "{body}");
+        assert!(body.contains("export BOSS_DATA_DIR='/data/Boss dir'"), "{body}");
+        assert!(
+            body.contains("export BOSS_GUARD_TRACE='/home/guard-trace.jsonl'"),
+            "{body}"
+        );
+        assert!(body.contains("export BOSS_GUARD_NAME='00_path_guard'"), "{body}");
+        assert!(body.contains("export BOSS_GUARD_SHA256='sha256:abc123'"), "{body}");
+        assert!(
+            body.contains("exec python3 '/home/guards/boss_guard_trace.py' '/home/guards/00_path_guard.py'"),
+            "{body}"
+        );
+    }
+}

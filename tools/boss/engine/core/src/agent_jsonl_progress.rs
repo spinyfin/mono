@@ -1063,7 +1063,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                if sink.events.lock().unwrap().len() >= 5 {
+                if sink.events.lock().unwrap().len() >= 6 {
                     break;
                 }
                 sink.notify.notified().await;
@@ -1074,7 +1074,12 @@ mod tests {
 
         let events = sink.events.lock().unwrap();
         let canonical_accepted = fs::canonicalize(&accepted).unwrap();
-        assert_eq!(events.len(), 5);
+        // Six, not five: this synthetic rollout runs a tool call with no Boss
+        // guard trace beside it, which is exactly the condition
+        // `GUARDS_SILENT_MARKER` reports (see the guard-trace notification
+        // asserted below). A real dispatch always has an armed guard, so the
+        // marker there means the hooks genuinely did not run.
+        assert_eq!(events.len(), 6);
         assert!(events.iter().all(|event| event.run_id.as_deref() == Some("run-live")));
         assert!(
             events
@@ -1090,6 +1095,11 @@ mod tests {
         assert!(matches!(&events[3].event, WorkerEvent::PostToolUse { .. }));
         assert!(matches!(
             &events[4].event,
+            WorkerEvent::Notification { message, .. }
+                if message.starts_with(crate::driver::codex::GUARDS_SILENT_MARKER)
+        ));
+        assert!(matches!(
+            &events[5].event,
             WorkerEvent::Stop {
                 stop_reason: StopReason::Completed,
                 ..
