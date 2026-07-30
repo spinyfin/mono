@@ -465,13 +465,14 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
     );
 
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-    let reap_ctx = crate::spawn_ack_sweep::SpawnReapCtx {
-        work_db: server_state.work_db.as_ref(),
-        coordinator: server_state.execution_coordinator.clone(),
-        dispatch_events: server_state.dispatch_events.as_ref(),
-        reaper: server_state.as_ref(),
-        spawn_health: server_state.spawn_health.as_ref(),
-    };
+    let reap_ctx = crate::spawn_ack_sweep::SpawnReapCtx::builder()
+        .work_db(server_state.work_db.as_ref())
+        .coordinator(server_state.execution_coordinator.clone())
+        .dispatch_events(server_state.dispatch_events.as_ref())
+        .reaper(server_state.as_ref())
+        .spawn_health(server_state.spawn_health.as_ref())
+        .cube_client(server_state.cube_client.as_ref())
+        .build();
     crate::spawn_ack_sweep::reap_never_started_spawn(
         &reap_ctx,
         &execution,

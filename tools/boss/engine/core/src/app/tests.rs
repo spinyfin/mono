@@ -190,6 +190,7 @@ mod answer_agent_lifecycle;
 mod app_channel;
 mod context;
 mod dispatch_pause;
+mod driver_start_signal;
 mod engine_health_report;
 mod open_document;
 mod pr_status;

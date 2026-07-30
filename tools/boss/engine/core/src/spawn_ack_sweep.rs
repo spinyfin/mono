@@ -25,34 +25,105 @@
 //! app accepted the spawn but no process, and thus no pid and no hook,
 //! ever manifested at all."
 //!
+//! ## The second incident: a pane that DID have a shell, and no driver
+//!
+//! On 2026-07-30 the inverse shape appeared. `pane_spawned/ok` came back,
+//! `onSurfaceAttached` reported a real foreground pid (92697), and the
+//! slot looked healthy to every check in Boss — but the pid was the
+//! **login shell's**, and the driver binary had never been exec'd at all
+//! (the spawn command was delivered as typed tty input and eaten by the
+//! macOS canonical-mode line-length cap; that trigger is fixed
+//! separately). `bossctl agents transcript` reported "engine has not yet
+//! received a hook event carrying transcript_path" indefinitely. The
+//! merge poller logged "still waiting_human with no pr_url; will retry"
+//! every ~68s forever. No attention item was ever raised. The slot and
+//! its cube workspace lease were held until a human noticed the pane.
+//!
+//! Every gate passed *because* a pid existed:
+//!
+//! - this sweep skipped the slot outright (`shell_pid > 0`);
+//! - [`LiveWorkerStateRegistry::mark_stalled_spawns`] skipped it too,
+//!   because grok omits `Capability::AwaitingInputSignal`;
+//! - [`crate::dead_pid_sweep`]'s `kill(pid, 0)` found the login shell
+//!   very much alive.
+//!
+//! The common root: **nothing validated the driver process.** Boss
+//! validated the pane surface and the shell hosting it, and treated that
+//! as proof of a working worker. So this module now reaps on two
+//! independent causes.
+//!
 //! ## Algorithm
 //!
-//! 1. Snapshot [`LiveWorkerStateRegistry`].
-//! 2. For each slot:
-//!    1. Skip unless `activity == Spawning`. A slot with `shell_pid > 0`
-//!       (a real process reported in) belongs to `mark_stalled_spawns`
-//!       or `dead_pid_sweep`, not here.
-//!    2. Skip if `shell_pid > 0` — some process did report in; this
-//!       sweep only owns the total-silence case.
-//!    3. Skip if any hook has ever fired (`last_event_at.is_some()`) —
-//!       proof of life even without a pid.
-//!    4. Age guard against the DB `started_at` ([`SPAWN_ACK_GRACE_SECS`]):
-//!       skip executions dispatched too recently to have exhausted the
-//!       app's own async surface-creation + shell-pid-retry window.
-//! 3. For a confirmed spawn-ack timeout: mark the execution `orphaned`,
-//!    append an `[engine-reconcile]` audit line, reap the (possibly
-//!    ghost) app pane through the same `release_worker_pane` teardown
-//!    `bossctl agents stop` uses, release the pool slot, emit a
-//!    `spawn_ack_timeout` dispatch event, and kick the coordinator so
-//!    the orphan sweep redispatches the never-started work.
+//! ### Pass 1 — spawn-ack timeout (the 2026-07-03/04 class)
+//!
+//! Snapshot [`LiveWorkerStateRegistry`]; for each slot:
+//!
+//! 1. Skip unless `activity == Spawning`.
+//! 2. Skip if a driver-originated signal was ever recorded
+//!    ([`LiveWorkerStateRegistry::driver_signal_at`]) — the driver is
+//!    running, whatever else is wrong.
+//! 3. Skip if `shell_pid > 0`. **This is a scope split, not a health
+//!    verdict** — a slot with a pid is pass 2's, on a longer window,
+//!    because the pid means the app really did host something and the
+//!    question narrows to "is that something the driver?".
+//! 4. Age guard against the DB `started_at` ([`SPAWN_ACK_GRACE_SECS`]).
+//!
+//! ### Pass 2 — driver-start timeout (the 2026-07-30 class)
+//!
+//! [`LiveWorkerStateRegistry::unverified_driver_starts`] returns every
+//! live slot past [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] with no driver-originated
+//! signal. That query reads only `driver_signal_at` and `spawned_at`, so
+//! it is blind to `shell_pid`, to `activity`, and to the driver's
+//! capability set: it covers grok exactly as it covers claude, and it
+//! sees a slot `mark_stalled_spawns` has promoted out of `Spawning` just
+//! as well as one still sitting in it.
+//!
+//! Both passes funnel into [`reap_never_started_spawn`], which marks the
+//! execution `orphaned`, appends an `[engine-reconcile]` audit line,
+//! reaps the pane through the same `release_worker_pane` teardown
+//! `bossctl agents stop` uses, releases the pool slot, force-releases the
+//! cube workspace lease, emits a dispatch event, and kicks the
+//! coordinator so the orphan sweep redispatches the never-started work.
+//! Pass 2 additionally raises an attention item (see below).
 //!
 //! ## False-positive guards
 //!
 //! [`SPAWN_ACK_GRACE_SECS`] (60s) is deliberately well above the app's
 //! shell-pid-propagation retry window (a single 250ms retry after
 //! `onSurfaceAttached`) so a merely-slow-but-real spawn is never reaped.
-//! Any slot that reports a pid or emits a single hook before the grace
-//! elapses is left alone — this sweep only fires on total silence.
+//!
+//! [`crate::live_worker_state::DRIVER_START_GRACE_SECS`] (300s) is five times that, and an order of
+//! magnitude above real driver startup — a healthy driver's `SessionStart`
+//! hook fires within seconds of exec. See that constant's doc for why
+//! claude's folder-trust dialog, the one historically legitimate
+//! multi-minute pre-hook wait, cannot produce a false positive here.
+//!
+//! A slot that produces a single driver signal before its window elapses
+//! is left alone by both passes, permanently: `driver_signal_at` is
+//! first-write-wins and is never cleared for the life of the run.
+//!
+//! ## Why pass 2 raises an attention item and pass 1 does not
+//!
+//! Both passes feed [`crate::spawn_health`] — the reap is shared, so every
+//! cause records evidence, records a failure against the work item, and can
+//! trip the spawn-capability breaker that pauses dispatch once enough
+//! DISTINCT work items fail inside the window. That is deliberate for a
+//! driver-start timeout too: a driver binary that cannot exec on this host
+//! fails identically for every work item routed to it, which is exactly the
+//! systemic shape the breaker exists to stop, and the alternative — reaping
+//! and redispatching forever without ever pausing — is the churn the breaker
+//! was built to end.
+//!
+//! What differs is *visibility*. Pass 1's failure is "the app's spawn path
+//! is misbehaving", and the breaker's one loud attention item on trip is a
+//! faithful summary of it. Pass 2's failure is different in kind: a pane
+//! genuinely came up and a live process was left holding a workspace with
+//! no driver in it. A single aggregate item cannot name which workspace is
+//! still held, and a lone occurrence — the 2026-07-30 incident was one — is
+//! below any aggregate threshold and would surface nowhere at all. So pass 2
+//! additionally raises its own per-execution item
+//! ([`DRIVER_START_ATTENTION_KIND`]) on top of the aggregation, rather than
+//! instead of it.
 //!
 //! ## Cadence
 //!
@@ -62,13 +133,17 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{WorkExecution, WorkerActivity};
+use boss_protocol::{CreateAttentionItemInput, WorkExecution, WorkerActivity};
 
-use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
+use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit};
 use crate::work::WorkDb;
+
+/// Kind string for the attention item raised when a spawn produced a
+/// pane but no driver. Stable — operator tooling pins it.
+pub const DRIVER_START_ATTENTION_KIND: &str = "worker_driver_never_started";
 
 /// Grace period after `started_at` (epoch seconds) during which a
 /// pid-less, hook-less `Spawning` slot is left alone. Comfortably above
@@ -99,24 +174,42 @@ pub trait SpawnAckReaper: Send + Sync {
 /// occurs.
 #[derive(Debug, Default)]
 pub struct SpawnAckSweepOutcome {
+    /// Reaped by pass 1 — nothing reported in at all.
     pub reaped: usize,
-    pub has_pid_skipped: usize,
-    pub has_event_skipped: usize,
-    pub not_spawning_skipped: usize,
-    pub grace_skipped: usize,
+    /// Reaped by pass 2 — a pane came up but no driver ever signalled.
+    pub driver_start_reaped: usize,
+    /// Why pass 1 passed over the slots it did not reap.
+    pub skipped: SpawnAckSkipCounts,
+}
+
+/// Pass 1's per-reason skip tallies, grouped so the outcome distinguishes
+/// what the sweep *did* from why it declined — and so adding a reason
+/// doesn't widen the outcome struct.
+#[derive(Debug, Default)]
+pub struct SpawnAckSkipCounts {
+    /// Slot reported a pid, so it belongs to pass 2's longer window.
+    pub has_pid: usize,
+    /// A driver-originated signal was recorded: a hook or transcript path
+    /// proving the driver runs, NOT merely "some event timestamp exists".
+    pub has_driver_signal: usize,
+    /// Slot has already left `Spawning`.
+    pub not_spawning: usize,
+    /// Execution is still inside [`SPAWN_ACK_GRACE_SECS`].
+    pub grace: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for SpawnAckSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.reaped > 0
+        self.reaped > 0 || self.driver_start_reaped > 0
     }
 
     fn log(&self) {
         tracing::info!(
             reaped = self.reaped,
-            has_pid_skipped = self.has_pid_skipped,
-            has_event_skipped = self.has_event_skipped,
-            grace_skipped = self.grace_skipped,
+            driver_start_reaped = self.driver_start_reaped,
+            has_pid_skipped = self.skipped.has_pid,
+            has_driver_signal_skipped = self.skipped.has_driver_signal,
+            grace_skipped = self.skipped.grace,
             "spawn-ack sweep: pass complete",
         );
     }
@@ -134,8 +227,10 @@ pub fn spawn_loop(
     dispatch_events: Arc<dyn DispatchEventSink>,
     reaper: Arc<dyn SpawnAckReaper>,
     spawn_health: Arc<SpawnHealthTracker>,
+    cube_client: Arc<dyn CubeClient>,
     interval: Duration,
     grace_secs: i64,
+    driver_start_grace_secs: i64,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
         let work_db = Arc::clone(&work_db);
@@ -144,6 +239,7 @@ pub fn spawn_loop(
         let dispatch_events = Arc::clone(&dispatch_events);
         let reaper = Arc::clone(&reaper);
         let spawn_health = Arc::clone(&spawn_health);
+        let cube_client = Arc::clone(&cube_client);
         async move {
             run_one_pass(
                 work_db.as_ref(),
@@ -152,7 +248,9 @@ pub fn spawn_loop(
                 dispatch_events.as_ref(),
                 reaper.as_ref(),
                 spawn_health.as_ref(),
+                cube_client.as_ref(),
                 grace_secs,
+                driver_start_grace_secs,
             )
             .await
         }
@@ -173,41 +271,63 @@ pub async fn run_one_pass(
     dispatch_events: &dyn DispatchEventSink,
     reaper: &dyn SpawnAckReaper,
     spawn_health: &SpawnHealthTracker,
+    cube_client: &dyn CubeClient,
     grace_secs: i64,
+    driver_start_grace_secs: i64,
 ) -> SpawnAckSweepOutcome {
     let mut outcome = SpawnAckSweepOutcome::default();
     let snapshot = live_states.snapshot();
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
     let grace_cutoff = now_epoch_secs - grace_secs;
-    let ctx = SpawnReapCtx {
-        work_db,
-        coordinator: Arc::clone(&coordinator),
-        dispatch_events,
-        reaper,
-        spawn_health,
-    };
+    let ctx = SpawnReapCtx::builder()
+        .work_db(work_db)
+        .coordinator(Arc::clone(&coordinator))
+        .dispatch_events(dispatch_events)
+        .reaper(reaper)
+        .spawn_health(spawn_health)
+        .cube_client(cube_client)
+        .build();
 
     for state in snapshot {
         // Only total-silence `Spawning` slots are candidates. Anything
         // else — `WaitingForInput`, `Working`, `Idle` — has already
         // shown some sign of life and belongs to a different sweep.
+        //
+        // NOTE this filter is NOT what covers the driver-never-started
+        // class: `mark_stalled_spawns` can promote such a slot out of
+        // `Spawning`, and it would escape here. Pass 2 below deliberately
+        // ignores `activity` for exactly that reason.
         if state.activity != WorkerActivity::Spawning {
-            outcome.not_spawning_skipped += 1;
+            outcome.skipped.not_spawning += 1;
             continue;
         }
 
-        // A reported pid means dead_pid_sweep (if it later dies) or the
-        // directory-trust-prompt path (mark_stalled_spawns) owns this
-        // slot — not us.
+        // A driver-originated signal — a hook, or a transcript path —
+        // is the ONLY thing that proves the driver binary is running.
+        // Checked before the pid split below so that a slot whose driver
+        // is demonstrably alive is never a candidate for either pass.
+        //
+        // Replaces the old `last_event_at.is_some()` test, which was
+        // forgeable: `mark_stalled_spawns` and `mark_errored` both write
+        // that timestamp from engine-side inference, so the engine's own
+        // guess could vouch for a driver that never ran.
+        if live_states.driver_signal_at(state.slot_id).is_some() {
+            outcome.skipped.has_driver_signal += 1;
+            continue;
+        }
+
+        // A reported pid means the app really did host something for
+        // this slot. That narrows the question from "did anything come
+        // up?" to "is what came up the driver?" — a different question
+        // on a longer window, owned by pass 2 below.
+        //
+        // This is a scope split between the two passes, NOT a health
+        // verdict: before pass 2 existed, this `continue` was the end of
+        // the line, and a pane hosting an idle login shell rode it to an
+        // indefinite hold on a slot and a cube lease.
         if state.shell_pid > 0 {
-            outcome.has_pid_skipped += 1;
-            continue;
-        }
-
-        // Any hook at all is proof of life even without a pid.
-        if state.last_event_at.is_some() {
-            outcome.has_event_skipped += 1;
+            outcome.skipped.has_pid += 1;
             continue;
         }
 
@@ -232,11 +352,11 @@ pub async fn run_one_pass(
         let started_epoch = execution.started_epoch();
         match started_epoch {
             None => {
-                outcome.grace_skipped += 1;
+                outcome.skipped.grace += 1;
                 continue;
             }
             Some(t) if t >= grace_cutoff => {
-                outcome.grace_skipped += 1;
+                outcome.skipped.grace += 1;
                 continue;
             }
             _ => {}
@@ -263,6 +383,65 @@ pub async fn run_one_pass(
         }
     }
 
+    // ─── Pass 2: driver-start verification ──────────────────────────────
+    //
+    // Everything above answers "did a pane come up?". This answers the
+    // question no check in Boss asked before 2026-07-30: "did the DRIVER
+    // come up?" — the one a pane hosting an idle login shell fails while
+    // satisfying every pane-level check indefinitely.
+    //
+    // `unverified_driver_starts` reads only `driver_signal_at` and
+    // `spawned_at`. It is blind to `shell_pid`, to `activity`, and to the
+    // driver's capability set by construction, so there is no driver-
+    // specific path through it and no way to opt a driver out.
+    for candidate in live_states.unverified_driver_starts(now_epoch_secs, driver_start_grace_secs) {
+        let execution_id = &candidate.run_id;
+
+        let Some(execution) = crate::sweep_loop::lookup_execution_or_warn(
+            work_db,
+            execution_id,
+            "driver-start check: failed to look up execution; skipping slot",
+        ) else {
+            continue;
+        };
+
+        // The completion path may have raced us to a terminal status.
+        if execution.status.is_terminal() {
+            continue;
+        }
+
+        tracing::error!(
+            execution_id,
+            work_item_id = %execution.work_item_id,
+            slot_id = candidate.slot_id,
+            shell_pid = candidate.shell_pid,
+            activity = candidate.activity.as_str(),
+            silent_secs = candidate.silent_secs,
+            threshold_secs = driver_start_grace_secs,
+            "driver-start timeout: pane spawned but NO driver-originated signal (no hook event, no \
+             transcript path) ever arrived. The reported shell pid is the login shell hosting the \
+             pane, not the driver. Reaping: releasing the worker slot and the cube workspace lease \
+             and raising an attention item.",
+        );
+
+        if reap_never_started_spawn(
+            &ctx,
+            &execution,
+            candidate.slot_id,
+            candidate.shell_pid,
+            ReapCause::DriverStartTimeout {
+                grace_secs: driver_start_grace_secs,
+                silent_secs: candidate.silent_secs,
+                activity: candidate.activity.as_str(),
+            },
+            now_epoch_secs,
+        )
+        .await
+        {
+            outcome.driver_start_reaped += 1;
+        }
+    }
+
     // Breaker half-open recovery: while dispatch is Breaker-paused, this is
     // the tick that periodically admits a single canary execution through
     // the pause. Runs every pass regardless of whether this pass reaped
@@ -277,6 +456,7 @@ pub async fn run_one_pass(
 /// [`reap_never_started_spawn`] stays under the argument-count lint and both
 /// callers (the periodic sweep and the `ReportWorkerSpawnFailed` NACK handler)
 /// construct it the same way.
+#[derive(bon::Builder)]
 pub(crate) struct SpawnReapCtx<'a> {
     pub work_db: &'a WorkDb,
     /// `Arc` because `release_worker_and_kick` spawns a task that holds a
@@ -285,6 +465,12 @@ pub(crate) struct SpawnReapCtx<'a> {
     pub dispatch_events: &'a dyn DispatchEventSink,
     pub reaper: &'a dyn SpawnAckReaper,
     pub spawn_health: &'a SpawnHealthTracker,
+    /// Used to force-release the reaped execution's cube workspace lease.
+    /// `mark_execution_orphaned` deliberately leaves the lease columns
+    /// intact, and the pane teardown does not touch cube — so without
+    /// this the workspace stays leased until TTL. Holding it silently is
+    /// the harm the 2026-07-30 incident consisted of.
+    pub cube_client: &'a dyn CubeClient,
 }
 
 /// Why a never-started spawn is being reaped. Selects the orphan reason text,
@@ -294,6 +480,15 @@ pub(crate) enum ReapCause<'a> {
     SpawnAckTimeout { grace_secs: i64 },
     /// The app proactively reported the spawn failed (fast-fail NACK).
     AppNack { reason: &'a str },
+    /// A pane came up — possibly with a live shell pid — but no
+    /// driver-originated signal ever arrived, so the driver binary never
+    /// executed. Unlike the two above, this one also raises a
+    /// per-execution attention item: nothing else in Boss surfaces it.
+    DriverStartTimeout {
+        grace_secs: i64,
+        silent_secs: i64,
+        activity: &'static str,
+    },
 }
 
 /// Reap a `Spawning` slot that never produced a live shell: mark the execution
@@ -335,6 +530,23 @@ pub(crate) async fn reap_never_started_spawn(
                 "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
             ),
             Stage::SpawnNack,
+        ),
+        ReapCause::DriverStartTimeout {
+            grace_secs,
+            silent_secs,
+            ..
+        } => (
+            format!(
+                "driver-start-timeout: pane spawned but no driver-originated signal (hook event or \
+                 transcript path) arrived within {grace_secs}s; driver binary never started \
+                 (silent for {silent_secs}s)"
+            ),
+            format!(
+                "driver-start timeout (exec {execution_id}) detected — pane came up but no hook event \
+                 or transcript path arrived within {grace_secs}s, so the driver binary never ran; \
+                 worker slot and cube workspace lease released, chore reset to todo for redispatch."
+            ),
+            Stage::DriverStartTimeout,
         ),
     };
 
@@ -393,6 +605,33 @@ pub(crate) async fn reap_never_started_spawn(
     let worker_id = worker_id_for_slot(slot_id);
     ctx.coordinator.release_worker_and_kick(&worker_id, None).await;
 
+    // Release the cube workspace lease. `mark_execution_orphaned`
+    // deliberately leaves the lease columns intact (a live workspace may
+    // hold in-flight commits a resume should reclaim) and nothing above
+    // this line talks to cube — so before this call the lease survived
+    // every reap on this path and stayed `leased` until TTL, kept warm by
+    // the engine's own DB-fallback heartbeat.
+    //
+    // Here we KNOW no worker occupies the workspace: no driver ever
+    // signalled, and the pane (with whatever shell it hosted) was torn
+    // down above. Holding the lease "to be safe" is the harm, not the
+    // safe option — that is what the 2026-07-30 incident was. Mirrors
+    // `lost_workspace_sweep::run_one_pass`. Best-effort: a lease already
+    // gone is the common benign case, so failure is `debug`, not `warn`.
+    if let Some(lease_id) = execution.cube_lease_id.as_deref()
+        && let Err(err) = ctx
+            .cube_client
+            .force_release_lease(lease_id, Some(orphan_reason.as_str()))
+            .await
+    {
+        tracing::debug!(
+            execution_id,
+            lease_id,
+            error = %format!("{err:#}"),
+            "reap-never-started-spawn: best-effort cube lease force-release failed (likely already released)",
+        );
+    }
+
     // Structured event for bossctl dispatch tail.
     let mut details = serde_json::json!({
         "slot_id": slot_id,
@@ -405,6 +644,16 @@ pub(crate) async fn reap_never_started_spawn(
         }
         ReapCause::AppNack { reason } => {
             details["reason"] = serde_json::json!(reason);
+        }
+        ReapCause::DriverStartTimeout {
+            grace_secs,
+            silent_secs,
+            activity,
+        } => {
+            details["threshold_secs"] = serde_json::json!(grace_secs);
+            details["silent_secs"] = serde_json::json!(silent_secs);
+            details["activity"] = serde_json::json!(activity);
+            raise_driver_start_attention(ctx.work_db, execution, slot_id, shell_pid, *grace_secs, *silent_secs);
         }
     }
     ctx.dispatch_events
@@ -419,6 +668,12 @@ pub(crate) async fn reap_never_started_spawn(
     // failure spreads across many work items, which the per-item churn guard
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
+    //
+    // All three causes feed it, driver-start timeouts included: a driver
+    // binary that cannot exec on this host fails the same way for every work
+    // item routed to it, so it belongs in the aggregate. Pass 2's own
+    // per-execution attention item above is additional to this, not a
+    // replacement for it — see the module doc.
     ctx.spawn_health
         .record_evidence(crate::spawn_health::SpawnFailureEvidence {
             execution_id: execution_id.to_owned(),
@@ -451,6 +706,80 @@ pub(crate) async fn reap_never_started_spawn(
     true
 }
 
+/// Raise the per-execution attention item for a driver-start timeout.
+///
+/// The 2026-07-30 incident's defining property was silence: the merge
+/// poller logged "still waiting_human with no pr_url; will retry" every
+/// ~68 seconds indefinitely, and `attention_created` was `false`, so the
+/// only thing that ever surfaced the stuck worker was a human happening
+/// to look at the pane. This is the fix for that half — the reap frees
+/// the resources, this makes the reap visible.
+///
+/// Deliberately per-execution rather than aggregated: unlike a spawn-ack
+/// timeout (which redispatches transparently and is aggregated by
+/// [`crate::spawn_health`]), a driver that never started with a live shell
+/// left behind is a distinct condition an operator should see even when it
+/// happens once.
+///
+/// Best-effort — a failure here must never abort the reap, since the reap
+/// is what actually frees the slot and lease.
+fn raise_driver_start_attention(
+    work_db: &WorkDb,
+    execution: &WorkExecution,
+    slot_id: u8,
+    shell_pid: i32,
+    grace_secs: i64,
+    silent_secs: i64,
+) {
+    let execution_id = execution.id.as_str();
+    let pid_note = if shell_pid > 0 {
+        format!(
+            "The pane reported shell pid `{shell_pid}`, which is why every existing check treated \
+             this slot as healthy — that pid is the **login shell hosting the pane**, not the driver."
+        )
+    } else {
+        "No shell pid was ever reported for this pane.".to_owned()
+    };
+    let body = format!(
+        "A worker pane was spawned for execution `{execution_id}` on slot {slot_id}, but no \
+         driver-originated signal — no hook event, no `transcript_path` — arrived within \
+         {grace_secs}s (silent for {silent_secs}s). The driver binary never started.\n\n\
+         {pid_note}\n\n\
+         The engine has reaped the execution: the pane was torn down, the worker slot released, \
+         and the cube workspace lease force-released. The work item is reset for redispatch.\n\n\
+         If this repeats for the same driver, the spawn command is most likely not reaching the \
+         driver binary at all — check how the command is delivered to the pane rather than \
+         whether the pane exists."
+    );
+    if let Err(err) = work_db.create_attention_item(CreateAttentionItemInput {
+        body_markdown: body,
+        kind: DRIVER_START_ATTENTION_KIND.to_owned(),
+        title: format!("Worker driver never started on slot {slot_id}"),
+        execution_id: Some(execution_id.to_owned()),
+        resolved_at: None,
+        status: None,
+        // Execution-scoped, not work-item-scoped: `create_attention_item`
+        // rejects an input carrying both, and the execution is the right
+        // anchor here — the failure is about this spawn, and the work item
+        // is about to be redispatched onto a fresh one.
+        work_item_id: None,
+    }) {
+        tracing::warn!(
+            execution_id,
+            ?err,
+            "driver-start timeout: failed to raise attention item (reap still proceeded)",
+        );
+    }
+}
+
+/// End-to-end reproduction of the incident against a real OS process,
+/// asserting that all three pre-existing guards pass the slot and only
+/// driver-start verification catches it. Kept in its own file because it
+/// drives several subsystems, not just this module.
+#[cfg(test)]
+#[path = "spawn_ack_sweep_induced_failure_tests.rs"]
+mod induced_failure_tests;
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -462,7 +791,7 @@ mod tests {
     use super::*;
     use crate::coordinator::ExecutionCoordinator;
     use crate::dispatch_events::RecordingDispatchEventSink;
-    use crate::live_worker_state::LiveWorkerStateRegistry;
+    use crate::live_worker_state::{DRIVER_START_GRACE_SECS, LiveWorkerStateRegistry};
     use crate::test_support::*;
     use crate::work::ExecutionStatus;
 
@@ -507,7 +836,62 @@ mod tests {
         }
     }
 
+    crate::stub_cube_client! { RecordingCube {
+        async fn force_release_lease(&self, lease_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
+            self.released.lock().unwrap().push((lease_id.to_owned(), reason.map(str::to_owned)));
+            Ok(())
+        }
+    } }
+
+    /// Records every cube lease force-release so a reap can be asserted to
+    /// have actually handed the workspace back, not merely orphaned the row.
+    #[derive(Default)]
+    struct RecordingCube {
+        released: StdMutex<Vec<(String, Option<String>)>>,
+    }
+
+    impl RecordingCube {
+        fn released_lease_ids(&self) -> Vec<String> {
+            self.released.lock().unwrap().iter().map(|(id, _)| id.clone()).collect()
+        }
+    }
+
     // ─── helpers ─────────────────────────────────────────────────────────────
+
+    /// Register a slot in the exact shape the 2026-07-30 incident left
+    /// behind: a live foreground shell pid reported by the app, and no
+    /// driver-originated signal at all.
+    ///
+    /// `awaiting_input_capable` mirrors the driver's declared capability —
+    /// `false` is grok (which omits `Capability::AwaitingInputSignal` and was
+    /// therefore exempt from `mark_stalled_spawns`), `true` is claude.
+    fn register_slot_with_live_shell(
+        live_states: &LiveWorkerStateRegistry,
+        slot_id: u8,
+        execution_id: &str,
+        work_item_id: &str,
+        shell_pid: i32,
+        awaiting_input_capable: bool,
+    ) {
+        live_states.register_spawn_with_capabilities(
+            slot_id,
+            execution_id,
+            "grok-4.5",
+            shell_pid,
+            Some(WorkItemBinding {
+                work_item_id: work_item_id.to_owned(),
+                work_item_name: "test chore".to_owned(),
+                execution_id: execution_id.to_owned(),
+            }),
+            awaiting_input_capable,
+            crate::live_worker_state::LiveSpawnRouting::none(),
+        );
+        // Age the spawn past every window under test.
+        live_states.set_spawn_time_for_test(
+            slot_id,
+            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+        );
+    }
 
     fn register_slot_zero_pid(
         live_states: &LiveWorkerStateRegistry,
@@ -565,7 +949,9 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
@@ -631,18 +1017,26 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
         assert_eq!(outcome.reaped, 0, "a slot with a reported pid must not be reaped here");
-        assert_eq!(outcome.has_pid_skipped, 1);
+        assert_eq!(outcome.skipped.has_pid, 1);
         assert!(sink.events().await.is_empty());
         assert_eq!(db.get_execution(&execution_id).unwrap().status, ExecutionStatus::Ready);
     }
 
     /// A pid-less slot that has emitted at least one hook event is proof
     /// of life and must not be reaped.
+    ///
+    /// The setup records the driver signal alongside `apply_event` because
+    /// that is what the production hook ingress does — `dispatch_live_worker_state`
+    /// calls `record_driver_signal` before it resolves the slot and calls
+    /// `apply_event`. Driving `apply_event` alone would be a hook that
+    /// arrived without arriving.
     #[tokio::test]
     async fn slot_with_any_hook_event_is_not_reaped() {
         let (_dir, db) = open_db();
@@ -657,6 +1051,7 @@ mod tests {
         // flipping activity away from Spawning (only the Startup source
         // does that) — this isolates the has_event guard from the
         // not_spawning guard exercised by the test below.
+        live_states.record_driver_signal(&execution_id, crate::live_worker_state::DriverSignalKind::HookEvent);
         live_states.apply_event(
             1,
             &WorkerEvent::SessionStart {
@@ -679,7 +1074,9 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
@@ -716,12 +1113,14 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
         assert_eq!(outcome.reaped, 0, "grace period must prevent reaping fresh dispatches");
-        assert_eq!(outcome.grace_skipped, 1);
+        assert_eq!(outcome.skipped.grace, 1);
     }
 
     /// A slot already past `Spawning` (e.g. `Working`) is never a
@@ -757,12 +1156,14 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
         assert_eq!(outcome.reaped, 0);
-        assert_eq!(outcome.not_spawning_skipped, 1);
+        assert_eq!(outcome.skipped.not_spawning, 1);
     }
 
     /// The post-wake systemic failure: several DIFFERENT work items each have
@@ -814,7 +1215,9 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
@@ -904,7 +1307,9 @@ mod tests {
             sink.as_ref(),
             reaper.as_ref(),
             &spawn_health,
+            &NoopCube,
             SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
         )
         .await;
 
@@ -949,13 +1354,14 @@ mod tests {
         let spawn_health = SpawnHealthTracker::new();
         let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
         let sink = Arc::new(RecordingDispatchEventSink::new());
-        let ctx = SpawnReapCtx {
-            work_db: db.as_ref(),
-            coordinator: coordinator.clone(),
-            dispatch_events: sink.as_ref(),
-            reaper: reaper.as_ref(),
-            spawn_health: &spawn_health,
-        };
+        let ctx = SpawnReapCtx::builder()
+            .work_db(db.as_ref())
+            .coordinator(coordinator.clone())
+            .dispatch_events(sink.as_ref())
+            .reaper(reaper.as_ref())
+            .spawn_health(&spawn_health)
+            .cube_client(&NoopCube)
+            .build();
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
         let reason = "ghostty_surface_new returned NULL (no active display)";
         let reaped = reap_never_started_spawn(&ctx, &execution, 1, 0, ReapCause::AppNack { reason }, now).await;
@@ -985,5 +1391,394 @@ mod tests {
             "a single NACK must not trip the breaker"
         );
         assert!(events.iter().all(|e| e.stage != "spawn_capability_unhealthy"));
+    }
+
+    // ─── driver-start verification (the 2026-07-30 class) ────────────────────
+
+    /// Drive one full sweep pass and hand back everything the driver-start
+    /// assertions need.
+    async fn run_pass(
+        db: &Arc<WorkDb>,
+        live_states: &LiveWorkerStateRegistry,
+        coordinator: &Arc<ExecutionCoordinator>,
+        cube: &RecordingCube,
+    ) -> (SpawnAckSweepOutcome, Arc<RecordingDispatchEventSink>) {
+        let reaper = Arc::new(RecordingReaper::new(coordinator.clone()));
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let spawn_health = SpawnHealthTracker::new();
+        let outcome = run_one_pass(
+            db.as_ref(),
+            live_states,
+            coordinator.clone(),
+            sink.as_ref(),
+            reaper.as_ref(),
+            &spawn_health,
+            cube,
+            SPAWN_ACK_GRACE_SECS,
+            DRIVER_START_GRACE_SECS,
+        )
+        .await;
+        (outcome, sink)
+    }
+
+    /// The incident, reproduced end to end.
+    ///
+    /// A pane spawned, the app reported a real foreground shell pid, and no
+    /// driver-originated signal ever arrived. Before this check existed the
+    /// positive pid made the slot invisible to every sweep and it held its
+    /// slot and cube lease indefinitely with no attention item.
+    ///
+    /// Asserts all four things the reap must do: orphan the execution,
+    /// release the pool slot, release the cube workspace lease, and raise an
+    /// attention item.
+    #[tokio::test]
+    async fn driver_start_timeout_reaps_pane_whose_driver_never_started() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        // `create_spawned_execution` records the post-spawn shape including
+        // the cube lease (`lease-1`) whose release is the point of the test.
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 92697, false);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(
+            outcome.driver_start_reaped, 1,
+            "a pane with a live shell pid and no driver signal must be reaped",
+        );
+        assert_eq!(
+            outcome.reaped, 0,
+            "pass 1 must not also claim it — the pid routes it to pass 2",
+        );
+
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::Orphaned,
+        );
+        assert!(
+            !coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the worker slot must be released, not held",
+        );
+        assert_eq!(
+            cube.released_lease_ids(),
+            vec!["lease-1".to_owned()],
+            "the cube workspace lease must be released, not held",
+        );
+
+        let attentions = db.list_attention_items(&execution_id).unwrap();
+        assert_eq!(attentions.len(), 1, "the reap must raise exactly one attention item");
+        assert_eq!(attentions[0].kind, DRIVER_START_ATTENTION_KIND);
+        assert!(
+            attentions[0].body_markdown.contains("92697"),
+            "the attention body must name the misleading shell pid; got: {:?}",
+            attentions[0].body_markdown,
+        );
+
+        let events = sink.events().await;
+        let reaps: Vec<_> = events.iter().filter(|e| e.stage == "driver_start_timeout").collect();
+        assert_eq!(reaps.len(), 1);
+        assert_eq!(reaps[0].details["shell_pid"], serde_json::json!(92697));
+        assert_eq!(
+            reaps[0].details["threshold_secs"],
+            serde_json::json!(DRIVER_START_GRACE_SECS),
+        );
+    }
+
+    /// The detection must not inherit `mark_stalled_spawns`'s
+    /// `Capability::AwaitingInputSignal` exemption.
+    ///
+    /// Runs the identical scenario for a capability-declaring driver (claude)
+    /// and a non-declaring one (grok) and asserts both are reaped. Grok's
+    /// omission of the capability is what made the real occurrence invisible.
+    #[tokio::test]
+    async fn driver_start_timeout_fires_regardless_of_awaiting_input_capability() {
+        for awaiting_input_capable in [true, false] {
+            let (_dir, db) = open_db();
+            let product_id = create_product(&db);
+            let work_item_id = create_active_chore(&db, &product_id, "test chore");
+            let db = Arc::new(db);
+
+            let execution_id = create_spawned_execution(&db, &work_item_id, 4242);
+            let live_states = Arc::new(LiveWorkerStateRegistry::new());
+            register_slot_with_live_shell(
+                &live_states,
+                1,
+                &execution_id,
+                &work_item_id,
+                4242,
+                awaiting_input_capable,
+            );
+
+            // Let `mark_stalled_spawns` run first, exactly as the engine does.
+            // For the capable driver it promotes the slot to `WaitingForInput`
+            // and synthesizes a `last_event_at`; for the incapable one it
+            // declines. Neither may hide the slot from driver-start
+            // verification.
+            live_states.mark_stalled_spawns(
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+                crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS,
+            );
+
+            let coordinator = make_coordinator(db.clone(), 1);
+            coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+            let cube = RecordingCube::default();
+            let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+            assert_eq!(
+                outcome.driver_start_reaped, 1,
+                "driver-start verification must fire with awaiting_input_capable={awaiting_input_capable}",
+            );
+            assert_eq!(
+                db.get_execution(&execution_id).unwrap().status,
+                ExecutionStatus::Orphaned,
+                "awaiting_input_capable={awaiting_input_capable}",
+            );
+        }
+    }
+
+    /// A slot `mark_stalled_spawns` has promoted out of `Spawning` must still
+    /// be reached. Pass 1 filters on `activity == Spawning`; if pass 2 shared
+    /// that filter, the promotion would be an escape hatch.
+    ///
+    /// Also pins the reason the promotion is not itself proof of life: it
+    /// writes `last_event_at` from engine-side inference, and that timestamp
+    /// must not satisfy driver-start verification.
+    #[tokio::test]
+    async fn promoted_slot_is_still_subject_to_driver_start_verification() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_spawned_execution(&db, &work_item_id, 555);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 555, true);
+
+        let promoted = live_states.mark_stalled_spawns(
+            boss_engine_utils::epoch_time::now_epoch_secs(),
+            crate::live_worker_state::STALLED_SPAWN_THRESHOLD_SECS,
+        );
+        assert_eq!(promoted, vec![1], "precondition: the slot leaves Spawning");
+        let state = live_states.get(1).unwrap();
+        assert_eq!(state.activity, WorkerActivity::WaitingForInput);
+        assert!(
+            state.last_event_at.is_some(),
+            "precondition: the promotion synthesizes a last_event_at",
+        );
+        assert!(
+            live_states.driver_signal_at(1).is_none(),
+            "the synthesized last_event_at must NOT count as driver evidence",
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(
+            outcome.driver_start_reaped, 1,
+            "leaving Spawning must not exempt a slot from driver-start verification",
+        );
+    }
+
+    /// No false positives: a worker whose driver DID start
+    /// is never touched, however long it then runs without further events —
+    /// the driver-start signal is first-write-wins and permanent.
+    #[tokio::test]
+    async fn a_driver_that_signalled_is_never_reaped() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_spawned_execution(&db, &work_item_id, 777);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 777, false);
+
+        // The driver reported in exactly once, long ago.
+        assert_eq!(
+            live_states.record_driver_signal(&execution_id, crate::live_worker_state::DriverSignalKind::HookEvent),
+            Some(1),
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(outcome.driver_start_reaped, 0, "a started driver must never be reaped");
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+            "the execution must be left exactly as it was",
+        );
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the slot must NOT be released out from under a working worker",
+        );
+        assert!(
+            cube.released_lease_ids().is_empty(),
+            "the cube lease must NOT be released out from under a working worker",
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+        assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
+    }
+
+    /// Re-adoption then sweep: the engine re-registers an already-running
+    /// worker, and the sweep must leave it entirely alone.
+    ///
+    /// `readopt_live_worker` restores the row to `waiting_human` and
+    /// re-registers the slot, which stamps `spawned_at` with the current
+    /// time for a process that has been running for however long. The
+    /// `redispatch_guard` trigger carries no driver-originated evidence at
+    /// all (it fires off a recorded-*shell*-pid probe), and a worker parked
+    /// at `waiting_human` emits no further hook by definition — so without
+    /// the re-adoption exemption nothing would ever supply the missing
+    /// proof and this pass would reap a live worker one grace window later:
+    /// pane killed by process group, workspace torn down, cube lease
+    /// force-released.
+    #[tokio::test]
+    async fn a_readopted_live_worker_is_not_reaped_as_a_never_started_driver() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_spawned_execution(&db, &work_item_id, 92697);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        // Exactly what `readopt_live_worker` does for the pid-only trigger.
+        live_states.register_readoption(
+            1,
+            execution_id.as_str(),
+            "grok-4.5",
+            92697,
+            Some(WorkItemBinding {
+                work_item_id: work_item_id.clone(),
+                work_item_name: "test chore".to_owned(),
+                execution_id: execution_id.clone(),
+            }),
+            false,
+            crate::live_worker_state::LiveSpawnRouting::none(),
+            crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+        );
+        // Age the re-registration past every window under test.
+        live_states.set_spawn_time_for_test(
+            1,
+            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+        );
+        assert!(
+            live_states.driver_signal_at(1).is_none(),
+            "precondition: a pid-triggered re-adoption records no driver proof",
+        );
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(
+            outcome.driver_start_reaped, 0,
+            "a re-adopted worker is not a spawn, so it has no driver start to verify",
+        );
+        assert_eq!(outcome.reaped, 0);
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+            "the re-adopted execution must be left exactly as re-adoption restored it",
+        );
+        assert!(
+            coordinator
+                .worker_pool()
+                .claimed_execution_ids()
+                .await
+                .contains(&execution_id),
+            "the slot must NOT be released out from under a re-adopted worker",
+        );
+        assert!(
+            cube.released_lease_ids().is_empty(),
+            "the cube lease must NOT be force-released out from under a re-adopted worker",
+        );
+        assert!(db.list_attention_items(&execution_id).unwrap().is_empty());
+        assert!(sink.events().await.iter().all(|e| e.stage != "driver_start_timeout"));
+    }
+
+    /// A driver still inside its grace window is left alone, so a merely-slow
+    /// start is never reaped.
+    #[tokio::test]
+    async fn driver_start_verification_respects_its_grace_window() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_spawned_execution(&db, &work_item_id, 888);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_live_shell(&live_states, 1, &execution_id, &work_item_id, 888, false);
+        // Spawned well inside the window: no driver signal yet, but too early
+        // to conclude anything.
+        live_states.set_spawn_time_for_test(1, boss_engine_utils::epoch_time::now_epoch_secs() - 5);
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(outcome.driver_start_reaped, 0, "a fresh spawn must be given its window");
+        assert_eq!(
+            db.get_execution(&execution_id).unwrap().status,
+            ExecutionStatus::WaitingHuman,
+        );
+    }
+
+    /// Pass 1's proof-of-life test is now the driver signal, not
+    /// `last_event_at`. A zero-pid slot carrying only a synthesized
+    /// `last_event_at` must still be reaped rather than skipped.
+    #[tokio::test]
+    async fn pass_one_no_longer_treats_a_synthesized_timestamp_as_proof_of_life() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let db = Arc::new(db);
+
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_zero_pid(&live_states, 1, &execution_id, &work_item_id);
+        // An engine-written timestamp with no driver behind it.
+        live_states.set_last_event_at_for_test(1, "2026-07-30T05:47:45Z");
+        assert!(live_states.driver_signal_at(1).is_none());
+
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        let cube = RecordingCube::default();
+        let (outcome, _sink) = run_pass(&db, &live_states, &coordinator, &cube).await;
+
+        assert_eq!(
+            outcome.reaped, 1,
+            "only a driver-originated signal may suppress the spawn-ack reap",
+        );
+        assert_eq!(outcome.skipped.has_driver_signal, 0);
     }
 }

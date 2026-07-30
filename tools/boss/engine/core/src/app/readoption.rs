@@ -274,7 +274,33 @@ impl ServerState {
                     .capabilities()
                     .provides(crate::driver::Capability::AwaitingInputSignal)
             });
-            self.live_worker_states.register_spawn_with_capabilities(
+            // Register through the re-adoption entry point, not the spawn
+            // one. Registration stamps `spawned_at` with the current time,
+            // which is a fiction here — this worker has been running,
+            // unobserved, for however long — and `spawn_ack_sweep`'s
+            // driver-start pass ages that stamp against
+            // `DRIVER_START_GRACE_SECS`. Registering as a spawn would put
+            // a healthy long-running worker 300 s from being reaped as "the
+            // driver binary never started": pane torn down (signalling the
+            // recorded shell pid's process *group*), workspace torn down,
+            // cube lease force-released — the exact incident this whole
+            // path exists to prevent, re-created by the check meant to
+            // prevent a different one.
+            //
+            // The trigger decides what Boss may claim to know. A hook
+            // arriving after the engine terminalized the run came from the
+            // driver itself, so it is recorded as genuine driver-start
+            // proof rather than discarded. `redispatch_guard` fired off
+            // `durable_liveness`'s recorded-pid probe, which observes the
+            // *shell* hosting the pane and says nothing about the driver —
+            // that conflation is what `driver_signal_at` exists to prevent
+            // — so it records nothing. Any trigger added later lands on the
+            // conservative side by default.
+            let evidence = match trigger {
+                "hook_after_terminal" => crate::live_worker_state::ReadoptionEvidence::DriverHook,
+                _ => crate::live_worker_state::ReadoptionEvidence::LiveShellPid,
+            };
+            self.live_worker_states.register_readoption(
                 slot_id,
                 run_id.to_owned(),
                 model_label,
@@ -282,6 +308,7 @@ impl ServerState {
                 binding,
                 awaiting_input_capable,
                 crate::live_worker_state::LiveSpawnRouting::new(pool, restored.kind.as_str()),
+                evidence,
             );
             self.broadcast_live_worker_states().await;
         } else {

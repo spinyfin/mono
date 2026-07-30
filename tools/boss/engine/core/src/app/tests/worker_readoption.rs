@@ -322,6 +322,32 @@ async fn readoption_derives_the_awaiting_input_capability_from_the_runs_driver()
         state.model, "OpenAI Codex",
         "the label must name the run's resolved driver, not a hardcoded `claude`",
     );
+
+    // Re-adoption re-registers an already-running worker, so the `spawned_at`
+    // it stamps is the moment the engine noticed, not the moment anything
+    // exec'd. Driver-start verification must not age that fiction and reap a
+    // live worker; and the hook that triggered this convergence is genuine
+    // driver-originated proof, so it is recorded rather than discarded.
+    assert_eq!(
+        server_state.live_worker_states.driver_start_expectation(4),
+        Some(crate::live_worker_state::DriverStartExpectation::Readopted),
+    );
+    assert!(
+        server_state.live_worker_states.driver_signal_at(4).is_some(),
+        "the hook that triggered the re-adoption is driver-start proof",
+    );
+    assert!(
+        server_state
+            .live_worker_states
+            .unverified_driver_starts(
+                boss_engine_utils::epoch_time::now_epoch_secs()
+                    + crate::live_worker_state::DRIVER_START_GRACE_SECS
+                    + 60,
+                crate::live_worker_state::DRIVER_START_GRACE_SECS,
+            )
+            .is_empty(),
+        "a re-adopted worker must never be reaped as a driver that never started",
+    );
 }
 
 // ─── progress-ingress readoption ────────────────────────────────────────────

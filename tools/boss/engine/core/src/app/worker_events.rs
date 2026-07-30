@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::driver::{AgentDriver, Capability, ClaudeDriver};
+use crate::live_worker_state::DriverSignalKind;
 
 impl ServerState {
     /// First call for a given `execution_id` returns `true` (and remembers
@@ -268,6 +269,22 @@ pub(super) async fn dispatch_live_worker_state(
         return;
     };
     server_state.dispatcher_stats.record_last_hook(run_id, event_kind);
+    // **Driver-start verification.** A hook is the earliest
+    // driver-ORIGINATED evidence Boss ever gets that the driver binary
+    // actually executed — a login shell cannot emit one. Record it here,
+    // at the top of the ingress, rather than down in the `apply_event`
+    // fan-out: the slot lookup below can legitimately miss (a hook racing
+    // `register_run_slot`, a released slot), and driver-start proof must
+    // not be contingent on that. First signal wins; later hooks are a
+    // cheap no-op.
+    //
+    // Until this existed, "the spawn is acked" meant only that the app
+    // accepted a slot and a foreground pid appeared — both true of a pane
+    // hosting nothing but an idle login shell. See
+    // `LiveWorkerStateRegistry::unverified_driver_starts`.
+    server_state
+        .live_worker_states
+        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
     // Resolve any outstanding pane-injection delivery waiter for this
     // run. A `UserPromptSubmit` hook is the CLI's own confirmation
     // that it enqueued *something* as the next prompt; when a probe
@@ -325,6 +342,16 @@ pub(super) async fn dispatch_live_worker_state(
         }
     };
     if let Some(path) = resolved_path.as_deref() {
+        // The second driver-originated signal named in the driver-start
+        // contract: a resolved transcript path means the driver created
+        // its transcript. Redundant with the hook stamp above on this
+        // code path (both are reached from the same ingress), and
+        // recorded anyway so the contract holds at every site that
+        // learns a transcript path rather than depending on the two
+        // staying adjacent.
+        server_state
+            .live_worker_states
+            .record_driver_signal(run_id, DriverSignalKind::TranscriptPath);
         // `run_id` here is the `_boss_run_id` from the hook payload,
         // which carries the **execution_id** (`exec_*`) — not a
         // `work_runs.id` (`run_*`). The setter joins on
@@ -474,6 +501,20 @@ pub(super) async fn dispatch_live_worker_state(
     // are gated off so they don't emit a misleading "notify dropped — no
     // per-slot task" warn on every remote hook.
     let is_remote_slot = slot_id >= crate::worker_registry::REMOTE_SLOT_BASE;
+    // Driver-start verification, second attempt — deliberately AFTER slot
+    // resolution as well as before it.
+    //
+    // The stamp at the top of this function is keyed by run id and only
+    // lands if the registry already knows the run. For a REMOTE worker it
+    // does not: `register_remote_worker_slot` above creates the live-state
+    // entry lazily, driven by this very hook. So the first remote hook
+    // would stamp nothing, and a remote run that then went quiet would be
+    // judged as never having started a driver. Repeating the call here —
+    // idempotent and first-write-wins — makes the record land for local and
+    // remote runs alike, whichever side of registration the hook fell on.
+    server_state
+        .live_worker_states
+        .record_driver_signal(run_id, DriverSignalKind::HookEvent);
     let prior_activity = server_state.live_worker_states.get(slot_id).map(|s| s.activity);
     let changed = server_state.live_worker_states.apply_event(slot_id, &incoming.event);
     if changed {

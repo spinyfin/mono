@@ -1262,8 +1262,10 @@ pub async fn serve_with_merge_probe(
         server_state.dispatch_events.clone(),
         server_state.clone() as Arc<dyn crate::spawn_ack_sweep::SpawnAckReaper>,
         server_state.spawn_health.clone(),
+        server_state.cube_client.clone(),
         Duration::from_secs(60),
         crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS,
+        crate::live_worker_state::DRIVER_START_GRACE_SECS,
     );
 
     // Periodic Boss-owned Codex home reclaim: deletes recorded per-run

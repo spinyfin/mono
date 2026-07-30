@@ -464,9 +464,19 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
     // lease out from under a live pane and re-dispatches a duplicate
     // worker onto the same work item. Instead we register the slot
     // PROVISIONALLY (shell_pid 0) so the pane's hook events correlate back
-    // to this run and the spawn-ack sweep can reconcile: a hook or a
-    // reported pid confirms liveness; total silence past the grace window
-    // reaps it exactly as it does for a never-hooked `pane_spawned/ok`.
+    // to this run and the spawn-ack sweep can reconcile.
+    //
+    // What "confirms liveness" there is a *driver-originated* signal — a
+    // hook event or a `transcript_path` — and nothing else. A reported
+    // shell pid explicitly does NOT confirm it: `onSurfaceAttached` reads
+    // `ghostty_surface_foreground_pid`, which is the login shell when the
+    // driver was never exec'd, and treating it as proof is what let a
+    // driverless pane hold a slot and a cube lease indefinitely on
+    // 2026-07-30. Total silence past the grace window reaps the slot
+    // exactly as it does for a never-hooked `pane_spawned/ok`; a pane that
+    // came up with a live shell but no driver is reaped by the same
+    // module's driver-start pass on a longer window. See
+    // `crate::spawn_ack_sweep`.
     //
     // Every other error means the pane definitively did NOT spawn — the
     // request was never delivered (`NotRegistered`/`SessionWedged`), the
