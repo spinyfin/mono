@@ -27,7 +27,10 @@
 //!   placeholder as the command's result sees a still-running command as
 //!   observed, and never sees its output at all.
 //! - `Script completed` refers to the **JavaScript cell** finishing, not to
-//!   the shell command. It is not an exit-status claim.
+//!   the shell command. It is not an exit-status claim — the command's
+//!   terminal signal is the `exit_code` on the harness chunk the cell
+//!   forwarded, which is why a `Script completed` whose chunk carries none
+//!   still means "running" ([`payload_is_running_chunk`]).
 //!
 //! Both are documented with captured transcripts in
 //! `tools/boss/docs/investigations/codex-exit-code-surfacing.md`
@@ -58,6 +61,13 @@ const YIELD_HEADER_PREFIX: &str = "Script running with cell ID ";
 /// that the command it ran succeeded.
 const COMPLETED_HEADER: &str = "Script completed";
 
+/// Prefix and suffix of the harness's second header line
+/// (`Wall time 17.7 seconds`). Present on every captured envelope, and
+/// required here so ordinary stdout whose first line happens to read
+/// `Script completed` is not mistaken for a harness envelope.
+const WALL_TIME_PREFIX: &str = "Wall time ";
+const WALL_TIME_SUFFIX: &str = " seconds";
+
 /// Marker line separating the harness's own header from the cell's output.
 const OUTPUT_MARKER: &str = "\nOutput:";
 
@@ -85,7 +95,9 @@ pub enum CellOutcome {
     /// real output will arrive on a `wait` targeting `cell_id`.
     Yielded { cell_id: String },
     /// The cell itself finished. Terminal for the cell — **not** a claim
-    /// about the command's exit status.
+    /// about the command's exit status. Whether the *command* finished is
+    /// [`payload_is_running_chunk`]'s question, asked of
+    /// [`CellOutput::payload`].
     Completed,
 }
 
@@ -104,8 +116,20 @@ pub struct CellOutput {
 /// `exec_command` form (`Process exited with code N\nOutput:\n…`), a bare
 /// structured chunk, or ordinary text. Callers keep their pre-cell handling
 /// for those rather than guessing.
+///
+/// This runs against *every* rollout tool output, so the header line alone
+/// is not enough to claim an envelope: a command whose own stdout opens with
+/// `Script completed` would have its body blanked, and one opening with
+/// `Script running with cell ID 3` would be read as a yield — suppressing
+/// its result and later flagging it as an abandoned command. Both are ruled
+/// out by also requiring the harness's `Wall time N seconds` second line,
+/// which every captured envelope carries and neither of those bodies would.
 pub fn parse_cell_output(text: &str) -> Option<CellOutput> {
-    let header = text.lines().next()?.trim_end();
+    let mut lines = text.lines();
+    let header = lines.next()?.trim_end();
+    if !is_wall_time_line(lines.next()?.trim_end()) {
+        return None;
+    }
     let outcome = if header == COMPLETED_HEADER {
         CellOutcome::Completed
     } else {
@@ -125,6 +149,42 @@ pub fn parse_cell_output(text: &str) -> Option<CellOutput> {
         .unwrap_or("")
         .to_owned();
     Some(CellOutput { outcome, payload })
+}
+
+/// Whether `line` is the harness's `Wall time N seconds` header line.
+fn is_wall_time_line(line: &str) -> bool {
+    line.strip_prefix(WALL_TIME_PREFIX)
+        .and_then(|rest| rest.strip_suffix(WALL_TIME_SUFFIX))
+        .is_some_and(|seconds| seconds.parse::<f64>().is_ok())
+}
+
+/// Whether a completed cell's forwarded payload is a harness chunk that
+/// carries **no exit code** — the cell finished, but the command it started
+/// is still running.
+///
+/// `Script completed` is a claim about the JavaScript cell, never about the
+/// command (see [`CellOutcome::Completed`]), so the header cannot be the
+/// terminal signal for the command. The chunk's `exit_code` is: probes 1, 2,
+/// 5 and 7 of the exit-code investigation all carry one, while probe 6's
+/// chunk — and probe 4's *first* poll — carry `chunk_id` and `session_id`
+/// with no `exit_code` while the command runs on. Probe 6 is the canonical
+/// reproduction of the reported failure, and reading its `Script completed`
+/// as terminal is exactly what let a still-running command look observed.
+///
+/// Only a recognised harness chunk (a JSON object carrying `chunk_id`) can
+/// be still-running here. Probe 8's bare `7` projection (`text(r.exit_code)`)
+/// and probe 3's truncation-warning prose are not chunks at all; calling
+/// those still-running would manufacture a false abandoned command.
+pub fn payload_is_running_chunk(payload: &str) -> bool {
+    let Ok(Value::Object(chunk)) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    let reports_exit_code = chunk.contains_key("exit_code")
+        || chunk
+            .get("metadata")
+            .and_then(|metadata| metadata.get("exit_code"))
+            .is_some();
+    chunk.contains_key("chunk_id") && !reports_exit_code
 }
 
 /// The shell command(s) a cell script issues, in source order.
@@ -315,7 +375,8 @@ mod tests {
 
     #[test]
     fn output_marker_inside_the_payload_does_not_re_split_it() {
-        let parsed = parse_cell_output("Script completed\nOutput:\nfirst\nOutput:\nsecond").expect("cell");
+        let parsed = parse_cell_output("Script completed\nWall time 0.2 seconds\nOutput:\nfirst\nOutput:\nsecond")
+            .expect("cell");
         assert_eq!(parsed.payload, "first\nOutput:\nsecond");
     }
 
@@ -327,7 +388,64 @@ mod tests {
         );
         assert_eq!(parse_cell_output(r#"{"output":"boom\n","exit_code":1}"#), None);
         assert_eq!(parse_cell_output(""), None);
-        assert_eq!(parse_cell_output("Script running with cell ID \nOutput:\n"), None);
+        assert_eq!(
+            parse_cell_output("Script running with cell ID \nWall time 1.0 seconds\nOutput:\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn ordinary_stdout_that_merely_starts_with_a_harness_header_is_not_an_envelope() {
+        // Both bodies a command could plausibly print itself. Without the
+        // `Wall time N seconds` line neither is a harness envelope: the
+        // first would otherwise have its body blanked before the denial
+        // scan reads it, and the second would suppress the command's result
+        // and later flag it as abandoned.
+        assert_eq!(
+            parse_cell_output("Script completed\nall 12 checks passed\ndone\n"),
+            None
+        );
+        assert_eq!(
+            parse_cell_output("Script running with cell ID 3\nstarting worker\n"),
+            None
+        );
+        // A plausible-looking but non-numeric wall time is not the harness's.
+        assert_eq!(parse_cell_output("Script completed\nWall time later\nOutput:\nx"), None);
+    }
+
+    #[test]
+    fn a_completed_cell_whose_chunk_carries_no_exit_code_is_still_running() {
+        // Probe 6 verbatim: the cell finished, the command did not.
+        assert!(payload_is_running_chunk(
+            r#"{"chunk_id":"d0540d","wall_time_seconds":30.001035083,"session_id":8467,"original_token_count":14,"output":"tick-1\ntick-2\n"}"#
+        ));
+    }
+
+    #[test]
+    fn a_chunk_that_reports_an_exit_code_is_terminal() {
+        assert!(!payload_is_running_chunk(
+            r#"{"chunk_id":"5ec81c","exit_code":4,"output":"tick-9\n"}"#
+        ));
+        assert!(!payload_is_running_chunk(
+            r#"{"chunk_id":"ab","exit_code":0,"output":"ok\n"}"#
+        ));
+        assert!(!payload_is_running_chunk(
+            r#"{"chunk_id":"ab","metadata":{"exit_code":0},"output":"ok\n"}"#
+        ));
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_harness_chunk_is_never_still_running() {
+        // Probe 8 projects the exit code alone; probe 3's outer truncation
+        // warning leaves the payload unparseable. Neither may become a
+        // false abandoned command.
+        assert!(!payload_is_running_chunk("7"));
+        assert!(!payload_is_running_chunk(
+            "Warning: truncated output (original token count: 11827)\n\n{\"chunk_id\":\"5ce387\"}"
+        ));
+        assert!(!payload_is_running_chunk(""));
+        // Probe 2's chunk has no `chunk_id` but does report an exit code.
+        assert!(!payload_is_running_chunk(r#"{"exit_code":9,"output":"STEP-A\n"}"#));
     }
 
     #[test]

@@ -135,31 +135,39 @@ pub fn coerce_command_to_string(command: &Value) -> String {
 /// Flatten a rollout tool-output `payload.output` value to the text the
 /// model actually saw, with no structural interpretation.
 ///
+/// This is the **single** flattener for a rollout `payload.output`: cell
+/// classification, the transcript session and the driver's PR-URL capture
+/// feed all go through it, so one value can never be read two ways. Two
+/// implementations previously split that job, and their block-type policies
+/// already disagreed — a block type one carried and the other dropped would
+/// have been invisible to classification (closing a still-running call)
+/// while staying visible to capture.
+///
+/// The policy is therefore deliberately structural rather than an
+/// allowlist: any object's `text` is taken, whatever its `type`. Blocks with
+/// no `text` (an image block, say) flatten to the empty string rather than
+/// being dropped, because the harness's own header/payload split relies on
+/// the blank line an empty block leaves behind.
+///
 /// Distinct from [`canonical_rollout_tool_output`], which *unwraps* the
 /// structured chunk form and hands back its inner `output` field. Dialect
 /// classification — is this a [`cell`] harness envelope? — has to run
-/// against the unwrapped text, before any such interpretation.
+/// against the flattened text, before any such interpretation.
 pub fn flatten_tool_output_text(output: &Value) -> String {
     match output {
-        Value::Array(blocks) => extract_text_blocks(blocks),
         Value::String(text) => text.clone(),
+        Value::Array(blocks) => extract_text_blocks(blocks),
+        Value::Object(object) => object.get("text").map(flatten_tool_output_text).unwrap_or_default(),
         _ => String::new(),
     }
 }
 
-/// Join text from Codex content-block arrays (`output_text` / `input_text` /
-/// `text`). Non-text block types are skipped.
+/// Join the text of a Codex content-block array, newline-separated.
+/// Element-wise [`flatten_tool_output_text`].
 pub fn extract_text_blocks(content: &[Value]) -> String {
     content
         .iter()
-        .filter_map(|block| {
-            let block_type = block.get("type").and_then(Value::as_str)?;
-            if matches!(block_type, "output_text" | "input_text" | "text") {
-                block.get("text").and_then(Value::as_str)
-            } else {
-                None
-            }
-        })
+        .map(flatten_tool_output_text)
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -347,14 +355,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_text_blocks_joins_known_types() {
+    fn extract_text_blocks_takes_text_whatever_the_block_type_is() {
+        // No block-type allowlist: an additive text-bearing type must not be
+        // invisible to cell classification while staying visible to capture.
         let blocks = vec![
             json!({"type":"input_text","text":"a"}),
             json!({"type":"output_text","text":"b"}),
             json!({"type":"text","text":"c"}),
+            json!({"type":"some_future_text","text":"d"}),
             json!({"type":"image","url":"x"}),
         ];
-        assert_eq!(extract_text_blocks(&blocks), "a\nb\nc");
+        assert_eq!(extract_text_blocks(&blocks), "a\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn flatten_tool_output_text_reads_a_bare_text_object() {
+        assert_eq!(
+            flatten_tool_output_text(&json!({"type":"output_text","text":"hi"})),
+            "hi"
+        );
+        assert_eq!(flatten_tool_output_text(&json!({"type":"image","url":"x"})), "");
     }
 
     #[test]

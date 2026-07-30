@@ -28,8 +28,8 @@ use serde_json::{Map, Value, json};
 use super::guard_chain::{self, ArmedChainStatus};
 use super::guard_trace;
 use super::rollout_calls::{
-    CallDisposition, MAX_TRACKED_TRANSCRIPT_TOOL_CALLS, OutputDisposition, RolloutCallSnapshot, RolloutCallTracker,
-    RolloutToolCall, cell_aware_tool_output, rollout_call_command_display,
+    CallDisposition, CorrelationError, MAX_TRACKED_TRANSCRIPT_TOOL_CALLS, OutputDisposition, RolloutCallSnapshot,
+    RolloutCallTracker, RolloutToolCall, cell_aware_tool_output, rollout_call_command_display,
 };
 use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionNormalizer};
 
@@ -231,11 +231,17 @@ impl CodexRolloutProgressSession {
     /// `Stop` is emitted so a later, unrelated turn never re-flags the same
     /// call.
     ///
-    /// "Terminal" is the cell-aware sense: a cell that yielded
-    /// (`Script running with cell ID N`) has not delivered its command's
-    /// result, so its call is still open here and a command the model
-    /// stopped polling is flagged — which is precisely the abandon shape
-    /// probe 6 reproduced.
+    /// "Terminal" is the cell-aware sense, and it is about the command, not
+    /// the cell. Two shapes leave a call open here, and the model stopping
+    /// without resolving either is what gets flagged:
+    ///
+    /// - a cell that yielded (`Script running with cell ID N`) and was never
+    ///   polled at all;
+    /// - a cell that yielded, was polled, and came back `Script completed`
+    ///   with a chunk carrying no exit code — the command was still running
+    ///   and the model stopped there. That is the shape probe 6 reproduced,
+    ///   and treating its `Script completed` as terminal is what previously
+    ///   made the reported failure invisible.
     fn drain_abandoned_command_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
         if !self.calls.has_open_calls() {
             return Vec::new();
@@ -378,6 +384,7 @@ impl CodexRolloutProgressSession {
                     .ok_or(NormalizeError::MissingField("payload.type"))?;
                 let session_id = self.session_id()?;
                 if let Some((call_id, call)) = canonical_rollout_tool_call(item_type, payload) {
+                    let session_id_for_failure = session_id.clone();
                     let event = WorkerEvent::PreToolUse {
                         session_id,
                         tool_name: call.tool_name.clone(),
@@ -397,7 +404,7 @@ impl CodexRolloutProgressSession {
                         // the editorial audit, which writes a row per
                         // observed `gh pr`/`cube pr` invocation.
                         Ok(CallDisposition::Continuation) => Ok(Vec::new()),
-                        Err(err) => Err(NormalizeError::UnknownEvent(err.to_string())),
+                        Err(err) => Ok(vec![correlation_failure_notification(&session_id_for_failure, &err)]),
                     };
                 }
                 if is_rollout_tool_output(item_type) {
@@ -413,8 +420,8 @@ impl CodexRolloutProgressSession {
                         // on a `wait`. Reporting the placeholder as this
                         // command's result is what made a still-running
                         // command look observed.
-                        Ok(OutputDisposition::StillRunning) => return Ok(Vec::new()),
-                        Err(err) => return Err(NormalizeError::UnknownEvent(err.to_string())),
+                        Ok(OutputDisposition::StillRunning { .. }) => return Ok(Vec::new()),
+                        Err(err) => return Ok(vec![correlation_failure_notification(&session_id, &err)]),
                     };
                     let mut events = vec![WorkerEvent::PostToolUse {
                         session_id: session_id.clone(),
@@ -760,12 +767,25 @@ impl CodexTranscriptSession {
             let raw_output = payload.get("output").cloned().unwrap_or(Value::Null);
             let call = match self.calls.observe_output(call_id, &raw_output) {
                 Ok(OutputDisposition::Completed(call)) => call,
-                // The cell yielded; the command's real output arrives on a
+                // The command is still running; its real result arrives on a
                 // later `wait` and is rendered against this same call then.
-                Ok(OutputDisposition::StillRunning) => return Some(json!({"type":"system"})),
+                // Say so rather than emitting a bare `{"type":"system"}`: if
+                // the model never polls again there is no later record at
+                // all, and a reader (or a marker scan over this transcript)
+                // would otherwise see a `tool_use` with no result and no
+                // indication why.
+                Ok(OutputDisposition::StillRunning { cell_id }) => {
+                    return Some(lifecycle_system(
+                        "cell_running",
+                        &cell_still_running_note(cell_id.as_deref()),
+                    ));
+                }
                 Err(err) => {
                     tracing::warn!(call_id, %err, "codex rollout: omitting uncorrelated tool output body");
-                    return Some(json!({"type":"system"}));
+                    return Some(lifecycle_system(
+                        "cell_uncorrelated",
+                        &format!("tool output could not be correlated: {err}"),
+                    ));
                 }
             };
             return Some(json!({
@@ -858,6 +878,36 @@ fn rollout_task_complete_error_message(payload: &Map<String, Value>) -> Option<S
 /// `AssistantText`. Lifecycle placeholders must not count: a synthetic
 /// "turn started" on a partial rollout used to make `all_text` non-empty and
 /// disable the retry, permanently dropping a late-flushed `[blocked]` marker.
+/// The transcript note standing in for a command whose result has not been
+/// delivered yet.
+fn cell_still_running_note(cell_id: Option<&str>) -> String {
+    match cell_id {
+        Some(cell_id) => format!("command still running; no result delivered yet (cell {cell_id})"),
+        None => "command still running; no result delivered yet".to_owned(),
+    }
+}
+
+/// Turn a correlation failure into an operator-visible event.
+///
+/// A `NormalizeError` alone does not reach an operator: the production
+/// reader (`boss_engine_stdout_progress`) treats *any* `Err` from
+/// `normalize_progress_events` as the expected steady state — it bumps
+/// `unrecognised_envelopes`, logs at `debug!`, and skips the line. A `wait`
+/// naming a cell this session never saw yield would then be dropped exactly
+/// as silently as the bug this correlation exists to expose, PR URL and all.
+///
+/// [`super::UNOBSERVED_COMMAND_MARKER`] is the right channel because it says
+/// precisely what happened: Boss watched a command's records go past and
+/// could not confirm its outcome. The engine files an attention item and
+/// stops treating the run's `NO_CHANGES_NEEDED` claim as confirmed.
+fn correlation_failure_notification(session_id: &str, err: &CorrelationError) -> WorkerEvent {
+    tracing::warn!(%err, "codex rollout: correlation failure surfaced as an unobserved command");
+    WorkerEvent::Notification {
+        session_id: session_id.to_owned(),
+        message: super::unobserved_command_notification(&err.lost_command_display()),
+    }
+}
+
 fn lifecycle_system(subtype: &str, message: &str) -> Value {
     json!({
         "type": "system",
@@ -1290,6 +1340,106 @@ mod tests {
         );
     }
 
+    /// Probe 6's `wait` output verbatim: the cell completed, but its chunk
+    /// carries `session_id` and no `exit_code` and only 8 of the command's
+    /// 12 ticks arrived — the command was still running.
+    const P6_RUNNING_CHUNK: &str = concat!(
+        r#"{"chunk_id":"d0540d","wall_time_seconds":30.001035083,"session_id":8467,"#,
+        r#""original_token_count":14,"output":"tick-1\ntick-2\ntick-3\ntick-4\ntick-5\ntick-6\ntick-7\ntick-8\n"}"#
+    );
+
+    #[test]
+    fn probe_6_replayed_end_to_end_flags_the_command_the_model_stopped_polling() {
+        // The four records of `p6_hidden_exit`'s rollout, in order. The
+        // `wait` comes back `Script completed` — a claim about the cell, not
+        // the command — with a chunk carrying no exit code. Treating that as
+        // terminal is what made the reported failure invisible: the call
+        // closed, a clean `PostToolUse` went out, and the abandoned-command
+        // guard never fired.
+        let mut session = cell_harness_session();
+        const P6_SCRIPT: &str = concat!(
+            r#"const r = await tools.exec_command({"cmd":"sh -c 'for i in $(seq 1 12); do echo tick-$i; "#,
+            r#"sleep 4; done; echo FINAL-LINE; exit 4'","yield_time_ms":30000});"#,
+            "\ntext(JSON.stringify(r));"
+        );
+        const P6_COMMAND: &str =
+            "sh -c 'for i in $(seq 1 12); do echo tick-$i; sleep 4; done; echo FINAL-LINE; exit 4'";
+
+        session
+            .normalize_progress_events(&cell_exec_call("call-p6", P6_SCRIPT))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_yield_output("call-p6", 1))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_wait_call("call-p6-wait", 1))
+            .unwrap();
+        assert_eq!(
+            session
+                .normalize_progress_events(&cell_completed_output("call-p6-wait", P6_RUNNING_CHUNK))
+                .unwrap(),
+            Vec::new(),
+            "a chunk with no exit code is not this command's result and must not be reported as one"
+        );
+
+        // The model answers `observed_exit=NONE` and the turn ends.
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"observed_exit=NONE","error":null}
+            }))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-cell".into(),
+                    message: crate::codex::unobserved_command_notification(P6_COMMAND),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-cell".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Completed,
+                },
+            ],
+            "the command the model stopped polling must be flagged unobserved"
+        );
+    }
+
+    #[test]
+    fn a_cell_that_completes_with_an_exit_code_is_terminal_for_the_command() {
+        // Probe 4's *second* poll: the same envelope header as probe 6's,
+        // but the chunk carries `exit_code`. That, not `Script completed`,
+        // is the command's terminal signal.
+        let mut session = cell_harness_session();
+        session
+            .normalize_progress_events(&cell_exec_call("call-p4", PR_CELL_SCRIPT))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_yield_output("call-p4", 2))
+            .unwrap();
+        session
+            .normalize_progress_events(&cell_wait_call("call-p4-wait", 2))
+            .unwrap();
+        let events = session
+            .normalize_progress_events(&cell_completed_output(
+                "call-p4-wait",
+                r#"{"chunk_id":"5ec81c","exit_code":4,"output":"tick-12\nFINAL-LINE\n"}"#,
+            ))
+            .unwrap();
+        assert!(matches!(&events[0], WorkerEvent::PostToolUse { .. }), "got {events:?}");
+        let stop = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"task_complete","last_agent_message":"done","error":null}
+            }))
+            .unwrap();
+        assert!(
+            matches!(stop.as_slice(), [WorkerEvent::Stop { .. }]),
+            "an observed command must not be flagged abandoned, got {stop:?}"
+        );
+    }
+
     #[test]
     fn a_yielded_cell_that_is_never_polled_is_flagged_abandoned_at_the_turn_boundary() {
         let mut session = cell_harness_session();
@@ -1351,15 +1501,40 @@ mod tests {
     }
 
     #[test]
-    fn a_wait_naming_an_unknown_cell_is_surfaced_not_silently_dropped() {
+    fn a_wait_naming_an_unknown_cell_reaches_an_operator() {
+        // A `NormalizeError` alone would not: the production reader treats
+        // every `Err` as the expected steady state, bumps a counter and logs
+        // at `debug!`. The failure has to travel on a channel the engine
+        // actually surfaces, so it files an attention item instead.
         let mut session = cell_harness_session();
-        let err = session
+        let events = session
             .normalize_progress_events(&cell_wait_call("call-wait", 4))
-            .expect_err("an uncorrelatable continuation must not look like a clean no-op");
+            .unwrap();
+        let [WorkerEvent::Notification { session_id, message }] = events.as_slice() else {
+            panic!("an uncorrelatable continuation must not look like a clean no-op: {events:?}");
+        };
+        assert_eq!(session_id, "thread-cell");
         assert!(
-            matches!(&err, NormalizeError::UnknownEvent(detail) if detail.contains("cell 4")),
-            "got {err:?}"
+            message.starts_with(crate::codex::UNOBSERVED_COMMAND_MARKER),
+            "{message}"
         );
+        assert!(message.contains("cell 4"), "{message}");
+    }
+
+    #[test]
+    fn an_output_for_an_untracked_call_reaches_an_operator() {
+        let mut session = cell_harness_session();
+        let events = session
+            .normalize_progress_events(&cell_completed_output("ghost", r#"{"exit_code":0,"output":"x"}"#))
+            .unwrap();
+        let [WorkerEvent::Notification { message, .. }] = events.as_slice() else {
+            panic!("an unattributable tool output must not look like a clean no-op: {events:?}");
+        };
+        assert!(
+            message.starts_with(crate::codex::UNOBSERVED_COMMAND_MARKER),
+            "{message}"
+        );
+        assert!(message.contains("ghost"), "{message}");
     }
 
     #[test]
@@ -1377,10 +1552,16 @@ mod tests {
                 "payload":{"id":"thread-cell-2","cwd":"/ws"}
             }))
             .unwrap();
+        let events = session
+            .normalize_progress_events(&cell_wait_call("call-wait", 1))
+            .unwrap();
+        let [WorkerEvent::Notification { session_id, message }] = events.as_slice() else {
+            panic!("a stale cell must not resolve silently: {events:?}");
+        };
+        assert_eq!(session_id, "thread-cell-2");
         assert!(
-            session
-                .normalize_progress_events(&cell_wait_call("call-wait", 1))
-                .is_err()
+            message.starts_with(crate::codex::UNOBSERVED_COMMAND_MARKER),
+            "{message}"
         );
     }
 
@@ -1400,8 +1581,11 @@ mod tests {
         );
         assert_eq!(
             session.normalize_transcript_entry(cell_yield_output("call-pr", 1)),
-            json!({"type":"system"}),
-            "a yield placeholder is not a tool result"
+            lifecycle_system(
+                "cell_running",
+                "command still running; no result delivered yet (cell 1)"
+            ),
+            "a yield placeholder is not a tool result, and must say why there is none yet"
         );
         assert_eq!(
             session.normalize_transcript_entry(cell_wait_call("call-wait", 1)),
@@ -1413,6 +1597,27 @@ mod tests {
         assert_eq!(
             rendered.get("tool_input"),
             Some(&json!({"command":"cube pr create --branch boss/exec_1 --title T"}))
+        );
+    }
+
+    #[test]
+    fn a_command_whose_result_never_arrives_says_so_in_the_transcript() {
+        // Probe 6 in the transcript: the assistant `tool_use` is followed by
+        // a poll that still does not deliver a result, and the model stops.
+        // There is no turn-boundary drain here, so this note is the only
+        // thing a reader (or a marker scan) has to explain the missing
+        // result.
+        let mut session = CodexTranscriptSession::default();
+        session.normalize_transcript_entry(cell_exec_call("call-p6", PR_CELL_SCRIPT));
+        session.normalize_transcript_entry(cell_yield_output("call-p6", 1));
+        session.normalize_transcript_entry(cell_wait_call("call-p6-wait", 1));
+        assert_eq!(
+            session.normalize_transcript_entry(cell_completed_output("call-p6-wait", P6_RUNNING_CHUNK)),
+            lifecycle_system(
+                "cell_running",
+                "command still running; no result delivered yet (cell 1)"
+            ),
+            "a `Script completed` with no exit code is not the command's result"
         );
     }
 

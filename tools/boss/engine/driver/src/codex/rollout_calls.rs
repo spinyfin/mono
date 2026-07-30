@@ -25,14 +25,26 @@
 //! the real command paired with the real output and never learn that a
 //! `wait` was involved.
 //!
+//! "Terminal" here is about the **command**, not the cell. `Script
+//! completed` says the JavaScript cell finished; the command's own terminal
+//! signal is the `exit_code` on the chunk the cell forwarded. A completed
+//! cell whose chunk carries none (probe 6's shape — `chunk_id` plus
+//! `session_id`, partial output, command still ticking) therefore keeps its
+//! call open, and re-arms the cell binding the poll consumed so a further
+//! `wait` still resolves.
+//!
 //! Correlation failures are [`CorrelationError`]s, never a silent drop: a
 //! `wait` naming a cell this session never yielded means the tracker has
 //! lost the thread, and a consumer that returned "no result" there would
-//! hide exactly the gap this module exists to expose.
+//! hide exactly the gap this module exists to expose. The progress
+//! normaliser turns each into an operator-visible unobserved-command
+//! notification rather than only a skipped line.
 
 use std::collections::{HashMap, VecDeque};
 
-use boss_engine_codex_rollout::cell::{CellOutcome, is_cell_wait_tool, parse_cell_output, wait_target_cell_id};
+use boss_engine_codex_rollout::cell::{
+    CellOutcome, CellOutput, is_cell_wait_tool, parse_cell_output, payload_is_running_chunk, wait_target_cell_id,
+};
 use boss_engine_codex_rollout::{CanonicalRolloutToolOutput, canonical_rollout_tool_output, flatten_tool_output_text};
 use serde_json::Value;
 
@@ -109,9 +121,12 @@ pub(super) enum OutputDisposition {
     /// output — `call` is the call that issued the command, which for a
     /// continuation is *not* the call this output's `call_id` names.
     Completed(RolloutToolCall),
-    /// The cell yielded and its command is still running: nothing is
-    /// observed yet, and the call stays open.
-    StillRunning,
+    /// The command is still running: nothing about it is observed yet, and
+    /// the call stays open. `cell_id` is the cell a further `wait` must poll
+    /// to reach the command's real result, when the record named one — the
+    /// yielded cell for a yield placeholder, or the cell just polled when a
+    /// `Script completed` turned out to carry a chunk with no exit code.
+    StillRunning { cell_id: Option<String> },
 }
 
 /// A correlation the tracker could not resolve. Surfaced, never swallowed.
@@ -122,6 +137,26 @@ pub(super) enum CorrelationError {
     UnresolvableWait(String),
     /// A tool output arrived for a call this session is not tracking.
     UnmatchedOutput(String),
+}
+
+impl CorrelationError {
+    /// The string this failure contributes to an unobserved-command
+    /// notification.
+    ///
+    /// A correlation failure is an unobserved command in the exact sense
+    /// `boss_engine_core::codex_unobserved_command` means: Boss saw a
+    /// command's record go past and could not attribute its outcome, so any
+    /// completion claim resting on it is unconfirmed. There is no command
+    /// string to quote — that is the whole problem — so the failure's own
+    /// detail stands in its place.
+    pub(super) fn lost_command_display(&self) -> String {
+        match self {
+            Self::UnresolvableWait(detail) => detail.clone(),
+            Self::UnmatchedOutput(call_id) => {
+                format!("rollout tool output {call_id} matched no tracked call")
+            }
+        }
+    }
 }
 
 impl std::fmt::Display for CorrelationError {
@@ -250,7 +285,7 @@ impl<V> BoundedMap<V> {
 pub(super) struct RolloutCallSnapshot {
     open_calls: Vec<(String, RolloutToolCall)>,
     cells: Vec<(String, String)>,
-    waits: Vec<(String, String)>,
+    waits: Vec<(String, WaitBinding)>,
 }
 
 /// Per-reader correlation state. One tracker belongs to one rollout reader;
@@ -263,8 +298,22 @@ pub(super) struct RolloutCallTracker {
     /// Yielded cell id → originating call id. Removed when a `wait` binds
     /// the cell, so this never outgrows `calls`.
     cells: BoundedMap<String>,
-    /// `wait` call id → originating call id.
-    waits: BoundedMap<String>,
+    /// `wait` call id → what that poll targets.
+    waits: BoundedMap<WaitBinding>,
+}
+
+/// What a `wait` call polls: the call that issued the command, and the cell
+/// id it named. The cell id is kept so a poll that comes back
+/// `Script completed` with a still-running chunk can re-arm the binding it
+/// consumed and let the next poll of the same cell resolve.
+///
+/// Serialisable for the same reason [`RolloutToolCall`] is: a readopted
+/// session that lost its pending bindings would report a correlation failure
+/// the run never actually had. See [`RolloutCallSnapshot`].
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct WaitBinding {
+    origin: String,
+    cell_id: String,
 }
 
 impl Default for RolloutCallTracker {
@@ -312,25 +361,59 @@ impl RolloutCallTracker {
                 call.tool_name
             ))
         })?;
-        self.waits.insert(call_id.to_owned(), origin);
+        self.waits.insert(call_id.to_owned(), WaitBinding { origin, cell_id });
         Ok(CallDisposition::Continuation)
     }
 
     /// Resolve a tool-output record against the call that issued the command.
     ///
     /// `output` is the record's verbatim `payload.output` value.
+    ///
+    /// A record is terminal for the **command** only when the cell harness
+    /// says the command finished, which the `Script completed` header does
+    /// not: it describes the JavaScript cell. Two shapes therefore keep the
+    /// call open — the yield placeholder, and a completed cell whose
+    /// forwarded chunk carries no exit code
+    /// ([`payload_is_running_chunk`], probe 6's shape).
     pub(super) fn observe_output(
         &mut self,
         call_id: &str,
         output: &Value,
     ) -> Result<OutputDisposition, CorrelationError> {
-        let origin = self.waits.remove(call_id).unwrap_or_else(|| call_id.to_owned());
+        let binding = self.waits.remove(call_id);
+        let origin = binding
+            .as_ref()
+            .map(|binding| binding.origin.clone())
+            .unwrap_or_else(|| call_id.to_owned());
         if !self.calls.contains_key(&origin) {
             return Err(CorrelationError::UnmatchedOutput(call_id.to_owned()));
         }
-        if let Some(CellOutcome::Yielded { cell_id }) = cell_outcome(output) {
-            self.cells.insert(cell_id, origin);
-            return Ok(OutputDisposition::StillRunning);
+        match parse_cell_output(&flatten_tool_output_text(output)) {
+            // The cell yielded under a (possibly new) cell id: bind that id
+            // so the next `wait` resolves back to this same command.
+            Some(CellOutput {
+                outcome: CellOutcome::Yielded { cell_id },
+                ..
+            }) => {
+                self.cells.insert(cell_id.clone(), origin);
+                return Ok(OutputDisposition::StillRunning { cell_id: Some(cell_id) });
+            }
+            // The cell finished but the command did not. Re-arm the cell
+            // binding this poll consumed, so polling the same cell again
+            // still reaches this command; when the model stops polling
+            // instead, the call stays open and drains as abandoned — which
+            // is exactly the reported failure probe 6 reproduced.
+            Some(CellOutput {
+                outcome: CellOutcome::Completed,
+                payload,
+            }) if payload_is_running_chunk(&payload) => {
+                let cell_id = binding.map(|binding| binding.cell_id);
+                if let Some(cell_id) = cell_id.clone() {
+                    self.cells.insert(cell_id, origin);
+                }
+                return Ok(OutputDisposition::StillRunning { cell_id });
+            }
+            _ => {}
         }
         let call = self
             .calls
@@ -377,11 +460,6 @@ impl RolloutCallTracker {
         self.cells.clear();
         self.waits.clear();
     }
-}
-
-/// Classify a tool-output record as a cell-harness envelope, if it is one.
-fn cell_outcome(output: &Value) -> Option<CellOutcome> {
-    parse_cell_output(&flatten_tool_output_text(output)).map(|parsed| parsed.outcome)
 }
 
 /// Parse a tool output's body and error flag, unwrapping the cell-harness
@@ -432,6 +510,14 @@ mod tests {
         ])
     }
 
+    /// Probe 6's `wait` output verbatim: the cell completed, the chunk
+    /// carries `session_id` and no `exit_code`, and only 8 of the command's
+    /// 12 ticks arrived.
+    const P6_RUNNING_CHUNK: &str = concat!(
+        r#"{"chunk_id":"d0540d","wall_time_seconds":30.001035083,"session_id":8467,"#,
+        r#""original_token_count":14,"output":"tick-1\ntick-2\ntick-3\ntick-4\ntick-5\ntick-6\ntick-7\ntick-8\n"}"#
+    );
+
     #[test]
     fn wait_continuation_completes_the_originating_call() {
         let mut tracker = RolloutCallTracker::default();
@@ -441,7 +527,7 @@ mod tests {
         ));
         assert!(matches!(
             tracker.observe_output("A", &yield_placeholder(1)),
-            Ok(OutputDisposition::StillRunning)
+            Ok(OutputDisposition::StillRunning { .. })
         ));
         assert!(
             tracker.has_open_calls(),
@@ -473,7 +559,7 @@ mod tests {
         // The poll timed out too: the harness re-yields under a new cell id.
         assert!(matches!(
             tracker.observe_output("W1", &yield_placeholder(2)),
-            Ok(OutputDisposition::StillRunning)
+            Ok(OutputDisposition::StillRunning { .. })
         ));
         assert!(tracker.has_open_calls());
         tracker.observe_call("W2", wait("2")).unwrap();
@@ -484,6 +570,81 @@ mod tests {
             call.tool_input.get("command").and_then(Value::as_str),
             Some("slow build")
         );
+    }
+
+    #[test]
+    fn a_completed_cell_whose_chunk_has_no_exit_code_keeps_the_command_open() {
+        // Probe 6 end to end. `Script completed` describes the cell; the
+        // command was still ticking, and the model stopped there. The call
+        // must stay open so the turn boundary flags it.
+        let mut tracker = RolloutCallTracker::default();
+        tracker
+            .observe_call("A", bash("sh -c 'for i in $(seq 1 12); ...'"))
+            .unwrap();
+        tracker.observe_output("A", &yield_placeholder(1)).unwrap();
+        tracker.observe_call("W", wait("1")).unwrap();
+        assert!(
+            matches!(
+                tracker.observe_output("W", &completed(P6_RUNNING_CHUNK)),
+                Ok(OutputDisposition::StillRunning { cell_id: Some(ref id) }) if id == "1"
+            ),
+            "a chunk with no exit code must not complete the command"
+        );
+        assert!(tracker.has_open_calls());
+        let abandoned = tracker.drain_open_calls();
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(
+            rollout_call_command_display(&abandoned[0]),
+            "sh -c 'for i in $(seq 1 12); ...'"
+        );
+    }
+
+    #[test]
+    fn re_polling_the_same_cell_after_a_running_chunk_still_resolves() {
+        // Probe 6's shape, but the model keeps polling: the binding the
+        // first `wait` consumed is re-armed, so the second poll reaches the
+        // same command and its exit code closes it.
+        let mut tracker = RolloutCallTracker::default();
+        tracker.observe_call("A", bash("slow build")).unwrap();
+        tracker.observe_output("A", &yield_placeholder(1)).unwrap();
+        tracker.observe_call("W1", wait("1")).unwrap();
+        tracker.observe_output("W1", &completed(P6_RUNNING_CHUNK)).unwrap();
+        assert!(matches!(
+            tracker.observe_call("W2", wait("1")),
+            Ok(CallDisposition::Continuation)
+        ));
+        let Ok(OutputDisposition::Completed(call)) = tracker.observe_output(
+            "W2",
+            &completed(r#"{"chunk_id":"ab","exit_code":4,"output":"tick-12\n"}"#),
+        ) else {
+            panic!("a chunk carrying an exit code is terminal for the command");
+        };
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("slow build")
+        );
+        assert!(!tracker.has_open_calls());
+    }
+
+    #[test]
+    fn a_payload_that_is_not_a_harness_chunk_still_completes_the_call() {
+        // Probe 8 projects only the exit code, and probe 3's truncation
+        // warning leaves the payload unparseable. Neither is a running
+        // chunk, so neither may be turned into a false abandoned command.
+        for payload in [
+            "7",
+            "Warning: truncated output (original token count: 11827)\n\ntouch: x: denied\n",
+        ] {
+            let mut tracker = RolloutCallTracker::default();
+            tracker.observe_call("A", bash("echo hi")).unwrap();
+            assert!(
+                matches!(
+                    tracker.observe_output("A", &completed(payload)),
+                    Ok(OutputDisposition::Completed(_))
+                ),
+                "payload {payload:?} must stay terminal"
+            );
+        }
     }
 
     #[test]
