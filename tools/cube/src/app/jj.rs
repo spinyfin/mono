@@ -142,10 +142,32 @@ pub(super) fn is_retryable_network_error(err: &CubeError) -> bool {
     }
 }
 
+/// The smallest remaining budget worth handing to a freshly spawned
+/// subprocess. Below this, the process has no realistic chance to finish
+/// before the deadline kills it — `jj` startup alone (loading the repo,
+/// resolving `@`) routinely costs low hundreds of milliseconds against a
+/// shared object store under load — so treating anything under a second as
+/// "no budget" turns a doomed spawn-then-kill into an honest
+/// [`CubeError::DeadlineExceeded`], the same outcome a genuinely-passed
+/// deadline already produces.
+///
+/// This is what closes the off-by-nothing bug: a caller's deadline check
+/// (`Instant::now() >= deadline`) between candidates only catches a budget
+/// that has hit zero *before* the next candidate starts. It says nothing
+/// about a budget that is still nominally positive but too small to survive
+/// even one subprocess — e.g. 40ms left after a fetch ate the rest of a
+/// 5-second pass. Without this floor, [`budgeted_timeout`] would hand that
+/// 40ms to `run_with_timeout` as a real bound, the subprocess would be killed
+/// almost immediately, and the resulting [`CubeError::CommandTimedOut`] would
+/// be indistinguishable from a genuine probe failure to every caller.
+const MIN_SUBPROCESS_BUDGET: Duration = Duration::from_secs(1);
+
 /// How long a subprocess started *right now* may run, given a caller's
 /// wall-clock `deadline` and the operation's own `default` per-attempt bound:
-/// the smaller of the two. `None` means the deadline has already passed and no
-/// new subprocess should be started at all.
+/// the smaller of the two. `None` means the deadline has already passed, or
+/// has too little left to be worth spawning into (see
+/// [`MIN_SUBPROCESS_BUDGET`]) — either way, no new subprocess should be
+/// started at all.
 ///
 /// This is what makes a caller's time budget mean something. Probe *count* was
 /// never a bound on probe *cost*: one `jj git fetch` against a slow remote is
@@ -158,11 +180,25 @@ pub(super) fn budgeted_timeout(deadline: Option<Instant>, default: Duration) -> 
         return Some(default);
     };
     let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    if remaining < MIN_SUBPROCESS_BUDGET {
         None
     } else {
         Some(default.min(remaining))
     }
+}
+
+/// Whether `err` means "we don't actually know the answer because the
+/// caller's time budget ran out or the subprocess was killed on its own
+/// timeout" — as opposed to a genuine command failure (bad revset, auth
+/// error, corrupt repo). Budget exhaustion is a deferral, not a health
+/// verdict: a caller that folds this into "probe failed" ends up reporting a
+/// decision it never actually made. See [`budgeted_timeout`] and
+/// [`CubeError::DeadlineExceeded`]'s doc comment.
+pub(super) fn is_time_budget_error(err: &CubeError) -> bool {
+    matches!(
+        err,
+        CubeError::DeadlineExceeded { .. } | CubeError::CommandTimedOut { .. }
+    )
 }
 
 fn deadline_exceeded(invocation: &CommandInvocation) -> CubeError {

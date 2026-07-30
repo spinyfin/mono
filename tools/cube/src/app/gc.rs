@@ -17,7 +17,7 @@ use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::gh_pr;
 use crate::app::health::probe_workspace_reuse;
-use crate::app::jj::{run_jj, run_jj_network, workspace_path_exists};
+use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -600,6 +600,24 @@ pub(super) fn reclaim_quarantined_workspace(
         scanned += 1;
         let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, main_branch, deadline) {
             Ok(status) => status,
+            Err(error) if jj::is_time_budget_error(&error) => {
+                // Ran out of time to evaluate this candidate, not a failed
+                // evaluation — distinguished from a genuine probe error below
+                // so the audit trail doesn't read as a health verdict nobody
+                // actually reached.
+                eprintln!(
+                    "cube: quarantine reclaim: {}: time budget exhausted, leaving quarantined (not evaluated): {error}",
+                    record.workspace_id,
+                );
+                audit!(
+                    database_path,
+                    "workspace.quarantine_reclaim_budget_exhausted",
+                    repo = repo,
+                    workspace_id = record.workspace_id,
+                    error = error.to_string(),
+                );
+                continue;
+            }
             Err(error) => {
                 eprintln!(
                     "cube: quarantine reclaim: {}: probe failed, leaving quarantined: {error}",
@@ -771,6 +789,25 @@ pub(super) fn gc_aged_unhealthy_workspaces(
         let status = match probe_workspace_reuse(runner, database_path, &record.workspace_path, &main_branch, deadline)
         {
             Ok(status) => status,
+            Err(e) if jj::is_time_budget_error(&e) => {
+                // Deferral, not a health verdict: this candidate was never
+                // actually evaluated, so it must not be reported the same way
+                // as a genuine probe failure below.
+                eprintln!(
+                    "cube: retention: {}: time budget exhausted, leaving retained (not evaluated): {e}",
+                    record.workspace_id,
+                );
+                audit!(
+                    database_path,
+                    "workspace.retention_budget_exhausted",
+                    repo = record.repo,
+                    workspace_id = record.workspace_id,
+                    prior_health = prior_health,
+                    age_secs = age_secs,
+                    error = e.to_string(),
+                );
+                continue;
+            }
             Err(e) => {
                 eprintln!(
                     "cube: retention: {}: reuse probe failed, leaving retained: {e}",

@@ -71,7 +71,7 @@ use crate::{audit, config};
 use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
-use crate::app::jj::{budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
+use crate::app::jj::{self, budgeted_timeout, cleanup_workspace_logs, workspace_path_exists};
 use crate::app::util::repo_lock_path;
 
 /// Wall-clock bound for the purely local jj subprocesses this module spawns:
@@ -427,6 +427,7 @@ fn trim_one_repo(
 
     let mut skipped_holding_work = 0usize;
     let mut probe_errors = 0usize;
+    let mut budget_exhausted = 0usize;
     for record in candidates {
         if report.workspaces_removed >= surplus {
             break;
@@ -451,6 +452,21 @@ fn trim_one_repo(
             deadline,
         ) {
             Ok(status) => status,
+            Err(e) if jj::is_time_budget_error(&e) => {
+                // Budget exhaustion, not a health verdict: this candidate was
+                // never actually evaluated, so "keeping it" here is a
+                // deferral to the next pass, not a decision that it holds
+                // unreclaimable work. Counted and logged separately from
+                // `probe_errors` so an operator reading either the log or the
+                // audit trail can tell "we ran out of time" apart from "the
+                // probe genuinely failed".
+                budget_exhausted += 1;
+                eprintln!(
+                    "cube: pool trim: {}: time budget exhausted mid-probe, deferring (not evaluated): {e}",
+                    record.workspace_id,
+                );
+                continue;
+            }
             Err(e) => {
                 probe_errors += 1;
                 eprintln!(
@@ -586,6 +602,7 @@ fn trim_one_repo(
         removed = report.workspaces_removed,
         skipped_holding_work = skipped_holding_work,
         probe_errors = probe_errors,
+        budget_exhausted = budget_exhausted,
         available_delta_bytes = report.available_delta_bytes,
     );
     report
