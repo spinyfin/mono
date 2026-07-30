@@ -230,13 +230,25 @@ pub fn sanitize_run_id_for_home(run_id: &str) -> anyhow::Result<String> {
 /// Returns an error for empty / unsafe `run_id` values that would resolve to
 /// the homes root (see [`sanitize_run_id_for_home`]).
 pub fn codex_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
+    Ok(codex_homes_root_and_home_for_run(run_id)?.1)
+}
+
+/// The homes root and the per-run `CODEX_HOME` beneath it, from a *single*
+/// read of [`CODEX_HOMES_ROOT_ENV`].
+///
+/// Callers that need both values must use this rather than pairing their own
+/// [`codex_homes_root`] call with [`codex_home_for_run`]: reading the root
+/// twice lets a change to the env between the two reads (only tests mutate it,
+/// via `test_support::codex_homes_override`) produce a root and a home that
+/// disagree, which makes containment checks — here and in
+/// [`verified_sessions_root`] — reject a perfectly valid run id.
+///
+/// # Errors
+///
+/// Returns an error for empty / unsafe `run_id` values that would resolve to
+/// the homes root (see [`sanitize_run_id_for_home`]).
+pub fn codex_homes_root_and_home_for_run(run_id: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
     let safe = sanitize_run_id_for_home(run_id)?;
-    // Resolve the root exactly once and check containment against that same
-    // value. Reading it twice made the check compare a home built from one
-    // root against a *re-read* root, so a concurrent change to
-    // `CODEX_HOMES_ROOT_ENV` between the two reads (only tests mutate it, via
-    // `test_support::codex_homes_override`) made this bail spuriously on a
-    // perfectly valid run id.
     let root = codex_homes_root();
     let home = root.join(safe);
     // Logical containment: a join of a single segment under an absolute root
@@ -249,7 +261,7 @@ pub fn codex_home_for_run(run_id: &str) -> anyhow::Result<PathBuf> {
             root.display()
         );
     }
-    Ok(home)
+    Ok((root, home))
 }
 
 /// Sandbox mode for Codex `exec --sandbox` from Boss's abstract worker kind.
@@ -1337,17 +1349,22 @@ impl AgentDriver for CodexDriver {
     }
 
     fn progress_session(&self, config: &ProgressSessionConfig) -> Option<Box<dyn ProgressSessionNormalizer>> {
-        let homes_root = codex_homes_root();
-        let codex_home = config
+        // Root and home come from one read so they cannot disagree; fall back
+        // to a bare root read only when there is no run id to resolve.
+        let resolved = config
             .run_id
             .as_deref()
-            .and_then(|run_id| match codex_home_for_run(run_id) {
-                Ok(home) => Some(home),
+            .and_then(|run_id| match codex_homes_root_and_home_for_run(run_id) {
+                Ok(pair) => Some(pair),
                 Err(err) => {
                     tracing::warn!(run_id, %err, "codex stdout: invalid run id for progress session");
                     None
                 }
             });
+        let (homes_root, codex_home) = match resolved {
+            Some((root, home)) => (root, Some(home)),
+            None => (codex_homes_root(), None),
+        };
         match config.source {
             ProgressStreamSource::StdoutJsonl => Some(Box::new(CodexProgressSession::new(
                 codex_home,
@@ -1457,8 +1474,7 @@ impl AgentDriver for CodexDriver {
     }
 
     fn transcript_containment_root(&self, run_id: &str) -> anyhow::Result<Option<PathBuf>> {
-        let homes_root = codex_homes_root();
-        let codex_home = codex_home_for_run(run_id)?;
+        let (homes_root, codex_home) = codex_homes_root_and_home_for_run(run_id)?;
         let sessions = verified_sessions_root(&homes_root, &codex_home).ok_or_else(|| {
             anyhow!(
                 "Codex transcript root for run {run_id:?} is missing, symlinked, replaced, or outside {}",
@@ -2305,6 +2321,25 @@ else:
             "expected empty-run_id error, got {err:#}"
         );
         assert!(sanitize_run_id_for_home("").is_err());
+    }
+
+    /// The root/home pair must come from one read of the homes-root env, so
+    /// every containment comparison downstream (`verified_sessions_root`,
+    /// `CodexProgressSession::new`) sees a home that is genuinely a child of
+    /// the root it was handed. Pairing an independent `codex_homes_root()`
+    /// call with `codex_home_for_run()` is what made a sibling test's env
+    /// mutation land between the two reads and reject a valid run id.
+    #[test]
+    fn homes_root_and_home_pair_is_self_consistent() {
+        let tmp = TempDir::new().unwrap();
+        let homes = tmp.path().join("homes");
+        let _guard = crate::test_support::codex_homes_override(&homes);
+
+        let (root, home) = codex_homes_root_and_home_for_run("run-pair-1").unwrap();
+        assert_eq!(root, homes);
+        assert_eq!(home.parent(), Some(root.as_path()));
+        assert_eq!(home, codex_home_for_run("run-pair-1").unwrap());
+        assert!(codex_homes_root_and_home_for_run("").is_err());
     }
 
     #[test]
