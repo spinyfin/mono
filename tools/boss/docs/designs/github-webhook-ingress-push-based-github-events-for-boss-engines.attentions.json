@@ -11,12 +11,12 @@
   },
   {
     "question_type": "yes_no",
-    "prompt": "T3538's description currently reserves event-driving ('where GitHub can tell us (webhooks...), react to the event and drop the corresponding poll'), which this design absorbs. Should the 'Event-driving' paragraph be struck from T3538, leaving it scoped to 'scope + batch the poller' only? Retitling another active work item is not this design's call to make unilaterally.",
-    "anchor": "relationship-to-t3537-and-t3538"
+    "prompt": "The merge-poller drain chore's description currently reserves event-driving ('where GitHub can tell us (webhooks...), react to the event and drop the corresponding poll'), which this design absorbs. Should the 'Event-driving' paragraph be struck from that chore, leaving it scoped to 'scope + batch the poller' only? Retitling another active work item is not this design's call to make unilaterally.",
+    "anchor": "relationship-to-the-instrumentation-and-merge-poller-drain-chores"
   },
   {
     "question_type": "multiple_choice",
-    "prompt": "v1 is designed against a repo-level webhook on spinyfin/mono (one GitHub UI screen, one-click revocable, no App registration, no private key) with a GitHub App as a deferred follow-up that could unify with T3196's polling auth. Confirm or override?",
+    "prompt": "v1 is designed against a repo-level webhook on spinyfin/mono (one GitHub UI screen, one-click revocable, no App registration, no private key) with a GitHub App as a deferred follow-up that could unify with the GitHub-App installation-token chore's polling auth. Confirm or override?",
     "choices": [
       "Repo-level webhook for v1 as designed; revisit the App after Phase 1 soaks",
       "Register the GitHub App up front and skip the repo-level webhook entirely, accepting the extra credential machinery in v1",
