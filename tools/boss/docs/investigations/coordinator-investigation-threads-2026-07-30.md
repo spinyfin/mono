@@ -128,11 +128,25 @@ _What forces it out:_ nothing in the taxonomy — the **absence of a warm second
 
 ### Class D — needs to interrupt synchronously
 
-_Examples:_ "this PR is ready to merge, do you want it?"; the ~10 pending decisions.
+_Examples:_ the ~10 pending decisions — forks where the operator holds information or authority the coordinator cannot derive (which of two designs to build; whether a behaviour change is acceptable; how to spend a scarce slot).
 
 _What forces it out:_ the operator's reason 3 — attentions exist for exactly this and go unread. The mechanism behind that is real and I verified it: see [§6](#6-the-pinned-decision-register).
 
-**Should be a row: no — it is not work, it is a decision.** Filing a task to represent "the operator needs to decide X" is a category error; that is what attentions are. The defect is in the attention _lifecycle_, not in the concept.
+**Should be a row: no — it is not work, it is a decision.** Filing a task to represent "the operator needs to decide X" is a category error; that is what attentions are. The defect is in the attention _lifecycle_ — and, per the correction below, partly in what gets raised at all.
+
+#### Correction from operator review: part of this class is not a decision
+
+This section originally led with _"this PR is ready to merge, do you want it?"_ as its example. Operator review of this document rejected it outright: **"Honestly, the coordinator should never be asking me this kind of question."**
+
+That is a ruling about the class, not a quibble about the example, and the split it forces is more useful than the class was:
+
+- **Genuine decisions.** The operator holds something the coordinator does not — a preference, a priority, an authority, a fact about the world outside the repo. Interrupting is correct; the question could not have been answered any other way. This is what [§6](#6-the-pinned-decision-register)'s register is for.
+- **Coordinator-manufactured interrupts.** Questions the operator considers illegitimate to be asked at all. "This PR is ready to merge, do you want it?" is one. It is the coordinator converting a settled situation back into an open item on the operator's queue — the readiness is observable state, and whatever should govern the disposition (a standing rule, the coordinator's own judgement, or simply _rendering_ readiness rather than _pushing_ a question), the operator's position is that it must not arrive as a question. I have the ruling but not the reasoning behind it, and the reasoning decides which remedy is right — see [open question 10](#open-questions).
+
+**Two consequences for the rest of this document:**
+
+1. **Class D is smaller than it looked, and part of the "~10 pending decisions" figure is suspect.** I counted pending items from the session, not legitimate ones. If a meaningful share are manufactured interrupts, the load-bearing problem for that share is generation, not lifecycle: an item that should never have been raised is not fixed by expiring it faster. This does not weaken the lifecycle finding in [§6](#6-the-pinned-decision-register) — an attention inventory rots for the reasons given there regardless — but it does mean two independent defects are producing the same symptom, and only one of them is addressed by anything else in this document.
+2. **The register must not inherit this traffic.** A register that faithfully records every question the coordinator asks would give the illegitimate ones a _pinned_ surface. That is the attentions failure again, with a better custodian and worse placement.
 
 ### Class E — genuinely wants a durable repo artifact
 
@@ -263,9 +277,17 @@ One difference, and it is the whole difference: **who writes it, and therefore w
 
 An attention is raised by a _worker_, about _its own run_, at the end of that run. The worker then dies. Nobody owns the row afterwards. Rot is structurally guaranteed.
 
-A decision register would be written by the _coordinator_, which is **still alive**, still holds the conversation in context, and is the same party that will surface the item to the operator next time. That is a categorically better custodian. The coordinator can mark an item resolved the moment the operator says "merge it", because it is _in the conversation where that was said_. No worker can ever do that.
+A decision register would be written by the _coordinator_, which is **still alive**, still holds the conversation in context, and is the same party that will surface the item to the operator next time. That is a categorically better custodian. The coordinator can mark an item resolved the moment the operator decides in conversation, because it is _in the conversation where that was said_. No worker can ever do that.
 
 **That is the lifecycle argument, and it is the only one that matters.** A register the coordinator writes and prunes can stay current in a way an agent-authored notification cannot.
+
+### Entry criterion, and why it is not optional
+
+A better custodian fixes rot. It does not fix a bad item being written in the first place — and a pinned surface makes a bad item _worse_ than an unpinned one, because pinning asserts that it deserves standing attention.
+
+**An item qualifies only if the operator holds something the coordinator cannot derive** — a preference, a priority, an authority, a fact from outside the repo. "The coordinator would like confirmation" does not qualify, and neither does a question whose answer is already observable in engine or repo state. That criterion comes straight from operator review of this document ([§3, class D](#class-d--needs-to-interrupt-synchronously)), where _"this PR is ready to merge, do you want it?"_ was rejected as a question the coordinator should never be asking. A register that recorded that class faithfully would preserve exactly the traffic being objected to.
+
+The criterion belongs in the same prompt rule that obliges the coordinator to keep the register current (item #5 below), because both are constraints on the same writer and neither works alone: a register nobody writes to is empty, and a register anybody writes to anything is noise.
 
 ### The lifecycle, stated (because the brief forbids proposing a surface without one)
 
@@ -483,19 +505,20 @@ Not filed — recommended, per the brief. Sized with the standard heuristic.
 
 **Do first (cheap, unblocks judgement):**
 
-| #   | Work                                                                                                        | Effort    | Target                                                     | Notes                                                                                                             |
-| --- | ----------------------------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| 1   | Add the investigation-routing rule to `bossSystemPrompt`                                                    | `small`   | **System-prompt source** — `BossPaneModel.swift`           | Text is drafted above. Not the runtime `CLAUDE.md`.                                                               |
-| 2   | Turn on `notification_dedup` (+ `_taxonomy`, `_sensibility`) and observe the attention inventory for a week | `trivial` | **Coordinator-only** — a flag toggle plus a judgement call | Half-built and switched off. Cheapest possible test of the debris hypothesis; may moot part of the register work. |
-| 3   | Fix: a project filter hides every product-level investigation                                               | `trivial` | `ChatViewModel.swift:877-884`                              | Direct sibling of the already-fixed issue #886.                                                                   |
+| #   | Work                                                                                                        | Effort    | Target                                                     | Notes                                                                                                                                                                                                                                                                                                                             |
+| --- | ----------------------------------------------------------------------------------------------------------- | --------- | ---------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Add the investigation-routing rule to `bossSystemPrompt`                                                    | `small`   | **System-prompt source** — `BossPaneModel.swift`           | Text is drafted above. Not the runtime `CLAUDE.md`.                                                                                                                                                                                                                                                                               |
+| 1b  | Prompt rule: do not escalate a question whose answer is already derivable from engine or repo state         | `trivial` | **System-prompt source** — `BossPaneModel.swift`           | Ships with #1 as one edit; cuts the interrupt volume #4 would otherwise inherit. Named example, rejected in operator review: "this PR is ready to merge, do you want it?" ([§3, class D](#class-d--needs-to-interrupt-synchronously)). **Exact wording gated on open question 10** — the reason for the rejection picks the rule. |
+| 2   | Turn on `notification_dedup` (+ `_taxonomy`, `_sensibility`) and observe the attention inventory for a week | `trivial` | **Coordinator-only** — a flag toggle plus a judgement call | Half-built and switched off. Cheapest possible test of the debris hypothesis; may moot part of the register work.                                                                                                                                                                                                                 |
+| 3   | Fix: a project filter hides every product-level investigation                                               | `trivial` | `ChatViewModel.swift:877-884`                              | Direct sibling of the already-fixed issue #886.                                                                                                                                                                                                                                                                                   |
 
 **Do next (the substance):**
 
-| #   | Work                                                                                                                              | Effort            | Target                            | Notes                                                                                                                                                         |
-| --- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 4   | Pending-decision register: schema, engine store, RPC, deterministic auto-expiry on artifact terminality, app surface              | `large` (project) | Engine + app                      | Evaluate reusing the `product_decisions` store first. Lifecycle in v1, not phase 2.                                                                           |
-| 5   | Prompt rule obliging the coordinator to keep the register current                                                                 | `small`           | **System-prompt source**          | Blocked on #4. Without it #4 is worse than nothing.                                                                                                           |
-| 6   | Boss-developing-boss read scope: per-product opt-in, scoped read verbs over IPC, writes stay closed, hand-back via `boss propose` | `large` (project) | Engine + worker permission config | Must be expressible on all three drivers or explicitly restricted; Grok's deny path is unwired ([`driver/src/grok.rs:120`](../../engine/driver/src/grok.rs)). |
+| #   | Work                                                                                                                              | Effort            | Target                            | Notes                                                                                                                                                                                     |
+| --- | --------------------------------------------------------------------------------------------------------------------------------- | ----------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 4   | Pending-decision register: schema, engine store, RPC, deterministic auto-expiry on artifact terminality, app surface              | `large` (project) | Engine + app                      | Evaluate reusing the `product_decisions` store first. Lifecycle in v1, not phase 2.                                                                                                       |
+| 5   | Prompt rule obliging the coordinator to keep the register current **and stating its entry criterion**                             | `small`           | **System-prompt source**          | Blocked on #4. Without it #4 is worse than nothing. Both halves required: an unwritten register is empty, an unfiltered one is noise ([§6](#entry-criterion-and-why-it-is-not-optional)). |
+| 6   | Boss-developing-boss read scope: per-product opt-in, scoped read verbs over IPC, writes stay closed, hand-back via `boss propose` | `large` (project) | Engine + worker permission config | Must be expressible on all three drivers or explicitly restricted; Grok's deny path is unwired ([`driver/src/grok.rs:120`](../../engine/driver/src/grok.rs)).                             |
 
 **Do after (needs #4 and #6):**
 
@@ -534,3 +557,5 @@ Not filed — recommended, per the brief. Sized with the standard heuristic.
 8. **Does the operator want threads on work items, or threads on questions?** I assumed the work item is the natural container because it is addressable and already rendered. But several session threads (the checkleft one) spanned multiple rows and belonged to neither. A thread that is its own first-class object is a different design, and I did not explore it.
 
 9. **Would the coordinator actually keep a register current?** The whole incremental recommendation in [§7](#7-replacing-the-coordinator-pane) rests on the coordinator being a reliable reporter. There is no evidence either way, because nothing has ever asked it to be one. This is the assumption most worth testing early, and #4 plus #5 is the test.
+
+10. **_Why_ should the coordinator never ask "this PR is ready to merge, do you want it?"** The ruling arrived in operator review of this document ([§3, class D](#class-d--needs-to-interrupt-synchronously)); the reasoning did not, and the reasoning picks the remedy. If the objection is that the coordinator should decide, the fix is a standing merge policy. If it is that the question is fine but the _channel_ is wrong, the fix is to render PR readiness as state and let the operator initiate. If it is that "ready to merge" is not reliably knowable and the question is really "is this actually done?", the fix is upstream of both. I would not write rule #1b's text without knowing which — the three produce materially different prompt rules, and one of them (the first) is a durable authority change the operator may not want.
