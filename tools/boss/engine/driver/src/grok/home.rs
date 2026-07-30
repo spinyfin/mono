@@ -809,6 +809,36 @@ pub fn assert_grok_home_safe_to_delete(grok_home: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Reclaim a Boss-owned per-run Grok container (`grok-home/` +
+/// `process-home/`) after retention policy says it is eligible. Refuses
+/// anything outside [`grok_homes_root`]. Idempotent when the path is
+/// already gone. Used by the engine retention sweep — **not** by
+/// interactive `~/.grok` scanning and not by cwd heuristics.
+///
+/// `container` is the run container returned by
+/// [`grok_run_container_for_run`] (parent of `GROK_HOME`), not `GROK_HOME`
+/// alone, so `process-home/` is reclaimed along with it. Mirrors
+/// [`crate::codex::reclaim_codex_home`] (`tools/boss/engine/driver/src/codex.rs:409`).
+///
+/// Deletion never follows symlinks: `std::fs::remove_dir_all` unlinks a
+/// symlink entry it encounters instead of descending into (or deleting) its
+/// target, so the `auth.json` credential symlink under `grok-home/` is
+/// removed while the real credential file it points at (outside the homes
+/// root) is left untouched.
+pub fn reclaim_grok_home(container: &Path) -> anyhow::Result<()> {
+    assert_grok_home_safe_to_delete(container)?;
+    if !container.exists() {
+        return Ok(());
+    }
+    // Re-check after exists: race with another reclaim is fine (NotFound).
+    assert_grok_home_safe_to_delete(container)?;
+    match fs::remove_dir_all(container) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("removing Boss-owned Grok run container {}", container.display())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1023,6 +1053,54 @@ mod tests {
         let home = grok_home_for_run("run-abc").unwrap();
         assert!(home.starts_with(tmp.path()));
         assert!(home.ends_with("grok-home"));
+        match prior {
+            Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
+            None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+        }
+    }
+
+    #[test]
+    fn reclaim_grok_home_removes_symlink_entry_but_never_its_target() {
+        let tmp = TempDir::new().unwrap();
+        let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior = std::env::var_os(GROK_HOMES_ROOT_ENV);
+        let homes_root = tmp.path().join("boss-grok-homes");
+        fs::create_dir_all(&homes_root).unwrap();
+        // SAFETY: serialised by GROK_HOMES_ENV_TEST_LOCK.
+        unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, &homes_root) };
+
+        let container = homes_root.join("run-1");
+        let grok_home = container.join(GROK_HOME_LEAF);
+        fs::create_dir_all(&grok_home).unwrap();
+        fs::create_dir_all(container.join(PROCESS_HOME_LEAF)).unwrap();
+
+        // Real credential file living entirely outside the Boss-owned homes
+        // root, exactly like the operator's real `~/.grok/auth.json`.
+        let real_auth_dir = tmp.path().join("real-auth-target");
+        fs::create_dir_all(&real_auth_dir).unwrap();
+        let real_auth = real_auth_dir.join("auth.json");
+        fs::write(&real_auth, "super-secret-token").unwrap();
+
+        // Symlink inside GROK_HOME pointing at the real credential, exactly
+        // as provisioning wires it (see `provision_grok_home`).
+        std::os::unix::fs::symlink(&real_auth, grok_home.join("auth.json")).unwrap();
+
+        reclaim_grok_home(&container).unwrap();
+
+        assert!(
+            !container.exists(),
+            "run container (including the symlink) must be gone"
+        );
+        assert!(
+            real_auth.exists(),
+            "symlink target outside the home must survive a sweep"
+        );
+        assert_eq!(
+            fs::read_to_string(&real_auth).unwrap(),
+            "super-secret-token",
+            "symlink target's contents must be untouched"
+        );
+
         match prior {
             Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
             None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
