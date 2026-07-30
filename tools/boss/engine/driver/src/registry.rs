@@ -301,15 +301,38 @@ mod tests {
         let reg = DriverRegistry::default();
         let resolver = reg.resolver("grok").expect("grok is registered");
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
-            resolver
+            let plan = resolver
                 .check_dispatch(&kind)
                 .unwrap_or_else(|e| panic!("Grok must clear the {kind:?} dispatch gate: {e}"));
+            assert!(
+                plan.provided.contains(&Capability::StructuredOutput),
+                "{kind:?} must see Grok's declared StructuredOutput: {:?}",
+                plan.provided,
+            );
+            assert!(
+                plan.provided.contains(&Capability::ToolUseInterception),
+                "{kind:?} must see Grok's declared ToolUseInterception: {:?}",
+                plan.provided,
+            );
+            // Grok's undeclared capabilities must degrade rather than being
+            // silently treated as provided, even under this kind's escalation.
+            assert!(
+                plan.degraded.contains(&Capability::ToolProvisioning),
+                "{kind:?} must degrade Grok's absent ToolProvisioning: {plan:?}",
+            );
+            assert!(
+                plan.degraded.contains(&Capability::AwaitingInputSignal),
+                "{kind:?} must degrade Grok's absent AwaitingInputSignal: {plan:?}",
+            );
+            assert!(
+                plan.degraded.contains(&Capability::CommandOutcomeObservation),
+                "{kind:?} must degrade Grok's absent CommandOutcomeObservation: {plan:?}",
+            );
         }
 
         // A driver that declares neither StructuredOutput nor
-        // ToolUseInterception — i.e. Grok before the canonicalisation
-        // adapter's honesty gates were satisfied — must be refused for
-        // every document-producing kind, not just Design.
+        // ToolUseInterception must be refused for every document-producing
+        // kind, not just Design.
         let incomplete: Arc<dyn AgentDriver> = Arc::new(StubDriver::new(
             stub_descriptor(),
             CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]),
@@ -331,6 +354,25 @@ mod tests {
                 err.refused,
             );
         }
+        // Control: the same stub is also missing WorkspaceProvisioning and
+        // PermissionPolicy (both Refuse-by-default), so it already fails the
+        // gate for a non-escalated kind like Chore. That the escalated kinds
+        // above additionally refuse StructuredOutput/ToolUseInterception —
+        // which Chore does not require-strict — is what actually shows the
+        // escalation is kind-scoped, not just "this stub fails everything".
+        let chore_err = resolver
+            .check_dispatch(&TaskKind::Chore)
+            .expect_err("the incomplete stub is missing WorkspaceProvisioning/PermissionPolicy too");
+        assert!(
+            !chore_err.refused.contains(&Capability::StructuredOutput),
+            "Chore must not refuse StructuredOutput (not required-strict for Chore): {:?}",
+            chore_err.refused,
+        );
+        assert!(
+            !chore_err.refused.contains(&Capability::ToolUseInterception),
+            "Chore must not refuse ToolUseInterception (not required-strict for Chore): {:?}",
+            chore_err.refused,
+        );
     }
 
     #[test]
