@@ -225,82 +225,83 @@ pub fn normalize_session_start_source(mut event: WorkerEvent) -> WorkerEvent {
     event
 }
 
-// ─── Codex exec spawn contract ───────────────────────────────────────────────
+// ─── Codex spawn contract (bare interactive TUI) ─────────────────────────────
 
-/// Flags every Codex `exec` spawn plan must include.
+/// Flags every Codex spawn plan must include.
 ///
-/// Shared between the conformance test double and (when it lands) production
+/// Shared between the conformance test double and production
 /// `CodexDriver::spawn_invocation`. Pin tests call
-/// [`assert_codex_exec_spawn_contract`] so a future production path that
+/// [`assert_codex_spawn_contract`] so a future production path that
 /// regresses these flags fails the same pin without rewriting the double.
 ///
-/// `--skip-git-repo-check` is required because cube workspaces are
-/// non-colocated jj workspaces (a `.jj`, never a `.git`); without it Codex
-/// refuses every dispatch with "Not inside a trusted directory and
-/// --skip-git-repo-check was not specified."
+/// Restated for the bare interactive TUI (retired `codex exec`) per the
+/// one-shape pivot recorded in
+/// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`: two of the
+/// three flags this contract used to require were measured as hard
+/// argument errors on the TUI, and the TUI requires flags that are hard
+/// argument errors on `exec`.
 ///
-/// `--color always` forces the human-readable ANSI transcript Codex prints
-/// by default (see [`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`] for the flag that used
-/// to suppress it). Pane rendering, not transport, is the reason it is
-/// pinned here.
-pub const CODEX_EXEC_REQUIRED_FLAGS: &[&str] = &["--color always", "--strict-config", "--skip-git-repo-check"];
+/// `--no-alt-screen` disables the alternate screen so the viewport and a
+/// full-screen surface read diverge and scrollback accumulates across
+/// turns, instead of capping at one screenful under the default alt-screen
+/// mode (measured in the pivot spike, V2).
+///
+/// `-a never` pins the approval policy so a long-lived interactive session
+/// never blocks on a human approval prompt Boss cannot answer — Boss's own
+/// `--sandbox` policy is the real authorization boundary.
+pub const CODEX_REQUIRED_FLAGS: &[&str] = &["--strict-config", "--no-alt-screen", "-a never"];
 
-/// Long-form flags that must never appear on a Codex `exec` spawn line.
+/// Long-form flags that must never appear on a Codex spawn line — each is a
+/// hard argument error on the bare TUI, measured against `codex-cli
+/// 0.145.0` in the pivot spike.
 ///
-/// `-a` / `--ask-for-approval` was removed from `codex exec` on 0.145.0 and
-/// produces a hard argument error.
+/// `--color` and `--skip-git-repo-check` were required on the retired
+/// `codex exec` shape; both are rejected outright by the TUI.
 ///
-/// `--json` switches Codex to JSONL-on-stdout, which is exactly the raw,
-/// unreadable pane output this contract exists to prevent (mono#2303).
-/// Progress ingress does not need it: `CodexDriver::progress_observation_wiring`
+/// `--json` switches `codex exec` to JSONL-on-stdout, which was exactly the
+/// raw, unreadable pane output the original `exec` contract existed to
+/// prevent (mono#2303); the bare TUI has no such flag at all. Progress
+/// ingress does not need it either way: `CodexDriver::progress_observation_wiring`
 /// always tails the rollout file (`ProgressIngress::AgentJsonlFile`), which
 /// Codex writes unconditionally regardless of `--json`.
-pub const CODEX_EXEC_FORBIDDEN_LONG_FLAGS: &[&str] = &["--ask-for-approval", "--json"];
+pub const CODEX_FORBIDDEN_LONG_FLAGS: &[&str] = &["--color", "--skip-git-repo-check", "--json"];
 
-/// Build the reference `codex exec …` command line that satisfies
-/// [`CODEX_EXEC_REQUIRED_FLAGS`] and omits every forbidden token.
+/// Build the reference `codex …` command line that satisfies
+/// [`CODEX_REQUIRED_FLAGS`] and omits every forbidden token.
 ///
 /// Production `CodexDriver` may add model / sandbox tokens around these
-/// required flags, but must still pass [`assert_codex_exec_spawn_contract`].
-pub fn codex_exec_reference_command() -> String {
+/// required flags, but must still pass [`assert_codex_spawn_contract`].
+pub fn codex_reference_command() -> String {
     // Required flags come from the shared constants so the double cannot
     // drift from the contract the pin tests enforce.
-    let mut cmd = String::from("codex exec");
-    for flag in CODEX_EXEC_REQUIRED_FLAGS {
+    let mut cmd = String::from("codex");
+    for flag in CODEX_REQUIRED_FLAGS {
         cmd.push(' ');
         cmd.push_str(flag);
     }
-    cmd.push_str(" --dangerously-bypass-approvals-and-sandbox \"$(cat .codex/initial-prompt.txt)\"\n");
+    cmd.push_str(" --sandbox danger-full-access \"$(cat .codex/initial-prompt.txt)\"\n");
     cmd
 }
 
-/// Assert a [`SpawnPlan`] satisfies the Codex exec spawn contract.
+/// Assert a [`SpawnPlan`] satisfies the Codex spawn contract.
 ///
-/// Intended for version-pin tests and, later, for production-driver tests that
-/// feed a real `CodexDriver` plan into the same checker.
-pub fn assert_codex_exec_spawn_contract(plan: &SpawnPlan) {
-    let tokens: Vec<&str> = plan.command.split_whitespace().collect();
-    for flag in CODEX_EXEC_REQUIRED_FLAGS {
+/// Intended for version-pin tests and for production-driver tests that feed
+/// a real `CodexDriver` plan into the same checker.
+pub fn assert_codex_spawn_contract(plan: &SpawnPlan) {
+    for flag in CODEX_REQUIRED_FLAGS {
         assert!(
             plan.command.contains(flag),
-            "Codex exec spawn contract requires `{flag}`; got {}",
+            "Codex spawn contract requires `{flag}`; got {}",
             plan.command,
         );
     }
-    for flag in CODEX_EXEC_FORBIDDEN_LONG_FLAGS {
+    for flag in CODEX_FORBIDDEN_LONG_FLAGS {
         assert!(
             !plan.command.contains(flag),
-            "Codex exec spawn contract forbids `{flag}` (removed on pinned CLI); got {}",
+            "Codex spawn contract forbids `{flag}` (hard argument error on the bare TUI); got {}",
             plan.command,
         );
     }
-    // Short `-a` is the removed ask-for-approval alias; match as a whole token
-    // so we do not false-positive on longer flags that happen to contain "a".
-    assert!(
-        !tokens.contains(&"-a"),
-        "Codex exec spawn contract forbids bare `-a` (removed ask-for-approval alias); got {}",
-        plan.command,
-    );
 }
 
 // ─── Codex-shaped reference normaliser (test double for a future CodexDriver) ─
@@ -410,10 +411,10 @@ impl AgentDriver for CodexShapedDriver {
     fn spawn_invocation(&self, _: SpawnRequest<'_>) -> SpawnPlan {
         // Build from the shared spawn contract so the double and the pin tests
         // share one source of truth. A production CodexDriver must pass the
-        // same [`assert_codex_exec_spawn_contract`] check.
+        // same [`assert_codex_spawn_contract`] check.
         SpawnPlan {
             env: vec![EnvDirective::Set("CODEX_HOME".into(), "/tmp/boss-codex-home".into())],
-            command: codex_exec_reference_command(),
+            command: codex_reference_command(),
         }
     }
 

@@ -24,7 +24,7 @@
 use std::process::Command;
 
 use crate::conformance::fixtures::{
-    CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_exec_spawn_contract,
+    CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_spawn_contract,
     codex_shaped_driver, decode_jsonl,
 };
 use crate::driver::grok::PINNED_GROK_VERSION;
@@ -186,7 +186,7 @@ fn fixture_carries_required_envelope_types_for_pinned_version() {
 }
 
 #[test]
-fn codex_exec_spawn_satisfies_shared_flag_contract() {
+fn codex_spawn_satisfies_shared_flag_contract() {
     // Pin against the shared spawn contract, not only the test double's
     // hardcoded command string.
     let plan = codex_shaped_driver().spawn_invocation(crate::driver::SpawnRequest {
@@ -197,7 +197,7 @@ fn codex_exec_spawn_satisfies_shared_flag_contract() {
         permission_mode_override: None,
         run_id: None,
     });
-    assert_codex_exec_spawn_contract(&plan);
+    assert_codex_spawn_contract(&plan);
 
     // Production CodexDriver must satisfy the same required/forbidden flags.
     let production = crate::driver::CodexDriver::default().spawn_invocation(crate::driver::SpawnRequest {
@@ -208,7 +208,7 @@ fn codex_exec_spawn_satisfies_shared_flag_contract() {
         permission_mode_override: None,
         run_id: Some("version-pin-codex"),
     });
-    assert_codex_exec_spawn_contract(&production);
+    assert_codex_spawn_contract(&production);
 }
 
 /// Config-schema conformance: the exact `config.toml` production writes

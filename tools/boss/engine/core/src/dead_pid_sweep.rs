@@ -93,13 +93,17 @@
 //!
 //! Every path here first asks [`crate::worker_process_exit`] whether the
 //! vanished process is a *death* at all. It is, for every driver whose
-//! process is contracted to outlive its turns — which is all of them except
-//! `codex exec`, whose CLI serves one turn and then exits by design. Reading
-//! that exit as a crash reaped a cleanly finished Codex run 160 ms after it
-//! succeeded and redispatched the same chore ~20 times; see that module for
-//! the full diagnosis and for why the fix is causal rather than a grace
-//! window. A one-shot worker that exited *without* delivering a turn boundary
-//! is still reaped here, exactly as before.
+//! process is contracted to outlive its turns. No driver in the registry
+//! currently declares otherwise: `codex exec`, whose CLI served one turn
+//! and then exited by design, was the one exception, and retired in favor
+//! of the persistent interactive TUI (see
+//! `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`). Reading a
+//! one-shot exit as a crash once reaped a cleanly finished Codex run 160 ms
+//! after it succeeded and redispatched the same chore ~20 times; see that
+//! module for the full diagnosis and for why the fix is causal rather than
+//! a grace window. This machinery is retained for a future one-shot driver
+//! rather than deleted — a one-shot worker that exited *without* delivering
+//! a turn boundary would still be reaped here, exactly as before.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -596,9 +600,10 @@ fn corroborating_liveness(state: &LiveWorkerState, started_epoch: i64, now_epoch
 /// already surfaced via the `dead_pid_reconcile` dispatch event.
 ///
 /// **The app's report is authoritative about the pane, not about the run.**
-/// `onChildExited` fires whenever the pane's foreground process exits — which
-/// for `codex exec` is what *success* looks like, since it serves one turn per
-/// process and terminates. So the report is classified through
+/// `onChildExited` fires whenever the pane's foreground process exits —
+/// which for a one-turn-per-process driver (the retired `codex exec` shape)
+/// was what *success* looked like, terminating by design at the end of its
+/// one turn. So the report is classified through
 /// [`crate::worker_process_exit`] before anything is reaped: this is the exact
 /// call that orphaned a cleanly finished Codex run 160 ms after `task_complete`
 /// and left its completion handler with nothing to finalize. `progress_drain`
@@ -2263,10 +2268,9 @@ mod tests {
 
     // ─── one-turn-per-process worker exits ────────────────────────────────────
 
-    /// Stand up a chore whose driver is `codex` (one turn per process) with a
-    /// live, started execution parked in `waiting_human` — the state a
-    /// pane-hosted worker holds for its whole life. Returns
-    /// `(work_item_id, execution_id)`.
+    /// Stand up a chore whose driver is `codex` with a live, started
+    /// execution parked in `waiting_human` — the state a pane-hosted worker
+    /// holds for its whole life. Returns `(work_item_id, execution_id)`.
     fn create_codex_run(db: &WorkDb) -> (String, String) {
         let product_id = create_product(db);
         let work_item_id = create_active_chore(db, &product_id, "codex chore");
@@ -2290,13 +2294,15 @@ mod tests {
         (work_item_id, execution_id)
     }
 
-    /// **The regression.** `codex exec` delivered its turn and exited; the app
-    /// reported the pane death 160 ms later. The execution must keep the
-    /// status its completion handler left it in — never `orphaned` — and the
-    /// work item must not be handed back to the redispatch loop. Before this,
-    /// the same chore accumulated 19 orphaned executions and zero PRs.
+    /// **The regression this test used to pin, now inverted.** Codex is
+    /// `Persistent` (the bare interactive TUI pivot — see
+    /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), so a
+    /// reported pane death is no longer read as an expected one-shot exit
+    /// even with a delivered turn boundary: the execution is orphaned and
+    /// reaped exactly like Claude's pane death, via the same
+    /// `dead_pid_reconcile` path.
     #[tokio::test]
-    async fn one_shot_clean_exit_is_not_orphaned_and_is_not_redispatched() {
+    async fn codex_clean_exit_is_now_reaped_like_a_persistent_driver() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
@@ -2320,37 +2326,24 @@ mod tests {
         )
         .await;
 
-        assert!(!reaped, "a one-shot worker finishing its turn is not a reap");
+        assert!(
+            reaped,
+            "a persistent-driver pane death is always a reap, boundary or not"
+        );
         let exec = db.get_execution(&execution_id).unwrap();
-        assert_eq!(
-            exec.status,
-            ExecutionStatus::WaitingHuman,
-            "the completion handler's outcome must survive the process exiting",
-        );
-        assert_ne!(exec.status, ExecutionStatus::Orphaned);
+        assert_eq!(exec.status, ExecutionStatus::Orphaned);
 
-        // No redispatch: `waiting_human` is a live state the orphan sweep
-        // excludes, and nothing here created a fresh `ready` row.
-        let executions = db.list_executions(Some(&work_item_id)).unwrap();
-        assert_eq!(
-            executions.len(),
-            1,
-            "no fresh execution may be queued for a worker that finished: {executions:?}",
-        );
-
-        // The slot IS released — the pane really is gone — but it is reported
-        // as a finished worker, not a dead one.
         let claimed = coordinator.worker_pool().claimed_execution_ids().await;
         assert!(!claimed.contains(&execution_id), "the dead pane's slot must be freed");
         assert!(live_states.get(1).is_none(), "live-state entry must be cleared");
 
         let events = sink.events().await;
         assert_eq!(events.len(), 1, "expected one dispatch event, got: {events:?}");
-        assert_eq!(events[0].stage, Stage::OneShotWorkerExit.as_str());
+        assert_eq!(events[0].stage, Stage::DeadPidReconcile.as_str());
         assert_ne!(
             events[0].stage,
-            Stage::DeadPidReconcile.as_str(),
-            "a finished worker must never be reported as a dead-pid reconcile",
+            Stage::OneShotWorkerExit.as_str(),
+            "no registered driver declares OneTurnPerProcess any more",
         );
     }
 
@@ -2390,10 +2383,13 @@ mod tests {
         assert_eq!(events[0].stage, Stage::DeadPidReconcile.as_str());
     }
 
-    /// The periodic sweep reads the same evidence: a dead pid on a one-shot
-    /// run that delivered its turn is a finished worker, not an orphan.
+    /// The periodic sweep reads the same evidence as [`reap_reported_pane_death`]:
+    /// now that Codex is `Persistent`, a dead pid on a Codex run that
+    /// delivered its turn boundary is a genuine orphan, not a finished
+    /// one-shot worker — no driver in the registry declares
+    /// `OneTurnPerProcess` any more.
     #[tokio::test]
-    async fn periodic_sweep_spares_a_finished_one_shot_worker() {
+    async fn periodic_sweep_now_reaps_a_finished_persistent_codex_worker() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
@@ -2416,19 +2412,22 @@ mod tests {
         )
         .await;
 
-        assert_eq!(outcome.reaped, 0);
-        assert_eq!(outcome.expected_turn_exits, 1);
+        assert_eq!(outcome.reaped, 1);
+        assert_eq!(outcome.expected_turn_exits, 0);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::WaitingHuman,
+            ExecutionStatus::Orphaned,
         );
     }
 
-    /// A worker the engine can no longer talk to, parked short of a terminal
-    /// outcome, is a human's call — so it leaves a durable, dismissable
-    /// record rather than a live-looking row nobody is driving.
+    /// The `ONE_SHOT_UNREACHABLE_ATTENTION_KIND` filing is gated on
+    /// [`crate::worker_process_exit::ProcessExitVerdict::ExpectedTurnExit`],
+    /// which no registered driver can produce any more now that Codex is
+    /// `Persistent` — so a reaped Codex pane files neither that item nor a
+    /// [`PANE_DEATH_ATTENTION_KIND`] one (per [`reap_reported_pane_death`]'s
+    /// own contract, which reserves that kind for the reattach reconciler).
     #[tokio::test]
-    async fn a_finished_one_shot_worker_with_a_live_execution_files_an_attention_item() {
+    async fn a_reaped_persistent_codex_worker_files_no_one_shot_attention_item() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
@@ -2452,17 +2451,13 @@ mod tests {
         .await;
 
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
-        assert_eq!(
-            items
-                .iter()
-                .filter(|i| i.kind == ONE_SHOT_UNREACHABLE_ATTENTION_KIND)
-                .count(),
-            1,
-            "expected exactly one unreachable-worker item; got: {items:?}",
+        assert!(
+            !items.iter().any(|i| i.kind == ONE_SHOT_UNREACHABLE_ATTENTION_KIND),
+            "no driver can produce ExpectedTurnExit any more: {items:?}",
         );
         assert!(
             !items.iter().any(|i| i.kind == PANE_DEATH_ATTENTION_KIND),
-            "a finished worker is not a pane death: {items:?}",
+            "reap_reported_pane_death never files this kind: {items:?}",
         );
     }
 
@@ -2506,22 +2501,21 @@ mod tests {
         );
     }
 
-    /// A progress drain can terminalize the execution (completion detection
-    /// ran on the drained envelopes) while the classifier still returns
-    /// `Death` — e.g. a one-shot worker with no turn boundary, or a drain that
-    /// finalized the run on a path other than the boundary record. After
-    /// `Death`, the periodic sweep must re-read and skip the reap; otherwise a
-    /// stale pre-drain snapshot is overwritten with `orphaned`.
+    /// The drain-vs-completion race [`execution_after_drain_if_not_terminal`]
+    /// closes only ever arises for a driver whose exit classification pays
+    /// for a drain at all — gated on
+    /// [`crate::worker_process_exit::one_turn_per_process`], which no driver
+    /// in the registry satisfies now that Codex is `Persistent`. A supplied
+    /// drain is therefore never invoked for a Codex pane death; confirmed by
+    /// [`codex_clean_exit_is_now_reaped_like_a_persistent_driver`] and its
+    /// `worker_process_exit` counterpart, which assert the drain's call
+    /// count directly. The race itself is currently unreachable through any
+    /// registered driver and so has no live regression test here.
     #[tokio::test]
-    async fn periodic_sweep_does_not_orphan_after_drain_terminalizes() {
+    async fn periodic_sweep_reaps_a_dead_codex_pane_without_invoking_the_supplied_drain() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
-        // No turn boundary: classify returns Death after draining. The drain
-        // itself terminalizes the execution (models completion racing in).
-        let drain = TerminalizingDrain {
-            db: db.clone(),
-            work_item_id: work_item_id.clone(),
-        };
+        let drain = RecordingDrain::default();
         let db = Arc::new(db);
 
         let live_states = Arc::new(LiveWorkerStateRegistry::new());
@@ -2541,37 +2535,35 @@ mod tests {
         .await;
 
         assert_eq!(
-            outcome.reaped, 0,
-            "a drain that terminalized the execution must not be followed by a reap",
+            drain.calls(),
+            0,
+            "a persistent driver's exit must not pay for the drain"
         );
-        assert_eq!(
-            outcome.expected_turn_exits, 0,
-            "no turn boundary was recorded, so this is not an expected-exit path",
-        );
+        assert_eq!(outcome.reaped, 1);
+        assert_eq!(outcome.expected_turn_exits, 0);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Completed,
-            "completion's outcome must survive the Death-path re-read",
-        );
-        assert!(
-            sink.events().await.is_empty(),
-            "no dead-pid reconcile event for an already-terminal execution",
+            ExecutionStatus::Orphaned,
         );
     }
 
-    /// Progress drain that terminalizes the run mid-classify — the race
-    /// [`execution_after_drain_if_not_terminal`] exists to close.
-    struct TerminalizingDrain {
-        db: WorkDb,
-        work_item_id: String,
+    /// Records how many times the drain was invoked, without side effects —
+    /// used to pin that a persistent driver's exit never pays for a drain.
+    #[derive(Default)]
+    struct RecordingDrain {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingDrain {
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
-    impl ProgressDrain for TerminalizingDrain {
+    impl ProgressDrain for RecordingDrain {
         async fn drain_progress_for_exited_worker(&self, _run_id: &str) {
-            self.db
-                .force_execution_status_for_test(&self.work_item_id, ExecutionStatus::Completed)
-                .unwrap();
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 }
