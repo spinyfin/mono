@@ -20,6 +20,13 @@
 //!   anything from a previous engine process, which is exactly the
 //!   engine-restart case.
 //!
+//! (The mirror-image strand — the COMMENT moves on but the EXECUTION is left
+//! live, holding a worker slot — belongs to
+//! [`crate::answer_agent_completion_sweep`], which is execution-driven for the
+//! same reason this one is comment-driven. The two do not overlap: this sweep
+//! only ever acts on a comment with no live execution, that one only ever acts
+//! on a live execution whose comment has moved on.)
+//!
 //! So the execution is correctly reaped and the comment is left behind
 //! permanently `answering`: excluded from `comments_banner_state`'s
 //! `unresolved_count` and from `query_revisable_comments` (both gate on

@@ -424,6 +424,28 @@ impl WorkerCompletionHandler {
         StopOutcome::AnswerAgent { replied }
     }
 
+    /// Run [`Self::finalize_answer_agent`] for `execution_id` from outside the
+    /// Stop path — the entry point [`crate::answer_agent_completion_sweep`]
+    /// uses once it has positive evidence the agent's work is done but no turn
+    /// boundary ever arrived to say so.
+    ///
+    /// Deliberately the SAME finalizer the Stop path runs, not a parallel
+    /// teardown: it is what keeps the execution row and the pool slot moving
+    /// together (`complete_pane_parked_execution` then
+    /// `finish_worker_teardown`), so there is no window where one says finished
+    /// and the other says claimed.
+    ///
+    /// Returns `None` — having done nothing — when the execution is unknown,
+    /// is not an `answer_agent`, or is already terminal. Those are the races
+    /// the caller must not act on, not conditions to force through.
+    pub async fn finalize_answer_agent_execution(&self, execution_id: &str) -> Option<StopOutcome> {
+        let execution = self.work_db.get_execution(execution_id).ok()?;
+        if execution.kind != ExecutionKind::AnswerAgent || execution.status.is_terminal() {
+            return None;
+        }
+        Some(self.finalize_answer_agent(&execution).await)
+    }
+
     /// Finalise a `pr_review` reviewer execution when its Stop
     /// hook fires. The reviewer never opens a PR; instead, it reads the
     /// producing task's PR diff and emits structured `ReviewResult` JSON in

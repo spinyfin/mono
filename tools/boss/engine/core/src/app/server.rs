@@ -1171,6 +1171,22 @@ pub async fn serve_with_merge_probe(
         crate::stranded_answering_sweep::DEFAULT_INTERVAL,
     );
 
+    // The execution-side counterpart of the sweep above. That one recovers a
+    // COMMENT whose agent is gone; this one completes an EXECUTION whose agent
+    // is done — the answer landed (or the thread moved on) but no driver turn
+    // boundary ever reached `finalize_answer_agent`, so the run holds a
+    // main-pool slot and its cube lease forever. `terminal_work_sweep` cannot
+    // see it (an answer agent is never task bound, so it reaps only on
+    // execution terminality, which is precisely what never arrives). State-
+    // driven, never time-driven, and every completion files an attention item
+    // because a lost completion signal is a defect, not a routine reclaim.
+    let _answer_agent_completion_sweep_handle = crate::answer_agent_completion_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        server_state.completion_handler.clone(),
+        server_state.teardown_registry.clone(),
+        crate::answer_agent_completion_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic remote-lease reconciler: the cross-host analogue of the
     // lost-workspace sweep above. `lost_workspace_sweep` deliberately only
     // judges LOCAL runs (a `.exists()` probe is meaningless for a workspace

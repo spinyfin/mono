@@ -171,6 +171,38 @@ impl WorkDb {
         Ok(None)
     }
 
+    /// Every non-terminal `answer_agent` execution, oldest first.
+    ///
+    /// The execution-centric counterpart of
+    /// [`Self::live_answer_agent_execution_for_comment`], and the candidate set
+    /// [`crate::answer_agent_completion_sweep`] scans: that sweep asks "is this
+    /// live execution's answer already delivered?", which is a question about
+    /// executions, not about comments. Cheap by construction — an engine has at
+    /// most a handful of live executions at a time, capped by the worker pools.
+    pub fn list_live_answer_agent_executions(&self) -> Result<Vec<WorkExecution>> {
+        let conn = self.connect()?;
+        let mut stmt = conn.prepare(
+            "SELECT id FROM work_executions
+             WHERE kind = ?1 AND status NOT IN ('completed', 'failed', 'abandoned', 'cancelled', 'orphaned')
+             ORDER BY created_at ASC, id ASC",
+        )?;
+        let ids: Vec<String> =
+            collect_rows(stmt.query_map(params![boss_protocol::EXECUTION_KIND_ANSWER_AGENT], |row| row.get(0))?)?;
+        let mut executions = Vec::with_capacity(ids.len());
+        for id in ids {
+            // Re-read through the shared mapper (rather than trusting the
+            // status string in the filter above) so terminality is judged by
+            // `ExecutionStatus::is_terminal`, the one definition every other
+            // reaper uses.
+            if let Some(execution) = query_execution(&conn, &id)?
+                && !execution.status.is_terminal()
+            {
+                executions.push(execution);
+            }
+        }
+        Ok(executions)
+    }
+
     /// Fetch an answer-agent run by id.
     pub fn get_answer_agent_run(&self, run_id: &str) -> Result<Option<AnswerAgentRun>> {
         let conn = self.connect()?;

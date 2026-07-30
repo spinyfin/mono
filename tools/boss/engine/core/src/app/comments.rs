@@ -8,8 +8,8 @@
 use super::*;
 
 use boss_protocol::{
-    AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, CommentThreadEntry, INTENT_REVISION,
-    THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
+    AnswerAgentRun, COMMENT_STATUS_ACTIVE, COMMENT_STATUS_ANSWERING, COMMENT_STATUS_DISMISSED, COMMENT_STATUS_RESOLVED,
+    CommentThreadEntry, INTENT_REVISION, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP,
 };
 
 use crate::utility_model::UtilityTask;
@@ -1122,6 +1122,7 @@ pub(super) async fn handle_comments_dismiss(ctx: Dispatch, req: FrontendRequest)
         unreachable!()
     };
     let result = work_db.dismiss_comment(&comment_id, actor.as_deref());
+    end_answer_agent_on_thread_terminal(&server_state, &work_db, &result).await;
     respond_comment_invalidation(
         &server_state,
         &session_id,
@@ -1151,6 +1152,7 @@ pub(super) async fn handle_comments_set_status(ctx: Dispatch, req: FrontendReque
         unreachable!()
     };
     let result = work_db.set_comment_status(&comment_id, &status, actor.as_deref());
+    end_answer_agent_on_thread_terminal(&server_state, &work_db, &result).await;
     respond_comment_invalidation(
         &server_state,
         &session_id,
@@ -1367,6 +1369,42 @@ async fn stand_down_answer_agent(server_state: &Arc<ServerState>, work_db: &Arc<
         }
         handler.force_release(&execution_id).await;
     });
+}
+
+/// Tear the answer agent down when its comment thread reaches a status that
+/// means nobody is waiting for the answer any more (`resolved` / `dismissed`).
+///
+/// Without this, resolving a thread is invisible to the execution bound to it:
+/// the agent keeps its pane, worker slot and cube lease with nothing left to
+/// do, and (before the events-socket driver-resolution fix in
+/// [`WorkDb::get_execution_driver_slug`]) with no Stop it could ever act on.
+/// The observed run sat `waiting_human` for 39 minutes *after* its thread was
+/// resolved. Resolution is the operator's terminal signal for the thread, so it
+/// must be terminal for the execution too.
+///
+/// `result` is the status write's own outcome: a failed write means the thread
+/// did NOT reach a terminal status, so nothing is stood down. Statuses that
+/// leave the thread live (`active` — a reopen) are likewise ignored; only the
+/// two terminal ones tear anything down.
+///
+/// Delegates to [`stand_down_answer_agent`], which supersedes a still-`running`
+/// run, cancels the bound execution, and force-releases its pane + lease — so
+/// the execution row and the pool slot move together. A comment with no live
+/// answer-agent execution (the overwhelmingly common case) costs one indexed
+/// lookup and does nothing.
+async fn end_answer_agent_on_thread_terminal(
+    server_state: &Arc<ServerState>,
+    work_db: &Arc<WorkDb>,
+    result: &anyhow::Result<WorkComment>,
+) {
+    let Ok(comment) = result else { return };
+    if !matches!(
+        comment.status.as_str(),
+        COMMENT_STATUS_RESOLVED | COMMENT_STATUS_DISMISSED
+    ) {
+        return;
+    }
+    stand_down_answer_agent(server_state, work_db, &comment.id).await;
 }
 
 /// Post the bucket-1&3 nudge on a comment, unless one is already there.
@@ -2093,6 +2131,95 @@ mod tests {
             },
         )
         .await;
+    }
+
+    async fn set_status(
+        server_state: &Arc<ServerState>,
+        work_db: &Arc<WorkDb>,
+        sink: &Arc<SessionSink>,
+        id: &str,
+        status: &str,
+    ) {
+        handle_comments_set_status(
+            dispatch_ctx(server_state, work_db, sink),
+            FrontendRequest::CommentsSetStatus {
+                comment_id: id.to_owned(),
+                status: status.to_owned(),
+                actor: Some("user:me".to_owned()),
+            },
+        )
+        .await;
+    }
+
+    /// Resolving the thread is the operator saying nobody is waiting for the
+    /// answer any more. The bound execution must not outlive that: in the
+    /// observed incident the thread resolved at 09:46:49 and the execution was
+    /// still `waiting_human` on its worker slot 39 minutes later.
+    #[tokio::test]
+    async fn resolving_a_thread_ends_its_live_answer_agent_execution() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        set_status(&server_state, &work_db, &sink, &comment_id, "resolved").await;
+
+        assert_eq!(work_db.get_comment(&comment_id).unwrap().unwrap().status, "resolved");
+        assert!(
+            work_db.get_execution(&execution_id).unwrap().status.is_terminal(),
+            "a resolved thread must not leave its answer-agent execution alive",
+        );
+        assert!(
+            work_db
+                .running_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .is_none(),
+            "the run must be stood down too, so a late reply cannot revive the thread",
+        );
+    }
+
+    /// The same for a dismissed thread — the other terminal status
+    /// `set_comment_status` accepts.
+    #[tokio::test]
+    async fn dismissing_a_thread_ends_its_live_answer_agent_execution() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        handle_comments_dismiss(
+            dispatch_ctx(&server_state, &work_db, &sink),
+            FrontendRequest::CommentsDismiss {
+                comment_id: comment_id.clone(),
+                actor: Some("user:me".to_owned()),
+            },
+        )
+        .await;
+
+        assert!(work_db.get_execution(&execution_id).unwrap().status.is_terminal());
+    }
+
+    /// A status write that does NOT end the thread must leave the agent alone
+    /// — reopening a comment to `active` is not a reason to kill a live run.
+    #[tokio::test]
+    async fn a_non_terminal_status_change_leaves_the_answer_agent_running() {
+        let (server_state, _dir) = test_server_state();
+        let work_db = server_state.work_db.clone();
+        let sink = make_session_sink();
+        let (comment_id, execution_id) = seed_answering_comment(&work_db);
+
+        set_status(&server_state, &work_db, &sink, &comment_id, "active").await;
+
+        assert!(
+            !work_db.get_execution(&execution_id).unwrap().status.is_terminal(),
+            "only a resolved/dismissed thread stands the agent down",
+        );
+        assert!(
+            work_db
+                .running_answer_agent_run_for_comment(&comment_id)
+                .unwrap()
+                .is_some(),
+        );
     }
 
     #[tokio::test]
