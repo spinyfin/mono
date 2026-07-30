@@ -91,11 +91,7 @@ final class IpcLog: @unchecked Sendable {
         }
 
         let path = (directory as NSString).appendingPathComponent("ipc-\(dateStr).jsonl")
-        if !FileManager.default.fileExists(atPath: path) {
-            FileManager.default.createFile(atPath: path, contents: nil)
-        }
-        guard let handle = FileHandle(forWritingAtPath: path) else { return }
-        guard DiagnosticWrite.seekToEndQuietly(handle) else { return }
+        guard let handle = DiagnosticWrite.openForAppending(atPath: path) else { return }
         fileHandle = handle
         currentDate = dateStr
         writeFailureWarned = false

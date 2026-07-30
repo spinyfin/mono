@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import os
 
@@ -54,21 +55,25 @@ enum DiagnosticWrite {
         try? handle.close()
     }
 
-    /// Non-throwing replacement for the legacy `FileHandle` `seekToEndOfFile` convenience method.
+    /// Open `path` for atomic appends, creating it if needed.
     ///
-    /// The legacy `seekToEndOfFile` method raises an `NSException` on a failing `lseek(2)`,
-    /// the same uncatchable-from-Swift crash shape as `write(_:)`. On
-    /// failure, this closes `handle` and returns `false` so the caller can
-    /// leave its stored handle `nil` — that rotation's logging degrades off
-    /// instead of raising.
-    @discardableResult
-    static func seekToEndQuietly(_ handle: FileHandle) -> Bool {
-        do {
-            _ = try handle.seekToEnd()
-            return true
-        } catch {
-            try? handle.close()
-            return false
-        }
+    /// This issues a single `open(2)` with `O_APPEND` rather than the old
+    /// `FileHandle`-forWritingAtPath + `seekToEnd()` two-step. `O_APPEND`
+    /// makes the kernel do the offset lookup and the write as one atomic
+    /// unit with respect to every other appender of the same file —
+    /// including the engine's Rust-side writer on shared logs like the IPC
+    /// log — so two concurrent writers can no longer compute the same
+    /// end-of-file offset and overwrite each other's records. Lseek-then-
+    /// write let exactly that race splice records in the IPC and
+    /// diagnostics logs (mid-record byte overwrites, not clean
+    /// concatenation) because the app and the engine both write the same
+    /// path.
+    ///
+    /// Returns `nil` on failure (e.g. an unwritable directory), matching
+    /// the degrade-off-quietly contract of the rest of this type.
+    static func openForAppending(atPath path: String) -> FileHandle? {
+        let fd = path.withCString { open($0, O_WRONLY | O_CREAT | O_APPEND, 0o644) }
+        guard fd >= 0 else { return nil }
+        return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
     }
 }
