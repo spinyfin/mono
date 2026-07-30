@@ -23,6 +23,10 @@ impl WorkerCompletionHandler {
         let workspace_path = execution.workspace_path.clone();
         let detail = "Worker verified the assigned work was already done (empty diff — no changes \
                       needed); closed as a no-op without a PR.";
+        // Marked before the terminalizing write so no sweep can observe
+        // this execution terminal-with-a-live-pane without also seeing
+        // that its own teardown owns the pane — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.record_worker_no_op_completion(&execution.id, detail) {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
@@ -42,24 +46,12 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
-        if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "no-op completion: cube release failed"
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
-        // Deliberately AFTER the pane release (mirrors `force_release`'s
-        // ordering) — see `finalize_pr_transition` for why teardown must not
-        // run while the worker process may still be alive.
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
+        self.finish_worker_teardown(
             &execution.id,
+            completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
+            "no_op",
+            teardown,
         )
         .await;
         let work_item_id = completion.execution.work_item_id.clone();
@@ -107,6 +99,8 @@ impl WorkerCompletionHandler {
         execution: &crate::work::WorkExecution,
         detail: &str,
     ) -> StopOutcome {
+        // Marked before the terminalizing write — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.fail_pane_parked_execution(&execution.id, detail) {
             Ok(Some(completion)) => completion,
             Ok(None) => return StopOutcome::AlreadyTerminal,
@@ -127,26 +121,22 @@ impl WorkerCompletionHandler {
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
         crate::structured_output::clear_all(&self.structured_output_dir, &execution.id);
-        // Reap termination path: tear down any driver-owned state outside the
-        // workspace (e.g. Codex's per-run CODEX_HOME) before the lease itself
-        // is released.
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
+        // The driver reported its process already dead, but "already dead"
+        // is the driver's claim, not the engine's observation — the pane is
+        // still mapped until `release_pane` reaps it. So this path takes the
+        // same ordering as every other: pane, then driver state, then lease.
+        // Previously it tore driver state down FIRST, which is exactly the
+        // window in which a Codex process the driver mis-reported as dead
+        // could refresh its auth token after the credential file had been
+        // adopted back.
+        self.finish_worker_teardown(
             &execution.id,
+            execution.cube_lease_id.as_deref(),
             execution.workspace_path.as_deref().map(std::path::Path::new),
+            "driver_terminal_error",
+            teardown,
         )
         .await;
-        if let Some(lease_id) = execution.cube_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "driver terminal error: cube workspace release failed",
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
 
         let body = format!(
             "The worker's own driver reported its terminal turn boundary as an unrecoverable \

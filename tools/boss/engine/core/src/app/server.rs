@@ -1069,15 +1069,18 @@ pub async fn serve_with_merge_probe(
     // stale-worker sweep only inspects `working` slots, transient-recovery
     // recovers unfinished work, and the pool-claim sweep leaves live-backed
     // claims to the (failed) completion path. This sweep reaps such strands
-    // via the same idempotent, run-id-keyed `release_worker_pane` teardown,
-    // gated by a two-pass confirmation so a teardown still in flight is never
-    // raced and an active worker is never reaped. Runs every 60s.
+    // via the same idempotent, run-id-keyed `release_worker_pane` teardown.
+    // A pane whose own completion teardown is still running is skipped
+    // outright via the shared `teardown_registry` mark (two-pass
+    // confirmation on top of that, for anything unmarked), so an active
+    // worker is never reaped. Runs every 60s.
     let _terminal_work_sweep_handle = crate::terminal_work_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),
         Arc::clone(&server_state) as Arc<dyn crate::terminal_work_sweep::WorkerReaper>,
         server_state.cube_client.clone(),
         server_state.dispatch_events.clone(),
+        server_state.teardown_registry.clone(),
         crate::terminal_work_sweep::DEFAULT_INTERVAL,
     );
 

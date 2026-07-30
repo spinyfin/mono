@@ -520,6 +520,12 @@ struct ServerState {
     /// [`crate::hold_registry`].
     #[builder(default)]
     hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    /// In-flight completion-teardown marks, shared with the completion
+    /// handler so [`crate::terminal_work_sweep`] (wired in
+    /// `app::server::serve`) never reclaims a pane whose own teardown is
+    /// still running. See [`crate::teardown_registry`].
+    #[builder(default)]
+    teardown_registry: Arc<crate::teardown_registry::TeardownRegistry>,
     /// Cross-work-item spawn-capability circuit breaker. Fed by both the
     /// `ReportWorkerSpawnFailed` NACK handler and the periodic
     /// [`crate::spawn_ack_sweep`]; when too many DISTINCT work items fail to
@@ -1108,6 +1114,13 @@ impl ServerState {
         let live_worker_states_for_completion = live_worker_states.clone();
         let hold_registry = Arc::new(crate::hold_registry::HoldRegistry::new());
         let hold_registry_for_state = hold_registry.clone();
+        // ONE teardown registry shared by the completion handler (which
+        // marks a teardown in flight before it terminalizes an execution)
+        // and `terminal_work_sweep` (which must not reclaim a marked pane).
+        // Two instances would silently protect nothing — see
+        // `crate::teardown_registry`.
+        let teardown_registry = Arc::new(crate::teardown_registry::TeardownRegistry::new());
+        let teardown_registry_for_state = teardown_registry.clone();
         let completion_handler = Arc::new(
             WorkerCompletionHandler::new(
                 work_db.clone(),
@@ -1130,7 +1143,8 @@ impl ServerState {
             .with_background_activity_probe(Arc::new(
                 crate::background_children::RegistryBackgroundActivityProbe::new(live_worker_states_for_completion),
             ))
-            .with_hold_registry(hold_registry),
+            .with_hold_registry(hold_registry)
+            .with_teardown_registry(teardown_registry),
         );
 
         // Build PaneSpawnRunner up front, hand its Weak<ServerState>
@@ -1246,6 +1260,7 @@ impl ServerState {
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
                 .hold_registry(hold_registry_for_state)
+                .teardown_registry(teardown_registry_for_state)
                 .spawn_health(Arc::new(
                     crate::spawn_health::SpawnHealthTracker::new()
                         .with_breaker_enabled(cfg.work.enable_spawn_capability_breaker),
@@ -1621,7 +1636,14 @@ impl ServerState {
             boss_engine_utils::epoch_time::now_epoch_secs(),
         );
         let Some(shell_pid) = process.alive_pid() else {
-            tracing::debug!(
+            // INFO, not DEBUG: this is the line that says a `release_pane`
+            // arrived after its slot was already gone — i.e. somebody else
+            // (a sweep, an operator stop) got to the pane first. The
+            // 2026-07-30 post-mortem could only infer that from the absence
+            // of other lines, because the retained log keeps INFO and above
+            // and this was DEBUG. A completion path reaching this arm is
+            // rare and always worth seeing.
+            tracing::info!(
                 run_id,
                 verdict = process.reason(),
                 trust_window_secs = crate::durable_liveness::REDISPATCH_PID_TRUST_SECS,

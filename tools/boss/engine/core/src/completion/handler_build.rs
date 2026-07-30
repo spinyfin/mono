@@ -43,6 +43,7 @@ impl WorkerCompletionHandler {
             background_children_tracker: Arc::new(BuildWaitTracker::new()),
             background_children_horizon_secs: crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS,
             hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
+            teardown_registry: Arc::new(crate::teardown_registry::TeardownRegistry::new()),
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
             min_review_changed_lines: crate::config::DEFAULT_MIN_REVIEW_CHANGED_LINES,
             enable_revision_triggered_reviews: false,
@@ -155,6 +156,18 @@ impl WorkerCompletionHandler {
     /// [`crate::stale_worker_sweep::run_one_pass`].
     pub fn with_hold_registry(mut self, registry: Arc<crate::hold_registry::HoldRegistry>) -> Self {
         self.hold_registry = registry;
+        self
+    }
+
+    /// Wire an externally-owned
+    /// [`crate::teardown_registry::TeardownRegistry`] into this handler.
+    /// `app.rs` shares ONE instance between this handler (which marks a
+    /// teardown in flight) and [`crate::terminal_work_sweep::run_one_pass`]
+    /// (which must respect the mark). A handler left on the default
+    /// private registry still functions — it just protects nothing,
+    /// because no sweep is reading its marks.
+    pub fn with_teardown_registry(mut self, registry: Arc<crate::teardown_registry::TeardownRegistry>) -> Self {
+        self.teardown_registry = registry;
         self
     }
 

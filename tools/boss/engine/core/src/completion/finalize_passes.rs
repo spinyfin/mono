@@ -275,22 +275,18 @@ impl WorkerCompletionHandler {
         // misleading pane-died detail.
         let lease_id = execution.cube_lease_id.clone();
         let workspace_path = execution.workspace_path.clone();
+        // Marked before the terminalizing write — see `super::teardown`.
+        // `AutomationTriage` is one of the two kinds `terminal_work_sweep`
+        // reaps on execution terminality alone (it can never resolve their
+        // work-item ids), so this path is if anything MORE exposed to the
+        // race than the PR-completion one.
+        let teardown = self.begin_teardown(&execution.id);
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
             Some(&format!("automation triage: {outcome}")),
         ) {
-            Ok(Some(_)) => {
-                // Stop-driven completion termination path: tear down any
-                // driver-owned state outside the workspace, captured before
-                // `complete_pane_parked_execution` nulls `workspace_path`.
-                crate::driver_teardown::teardown_driver_workspace(
-                    &self.work_db,
-                    &execution.id,
-                    workspace_path.as_deref().map(std::path::Path::new),
-                )
-                .await;
-            }
+            Ok(Some(_)) => {}
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "automation triage finalise: execution already terminal; nothing to do",
@@ -301,17 +297,14 @@ impl WorkerCompletionHandler {
                 "failed to finalise triage execution row",
             ),
         }
-        if let Some(lease_id) = lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "triage finalisation: cube workspace release failed",
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
+        self.finish_worker_teardown(
+            &execution.id,
+            lease_id.as_deref(),
+            workspace_path.as_deref().map(std::path::Path::new),
+            "automation_triage",
+            teardown,
+        )
+        .await;
         self.publisher
             .publish(
                 &execution.id,
@@ -386,6 +379,10 @@ impl WorkerCompletionHandler {
         // why this does not depend on there being a still-`active` run).
         let lease_id = execution.cube_lease_id.clone();
         let workspace_path = execution.workspace_path.clone();
+        // Marked before the terminalizing write — see `super::teardown`.
+        // `AnswerAgent` is the other kind `terminal_work_sweep` reaps on
+        // execution terminality alone.
+        let teardown = self.begin_teardown(&execution.id);
         match self.work_db.complete_pane_parked_execution(
             &execution.id,
             "completed",
@@ -395,17 +392,7 @@ impl WorkerCompletionHandler {
                 "answer agent: no reply posted"
             }),
         ) {
-            Ok(Some(_)) => {
-                // Stop-driven completion termination path: tear down any
-                // driver-owned state outside the workspace, captured before
-                // `complete_pane_parked_execution` nulls `workspace_path`.
-                crate::driver_teardown::teardown_driver_workspace(
-                    &self.work_db,
-                    &execution.id,
-                    workspace_path.as_deref().map(std::path::Path::new),
-                )
-                .await;
-            }
+            Ok(Some(_)) => {}
             Ok(None) => tracing::debug!(
                 execution_id = %execution.id,
                 "answer-agent finalise: execution already terminal; nothing to do",
@@ -416,17 +403,14 @@ impl WorkerCompletionHandler {
                 "failed to finalise answer-agent execution row",
             ),
         }
-        if let Some(lease_id) = lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "answer-agent finalisation: cube workspace release failed",
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
+        self.finish_worker_teardown(
+            &execution.id,
+            lease_id.as_deref(),
+            workspace_path.as_deref().map(std::path::Path::new),
+            "answer_agent",
+            teardown,
+        )
+        .await;
         self.publisher
             .publish(&execution.id, &comment_id, "completed", "answer_agent_completed")
             .await;
@@ -695,6 +679,8 @@ impl WorkerCompletionHandler {
         // hold it in blocked:deletion_signoff when the tripwire fired) +
         // complete the reviewer execution + clear its cube columns. Same path
         // for both revision and no-revision cases.
+        // Marked before the terminalizing write — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
         let completion = match self
             .work_db
             .record_worker_pr_completion(&execution.id, &pr_url, None, completion_target)
@@ -796,24 +782,12 @@ impl WorkerCompletionHandler {
             "pr_review pass duration",
         );
 
-        if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "pr_review finalize: cube workspace release failed",
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
-        // Deliberately AFTER the pane release (mirrors `force_release`'s
-        // ordering) — see `finalize_pr_transition` for why teardown must not
-        // run while the worker process may still be alive.
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
+        self.finish_worker_teardown(
             &execution.id,
+            completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
+            "pr_review",
+            teardown,
         )
         .await;
 

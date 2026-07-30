@@ -353,6 +353,8 @@ status is otherwise left unchanged for re-dispatch or manual review."
         // execution — this path terminalizes a parked-live execution, so it
         // owns driver teardown.
         let workspace_path = execution.workspace_path.clone();
+        // Marked before the terminalizing write — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
         let completion = match self.work_db.record_worker_idle_abandonment(&execution.id, detail) {
             Ok(Some(completion)) => completion,
             Ok(None) => return,
@@ -370,24 +372,12 @@ status is otherwise left unchanged for re-dispatch or manual review."
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
-        if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id = %execution.id,
-                lease_id,
-                ?err,
-                "idle-park finalize: cube release failed"
-            );
-        }
-        self.pane_releaser.release_pane(&execution.id).await;
-        // Deliberately AFTER the pane release (mirrors `force_release`'s
-        // ordering) — see `finalize_pr_transition` for why teardown must not
-        // run while the worker process may still be alive.
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
+        self.finish_worker_teardown(
             &execution.id,
+            completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
+            "idle_park",
+            teardown,
         )
         .await;
         let work_item_id = completion.execution.work_item_id.clone();

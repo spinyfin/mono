@@ -88,6 +88,7 @@ mod recheck;
 mod release;
 mod remediation;
 mod stop;
+mod teardown;
 mod worker_signals;
 
 // Counter handles for the PR URL capture channels, in the order they are
@@ -1194,6 +1195,15 @@ pub struct WorkerCompletionHandler {
     /// pair. Shared via `Arc` so `app.rs`'s RPC handlers and both sweeps
     /// see the same holds.
     hold_registry: Arc<crate::hold_registry::HoldRegistry>,
+    /// In-flight completion-teardown marks. Every path that terminalizes
+    /// an execution marks it here BEFORE the terminalizing write and
+    /// clears the mark once [`Self::finish_worker_teardown`] has released
+    /// the pane, torn down driver state, and freed the cube lease.
+    /// [`crate::terminal_work_sweep`] consults the same registry so it can
+    /// tell "this pane's own teardown owns it" apart from "this pane is a
+    /// strand" — see [`crate::teardown_registry`]. Shared via `Arc` so the
+    /// handler and the sweep see the same marks.
+    teardown_registry: Arc<crate::teardown_registry::TeardownRegistry>,
     /// Maximum number of automated reviewer passes per PR.
     /// When a producing task's `review_cycle` reaches this value the engine
     /// skips the next reviewer pass and advances to human Review directly.
