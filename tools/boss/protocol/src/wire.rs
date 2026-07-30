@@ -9,12 +9,12 @@ use crate::live_worker_state::LiveWorkerState;
 use crate::metrics_wire::MetricLiveEntry;
 use crate::types::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, AttentionMerge, Automation,
-    AutomationDedupSuppression, AutomationPatch, AutomationRun, CiBudgetSnapshot, CiRemediation, CommentAnchor,
-    CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport, ConflictResolution,
-    CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput, CreateCommentInput,
-    CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision,
-    DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, EditorialAction,
+    AutomationDedupSuppression, AutomationPatch, AutomationRun, BoardDropTarget, CiBudgetSnapshot, CiRemediation,
+    CommentAnchor, CommentThreadEntry, CommentWithThread, CommentsBannerState, ConflictHotspotReport,
+    ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
+    CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
+    CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
+    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, EditorialAction,
     EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
     PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project,
     ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
@@ -1441,6 +1441,37 @@ pub enum FrontendRequest {
     /// when no counter or gauge with `name` is registered.
     MetricsShowLive {
         name: String,
+    },
+
+    /// A kanban drag-and-drop landed on the board. The app reports *where*
+    /// the card was dropped ([`BoardDropTarget`] — column, plus the group
+    /// within it when the drop landed on one); the engine decides what that
+    /// drop *means*.
+    ///
+    /// This exists because a status patch cannot express a drop. Both board
+    /// levels are derived from engine state, so the same drop is a reorder or
+    /// a transition depending on where the card already was — and the app,
+    /// which sees only the layout, cannot tell the two apart. Concretely: an
+    /// `in_review` row whose PR is in a merge queue renders in the Done
+    /// column's "Merging" group, so dragging it a few pixels within that
+    /// group used to be sent as `UpdateWorkItem { status: "done" }` and
+    /// silently completed an in-flight merge.
+    ///
+    /// The engine resolves the drop against the row's own derived board
+    /// position and then applies at most one of: nothing (a reorder), a
+    /// status transition, or an autostart change. Replies with
+    /// [`FrontendEvent::WorkItemUpdated`] carrying the row as it stands
+    /// afterwards — unchanged, for a reorder — or
+    /// [`FrontendEvent::WorkError`] when the drop names no meaningful
+    /// gesture.
+    ///
+    /// This is the drag path only. An *explicit* status choice (the work
+    /// card popover's "Move" buttons, `boss chore update --status`) still
+    /// goes through [`FrontendRequest::UpdateWorkItem`], where "set this
+    /// status" is exactly what the caller meant and no inference is needed.
+    MoveWorkItemOnBoard {
+        id: String,
+        target: BoardDropTarget,
     },
 
     /// Boss-tier RPC: ask the macOS app to open `path` (an absolute or

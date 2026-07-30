@@ -1672,10 +1672,12 @@ final class ChatViewModel: ObservableObject {
     ]
 
     /// True iff the work item has a non-terminal worker currently
-    /// attached (running, paused on input, or idle between turns).
+    /// attached (running, paused on input, or idle between turns). Shared
+    /// with the kanban drop path (`attemptDrop`), which applies the same
+    /// out-of-Doing rule as the popover's explicit Move buttons.
     /// `WorkerActivity.terminated` and `.errored` count as "no live
     /// worker" — the slot is no longer holding the run open.
-    private func hasLiveWorker(forTaskID taskID: String) -> Bool {
+    func hasLiveWorker(forTaskID taskID: String) -> Bool {
         guard let live = workerLiveState(forTaskID: taskID) else {
             return false
         }

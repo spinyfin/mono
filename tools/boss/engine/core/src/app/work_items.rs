@@ -5,7 +5,11 @@
 //! behavioural change. See [`super::Dispatch`] for the per-request
 //! context every handler receives.
 
+use anyhow::anyhow;
+use boss_engine_board_gesture::{BoardRow, DropResolution, resolve_drop};
+
 use super::*;
+use crate::protocol::WorkItemPatch;
 
 pub(super) async fn handle_list_tasks(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
@@ -385,6 +389,109 @@ pub(super) async fn handle_create_many_chores(ctx: Dispatch, req: FrontendReques
 }
 
 pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::UpdateWorkItem { id, patch } = req else {
+        unreachable!()
+    };
+    apply_work_item_patch(ctx, id, patch).await;
+}
+
+/// A kanban drag landed on the board. Resolve what the drop *meant* against
+/// the row's own engine-derived board position, then apply at most one
+/// effect.
+///
+/// The app reports only where the card was dropped; it does not compute a
+/// status. That inversion is the fix for a real defect: the Done column's
+/// "Merging" group holds `in_review` rows whose PR is in a merge queue, so
+/// when the app derived "Done column ⇒ status `done`" its only guard
+/// (`status != target_status`) passed and a *reorder inside that group*
+/// silently completed an in-flight merge. See
+/// [`boss_engine_board_gesture`] for the full resolution matrix.
+///
+/// A resolved transition is applied through the exact same
+/// [`apply_work_item_patch`] path an explicit `UpdateWorkItem` takes, so
+/// every guard and side effect (the missing-repo precheck, worker teardown
+/// on a terminal move, auto-dispatch into Doing, the gated-`blocked`
+/// refusal) behaves identically whichever way the status was chosen.
+pub(super) async fn handle_move_work_item_on_board(ctx: Dispatch, req: FrontendRequest) {
+    let FrontendRequest::MoveWorkItemOnBoard { id, target } = req else {
+        unreachable!()
+    };
+    let row = match board_row_for_id(&ctx.work_db, &id) {
+        Ok(row) => row,
+        Err(err) => {
+            send_work_error(&ctx.sink, &ctx.request_id, &err);
+            return;
+        }
+    };
+    let current = row.position();
+    let resolution = resolve_drop(&row, target);
+    tracing::debug!(
+        work_item_id = %id,
+        from = %current.label(),
+        to = %target.label(),
+        ?resolution,
+        "board drop resolved",
+    );
+    match resolution {
+        DropResolution::Reorder { reason } => {
+            // Status-preserving by construction: apply nothing, publish
+            // nothing, and hand the row straight back so the client's
+            // optimistic placement reconciles against real state. The
+            // `info!` is deliberate — "I dragged it and nothing happened"
+            // is otherwise indistinguishable from a dropped RPC.
+            tracing::info!(
+                work_item_id = %id,
+                position = %current.label(),
+                ?reason,
+                "board drop is a reorder; leaving status unchanged",
+            );
+            match ctx.work_db.get_work_item(&id) {
+                Ok(item) => send_response_with_revision(
+                    &ctx.sink,
+                    &ctx.request_id,
+                    ctx.server_state.current_work_revision(),
+                    FrontendEvent::WorkItemUpdated { item },
+                ),
+                Err(err) => send_work_error(&ctx.sink, &ctx.request_id, &err),
+            }
+        }
+        DropResolution::SetStatus(status) => {
+            let patch = WorkItemPatch::builder().status(status.as_str()).build();
+            apply_work_item_patch(ctx, id, patch).await;
+        }
+        DropResolution::ClearAutostart => {
+            let patch = WorkItemPatch::builder().autostart(false).build();
+            apply_work_item_patch(ctx, id, patch).await;
+        }
+        DropResolution::Refused { message } => {
+            let err = anyhow!(message);
+            send_work_error(&ctx.sink, &ctx.request_id, &err);
+        }
+    }
+}
+
+/// Read the four columns board layout is derived from. Products and projects
+/// have no board position — they are not cards — so a drop naming one is an
+/// error rather than a silently ignored no-op.
+fn board_row_for_id(work_db: &WorkDb, id: &str) -> Result<BoardRow> {
+    match work_db.get_work_item(id)? {
+        WorkItem::Task(task) | WorkItem::Chore(task) => Ok(BoardRow {
+            status: task.status,
+            autostart: task.autostart,
+            blocked_reason: task.blocked_reason,
+            merge_queue_state: task.merge_queue_state,
+        }),
+        WorkItem::Product(_) | WorkItem::Project(_) => {
+            bail!("{id} is not a work-board card: only tasks and chores have a board position")
+        }
+    }
+}
+
+/// The one place a `WorkItemPatch` is applied on behalf of a peer, shared by
+/// [`handle_update_work_item`] (an explicit status/field edit) and
+/// [`handle_move_work_item_on_board`] (a drag whose meaning the engine just
+/// resolved).
+async fn apply_work_item_patch(ctx: Dispatch, id: String, patch: WorkItemPatch) {
     let Dispatch {
         server_state,
         work_db,
@@ -394,9 +501,6 @@ pub(super) async fn handle_update_work_item(ctx: Dispatch, req: FrontendRequest)
         peer_pid,
         ..
     } = ctx;
-    let FrontendRequest::UpdateWorkItem { id, patch } = req else {
-        unreachable!()
-    };
     {
         // Capture the task/chore status before the update so we
         // can detect a transition into `active` after the patch

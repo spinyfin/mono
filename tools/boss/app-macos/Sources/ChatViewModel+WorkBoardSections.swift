@@ -42,6 +42,7 @@ extension ChatViewModel {
             items: sorted,
             isCollapsible: true,
             defaultExpanded: true,
+            groupKey: .merging,
             queueBannerText: queueBanner
         )
     }
@@ -64,7 +65,7 @@ extension ChatViewModel {
 
         let nowDay = calendar.startOfDay(for: now)
         guard let yesterdayDay = calendar.date(byAdding: .day, value: -1, to: nowDay) else {
-            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
+            return [WorkBoardSection(id: "done-all", title: "Done", items: items, groupKey: .completed)]
         }
         let weekday = calendar.component(.weekday, from: nowDay)
         let firstWeekday = calendar.firstWeekday
@@ -72,7 +73,7 @@ extension ChatViewModel {
         guard let startOfWeek = calendar.date(byAdding: .day, value: -daysSinceStartOfWeek, to: nowDay),
               let startOfLastWeek = calendar.date(byAdding: .day, value: -7, to: startOfWeek)
         else {
-            return [WorkBoardSection(id: "done-all", title: "Done", items: items)]
+            return [WorkBoardSection(id: "done-all", title: "Done", items: items, groupKey: .completed)]
         }
 
         let weekdayFormatter = DateFormatter()
@@ -127,7 +128,8 @@ extension ChatViewModel {
                 title: spec.title,
                 items: sorted,
                 isCollapsible: true,
-                defaultExpanded: spec.defaultExpanded
+                defaultExpanded: spec.defaultExpanded,
+                groupKey: .completed
             )
         }
     }

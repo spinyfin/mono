@@ -17,9 +17,9 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(model.workItems(in: .backlog).map(\.id), [task.id])
         XCTAssertTrue(model.workItems(in: .doing).isEmpty)
 
-        // Drop into Doing — attemptMoveTask should return true and the card
+        // Drop into Doing — attemptDrop should return true and the card
         // should appear in Doing before any engine response.
-        let accepted = model.attemptMoveTask(task.id, to: .doing)
+        let accepted = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         XCTAssertTrue(accepted, "drop should be accepted")
         XCTAssertTrue(model.workItems(in: .doing).map(\.id).contains(task.id),
                       "card must appear in Doing immediately after drop")
@@ -32,7 +32,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
 
         // Engine has not yet responded; tasksByProjectID still has old status.
         // The card must stay in Doing via the optimistic override.
@@ -46,7 +46,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
 
         // Engine confirms the move via work_item_updated alone — no full tree fetch.
         let confirmedTask = makeTask(status: "active", id: task.id)
@@ -68,7 +68,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeProjectTask(status: "todo", projectID: project.id)
         model.tasksByProjectID = [project.id: [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
 
         let confirmedTask = makeProjectTask(status: "active", id: task.id, projectID: project.id)
         model.applyEventForTest(.workItemUpdated(item: .task(confirmedTask)))
@@ -84,7 +84,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
 
         // Simulate engine sending back a work_item_updated with the new status,
         // then a work tree that reflects the updated status.
@@ -114,7 +114,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         // Card is now optimistically in Doing.
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
@@ -134,7 +134,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let task = makeTask(status: "todo")
         model.choresByProductID = ["prod_test": [task]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         model.applyEventForTest(.workError(message: "test error"))
 
         // Inline drag-refusal notice is set for the affected task.
@@ -161,7 +161,7 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         let other = makeTask(status: "active", id: "task_b")
         model.choresByProductID = ["prod_test": [task, other]]
 
-        _ = model.attemptMoveTask(task.id, to: .doing)
+        _ = model.attemptDrop(task.id, onColumn: .doing, group: nil)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
         // Engine sends a tree update (unrelated, task_a still has old status).
@@ -193,10 +193,80 @@ final class OptimisticKanbanMoveTests: XCTestCase {
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
 
         // Drop to Backlog (cancels dispatch).
-        let accepted = model.attemptMoveTask(task.id, to: .backlog)
+        let accepted = model.attemptDrop(task.id, onColumn: .backlog, group: nil)
         XCTAssertTrue(accepted)
         XCTAssertEqual(model.effectiveBoardColumn(for: task), .backlog,
                        "card must move to Backlog immediately")
+    }
+
+    // MARK: - Reorder drops leave the card alone
+
+    /// The defect this drop path was rebuilt for. A chore whose PR is in the
+    /// merge queue is `in_review` and renders in Done ▸ Merging — in flight,
+    /// not complete. Reordering it inside that group must not stage any move:
+    /// the engine resolves the drop and answers "reorder", so an optimistic
+    /// reposition here would flash the card into a completion bucket and, if
+    /// the client had computed the status itself (as it used to), would have
+    /// marked the merge done.
+    func testReorderWithinMergingGroupStagesNoMove() {
+        let model = makeModel()
+        var task = makeTask(status: "in_review")
+        task.mergeQueueState = "queued"
+        model.choresByProductID = ["prod_test": [task]]
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .done)
+        XCTAssertEqual(model.boardGroup(for: task), .merging)
+
+        let accepted = model.attemptDrop(task.id, onColumn: .done, group: .merging)
+        XCTAssertTrue(accepted, "the drop is still reported — the engine decides what it meant")
+        XCTAssertNil(model.optimisticColumnByTaskID[task.id],
+                     "a reorder must not stage an optimistic column change")
+        XCTAssertNil(model.pendingMoveOriginByTaskID[task.id],
+                     "a reorder has no origin to bounce back to")
+        XCTAssertEqual(model.boardGroup(for: task), .merging,
+                       "card must stay in Merging")
+    }
+
+    /// A drop that misses every group and lands on the Done column's padding
+    /// is unqualified — less intent than a group-qualified drop, not more. It
+    /// must not stage a move for a card already in that column.
+    func testUnqualifiedDropOnOwnColumnStagesNoMove() {
+        let model = makeModel()
+        var task = makeTask(status: "in_review")
+        task.mergeQueueState = "queued"
+        model.choresByProductID = ["prod_test": [task]]
+
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .done, group: nil))
+        XCTAssertNil(model.optimisticColumnByTaskID[task.id])
+        XCTAssertNil(model.pendingMoveOriginByTaskID[task.id])
+    }
+
+    /// The legitimate transition the fix must preserve: dragging an in-flight
+    /// merge out of Merging and into a completion group means "this is done",
+    /// and it is distinguishable from the reorder above purely by the group.
+    func testMergingToCompletionGroupStagesTheMove() {
+        let model = makeModel()
+        var task = makeTask(status: "in_review")
+        task.mergeQueueState = "queued"
+        model.choresByProductID = ["prod_test": [task]]
+
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .done, group: .completed))
+        XCTAssertEqual(model.optimisticColumnByTaskID[task.id], .done,
+                       "a cross-group drop is a real move and is staged optimistically")
+        XCTAssertEqual(model.pendingMoveOriginByTaskID[task.id], .done)
+    }
+
+    /// Same rule in a column with no groups: reordering a dispatch-pending
+    /// card inside Doing must not force it to start.
+    func testReorderWithinDoingStagesNoMove() {
+        let model = makeModel()
+        let task = makeTask(status: "todo", autostart: true)
+        model.choresByProductID = ["prod_test": [task]]
+
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
+        XCTAssertTrue(model.attemptDrop(task.id, onColumn: .doing, group: nil))
+        XCTAssertNil(model.optimisticColumnByTaskID[task.id])
+        XCTAssertEqual(model.effectiveBoardColumn(for: task), .doing)
     }
 
     // MARK: - Helpers

@@ -306,6 +306,12 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // dependency surgery, actioning someone else's attention. There is
         // no worker-facing equivalent by design; `boss propose blocked` is
         // the escape hatch the `closed` message points at.
+        //
+        // `MoveWorkItemOnBoard` belongs here rather than alongside
+        // `UpdateWorkItem`: it is a human's drag gesture on the kanban, and
+        // a worker has no board to drag on. A worker that wants a status
+        // change asks for it explicitly via the `UpdateWorkItem` route
+        // below, where the redirect can name the right `boss propose …`.
         FrontendRequest::ActionAttentionGroup { .. }
         | FrontendRequest::AddDependency { .. }
         | FrontendRequest::AnswerAttention { .. }
@@ -315,6 +321,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DeleteWorkItem { .. }
         | FrontendRequest::DismissAttention { .. }
         | FrontendRequest::LinkWorkItemExternalRef { .. }
+        | FrontendRequest::MoveWorkItemOnBoard { .. }
         | FrontendRequest::RemoveDependency { .. }
         | FrontendRequest::ReorderProjectTasks { .. }
         | FrontendRequest::RestoreWorkItem { .. }

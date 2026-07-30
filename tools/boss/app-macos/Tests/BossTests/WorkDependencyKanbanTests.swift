@@ -73,12 +73,12 @@ final class WorkDependencyKanbanTests: XCTestCase {
     /// rejected and surface an inline notice keyed to the source
     /// card's id. The lane never sees the move; the warning replaces
     /// it.
-    func testAttemptMoveTaskRefusesGatedDrag() {
+    func testAttemptDropRefusesGatedDrag() {
         let model = makeFixture()
         guard let dependent = model.taskByName("Phase 4") else {
             XCTFail("expected fixture"); return
         }
-        let accepted = model.attemptMoveTask(dependent.id, to: .doing)
+        let accepted = model.attemptDrop(dependent.id, onColumn: .doing, group: nil)
         XCTAssertFalse(accepted)
         XCTAssertEqual(model.dragRefusalNotice?.taskID, dependent.id)
         XCTAssertTrue(
@@ -235,7 +235,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
     /// A manual-block row with no gating edges should still be
     /// movable — the engine accepts a manual unblock once the prereq
     /// set is empty, so the kanban must not pre-empt that.
-    func testAttemptMoveTaskAcceptsUngatedDragOutOfBlocked() {
+    func testAttemptDropAcceptsUngatedDragOutOfBlocked() {
         let model = makeFixture()
         model.upsertTaskForTest(
             id: "task_movable",
@@ -243,7 +243,7 @@ final class WorkDependencyKanbanTests: XCTestCase {
             status: "blocked",
             lastStatusActor: "human"
         )
-        let accepted = model.attemptMoveTask("task_movable", to: .doing)
+        let accepted = model.attemptDrop("task_movable", onColumn: .doing, group: nil)
         XCTAssertTrue(accepted)
         XCTAssertNil(model.dragRefusalNotice)
     }

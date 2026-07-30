@@ -425,6 +425,7 @@ dependencies = [
  "boss-editorial",
  "boss-engine-automation-dedup",
  "boss-engine-automation-schedule",
+ "boss-engine-board-gesture",
  "boss-engine-codex-rollout-retention",
  "boss-engine-comment-classifier",
  "boss-engine-day-rotated-log",
@@ -492,6 +493,13 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "chrono-tz",
+]
+
+[[package]]
+name = "boss-engine-board-gesture"
+version = "0.1.0"
+dependencies = [
+ "boss-protocol",
 ]
 
 [[package]]

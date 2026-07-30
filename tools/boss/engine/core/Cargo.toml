@@ -28,6 +28,7 @@ boss-deterministic-resolvers = { path = "../deterministic-resolvers" }
 boss-dispatch-events = { path = "../dispatch-events" }
 boss-dispatch-reader = { path = "../dispatch-reader" }
 boss-editorial = { path = "../editorial" }
+boss-engine-board-gesture = { path = "../board-gesture" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-codex-rollout-retention = { path = "../codex-rollout-retention" }
 boss-engine-driver = { path = "../driver" }
