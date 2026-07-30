@@ -92,7 +92,7 @@ invocations:
         message: "{{item.msg}}"
         severity: "{{item.sev}}"
         remediations:
-          - "`checkleft fix` applies Biome's safe auto-fixes. If the violation remains afterward, fix it manually, or suppress it with a justified `// biome-ignore lint: <reason>` comment."
+          - "For error and warning findings, `checkleft fix` applies Biome's safe auto-fixes. If the violation remains afterward, fix it manually, or suppress it with a justified `// biome-ignore lint: <reason>` comment."
     fix:
       # --write applies safe auto-fixes in place. Exit 1 means unfixable diagnostics
       # remain — that is not a fix error; the post-verify pass will report the residue.
