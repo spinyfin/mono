@@ -484,13 +484,12 @@ extension EngineClient {
     }
 
     /// Report where a kanban drag ended and let the engine decide what the
-    /// drop meant. We send the observed drop target — never a status — because
-    /// the board's columns and groups are both *derived* from engine state, so
-    /// the same target is a reorder for a card already there and a transition
-    /// for one arriving from elsewhere. The client cannot tell those apart
-    /// without re-deriving engine rules, and when it tried, a reorder inside
-    /// Done ▸ Merging (whose rows are `in_review` with a PR in the merge
-    /// queue, not `done`) silently completed the merge.
+    /// drop meant. We send the observed drop target — never a status —
+    /// because the board's columns and groups are both *derived* from engine
+    /// state, so the same target is a reorder for a card already there and a
+    /// transition for one arriving from elsewhere, and only the engine holds
+    /// the state that tells them apart. See the `boss-engine-board-gesture`
+    /// crate docs.
     ///
     /// `group` is `nil` when the drop landed on the column but not on one of
     /// its groups — the column's padding, or a column with no groups.

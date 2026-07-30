@@ -1453,9 +1453,9 @@ pub enum FrontendRequest {
     /// a transition depending on where the card already was — and the app,
     /// which sees only the layout, cannot tell the two apart. Concretely: an
     /// `in_review` row whose PR is in a merge queue renders in the Done
-    /// column's "Merging" group, so dragging it a few pixels within that
-    /// group used to be sent as `UpdateWorkItem { status: "done" }` and
-    /// silently completed an in-flight merge.
+    /// column's "Merging" group, so "dropped on Done" says nothing about
+    /// whether that row is finished. See the `boss-engine-board-gesture`
+    /// crate docs for the whole argument.
     ///
     /// The engine resolves the drop against the row's own derived board
     /// position and then applies at most one of: nothing (a reorder), a

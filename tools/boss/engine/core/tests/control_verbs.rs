@@ -34,7 +34,7 @@ use boss_engine::merge_poller::{
 use boss_engine::work::WorkDb;
 use boss_protocol::{
     BoardColumn, BoardDropTarget, BoardGroup, CreateChoreInput, CreateProductInput, CreateRunInput, ExecutionStatus,
-    FrontendEvent, FrontendRequest, RequestExecutionInput, TaskStatus, WorkItem, WorkItemPatch,
+    FrontendEvent, FrontendRequest, RequestExecutionInput, Task, TaskStatus, WorkItem, WorkItemPatch,
 };
 
 mod common;
@@ -114,6 +114,13 @@ async fn seed_execution(client: &mut BossClient) -> Result<SeededExecution> {
 }
 
 async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Result<TaskStatus> {
+    Ok(fetch_task(client, work_item_id).await?.status)
+}
+
+/// Re-read a task/chore row. Use over [`fetch_task_status`] when the
+/// assertion is about a field other than `status` — or about `status`
+/// *staying put* while another field moves.
+async fn fetch_task(client: &mut BossClient, work_item_id: &str) -> Result<Task> {
     let response = client
         .send_request(&FrontendRequest::GetWorkItem {
             id: work_item_id.to_owned(),
@@ -125,7 +132,7 @@ async fn fetch_task_status(client: &mut BossClient, work_item_id: &str) -> Resul
         }
         | FrontendEvent::WorkItemResult {
             item: WorkItem::Task(t),
-        } => Ok(t.status),
+        } => Ok(t),
         other => Err(anyhow!("unexpected GetWorkItem response: {other:?}")),
     }
 }
@@ -2815,6 +2822,92 @@ async fn board_drop_into_merging_group_is_refused() -> Result<()> {
         fetch_task_status(&mut client, &chore.id).await?,
         TaskStatus::Todo,
         "a refused drop must mutate nothing"
+    );
+    Ok(())
+}
+
+/// Doing → Backlog for a row that is queued to dispatch but has not started.
+/// This is the one drag whose *status* does not change: `todo` + `autostart`
+/// renders in Doing, plain `todo` renders in Backlog, so both columns map to
+/// `todo` and a status patch would be a no-op that snapped the card back.
+/// Clearing `autostart` is what parks it.
+///
+/// Covered here and not only at the resolver level because this branch
+/// changed layers: the drag used to send `update_work_item { autostart:
+/// false }` from the app, and now the engine derives it. The end-to-end
+/// assertion is that the patch actually lands on the row — resolver unit
+/// tests and the client's optimistic-column test can both pass while the
+/// verb writes nothing.
+#[tokio::test]
+async fn board_drop_from_doing_to_backlog_clears_autostart_on_a_dispatch_pending_row() -> Result<()> {
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+
+    let product = match client
+        .send_request(&FrontendRequest::CreateProduct {
+            input: CreateProductInput::builder()
+                .name("Boss")
+                .repo_remote_url("git@example.com:boss.git")
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Product(p),
+        } => p,
+        other => return Err(anyhow!("unexpected response to CreateProduct: {other:?}")),
+    };
+
+    // Created parked so no creation-time dispatch races the assertion, then
+    // armed — leaving exactly the `todo` + `autostart` shape that renders in
+    // Doing with no execution row.
+    let chore = match client
+        .send_request(&FrontendRequest::CreateChore {
+            input: CreateChoreInput::builder()
+                .product_id(product.id.clone())
+                .name("Queued to dispatch")
+                .autostart(false)
+                .build(),
+        })
+        .await?
+    {
+        FrontendEvent::WorkItemCreated {
+            item: WorkItem::Chore(t),
+        }
+        | FrontendEvent::WorkItemCreated {
+            item: WorkItem::Task(t),
+        } => t,
+        other => return Err(anyhow!("unexpected response to CreateChore: {other:?}")),
+    };
+    client
+        .send_request(&FrontendRequest::UpdateWorkItem {
+            id: chore.id.clone(),
+            patch: WorkItemPatch {
+                autostart: Some(true),
+                ..WorkItemPatch::default()
+            },
+        })
+        .await?;
+    let armed = fetch_task(&mut client, &chore.id).await?;
+    assert_eq!(armed.status, TaskStatus::Todo);
+    assert!(armed.autostart, "the row must be dispatch-pending to render in Doing");
+
+    client
+        .send_request(&FrontendRequest::MoveWorkItemOnBoard {
+            id: chore.id.clone(),
+            target: BoardDropTarget::new(BoardColumn::Backlog, None),
+        })
+        .await?;
+
+    let parked = fetch_task(&mut client, &chore.id).await?;
+    assert_eq!(
+        parked.status,
+        TaskStatus::Todo,
+        "both columns are `todo`; the drag must not invent a status change"
+    );
+    assert!(
+        !parked.autostart,
+        "Doing → Backlog must clear autostart, or the card snaps back to Doing"
     );
     Ok(())
 }

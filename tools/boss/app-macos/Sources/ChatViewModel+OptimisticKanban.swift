@@ -14,12 +14,9 @@ extension ChatViewModel {
     /// This does not compute a status, and deliberately so. Both board levels
     /// — column, and group within the Done column — are derived from engine
     /// state, so the same drop target means different things depending on
-    /// where the card already was. The client cannot resolve that without
-    /// re-implementing engine rules, and when it tried the result was a real
-    /// defect: a card in Done ▸ Merging is `in_review` (its PR is in a merge
-    /// queue), so the old `column.targetStatus != task.status` guard passed
-    /// and reordering the card inside its own group marked an in-flight merge
-    /// `done`. See `boss-engine-board-gesture` for the resolution matrix.
+    /// where the card already was, and the client sees only the layout. See
+    /// the `boss-engine-board-gesture` crate docs for the full argument and
+    /// the resolution matrix.
     ///
     /// `group` is `nil` when the drop landed on the column but not on one of
     /// its groups. That is strictly less intent than a group-qualified drop,

@@ -15,15 +15,13 @@
 //!
 //! # Why it lives in the engine
 //!
-//! Gesture reconciliation used to happen in the macOS app: the drop handler
-//! computed the target column's status and sent `update_work_item { status }`
-//! whenever that status differed from the row's. That is wrong for every row
-//! whose column does not determine its status, and the Done column's
-//! "Merging" group is exactly such a case — its rows are `in_review` (a PR in
-//! a merge queue or with Merge When Ready armed), so `in_review != done`
-//! passed the app's only guard and a reorder inside the group silently
-//! completed an in-flight merge. Deriving the position engine-side fixes the
-//! whole class, not that one group.
+//! A column does not determine its rows' statuses. Done holds both `done`
+//! rows and `in_review` rows whose PR is in a merge queue (or has Merge When
+//! Ready armed); Doing holds `active` rows and `todo` rows queued to
+//! dispatch; Review holds `in_review` rows and review-phase-`blocked` ones.
+//! So the target column alone cannot name a status, and the app — which sees
+//! only the layout — cannot supply the missing half. Resolving a drop
+//! requires the row's own derived position, which only the engine has.
 //!
 //! # The rule
 //!
@@ -145,8 +143,8 @@ pub enum DropResolution {
     /// gesture is expressed by clearing `autostart`, which is what moves the
     /// card to Backlog.
     ClearAutostart,
-    /// The drop names no meaningful gesture. Mutate nothing and tell the
-    /// operator why, rather than picking the nearest plausible transition.
+    /// The drop names no meaningful gesture. Mutate nothing and explain why,
+    /// rather than picking the nearest plausible transition.
     Refused { message: String },
 }
 
@@ -178,11 +176,22 @@ pub enum ReorderReason {
 /// 4. **Everything else** → the target position's status, except the one
 ///    case where the target's status equals the row's own
 ///    ([`DropResolution::ClearAutostart`]).
+///
+/// A group named for a column that has none is discarded before any of that
+/// runs: Done is the only column the board groups, so a group qualifier on
+/// any other column describes a target that does not exist. The wire is
+/// untrusted, and degrading such a target to an unqualified drop on the named
+/// column keeps every arm below reasoning about positions the board can
+/// actually render.
 pub fn resolve_drop(row: &BoardRow, target: BoardDropTarget) -> DropResolution {
     let current = row.position();
+    let target_group = match target.column {
+        BoardColumn::Done => target.group,
+        _ => None,
+    };
 
     if current.column == target.column {
-        match target.group {
+        match target_group {
             None => {
                 return DropResolution::Reorder {
                     reason: ReorderReason::SameColumnUnqualified,
@@ -197,7 +206,7 @@ pub fn resolve_drop(row: &BoardRow, target: BoardDropTarget) -> DropResolution {
         }
     }
 
-    if target.group == Some(BoardGroup::Merging) {
+    if target_group == Some(BoardGroup::Merging) {
         return DropResolution::Refused {
             message: "the Done column's \"Merging\" group is engine-owned: a card appears there \
                       once Boss observes its PR in a merge queue or with Merge When Ready armed. \
@@ -219,10 +228,14 @@ pub fn resolve_drop(row: &BoardRow, target: BoardDropTarget) -> DropResolution {
 
     let target_status = status_for_column(target.column);
     if target_status == row.status {
-        // The only way to reach this: Doing ⇄ Backlog for a `todo` +
-        // `autostart` row, where both columns map to `todo`. The card is
-        // visibly moving, so a bare no-op would look like a dropped gesture;
-        // clearing `autostart` is what actually parks it in Backlog.
+        // The only way to reach this: Doing → Backlog for a `todo` +
+        // `autostart` row, the one pair of columns that map to the same
+        // status. Every other row whose status matches its target column's
+        // is already in that column, so the reorder arm claimed it first —
+        // which is only true because a group named for a groupless column
+        // was discarded above rather than being allowed to skip that arm.
+        // The card is visibly moving, so a bare no-op would look like a
+        // dropped gesture; clearing `autostart` is what parks it in Backlog.
         return DropResolution::ClearAutostart;
     }
     DropResolution::SetStatus(target_status)
@@ -524,6 +537,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_group_named_for_a_groupless_column_is_ignored() {
+        // Only Done has groups, so these targets describe a position the
+        // board cannot render. The client never sends them, but the wire is
+        // untrusted: each must degrade to the unqualified drop it names,
+        // never slip past the reorder arm on a group mismatch.
+        let pending = BoardRow {
+            autostart: true,
+            ..row(TaskStatus::Todo)
+        };
+        for group in [BoardGroup::Merging, BoardGroup::Completed] {
+            assert!(
+                matches!(
+                    resolve_drop(&row(TaskStatus::Active), target(BoardColumn::Doing, Some(group))),
+                    DropResolution::Reorder { .. }
+                ),
+                "active row dropped on Doing/{} must stay a reorder",
+                group.as_str(),
+            );
+            assert!(
+                matches!(
+                    resolve_drop(&pending, target(BoardColumn::Backlog, Some(group))),
+                    DropResolution::ClearAutostart
+                ),
+                "the Backlog/{} target must resolve as the plain Backlog drop it is",
+                group.as_str(),
+            );
+            // Merging is refused only where it exists. Named against
+            // Review it is discarded, leaving an ordinary transition.
+            assert_eq!(
+                resolve_drop(&row(TaskStatus::Todo), target(BoardColumn::Review, Some(group))),
+                DropResolution::SetStatus(TaskStatus::InReview),
+            );
+        }
+    }
+
     // ── the whole matrix is total ───────────────────────────────────────
 
     #[test]
@@ -566,6 +615,19 @@ mod tests {
                             "{} dropped on {} should be a reorder, got {resolution:?}",
                             r.position().label(),
                             target(column, group).label(),
+                        );
+                    }
+                    // Done is the only column with groups, so in every other
+                    // one the qualifier carries no information and cannot
+                    // make a same-column drop mean anything. Without the
+                    // normalisation this is where a stray `ClearAutostart`
+                    // would show up, for a card that never moved.
+                    if r.position().column == column && column != BoardColumn::Done {
+                        assert!(
+                            matches!(resolution, DropResolution::Reorder { .. }),
+                            "{} dropped on its own column, qualified {group:?}, should be a \
+                             reorder — the group names nothing there — got {resolution:?}",
+                            r.position().label(),
                         );
                     }
                 }

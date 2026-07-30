@@ -35,14 +35,13 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
     /// where "put this row in that status" is exactly what the operator
     /// clicked.
     ///
-    /// Deliberately NOT used by the drag path. A drag reports its drop target
-    /// to the engine (`sendMoveWorkItemOnBoard`) and the engine resolves what
-    /// it meant, because a column does not determine its rows' statuses: Done
-    /// contains both `in_review` merges-in-flight and `done` rows, Doing
-    /// contains `active` and `todo`+autostart rows, and Review contains
-    /// `in_review` and review-phase-`blocked` rows. Mapping column → status at
-    /// the drop site is what made reordering a card inside Done ▸ Merging
-    /// silently mark it done.
+    /// Deliberately NOT used by the drag path: a column does not determine
+    /// its rows' statuses, so this mapping is only sound where the operator
+    /// named the status directly. A drag reports its drop target to the
+    /// engine (`sendMoveWorkItemOnBoard`) and the engine resolves what it
+    /// meant against the row's own board position — see the
+    /// `boss-engine-board-gesture` crate docs for why that is the only place
+    /// the question can be answered.
     var targetStatus: String {
         switch self {
         case .backlog:
@@ -301,6 +300,32 @@ struct WorkBoardSection: Identifiable {
     /// rollup). `nil` for every section except "Merging" while a tracked
     /// Trunk queue is non-`running`.
     var queueBannerText: String? = nil
+
+    /// The group a drop landing on this section should report to the engine:
+    /// [`groupKey`], except that a **collapsed** section reports `nil`.
+    ///
+    /// A collapsed section is a header row and nothing else — a thin strip
+    /// stacked directly beneath the section above it, whose cards are not on
+    /// screen. A drop there cannot mean "put this card among those": the user
+    /// cannot see what "those" are, and the strip is a few points tall
+    /// immediately below a full-height expanded section. Naming only the
+    /// column downgrades it to the same unqualified drop as a landing on the
+    /// column's padding, which the engine never reads as a transition for a
+    /// card already in that column.
+    ///
+    /// This narrows one specific accident — reordering inside Done ▸ Merging
+    /// while a collapsed completion group sits underneath it — without
+    /// disabling anything: an expanded completion group still carries its
+    /// key, so the deliberate Merging → completed drop still completes the
+    /// row. Non-collapsible sections are always visible and unaffected.
+    var dropGroupKey: WorkBoardGroupKey? {
+        guard isCollapsible else { return groupKey }
+        let expanded = WorkBoardSectionCollapse.isExpanded(
+            sectionID: id,
+            defaultExpanded: defaultExpanded
+        )
+        return expanded ? groupKey : nil
+    }
 }
 
 /// Swift mirror of `boss_protocol::short_name_for(url)` from the

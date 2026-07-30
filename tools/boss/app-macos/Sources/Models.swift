@@ -133,7 +133,7 @@ struct WorkTask: Identifiable, Hashable {
     /// `mergeQueueState == "auto_merge_enabled"` means GitHub will merge the
     /// PR *once it becomes mergeable*, not that it is mergeable now, so a
     /// card can legitimately show both "auto-merge armed" and
-    /// `prMergeableState == "conflicting"` simultaneously (T3271 / mono#2303).
+    /// `prMergeableState == "conflicting"` simultaneously (mono#2303).
     /// Mirrors `Task.pr_mergeable_state` on the wire.
     var prMergeableState: String? = nil
     /// Stable upstream pointer to the external tracker issue linked to this

@@ -1107,21 +1107,25 @@ struct ContentView: View {
                 workSectionItems(section.items, column: column)
             }
         }
-        // Group-qualified drop target. `section.groupKey` is non-nil only for
-        // sections that are real named groups (Done's "Merging" and its
-        // completion buckets); whole-column and project-rollup sections carry
-        // no status meaning, so they report `nil` and behave exactly like the
-        // column-level fallback above. Naming the group is what lets the
-        // engine tell a reorder inside Done ▸ Merging (a no-op) from a genuine
-        // Merging → completed transition (a completion), without either
-        // gesture having to be disabled.
+        // Group-qualified drop target. `section.dropGroupKey` is non-nil only
+        // for sections that are real named groups (Done's "Merging" and its
+        // completion buckets) *and* currently expanded; whole-column and
+        // project-rollup sections carry no status meaning, and a collapsed
+        // section shows no cards to aim between, so both report `nil` and
+        // behave exactly like the column-level fallback above. Naming the
+        // group is what lets the engine tell a reorder inside Done ▸ Merging
+        // (a no-op) from a genuine Merging → completed transition (a
+        // completion), without either gesture having to be disabled.
+        //
+        // Read inside the closure, not captured: the disclosure state can
+        // change between laying the section out and the drop landing on it.
         //
         // SwiftUI routes a drop to the innermost matching destination, so this
         // wins over the column's whenever the pointer is actually over a
         // section.
         .dropDestination(for: String.self) { items, _ in
             guard let taskID = items.first else { return false }
-            return model.attemptDrop(taskID, onColumn: column, group: section.groupKey)
+            return model.attemptDrop(taskID, onColumn: column, group: section.dropGroupKey)
         }
     }
 
