@@ -68,7 +68,7 @@ impl WorkerCompletionHandler {
             TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         };
         let decision = crate::automation_triage::resolve_triage_decision(
-            driver.as_deref().unwrap_or(&crate::driver::ClaudeDriver),
+            crate::driver_transcript::driver_or_default(driver.as_deref()),
             &self.structured_output_dir,
             &execution.id,
             final_message,
@@ -556,9 +556,7 @@ impl WorkerCompletionHandler {
                 match transcript.into_message() {
                     None => None,
                     Some(text) => {
-                        let candidates = driver
-                            .as_deref()
-                            .unwrap_or(&crate::driver::ClaudeDriver)
+                        let candidates = crate::driver_transcript::driver_or_default(driver.as_deref())
                             .structured_output_fallback(
                                 crate::structured_output::StructuredOutputKind::ReviewResult,
                                 &text,

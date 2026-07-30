@@ -245,9 +245,7 @@ impl WorkerCompletionHandler {
         let Some(text) = transcript.into_message() else {
             return false;
         };
-        let candidates = driver
-            .as_deref()
-            .unwrap_or(&crate::driver::ClaudeDriver)
+        let candidates = crate::driver_transcript::driver_or_default(driver.as_deref())
             .structured_output_fallback(crate::structured_output::StructuredOutputKind::PrUrl, &text);
         let staged = candidates
             .iter()

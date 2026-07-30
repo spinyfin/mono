@@ -455,4 +455,47 @@ mod tests {
             ProcessExitVerdict::Death,
         );
     }
+
+    /// A codex-attributed chore reviewed by a review-pool worker must be
+    /// classified as a persistent-driver exit, not a one-shot codex exit: the
+    /// reviewer pane is a Claude pane regardless of the reviewed row's own
+    /// driver. Before the pool-dispatch override, this run's exit would flip
+    /// to `OneTurnPerProcess` and skip the drain — silently orphaning the
+    /// review pane's unread progress stream. Pins the change to
+    /// `one_turn_per_process` alongside the driver-resolution tests in
+    /// `driver_transcript`.
+    #[tokio::test]
+    async fn a_review_pool_worker_over_a_codex_row_is_a_persistent_driver_exit() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "repo", "lease", "ws", "/tmp/ws")
+            .unwrap();
+        db.record_run_turn_boundary_for_execution(&execution.id, "2026-07-28T00:16:58Z")
+            .unwrap();
+
+        let drain = RecordingDrain::inert();
+        let verdict = classify_worker_process_exit(&db, Some(&drain), &execution.id).await;
+
+        assert_eq!(
+            drain.calls.load(Ordering::SeqCst),
+            0,
+            "a persistent-driver (reviewer-pane) exit must not pay for the drain",
+        );
+        assert_eq!(
+            verdict,
+            ProcessExitVerdict::Death,
+            "a review-pool worker's exit must be classified as a persistent-driver death, \
+             not exempted as a codex one-shot turn exit",
+        );
+    }
 }

@@ -419,6 +419,56 @@ async fn pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_cho
     );
 }
 
+/// The automation-triage counterpart of the pr_review test above.
+/// `finalize_automation_triage` always dispatches on the automation pool
+/// (`auto-worker-N`), which forces Claude regardless of what the automated
+/// row/product carries — but `automation_triage_fixture`'s execution's own
+/// `work_item_id` is the automation id, not a `tasks` row, so
+/// `get_execution_driver_slug`'s join never reaches it and the row-driver
+/// fallback resolves `None` today. The pool override makes this correct *by
+/// construction* rather than by that (fragile) coincidence: pin it here so a
+/// future change to the join or the pool prefixes can't silently change which
+/// parser reads a triage transcript.
+#[tokio::test]
+async fn automation_triage_recovers_claude_shaped_fallback_dispatched_on_the_automation_pool() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) =
+        automation_triage_fixture_dispatched_as(workspace.path(), "auto-worker-1");
+
+    // A non-Claude product default driver, so a regression that made the row
+    // side reachable (a widened join) would still resolve non-Claude without
+    // the pool override.
+    let product_id = db.get_automation(&automation_id).unwrap().unwrap().product_id;
+    db.update_work_item(
+        &product_id,
+        crate::work::WorkItemPatch {
+            default_driver: Some("codex".to_owned()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "automation: skip — nothing actionable found",
+    );
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(
+                outcome, AUTOMATION_OUTCOME_SKIPPED,
+                "the Claude-shaped skip marker must still be recovered on the automation pool",
+            );
+        }
+        other => panic!("expected AutomationTriage(skipped), got {other:?}"),
+    }
+}
+
 /// A `ReviewResult` with a HIGH severity finding must trigger the engine's
 /// severity gate and create a revision on the producing task with the
 /// correct `created_via` prefix and rendered instructions.

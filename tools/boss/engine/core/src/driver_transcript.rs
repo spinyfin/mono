@@ -77,13 +77,18 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
     }
 }
 
-/// [`driver_for_execution`], defaulting to [`crate::driver::ClaudeDriver`]
-/// when no driver resolves at all. The single documented home for the
-/// `driver.as_deref().unwrap_or(&ClaudeDriver)` fail-safe every Stop-boundary
-/// fallback site needs, instead of that idiom being spelled out at each call
-/// site.
-pub fn driver_for_execution_or_default(work_db: &WorkDb, execution_id: &str) -> Arc<dyn AgentDriver> {
-    driver_for_execution(work_db, execution_id).unwrap_or_else(|| Arc::new(crate::driver::ClaudeDriver))
+/// The `ClaudeDriver` fail-safe every Stop-boundary fallback site falls back
+/// to when its own driver resolution came up empty.
+static CLAUDE_FALLBACK: crate::driver::ClaudeDriver = crate::driver::ClaudeDriver;
+
+/// Defaults an already-resolved `Option<&dyn AgentDriver>` — the shape every
+/// Stop-boundary fallback site holds after calling [`driver_for_execution`] or
+/// the `read_final_triage_message_with_driver` helper those sites share — to
+/// [`crate::driver::ClaudeDriver`]. The single documented home for the
+/// `driver.as_deref().unwrap_or(&ClaudeDriver)` idiom, instead of that idiom
+/// being spelled out at each call site.
+pub fn driver_or_default(driver: Option<&dyn AgentDriver>) -> &dyn AgentDriver {
+    driver.unwrap_or(&CLAUDE_FALLBACK)
 }
 
 /// The driver slug that actually governed `execution_id`'s run: the pool's
@@ -315,6 +320,66 @@ mod tests {
         assert!(
             assistant_texts(&events).iter().any(|text| text.contains(marker)),
             "parse_execution_transcript must normalize through the execution's own driver",
+        );
+    }
+
+    /// A review-pool worker id (`review-N`) must override a codex-attributed
+    /// row's own driver: the reviewer pane is always a Claude pane regardless
+    /// of what the row under review carries. Mirrors
+    /// `worker_spawn::effective_task_driver_for_worker`'s precedence and pins
+    /// the same shape `completion/tests/t04.rs::
+    /// pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_chore`
+    /// exercises end-to-end, but in the module that actually owns the
+    /// precedence decision.
+    #[test]
+    fn pool_override_wins_over_a_codex_attributed_row_for_a_review_pool_worker() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+
+        let driver = driver_for_execution(&db, &execution.id).expect("claude driver must resolve");
+        assert_eq!(
+            driver.descriptor().name,
+            "claude",
+            "a review-pool worker id must override the row's own codex driver",
+        );
+    }
+
+    /// The main-pool counterpart of the above: a `worker-N` agent id is not a
+    /// pool-dispatch override, so the row's own codex driver must still win.
+    #[test]
+    fn main_pool_worker_falls_through_to_the_row_driver() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+
+        let driver = driver_for_execution(&db, &execution.id).expect("codex driver must resolve");
+        assert_eq!(
+            driver.descriptor().name,
+            "codex",
+            "a main-pool worker id must not override the row's own driver",
         );
     }
 

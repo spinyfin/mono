@@ -363,7 +363,7 @@ pub async fn reconcile_task_followups(
             let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id);
             let assistant_text = extract_assistant_text(driver.as_deref(), &jsonl);
             followups_from_driver_fallback(
-                driver.as_deref().unwrap_or(&crate::driver::ClaudeDriver),
+                crate::driver_transcript::driver_or_default(driver.as_deref()),
                 &assistant_text,
                 execution_id,
             )
@@ -791,12 +791,16 @@ pub async fn extract_followups_backstop(
         }
     };
 
-    // Intentional exception to driver-aware parsing: this backstop only ever
-    // feeds a lossy tail of prose to a Claude utility-model extractor, never
-    // scans for a driver-specific marker, so an un-normalized parse is
-    // sufficient here and the driver lookup is not worth the extra DB round
-    // trip on this best-effort path.
-    let assistant_text = extract_assistant_text(None, &jsonl);
+    // The transcript must be normalized through the run's own driver: an
+    // un-normalized parse of a non-Claude rollout yields zero assistant turns
+    // (see `driver_transcript::codex_rollout_yields_no_assistant_text_without_driver_normalization`),
+    // which would make this backstop silently inert for every codex/grok run.
+    // The lookup costs a SQLite round trip, dwarfed by the utility-model API
+    // call this function goes on to make. The Claude pinning that's actually
+    // intentional lives one level down, in `followups_from_driver_fallback`'s
+    // parse of the utility model's own (always Claude-shaped) answer.
+    let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id);
+    let assistant_text = extract_assistant_text(driver.as_deref(), &jsonl);
     if assistant_text.is_empty() {
         return None;
     }

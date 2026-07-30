@@ -535,6 +535,17 @@ fn answer_agent_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String,
 /// `finalize_automation_triage` (called from `on_stop`) expects to find.
 /// Returns `(db, automation_id, execution_id)`.
 fn automation_triage_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, String, String) {
+    automation_triage_fixture_dispatched_as(workspace_path, "worker-1")
+}
+
+/// Like [`automation_triage_fixture`], but lets the caller pick the run's
+/// `agent_id` — so a test can dispatch the triage run on the automation pool
+/// (`auto-worker-N`) instead of the main pool, to exercise
+/// `driver_transcript`'s pool-dispatch override for `finalize_automation_triage`.
+fn automation_triage_fixture_dispatched_as(
+    workspace_path: &Path,
+    worker_id: &str,
+) -> (TempDir, Arc<WorkDb>, String, String) {
     let dir = tempdir().unwrap();
     let path = dir.path().join("boss.db");
     let db = Arc::new(WorkDb::open(path).unwrap());
@@ -561,7 +572,7 @@ fn automation_triage_fixture(workspace_path: &Path) -> (TempDir, Arc<WorkDb>, St
     let (execution, run) = db
         .start_execution_run(
             &execution.id,
-            "worker-1",
+            worker_id,
             "mono",
             "lease-1",
             "mono-agent-001",
