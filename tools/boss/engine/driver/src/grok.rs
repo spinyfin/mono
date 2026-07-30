@@ -526,12 +526,7 @@ impl AgentDriver for GrokDriver {
         if tool_name != "Bash" {
             return None;
         }
-        let command = tool_input
-            .get("command")
-            .and_then(Value::as_str)
-            .or_else(|| tool_input.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let command = crate::command_from_tool_input(tool_input);
         Some(PrUrlCaptureFeed {
             output_text: grok_bash_output_text(tool_response),
             command,
@@ -735,12 +730,26 @@ impl AgentDriver for GrokDriver {
 /// Prefers `output_for_prompt` — the `exit: N\n`-prefixed combined-output
 /// string observed on the wire, the same text Grok's own prompt rendering
 /// uses, so a PR URL printed by `gh pr create` / `cube pr create` lands in
-/// it exactly as it would in a Claude `stdout` field. Falls back to a lossy
-/// UTF-8 decode of the raw `output` byte array on the chance a future
-/// toolResult shape omits `output_for_prompt`, so this never regresses to
-/// silently scanning nothing.
+/// it exactly as it would in a Claude `stdout` field. A present-but-empty
+/// `output_for_prompt` is treated as absent so a genuinely empty capture
+/// still tries the byte fallback rather than short-circuiting on `""`.
+/// Falls back to a lossy UTF-8 decode of the raw `output` byte array on the
+/// chance a future toolResult shape omits `output_for_prompt`, so this never
+/// regresses to silently scanning nothing. A bare-string `tool_response` is
+/// handled first, mirroring [`crate::default_pr_url_capture_feed`]'s own
+/// bare-string arm, so a future Grok ingress that ever delivers free text
+/// instead of an object still degrades gracefully instead of going dark.
 fn grok_bash_output_text(tool_response: &Value) -> String {
-    if let Some(text) = tool_response.get("output_for_prompt").and_then(Value::as_str) {
+    if let Some(text) = tool_response.as_str() {
+        // Degrade the same way the default does if a future Grok ingress
+        // ever delivers tool_response as free text instead of an object.
+        return text.to_owned();
+    }
+    if let Some(text) = tool_response
+        .get("output_for_prompt")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
         return text.to_owned();
     }
     let Some(bytes) = tool_response.get("output").and_then(Value::as_array) else {
@@ -940,6 +949,50 @@ mod tests {
         let url = boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).expect("url");
         assert_eq!(url, "https://github.com/spinyfin/mono/pull/458");
         assert_eq!(feed.command, "cube pr create --branch boss/exec_x --title t");
+    }
+
+    #[test]
+    fn pr_url_capture_feed_end_to_end_from_raw_hook_payload() {
+        // Regression for the T-19 acceptance criterion end to end: wire
+        // payload (toolName "run_terminal_command") -> normalize_progress_event
+        // -> pr_url_capture_feed -> find_first_pr_url. The other
+        // pr_url_capture_feed tests hand-build already-canonicalised "Bash"
+        // inputs, and post_tool_use_run_terminal_command_preserves_bash_shaped_tool_result_verbatim
+        // (grok/progress.rs) covers the toolName -> "Bash" rename alone —
+        // neither exercises the full chain the acceptance criterion depends
+        // on, so this test fails if either half regresses.
+        let raw = json!({
+            "hookEventName": "post_tool_use",
+            "sessionId": "0c4c0914-5e64-432c-90fa-dcdad9ff5957",
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "cube pr create --branch boss/exec_x --title t"},
+            "toolResult": {
+                "type": "Bash",
+                "output": [],
+                "output_for_prompt": "exit: 0\nhttps://github.com/spinyfin/mono/pull/458\n",
+                "exit_code": 0,
+                "truncated": false,
+            },
+        });
+
+        let event = GrokProgressSession::new()
+            .normalize_progress_event(&raw)
+            .expect("normalizes");
+        let WorkerEvent::PostToolUse {
+            tool_name,
+            tool_input,
+            tool_response,
+            ..
+        } = event
+        else {
+            panic!("expected PostToolUse, got {event:?}");
+        };
+
+        let feed = GrokDriver::default()
+            .pr_url_capture_feed(&tool_name, &tool_input, &tool_response)
+            .expect("Grok Bash observation must yield a feed");
+        let url = boss_engine_structured_output::pr_url::find_first_pr_url(&feed.output_text).expect("url");
+        assert_eq!(url, "https://github.com/spinyfin/mono/pull/458");
     }
 
     #[test]

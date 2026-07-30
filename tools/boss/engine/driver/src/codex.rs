@@ -1442,12 +1442,7 @@ impl AgentDriver for CodexDriver {
         if tool_name != "Bash" {
             return None;
         }
-        let command = tool_input
-            .get("command")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| tool_input.as_str())
-            .unwrap_or("")
-            .to_owned();
+        let command = crate::command_from_tool_input(tool_input);
         Some(PrUrlCaptureFeed {
             // Rollout tool completion is
             // `response_item.payload.output`, observed as either a string
