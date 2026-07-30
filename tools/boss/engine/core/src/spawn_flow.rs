@@ -77,6 +77,38 @@ const WORKER_EXTRA_ENV_ALLOWLIST: &[&str] = &[
 /// forgotten `-m` into a fast, recoverable error.
 const WORKER_EDITOR_NOOP: &str = "false";
 
+/// Value forced into `XAI_API_KEY` for every worker pane, same belt-and-
+/// suspenders rationale as `WORKER_EDITOR_NOOP` above: a caller-side
+/// precheck (`grok::home::provision_grok_home`) already refuses to spawn
+/// the driver's own Grok pane when the real `GROK_HOME/auth.json` is
+/// missing, but that guard only covers the one path that calls it. Any
+/// other Grok invocation inside a worker pane — an ad hoc `grok agent
+/// leader ...` a worker runs directly via Bash, a probe script, a future
+/// driver path — inherits no such precheck, and the bundled Grok CLI's
+/// own default behavior on a missing/expired session token is to
+/// proactively call its `authenticate` extension method and escalate
+/// through device-code/browser OAuth (confirmed live: `xai_grok_pager`
+/// logs `auto-triggering login at startup` and, when the account's
+/// device-flow endpoint is unavailable, falls through to loopback OAuth,
+/// which shells out to open a real browser window — the incident this
+/// guards against).
+///
+/// Per Grok's own documented auth precedence
+/// (`~/.grok/docs/user-guide/02-authentication.md#auth-precedence`), an
+/// active session token always wins over `XAI_API_KEY`, so a real,
+/// already-provisioned `GROK_HOME/auth.json` is unaffected by this and
+/// nothing changes for a correctly-provisioned Grok pane. Only when no
+/// session token is available does Grok fall back to `XAI_API_KEY` —
+/// and forcing that fallback to an intentionally-invalid value makes the
+/// missing-credential case fail loudly and immediately (a 400 from
+/// `api.x.ai`: "Incorrect API key provided") instead of escalating to an
+/// interactive browser flow. Verified empirically: with no `auth.json`
+/// present, the real pane invocation shape returns this exact API error
+/// in under a second and never calls the platform's URL-open command,
+/// versus opening a browser (or hanging on a device-code prompt) with
+/// this var absent.
+const WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH: &str = "xai-boss-worker-no-interactive-auth-fallback";
+
 // No `Debug` derive: `Arc<dyn AgentDriver>` is not `Debug`, and nothing
 // logs or asserts on a full `StartWorkerInput` dump.
 #[derive(Clone, bon::Builder)]
@@ -349,6 +381,10 @@ pub async fn start_worker<S: WorkerSpawner + ?Sized>(
         EnvVar {
             key: "JJ_EDITOR".into(),
             value: WORKER_EDITOR_NOOP.into(),
+        },
+        EnvVar {
+            key: "XAI_API_KEY".into(),
+            value: WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH.into(),
         },
     ];
     for (k, v) in input.extra_env {
@@ -1259,6 +1295,58 @@ mod tests {
                 "{key} should be forced to {WORKER_EDITOR_NOOP}, got {value}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn env_forces_xai_api_key_to_block_interactive_grok_auth() {
+        // Belt-and-suspenders against the "unsolicited browser auth"
+        // incident: every worker pane gets a deliberately-invalid
+        // XAI_API_KEY so any Grok invocation inside the pane — not just
+        // the driver's own precheck-guarded spawn — fails loudly on a
+        // missing/expired session token instead of falling through to
+        // interactive device-code/browser OAuth. A real, already
+        // provisioned GROK_HOME/auth.json still wins (Grok's documented
+        // auth precedence puts an active session token ahead of
+        // XAI_API_KEY), so this changes nothing for a correctly
+        // provisioned Grok pane.
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        start_worker(&spawner, sample_input(&workspace), StdDuration::from_secs(1))
+            .await
+            .unwrap();
+
+        let env = spawner.last_spawn_env();
+        assert_eq!(
+            env.iter().find(|(k, _)| k == "XAI_API_KEY").map(|(_, v)| v.as_str()),
+            Some(WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH),
+        );
+    }
+
+    #[tokio::test]
+    async fn xai_api_key_cannot_be_overridden_via_extra_env() {
+        // XAI_API_KEY is not on WORKER_EXTRA_ENV_ALLOWLIST, so a caller
+        // cannot smuggle a different value in through extra_env and
+        // reintroduce the interactive-auth fallback path.
+        let workspace = TempDir::new().unwrap();
+        let spawner = ok_spawner_capturing();
+
+        let mut input = sample_input(&workspace);
+        input.extra_env = vec![("XAI_API_KEY".into(), "xai-real-looking-key".into())];
+
+        start_worker(&spawner, input, StdDuration::from_secs(1)).await.unwrap();
+
+        let env = spawner.last_spawn_env();
+        let values: Vec<&str> = env
+            .iter()
+            .filter(|(k, _)| k == "XAI_API_KEY")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            values,
+            vec![WORKER_XAI_API_KEY_NO_INTERACTIVE_AUTH],
+            "extra_env must not be able to override the safety-net XAI_API_KEY",
+        );
     }
 
     #[tokio::test]
