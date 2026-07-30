@@ -22,11 +22,12 @@
 use boss_protocol::{StopReason, WorkerEvent};
 
 use crate::conformance::fixtures::{
-    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, codex_shaped_driver, decode_jsonl,
+    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, GROK_HOOK_SESSION_JSONL,
+    codex_shaped_driver, decode_jsonl,
 };
 use boss_protocol::WorkerActivity;
 
-use crate::driver::{AgentDriver, ClaudeDriver, TurnEnd};
+use crate::driver::{AgentDriver, ClaudeDriver, GrokDriver, TurnEnd};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 
 fn last_turn_end(driver: &dyn AgentDriver, jsonl: &str) -> TurnEnd {
@@ -61,13 +62,37 @@ fn hook_stop_and_native_turn_completed_produce_identical_turn_end() {
 }
 
 #[test]
+fn hook_stop_and_grok_stop_produce_identical_turn_end() {
+    // Grok's Stop hook is structurally identical to Claude's (design G-7):
+    // `stopHookActive` canonicalises to `stop_hook_active` / `continuation`.
+    let from_claude_hooks = last_turn_end(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL);
+    let from_grok_hooks = last_turn_end(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL);
+
+    assert_eq!(
+        from_claude_hooks,
+        TurnEnd {
+            session_id: CANONICAL_SESSION_ID.to_owned(),
+            reason: StopReason::Completed,
+            continuation: false,
+        },
+    );
+    assert_eq!(
+        from_claude_hooks, from_grok_hooks,
+        "TurnEnd from Claude's hook Stop and Grok's hook Stop must be identical",
+    );
+}
+
+#[test]
 fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
-    // Claim 2: apply_event is fed WorkerEvents (not TurnEnd). Both transports'
-    // decoded sequences leave the live-worker slot Idle after the turn.
+    // Claim 2: apply_event is fed WorkerEvents (not TurnEnd). Every
+    // transport's decoded sequence leaves the live-worker slot Idle after
+    // the turn.
     let codex = codex_shaped_driver();
-    let cases: [(&str, &dyn AgentDriver, &str); 2] = [
-        ("hook", &ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL),
-        ("stdout-jsonl", &codex, CODEX_STDOUT_SESSION_JSONL),
+    let grok = GrokDriver::default();
+    let cases: [(&str, &dyn AgentDriver, &str); 3] = [
+        ("hook-claude", &ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL),
+        ("stdout-jsonl-codex", &codex, CODEX_STDOUT_SESSION_JSONL),
+        ("hook-grok", &grok, GROK_HOOK_SESSION_JSONL),
     ];
     for (label, driver, jsonl) in cases {
         let reg = LiveWorkerStateRegistry::new();
@@ -103,7 +128,7 @@ fn decoded_event_sequence_drives_activity_machine_to_idle_from_either_source() {
 }
 
 #[test]
-fn only_stop_shaped_events_are_turn_boundaries_on_either_driver() {
+fn only_stop_shaped_events_are_turn_boundaries_on_any_driver() {
     let mid_turn = [
         WorkerEvent::SessionStart {
             session_id: CANONICAL_SESSION_ID.to_owned(),
@@ -142,6 +167,10 @@ fn only_stop_shaped_events_are_turn_boundaries_on_either_driver() {
         assert!(
             codex_shaped_driver().turn_boundary(event).is_none(),
             "Codex-shaped must not treat {event:?} as a turn boundary",
+        );
+        assert!(
+            GrokDriver::default().turn_boundary(event).is_none(),
+            "Grok must not treat {event:?} as a turn boundary",
         );
     }
 }

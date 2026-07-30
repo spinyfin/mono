@@ -102,6 +102,37 @@ pub const CODEX_STDOUT_SESSION_JSONL: &str = concat!(
     "\n",
 );
 
+/// Grok-hook ingress for the same logical session, in Grok's native
+/// camelCase payload dialect (design §"Payload shape" /
+/// `tools/boss/engine/driver/src/grok/progress.rs`).
+///
+/// Grok's hook payload is fully self-describing per invocation (own
+/// `sessionId`, own `hookEventName`) — one JSON object per hook firing, the
+/// same "one line per event" shape [`decode_jsonl`] already assumes for
+/// Claude. Field values are chosen so canonicalisation
+/// (`grok/progress.rs::canonicalize`) and the shared
+/// [`boss_protocol::normalize_hook_event`] produce exactly
+/// [`expected_session_events`] after [`normalize_session_id`]:
+/// `toolName: "run_terminal_command"` maps to Claude's `"Bash"`
+/// (`grok/progress.rs::TOOL_NAME_MAP`), and `toolResult` carries the same
+/// plain output string Claude's `tool_response` does (a real Grok
+/// `run_terminal_command` result is a richer `{"type":"Bash",...}` object —
+/// see `GrokDriver::pr_url_capture_feed` — but ingress equivalence here is
+/// about the canonicalisation/mapping shape, not the tool's own result
+/// schema).
+pub const GROK_HOOK_SESSION_JSONL: &str = concat!(
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"session_start","model":"grok-4.5","permissionMode":"bypassPermissions","source":"startup"}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"user_prompt_submit","prompt":""}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"pre_tool_use","toolName":"run_terminal_command","toolUseId":"call_fixture","toolInput":{"command":"echo hooktest-exec"}}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"post_tool_use","toolName":"run_terminal_command","toolUseId":"call_fixture","toolInput":{"command":"echo hooktest-exec"},"toolResult":"hooktest-exec\n"}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"stop","promptId":"call_fixture","stopHookActive":false,"lastAssistantMessage":"hooktest-exec"}"#,
+    "\n",
+);
+
 /// Expected activity-machine event sequence for both fixture sides.
 pub fn expected_session_events() -> Vec<WorkerEvent> {
     vec![

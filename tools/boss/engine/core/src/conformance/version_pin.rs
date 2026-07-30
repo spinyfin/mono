@@ -27,7 +27,8 @@ use crate::conformance::fixtures::{
     CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_exec_spawn_contract,
     codex_shaped_driver, decode_jsonl,
 };
-use crate::driver::AgentDriver;
+use crate::driver::grok::PINNED_GROK_VERSION;
+use crate::driver::{AgentDriver, GrokDriver};
 
 /// Parse `codex-cli X.Y.Z` (or `codex X.Y.Z`) stdout from `codex --version`.
 fn parse_codex_version(stdout: &str) -> Option<String> {
@@ -387,5 +388,170 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
     assert!(
         matches!(err, boss_protocol::NormalizeError::UnknownEvent(_)),
         "got {err:?}",
+    );
+}
+
+// ─── Grok live-CLI version + posture pin ────────────────────────────────────
+//
+// Mirrors the Codex convention above: soft-skip when `grok` is not on PATH,
+// or when a live invocation exits non-zero for any reason (including "not
+// logged in" — `grok models` and `grok inspect --json` both require auth,
+// per the pane-viability spike's Q1/Q9, and a bare CI image has neither the
+// binary nor a login). Set `BOSS_REQUIRE_GROK_CLI=1` to require the binary
+// and a successful invocation, failing instead of skipping — use this on
+// hosts that claim the live Grok pin (dev machines re-running the
+// pane-viability spike / re-capturing fixtures).
+//
+// The hidden `--trust` flag (design D-3: absent from `--help`) and the
+// `grok models` menu are asserted here rather than folded into a `--help`
+// text diff: a `--help` diff would never notice `--trust`'s removal (it was
+// never listed there), and losing it silently hangs every worker on the
+// folder-trust dialog (spike Q3). A `grok models` menu that grows a second
+// SKU must fail this pin loudly, not get silently absorbed as a stale
+// default (`GROK_DESCRIPTOR`'s model menu, `model_menu.rs`, still hard-codes
+// the single `grok-4.5` SKU).
+
+fn require_grok_cli() -> bool {
+    match std::env::var("BOSS_REQUIRE_GROK_CLI") {
+        Ok(v) => {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Run `grok` with `args`; soft-skip (return `None`) on spawn failure or a
+/// non-zero exit unless `BOSS_REQUIRE_GROK_CLI` is set — same convention as
+/// [`installed_codex_matches_pinned_version_when_present`]'s
+/// `BOSS_REQUIRE_CODEX_CLI`.
+fn run_live_grok(args: &[&str]) -> Option<std::process::Output> {
+    let require = require_grok_cli();
+    let joined = args.join(" ");
+    match Command::new("grok").args(args).output() {
+        Ok(o) if o.status.success() => Some(o),
+        Ok(o) => {
+            if require {
+                panic!(
+                    "BOSS_REQUIRE_GROK_CLI is set but `grok {joined}` failed (status {}): \
+                     stdout={} stderr={}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr),
+                );
+            }
+            eprintln!(
+                "`grok {joined}` failed (status {}); skipping live check \
+                 (set BOSS_REQUIRE_GROK_CLI=1 to require it)",
+                o.status,
+            );
+            None
+        }
+        Err(err) => {
+            if require {
+                panic!("BOSS_REQUIRE_GROK_CLI is set but grok is not on PATH: {err}");
+            }
+            eprintln!(
+                "grok not on PATH ({err}); skipping live `grok {joined}` check \
+                 (set BOSS_REQUIRE_GROK_CLI=1 to require it)"
+            );
+            None
+        }
+    }
+}
+
+#[test]
+fn pinned_grok_version_constant_is_semver_shaped() {
+    let parts: Vec<_> = PINNED_GROK_VERSION.split('.').collect();
+    assert!(
+        parts.len() >= 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
+        "PINNED_GROK_VERSION must be X.Y.Z, got {PINNED_GROK_VERSION}",
+    );
+}
+
+#[test]
+fn installed_grok_matches_pinned_version_when_present() {
+    // `grok inspect --json` reports the version and the resolved config in
+    // one call — the design's stated source, rather than a separate
+    // `--version` parse.
+    let Some(output) = run_live_grok(&["inspect", "--json"]) else {
+        return;
+    };
+    let inspect: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "parsing `grok inspect --json` stdout ({e}): {}",
+            String::from_utf8_lossy(&output.stdout)
+        )
+    });
+    let version = inspect.get("grokVersion").and_then(|v| v.as_str()).unwrap_or("");
+    assert!(
+        version.starts_with(PINNED_GROK_VERSION),
+        "installed grok reports grokVersion={version:?}, but the conformance harness is pinned \
+         to {PINNED_GROK_VERSION}. Re-run the pane-viability spike, update fixtures, and bump \
+         PINNED_GROK_VERSION deliberately — do not silently absorb drift.",
+    );
+}
+
+#[test]
+fn hidden_trust_flag_still_parses_on_installed_grok() {
+    // `--trust` is deliberately absent from `--help` output (design D-3), so
+    // a `--help` text diff would never notice its removal. Combine it with
+    // `--help`: argument parsing must accept every flag as known before the
+    // `--help` action fires, so an unrecognised `--trust` fails the whole
+    // invocation regardless of where `--help` sits on the command line —
+    // this catches the removal a `--help` diff cannot.
+    let Some(output) = run_live_grok(&["--trust", "--help"]) else {
+        return;
+    };
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_lowercase();
+    assert!(
+        !combined.contains("unrecognized")
+            && !combined.contains("unexpected argument")
+            && !combined.contains("unknown flag"),
+        "`grok --trust --help` must still accept the hidden --trust flag; a worker spawn that \
+         loses it hangs on the folder-trust dialog (spike Q3). got: {combined}",
+    );
+}
+
+#[test]
+fn grok_models_menu_matches_pinned_descriptor() {
+    let Some(output) = run_live_grok(&["models"]) else {
+        return;
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let default_model = stdout
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Default model:"))
+        .map(str::trim)
+        .unwrap_or_else(|| panic!("`grok models` stdout must contain a \"Default model:\" line; got {stdout:?}"));
+    let available: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| {
+            let trimmed = l.trim();
+            let rest = trimmed.strip_prefix('*').or_else(|| trimmed.strip_prefix('-'))?;
+            let rest = rest.trim();
+            Some(rest.strip_suffix(" (default)").unwrap_or(rest))
+        })
+        .collect();
+
+    let driver = GrokDriver::default();
+    let expected_default = driver.descriptor().model_menu.engine_default;
+    assert_eq!(
+        default_model, expected_default,
+        "`grok models` default must match the pinned descriptor's engine_default; \
+         got stdout={stdout:?}",
+    );
+    assert_eq!(
+        available,
+        vec![expected_default],
+        "`grok models` must still advertise exactly the pinned single-SKU menu \
+         ({expected_default:?}); a second model appearing here means GROK_DESCRIPTOR's model \
+         menu (model_menu.rs) is stale — update it deliberately (design A-11 / T-20) rather than \
+         letting a new SKU silently become the wrong default. got stdout={stdout:?}",
     );
 }
