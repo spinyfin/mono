@@ -20,6 +20,19 @@
 //! Deliberately NOT here: any way to suppress the above. There is no `--quiet`
 //! and nothing is routed to a channel a caller can drop. If the stream is
 //! damaged, every consumer of this output learns about it.
+//!
+//! **Both evidence streams, not just one.** `dispatch diagnose` derives
+//! findings from two files: the dispatch JSONL *and* `engine-trace.jsonl` (SIG-4b
+//! / SIG-5 / SIG-5c / SIG-G read only the latter). A clean dispatch stream over a
+//! torn trace is exactly the same defect as the reverse — the report looks
+//! complete while evidence was dropped, and a trace-only signature that never
+//! fired is indistinguishable from one that had nothing to match. So
+//! [`IntegrityReport`] carries the engine-trace scan's damage too, including the
+//! case where the whole scan failed, and every surface above accounts for it:
+//! [`IntegrityReport::is_intact`] is false, the banner and footer name it, the
+//! `--json` block reports it under `trace_integrity`, and lost trace records
+//! drive the same [`EXIT_UNRECOVERED_RECORDS`] exit status. There is no stderr
+//! warning path left for a dropped evidence source to hide in.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -29,12 +42,24 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use boss_engine::dispatch_reader::{DamageShape, DamagedLine};
 use serde_json::{Value, json};
 
-/// Exit code when a command read a dispatch stream from which records were
+/// Exit code when a command read an evidence stream from which records were
 /// genuinely lost (not merely concatenated and recovered).
 ///
 /// Distinct from `1`, which means the command itself failed: the report was
 /// produced and is usable, it just cannot be treated as complete. Automated
 /// callers that only inspect the exit status still cannot miss it.
+///
+/// **Scope is "this report", not "this id".** The status latches on any file the
+/// command read, which for `dispatch diagnose <id>` includes the fleet-wide
+/// `current.jsonl` and the engine-trace segments — so it can fire for damage
+/// that is not attributable to `<id>`. That is intentional and it is the same
+/// claim the banner makes: the *report* is incomplete, because the command
+/// derived cross-execution findings (SIG-2 recurrence, the trace signatures)
+/// from those shared files. Per-execution attribution is a separate, finer
+/// question and lives elsewhere: `timelines.<id>.complete` in `--json`, the
+/// in-timeline markers, and the per-execution rule that decides whether an
+/// absence-based finding gets [`ABSENCE_CAVEAT`]. A script that wants "is
+/// `<id>`'s own timeline complete" must read that field, not this exit code.
 pub const EXIT_UNRECOVERED_RECORDS: u8 = 3;
 
 /// Set when any command in this process read a stream with unrecoverable
@@ -63,6 +88,63 @@ pub fn exit_code() -> ExitCode {
 #[derive(Debug, Clone, Default)]
 pub struct IntegrityReport {
     damage: Vec<DamagedLine>,
+    trace: TraceIntegrity,
+}
+
+/// Integrity of the engine-trace scan, kept beside the dispatch-stream damage
+/// rather than pooled into it.
+///
+/// Separate because the two answer different questions. Dispatch damage is
+/// time-bracketed and attributable to an execution's timeline, so it can
+/// qualify one finding and leave another alone. Trace damage is neither: the
+/// segments are fleet-wide and their `timestamp` is an RFC3339 string this
+/// binary has no clock library to convert, so there is no epoch-millisecond
+/// window to test a finding against. It therefore qualifies the findings that
+/// were *derived from the trace* and nothing else — which is more useful than
+/// pooling it would be, and more honest than dropping it.
+#[derive(Debug, Clone, Default)]
+pub struct TraceIntegrity {
+    /// Torn engine-trace lines, with whatever was salvaged from them.
+    pub damage: Vec<DamagedLine>,
+    /// Set when the scan could not be completed at all (an unreadable segment).
+    /// This used to be an `eprintln!` the caller carried on past — the loudest
+    /// possible way to lose a whole evidence source quietly.
+    pub scan_error: Option<String>,
+}
+
+impl TraceIntegrity {
+    pub fn is_intact(&self) -> bool {
+        self.damage.is_empty() && self.scan_error.is_none()
+    }
+
+    /// Damaged trace lines from which at least one record is definitively gone.
+    pub fn lost_lines(&self) -> impl Iterator<Item = &DamagedLine> {
+        self.damage.iter().filter(|line| line.shape.lost_records())
+    }
+
+    pub fn recovered_records(&self) -> usize {
+        self.damage.iter().map(|line| line.recovered).sum()
+    }
+
+    /// True when trace evidence is missing — records lost, or the scan failed.
+    /// A concatenated-but-fully-recovered trace line does not degrade evidence,
+    /// so it does not count here (it is still reported).
+    pub fn evidence_degraded(&self) -> bool {
+        self.scan_error.is_some() || self.lost_lines().next().is_some()
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({
+            "intact": self.is_intact(),
+            "scan_failed": self.scan_error.is_some(),
+            "scan_error": self.scan_error.clone().map(Value::String).unwrap_or(Value::Null),
+            "unreadable_lines": self.damage.len(),
+            "recovered_records": self.recovered_records(),
+            "lines_with_lost_records": self.lost_lines().count(),
+            "evidence_degraded": self.evidence_degraded(),
+            "lines": self.damage,
+        })
+    }
 }
 
 impl IntegrityReport {
@@ -75,14 +157,44 @@ impl IntegrityReport {
             }
         }
         out.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.line_number.cmp(&b.line_number)));
-        let report = Self { damage: out };
-        if report.lost_lines().next().is_some() {
-            LOST_RECORDS_SEEN.store(true, Ordering::Relaxed);
-        }
+        let report = Self {
+            damage: out,
+            trace: TraceIntegrity::default(),
+        };
+        report.latch_lost_records();
         report
     }
 
+    /// Attach the engine-trace scan's integrity, so every surface on this type
+    /// covers both evidence streams.
+    pub fn with_trace(mut self, trace: TraceIntegrity) -> Self {
+        self.trace = trace;
+        self.latch_lost_records();
+        self
+    }
+
+    pub fn trace(&self) -> &TraceIntegrity {
+        &self.trace
+    }
+
+    fn latch_lost_records(&self) {
+        if self.lost_lines().next().is_some() || self.trace.evidence_degraded() {
+            LOST_RECORDS_SEEN.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// True when every line of every evidence stream this report covers was read
+    /// cleanly. False for engine-trace damage as well as dispatch damage — the
+    /// callers that gate a caveat on this (`render_findings`'s "no matches",
+    /// `NO_EVENTS_CAVEAT`, the banner) are making a claim about the whole report.
     pub fn is_intact(&self) -> bool {
+        self.damage.is_empty() && self.trace.is_intact()
+    }
+
+    /// True when the *dispatch* stream specifically was read cleanly, ignoring
+    /// the trace. For the few places that are talking about the timeline rather
+    /// than the report.
+    pub fn dispatch_stream_is_intact(&self) -> bool {
         self.damage.is_empty()
     }
 
@@ -144,28 +256,57 @@ impl IntegrityReport {
             out,
             "!! ── STREAM INTEGRITY ─────────────────────────────────────────────"
         );
-        let _ = writeln!(
-            out,
-            "!! {} unreadable line(s) in the dispatch stream; {} record(s) recovered, {} line(s) UNRECOVERABLE",
-            self.damage.len(),
-            self.recovered_records(),
-            lost,
-        );
+        if !self.damage.is_empty() {
+            let _ = writeln!(
+                out,
+                "!! {} unreadable line(s) in the dispatch stream; {} record(s) recovered, {} line(s) UNRECOVERABLE",
+                self.damage.len(),
+                self.recovered_records(),
+                lost,
+            );
+        }
+        if let Some(err) = &self.trace.scan_error {
+            let _ = writeln!(out, "!! engine-trace scan FAILED: {err}");
+            let _ = writeln!(
+                out,
+                "!! Trace-only signatures (SIG-4b / SIG-5 / SIG-5c / SIG-G) did not run over"
+            );
+            let _ = writeln!(
+                out,
+                "!! this evidence at all. Their absence below means NOTHING was checked."
+            );
+        }
+        if !self.trace.damage.is_empty() {
+            let _ = writeln!(
+                out,
+                "!! {} unreadable line(s) in engine-trace; {} record(s) recovered, {} line(s) UNRECOVERABLE",
+                self.trace.damage.len(),
+                self.trace.recovered_records(),
+                self.trace.lost_lines().count(),
+            );
+        }
         if lost > 0 {
             let _ = writeln!(
                 out,
                 "!! Records are missing from the timeline below. The ABSENCE of an event"
             );
             let _ = writeln!(out, "!! in this report is NOT evidence that it never happened.");
-        } else {
+        } else if !self.damage.is_empty() {
             let _ = writeln!(
                 out,
-                "!! Every record was recovered, so the timeline below is complete — but"
+                "!! Every dispatch record was recovered, so the timeline below is complete —"
             );
             let _ = writeln!(
                 out,
-                "!! the stream interleaved, which means the writer needs attention."
+                "!! but the stream interleaved, which means the writer needs attention."
             );
+        }
+        if self.trace.evidence_degraded() {
+            let _ = writeln!(
+                out,
+                "!! Engine-trace evidence is incomplete, so a trace-only signature that did"
+            );
+            let _ = writeln!(out, "!! not fire may simply never have seen its record.");
         }
         let _ = writeln!(
             out,
@@ -184,9 +325,13 @@ impl IntegrityReport {
             return String::new();
         }
         let mut out = String::new();
-        let _ = writeln!(out, "\nstream integrity: {} unreadable line(s)", self.damage.len());
+        let _ = writeln!(
+            out,
+            "\nstream integrity: {} unreadable line(s)",
+            self.damage.len() + self.trace.damage.len()
+        );
         let mut by_file: BTreeMap<&std::path::Path, Vec<&DamagedLine>> = BTreeMap::new();
-        for line in self.lines() {
+        for line in self.lines().iter().chain(self.trace.damage.iter()) {
             by_file.entry(line.path.as_path()).or_default().push(line);
         }
         for (path, lines) in by_file {
@@ -195,8 +340,11 @@ impl IntegrityReport {
                 let _ = writeln!(out, "    {}", Self::describe(line));
             }
         }
-        let lost = self.lost_lines().count();
-        if lost > 0 {
+        if let Some(err) = &self.trace.scan_error {
+            let _ = writeln!(out, "  engine-trace scan FAILED, no trace evidence was read: {err}");
+        }
+        let lost = self.lost_lines().count() + self.trace.lost_lines().count();
+        if lost > 0 || self.trace.scan_error.is_some() {
             let _ = writeln!(
                 out,
                 "  exit status {EXIT_UNRECOVERED_RECORDS}: {lost} line(s) lost records; \
@@ -219,6 +367,13 @@ impl IntegrityReport {
         }
         let lost = self.lost_lines().count();
         let mut out = String::new();
+        if let Some(err) = &self.trace.scan_error {
+            let _ = writeln!(out, "!! engine-trace scan FAILED: {err}");
+        }
+        if self.damage.is_empty() {
+            // Trace-only damage: nothing to say about this listing's own stream.
+            return out;
+        }
         if lost > 0 {
             let _ = writeln!(
                 out,
@@ -242,13 +397,21 @@ impl IntegrityReport {
     }
 
     pub fn to_json(&self) -> Value {
+        let incomplete = self.lost_lines().next().is_some() || self.trace.evidence_degraded();
         json!({
             "intact": self.is_intact(),
+            "dispatch_stream_intact": self.dispatch_stream_is_intact(),
             "unreadable_lines": self.damage.len(),
             "recovered_records": self.recovered_records(),
             "lines_with_lost_records": self.lost_lines().count(),
-            "exit_code": if self.lost_lines().next().is_some() { EXIT_UNRECOVERED_RECORDS } else { 0 },
+            "exit_code": if incomplete { EXIT_UNRECOVERED_RECORDS } else { 0 },
             "lines": self.damage,
+            // Sibling block rather than pooled into `lines`: the trace is a
+            // second evidence source with its own failure modes (including a
+            // whole-scan failure, which has no line number), and an automated
+            // caller must be able to tell "the timeline has holes" from "the
+            // trace signatures never ran".
+            "trace_integrity": self.trace.to_json(),
         })
     }
 }
@@ -293,13 +456,22 @@ pub const ABSENCE_CAVEAT: &str = "UNRELIABLE: unreadable records overlap the win
                                   stream damage (see the stream integrity block) before acting on \
                                   this as fact.";
 
-/// Sentence printed in place of a bare "no matches" when the stream was
+/// Variant of [`ABSENCE_CAVEAT`] for a finding derived from engine-trace, whose
+/// damage cannot be time-windowed (see [`TraceIntegrity`]) — so the caveat is
+/// about the source rather than about an overlap.
+pub const TRACE_ABSENCE_CAVEAT: &str = "UNRELIABLE: engine-trace evidence was incomplete (unreadable \
+                                        records, or the scan failed), and this conclusion rests on \
+                                        an event not being present in it. Fix the trace damage (see \
+                                        the stream integrity block) before acting on this as fact.";
+
+/// Sentence printed in place of a bare "no matches" when an evidence stream was
 /// damaged. "No matches" over a stream with holes in it is not a clean bill of
-/// health, and must not read as one.
-pub const NO_MATCHES_CAVEAT: &str = "…but records in this stream were unreadable, so \"no matches\" \
-                                     does NOT mean nothing matched — a signature that depends on an \
-                                     event may simply not have seen it. See the stream integrity \
-                                     block above.";
+/// health, and must not read as one. Covers engine-trace as well as dispatch:
+/// the trace-only signatures cannot match a record the scan never read.
+pub const NO_MATCHES_CAVEAT: &str = "…but records in the evidence this scan read were unreadable, so \
+                                     \"no matches\" does NOT mean nothing matched — a signature that \
+                                     depends on an event may simply not have seen it. See the stream \
+                                     integrity block above.";
 
 /// Sentence printed when a diagnose found nothing at all over a damaged stream.
 /// The strongest absence claim the tool makes, so the one that most needs

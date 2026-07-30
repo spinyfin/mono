@@ -382,6 +382,10 @@ fn fold_open_file(
     let mut reader = BufReader::new(file);
     let mut outcome = FoldOutcome::default();
     let mut line = Vec::new();
+    // Timestamp of the last record this pass applied, threaded into salvage as
+    // the neighbour bound for its plausibility gate (see
+    // `integrity::salvage_damaged_line`).
+    let mut prev_ts_epoch_ms: Option<u128> = None;
     loop {
         line.clear();
         let read = reader
@@ -405,6 +409,7 @@ fn fold_open_file(
         }
         match serde_json::from_slice::<DispatchEvent>(trimmed) {
             Ok(event) => {
+                prev_ts_epoch_ms = Some(event.ts_epoch_ms);
                 apply_event(states, &event);
                 outcome.records += 1;
             }
@@ -421,7 +426,8 @@ fn fold_open_file(
                 let Ok(text) = std::str::from_utf8(trimmed) else {
                     continue;
                 };
-                for event in crate::integrity::salvage_damaged_line(text).records {
+                for event in crate::integrity::salvage_damaged_line(text, prev_ts_epoch_ms).records {
+                    prev_ts_epoch_ms = Some(event.ts_epoch_ms);
                     apply_event(states, &event);
                     outcome.records += 1;
                 }

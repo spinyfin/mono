@@ -259,6 +259,19 @@ bossctl dispatch ghost-active
   user-facing verb instead of buried in the engine log when the pool stalls.
   Output is the work item list with the latest `dispatch.jsonl` line for each.
 
+**Stream integrity (added by mono#2549).** These verbs read an append-only
+stream that can be damaged, and `diagnose`'s primary evidence is often an
+_absence_ — so a record it could not read is a hole in the evidence, not a
+cosmetic wart. Damaged lines are salvaged where possible and always reported:
+an integrity banner above the timeline, an in-timeline marker, an `UNRELIABLE:`
+prefix on absence-based findings, a `stream_integrity` block in `--json`, and a
+distinct **exit status 3** meaning "report produced but incomplete". `tail` and
+`state --history` changed their `--json` top-level shape from a bare array to an
+object to carry that block. The full operator contract — exit codes, the JSON
+keys, the changed shapes — is tabulated in
+[`../investigations/bossctl-doctor-failure-signatures-2026-07-26.md`](../investigations/bossctl-doctor-failure-signatures-2026-07-26.md)
+under "Stream integrity and exit codes".
+
 ### Subscription topic (optional, deferred)
 
 The Boss-session UX would benefit from a live tail surfaced through the

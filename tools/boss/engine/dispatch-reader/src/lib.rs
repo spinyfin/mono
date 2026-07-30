@@ -58,7 +58,7 @@ use serde::Serialize;
 use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
 pub use index::{RefreshStats, SharedTimelineIndex, TimelineIndex};
-pub use integrity::{DamageShape, DamagedLine, StreamRead};
+pub use integrity::{DamageShape, DamagedLine, Salvage, StreamRead, salvage_records_with};
 pub use timeline::{StageThresholds, StalledStage, TimelineState, is_terminal_event};
 
 /// Default Boss state root used by the file-scan readers when the
@@ -136,7 +136,7 @@ fn parse_lines<R: BufRead>(path: &Path, reader: R) -> Result<StreamRead> {
             Ok(event) => events.push(event),
             Err(_) => {
                 let events_before = events.len();
-                let salvage = integrity::salvage_damaged_line(trimmed);
+                let salvage = integrity::salvage_damaged_line(trimmed, events.last().map(|e| e.ts_epoch_ms));
                 events.extend(salvage.records.iter().cloned());
                 pending.push((line_number, trimmed.len(), events_before, salvage));
             }
