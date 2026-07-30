@@ -14,11 +14,14 @@
 //! governed by the repo's `rustfmt.toml` (not rustfmt defaults).
 //!
 //! `skip_children` is unstable and only honoured via the CLI `--config=`
-//! override loophole on the pinned stable toolchain (rustfmt 1.9.0-stable on
-//! rustc 1.95.0). This test exercises the real, hermetic `@rules_rust`
-//! toolchain rustfmt (not the host `rustfmt`), so a future toolchain bump
-//! that closes that loophole fails this test loudly instead of silently
-//! resurrecting the multi-second abort-with-no-diff bug.
+//! override loophole on a *stable* toolchain. On a nightly/beta rustfmt,
+//! unstable options are accepted unconditionally, so the fix would succeed
+//! regardless of whether the stable-channel loophole is open — the guard
+//! would become vacuous. `fix_succeeds_on_file_declaring_absent_sibling_module`
+//! therefore asserts the staged, hermetic `@rules_rust` toolchain rustfmt
+//! (not the host `rustfmt`) actually reports a `-stable` version before
+//! trusting the fix outcome, so this test fails loudly — rather than
+//! passing vacuously — the moment the pinned toolchain drifts off stable.
 
 use std::path::{Path, PathBuf};
 
@@ -52,30 +55,17 @@ const UNFORMATTED_SOURCE_WITH_ABSENT_MODULE: &str = "mod sibling;\nfn probe_conf
 const ONE_LINE_SIGNATURE: &str = "fn probe_configured_max_width_value_for_rustfmt_config_path(alpha: i32, beta: i32, gamma: i32, delta: i32) -> i32 {";
 
 /// Resolve the real, hermetic-toolchain rustfmt from the test's runfiles, or
-/// `None` when not staged (e.g. plain `cargo test`). Mirrors
-/// `parity_e2e::buildifier_from_runfiles`: outside Bazel this is a no-op, but
-/// under `bazel test` a missing `CHECKLEFT_E2E_RUSTFMT` is a broken `data`/`env`
-/// wiring, not a silently-skipped check, so it asserts rather than swallows.
+/// `None` when not staged (e.g. plain `cargo test`). Outside Bazel this is a
+/// no-op, but under `bazel test` a missing `CHECKLEFT_E2E_RUSTFMT` is a broken
+/// `data`/`env` wiring, not a silently-skipped check, so it asserts rather
+/// than swallows. See [`crate::external::test_support::staged_path_from_runfiles`],
+/// which this shares with `parity_e2e::buildifier_from_runfiles`.
 fn hermetic_rustfmt_from_runfiles() -> Option<PathBuf> {
-    match std::env::var("CHECKLEFT_E2E_RUSTFMT") {
-        Ok(rlocationpath) => {
-            let runfiles = runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
-            let path = runfiles
-                .rlocation(&rlocationpath)
-                .expect("rustfmt wrapper rlocation must resolve");
-            assert!(path.exists(), "staged rustfmt wrapper must exist at {}", path.display());
-            Some(path)
-        }
-        Err(_) => {
-            assert!(
-                std::env::var_os("TEST_SRCDIR").is_none(),
-                "running under `bazel test` but CHECKLEFT_E2E_RUSTFMT is unset — the \
-                 rustfmt `data`/`env` wiring on checkleft_lib_test is broken; refusing to \
-                 silently skip the fix regression test"
-            );
-            None
-        }
-    }
+    crate::external::test_support::staged_path_from_runfiles(
+        "CHECKLEFT_E2E_RUSTFMT",
+        "rustfmt wrapper",
+        crate::external::test_support::StagedPathKind::File,
+    )
 }
 
 fn parse_rustfmt_package() -> ExternalCheckDeclarativePackage {
@@ -108,6 +98,21 @@ async fn fix_succeeds_on_file_declaring_absent_sibling_module() {
     let Some(rustfmt) = hermetic_rustfmt_from_runfiles() else {
         return;
     };
+
+    let version_output = std::process::Command::new(&rustfmt)
+        .arg("--version")
+        .output()
+        .expect("staged rustfmt wrapper must run --version");
+    let version = String::from_utf8_lossy(&version_output.stdout).trim().to_owned();
+    eprintln!("checkleft: staged hermetic rustfmt reports: {version}");
+    assert!(
+        version.contains("-stable"),
+        "the `--config=skip_children=true` loophole this test guards is a stable-channel-only \
+         behaviour: an unstable/nightly/beta rustfmt would accept `skip_children` unconditionally, \
+         making this test pass regardless of whether the loophole is actually open. Staged rustfmt \
+         reported {version:?}, which is not a `-stable` build — the pinned toolchain has drifted off \
+         stable and this guard needs re-evaluating, not silently trusting"
+    );
 
     let repo_root = tempfile::tempdir().expect("temp repo root");
     std::fs::write(repo_root.path().join("rustfmt.toml"), RUSTFMT_TOML).expect("write rustfmt.toml");

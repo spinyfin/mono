@@ -13,41 +13,67 @@ use std::path::{Path, PathBuf};
 
 use super::DefaultExternalCheckExecutor;
 
+/// Whether a staged runfiles path is expected to be a regular file (a binary)
+/// or a directory (a fixture tree). Distinguishes the `exists()` vs `is_dir()`
+/// existence check in [`staged_path_from_runfiles`].
+pub(crate) enum StagedPathKind {
+    File,
+    Dir,
+}
+
+/// Resolve a Bazel-staged `data` dependency (binary or directory) from the
+/// test's runfiles via `env_var`, or `None` when it was not staged (e.g.
+/// running under plain `cargo test`, where there are no runfiles).
+///
+/// Shared by every hermetic e2e test that stages a real external tool
+/// (buildifier, rustfmt) or fixture directory (the precompiled `.cwasm`
+/// cache) as Bazel `data` + `env`: under `bazel test` the env var is always
+/// set to the dependency's runfiles path, so the staged path is always taken
+/// in CI. When the env var is absent we *assert* we are genuinely outside
+/// Bazel (no `TEST_SRCDIR`), so a broken `data`/`env` wiring can never
+/// silently skip the test it backs instead of failing loudly. `what` names
+/// the dependency in the resulting panic messages (e.g. `"buildifier"`,
+/// `"rustfmt wrapper"`, `"precompiled .cwasm dir"`).
+pub(crate) fn staged_path_from_runfiles(env_var: &str, what: &str, kind: StagedPathKind) -> Option<PathBuf> {
+    match std::env::var(env_var) {
+        Ok(rlocationpath) => {
+            let runfiles = runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
+            let path = runfiles
+                .rlocation(&rlocationpath)
+                .unwrap_or_else(|| panic!("{what} rlocation must resolve"));
+            let staged = match kind {
+                StagedPathKind::File => path.exists(),
+                StagedPathKind::Dir => path.is_dir(),
+            };
+            assert!(staged, "staged {what} must exist at {}", path.display());
+            Some(path)
+        }
+        Err(_) => {
+            assert!(
+                std::env::var_os("TEST_SRCDIR").is_none(),
+                "running under `bazel test` but {env_var} is unset — the {what} `data`/`env` \
+                 wiring on checkleft_lib_test is broken; refusing to silently skip the test it backs"
+            );
+            None
+        }
+    }
+}
+
 /// Resolve the build-time precompiled `.cwasm` fixture directory from the test's
 /// runfiles, or `None` when it was not staged (e.g. running under plain
 /// `cargo test`, where there are no runfiles).
 ///
 /// Under `bazel test`, `checkleft_lib_test` sets `CHECKLEFT_PRECOMPILED_CWASM_DIR`
 /// to the runfiles path of the `:precompiled_cwasm` directory via
-/// `$(rlocationpath ...)`, so the precompiled path is always taken in CI. As with
-/// the buildifier wiring in `declarative::parity_e2e`, we *assert* we are
-/// genuinely outside Bazel (no `TEST_SRCDIR`) when the env var is absent, so a
+/// `$(rlocationpath ...)`, so the precompiled path is always taken in CI. A
 /// broken `data`/`env` wiring can never silently fall back to JIT-compiling the
-/// component and re-open the timeout.
+/// component and re-open the timeout (see [`staged_path_from_runfiles`]).
 pub(crate) fn precompiled_cwasm_dir() -> Option<PathBuf> {
-    match std::env::var("CHECKLEFT_PRECOMPILED_CWASM_DIR") {
-        Ok(rlocationpath) => {
-            let runfiles = runfiles::Runfiles::create().expect("runfiles must initialize under `bazel test`");
-            let dir = runfiles
-                .rlocation(&rlocationpath)
-                .expect("precompiled .cwasm dir rlocation must resolve");
-            assert!(
-                dir.is_dir(),
-                "staged precompiled .cwasm dir must exist at {}",
-                dir.display()
-            );
-            Some(dir)
-        }
-        Err(_) => {
-            assert!(
-                std::env::var_os("TEST_SRCDIR").is_none(),
-                "running under `bazel test` but CHECKLEFT_PRECOMPILED_CWASM_DIR is unset — the \
-                 precompiled-.cwasm `data`/`env` wiring on checkleft_lib_test is broken; refusing \
-                 to silently JIT-compile the giant-structs component (which re-opens the 60 s timeout)"
-            );
-            None
-        }
-    }
+    staged_path_from_runfiles(
+        "CHECKLEFT_PRECOMPILED_CWASM_DIR",
+        "precompiled .cwasm dir",
+        StagedPathKind::Dir,
+    )
 }
 
 /// Build a [`DefaultExternalCheckExecutor`] rooted at `root`, pointed at the
