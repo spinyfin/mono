@@ -1199,16 +1199,16 @@ mod tests {
     #[test]
     fn a_resumed_session_does_not_re_announce_guard_decisions_it_already_read() {
         let dir = TempDir::new().unwrap();
-        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        armed_codex_home(dir.path());
         std::fs::write(
-            &trace,
+            dir.path().join(guard_trace::GUARD_TRACE_FILENAME),
             "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
         )
         .unwrap();
 
         // The pre-restart engine: one turn, whose boundary reads and reports
         // the one guard record.
-        let mut before = started_rollout_session(&trace);
+        let mut before = started_rollout_session(dir.path());
         let first = guard_trace_turn(&mut before, "call-1");
         assert!(
             first
@@ -1221,7 +1221,8 @@ mod tests {
 
         // The post-restart engine: a brand new session over the same run,
         // re-seeded from that snapshot rather than from zero.
-        let mut after = CodexRolloutProgressSession::new(None, None, None).with_guard_trace_path(Some(trace.clone()));
+        let mut after =
+            CodexRolloutProgressSession::new(None, None, None).with_codex_home(Some(dir.path().to_path_buf()));
         after.restore_resume_state(&state).unwrap();
 
         let second = guard_trace_turn(&mut after, "call-2");
@@ -1249,19 +1250,19 @@ mod tests {
     #[test]
     fn an_unrestored_session_re_announces_guard_decisions_and_proves_the_restore_matters() {
         let dir = TempDir::new().unwrap();
-        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        armed_codex_home(dir.path());
         std::fs::write(
-            &trace,
+            dir.path().join(guard_trace::GUARD_TRACE_FILENAME),
             "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
         )
         .unwrap();
-        let mut before = started_rollout_session(&trace);
+        let mut before = started_rollout_session(dir.path());
         let _ = guard_trace_turn(&mut before, "call-1");
 
         // What a from-scratch re-attachment looks like: the session_meta
         // record at the head of the file is read a second time (which is its
         // own duplicate `SessionStart`), and nothing carries the guard cursor.
-        let mut after = started_rollout_session(&trace);
+        let mut after = started_rollout_session(dir.path());
         let second = guard_trace_turn(&mut after, "call-2");
         assert!(
             second
