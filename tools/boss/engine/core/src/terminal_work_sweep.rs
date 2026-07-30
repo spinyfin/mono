@@ -66,17 +66,29 @@
 //! revision's (still-active) work-item id, not the parent's, so it is never
 //! mistaken for the zombie.
 //!
-//! Two independent guards make a wrong reap impossible:
+//! Three independent guards make a wrong reap impossible:
 //!
-//! 1. **Two-pass confirmation.** A candidate is reaped only if it was ALSO
+//! 1. **The teardown mark.** Every completion path marks its execution in
+//!    [`crate::teardown_registry`] BEFORE the write that terminalizes it,
+//!    and clears the mark only once the pane is released, driver state is
+//!    torn down and the cube lease is freed. A marked execution is skipped
+//!    outright: its pane already has an owner. This is what makes "never
+//!    reap a worker mid-completion" an invariant rather than a bet on
+//!    teardown being faster than the sweep interval — the 2026-07-30
+//!    incident lost that bet by 388 s when an unbounded `cube workspace
+//!    release` sat inside the window. A mark that outlives
+//!    [`crate::teardown_registry::MAX_TEARDOWN_PROTECTION`] stops
+//!    protecting (logged loudly), because a wedged teardown is exactly the
+//!    strand this sweep exists to reclaim.
+//! 2. **Two-pass confirmation.** A candidate is reaped only if it was ALSO
 //!    a terminal-and-live candidate on the immediately preceding pass — so
-//!    it must have been terminal+live for at least one full [`DEFAULT_INTERVAL`].
-//!    Normal completion teardown fires within seconds of terminality, so a
-//!    candidate that survives a full interval is a genuine strand, never a
-//!    teardown still in flight. If the status flips back to non-terminal
+//!    it must have been terminal+live, *and unmarked*, for at least one
+//!    full [`DEFAULT_INTERVAL`]. If the status flips back to non-terminal
 //!    between passes (a reopened task), the candidate drops out and is not
-//!    reaped.
-//! 2. **Run-id-keyed idempotent reap.** Reaping goes through the same
+//!    reaped. A candidate skipped for an in-flight teardown is likewise
+//!    dropped from the carried-forward set, so its confirmation clock
+//!    restarts from scratch once the teardown finishes.
+//! 3. **Run-id-keyed idempotent reap.** Reaping goes through the same
 //!    `release_worker_pane(run_id)` the completion path uses, which resolves
 //!    the slot from the run id via an atomic `take_slot_for_run`. If the
 //!    slot was freed and recycled to a DIFFERENT execution between this
@@ -86,6 +98,30 @@
 //!
 //! When in doubt the sweep does nothing: a DB lookup failure is a
 //! conservative skip, and a non-terminal worker is simply left running.
+//!
+//! ## Why only this sweep consults the teardown mark
+//!
+//! This is the only reconciler whose reap precondition is satisfied
+//! *during* a normal teardown. [`crate::pool_claim_sweep`] skips any claim
+//! still backed by a live-state entry, and `release_worker_pane` frees the
+//! pool slot before it drops that entry, so a teardown in flight always
+//! looks "claimed + live entry" to it. [`crate::husk_pane_sweep`] fires
+//! only once the engine has already forgotten a slot the app still hosts —
+//! the opposite of an in-flight teardown, which the engine has very much
+//! not forgotten. [`crate::dead_pid_sweep`], [`crate::dead_pane_sweep`]
+//! and [`crate::lost_workspace_sweep`] all additionally require a
+//! NON-terminal execution, which a teardown window never is.
+//!
+//! ## Teardown on reap
+//!
+//! A reap kills the worker's process tree, so this sweep owns the same
+//! post-mortem obligation the completion path has: it runs
+//! [`crate::driver_teardown::teardown_driver_workspace`] AFTER the reap,
+//! for every reap reason. Before, only the `work_item_missing` arm did it,
+//! and it did it *before* the reap — so a Codex process still alive at
+//! that moment could refresh its auth token after the per-run credential
+//! file had already been adopted back, and the two other reap reasons
+//! never tore driver state down at all.
 //!
 //! ## Cadence
 //!
@@ -101,6 +137,7 @@ use std::time::Duration;
 use crate::coordinator::CubeClient;
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
+use crate::teardown_registry::{TeardownRegistry, TeardownState};
 use crate::work::WorkDb;
 
 /// How often the terminal-work reconciler runs. 60s mirrors the dead-pid,
@@ -147,6 +184,10 @@ pub struct TerminalWorkSweepOutcome {
     /// Live workers left alone because their work item and execution are
     /// both still non-terminal — the normal, healthy case.
     pub active_skipped: usize,
+    /// Slots skipped this pass because the execution's own completion
+    /// teardown is still in flight (see [`crate::teardown_registry`]).
+    /// These are NOT strands — the pane already has an owner.
+    pub teardown_in_flight_skipped: usize,
     /// Slots skipped this pass because the execution lookup failed
     /// (conservative — retried next pass).
     pub lookup_failed_skipped: usize,
@@ -162,6 +203,7 @@ impl crate::sweep_loop::SweepOutcome for TerminalWorkSweepOutcome {
             reaped = self.reaped,
             pending_confirmation = self.pending_confirmation,
             active_skipped = self.active_skipped,
+            teardown_in_flight_skipped = self.teardown_in_flight_skipped,
             lookup_failed_skipped = self.lookup_failed_skipped,
             "terminal-work sweep: reaped stranded worker(s) whose work was already terminal",
         );
@@ -177,6 +219,7 @@ pub fn spawn_loop(
     reaper: Arc<dyn WorkerReaper>,
     cube_client: Arc<dyn CubeClient>,
     dispatch_events: Arc<dyn DispatchEventSink>,
+    teardown_registry: Arc<TeardownRegistry>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     // Candidates observed terminal+live on the previous pass. A candidate is
@@ -192,6 +235,7 @@ pub fn spawn_loop(
         let reaper = Arc::clone(&reaper);
         let cube_client = Arc::clone(&cube_client);
         let dispatch_events = Arc::clone(&dispatch_events);
+        let teardown_registry = Arc::clone(&teardown_registry);
         let seen_terminal = Arc::clone(&seen_terminal);
         async move {
             let mut seen_terminal = seen_terminal.lock().await;
@@ -201,6 +245,7 @@ pub fn spawn_loop(
                 reaper.as_ref(),
                 cube_client.as_ref(),
                 dispatch_events.as_ref(),
+                teardown_registry.as_ref(),
                 &mut seen_terminal,
             )
             .await
@@ -219,9 +264,14 @@ pub async fn run_one_pass(
     reaper: &dyn WorkerReaper,
     cube_client: &dyn CubeClient,
     dispatch_events: &dyn DispatchEventSink,
+    teardown_registry: &TeardownRegistry,
     seen_terminal: &mut HashSet<String>,
 ) -> TerminalWorkSweepOutcome {
     let mut outcome = TerminalWorkSweepOutcome::default();
+    // One clock read per pass: every candidate's teardown mark is judged
+    // against the same instant, so a long pass can't classify two runs
+    // inconsistently.
+    let pass_started = std::time::Instant::now();
     // Reap candidates gathered this pass (terminal work item and/or terminal
     // execution, live pane). The shared two-pass confirmation helper turns
     // these into the confirmed/pending partitions below.
@@ -320,6 +370,45 @@ pub async fn run_one_pass(
             "execution_terminal"
         };
 
+        // The execution is terminal and its pane is live — but that is ALSO
+        // the normal shape of a completion teardown mid-flight, because the
+        // terminalizing DB write necessarily precedes the pane release. The
+        // teardown mark is the explicit signal that tells the two apart.
+        match teardown_registry.state(&run_id, pass_started) {
+            TeardownState::Idle => {}
+            TeardownState::InFlight { elapsed } => {
+                // INFO, not DEBUG: the retained engine log keeps INFO and
+                // above, and this is the line that answers "why did the
+                // sweep leave that terminal-looking slot alone?". It fires
+                // at most once per pass per completing run, and only while
+                // a teardown is genuinely slow enough to still be running
+                // when a pass lands — a healthy teardown never produces it.
+                tracing::info!(
+                    run_id = %run_id,
+                    slot_id = state.slot_id,
+                    reason,
+                    teardown_elapsed_ms = elapsed.as_millis(),
+                    "terminal-work sweep: skipping — this pane's own completion teardown is still \
+                     in flight and owns it",
+                );
+                outcome.teardown_in_flight_skipped += 1;
+                // Deliberately NOT pushed as a candidate: dropping it from
+                // the carried-forward set restarts its confirmation clock,
+                // so a teardown that finishes just after this pass still
+                // gets two full intervals of grace before anything reaps.
+                continue;
+            }
+            TeardownState::Expired { elapsed } => tracing::warn!(
+                run_id = %run_id,
+                slot_id = state.slot_id,
+                reason,
+                teardown_elapsed_ms = elapsed.as_millis(),
+                max_protection_secs = crate::teardown_registry::MAX_TEARDOWN_PROTECTION.as_secs(),
+                "terminal-work sweep: this pane's completion teardown has outlived its protection \
+                 bound — the teardown is wedged, so treating the pane as a genuine strand",
+            ),
+        }
+
         // This slot is a reap candidate this pass. Keyed on `run_id` for the
         // shared two-pass confirmation helper.
         candidates.push((
@@ -334,6 +423,7 @@ pub async fn run_one_pass(
                 .work_item_missing(work_item_missing)
                 .reason(reason)
                 .maybe_cube_lease_id(execution.cube_lease_id.clone())
+                .maybe_workspace_path(execution.workspace_path.clone())
                 .build(),
         ));
     }
@@ -375,24 +465,13 @@ pub async fn run_one_pass(
         // the row. Best-effort: if the execution turns out already terminal
         // (a race with some other teardown) this is a conservative no-op.
         if candidate.work_item_missing {
-            match work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists") {
-                Ok(orphaned) => {
-                    // Reap termination path: tear down any driver-owned
-                    // state outside the workspace.
-                    crate::driver_teardown::teardown_driver_workspace(
-                        work_db,
-                        &candidate.run_id,
-                        orphaned.workspace_path.as_deref().map(std::path::Path::new),
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        run_id = %candidate.run_id,
-                        ?err,
-                        "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
-                    );
-                }
+            if let Err(err) = work_db.mark_execution_orphaned(&candidate.run_id, "bound work item row no longer exists")
+            {
+                tracing::warn!(
+                    run_id = %candidate.run_id,
+                    ?err,
+                    "terminal-work sweep: failed to mark orphaned execution for missing work item (may already be terminal)",
+                );
             }
 
             // `mark_execution_orphaned` deliberately leaves the cube lease
@@ -423,6 +502,22 @@ pub async fn run_one_pass(
         // this is a no-op and the live worker now in the slot is untouched.
         reaper.reap_terminal_worker(&candidate.run_id).await;
         outcome.reaped += 1;
+
+        // Reap termination path: tear down any driver-owned state outside
+        // the workspace, for EVERY reap reason and strictly AFTER the reap.
+        // The reap is what kills the process tree, and running teardown
+        // first would let a still-live Codex process refresh its auth token
+        // after the per-run credential file had already been adopted back —
+        // the same ordering constraint the completion path documents. This
+        // is also the half of the 2026-07-30 incident the sweep itself
+        // owned: it killed the worker at 22:52:16 while the (pre-empted)
+        // completion path did not reach its own teardown until 22:57:19.
+        crate::driver_teardown::teardown_driver_workspace(
+            work_db,
+            &candidate.run_id,
+            candidate.workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
 
         dispatch_events
             .emit(
@@ -466,6 +561,13 @@ struct ReapCandidate {
     /// `lost_workspace_sweep`), so nothing else frees it once the row goes
     /// terminal here.
     cube_lease_id: Option<String>,
+    /// The execution's recorded workspace path, captured at snapshot time
+    /// so the post-reap [`crate::driver_teardown::teardown_driver_workspace`]
+    /// call has it. `None` is expected and fine — a completion path that
+    /// already ran nulls the column in the same transaction that
+    /// terminalizes the row, and drivers may key their out-of-workspace
+    /// state off the persisted runtime state alone.
+    workspace_path: Option<String>,
 }
 
 /// Whether a bound work item is in a terminal status. Only task-shaped
@@ -646,17 +748,36 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         // Pass 1: candidate observed, not yet reaped.
-        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
         assert_eq!(first.pending_confirmation, 1);
         assert!(reaper.reaped().is_empty());
         assert!(sink.events().await.is_empty());
 
         // Pass 2: candidate confirmed across two passes — reap.
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed strand");
         assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
 
@@ -669,7 +790,16 @@ mod tests {
         assert_eq!(events[0].details["slot_id"], 8);
 
         // Pass 3: the live state was torn down, so nothing remains to reap.
-        let third = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let third = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(third.reaped, 0);
         assert_eq!(third.pending_confirmation, 0);
         assert_eq!(third.active_skipped, 0);
@@ -691,10 +821,29 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
-        run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
 
         assert_eq!(second.reaped, 1);
         assert_eq!(reaper.reaped(), vec![execution_id]);
@@ -763,12 +912,22 @@ mod tests {
         let lease_id = "lease-25";
         force_cube_lease_id(&db, &execution_id, lease_id);
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         // Pass 1: candidate observed, not yet reaped — mirrors the O'Brien
         // two-pass guard so a delete-then-immediately-torn-down-by-the-
         // deletion-path race isn't double-reaped.
-        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(first.reaped, 0, "first pass must only record the candidate");
         assert_eq!(first.pending_confirmation, 1);
         assert!(reaper.reaped().is_empty());
@@ -776,7 +935,16 @@ mod tests {
         // Pass 2: confirmed — reap the pane/slot AND mark the execution
         // orphaned (there is no other path that would have done so, since
         // the row is gone and no normal completion ever fired).
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(second.reaped, 1, "second pass must reap the confirmed orphan");
         assert_eq!(reaper.reaped(), vec![execution_id.clone()]);
 
@@ -833,10 +1001,20 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         for _ in 0..3 {
-            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
             assert_eq!(outcome.reaped, 0);
             assert_eq!(outcome.active_skipped, 1);
         }
@@ -863,10 +1041,20 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         for _ in 0..5 {
-            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
             assert_eq!(outcome.reaped, 0, "active worker must never be reaped");
             assert_eq!(outcome.active_skipped, 1);
         }
@@ -891,16 +1079,35 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         // Pass 1: candidate recorded.
-        let first = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(first.pending_confirmation, 1);
 
         // Status reverts to active before the confirming pass.
         set_work_item_status(&db, &work_item_id, "active");
 
-        let second = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
         assert_eq!(second.reaped, 0, "reverted candidate must not be reaped");
         assert_eq!(second.active_skipped, 1);
         assert!(reaper.reaped().is_empty());
@@ -919,10 +1126,20 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), true);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
         for _ in 0..3 {
-            let outcome = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await;
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                &teardown,
+                &mut seen,
+            )
+            .await;
             assert_eq!(outcome.reaped, 0);
             assert_eq!(outcome.lookup_failed_skipped, 1);
         }
@@ -947,14 +1164,232 @@ mod tests {
         let reaper = RecordingReaper::new(live_states.clone(), false);
         let cube = RecordingCubeClient::default();
         let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
         let mut seen = HashSet::new();
 
-        run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // record
-        let p2 = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // reap
-        let p3 = run_one_pass(db.as_ref(), &live_states, &reaper, &cube, sink.as_ref(), &mut seen).await; // retry
+        run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await; // record
+        let p2 = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await; // reap
+        let p3 = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await; // retry
 
         assert_eq!(p2.reaped, 1);
         assert_eq!(p3.reaped, 1, "an un-landed reap must be retried next pass");
         assert_eq!(reaper.reaped(), vec![execution_id.clone(), execution_id]);
+    }
+
+    /// **The 2026-07-30 invariant.** An execution whose own completion
+    /// teardown is in flight is never a reap candidate — *however long the
+    /// teardown takes*. The point of the mark rather than a longer grace is
+    /// exactly that no number of passes changes the answer, so this runs
+    /// far more passes than the two-pass guard would need.
+    #[tokio::test]
+    async fn never_reaps_while_a_teardown_mark_is_held() {
+        let (_dir, db, product_id) = setup();
+        let work_item_id = create_active_chore(&db, &product_id, "mid-completion");
+        let execution_id = create_execution(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 3, &execution_id, &work_item_id);
+
+        // Exactly the incident's state: the completion path has marked its
+        // teardown, its terminalizing write has landed, and its pane is
+        // still live because `release_pane` has not run yet.
+        let teardown = Arc::new(TeardownRegistry::new());
+        let guard = teardown.begin(&execution_id);
+        force_execution_status(&db, &execution_id, "completed");
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        for pass in 1..=10 {
+            let outcome = run_one_pass(
+                db.as_ref(),
+                &live_states,
+                &reaper,
+                &cube,
+                sink.as_ref(),
+                teardown.as_ref(),
+                &mut seen,
+            )
+            .await;
+            assert_eq!(
+                outcome.reaped, 0,
+                "pass {pass}: an in-flight teardown must never be reaped"
+            );
+            assert_eq!(outcome.teardown_in_flight_skipped, 1, "pass {pass}");
+            assert_eq!(
+                outcome.pending_confirmation, 0,
+                "pass {pass}: a marked run must not even accumulate confirmation",
+            );
+        }
+        assert!(reaper.reaped().is_empty());
+        assert!(sink.events().await.is_empty());
+
+        // Once teardown finishes without releasing the pane (the genuine
+        // strand shape), the sweep resumes ownership — and, because the
+        // marked passes were dropped from the carried-forward set, it still
+        // takes a full two passes.
+        drop(guard);
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            teardown.as_ref(),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(first.reaped, 0, "the confirmation clock restarts after the mark clears");
+        assert_eq!(first.pending_confirmation, 1);
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            teardown.as_ref(),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(
+            second.reaped, 1,
+            "a strand left behind by a finished teardown is still reaped"
+        );
+        assert_eq!(reaper.reaped(), vec![execution_id]);
+    }
+
+    /// The mark must not become a way to leak a slot forever: a teardown
+    /// that outlives its protection bound is a wedged teardown, which is
+    /// exactly the strand this sweep exists to reclaim.
+    #[tokio::test]
+    async fn reaps_when_a_teardown_mark_outlives_its_protection_bound() {
+        let (_dir, db, product_id) = setup();
+        let work_item_id = create_active_chore(&db, &product_id, "wedged-teardown");
+        let execution_id = create_execution(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 6, &execution_id, &work_item_id);
+
+        // A zero protection bound models a mark that is already overrun,
+        // without the test having to sleep for the real ten minutes.
+        let teardown = Arc::new(TeardownRegistry::with_max_protection(Duration::ZERO));
+        let _guard = teardown.begin(&execution_id);
+        force_execution_status(&db, &execution_id, "completed");
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let mut seen = HashSet::new();
+
+        let first = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            teardown.as_ref(),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(first.teardown_in_flight_skipped, 0, "an overrun mark stops protecting");
+        assert_eq!(first.pending_confirmation, 1);
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            teardown.as_ref(),
+            &mut seen,
+        )
+        .await;
+        assert_eq!(second.reaped, 1, "a wedged teardown must still be reclaimable");
+        assert_eq!(reaper.reaped(), vec![execution_id]);
+    }
+
+    /// A reap kills the worker's process tree, so the sweep owns driver
+    /// teardown for the run it just killed — on every reap reason, not only
+    /// the `work_item_missing` one, and strictly after the reap so the
+    /// process is already dead when driver credentials are adopted back.
+    ///
+    /// Single-threaded runtime: `driver_teardown`'s test hook counts calls
+    /// in a thread-local.
+    #[tokio::test]
+    async fn reaping_a_strand_also_tears_down_driver_state() {
+        let (_dir, db, product_id) = setup();
+        let work_item_id = create_active_chore(&db, &product_id, "driver-state");
+        let execution_id = create_execution(&db, &work_item_id);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_live_worker(&live_states, 11, &execution_id, &work_item_id);
+        force_execution_status(&db, &execution_id, "completed");
+
+        let reaper = RecordingReaper::new(live_states.clone(), true);
+        let cube = RecordingCubeClient::default();
+        let sink = Arc::new(RecordingDispatchEventSink::new());
+        let teardown = TeardownRegistry::new();
+        let mut seen = HashSet::new();
+
+        crate::driver_teardown::test_hooks::reset();
+        run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
+        assert_eq!(
+            crate::driver_teardown::test_hooks::count(),
+            0,
+            "a pass that reaps nothing must not tear driver state down",
+        );
+        let second = run_one_pass(
+            db.as_ref(),
+            &live_states,
+            &reaper,
+            &cube,
+            sink.as_ref(),
+            &teardown,
+            &mut seen,
+        )
+        .await;
+        assert_eq!(second.reaped, 1);
+        assert_eq!(
+            crate::driver_teardown::test_hooks::count(),
+            1,
+            "the `execution_terminal` reap arm must tear driver state down too",
+        );
     }
 }

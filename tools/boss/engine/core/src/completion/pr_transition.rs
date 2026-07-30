@@ -229,6 +229,17 @@ impl WorkerCompletionHandler {
             target
         };
 
+        // Mark the teardown in flight BEFORE the write that terminalizes
+        // this execution. From here until `finish_worker_teardown` drops
+        // the guard, `terminal_work_sweep` can see that this pane already
+        // has an owner and must not reclaim it — without the mark, the
+        // window between "row is terminal" and "pane is gone" is exactly
+        // that sweep's reap precondition, and on 2026-07-30 it reaped and
+        // SIGKILLed live workers inside it. Dropped automatically on both
+        // early returns below.
+        let teardown = self.begin_teardown(execution_id);
+
+        let record_started = std::time::Instant::now();
         let completion = match self
             .work_db
             .record_worker_pr_completion(execution_id, &pr_url, None, effective_target)
@@ -240,6 +251,13 @@ impl WorkerCompletionHandler {
                 return StopOutcome::DbError;
             }
         };
+        tracing::info!(
+            execution_id,
+            source,
+            target = ?effective_target,
+            elapsed_ms = record_started.elapsed().as_millis(),
+            "pr completion: execution terminalized; teardown in flight",
+        );
         // Clear the staged URL now that the DB write succeeded.
         // Deliberately ordered after `record_worker_pr_completion` so
         // a failed DB write leaves the cache intact and the next
@@ -251,30 +269,18 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(execution_id);
         self.background_children_tracker.forget(execution_id);
         self.hold_registry.release(execution_id);
-        if let Some(lease_id) = completion.released_lease_id.as_deref()
-            && let Err(err) = self.cube_client.release_workspace(lease_id).await
-        {
-            tracing::error!(
-                execution_id,
-                source,
-                lease_id,
-                ?err,
-                "pr completion: cube release failed"
-            );
-        }
-        self.pane_releaser.release_pane(execution_id).await;
-        // Stop → pr_transition termination path: this call just moved the
-        // execution to `completed` (see `record_worker_pr_completion`), so it
-        // owns driver teardown. Deliberately AFTER the pane release (mirrors
-        // `force_release`'s ordering): the worker process is still alive
-        // until `release_pane` reaps it, and running teardown first would let
-        // a still-live Codex process refresh its auth token again after the
-        // per-run credential file has already been adopted back to the
-        // source, silently dropping that refresh.
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
+        // Stop → pr_transition termination path: the call above just moved
+        // the execution to `completed` (see `record_worker_pr_completion`),
+        // so this path owns the whole teardown — pane, driver state, cube
+        // lease, in that order. See `super::teardown` for why the ordering
+        // is what it is (in particular why driver teardown must not run
+        // while the worker process may still be alive).
+        self.finish_worker_teardown(
             execution_id,
+            completion.released_lease_id.as_deref(),
             workspace_path.as_deref().map(std::path::Path::new),
+            source,
+            teardown,
         )
         .await;
         let product_id = completion.work_item.product_id().to_string();
