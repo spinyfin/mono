@@ -57,7 +57,7 @@ final class WorkBoardSectionDropTargetTests: XCTestCase {
     /// collapsed completion group ("Monday (1)") stacked directly beneath it.
     /// A drag inside Merging that overshoots by a few points lands on that
     /// header strip. Reporting the column alone makes it a reorder rather
-    /// than a completion the operator cannot cleanly undo.
+    /// than a completion that cannot be cleanly undone.
     func testCollapsedByDefaultSectionReportsNoGroup() {
         XCTAssertNil(section(defaultExpanded: false).dropGroupKey)
     }

@@ -32,12 +32,12 @@ enum WorkBoardColumnKey: String, CaseIterable, Identifiable {
 
     /// The status this column asserts for a card moved into it by an
     /// **explicit** affordance — the work-card popover's "Move" buttons,
-    /// where "put this row in that status" is exactly what the operator
-    /// clicked.
+    /// where "put this row in that status" is exactly what the click
+    /// meant.
     ///
     /// Deliberately NOT used by the drag path: a column does not determine
-    /// its rows' statuses, so this mapping is only sound where the operator
-    /// named the status directly. A drag reports its drop target to the
+    /// its rows' statuses, so this mapping is only sound where the status
+    /// was named directly. A drag reports its drop target to the
     /// engine (`sendMoveWorkItemOnBoard`) and the engine resolves what it
     /// meant against the row's own board position — see the
     /// `boss-engine-board-gesture` crate docs for why that is the only place

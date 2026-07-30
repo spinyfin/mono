@@ -2762,7 +2762,7 @@ async fn board_drop_on_own_column_is_a_reorder_for_a_blocked_row() -> Result<()>
 
 /// Nothing can be dragged *into* the Merging group: a row is there because
 /// the engine observed its PR in a merge queue, so the gesture asserts a
-/// fact the operator cannot know. The engine refuses rather than picking
+/// fact the client cannot know. The engine refuses rather than picking
 /// the nearest plausible transition, and mutates nothing.
 #[tokio::test]
 async fn board_drop_into_merging_group_is_refused() -> Result<()> {
