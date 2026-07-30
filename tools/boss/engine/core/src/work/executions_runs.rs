@@ -177,6 +177,29 @@ impl WorkDb {
                AND finished_at IS NULL",
             params![execution_id, now.as_str(), reason],
         )?;
+        // Reason durability for a run row that was already closed at
+        // spawn-return — e.g. `PaneSpawnRunner` stamps `work_runs.finished_at`
+        // (with a generic "spawned pane" `result_summary`) the instant the
+        // pane comes up, before the worker ever produces a shell. Both guards
+        // on the write above (`finished_at IS NULL`, `COALESCE(result_summary,
+        // …)`) are then already defeated by the time a never-started-spawn
+        // reap runs, so the real orphan reason never reaches the database —
+        // only a rotating log has it. `error_text` is otherwise untouched by
+        // that spawn-confirm write, so stamp it on the execution's most
+        // recent run row regardless of `finished_at`, without overwriting a
+        // legitimate existing value (ordering-by-recency instead of widening
+        // the write above to be unconditional).
+        tx.execute(
+            "UPDATE work_runs
+             SET error_text = COALESCE(NULLIF(error_text, ''), ?2)
+             WHERE id = (
+                 SELECT id FROM work_runs
+                 WHERE execution_id = ?1
+                 ORDER BY created_at DESC, id DESC
+                 LIMIT 1
+             )",
+            params![execution_id, reason],
+        )?;
         let updated = query_execution(&tx, execution_id)?
             .with_context(|| format!("unknown execution after orphan reap: {execution_id}"))?;
         // Canonical terminalization trace. `mark_execution_orphaned` is the

@@ -678,58 +678,20 @@ impl WorkerCompletionHandler {
             .map(|r| r.head_sha.clone())
             .filter(|s| !s.is_empty());
 
-        let revision_warranted = review_result
+        let original_revision_warranted = review_result
             .as_ref()
             .is_some_and(crate::pr_review::passes_severity_gate);
 
-        // incident-002 postmortem action item: rationale-independent
-        // both-parents deletion tripwire. For a conflict-resolution review, diff the resolution
-        // against BOTH merge parents; if it removed a surface a merged parent
-        // added, halt auto-progression — the task is held in `blocked:
-        // deletion_signoff` pending explicit operator sign-off instead of
-        // advancing to human Review, regardless of the reviewer's verdict.
-        let deletion_signoff = self
-            .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
-            .await;
-        let completion_target = if deletion_signoff.is_empty() {
-            WorkerPrCompletionTarget::InReview
-        } else {
-            WorkerPrCompletionTarget::BlockedDeletionSignoff
-        };
-
-        // Atomically: advance the producing task from active → in_review (or
-        // hold it in blocked:deletion_signoff when the tripwire fired) +
-        // complete the reviewer execution + clear its cube columns. Same path
-        // for both revision and no-revision cases.
-        // Marked before the terminalizing write — see `super::teardown`.
-        let teardown = self.begin_teardown(&execution.id);
-        let completion = match self
-            .work_db
-            .record_worker_pr_completion(&execution.id, &pr_url, None, completion_target)
-        {
-            Ok(Some(completion)) => completion,
-            Ok(None) => return StopOutcome::AlreadyTerminal,
-            Err(err) => {
-                tracing::error!(
-                    execution_id = %execution.id,
-                    producing_task_id,
-                    ?err,
-                    "pr_review finalize: DB write failed",
-                );
-                return StopOutcome::DbError;
-            }
-        };
-
-        // Increment the review cycle counter and record
-        // last_reviewed_sha. This happens regardless of whether a revision
-        // was warranted — the cycle ticks on every completed reviewer pass.
-        // A failure here is non-fatal (the task is already in in_review).
-        //
         // Tracked on the review-cycle root (chain root for a revision-
         // triggered pass, the task itself otherwise) so the counter
         // accumulates across the whole revision chain instead of resetting
         // to zero on every fresh revision task row — see
-        // `WorkDb::review_cycle_root_id`.
+        // `WorkDb::review_cycle_root_id`. Resolved here (moved ahead of the
+        // `record_worker_pr_completion` call below, which it does not
+        // depend on) because the duplicate-head check right after needs it
+        // to compute this pass's `gate_outcome` BEFORE that call, so the
+        // verdict recorded in the same transaction reflects the real
+        // outcome instead of a value patched in after the fact.
         let cycle_root_id = self.work_db.review_cycle_root_id(producing_task_id);
 
         // Dedup at the revision-minting end too. If a prior COMPLETED
@@ -761,8 +723,97 @@ impl WorkerCompletionHandler {
                 false
             }
         };
-        let revision_warranted = revision_warranted && !duplicate_head_review;
+        let revision_warranted = original_revision_warranted && !duplicate_head_review;
 
+        // incident-002 postmortem action item: rationale-independent
+        // both-parents deletion tripwire. For a conflict-resolution review, diff the resolution
+        // against BOTH merge parents; if it removed a surface a merged parent
+        // added, halt auto-progression — the task is held in `blocked:
+        // deletion_signoff` pending explicit operator sign-off instead of
+        // advancing to human Review, regardless of the reviewer's verdict.
+        let deletion_signoff = self
+            .compute_merge_parent_deletion_signoff(producing_task_id, execution, head_sha_for_cycle.as_deref())
+            .await;
+        let completion_target = if deletion_signoff.is_empty() {
+            WorkerPrCompletionTarget::InReview
+        } else {
+            WorkerPrCompletionTarget::BlockedDeletionSignoff
+        };
+
+        // Durable per-pass review verdict (Boss cannot otherwise tell a
+        // clean review from a destroyed one — see the work item this
+        // change implements). `None` result ⇒ the only way this point is
+        // reached with no `ReviewResult` is the give-up path above
+        // (`NudgeDecision::Trip`); every other None-result path already
+        // returned early. Findings computed then dropped by the
+        // duplicate-head guard are recorded as such, not silently folded
+        // into `completed_clean`.
+        let findings_count = review_result.as_ref().map_or(0, |r| r.findings.len() as i64);
+        let gate_outcome = if review_result.is_none() {
+            crate::work::REVIEW_GATE_OUTCOME_GAVE_UP
+        } else if duplicate_head_review && original_revision_warranted {
+            crate::work::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD
+        } else if revision_warranted {
+            crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+        } else {
+            crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN
+        };
+        let review_verdict = crate::work::ReviewVerdictInput {
+            head_sha: head_sha_for_cycle.clone(),
+            findings_count,
+            revision_warranted,
+            gate_outcome,
+        };
+
+        // Atomically: advance the producing task from active → in_review (or
+        // hold it in blocked:deletion_signoff when the tripwire fired) +
+        // complete the reviewer execution + clear its cube columns + record
+        // the review verdict above. Same path for both revision and
+        // no-revision cases.
+        // Marked before the terminalizing write — see `super::teardown`.
+        let teardown = self.begin_teardown(&execution.id);
+        let completion = match self.work_db.record_worker_pr_completion(
+            &execution.id,
+            &pr_url,
+            None,
+            completion_target,
+            Some(review_verdict),
+        ) {
+            Ok(Some(completion)) => completion,
+            Ok(None) => return StopOutcome::AlreadyTerminal,
+            Err(err) => {
+                tracing::error!(
+                    execution_id = %execution.id,
+                    producing_task_id,
+                    ?err,
+                    "pr_review finalize: DB write failed",
+                );
+                return StopOutcome::DbError;
+            }
+        };
+
+        // A fresh pass just completed for this work item (clean, with
+        // findings, or gave-up) — any earlier `pr_review_died_without_findings`
+        // attention (filed when a PREVIOUS review died before finishing) no
+        // longer describes the current state, so resolve it. Best-effort:
+        // this pass has already been durably recorded above regardless of
+        // whether this cleanup succeeds.
+        if let Err(err) = self.work_db.resolve_external_tracker_attention(
+            producing_task_id,
+            crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
+        ) {
+            tracing::warn!(
+                execution_id = %execution.id,
+                producing_task_id,
+                ?err,
+                "pr_review finalize: failed to resolve stale pr_review_died_without_findings attention",
+            );
+        }
+
+        // Increment the review cycle counter and record last_reviewed_sha.
+        // This happens regardless of whether a revision was warranted — the
+        // cycle ticks on every completed reviewer pass. A failure here is
+        // non-fatal (the task is already in in_review).
         if duplicate_head_review {
             tracing::warn!(
                 execution_id = %execution.id,
@@ -883,6 +934,18 @@ impl WorkerCompletionHandler {
                 self.pr_state_checker.as_ref(),
             ) {
                 Ok(revision) => {
+                    if let Err(err) = self
+                        .work_db
+                        .set_review_verdict_revision_task_id(&execution.id, &revision.id)
+                    {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_task_id,
+                            revision_task_id = %revision.id,
+                            ?err,
+                            "pr_review finalize: failed to record revision_task_id on the review verdict",
+                        );
+                    }
                     tracing::info!(
                         execution_id = %execution.id,
                         producing_task_id,
@@ -912,6 +975,18 @@ impl WorkerCompletionHandler {
                     // Revision creation failed (parent no longer revisable — PR
                     // merged or closed between review and now). The producing task
                     // is already in in_review; fall through to ReviewPassCompleted.
+                    // The findings this pass computed are about to be discarded —
+                    // amend the verdict this transaction already wrote so that
+                    // destruction leaves a trace instead of a silent
+                    // `completed_with_findings` row with no revision to show for it.
+                    if let Err(mark_err) = self.work_db.mark_review_verdict_revision_creation_failed(&execution.id) {
+                        tracing::warn!(
+                            execution_id = %execution.id,
+                            producing_task_id,
+                            ?mark_err,
+                            "pr_review finalize: failed to record revision_creation_failed on the review verdict",
+                        );
+                    }
                     tracing::warn!(
                         execution_id = %execution.id,
                         producing_task_id,

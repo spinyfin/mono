@@ -209,7 +209,7 @@ fn record_worker_pr_completion_binds_pr_and_advances_to_in_review() {
     let pr_url = "https://github.com/spinyfin/mono/pull/4030";
 
     let completion = db
-        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview)
+        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap()
         .expect("a live execution must return Some(WorkerPrCompletion)");
 
@@ -285,7 +285,7 @@ fn pr_completion_and_no_op_completion_differ_in_status_and_pr_binding() {
     let (_pb, noop_chore, noop_exec) = make_waiting_human_chore(&db, "noop-path");
 
     let pr_done = db
-        .record_worker_pr_completion(&pr_exec, pr_url, None, WorkerPrCompletionTarget::InReview)
+        .record_worker_pr_completion(&pr_exec, pr_url, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap()
         .unwrap();
     let noop_done = db
@@ -318,13 +318,13 @@ fn record_worker_pr_completion_noop_when_execution_terminal() {
     let pr_url = "https://github.com/spinyfin/mono/pull/4050";
 
     // First call finalises the execution.
-    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview)
+    db.record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap()
         .expect("first completion must return Some");
 
     // Second call sees a terminal execution and no-ops.
     let repeat = db
-        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview)
+        .record_worker_pr_completion(&exec_id, pr_url, None, WorkerPrCompletionTarget::InReview, None)
         .unwrap();
     assert!(
         repeat.is_none(),

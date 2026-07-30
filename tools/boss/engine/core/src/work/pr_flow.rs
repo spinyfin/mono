@@ -18,12 +18,18 @@ impl WorkDb {
     /// Returns `Ok(None)` if the execution has already been finalised
     /// (terminal status), making this safe to call from a hook handler
     /// that may fire repeatedly.
+    ///
+    /// `review_verdict`, when `Some`, is inserted into `pr_review_verdicts`
+    /// inside the SAME transaction as the writes below — see
+    /// [`crate::work::ReviewVerdictInput`]'s docs. Every non-`pr_review`
+    /// caller passes `None`.
     pub fn record_worker_pr_completion(
         &self,
         execution_id: &str,
         pr_url: &str,
         result_summary: Option<&str>,
         target: WorkerPrCompletionTarget,
+        review_verdict: Option<ReviewVerdictInput>,
     ) -> Result<Option<WorkerPrCompletion>> {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
@@ -143,6 +149,13 @@ impl WorkDb {
                     params![execution_id, trimmed],
                 )?;
             }
+        }
+
+        // Written in the same transaction as the writes above: a `pr_review`
+        // pass can never reach `completed` without this row committing
+        // alongside it, and this row can never exist for a pass that didn't.
+        if let Some(verdict) = review_verdict.as_ref() {
+            Self::insert_review_verdict_in_tx(&tx, execution_id, &work_item_id, verdict)?;
         }
 
         let updated_execution = query_execution(&tx, execution_id).require("execution", execution_id)?;

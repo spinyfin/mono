@@ -762,6 +762,63 @@ fn mark_execution_orphaned_preserves_workspace_and_stamps_run() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Regression: `PaneSpawnRunner` stamps `work_runs.finished_at` (with a
+/// generic "spawned pane" `result_summary`) the instant the pane comes up —
+/// before the worker ever produces a shell. When a subsequent
+/// never-started-spawn reap calls `mark_execution_orphaned`, the run row is
+/// already closed, so the reason must still land somewhere durable
+/// (`error_text`) instead of being silently dropped because both of the
+/// `result_summary` write's guards (`finished_at IS NULL`,
+/// `COALESCE(result_summary, …)`) are defeated. `result_summary` itself must
+/// be left untouched — this fix must not clobber the legitimate spawn-confirm
+/// message.
+#[test]
+fn mark_execution_orphaned_records_reason_in_error_text_when_run_already_closed() {
+    let path = temp_db_path("reap-orphan-already-closed-run");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Orphan candidate, closed run");
+    let execution = create_ready_chore_execution(&db, chore.id.clone());
+    let (_running, run) = db
+        .start_execution_run(
+            &execution.id,
+            "worker-orphan-2",
+            "mono",
+            "lease-ORPH2",
+            "mono-agent-005",
+            "/tmp/mono-agent-005",
+        )
+        .unwrap();
+
+    // Simulate `PaneSpawnRunner`'s spawn-confirm completion: the run row is
+    // closed with a generic summary before the worker ever produces a shell.
+    let spawn_confirm_summary = "Spawned worker pane in slot 3 (shell pid 4242).";
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE work_runs SET finished_at = '1000', result_summary = ?2 WHERE id = ?1",
+            rusqlite::params![run.id, spawn_confirm_summary],
+        )
+        .unwrap();
+
+    let reason = "ghostty_surface_new returned NULL (no active display)";
+    let orphaned = db.mark_execution_orphaned(&execution.id, reason).unwrap();
+    assert_eq!(orphaned.status, ExecutionStatus::Orphaned);
+
+    let run_after = db.get_run(&run.id).unwrap();
+    // The pre-existing spawn-confirm summary must survive untouched.
+    assert_eq!(run_after.result_summary.as_deref(), Some(spawn_confirm_summary));
+    // But the real orphan reason must now be durable in error_text.
+    assert_eq!(
+        run_after.error_text.as_deref(),
+        Some(reason),
+        "the reap reason must land in error_text even when the run row was already \
+         closed at spawn-confirm time",
+    );
+
+    let _ = std::fs::remove_file(path);
+}
+
 /// Reaping a row that's already terminal must error rather than
 /// silently no-op — same contract as `cancel_execution`. This is
 /// what stops the engine-startup reaper from racing the existing
