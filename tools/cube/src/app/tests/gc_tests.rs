@@ -1708,7 +1708,11 @@ fn gc_bounds_the_reuse_probe_by_the_remaining_pass_deadline() {
     let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
 
     // A fetch that would take far longer than the whole pass is allowed.
-    let budget = Duration::from_millis(300);
+    // Comfortably above `MIN_SUBPROCESS_BUDGET` so the probe is still spawned
+    // (and clipped) rather than deferred outright before it ever starts —
+    // that floor has its own coverage in
+    // `gc_defers_a_probe_whose_remaining_budget_is_too_small_to_spawn`.
+    let budget = Duration::from_secs(2);
     let runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws_path.to_path_buf(), "jj", &["git", "fetch"], "").taking(Duration::from_secs(30)),
     ]);
@@ -1742,6 +1746,55 @@ fn gc_bounds_the_reuse_probe_by_the_remaining_pass_deadline() {
         timeouts[0] <= budget,
         "the pass deadline must reach the subprocess bound, got {:?}",
         timeouts[0],
+    );
+
+    // Untouched, and eligible again next pass.
+    let ws_after = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    assert_eq!(ws_after.health_status, Some(crate::metadata::WorkspaceHealth::Dirty));
+}
+
+/// The off-by-nothing regression this module's other test is named for: the
+/// per-candidate deadline check above only catches a budget that has already
+/// hit zero. It says nothing about a budget that is still nominally positive
+/// but too small for any subprocess to plausibly complete in — e.g. a few
+/// tens of milliseconds left in a multi-millisecond-precision pass. Handing
+/// that to `run_with_timeout` spawns a doomed process, gets it killed almost
+/// immediately, and folds the resulting `CommandTimedOut` into "probe failed"
+/// — indistinguishable from a genuine health problem. The fix must refuse to
+/// spawn at all once the remaining budget drops below the floor.
+#[test]
+fn gc_defers_a_probe_whose_remaining_budget_is_too_small_to_spawn() {
+    use std::time::{Duration, Instant};
+
+    let (tempdir, database_path) = with_database_path();
+    let (store, ws_path) = setup_unhealthy_gc_scenario(&tempdir, &database_path);
+
+    store
+        .update_workspace_health("mono", "mono-agent-001", crate::metadata::WorkspaceHealth::Dirty)
+        .expect("mark dirty");
+
+    let ws = store.get_workspace_by_path(&ws_path).unwrap().unwrap();
+    let fake_now = ws.unhealthy_since_epoch_s.unwrap() + 6 * 86_400;
+
+    // No expected commands: a doomed spawn must never reach the runner.
+    let runner = FakeRunner::new(vec![]);
+    let budget = Duration::from_millis(50);
+
+    let started = Instant::now();
+    let recycled = gc_aged_unhealthy_workspaces(
+        &runner,
+        &store,
+        Some(&database_path),
+        fake_now,
+        5 * 86_400,
+        Some(started + budget),
+    );
+    runner.assert_exhausted();
+
+    assert_eq!(recycled, 0, "a candidate that could not be evaluated is deferred");
+    assert!(
+        runner.observed_timeouts().is_empty(),
+        "no subprocess should have been spawned at all"
     );
 
     // Untouched, and eligible again next pass.

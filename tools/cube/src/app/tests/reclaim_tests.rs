@@ -308,7 +308,10 @@ fn a_probe_that_outlives_the_pass_budget_leaves_the_artifact_tree_alone() {
     set_last_activity(&database_path, "mono-agent-001", LONG_IDLE);
 
     let runner = FakeRunner::new(vec![tracked_probe(&ws, "target", "").taking(Duration::from_secs(30))]);
-    let deadline = Instant::now() + Duration::from_millis(200);
+    // Comfortably above `MIN_SUBPROCESS_BUDGET` so the probe is still spawned
+    // (and clipped) rather than deferred outright — that floor has its own
+    // coverage below.
+    let deadline = Instant::now() + Duration::from_secs(2);
     let report = compact_free_workspaces(&runner, &store, Some(&database_path), None, NOW, false, Some(deadline));
     runner.assert_exhausted();
 
@@ -319,9 +322,41 @@ fn a_probe_that_outlives_the_pass_budget_leaves_the_artifact_tree_alone() {
     );
     let timeouts = runner.observed_timeouts();
     assert!(
-        timeouts[0] <= Duration::from_millis(200),
+        timeouts[0] <= Duration::from_secs(2),
         "the probe must be clipped to what the pass deadline has left: {:?}",
         timeouts[0],
+    );
+}
+
+#[test]
+fn a_pass_deadline_too_small_to_finish_a_probe_defers_without_spawning_one() {
+    // Below `MIN_SUBPROCESS_BUDGET` the remaining time is not just tight, it
+    // is doomed: `jj`'s own startup overhead alone would outlast it. Spawning
+    // anyway produces a subprocess that is killed almost immediately, and
+    // that kill is indistinguishable from a genuine probe failure to the
+    // caller — this is the off-by-nothing bug. The fix must refuse to spawn
+    // at all, the same as when the deadline has already passed outright.
+    let _config = ConfigGuard::new("[pool]\nbuild-artifact-dirs = [\"target\"]\n");
+    let (tempdir, database_path) = with_database_path();
+    let (store, workspace_root) = seed_pool(&tempdir, &database_path, 1, None);
+    let ws = workspace_root.join("mono-agent-001");
+    let target = write_artifact_tree(&ws, "target");
+    set_last_activity(&database_path, "mono-agent-001", LONG_IDLE);
+
+    // No expected commands: a doomed spawn must never reach the runner.
+    let runner = FakeRunner::new(vec![]);
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let report = compact_free_workspaces(&runner, &store, Some(&database_path), None, NOW, false, Some(deadline));
+    runner.assert_exhausted();
+
+    assert_eq!(report.dirs_removed, 0);
+    assert!(
+        target.is_dir(),
+        "a candidate that could not be evaluated in time must be left alone, not deleted"
+    );
+    assert!(
+        runner.observed_timeouts().is_empty(),
+        "no subprocess should have been spawned at all"
     );
 }
 
