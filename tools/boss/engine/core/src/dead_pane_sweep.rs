@@ -66,13 +66,6 @@
 //!   never touched here.
 //! - **No pid → skip**: an execution whose pid was never reported (surface
 //!   never attached, or a pre-fix spawn) yields `None` and is left alone.
-//! - **Expected one-shot exit → skip**: a driver declaring
-//!   `WorkerProcessLifetime::OneTurnPerProcess` exits by design once its turn
-//!   is delivered, so a dead pid there is not a dead worker (no driver in the
-//!   registry currently declares this — see
-//!   `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`). See
-//!   [`crate::worker_process_exit`]; a one-shot run that exited *without*
-//!   delivering a turn boundary is still reaped here.
 //! - **Alive / not-ours / probe-error → skip**: only `Dead` (ESRCH) reaps;
 //!   `EPERM` (alive, not ours) and any other errno are treated conservatively
 //!   as alive. Pid recycling can therefore only ever cause a *missed* reap
@@ -181,18 +174,17 @@ pub async fn run_one_pass(
 }
 
 /// Durable, restart-robust evidence that a LOCAL execution's worker shell pid
-/// is dead (`kill(pid, 0) == ESRCH`), gated by `is_live()`, the grace window,
-/// and the one-shot-driver exit guard. Returns `Some(shell_pid)` only on
-/// positive evidence of death; `None` on anything ambiguous (not live, still
-/// within the grace window, no durable pid, alive/EPERM/unexpected errno, or
-/// a one-shot driver's expected post-turn exit).
+/// is dead (`kill(pid, 0) == ESRCH`), gated by `is_live()` and the grace
+/// window. Returns `Some(shell_pid)` only on positive evidence of death;
+/// `None` on anything ambiguous (not live, still within the grace window, no
+/// durable pid, or alive/EPERM/unexpected errno).
 ///
 /// This is the **exclusive** implementation of the pid-death signal — see the
 /// module doc on "exactly one reaper per death signal". [`reconcile_if_pane_dead`]
 /// and `cube_lease_heartbeat::db_fallback_death_evidence` both call this
 /// rather than re-probing, so a future change to the liveness rules (a wider
-/// grace window, a new one-shot-driver exemption) lands here once instead of
-/// drifting across call sites.
+/// grace window, a new evidence source) lands here once instead of drifting
+/// across call sites.
 pub(crate) async fn shell_pid_death_evidence(
     work_db: &WorkDb,
     execution: &WorkExecution,
@@ -239,22 +231,6 @@ pub(crate) async fn shell_pid_death_evidence(
         WorkerProcess::Gone { shell_pid } => i64::from(shell_pid),
         _ => return None,
     };
-
-    // A dead pid is only a dead *worker* when the driver's process was
-    // supposed to outlive its turns. `codex exec` serves one turn per process
-    // and exits, so its pid is dead by design once the turn is delivered —
-    // this sweep is restart-robust and DB-driven, which means without this
-    // check it would re-orphan a cleanly finished one-shot run on its next
-    // 60s pass even after the pane-death path correctly spared it. No drain
-    // here: this sweep only ever sees exits that happened at least
-    // `PANE_DEATH_GRACE_SECS` ago, by which time the run's progress stream has
-    // long since been read, so the durable record is settled.
-    if !crate::worker_process_exit::classify_worker_process_exit(work_db, None, &execution.id)
-        .await
-        .is_death()
-    {
-        return None;
-    }
 
     Some(shell_pid)
 }

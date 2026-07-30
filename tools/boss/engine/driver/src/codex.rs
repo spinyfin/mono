@@ -2802,6 +2802,5 @@ mod tests {
     fn codex_declares_persistent_lifetime() {
         let driver = CodexDriver::default();
         assert_eq!(driver.worker_process_lifetime(), WorkerProcessLifetime::Persistent);
-        assert!(!driver.worker_process_lifetime().exits_after_each_turn());
     }
 }

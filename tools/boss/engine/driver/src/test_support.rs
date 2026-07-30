@@ -13,7 +13,7 @@ use boss_protocol::{NormalizeError, WorkerEvent};
 use super::{
     AgentDriver, CapabilitySet, DriverDescriptor, DriverRuntimeState, ModelMenu, PermissionArtifacts, PermissionInput,
     PostHocInterceptionFn, ProgressFidelity, ProgressIngress, ProgressObservationConfig, SpawnPlan, SpawnRequest,
-    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
+    ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass, WorkerProcessLifetime,
 };
 
 /// RAII override of [`crate::codex::CODEX_HOMES_ROOT_ENV`], obtained
@@ -141,6 +141,7 @@ pub struct StubDriver {
     pub descriptor: DriverDescriptor,
     pub caps: CapabilitySet,
     pub post_hoc_interception_fn: Option<PostHocInterceptionFn>,
+    pub worker_process_lifetime: WorkerProcessLifetime,
 }
 
 impl StubDriver {
@@ -149,12 +150,22 @@ impl StubDriver {
             descriptor,
             caps,
             post_hoc_interception_fn: None,
+            worker_process_lifetime: WorkerProcessLifetime::Persistent,
         }
     }
 
     /// Chainable: register the fixture's [`PostHocInterceptionFn`].
     pub fn with_post_hoc_interception(mut self, f: PostHocInterceptionFn) -> Self {
         self.post_hoc_interception_fn = Some(f);
+        self
+    }
+
+    /// Chainable: override the fixture's declared [`WorkerProcessLifetime`]
+    /// (defaults to `Persistent`, same as the trait default) — e.g. to
+    /// exercise [`crate::registry::DriverRegistry`]'s admission guard against
+    /// a driver that declares `OneTurnPerProcess`.
+    pub fn with_worker_process_lifetime(mut self, lifetime: WorkerProcessLifetime) -> Self {
+        self.worker_process_lifetime = lifetime;
         self
     }
 }
@@ -238,5 +249,8 @@ impl AgentDriver for StubDriver {
     }
     fn structured_output_fallback(&self, _: StructuredOutputKind, _: &str) -> Vec<FallbackCandidate> {
         Vec::new()
+    }
+    fn worker_process_lifetime(&self) -> WorkerProcessLifetime {
+        self.worker_process_lifetime
     }
 }

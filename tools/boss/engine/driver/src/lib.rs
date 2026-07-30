@@ -833,20 +833,25 @@ pub struct InterruptRecoverySnapshot {
 ///
 /// Boss's process-liveness reapers ([`crate`]'s consumers: the engine's
 /// dead-pid sweep, the app's pane-death report, and the durable-pid dead-pane
-/// sweep) were all written against Claude Code, whose CLI is a long-lived
-/// interactive session: it outlives every turn, so its exit can only ever mean
-/// the worker died mid-run. That inference is *false* for a driver whose CLI
-/// runs one turn per process — `codex exec` writes `turn.completed` and then
-/// exits, by design. Reading that exit as a crash is what reaped a cleanly
-/// finished Codex run 160 ms after it succeeded, orphaned it, and redispatched
-/// the same work item ~20 times.
+/// sweep) are all written against a long-lived interactive session: it
+/// outlives every turn, so its exit can only ever mean the worker died
+/// mid-run. That inference was *false* for `codex exec`, whose CLI ran one
+/// turn per process and wrote `turn.completed` before exiting by design —
+/// reading that exit as a crash reaped a cleanly finished Codex run 160 ms
+/// after it succeeded, orphaned it, and redispatched the same work item ~20
+/// times. Codex was moved to a persistent interactive session to close that
+/// gap (see `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`),
+/// and the classification/drain machinery that used to pair a one-shot
+/// exit with terminal-result evidence — so a driver could legitimately
+/// declare [`Self::OneTurnPerProcess`] — was removed along with the last
+/// driver that needed it.
 ///
-/// This is deliberately a *driver* property rather than something the engine
-/// infers from the pane or the process table, for the same reason
-/// [`MidTurnPaneInput`] is: only the driver knows what its foreground process
-/// is contracted to do. It is **not** a licence to skip the liveness check —
-/// see [`Self::OneTurnPerProcess`] for the evidence a one-shot exit must still
-/// produce before it is believed.
+/// No registered driver may declare [`Self::OneTurnPerProcess`] today:
+/// [`crate::registry::DriverRegistry`] refuses to register one that does
+/// (mirroring its `refuse_stdout_jsonl_ingress` guard for a different
+/// discontinued topology). A future one-shot driver must rebuild that
+/// classification/drain machinery before it can declare this variant — not
+/// just flip the enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WorkerProcessLifetime {
     /// The foreground process is expected to outlive every turn it serves and
@@ -854,32 +859,14 @@ pub enum WorkerProcessLifetime {
     /// TUI). Its exit is therefore always unexpected: a crash, an OOM, a
     /// kill-9, or the host app dying and taking the pane with it.
     ///
-    /// The safe default for any driver that has not established otherwise —
-    /// under it every reaper behaves exactly as it did before this property
-    /// existed.
+    /// The only variant any registered driver may declare today — see the
+    /// type doc above.
     #[default]
     Persistent,
-    /// The foreground process serves exactly one turn and then exits (`codex
-    /// exec`; verified codex-cli 0.145.0 — see
-    /// `tools/boss/docs/investigations/ghostty-codex-pane-viability.md` §"one
-    /// turn then process exit"). Exit *after* the driver has delivered a turn
-    /// boundary is the process's normal end of life, not a death.
-    ///
-    /// Exit *without* one still is a death. This variant does not weaken the
-    /// liveness check; it only says the check must be paired with the run's
-    /// own terminal-result evidence instead of standing alone. The engine
-    /// resolves that pairing causally — the process's exit is what makes its
-    /// progress stream final, so the stream is drained to end-of-file before
-    /// the verdict is taken — never by widening a timing window.
+    /// The foreground process serves exactly one turn and then exits.
+    /// [`crate::registry::DriverRegistry`] refuses to register a driver that
+    /// declares this — see the type doc above for why.
     OneTurnPerProcess,
-}
-
-impl WorkerProcessLifetime {
-    /// True when this driver's process exiting after a delivered turn
-    /// boundary is expected rather than a death.
-    pub fn exits_after_each_turn(self) -> bool {
-        matches!(self, Self::OneTurnPerProcess)
-    }
 }
 
 /// Fidelity tier of the [`WorkerEvent`] stream a driver's
@@ -2037,9 +2024,9 @@ pub trait AgentDriver: Send + Sync {
     /// liveness before it concludes a vanished process means a dead worker.
     ///
     /// Defaults to [`WorkerProcessLifetime::Persistent`], which reproduces the
-    /// pre-existing behaviour exactly: any exit is a death and is reaped. A
-    /// driver whose CLI is one-turn-per-process must say so, and must be able
-    /// to point at the evidence — see [`WorkerProcessLifetime::OneTurnPerProcess`].
+    /// pre-existing behaviour exactly: any exit is a death and is reaped. See
+    /// [`WorkerProcessLifetime::OneTurnPerProcess`] for why no driver may
+    /// declare otherwise today.
     fn worker_process_lifetime(&self) -> WorkerProcessLifetime {
         WorkerProcessLifetime::Persistent
     }

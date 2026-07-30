@@ -1885,6 +1885,5 @@ mod tests {
             ClaudeDriver.worker_process_lifetime(),
             WorkerProcessLifetime::Persistent
         );
-        assert!(!ClaudeDriver.worker_process_lifetime().exits_after_each_turn());
     }
 }

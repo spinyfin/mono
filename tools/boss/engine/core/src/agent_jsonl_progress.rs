@@ -493,23 +493,13 @@ enum IngressStart {
 
 /// How an in-flight file ingress is being brought to an end.
 ///
-/// The two endings are not interchangeable, which is why this is a tri-state
-/// rather than the boolean it replaced. [`Self::Cancel`] is teardown: the
-/// engine is releasing the pane and unread bytes are forfeit. [`Self::Drain`]
-/// is the *writer* ending: the agent process has exited, so the file can never
-/// grow again and every byte it holds is part of this run's record — including,
-/// for a one-turn-per-process driver, the `turn.completed` envelope that says
-/// the run finished cleanly. Cancelling there would discard exactly the
-/// evidence [`crate::worker_process_exit`] needs.
+/// [`Self::Cancel`] is teardown: the engine is releasing the pane and unread
+/// bytes are forfeit.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum StreamHalt {
     /// Normal operation: keep tailing the growing file.
     #[default]
     Running,
-    /// The writer process has exited. Read to end of file, publish everything
-    /// that is there, then close the stream. Bounded by the file's own size —
-    /// there is nothing to wait for, so this terminates without a timer.
-    Drain,
     /// Tear down now. Anything unread is dropped.
     Cancel,
 }
@@ -517,7 +507,6 @@ enum StreamHalt {
 struct RunHandle {
     activate: Option<oneshot::Sender<()>>,
     halt: watch::Sender<StreamHalt>,
-    join: tokio::task::JoinHandle<()>,
 }
 
 /// What [`AgentJsonlProgressManager::resume_run`] did.
@@ -708,7 +697,7 @@ impl AgentJsonlProgressManager {
         let (activate_tx, activate_rx) = oneshot::channel();
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
-        let join = tokio::spawn(async move {
+        tokio::spawn(async move {
             run_prepared(task_run_id, driver, prepared, sink, store, start, activate_rx, halt_rx).await;
         });
         runs.insert(
@@ -716,7 +705,6 @@ impl AgentJsonlProgressManager {
             RunHandle {
                 activate: Some(activate_tx),
                 halt: halt_tx,
-                join,
             },
         );
         Ok(())
@@ -741,8 +729,6 @@ impl AgentJsonlProgressManager {
     /// unterminated final fragment and drains its ordered dispatch queue.
     ///
     /// Teardown, not completion: bytes the tail had not read yet are dropped.
-    /// A caller that is reacting to the *writer* exiting wants
-    /// [`Self::finish_run`] instead.
     pub fn stop_run(&self, run_id: &str) {
         let Ok(mut runs) = self.runs.lock() else {
             tracing::warn!(run_id, "agent JSONL progress: manager mutex poisoned during stop");
@@ -752,38 +738,6 @@ impl AgentJsonlProgressManager {
             let _ = handle.halt.send(StreamHalt::Cancel);
             drop(handle.activate);
         }
-    }
-
-    /// Signal that the run's **writer has exited**, so the source file is
-    /// final: read it to end of file, dispatch every remaining event through
-    /// the sink, then close. Returns the ingress task's join handle so the
-    /// caller can await that completion.
-    ///
-    /// This is the ordering primitive behind the one-turn-per-process exit
-    /// check. It is causal, not temporal: the agent process exiting is what
-    /// makes the file final, so "read to EOF" terminates on the file's own
-    /// size with nothing to wait for — it is not a grace window that hopes a
-    /// racing event turns up. When the returned handle resolves, every event
-    /// the run ever produced has been through the engine's fan-out, so
-    /// `turn.completed` has already reached the completion handler and the
-    /// durable turn-boundary record is written.
-    ///
-    /// Returns `None` when no ingress is registered for `run_id` — a driver
-    /// with a different progress transport (Claude's hook callback), a run
-    /// whose ingress already ended, or one that never started. Callers must
-    /// treat `None` as "nothing to drain", never as "the run delivered
-    /// nothing": the verdict comes from the durable record, not from here.
-    pub fn finish_run(&self, run_id: &str) -> Option<tokio::task::JoinHandle<()>> {
-        let Ok(mut runs) = self.runs.lock() else {
-            tracing::warn!(run_id, "agent JSONL progress: manager mutex poisoned during finish");
-            return None;
-        };
-        let handle = runs.remove(run_id)?;
-        let _ = handle.halt.send(StreamHalt::Drain);
-        // Dropping the activate sender makes a never-activated ingress return
-        // immediately rather than block the caller until its discovery timeout.
-        drop(handle.activate);
-        Some(handle.join)
     }
 }
 
@@ -937,10 +891,8 @@ async fn discover_candidate(
 ) -> Result<Option<Candidate>, String> {
     let deadline = tokio::time::Instant::now() + DISCOVERY_TIMEOUT;
     loop {
-        // Either ending stops discovery. A `Drain` here means the writer
-        // exited before it ever created a correlated rollout — there is
-        // nothing to read to EOF, and the absent turn-boundary record is
-        // exactly what makes that exit a death.
+        // A `Cancel` during discovery stops it: the engine is tearing the
+        // ingress down and there is nothing left to attach to.
         if *halt.borrow() != StreamHalt::Running {
             return Ok(None);
         }
@@ -1355,16 +1307,6 @@ where
             }
         }
 
-        // Everything the file held up to `size` has now been published. Under
-        // `Drain` the writer process has already exited, so the file cannot
-        // grow again and this is genuinely end-of-stream: close it rather than
-        // poll a file nobody is writing. Placed AFTER the read above so a
-        // drain can never truncate the run's own terminal envelope — which is
-        // the whole point of draining instead of cancelling.
-        if *halt.borrow() == StreamHalt::Drain {
-            return Ok(());
-        }
-
         let path_metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -1373,8 +1315,8 @@ where
                     changed = halt.changed() => {
                         // Every sender dropped: nothing can ever halt us. End
                         // cleanly rather than spinning the poll loop forever.
-                        // A prior `Drain`/`Cancel` still reaches us via
-                        // `changed()`'s last Ok (version bumps before close).
+                        // A prior `Cancel` still reaches us via `changed()`'s
+                        // last Ok (version bumps before close).
                         if changed.is_err() {
                             return Ok(());
                         }
@@ -1415,13 +1357,9 @@ where
         tokio::select! {
             _ = tokio::time::sleep(FILE_POLL) => {}
             changed = halt.changed() => {
-                // Re-run the loop so a `Drain` re-reads the file (picking up
-                // bytes written between the last poll and the writer's exit)
-                // before the drain check above closes the stream; the
-                // top-of-loop check handles `Cancel`. Every sender dropped
-                // is terminal: end cleanly rather than busy-looping the poll.
-                // A prior `Drain` still arrives as Ok first (version before
-                // the closed flag).
+                // Re-run the loop on any change; the top-of-loop check
+                // handles `Cancel`. Every sender dropped is terminal: end
+                // cleanly rather than busy-looping the poll.
                 if changed.is_err() {
                     return Ok(());
                 }
@@ -1471,13 +1409,6 @@ fn record_delimiter(map: &Mutex<StreamFileMap>, next_file_start: u64, identity: 
 
 /// Publish `bytes` to the reader, abandoning the write only on
 /// [`StreamHalt::Cancel`].
-///
-/// A `Drain` transition deliberately does **not** cancel an in-flight write:
-/// these bytes have already been read off the run's now-final file, and
-/// `write_all` is not cancellation-safe — dropping it mid-write would lose a
-/// partial chunk, corrupting the very envelope the drain exists to deliver.
-/// The consumer is actively reading to EOF during a drain, so the await
-/// completes rather than hangs.
 async fn write_or_halt(
     writer: &mut tokio::io::DuplexStream,
     bytes: &[u8],
@@ -1492,8 +1423,7 @@ async fn write_or_halt(
     }
 }
 
-/// Resolve only once the halt state reaches [`StreamHalt::Cancel`], so a
-/// `Running` → `Drain` transition never wins a `select!` against a write.
+/// Resolve only once the halt state reaches [`StreamHalt::Cancel`].
 async fn wait_for_cancel(halt: &mut watch::Receiver<StreamHalt>) {
     loop {
         if *halt.borrow() == StreamHalt::Cancel {
@@ -1659,30 +1589,6 @@ mod tests {
             + "\n"
     }
 
-    /// [`rollout_text`] minus its final `task_complete` record — the state of
-    /// a rollout mid-turn, before the envelope that ends it.
-    fn rollout_text_without_task_complete(workspace: &Path, thread_id: &str) -> String {
-        let full = rollout_text(workspace, thread_id);
-        let mut lines: Vec<&str> = full.lines().collect();
-        lines.pop();
-        lines.join("\n") + "\n"
-    }
-
-    /// Just the `task_complete` line — appended to simulate `codex exec`
-    /// writing its terminal envelope immediately before the process exits.
-    fn task_complete_line() -> String {
-        serde_json::to_string(&serde_json::json!({
-            "type":"event_msg",
-            "payload":{
-                "type":"task_complete",
-                "turn_id":"turn-live",
-                "last_agent_message":"done"
-            }
-        }))
-        .unwrap()
-            + "\n"
-    }
-
     fn rollout_with_marker(workspace: &Path, thread_id: &str, marker: &str) -> String {
         let meta = serde_json::json!({
             "type":"session_meta",
@@ -1839,101 +1745,6 @@ mod tests {
         drop(events);
 
         manager.stop_run("run-live");
-    }
-
-    /// The ordering guarantee `worker_process_exit` rests on: when the agent
-    /// process exits its rollout is final, so `finish_run` must read whatever
-    /// is left of it and put every remaining event through the fan-out before
-    /// its handle resolves.
-    ///
-    /// The terminal envelope is appended and the drain requested with no wait
-    /// in between — exactly the shape of the live failure, where `codex exec`
-    /// wrote `task_complete` and exited 160 ms before anything read it. Under
-    /// `stop_run`'s cancel those bytes would simply be dropped.
-    #[tokio::test]
-    async fn finish_run_drains_the_final_envelope_before_its_handle_resolves() {
-        let temp = TempDir::new().unwrap();
-        let sessions = temp.path().join("sessions");
-        let workspace = temp.path().join("workspace");
-        fs::create_dir_all(&sessions).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-
-        let manager = AgentJsonlProgressManager::new();
-        let sink = CaptureSink::default();
-        manager
-            .prepare_run(
-                "run-drain",
-                Arc::new(crate::driver::CodexDriver::default()),
-                AgentJsonlFileIngress {
-                    directory: sessions.clone(),
-                    filename_prefix: "rollout-".into(),
-                    filename_suffix: ".jsonl".into(),
-                    workspace_path: workspace.clone(),
-                },
-                sink.clone(),
-                test_store(),
-            )
-            .unwrap();
-
-        let path = sessions.join("rollout-new-thread-drain.jsonl");
-        fs::write(&path, rollout_text_without_task_complete(&workspace, "thread-drain")).unwrap();
-        manager.activate_run("run-drain");
-
-        // Let the tail attach and consume the mid-turn records, so the only
-        // thing the drain can be responsible for is the terminal envelope.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                if sink.events.lock().unwrap().len() >= 4 {
-                    break;
-                }
-                sink.notify.notified().await;
-            }
-        })
-        .await
-        .expect("mid-turn rollout events should reach the fanout");
-        assert!(
-            !sink
-                .events
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|event| matches!(event.event, WorkerEvent::Stop { .. })),
-            "precondition: no turn boundary has been observed yet",
-        );
-
-        {
-            use std::io::Write;
-            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-            file.write_all(task_complete_line().as_bytes()).unwrap();
-        }
-
-        let join = manager.finish_run("run-drain").expect("an active ingress to drain");
-        tokio::time::timeout(Duration::from_secs(5), join)
-            .await
-            .expect("draining a final file must terminate on the file's own size")
-            .unwrap();
-
-        let events = sink.events.lock().unwrap();
-        assert!(
-            events.iter().any(|event| matches!(
-                &event.event,
-                WorkerEvent::Stop {
-                    stop_reason: StopReason::Completed,
-                    ..
-                }
-            )),
-            "the terminal envelope must have been fanned out by the time the drain resolved; got: {:?}",
-            events.iter().map(|e| &e.event).collect::<Vec<_>>(),
-        );
-    }
-
-    /// `finish_run` is keyed on a live ingress, and returning `None` must mean
-    /// "nothing to drain" — never "the run delivered nothing". Callers read
-    /// the durable turn-boundary record for that.
-    #[tokio::test]
-    async fn finish_run_is_none_for_an_unknown_run() {
-        let manager = AgentJsonlProgressManager::new();
-        assert!(manager.finish_run("run-never-prepared").is_none());
     }
 
     async fn read_until_contains(reader: &mut tokio::io::DuplexStream, observed: &mut Vec<u8>, needle: &[u8]) {

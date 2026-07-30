@@ -96,10 +96,8 @@ pub fn driver_or_default(driver: Option<&dyn AgentDriver>) -> &dyn AgentDriver {
 /// own `tasks.driver` → `products.default_driver` → engine-default chain.
 ///
 /// `pub(crate)` so call sites that only need the slug (not a resolved
-/// [`AgentDriver`]) — e.g. [`crate::worker_process_exit::one_turn_per_process`],
-/// which asks a driver for its [`crate::driver::WorkerProcessLifetime`] rather
-/// than for transcript parsing — go through the same pool-dispatch-aware
-/// resolution instead of reading `tasks.driver` directly and mis-resolving a
+/// [`AgentDriver`]) go through the same pool-dispatch-aware resolution
+/// instead of reading `tasks.driver` directly and mis-resolving a
 /// pool-dispatched run's actual driver.
 pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
     if let Some(slug) = pool_override_driver_slug(work_db, execution_id) {
