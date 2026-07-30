@@ -350,26 +350,17 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // a run nothing will ever revisit. Re-check right after inserting and
         // settle immediately rather than leaving it reading `queued` forever.
         //
-        // Drain directly (rather than going through
-        // `abandon_pending_probes_for_terminated_run`) so this call site can
+        // Reuse `abandon_pending_probes_for_terminated_run` (rather than
+        // hand-copying its drain-and-log body) so this call site can still
         // see whether the probe it just minted is among the ones settled
         // `Abandoned` — deciding before answering, per the doc above, rather
         // than answering `ProbeQueued` for a probe already known dead.
         let just_abandoned = if server_state.worker_registry.slot_for_run(&run_id).is_none() {
-            let ids = server_state.drain_pending_probes(
+            let ids = server_state.abandon_pending_probes_for_terminated_run(
                 &run_id,
-                ProbeDeliveryState::Abandoned,
-                "run's pane was released between the delivery-expectation check and the probe being \
-                 queued; the worker was gone before the probe's delivery boundary arrived",
+                "run's pane was released between the delivery-expectation check and the probe \
+                 being queued",
             );
-            if !ids.is_empty() {
-                tracing::warn!(
-                    run_id = %run_id,
-                    probe_ids = %ids.join(","),
-                    "run terminated with probes still queued; the accepted delivery commitment could \
-                     not be honoured — recorded as abandoned rather than left queued",
-                );
-            }
             ids.contains(&probe_id)
         } else {
             false
@@ -428,15 +419,27 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
             // say so loudly when the engine promised `Immediate` and the
             // immediate path then declined to deliver, which is the engine
             // breaking a commitment it made in the response it already sent.
+            // `Orphaned` still counts as the commitment honoured: it is recorded
+            // only after a successful `SendToPane` write, when the pane's pid
+            // liveness check failed after the fact (see
+            // `ProbeDeliveryState::is_undeliverable`'s doc) — the pane got the
+            // bytes, and a later `Replied` can still correct the record.
+            // `Dropped`/`Abandoned` are the only states where nothing was ever
+            // written, so only those break an `Immediate` commitment.
             let promised_now = expected_delivery == ProbeDeliveryExpectation::Immediate;
-            if promised_now && !matches!(outcome, ProbeDispatchOutcome::Dispatched(state) if !state.is_undeliverable())
-            {
+            let broke_commitment = promised_now
+                && !matches!(
+                    outcome,
+                    ProbeDispatchOutcome::Dispatched(state)
+                        if !matches!(state, ProbeDeliveryState::Dropped | ProbeDeliveryState::Abandoned)
+                );
+            if broke_commitment {
                 tracing::warn!(
                     run_id = %run_id_for_now,
                     probe_id = %probe_id_for_now,
                     outcome = outcome.as_str(),
-                    "probe was accepted with an `immediate` delivery commitment but the immediate \
-                     dispatch did not deliver it; it now depends on the next turn boundary",
+                    "probe was accepted with an `immediate` delivery commitment but settled \
+                     undeliverable without ever reaching the pane",
                 );
             } else {
                 tracing::debug!(

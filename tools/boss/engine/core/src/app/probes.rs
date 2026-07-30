@@ -470,7 +470,12 @@ impl ServerState {
     /// agents stop`, the stale/terminal/dead-pid sweeps, engine shutdown).
     /// Without this a probe accepted with a `next_turn_boundary` commitment
     /// outlives the run it was addressed to and reports `queued` forever.
-    pub(super) fn abandon_pending_probes_for_terminated_run(&self, run_id: &str, cause: &str) {
+    ///
+    /// Returns the drained probe ids so a caller that just minted a probe
+    /// (`handle_probe_run`'s post-insert re-check) can tell whether its own
+    /// probe was among the ones abandoned, without hand-copying this
+    /// function's drain-and-log body.
+    pub(super) fn abandon_pending_probes_for_terminated_run(&self, run_id: &str, cause: &str) -> Vec<String> {
         let ids = self.drain_pending_probes(
             run_id,
             ProbeDeliveryState::Abandoned,
@@ -485,6 +490,7 @@ impl ServerState {
                  not be honoured — recorded as abandoned rather than left queued",
             );
         }
+        ids
     }
 
     /// Whether the worker process behind `run_id` probes *dead* right now.
