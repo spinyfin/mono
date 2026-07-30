@@ -1273,15 +1273,13 @@ pub(super) async fn dispatch_post_hoc_interception_on_post_tool_use(
 /// foreground process.
 ///
 /// **Every exit is logged and returned.** This function is the drain path a
-/// probe accepted with a `next_turn_boundary` commitment depends on, and it
-/// used to have two exits that wrote nothing at all: the bare `pop → None`,
-/// and the no-slot branch when the queue was already empty. That silence is
-/// what made a dropped probe undiagnosable — a trace showing the completion
-/// handler running at a boundary and this function saying nothing was
-/// consistent with "no probe was queued", "the slot vanished" and "the probe
-/// was popped and lost", which are three very different bugs. The returned
-/// [`ProbeDispatchOutcome`] names the branch taken so tests can assert on it
-/// without scraping log output.
+/// probe accepted with a `next_turn_boundary` commitment depends on, so every
+/// exit — including the routine "nothing queued" case and the "queue emptied
+/// out from under the peek" race — is named and logged, so a trace can
+/// distinguish "no probe was queued" from "the slot vanished" from "something
+/// was queued and could not be delivered", which are different bugs. The
+/// returned [`ProbeDispatchOutcome`] names the branch taken so tests can
+/// assert on it without scraping log output.
 pub(super) async fn dispatch_probe_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -1424,10 +1422,16 @@ async fn deliver_probe_via_pane_write(
             );
             // Back to the front of the queue with the same probe id — callers
             // waiting on the matching `ProbeReplied` must not see their id
-            // silently reissued — and the run's delivery slot freed.
+            // silently reissued — and the run's delivery slot freed. If the
+            // run's slot mapping is already gone, `release_probe_reservation`
+            // settles the probe as `Abandoned` instead of requeuing it
+            // against a dead run.
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
-            server_state.release_probe_reservation(run_id, probe);
-            ProbeDispatchOutcome::RequeuedAfterFailure
+            if server_state.release_probe_reservation(run_id, probe) {
+                ProbeDispatchOutcome::RequeuedAfterFailure
+            } else {
+                ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
+            }
         }
     }
 }
@@ -1437,11 +1441,10 @@ async fn deliver_probe_via_pane_write(
 /// exited, and log the result. Returns the state actually recorded.
 ///
 /// `SendToPane` returning `Ok` only means the app wrote bytes into the pty. A
-/// pane whose foreground process is gone accepts those bytes with nobody to
-/// read them, which is how `probe-1` came to be reported `consumed` after
-/// being injected into a `codex` pane whose process had already exited. A
-/// `consumed` status that can mean that is not evidence of anything, so the
-/// engine checks liveness before making the claim.
+/// pane whose foreground process has already exited (observed with `codex`)
+/// accepts those bytes with nobody to read them, so a `consumed` status alone
+/// is not evidence anyone read the text — the engine checks liveness before
+/// making that claim.
 fn record_pane_write_outcome(
     server_state: &ServerState,
     run_id: &str,
@@ -1779,8 +1782,11 @@ async fn inject_probe_mid_turn(
                 "probe refused after claim (activity race); re-queuing for a later boundary",
             );
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
-            server_state.release_probe_reservation(run_id, probe);
-            ProbeDispatchOutcome::RequeuedAfterFailure
+            if server_state.release_probe_reservation(run_id, probe) {
+                ProbeDispatchOutcome::RequeuedAfterFailure
+            } else {
+                ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
+            }
         }
         PaneInjectOutcome::SendFailed(failure) => {
             tracing::warn!(
@@ -1791,8 +1797,11 @@ async fn inject_probe_mid_turn(
                 "mid-turn probe injection failed; pushing back onto queue",
             );
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Queued);
-            server_state.release_probe_reservation(run_id, probe);
-            ProbeDispatchOutcome::RequeuedAfterFailure
+            if server_state.release_probe_reservation(run_id, probe) {
+                ProbeDispatchOutcome::RequeuedAfterFailure
+            } else {
+                ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Abandoned)
+            }
         }
     }
 }

@@ -8,18 +8,17 @@
 //! a reply, and the observable [`ProbeDeliveryState`] each probe id moves
 //! through.
 //!
-//! Originally split out of `app.rs` as a pure structural move.
-//!
 //! **The invariant this module owns:** `pending_probes` and `probe_lifecycle`
 //! must never disagree. A probe id in `probe_lifecycle` at `Queued` is a live
 //! promise that some dispatch path still holds the probe and intends to
 //! deliver it. So a probe may only leave the pending queue by being
 //! dispatched (which records what happened to it) or through
 //! [`ServerState::drain_pending_probes`] (which settles it at an
-//! undeliverable state and says why). Removing it any other way — the bare
-//! `pending_probes.remove(run_id)` this module used to do on the discard path
-//! — leaves the promise standing with nothing behind it, which is how a probe
-//! came to report `queued` forever against a run whose pane had been reaped.
+//! undeliverable state and says why). A bare `pending_probes.remove(run_id)`
+//! leaves the promise standing with nothing behind it: `probe_lifecycle`
+//! keeps reading `Queued` even though nothing will ever deliver or drain the
+//! probe again, so `bossctl probe-status` reports it as still on its way
+//! indefinitely.
 
 use super::*;
 
@@ -78,12 +77,12 @@ impl ProbeQueuer for ServerStateProbeQueuer {
 /// no trace. The value exists on top of the log line because a test asserting
 /// "the `None` branch was taken" should not have to parse `tracing` output.
 ///
-/// The reason this is an explicit type rather than three bare `return`s: the
-/// silently-dropped `probe-2` was undiagnosable precisely because two of the
-/// exits here (`NothingQueued`, and the no-slot case when the queue happened
-/// to be empty) wrote nothing at all. Reading the trace could not distinguish
-/// "the dispatcher never ran" from "it ran and found an empty queue" — which
-/// is the difference between the bug being upstream or downstream.
+/// The reason this is an explicit type rather than a bare `return`: a silent
+/// exit (writing nothing to the trace) makes "the dispatcher never ran" and
+/// "it ran and found an empty queue" indistinguishable from the outside —
+/// which is exactly the difference between a bug being upstream or
+/// downstream of this function. Every branch, including the routine
+/// `NothingQueued` case, names itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ProbeDispatchOutcome {
     /// The hook event was not a delivery boundary for this path (wrong event
@@ -227,13 +226,36 @@ impl ServerState {
     /// `probe_id` stays stable across the retry. Delivery sites should call
     /// [`Self::release_probe_reservation`], which also frees the in-flight
     /// slot.
-    pub(super) fn requeue_probe_front(&self, run_id: String, probe: PendingProbe) {
+    ///
+    /// Refuses to re-queue against a run with no live slot mapping: nothing
+    /// drains a run's queue after the run itself is gone (only
+    /// [`Self::drain_pending_probes`] does, and its callers are teardown
+    /// paths that already ran), so pushing a probe back on would leave it
+    /// reading `queued` forever. In that case the probe is settled as
+    /// [`ProbeDeliveryState::Abandoned`] here instead, and this returns
+    /// `false` so the caller can report the outcome accurately.
+    pub(super) fn requeue_probe_front(&self, run_id: String, probe: PendingProbe) -> bool {
+        if self.worker_registry.slot_for_run(&run_id).is_none() {
+            tracing::warn!(
+                run_id,
+                probe_id = %probe.probe_id,
+                "pane write failed and the run's slot mapping is already gone; \
+                 abandoning instead of re-queuing against a dead run",
+            );
+            self.set_probe_lifecycle_detail(
+                &probe.probe_id,
+                ProbeDeliveryState::Abandoned,
+                Some("the pane write failed and the run was released before it could be retried".to_owned()),
+            );
+            return false;
+        }
         self.pending_probes
             .lock()
             .expect("pending_probes mutex poisoned")
             .entry(run_id)
             .or_default()
             .push_front(probe);
+        true
     }
 
     fn allocate_probe_id(&self) -> String {
@@ -338,13 +360,17 @@ impl ServerState {
     /// when the pane write did not happen: the probe returns to the front of
     /// the queue with its id intact (callers waiting on the matching
     /// `ProbeReplied` must not see their id reissued) and the run's in-flight
-    /// slot is freed for the next attempt.
-    pub(super) fn release_probe_reservation(&self, run_id: &str, probe: PendingProbe) {
+    /// slot is freed for the next attempt — unless the run's slot mapping is
+    /// already gone, in which case [`Self::requeue_probe_front`] settles the
+    /// probe as `Abandoned` instead. Returns `true` when the probe was
+    /// requeued, `false` when it was abandoned, so the caller can report the
+    /// outcome it actually recorded rather than assuming a requeue.
+    pub(super) fn release_probe_reservation(&self, run_id: &str, probe: PendingProbe) -> bool {
         self.in_flight_probes
             .lock()
             .expect("in_flight_probes mutex poisoned")
             .remove(run_id);
-        self.requeue_probe_front(run_id.to_owned(), probe);
+        self.requeue_probe_front(run_id.to_owned(), probe)
     }
 
     /// True when at least one probe is queued (not yet written into the
@@ -380,14 +406,13 @@ impl ServerState {
     /// operator-facing explanation. Returns the drained probe ids.
     ///
     /// **This is the only sanctioned way to remove a queued probe without
-    /// delivering it.** A bare `pending_probes.remove(run_id)` was the defect
-    /// behind the silently-dropped `probe-2`: it took the probe out of the
-    /// queue but left `probe_lifecycle` reading `Queued`, so `bossctl
-    /// probe-status` reported a probe as still on its way against a run whose
-    /// pane had already been reaped — indefinitely, since nothing else ever
-    /// revisits the record. Draining through here keeps the two tables in
-    /// step and logs one line per probe, so the drop is both visible in the
-    /// trace and answerable over the wire.
+    /// delivering it.** Removing from `pending_probes` without a matching
+    /// `probe_lifecycle` transition leaves the record reading `Queued` — a
+    /// live promise with nothing behind it — and nothing revisits it, so
+    /// `bossctl probe-status` would report the probe as still on its way
+    /// indefinitely. Draining through here keeps the two tables in step and
+    /// logs one line per probe, so the drop is both visible in the trace and
+    /// answerable over the wire.
     ///
     /// Leaves any already-injected in-flight probe untouched: those are past
     /// the queue and their outcome is settled by the reply path.

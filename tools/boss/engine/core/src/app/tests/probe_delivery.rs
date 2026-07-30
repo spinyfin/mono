@@ -1125,6 +1125,118 @@ async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() 
     );
 }
 
+/// The queue is non-empty at the pre-pop peek but empty at the pop: another
+/// dispatch path already holds the run's single delivery slot. Simulated
+/// deterministically by claiming that slot directly before driving the Stop
+/// path, rather than relying on real concurrency.
+#[tokio::test]
+async fn stop_drain_names_raced_to_empty_when_another_path_holds_the_slot() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 5, None);
+    server_state.live_worker_states.apply_event(
+        5,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+
+    let first = server_state.queue_probe(run_id.clone(), "first".into(), false);
+    let second = server_state.queue_probe(run_id.clone(), "second".into(), false);
+
+    // Another dispatch path already claimed the run's only delivery slot.
+    let claimed = server_state
+        .try_reserve_probe_for_delivery(&run_id, None, 0)
+        .expect("claiming the first probe must succeed");
+    assert_eq!(claimed.probe_id, first);
+
+    let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
+    assert_eq!(outcome, ProbeDispatchOutcome::RacedToEmpty);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&second),
+        Some(ProbeDeliveryState::Queued),
+        "the probe that lost the race stays queued rather than being lost",
+    );
+}
+
+/// A pane write that fails (no app session registered, so `SendToPane`
+/// errors immediately) pushes the probe back to the front of the queue with
+/// its id intact and reports `RequeuedAfterFailure` — the specific defect
+/// the brief called out (the original `pop -> None` / silent-failure shape
+/// this drain path replaced).
+#[tokio::test]
+async fn stop_drain_requeues_after_a_failed_pane_write() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 6, None);
+    server_state.live_worker_states.apply_event(
+        6,
+        &WorkerEvent::Stop {
+            session_id: "test-sess".into(),
+            stop_hook_active: false,
+            stop_reason: crate::protocol::StopReason::Completed,
+        },
+    );
+    // Deliberately no app session registered, so `SendToPane` fails fast
+    // with `SendToAppError::NotRegistered` instead of timing out.
+    let probe_id = server_state.queue_probe(run_id.clone(), "still there?".into(), false);
+
+    let outcome = dispatch_probe_on_stop(&server_state, &stop_event(&run_id)).await;
+
+    assert_eq!(outcome, ProbeDispatchOutcome::RequeuedAfterFailure);
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Queued),
+        "a failed write returns the probe to Queued, not stuck at Injected",
+    );
+    assert!(
+        !server_state.has_in_flight_probe(&run_id),
+        "the failed claim must free the run's delivery slot",
+    );
+    let requeued = server_state
+        .pop_pending_probe(&run_id)
+        .expect("probe must be back on the queue");
+    assert_eq!(
+        requeued.probe_id, probe_id,
+        "the requeued probe keeps its original id across the retry",
+    );
+}
+
+/// If the run's slot mapping is already gone by the time a failed pane write
+/// tries to requeue (the run was released — e.g. the pane was torn down
+/// between the claim and the failed write), the probe must not go back onto
+/// a queue nothing will ever drain again. It is settled `Abandoned` instead.
+/// Regression test for the hole where `requeue_probe_front` pushed
+/// unconditionally, leaving a probe reading `queued` forever against a dead
+/// run.
+#[test]
+fn release_probe_reservation_abandons_instead_of_requeuing_against_a_released_run() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = "run-released-mid-flight";
+    server_state.worker_registry.register_run_slot(run_id, 7);
+    let probe_id = server_state.queue_probe(run_id.to_owned(), "hello".into(), false);
+    let claimed = server_state
+        .try_reserve_probe_for_delivery(run_id, None, 0)
+        .expect("claiming the probe must succeed");
+    assert_eq!(claimed.probe_id, probe_id);
+
+    // The run's pane is released while the write is still in flight: the
+    // slot mapping disappears out from under the claim.
+    assert_eq!(server_state.worker_registry.take_slot_for_run(run_id), Some(7));
+
+    let requeued = server_state.release_probe_reservation(run_id, claimed);
+    assert!(!requeued, "a released run must refuse the requeue");
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Abandoned),
+        "refusing the requeue must settle the probe, not leave it unrecorded",
+    );
+    assert!(
+        !server_state.has_pending_probe(run_id),
+        "an abandoned probe must not sit back on a queue nothing will ever drain",
+    );
+}
+
 /// Every outcome renders as a distinct, non-empty label. The labels are what
 /// a human reads out of the trace when a probe goes missing, so two branches
 /// sharing one name would reintroduce the ambiguity this type exists to

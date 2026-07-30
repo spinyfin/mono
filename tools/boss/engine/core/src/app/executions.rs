@@ -342,6 +342,19 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
             }
         };
         let probe_id = server_state.queue_probe(run_id.clone(), text, urgent);
+        // `probe_delivery_expectation` above confirmed a slot mapping existed,
+        // but that check and this insert are not atomic with
+        // `release_worker_pane`'s teardown drain: if the run's pane was
+        // released in between, the drain already ran and found nothing (this
+        // probe was not queued yet), and the insert above then landed against
+        // a run nothing will ever revisit. Re-check right after inserting and
+        // settle immediately rather than leaving it reading `queued` forever.
+        if server_state.worker_registry.slot_for_run(&run_id).is_none() {
+            server_state.abandon_pending_probes_for_terminated_run(
+                &run_id,
+                "run's pane was released between the delivery-expectation check and the probe being queued",
+            );
+        }
         tracing::info!(
             run_id = %run_id,
             probe_id = %probe_id,

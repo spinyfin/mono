@@ -98,12 +98,17 @@ pub async fn probe_run(
 /// field (`--json`) or the printed `state=`, so a consumer gets one predicate
 /// per question instead of an exit code that means both.
 ///
-/// An *undeliverable* state (`dropped` / `abandoned` / `orphaned`) also gets a
-/// stderr line, and that one IS a redelivery cue: the engine gave up before
-/// the text reached a live worker, so nothing landed and re-issuing cannot
-/// duplicate an instruction. These states exist so that a probe the engine
-/// stopped trying to deliver stops reporting `queued` — `queued` is a live
-/// promise, and a probe stuck on it against a finished run was the bug.
+/// `dropped` and `abandoned` also get a stderr line, and that one IS a
+/// redelivery cue: the engine gave up before the text ever reached a live
+/// worker (queued but never written, or the run went away first), so nothing
+/// landed and re-issuing cannot duplicate an instruction. `orphaned` is
+/// undeliverable too but is a different case: the write reached the pane, and
+/// only a fragile `kill(pid, 0)` liveness check says nobody was left to read
+/// it — a reply that does arrive still corrects the record to `Replied`. So
+/// `orphaned` gets its own, more cautious stderr line instead of the
+/// safe-to-reissue one. These states exist so that a probe the engine stopped
+/// trying to deliver stops reporting `queued` — `queued` is a live promise,
+/// and a probe stuck on it against a finished run was the bug.
 ///
 /// `unconfirmed` still gets an explanatory line on stderr: the engine wrote
 /// the text but could not prove the worker took it. That is deliberately
@@ -159,11 +164,21 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
                      not prove the worker took it. It may still have landed — check the worker's transcript \
                      before re-issuing, since a second copy would repeat the instruction."
                 );
-            } else if state.is_undeliverable() {
+            } else if matches!(
+                state,
+                boss_protocol::ProbeDeliveryState::Dropped | boss_protocol::ProbeDeliveryState::Abandoned
+            ) {
                 eprintln!(
                     "warning: probe {returned} was never delivered (state={}): the engine gave up on it before \
                      the text reached a live worker. Nothing landed, so re-issuing against a live run is safe.",
                     state.as_str(),
+                );
+            } else if state == boss_protocol::ProbeDeliveryState::Orphaned {
+                eprintln!(
+                    "warning: probe {returned} is orphaned (state=orphaned): the write reached the pane but \
+                     the worker's recorded process had already exited. It most likely went unread, but the pid \
+                     identity is not conclusive — check the worker's transcript before re-issuing, since a \
+                     reply that does arrive still corrects the record to `replied`.",
                 );
             }
             Ok(())
