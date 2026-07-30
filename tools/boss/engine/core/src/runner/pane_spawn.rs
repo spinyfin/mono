@@ -104,8 +104,9 @@ mod apply_permission_extra_args_tests {
             "default sandbox must be replaced: {merged}"
         );
         // Required contract flags survive the rewrite.
-        assert!(merged.contains("--color always"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
+        assert!(merged.contains("--no-alt-screen"), "{merged}");
+        assert!(merged.contains("-a never"), "{merged}");
     }
 
     #[test]
@@ -133,8 +134,9 @@ mod apply_permission_extra_args_tests {
             "default sandbox must be replaced: {merged}"
         );
         // Required contract flags survive the rewrite.
-        assert!(merged.contains("--color always"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
+        assert!(merged.contains("--no-alt-screen"), "{merged}");
+        assert!(merged.contains("-a never"), "{merged}");
     }
 
     /// Grok spells its model flag `--model` (not ` -m `) and has no stdin

@@ -631,11 +631,13 @@ pub fn render_base_config_toml(workspace: &Path) -> String {
 /// `workspace` itself is granted write access by Codex's own cwd default,
 /// separate from this function's `writable_roots` list, and does not need a
 /// paired `workspace/.git` grant: cube workspaces are non-colocated secondary
-/// jj workspaces (`.jj` pointer file, no `.git`) by construction — the same
-/// invariant `--skip-git-repo-check` exists to work around (see
-/// `build_codex_exec_command`) — so there is no colocated `.git` under
-/// `workspace` for the sandbox's auto-exclusion to bite. Only the shared
-/// store root resolved by [`cube_repo_store_root`] carries a real `.git`.
+/// jj workspaces (`.jj` pointer file, no `.git`) by construction, so there is
+/// no colocated `.git` under `workspace` for the sandbox's auto-exclusion to
+/// bite. (The retired `codex exec` shape needed `--skip-git-repo-check` to
+/// dispatch into a `.git`-less workspace at all; that check — and the flag
+/// that bypassed it — is `exec`-specific and does not exist on the bare TUI,
+/// which never performs it.) Only the shared store root resolved by
+/// [`cube_repo_store_root`] carries a real `.git`.
 fn render_sandbox_workspace_write_toml(workspace: &Path) -> String {
     let mut out = String::from(
         "[sandbox_workspace_write]\n\
@@ -825,32 +827,33 @@ fn toml_basic_string(s: &str) -> String {
 // Spawn command (pane-safe)
 // ---------------------------------------------------------------------------
 
-/// Build the `codex exec …` command body (without the leading `exec `).
+/// Build the bare `codex …` command body — the interactive TUI, no
+/// subcommand. Retired `codex exec` for the one-shape decision recorded in
+/// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`: two of the
+/// three flags the old `exec` contract required are hard argument errors on
+/// this shape, and the flag this shape needs is a hard argument error on
+/// `exec` — "support both" is a spawn-line contract conflict, not a
+/// configuration choice.
 ///
-/// Contract (also enforced by `assert_codex_exec_spawn_contract` in core):
-/// - requires `--color always`, `--strict-config`, and `--skip-git-repo-check`
-///   (cube workspaces are non-colocated jj workspaces with a `.jj` and no
-///   `.git`, so the git-repo trust check would refuse every dispatch)
-/// - forbids `-a` / `--ask-for-approval` (removed on 0.145.0) and `--json`
-///   (mono#2303: `--json` makes Codex dump raw JSONL to the pane instead of
-///   the human-readable ANSI transcript `codex exec` renders by default;
-///   `--color always` guarantees that transcript is colorized even when
-///   Codex's own `auto` tty-detection would be unreliable inside a pane
-///   pty. Progress ingress does not read pane stdout at all — see
-///   `progress_observation_wiring` below, which always tails the rollout
-///   JSONL file instead, and that file is written unconditionally
-///   regardless of `--json`)
-/// - redirects stdin from `/dev/null` so Codex does not block on "Reading
-///   additional input from stdin..."
+/// Contract (also enforced by `assert_codex_spawn_contract` in core):
+/// - requires `--strict-config`, `--no-alt-screen`, and `-a never`
+///   (`--no-alt-screen` disables the alternate screen so the viewport and a
+///   full-screen read diverge and scrollback accumulates across turns,
+///   instead of being capped at one screenful under the default alt-screen
+///   mode — measured in the pivot spike (V2); `-a never` pins the approval
+///   policy so a long-lived session never blocks on a human approval
+///   prompt Boss cannot answer — Boss's own `--sandbox` policy is the real
+///   authorization boundary)
+/// - forbids `--color`, `--skip-git-repo-check`, and `--json` — each is a
+///   hard argument error on the bare TUI (measured against `codex-cli
+///   0.145.0` in the pivot spike): `--color`/`--skip-git-repo-check` were
+///   required on the retired `exec` shape, and `--json` never existed on
+///   either shape as anything but a hard error here.
 ///
-/// **Pane launch safety (ghostty-codex-pane-viability Q2, choice (a)):**
-/// the full pane line is `exec codex exec … </dev/null`. `exec` replaces the
-/// interactive shell, so when codex exits there is no shell left to consume
-/// tty-buffered injects that arrived while codex was foreground. Choice (b)
-/// (drain pending tty input) is deliberately not used: draining requires a
-/// shell still in control after the worker exits, which re-opens the
-/// footgun window. See [`pane_launch_spec_uses_exec_not_interactive_return`].
-pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
+/// No `< /dev/null` stdin redirect: that existed so `codex exec` would not
+/// block reading stdin, and a TUI needs the tty to read typed input,
+/// including the pane's own initial-prompt line.
+pub fn build_codex_command(request: &SpawnRequest<'_>) -> String {
     let SpawnRequest {
         model,
         effort,
@@ -875,8 +878,7 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
     // `codex_sandbox_enforced` feature flag is on, in which case
     // `workspace-write`) applied by the spawn flow — do not hardcode a
     // second source of truth here without also applying extra_args.
-    let mut cmd =
-        String::from("codex exec --color always --strict-config --skip-git-repo-check --sandbox workspace-write");
+    let mut cmd = String::from("codex --strict-config --no-alt-screen -a never --sandbox workspace-write");
     cmd.push_str(" -m ");
     // Model / effort tokens come from operator config and work-item metadata;
     // shell-quote so a future slug with spaces/metacharacters cannot break
@@ -889,19 +891,8 @@ pub fn build_codex_exec_command(request: &SpawnRequest<'_>) -> String {
     }
     cmd.push(' ');
     cmd.push_str(&prompt_cat);
-    // Stdin must not be the open tty: otherwise Codex prints
-    // "Reading additional input from stdin..." and waits.
-    cmd.push_str(" < /dev/null\n");
+    cmd.push('\n');
     cmd
-}
-
-/// Prefix the exec body with shell `exec` so the pane does not return to an
-/// interactive prompt after the worker process exits (Q2 choice (a)).
-pub fn wrap_codex_command_for_pane(exec_body: &str) -> String {
-    // `exec` replaces the shell process. Mid-run SendToPane injects land in
-    // the tty line discipline; with no shell after codex exits they are not
-    // evaluated as shell commands.
-    format!("exec {exec_body}")
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,8 +1310,7 @@ impl AgentDriver for CodexDriver {
             // sanitize_run_id_for_home only fails on empty; unknown-run is safe.
             codex_homes_root().join("unknown-run")
         });
-        let body = build_codex_exec_command(&request);
-        let command = wrap_codex_command_for_pane(&body);
+        let command = build_codex_command(&request);
         SpawnPlan {
             env: vec![EnvDirective::Set(
                 "CODEX_HOME".to_owned(),
@@ -1722,19 +1712,16 @@ impl AgentDriver for CodexDriver {
         MidTurnPaneInput::Rejects
     }
 
-    /// `codex exec` serves exactly one turn and then exits — the same
-    /// one-turn-per-process shape the mid-turn guard above exists for, seen
-    /// from the other end of the run. `turn.completed` is followed by process
-    /// exit within milliseconds, so a reaper that reads "the foreground
-    /// process is gone" as "the worker died" reaps a successful run before its
-    /// completion handler can finish. Declaring the lifetime here is what lets
-    /// the engine pair that exit with the run's own delivered turn boundary
-    /// instead of guessing.
-    ///
-    /// This is not an exemption from the liveness sweeps: an exit with no
-    /// delivered turn boundary is still reaped as a death.
+    /// The bare TUI is a long-lived, multi-turn session — the retired
+    /// `codex exec` shape was the one-turn-per-process outlier among Boss's
+    /// drivers, not the norm: Claude asserts `Persistent` explicitly
+    /// (`claude.rs`), and Grok takes it as the trait default. Flipping this
+    /// from `OneTurnPerProcess` closes that gap; a foreground process exiting
+    /// is now always a death for Codex too, exactly as it already is for
+    /// Claude and Grok — see
+    /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`.
     fn worker_process_lifetime(&self) -> WorkerProcessLifetime {
-        WorkerProcessLifetime::OneTurnPerProcess
+        WorkerProcessLifetime::Persistent
     }
 
     fn structured_output_wiring(
@@ -1947,16 +1934,16 @@ mod tests {
     }
 
     #[test]
-    fn spawn_invocation_meets_codex_exec_contract() {
+    fn spawn_invocation_meets_codex_tui_contract() {
         let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-terra", "run-spawn-1"));
         assert!(
-            plan.command.contains("--color always"),
-            "requires --color always: {}",
+            !plan.command.contains("--color"),
+            "forbids --color: hard argument error on the bare TUI: {}",
             plan.command
         );
         assert!(
             !plan.command.contains("--json"),
-            "forbids --json (mono#2303: raw JSONL in the pane, not the human-readable transcript): {}",
+            "forbids --json: never existed on the bare TUI as anything but a hard error: {}",
             plan.command
         );
         assert!(
@@ -1965,21 +1952,37 @@ mod tests {
             plan.command
         );
         assert!(
-            plan.command.contains("--skip-git-repo-check"),
-            "requires --skip-git-repo-check: cube workspaces are non-colocated jj \
-             workspaces with no `.git`, so codex would refuse to run without it: {}",
+            !plan.command.contains("--skip-git-repo-check"),
+            "forbids --skip-git-repo-check: hard argument error on the bare TUI \
+             (the retired `codex exec` shape needed it; the TUI does not perform \
+             the check it bypassed): {}",
             plan.command
         );
         assert!(
-            !plan.command.contains("--ask-for-approval"),
-            "forbids --ask-for-approval: {}",
+            plan.command.contains("--no-alt-screen"),
+            "requires --no-alt-screen: viewport/screen reads must diverge so scrollback \
+             accumulates across turns instead of capping at one screenful: {}",
             plan.command
         );
-        let tokens: Vec<&str> = plan.command.split_whitespace().collect();
-        assert!(!tokens.contains(&"-a"), "forbids bare -a: {}", plan.command);
         assert!(
-            plan.command.contains("< /dev/null"),
-            "must redirect stdin from /dev/null: {}",
+            plan.command.contains("-a never"),
+            "requires -a never: a persistent session must never block on an approval \
+             prompt Boss cannot answer: {}",
+            plan.command
+        );
+        assert!(
+            !plan.command.starts_with("exec ") && !plan.command.trim_start().starts_with("exec "),
+            "must not wrap the command in a shell `exec` prefix: {}",
+            plan.command
+        );
+        assert!(
+            !plan.command.contains("codex exec"),
+            "must not invoke the `exec` subcommand: {}",
+            plan.command
+        );
+        assert!(
+            !plan.command.contains("< /dev/null"),
+            "must not redirect stdin from /dev/null: a TUI needs the tty: {}",
             plan.command
         );
         assert!(
@@ -2003,71 +2006,25 @@ mod tests {
         );
     }
 
+    /// The pivot's opposite pane-launch invariant: unlike the retired
+    /// `codex exec` shape (which wrapped the body in a shell `exec` so no
+    /// shell survived to consume tty-buffered injects), a persistent session
+    /// is typed as a plain command at the pane's shell prompt — the same
+    /// shape Claude and Grok already use — so the shell survives and can go
+    /// on to accept later `SendToPane` turns.
     #[test]
-    fn pane_launch_spec_uses_exec_not_interactive_return() {
-        // Choice (a): do not return to an interactive prompt after the worker
-        // exits. The spawn line must start with `exec` so the shell is
-        // replaced by codex; buffered injects cannot be eval'd by zsh after.
+    fn pane_launch_spec_does_not_use_shell_exec() {
         let plan = CodexDriver::default().spawn_invocation(spawn_request("gpt-5.6-sol", "run-pane-a"));
         let trimmed = plan.command.trim_start();
         assert!(
-            trimmed.starts_with("exec "),
-            "pane launch must use `exec` (Q2 choice a); got: {}",
+            trimmed.starts_with("codex "),
+            "pane launch must type a plain `codex` command line, not shell-exec into it; got: {}",
             plan.command
         );
         assert!(
-            !trimmed.contains("; exit") && !plan.command.contains("\nexit"),
-            "must not rely on a trailing shell `exit` after an interactive return: {}",
+            !trimmed.starts_with("exec "),
+            "must not wrap the command in a shell `exec` prefix: {}",
             plan.command
-        );
-    }
-
-    /// Integration-style: a shell that runs `exec <long-running>` must not
-    /// execute tty-buffered input that arrived while the child was foreground.
-    ///
-    /// Apparatus (Python `pty`): child runs `exec sleep 1` — same shape as
-    /// [`wrap_codex_command_for_pane`]. Mid-run we write a side-effect command
-    /// into the master. After the child exits we assert the side-effect file
-    /// was **not** created — proving choice (a) closes the Q2 footgun that
-    /// Layer D measured against interactive zsh.
-    #[test]
-    fn exec_launch_discards_buffered_inject_after_exit() {
-        let tmp = TempDir::new().unwrap();
-        let side_effect = tmp.path().join("injected_side_effect.txt");
-        let side_effect_str = side_effect.display().to_string();
-        let script = format!(
-            r#"
-import os, pty, time, pathlib, sys
-side = pathlib.Path({side:?})
-pid, fd = pty.fork()
-if pid == 0:
-    # Same shape as wrap_codex_command_for_pane: exec replaces the shell.
-    os.execvp("zsh", ["zsh", "-c", "exec sleep 1"])
-else:
-    time.sleep(0.2)
-    os.write(fd, b"echo INJECTED > " + str(side).encode() + b"\n")
-    _pid, status = os.waitpid(pid, 0)
-    time.sleep(0.1)
-    if side.exists():
-        sys.stderr.write("side effect file exists: " + side.read_text() + "\n")
-        sys.exit(2)
-    sys.exit(0)
-"#,
-            side = side_effect_str,
-        );
-        let status = Command::new("python3")
-            .arg("-c")
-            .arg(&script)
-            .status()
-            .expect("python3 pty harness");
-        assert!(
-            status.success(),
-            "buffered inject must not execute after `exec` worker exits (rc={status:?})"
-        );
-        assert!(
-            !side_effect.exists(),
-            "side-effect file must not exist; got {:?}",
-            fs::read_to_string(&side_effect).ok()
         );
     }
 
@@ -2837,16 +2794,14 @@ else:
         assert_eq!(driver.reap(), ReapDelivery::ProcessGroup);
     }
 
-    /// The declaration the engine's process-liveness reapers key off. Without
-    /// it a clean `codex exec` termination reads as a pane death and the run
-    /// is orphaned milliseconds after it succeeded.
+    /// The declaration the engine's process-liveness reapers key off. Codex
+    /// is now Persistent like Claude and Grok, so its foreground process
+    /// exiting is always a death — no exemption for a delivered turn
+    /// boundary, unlike the retired `codex exec` shape.
     #[test]
-    fn codex_declares_one_turn_per_process_lifetime() {
+    fn codex_declares_persistent_lifetime() {
         let driver = CodexDriver::default();
-        assert_eq!(
-            driver.worker_process_lifetime(),
-            WorkerProcessLifetime::OneTurnPerProcess
-        );
-        assert!(driver.worker_process_lifetime().exits_after_each_turn());
+        assert_eq!(driver.worker_process_lifetime(), WorkerProcessLifetime::Persistent);
+        assert!(!driver.worker_process_lifetime().exits_after_each_turn());
     }
 }

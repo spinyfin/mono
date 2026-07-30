@@ -231,27 +231,20 @@ mod tests {
     use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
     use crate::work::{WorkDb, WorkItemPatch};
 
-    /// Records how often the drain was asked for, and optionally writes the
-    /// boundary record from inside the drain — modelling the real ordering,
-    /// where the terminal envelope only reaches the DB *because* the stream
-    /// was drained to EOF.
+    /// Records how often the drain was asked for. No registered driver
+    /// reaches this path any more now that Codex is `Persistent` (the drain
+    /// branch in [`classify_worker_process_exit`] is gated on
+    /// [`one_turn_per_process`]), so the constructor that modelled a drain
+    /// delivering a boundary record was dropped along with the tests that
+    /// used it.
     struct RecordingDrain {
         calls: AtomicUsize,
-        db: Option<(WorkDb, String)>,
     }
 
     impl RecordingDrain {
         fn inert() -> Self {
             Self {
                 calls: AtomicUsize::new(0),
-                db: None,
-            }
-        }
-
-        fn delivering(db: WorkDb, execution_id: &str) -> Self {
-            Self {
-                calls: AtomicUsize::new(0),
-                db: Some((db, execution_id.to_owned())),
             }
         }
     }
@@ -260,10 +253,6 @@ mod tests {
     impl ProgressDrain for RecordingDrain {
         async fn drain_progress_for_exited_worker(&self, _run_id: &str) {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            if let Some((db, execution_id)) = &self.db {
-                db.record_run_turn_boundary_for_execution(execution_id, "2026-07-28T00:16:58Z")
-                    .unwrap();
-            }
         }
     }
 
@@ -301,31 +290,29 @@ mod tests {
         execution.id
     }
 
-    /// The regression this module exists for: `codex exec` writes
-    /// `turn.completed` and exits milliseconds later. That exit must not be
-    /// read as a pane death.
+    /// Codex was the regression this module was built for (`codex exec`
+    /// wrote `turn.completed` and exited milliseconds later, which must not
+    /// have read as a pane death) but the driver is now `Persistent` (the
+    /// bare interactive TUI pivot — see
+    /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), so a
+    /// delivered turn boundary no longer exempts its exit: a Codex process
+    /// disappearing is exactly as much a death as Claude's, boundary or not.
     #[tokio::test]
-    async fn one_shot_exit_after_a_delivered_turn_boundary_is_not_a_death() {
+    async fn codex_exit_after_a_delivered_turn_boundary_is_now_a_persistent_driver_death() {
         let (_dir, db) = open_db();
         let execution_id = codex_execution(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
             .unwrap();
 
         let verdict = classify_worker_process_exit(&db, None, &execution_id).await;
-        assert_eq!(
-            verdict,
-            ProcessExitVerdict::ExpectedTurnExit {
-                turn_boundary_at: "2026-07-28T00:16:58Z".to_owned()
-            },
-        );
-        assert!(!verdict.is_death());
+        assert_eq!(verdict, ProcessExitVerdict::Death);
     }
 
-    /// The exemption is evidence-gated, not driver-gated. A one-shot worker
-    /// that died mid-turn delivered no boundary and must still be reaped —
-    /// otherwise a genuinely crashed Codex pane would hold its slot forever.
+    /// A dead Codex process with no delivered boundary is still a death —
+    /// unchanged by the `Persistent` flip, since this path never depended on
+    /// the one-shot exemption in the first place.
     #[tokio::test]
-    async fn one_shot_exit_with_no_turn_boundary_is_still_a_death() {
+    async fn codex_exit_with_no_turn_boundary_is_still_a_death() {
         let (_dir, db) = open_db();
         let execution_id = codex_execution(&db);
 
@@ -358,43 +345,22 @@ mod tests {
         );
     }
 
-    /// The causal ordering, end to end: at exit time the boundary has not been
-    /// recorded yet (the tailer is behind — this is precisely the race that
-    /// orphaned the live run). Draining the now-final stream is what delivers
-    /// it, and only then is the verdict taken.
+    /// The drain-then-verdict race this module was built to close only ever
+    /// applied to a one-turn-per-process driver — the branch that pays for a
+    /// drain is gated on [`one_turn_per_process`], which no driver in the
+    /// registry declares any more now that Codex is `Persistent`. Codex now
+    /// takes the same no-drain path Claude always has.
     #[tokio::test]
-    async fn draining_the_final_stream_delivers_the_boundary_before_the_verdict() {
+    async fn codex_exit_never_drains_now_that_it_is_persistent() {
         let (_dir, db) = open_db();
         let execution_id = codex_execution(&db);
-        assert_eq!(
-            db.latest_run_turn_boundary_for_execution(&execution_id).unwrap(),
-            None,
-            "precondition: the boundary has not reached the DB when the process exits",
-        );
-
-        let drain = RecordingDrain::delivering(db.clone(), &execution_id);
-        let verdict = classify_worker_process_exit(&db, Some(&drain), &execution_id).await;
-
-        assert_eq!(drain.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            verdict,
-            ProcessExitVerdict::ExpectedTurnExit {
-                turn_boundary_at: "2026-07-28T00:16:58Z".to_owned()
-            },
-        );
-    }
-
-    /// A drain that delivers nothing does not manufacture a clean exit. The
-    /// stream was final and held no terminal result, so the worker died.
-    #[tokio::test]
-    async fn draining_an_empty_stream_still_yields_a_death() {
-        let (_dir, db) = open_db();
-        let execution_id = codex_execution(&db);
+        db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
+            .unwrap();
 
         let drain = RecordingDrain::inert();
         let verdict = classify_worker_process_exit(&db, Some(&drain), &execution_id).await;
 
-        assert_eq!(drain.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drain.calls.load(Ordering::SeqCst), 0);
         assert_eq!(verdict, ProcessExitVerdict::Death);
     }
 
@@ -457,13 +423,15 @@ mod tests {
     }
 
     /// A codex-attributed chore reviewed by a review-pool worker must be
-    /// classified as a persistent-driver exit, not a one-shot codex exit: the
-    /// reviewer pane is a Claude pane regardless of the reviewed row's own
-    /// driver. Before the pool-dispatch override, this run's exit would flip
-    /// to `OneTurnPerProcess` and skip the drain — silently orphaning the
-    /// review pane's unread progress stream. Pins the change to
+    /// classified as a persistent-driver exit: the reviewer pane is a Claude
+    /// pane regardless of the reviewed row's own driver. Pins the change to
     /// `one_turn_per_process` alongside the driver-resolution tests in
-    /// `driver_transcript`.
+    /// `driver_transcript`. Now that Codex itself is also `Persistent`, the
+    /// pool-dispatch override this test exercises no longer changes the
+    /// *outcome* (both paths land on `Death`) — it is retained because it
+    /// still pins that review-pool resolution runs and does not panic, and
+    /// it is the one test in this module that exercises that resolution path
+    /// at all.
     #[tokio::test]
     async fn a_review_pool_worker_over_a_codex_row_is_a_persistent_driver_exit() {
         let (_dir, db) = open_db();

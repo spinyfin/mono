@@ -67,8 +67,10 @@
 //! - **No pid → skip**: an execution whose pid was never reported (surface
 //!   never attached, or a pre-fix spawn) yields `None` and is left alone.
 //! - **Expected one-shot exit → skip**: a driver declaring
-//!   `WorkerProcessLifetime::OneTurnPerProcess` (`codex exec`) exits by design
-//!   once its turn is delivered, so a dead pid there is not a dead worker. See
+//!   `WorkerProcessLifetime::OneTurnPerProcess` exits by design once its turn
+//!   is delivered, so a dead pid there is not a dead worker (no driver in the
+//!   registry currently declares this — see
+//!   `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`). See
 //!   [`crate::worker_process_exit`]; a one-shot run that exited *without*
 //!   delivering a turn boundary is still reaped here.
 //! - **Alive / not-ours / probe-error → skip**: only `Dead` (ESRCH) reaps;
@@ -689,8 +691,7 @@ mod tests {
     }
 
     /// Create a `waiting_human` chore execution on the `codex` driver whose
-    /// durable shell pid is dead — a one-turn-per-process worker that
-    /// delivered its turn and exited.
+    /// durable shell pid is dead.
     fn parked_codex_execution(db: &WorkDb, boundary: Option<&str>) -> WorkExecution {
         let product = create_product(db);
         let work_item_id = create_active_chore(db, &product, "codex chore");
@@ -725,29 +726,28 @@ mod tests {
         db.get_execution(&execution_id).unwrap()
     }
 
-    /// This sweep is the restart-robust one, so it is the one that would keep
-    /// the redispatch loop alive even after the pane-death path was fixed: 60s
-    /// after a Codex worker finished cleanly it would find a dead durable pid
-    /// on a `waiting_human` row and orphan it. A delivered turn boundary means
-    /// that pid is dead *by design*.
+    /// Codex is now `Persistent` (the bare interactive TUI pivot — see
+    /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), so a
+    /// dead durable pid on a `waiting_human` Codex row is a genuine dead
+    /// pane, delivered turn boundary or not — the one-shot exemption this
+    /// sweep used to grant Codex no longer applies, and a dead pid is
+    /// reconciled exactly as it already was for Claude.
     #[tokio::test]
-    async fn a_finished_one_shot_worker_is_not_reconciled_as_a_dead_pane() {
+    async fn a_finished_persistent_codex_worker_is_still_reconciled_as_a_dead_pane() {
         let (_d, db) = open_db();
         let exec = parked_codex_execution(&db, Some("2026-07-28T00:16:58Z"));
 
         let sink = NoopDispatchEventSink;
         assert!(
-            !reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
-            "a one-shot worker that delivered its turn is not a dead-pane zombie",
+            reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
+            "a persistent-driver worker's dead pid is a genuine dead pane, boundary or not",
         );
-        assert_eq!(
-            db.get_execution(&exec.id).unwrap().status,
-            ExecutionStatus::WaitingHuman,
-        );
+        assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
     }
 
-    /// The counterpart: no delivered turn boundary means the one-shot process
-    /// died before finishing, and this sweep must still recover its workspace.
+    /// No delivered turn boundary is also still reconciled — unchanged by
+    /// the `Persistent` flip, since this path never depended on the
+    /// one-shot exemption in the first place.
     #[tokio::test]
     async fn a_one_shot_worker_that_never_finished_is_still_reconciled() {
         let (_d, db) = open_db();
