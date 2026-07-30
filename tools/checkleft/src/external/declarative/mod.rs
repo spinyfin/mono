@@ -476,6 +476,14 @@ pub(super) fn validate_declarative_implementation(
     if raw.applies_to.is_empty() {
         bail!("declarative package must declare a non-empty `applies_to` glob list");
     }
+    for (i, pattern) in raw.applies_to.iter().enumerate() {
+        if let Some(reason) = crate::glob_scope::structurally_empty_reason(pattern, false) {
+            bail!(
+                "declarative package `applies_to[{i}]` pattern `{pattern}` can never match any \
+                 changeset path: {reason}"
+            );
+        }
+    }
     if raw.invocations.is_empty() {
         bail!("declarative package must declare at least one `invocations` entry");
     }

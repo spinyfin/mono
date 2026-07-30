@@ -149,6 +149,77 @@ fn applies_to_override_empty_string_entry_is_rejected() {
     );
 }
 
+// ── structurally-empty override patterns (case a) ──────────────────────────────
+//
+// A pattern in this shape can never match any changeset path, in any repo,
+// decided from the text alone — distinct from a pattern that is merely
+// typo'd/wrong-case (case b, `srcc/**`/`SRC/**` below) which must NOT error.
+
+#[test]
+fn applies_to_override_leading_dot_slash_is_rejected() {
+    let config: toml::Value = toml::from_str(r#"applies_to = ["./src/*.rs"]"#).unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("./src/*.rs"),
+        "must name the pattern verbatim; got: {message}"
+    );
+    assert!(
+        message.contains("applies_to[0]"),
+        "must name the key/position; got: {message}"
+    );
+    assert!(message.contains("./"), "must explain why; got: {message}");
+}
+
+#[test]
+fn applies_to_override_negation_prefix_is_rejected_and_points_at_exclude() {
+    let config: toml::Value = toml::from_str(r#"applies_to = ["!src/**"]"#).unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("!src/**"),
+        "must name the pattern verbatim; got: {message}"
+    );
+    assert!(
+        message.contains("exclude"),
+        "must point at the `exclude` key; got: {message}"
+    );
+}
+
+#[test]
+fn applies_to_override_trailing_separator_is_rejected() {
+    let config: toml::Value = toml::from_str(r#"applies_to = ["src/"]"#).unwrap();
+    let err = super::resolve::override_applies_to(&config)
+        .expect("override present")
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("src/"),
+        "must name the pattern verbatim; got: {message}"
+    );
+    assert!(message.contains("separator"), "must explain why; got: {message}");
+}
+
+#[test]
+fn applies_to_override_typo_case_is_not_rejected() {
+    // Case (b): structurally matchable, but a typo'd directory or wrong case —
+    // NOT statically decidable, and must never error here.
+    let config: toml::Value = toml::from_str(r#"applies_to = ["srcc/**"]"#).unwrap();
+    let globs = super::resolve::override_applies_to(&config)
+        .expect("override must be present")
+        .expect("typo'd-but-matchable pattern must not be rejected");
+    assert_eq!(globs, vec!["srcc/**"]);
+
+    let config: toml::Value = toml::from_str(r#"applies_to = ["SRC/**"]"#).unwrap();
+    super::resolve::override_applies_to(&config)
+        .expect("override must be present")
+        .expect("wrong-case pattern must not be rejected");
+}
+
 /// End-to-end test: config applies_to override restricts file selection so only
 /// matching files are checked. The package definition matches `**/*.bzl`; the
 /// config override changes it to `**/*.rs`. A .rs file should produce findings;

@@ -60,6 +60,84 @@ fn manifest_requires_default_exit_outcome() {
     );
 }
 
+// ── structurally-empty `applies_to` patterns in the check-definition manifest ──
+//
+// Same taxonomy as the per-repo override tests in `tests_selection.rs`: these
+// three shapes can never match any changeset path, decided from the pattern
+// text alone, and must be rejected at manifest-validation time. A typo'd or
+// wrong-case pattern (case b) is NOT statically decidable and must not error.
+
+fn minimal_declarative_manifest(applies_to_toml: &str) -> String {
+    format!(
+        r#"
+id = "test-check"
+mode = "declarative"
+runtime = "declarative-v1"
+api_version = "v1"
+applies_to = {applies_to_toml}
+
+[needs.tool.default]
+path = "some-tool"
+
+[[invocations]]
+id = "run"
+run = "tool"
+mode = "batch"
+args = ["{{{{files}}}}"]
+exit = {{ "0" = "findings", default = "error" }}
+
+[invocations.transform]
+kind = "passthrough"
+"#
+    )
+}
+
+#[test]
+fn manifest_rejects_leading_dot_slash_applies_to() {
+    let manifest = minimal_declarative_manifest(r#"["./src/*.rs"]"#);
+    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("./src/*.rs"),
+        "must name the pattern verbatim: {message}"
+    );
+    assert!(
+        message.contains("applies_to[0]"),
+        "must name the key/position: {message}"
+    );
+}
+
+#[test]
+fn manifest_rejects_negation_prefix_applies_to() {
+    let manifest = minimal_declarative_manifest(r#"["!src/**"]"#);
+    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("!src/**"), "must name the pattern verbatim: {message}");
+    assert!(
+        message.contains("exclude"),
+        "must point at the `exclude` key: {message}"
+    );
+}
+
+#[test]
+fn manifest_rejects_trailing_separator_applies_to() {
+    let manifest = minimal_declarative_manifest(r#"["src/"]"#);
+    let err = parse_external_check_package_manifest(&manifest).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("src/"), "must name the pattern verbatim: {message}");
+    assert!(message.contains("separator"), "must explain why: {message}");
+}
+
+#[test]
+fn manifest_accepts_typo_and_wrong_case_applies_to() {
+    // Case (b): not statically decidable, must never be rejected here.
+    let manifest = minimal_declarative_manifest(r#"["srcc/**"]"#);
+    parse_external_check_package_manifest(&manifest).expect("typo'd-but-matchable pattern must not be rejected");
+
+    let manifest = minimal_declarative_manifest(r#"["SRC/**"]"#);
+    parse_external_check_package_manifest(&manifest).expect("wrong-case pattern must not be rejected");
+}
+
 #[test]
 fn declarative_fields_rejected_in_component_mode() {
     let manifest = r#"

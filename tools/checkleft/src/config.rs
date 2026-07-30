@@ -540,6 +540,23 @@ impl ConfigResolver {
                 ));
                 continue;
             }
+            // A `scope = changeset` check resolves once at repo root with an empty
+            // changed-file set by construction (see `Runner::schedule_changeset_scope_runs`),
+            // so a positive `applies_to` file-scope override on it is meaningless — it would
+            // filter a file set that is always empty. Reject the combination rather than
+            // silently accepting an override that can never do anything.
+            if scope == CheckScope::Changeset && check.config.get("applies_to").is_some() {
+                resolved.push_diagnostic(config_check_diagnostic(
+                    configured_id.clone(),
+                    config_relative_path.clone(),
+                    format!(
+                        "check `{configured_id}` sets `scope: changeset` and a `config.applies_to` \
+                         override; a changeset-scope check runs once with no changed file to filter, \
+                         so `applies_to` can never select anything here — remove it from this check's `config`"
+                    ),
+                ));
+                continue;
+            }
             resolved.upsert(CheckConfig {
                 check: check_name,
                 id: configured_id,
@@ -725,6 +742,21 @@ fn parse_global_exclude_patterns(
             Some("Add at least one glob pattern, or remove the `exclude` key entirely.".to_owned()),
         ));
     }
+    for (i, pattern) in patterns.iter().enumerate() {
+        if let Some(reason) = crate::glob_scope::structurally_empty_reason(pattern, true) {
+            return Err(config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                format!(
+                    "top-level `exclude[{i}]` pattern `{pattern}` can never match any changeset \
+                     path: {reason}"
+                ),
+                None,
+                None,
+                Some("Fix or remove this pattern from the top-level `exclude` list.".to_owned()),
+            ));
+        }
+    }
     let normalized = normalize_exclude_patterns(patterns, config_dir);
     if let Err(err) = ExclusionMatcher::new(&normalized) {
         return Err(config_file_diagnostic(
@@ -763,6 +795,23 @@ fn parse_per_check_exclude_patterns(
             None,
             Some("Add at least one glob pattern, or remove the `exclude` key from this check entry.".to_owned()),
         ));
+    }
+    if let Some(patterns) = raw_exclude {
+        for (i, pattern) in patterns.iter().enumerate() {
+            if let Some(reason) = crate::glob_scope::structurally_empty_reason(pattern, true) {
+                return Err(config_file_diagnostic(
+                    check_id.to_owned(),
+                    source_path.to_path_buf(),
+                    format!(
+                        "check `{check_id}` `exclude[{i}]` pattern `{pattern}` can never match \
+                         any changeset path: {reason}"
+                    ),
+                    None,
+                    None,
+                    Some("Fix or remove this pattern from this check's `exclude` list.".to_owned()),
+                ));
+            }
+        }
     }
     let framework_patterns = raw_exclude
         .as_deref()
