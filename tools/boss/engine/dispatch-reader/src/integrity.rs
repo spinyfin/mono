@@ -8,7 +8,8 @@
 //! (fixed in `boss_engine_jsonl_append` — see that crate's docs) issued a
 //! record's body and its trailing newline as two separate `write()` calls.
 //! `O_APPEND` makes each individual write atomic but not the pair, so two
-//! interleaved appenders produced `bodyA` `bodyB` `\n` `\n` on disk: ONE line
+//! concurrent appenders *in the same process* produced `bodyA` `bodyB` `\n`
+//! `\n` on disk: ONE line
 //! holding two complete records, followed by a blank line. A JSON parser reads
 //! that as `trailing characters at line 1 column <len(bodyA)+1>` — which is
 //! exactly the error, and exactly the column distribution (clustered at

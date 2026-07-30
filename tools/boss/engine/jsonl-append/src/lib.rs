@@ -3,10 +3,18 @@
 //! A JSONL writer that issues a record's body and its trailing newline as
 //! two separate `write()` calls is corruptible under concurrency: `O_APPEND`
 //! makes each individual `write()` atomic, but not the *pair* of them, so
-//! two interleaved appenders can produce `bodyAbodyB\n\n` on disk instead of
-//! two well-formed lines. This is exactly the defect that motivated this
-//! crate — see the dispatch-events sink, `boss-dispatch-events`, which used
-//! to reimplement JSONL appending inline with that two-write bug.
+//! two concurrent appenders *in the same process* can produce `bodyAbodyB\n\n`
+//! on disk instead of two well-formed lines. This is exactly the defect that
+//! motivated this crate — see the dispatch-events sink, `boss-dispatch-events`,
+//! which used to reimplement JSONL appending inline with that two-write bug.
+//!
+//! That is the *measured* cause, not a hypothesis. Every damaged row in the
+//! rotated `dispatch-events` segment that motivated this work is that one
+//! shape — two complete, well-formed records concatenated with no newline
+//! between them, followed by a stray blank line — with zero torn or truncated
+//! records, and the pairs mix worker slots belonging to a single engine's
+//! pool. The fix is to fold the newline into the same buffer as the body
+//! (`line.push(b'\n')` below) and issue exactly one `write_all`.
 //!
 //! [`JsonlAppender`] fixes this by serializing every append — across all
 //! paths, and across every [`JsonlAppender`] instance, since the lock is a
@@ -29,52 +37,23 @@
 //! execution) — caching a handle per path would leak file descriptors.
 //! Each [`JsonlAppender::append`] call opens, writes, and closes.
 //!
-//! Serializing through a process-wide mutex is not sufficient on its own:
-//! `<state-root>/dispatch-events/current.jsonl` has more than one potential
-//! writer *process* (an app-autostarted engine plus a hand-started one, or an
-//! engine outliving a crash-recovery relaunch), and a mutex in one address
-//! space says nothing about the other. So each append also takes an
-//! **exclusive advisory lock on the target file** for the duration of the
-//! write, via `fs4` — the same `flock` mechanism `tools/boss/event-shim`,
-//! `tools/cube`, and `tools/repobin` already use for their multi-process
-//! buffers. Both layers are kept: the mutex is what keeps the *set* of paths
-//! in one `append_to_all` call from interleaving with another task's set, and
-//! the file lock is what makes each individual append atomic against other
-//! processes.
+//! This utility serializes writers **within one process**. It does not
+//! provide cross-process exclusion, and does not need to: the dispatch-event
+//! stream has exactly one writer process by construction. The engine refuses
+//! to start at all if a live process already holds `<state_root>/events.sock`
+//! (`tools/boss/engine/core/src/app/server.rs:368-390`) — the probe is derived
+//! from the state root, so a different `--socket-path` does not evade it, and
+//! it fires before the event sink is constructed. `bossctl` only reads these
+//! files. Anything that appends to a Boss `.jsonl` from a second process is
+//! outside this crate's contract and must not.
 //!
-//! The lock is advisory, so it only excludes writers that also take it. Every
-//! writer of these files goes through this crate; anything that appends to a
-//! Boss `.jsonl` by hand is outside the guarantee and must not.
-//!
-//! **The file lock is bounded, and never an availability dependency.** The
-//! obvious implementation — a blocking `lock_exclusive` — would make the
-//! forensic writer able to stall the thing it is recording: because the
-//! process-wide mutex is held across the whole path set, one wedged holder of
-//! one file's advisory lock (a crashed-but-not-reaped process, a debugging
-//! `flock(1)` on `current.jsonl`, a lock on a network-mounted state root)
-//! would block *every* append in this process — including appends to unrelated
-//! per-execution mirrors — for as long as it kept the lock. Dispatch events are
-//! output *about* the dispatch path and must not be able to stop it. So
-//! acquisition is [`LOCK_ACQUIRE_TIMEOUT`]-bounded `try_lock_exclusive` with
-//! backoff, and on timeout the append takes a defined, logged branch: it
-//! proceeds with the single `write_all` anyway and warns on stderr.
-//!
-//! Falling back to the unlocked write (rather than returning an error) is the
-//! deliberate choice, and it is the same trade the two-layer design makes
-//! above: a single `write_all` of a record this size is atomic against
-//! concurrent appenders in practice, so the fallback's exposure is the
-//! *theoretical* short-write case, whereas dropping the append loses a
-//! forensic record for certain. This crate exists because records were being
-//! lost; it must not itself become a way to lose them. The warning is what
-//! makes the degraded write visible — a wedged lock holder on a Boss state
-//! file is an operator problem, not something to absorb silently.
+//! (`tools/boss/event-shim` does take a real `flock` for its own genuinely
+//! multi-process buffer, and is not a caller of this crate.)
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
 
-use fs4::fs_std::FileExt;
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -84,26 +63,6 @@ use tokio::sync::Mutex;
 /// caller constructs against the same or different roots: two independently
 /// constructed appenders still serialize through this one lock.
 static APPEND_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-/// Longest an append will wait for another *process* to release the target
-/// file's advisory lock before writing without it.
-///
-/// Sized against what the lock actually protects: one `write_all` of a
-/// few-hundred-byte record, i.e. microseconds. Half a second is therefore
-/// thousands of times the honest contention case — a wait that reaches this
-/// bound is a wedged holder, not a busy one, and waiting longer would only
-/// deepen the stall it represents.
-pub const LOCK_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// First sleep between `try_lock_exclusive` attempts; doubles up to
-/// [`LOCK_RETRY_BACKOFF_MAX`]. Starting this short keeps the common case
-/// (genuine, microsecond-scale contention with another engine) from paying a
-/// scheduler-quantum penalty.
-const LOCK_RETRY_BACKOFF_START: Duration = Duration::from_micros(200);
-
-/// Cap on the retry sleep, so a long wait still polls often enough to pick the
-/// lock up promptly once it is released.
-const LOCK_RETRY_BACKOFF_MAX: Duration = Duration::from_millis(20);
 
 /// Serializes concurrent `.jsonl` appends within this process — across all
 /// `JsonlAppender` instances — so that no two records' bytes can ever
@@ -173,56 +132,7 @@ fn append_locked(path: &Path, line: &[u8]) -> io::Result<()> {
         }
         Err(err) => return Err(err),
     };
-    // Exclusive for the duration of the write, so a second *process* appending
-    // to the same file cannot land bytes in the middle of this record. Bounded,
-    // never blocking indefinitely — see the module docs for why a forensic
-    // writer must not be able to stall on a wedged lock holder.
-    let locked = acquire_bounded(&file, path)?;
-    // Unlock explicitly rather than relying on the handle's close: the write
-    // result is the one thing that must survive, so it is captured first and the
-    // unlock's own (uninteresting) failure never masks it.
-    let written = file.write_all(line);
-    if locked {
-        let _ = FileExt::unlock(&file);
-    }
-    written
-}
-
-/// Take `file`'s exclusive advisory lock, giving up after
-/// [`LOCK_ACQUIRE_TIMEOUT`].
-///
-/// Returns `Ok(true)` when the lock is held (the caller must unlock),
-/// `Ok(false)` when the timeout expired and the caller should write without it
-/// — the documented degraded branch, warned about on stderr rather than
-/// absorbed. `Err` is reserved for a lock attempt that failed for a reason
-/// other than contention, which is a real filesystem problem and belongs in the
-/// caller's per-path error handling.
-fn acquire_bounded(file: &std::fs::File, path: &Path) -> io::Result<bool> {
-    let deadline = Instant::now() + LOCK_ACQUIRE_TIMEOUT;
-    let mut backoff = LOCK_RETRY_BACKOFF_START;
-    loop {
-        match FileExt::try_lock_exclusive(file) {
-            Ok(true) => return Ok(true),
-            // Contended. `fs4` reports this as `Ok(false)` on some platforms and
-            // as `WouldBlock`/`Other` on others, so both shapes retry.
-            Ok(false) => {}
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
-        }
-        if Instant::now() >= deadline {
-            eprintln!(
-                "warning: {} advisory lock held elsewhere for >{}ms; appending without it. \
-                 Another process is wedged holding this file's lock — find and clear it \
-                 (`lsof {}`); until then cross-process appends to this file are unprotected.",
-                path.display(),
-                LOCK_ACQUIRE_TIMEOUT.as_millis(),
-                path.display(),
-            );
-            return Ok(false);
-        }
-        std::thread::sleep(backoff.min(deadline.saturating_duration_since(Instant::now())));
-        backoff = (backoff * 2).min(LOCK_RETRY_BACKOFF_MAX);
-    }
+    file.write_all(line)
 }
 
 #[cfg(test)]
@@ -340,180 +250,5 @@ mod tests {
             );
         }
         assert_eq!(seen.len(), WRITERS * PER_WRITER);
-    }
-
-    /// The process-wide mutex cannot exclude another *process*, and
-    /// `dispatch-events/current.jsonl` genuinely has more than one potential
-    /// writer process. This asserts the second layer is real: while a foreign
-    /// holder owns the file's advisory lock, an append must block rather than
-    /// write, and must complete once the lock is released.
-    ///
-    /// `flock` is per open-file-description, not per process, so a second
-    /// `File` opened here contends exactly as another process's handle would —
-    /// which is what makes this testable in-process at all.
-    ///
-    /// The wait asserted here is bounded by [`LOCK_ACQUIRE_TIMEOUT`]; the
-    /// 150 ms probe below is well inside it, so this test says "the lock is
-    /// honoured", not "the wait is unbounded". The bound itself is pinned by
-    /// `append_gives_up_on_a_wedged_holder_and_still_records_the_event`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn append_waits_for_a_foreign_holder_of_the_file_lock() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("current.jsonl");
-        std::fs::write(&path, b"").unwrap();
-
-        let foreign = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        FileExt::lock_exclusive(&foreign).unwrap();
-
-        let appender = JsonlAppender::new();
-        let append_path = path.clone();
-        let appending = tokio::spawn(async move {
-            let appender = appender;
-            appender
-                .append(
-                    &append_path,
-                    &Record {
-                        writer: 1,
-                        seq: 1,
-                        padding: "z".repeat(256),
-                    },
-                )
-                .await
-        });
-
-        // Give the append every chance to run to completion if the lock were
-        // not being honoured: it is on a multi-thread runtime with a free
-        // worker, so the only thing that can hold it up is the `flock`.
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        assert!(
-            !appending.is_finished(),
-            "append completed while a foreign process held the file lock — cross-process appends can interleave"
-        );
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            "",
-            "no bytes may land while the lock is held elsewhere"
-        );
-
-        FileExt::unlock(&foreign).unwrap();
-        appending.await.unwrap().unwrap();
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(contents.lines().count(), 1, "the append must land once unblocked");
-        let parsed: Record = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-        assert_eq!(parsed.seq, 1);
-    }
-
-    /// The bound on the wait above. A holder that never releases the lock — a
-    /// wedged process, a `flock(1)` left running, a stale lock on a network
-    /// state root — must not turn the forensic writer into an availability
-    /// dependency for the dispatch path it is recording. After
-    /// [`LOCK_ACQUIRE_TIMEOUT`] the append takes the documented degraded
-    /// branch: it writes anyway (so the event is not lost) and warns.
-    ///
-    /// The generous upper bound on the assertion is deliberate: what matters is
-    /// that the wait is *bounded at all*, not that it lands on a precise
-    /// deadline on a loaded CI host.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn append_gives_up_on_a_wedged_holder_and_still_records_the_event() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("current.jsonl");
-        std::fs::write(&path, b"").unwrap();
-
-        // Never unlocked: this stands in for a wedged holder.
-        let wedged = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        FileExt::lock_exclusive(&wedged).unwrap();
-
-        let appender = JsonlAppender::new();
-        let result = tokio::time::timeout(
-            LOCK_ACQUIRE_TIMEOUT * 10,
-            appender.append(
-                &path,
-                &Record {
-                    writer: 7,
-                    seq: 7,
-                    padding: "w".repeat(256),
-                },
-            ),
-        )
-        .await
-        .expect("append must not hang indefinitely on a wedged lock holder");
-        result.expect("the degraded branch writes rather than failing");
-
-        let contents = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            contents.lines().count(),
-            1,
-            "the record must still reach the file — losing forensic output is the failure this crate exists to prevent"
-        );
-        let parsed: Record = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
-        assert_eq!(parsed.seq, 7);
-
-        // A second append must not be permanently poisoned either: the bound is
-        // per-attempt, not a latch.
-        appender
-            .append(
-                &path,
-                &Record {
-                    writer: 8,
-                    seq: 8,
-                    padding: String::new(),
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap().lines().count(), 2);
-    }
-
-    /// A wedged holder of ONE file must not block appends to a DIFFERENT file.
-    /// The process-wide mutex means both go through the same critical section,
-    /// so an unbounded wait on the first would stall the second — which is the
-    /// specific way a forensic writer becomes an availability dependency for
-    /// unrelated per-execution mirrors.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_wedged_holder_on_one_file_does_not_stall_appends_to_another() {
-        let dir = TempDir::new().unwrap();
-        let wedged_path = dir.path().join("current.jsonl");
-        let other_path = dir.path().join("executions").join("exec-1").join("dispatch.jsonl");
-        std::fs::write(&wedged_path, b"").unwrap();
-
-        let wedged = std::fs::OpenOptions::new().append(true).open(&wedged_path).unwrap();
-        FileExt::lock_exclusive(&wedged).unwrap();
-
-        let appender = Arc::new(JsonlAppender::new());
-        let blocked = {
-            let appender = Arc::clone(&appender);
-            let wedged_path = wedged_path.clone();
-            tokio::spawn(async move {
-                appender
-                    .append(
-                        &wedged_path,
-                        &Record {
-                            writer: 1,
-                            seq: 1,
-                            padding: String::new(),
-                        },
-                    )
-                    .await
-            })
-        };
-
-        tokio::time::timeout(
-            LOCK_ACQUIRE_TIMEOUT * 10,
-            appender.append(
-                &other_path,
-                &Record {
-                    writer: 2,
-                    seq: 2,
-                    padding: String::new(),
-                },
-            ),
-        )
-        .await
-        .expect("an unrelated mirror must not be held hostage by another file's lock")
-        .unwrap();
-
-        blocked.await.unwrap().unwrap();
-        assert_eq!(std::fs::read_to_string(&other_path).unwrap().lines().count(), 1);
     }
 }
