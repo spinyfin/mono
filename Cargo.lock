@@ -454,6 +454,7 @@ dependencies = [
  "boss-pr-template",
  "boss-protocol",
  "boss-ssh-transport",
+ "boss-timer-wheel",
  "boss-transcript-markdown",
  "boss-transcript-tail",
  "boss-trunk-auth",

@@ -1489,13 +1489,26 @@ pub async fn serve_with_merge_probe(
             Arc::new(move || coord_for_automation_triage.kick()),
             Arc::new(move || coord_for_automation_pause_check.is_automation_paused()),
         ));
+    // Timer-wheel private to the automation scheduler: the scheduler
+    // schedules its own next-wake deadline here, so a `Timer{deadline_id}`
+    // event on `server_state.event_bus` is what wakes it. `TimerWheel::spawn`
+    // requires a running Tokio reactor, so it is constructed here (in
+    // `serve`'s async context) rather than in `ServerState::new`, which many
+    // synchronous unit tests call directly. A future `Timer`-driven consumer
+    // (e.g. `envelope_watch`) needs either its own wheel spawned the same way
+    // or a refactor of `ServerState::new` to defer wheel construction until
+    // first async use.
+    let automation_scheduler_timer_wheel =
+        Arc::new(boss_timer_wheel::TimerWheel::spawn(server_state.event_bus.clone()));
     let _automation_scheduler_handle = crate::automation_scheduler::spawn_loop(
         server_state.work_db.clone(),
         automation_triage_dispatcher,
-        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kind(
+        server_state.event_bus.subscribe(boss_event_bus::TopicFilter::kinds([
             boss_event_bus::EventKind::AutomationMutation,
-        )),
+            boss_event_bus::EventKind::Timer,
+        ])),
         Arc::new(move || coord_for_scheduler_pause_check.is_automation_paused()),
+        automation_scheduler_timer_wheel,
     );
 
     // Scheduler heartbeat: periodic `kick()` so a ready row stranded
