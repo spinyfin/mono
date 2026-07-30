@@ -16,6 +16,11 @@ impl WorkerCompletionHandler {
     /// Idempotent against an already-finalized execution: the DB write
     /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
     pub(super) async fn finalize_no_op_completion(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        // Captured before `record_worker_no_op_completion` below nulls
+        // `workspace_path` in the same transaction that terminalizes the
+        // execution — this path terminalizes a parked-live execution, so it
+        // owns driver teardown.
+        let workspace_path = execution.workspace_path.clone();
         let detail = "Worker verified the assigned work was already done (empty diff — no changes \
                       needed); closed as a no-op without a PR.";
         let completion = match self.work_db.record_worker_no_op_completion(&execution.id, detail) {
@@ -37,6 +42,12 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

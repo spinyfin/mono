@@ -466,6 +466,11 @@ impl WorkerCompletionHandler {
     /// In either case the reviewer execution is completed and its workspace
     /// released — it is always terminal after this handler runs.
     pub(super) async fn finalize_pr_review_pass(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        // Captured before `record_worker_pr_completion` below nulls
+        // `workspace_path` in the same transaction that terminalizes this
+        // execution — this path terminalizes a parked-live execution, so it
+        // owns driver teardown.
+        let workspace_path = execution.workspace_path.clone();
         let producing_task_id = &execution.work_item_id;
 
         // Trace marker distinguishing a re-review triggered by a revision's
@@ -791,6 +796,12 @@ impl WorkerCompletionHandler {
             "pr_review pass duration",
         );
 
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

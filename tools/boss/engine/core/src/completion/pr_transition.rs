@@ -16,6 +16,17 @@ impl WorkerCompletionHandler {
         target: WorkerPrCompletionTarget,
         source: &'static str,
     ) -> StopOutcome {
+        // Captured before `record_worker_pr_completion` below nulls
+        // `workspace_path` in the same transaction that terminalizes the
+        // execution — this IS the path that terminalizes a parked-live
+        // (`waiting_human` / `running`) execution on PR success, so it owns
+        // driver teardown; nothing downstream of this call reaps it.
+        let workspace_path = self
+            .work_db
+            .get_execution(execution_id)
+            .ok()
+            .and_then(|execution| execution.workspace_path);
+
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
         // For reviewer-triggering executions with a fresh
@@ -227,6 +238,17 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(execution_id);
         self.background_children_tracker.forget(execution_id);
         self.hold_registry.release(execution_id);
+        // Stop → pr_transition termination path: this call just moved the
+        // execution to `completed` (see `record_worker_pr_completion`), so it
+        // owns driver teardown — mirrors `force_release`'s and the automation
+        // triage / answer-agent finalizers' ordering (teardown before the
+        // actual cube release).
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            execution_id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {

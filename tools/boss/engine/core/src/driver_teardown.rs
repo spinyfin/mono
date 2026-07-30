@@ -36,6 +36,17 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
     #[cfg(test)]
     test_hooks::record_call();
 
+    // Entry-level trace, unconditional and before any early return below, so
+    // "did teardown run for this execution?" is answerable directly from the
+    // trace instead of being inferred from a driver's own outcome log (e.g.
+    // Codex's "teardown adopt finished" line, which never fires if this
+    // function itself is never reached).
+    tracing::info!(
+        execution_id,
+        workspace_path = ?workspace_path.map(Path::display),
+        "driver workspace teardown: entered",
+    );
+
     // Provider-session identity is engine-owned lifecycle state, independent
     // of whether the driver had filesystem runtime state to clean up. Clear it
     // before any early return below so every normal termination path prunes
