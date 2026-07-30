@@ -286,7 +286,7 @@ impl ProbeQueuer for RecordingProbeQueuer {
             .push((run_id.to_owned(), text.to_owned()));
     }
 
-    fn clear_pending_probes(&self, run_id: &str) {
+    fn clear_pending_probes(&self, run_id: &str, _reason: &str) {
         self.clear_calls
             .lock()
             .expect("RecordingProbeQueuer mutex poisoned")

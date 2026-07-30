@@ -380,8 +380,32 @@ pub(super) async fn handle_probe_run(ctx: Dispatch, req: FrontendRequest) {
         // the probe queued for a later `PostToolUse`/`Stop` retry.
         let server_for_now = server_state.clone();
         let run_id_for_now = run_id.clone();
+        let probe_id_for_now = probe_id.clone();
         tokio::spawn(async move {
-            dispatch_probe_now(&server_for_now, &run_id_for_now).await;
+            let outcome = dispatch_probe_now(&server_for_now, &run_id_for_now).await;
+            // This runs detached, after the response has already gone back to
+            // the caller, so its verdict is otherwise invisible. Log it — and
+            // say so loudly when the engine promised `Immediate` and the
+            // immediate path then declined to deliver, which is the engine
+            // breaking a commitment it made in the response it already sent.
+            let promised_now = expected_delivery == ProbeDeliveryExpectation::Immediate;
+            if promised_now && !matches!(outcome, ProbeDispatchOutcome::Dispatched(_)) {
+                tracing::warn!(
+                    run_id = %run_id_for_now,
+                    probe_id = %probe_id_for_now,
+                    outcome = outcome.as_str(),
+                    "probe was accepted with an `immediate` delivery commitment but the immediate \
+                     dispatch did not deliver it; it now depends on the next turn boundary",
+                );
+            } else {
+                tracing::debug!(
+                    run_id = %run_id_for_now,
+                    probe_id = %probe_id_for_now,
+                    outcome = outcome.as_str(),
+                    expected_delivery = expected_delivery.as_str(),
+                    "immediate probe dispatch attempt settled",
+                );
+            }
         });
         send_response(
             &sink,

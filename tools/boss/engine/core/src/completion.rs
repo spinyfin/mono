@@ -999,9 +999,10 @@ pub(crate) fn parse_repo_slug(remote_url: &str) -> Result<String> {
 /// Queues an automatic probe for `run_id`. The shape mirrors
 /// `ServerState::queue_probe` but is exposed via a trait so the
 /// completion handler can be unit-tested without standing up the full
-/// app server. Implementations must be cheap and infallible — probes
-/// that can't be delivered are dropped silently at injection time
-/// (see `dispatch_probe_on_stop` in `app.rs`).
+/// app server. Implementations must be cheap and infallible — a probe
+/// that turns out to be undeliverable is settled at a terminal
+/// [`boss_protocol::ProbeDeliveryState`] by the injection path rather
+/// than dropped silently (see `dispatch_probe_on_stop` in `app.rs`).
 pub trait ProbeQueuer: Send + Sync {
     /// Push `text` onto the FIFO of probes for `run_id`. The engine
     /// `SendToPane`'s it as if the human had typed it, at the earliest
@@ -1030,7 +1031,13 @@ pub trait ProbeQueuer: Send + Sync {
     /// Called whenever `on_stop_inner` finds an unresolved worker
     /// signal, so no queued nudge survives into a Stop where nudging is
     /// suppressed.
-    fn clear_pending_probes(&self, run_id: &str);
+    ///
+    /// `reason` is recorded against every discarded probe's status record.
+    /// It is not optional: discarding a probe the caller was told was
+    /// `queued` is only acceptable if that caller can subsequently find out
+    /// it happened and why. A discard that leaves the probe reading `queued`
+    /// is the silent-drop defect this parameter exists to prevent.
+    fn clear_pending_probes(&self, run_id: &str, reason: &str);
 }
 
 /// `ProbeQueuer` that drops everything — used when the test harness
@@ -1040,7 +1047,7 @@ pub struct NoopProbeQueuer;
 
 impl ProbeQueuer for NoopProbeQueuer {
     fn queue_probe(&self, _run_id: &str, _text: &str) {}
-    fn clear_pending_probes(&self, _run_id: &str) {}
+    fn clear_pending_probes(&self, _run_id: &str, _reason: &str) {}
 }
 
 /// Orchestrates the on-Stop completion flow: detect PR, transition

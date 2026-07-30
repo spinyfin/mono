@@ -387,7 +387,7 @@ struct NoopProbeQueuer;
 
 impl ProbeQueuer for NoopProbeQueuer {
     fn queue_probe(&self, _run_id: &str, _text: &str) {}
-    fn clear_pending_probes(&self, _run_id: &str) {}
+    fn clear_pending_probes(&self, _run_id: &str, _reason: &str) {}
 }
 
 struct NoopCubeClient;

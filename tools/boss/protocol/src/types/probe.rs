@@ -70,6 +70,17 @@ impl ProbeDeliveryExpectation {
 /// worker goes `Queued → Injected → Consumed`, a mid-turn one goes
 /// `Queued → Injected → Buffered`, and either can end at `Replied` once the
 /// worker answers.
+///
+/// Not every probe is delivered, and the failure modes are deliberately
+/// distinct states rather than a probe left sitting at [`Self::Queued`]
+/// forever. `Queued` is a live promise: it means the engine still intends to
+/// deliver. The moment that stops being true — the engine discards the probe
+/// ([`Self::Dropped`]), the run it targeted goes away ([`Self::Abandoned`]),
+/// or the bytes were written into a pane whose process had already exited
+/// ([`Self::Orphaned`]) — the record must say so, because a caller cannot
+/// otherwise tell "arriving shortly" from "never going to arrive". All three
+/// answer [`Self::is_undeliverable`]; the first two are also
+/// [`Self::is_terminal`], while `Orphaned` can still be corrected by a reply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProbeDeliveryState {
@@ -96,6 +107,29 @@ pub enum ProbeDeliveryState {
     /// The worker replied and the engine published the reply on the probe
     /// topic.
     Replied,
+    /// The engine deliberately discarded the probe before any pane write —
+    /// e.g. a stale nudge cleared when the worker turned out to be
+    /// `[blocked]`. Terminal: it will never be delivered, and the `detail`
+    /// on the status record says why it was discarded.
+    Dropped,
+    /// The run the probe targeted went away before its delivery boundary
+    /// arrived: the worker's pane was released or the run reached a terminal
+    /// state with the probe still queued. Terminal, and never the caller's
+    /// fault — the boundary the engine committed to simply never came.
+    Abandoned,
+    /// The pane write was issued, but the worker's recorded process had
+    /// already exited: the bytes went into a pane nothing was reading. Distinct
+    /// from [`Self::Unconfirmed`] (where the worker is alive and the text
+    /// probably landed, just unobservably) — here there was demonstrably
+    /// nobody home, so this must not be reported as [`Self::Consumed`].
+    ///
+    /// The verdict rests on a `kill(pid, 0)` probe of the *recorded* shell
+    /// pid, which the engine treats elsewhere as a fragile identity (a wrapper
+    /// shell that exec'd or exited leaves the agent alive under another pid).
+    /// So this is undeliverable-as-far-as-we-know rather than proof of loss:
+    /// if the worker answers anyway, the reply path corrects the record to
+    /// [`Self::Replied`]. That is why it is not terminal.
+    Orphaned,
 }
 
 impl ProbeDeliveryState {
@@ -107,6 +141,9 @@ impl ProbeDeliveryState {
             Self::Buffered => "buffered",
             Self::Unconfirmed => "unconfirmed",
             Self::Replied => "replied",
+            Self::Dropped => "dropped",
+            Self::Abandoned => "abandoned",
+            Self::Orphaned => "orphaned",
         }
     }
 
@@ -115,6 +152,29 @@ impl ProbeDeliveryState {
     /// is by definition unproven.
     pub fn is_delivered(self) -> bool {
         matches!(self, Self::Consumed | Self::Buffered | Self::Replied)
+    }
+
+    /// True when no further transition is possible: the worker answered, or
+    /// the probe definitively will not be delivered.
+    ///
+    /// `Consumed`/`Buffered`/`Unconfirmed`/`Orphaned` are *not* terminal —
+    /// each can still become `Replied` when the worker's answer lands. Only
+    /// `Dropped` and `Abandoned` are settled by construction: in both the
+    /// engine discarded the probe before any pane write, so there is nothing
+    /// out there that could produce a reply.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Replied | Self::Dropped | Self::Abandoned)
+    }
+
+    /// True when the engine has given up on delivering this probe.
+    ///
+    /// The point of this predicate is the contrast with `Queued`. `Queued` and
+    /// `Injected` are *live* — something is still expected to happen — so a
+    /// probe reported in either state indefinitely is a bug in the engine, not
+    /// a slow worker. Every path that removes a probe from the pending queue
+    /// without delivering it must land on one of the states here.
+    pub fn is_undeliverable(self) -> bool {
+        matches!(self, Self::Dropped | Self::Abandoned | Self::Orphaned)
     }
 }
 
@@ -139,6 +199,9 @@ mod tests {
             ProbeDeliveryState::Buffered,
             ProbeDeliveryState::Unconfirmed,
             ProbeDeliveryState::Replied,
+            ProbeDeliveryState::Dropped,
+            ProbeDeliveryState::Abandoned,
+            ProbeDeliveryState::Orphaned,
         ] {
             let json = serde_json::to_string(&state).unwrap();
             let parsed: ProbeDeliveryState = serde_json::from_str(&json).unwrap();
@@ -157,6 +220,50 @@ mod tests {
         assert!(!ProbeDeliveryState::Queued.is_delivered());
         assert!(!ProbeDeliveryState::Injected.is_delivered());
         assert!(!ProbeDeliveryState::Unconfirmed.is_delivered());
+        assert!(!ProbeDeliveryState::Dropped.is_delivered());
+        assert!(!ProbeDeliveryState::Abandoned.is_delivered());
+        assert!(!ProbeDeliveryState::Orphaned.is_delivered());
+    }
+
+    #[test]
+    fn live_states_are_neither_terminal_nor_undeliverable() {
+        // The whole point of the terminal states: a probe that is no longer
+        // going to be delivered must not read as one that is still on its
+        // way. `Queued`/`Injected` are the only two "still coming" states.
+        for live in [ProbeDeliveryState::Queued, ProbeDeliveryState::Injected] {
+            assert!(!live.is_terminal(), "{} must stay live", live.as_str());
+            assert!(!live.is_undeliverable(), "{} must stay live", live.as_str());
+        }
+        for gave_up in [
+            ProbeDeliveryState::Dropped,
+            ProbeDeliveryState::Abandoned,
+            ProbeDeliveryState::Orphaned,
+        ] {
+            assert!(gave_up.is_undeliverable(), "{} must be undeliverable", gave_up.as_str());
+        }
+        // Discarded before any pane write: nothing exists that could reply.
+        assert!(ProbeDeliveryState::Dropped.is_terminal());
+        assert!(ProbeDeliveryState::Abandoned.is_terminal());
+        // The bytes did reach the pane, and the dead-pid verdict rests on a
+        // fragile pid identity — a reply that arrives anyway must be able to
+        // correct the record.
+        assert!(!ProbeDeliveryState::Orphaned.is_terminal());
+        // Delivered-but-unanswered states can still advance to `Replied`, so
+        // they are not terminal even though they are not failures either.
+        for pending_reply in [
+            ProbeDeliveryState::Consumed,
+            ProbeDeliveryState::Buffered,
+            ProbeDeliveryState::Unconfirmed,
+        ] {
+            assert!(
+                !pending_reply.is_terminal(),
+                "{} can still be replied to",
+                pending_reply.as_str()
+            );
+            assert!(!pending_reply.is_undeliverable());
+        }
+        assert!(ProbeDeliveryState::Replied.is_terminal());
+        assert!(!ProbeDeliveryState::Replied.is_undeliverable());
     }
 
     #[test]

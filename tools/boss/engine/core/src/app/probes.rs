@@ -8,7 +8,18 @@
 //! a reply, and the observable [`ProbeDeliveryState`] each probe id moves
 //! through.
 //!
-//! Split out of `app.rs`; pure structural move — no behavioural change.
+//! Originally split out of `app.rs` as a pure structural move.
+//!
+//! **The invariant this module owns:** `pending_probes` and `probe_lifecycle`
+//! must never disagree. A probe id in `probe_lifecycle` at `Queued` is a live
+//! promise that some dispatch path still holds the probe and intends to
+//! deliver it. So a probe may only leave the pending queue by being
+//! dispatched (which records what happened to it) or through
+//! [`ServerState::drain_pending_probes`] (which settles it at an
+//! undeliverable state and says why). Removing it any other way — the bare
+//! `pending_probes.remove(run_id)` this module used to do on the discard path
+//! — leaves the promise standing with nothing behind it, which is how a probe
+//! came to report `queued` forever against a run whose pane had been reaped.
 
 use super::*;
 
@@ -47,7 +58,7 @@ impl ProbeQueuer for ServerStateProbeQueuer {
         let _ = server.queue_probe(run_id.to_owned(), text.to_owned(), false);
     }
 
-    fn clear_pending_probes(&self, run_id: &str) {
+    fn clear_pending_probes(&self, run_id: &str, reason: &str) {
         let Some(weak) = self.server.get() else {
             tracing::warn!(run_id, "probe queuer called before server state was bound");
             return;
@@ -56,7 +67,69 @@ impl ProbeQueuer for ServerStateProbeQueuer {
             tracing::debug!(run_id, "probe queuer: server state already dropped");
             return;
         };
-        server.clear_pending_probes(run_id);
+        server.clear_pending_probes(run_id, reason);
+    }
+}
+
+/// Why one call into a probe-dispatch path ended the way it did.
+///
+/// Returned by every `dispatch_probe_*` function and logged by that function
+/// before it returns, so there is no exit from the dispatch path that leaves
+/// no trace. The value exists on top of the log line because a test asserting
+/// "the `None` branch was taken" should not have to parse `tracing` output.
+///
+/// The reason this is an explicit type rather than three bare `return`s: the
+/// silently-dropped `probe-2` was undiagnosable precisely because two of the
+/// exits here (`NothingQueued`, and the no-slot case when the queue happened
+/// to be empty) wrote nothing at all. Reading the trace could not distinguish
+/// "the dispatcher never ran" from "it ran and found an empty queue" — which
+/// is the difference between the bug being upstream or downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProbeDispatchOutcome {
+    /// The hook event was not a delivery boundary for this path (wrong event
+    /// kind, or a driver whose `Stop` is not a turn boundary).
+    NotADeliveryBoundary,
+    /// The hook event carried no `run_id`, so no queue could be identified.
+    NoRunId,
+    /// Nothing was queued for the run. The overwhelmingly common outcome —
+    /// most boundaries have no probe waiting.
+    NothingQueued,
+    /// Probes are queued but the run has no slot mapping, so there is no pane
+    /// to write into. They stay queued for a later boundary.
+    NoSlotMapping,
+    /// Probes are queued but the `(activity, driver)` pair admits no write.
+    /// They stay queued (fail closed — never write into a non-consuming
+    /// foreground process).
+    PostureRefused,
+    /// A probe is already in flight for the run and still owes a
+    /// `ProbeReplied`. The queue is left alone so the single in-flight slot
+    /// is not overwritten; it drains after the next turn boundary.
+    AlreadyInFlight,
+    /// The queue was non-empty at the pre-pop peek and empty at the pop:
+    /// another dispatch path won the race. Anomalous but not a loss — the
+    /// winner owns the probe and records its outcome.
+    RacedToEmpty,
+    /// A probe was popped and dispatched; the value is the delivery state
+    /// recorded for it.
+    Dispatched(ProbeDeliveryState),
+    /// A probe was popped, the write failed, and it was pushed back onto the
+    /// front of the queue with its id intact for the next boundary.
+    RequeuedAfterFailure,
+}
+
+impl ProbeDispatchOutcome {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::NotADeliveryBoundary => "not_a_delivery_boundary",
+            Self::NoRunId => "no_run_id",
+            Self::NothingQueued => "nothing_queued",
+            Self::NoSlotMapping => "no_slot_mapping",
+            Self::PostureRefused => "posture_refused",
+            Self::AlreadyInFlight => "already_in_flight",
+            Self::RacedToEmpty => "raced_to_empty",
+            Self::Dispatched(_) => "dispatched",
+            Self::RequeuedAfterFailure => "requeued_after_failure",
+        }
     }
 }
 
@@ -186,18 +259,6 @@ impl ServerState {
         probe
     }
 
-    /// True when at least one probe is queued (not yet written into the
-    /// pane) for `run_id`. Lets the `PostToolUse` dispatcher no-op on the
-    /// overwhelming majority of tool boundaries without touching the
-    /// registry, the driver table, or the DB.
-    pub(super) fn has_pending_probe(&self, run_id: &str) -> bool {
-        self.pending_probes
-            .lock()
-            .expect("pending_probes mutex poisoned")
-            .get(run_id)
-            .is_some_and(|queue| !queue.is_empty())
-    }
-
     /// True when a probe has been written into `run_id`'s pane (or claimed
     /// the run's delivery slot and is about to be) and its `ProbeReplied` is
     /// still outstanding.
@@ -277,18 +338,144 @@ impl ServerState {
         self.requeue_probe_front(run_id.to_owned(), probe);
     }
 
+    /// True when at least one probe is queued (not yet written into the
+    /// pane) for `run_id`. Lets a dispatcher no-op on the overwhelming
+    /// majority of boundaries without touching the registry, the driver
+    /// table, or the DB. Use [`Self::pending_probe_count`] instead when the
+    /// exit being taken wants to report *how many* probes it left queued.
+    pub(super) fn has_pending_probe(&self, run_id: &str) -> bool {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .is_some_and(|queue| !queue.is_empty())
+    }
+
+    /// How many probes are queued (not yet dispatched) for `run_id`.
+    ///
+    /// Lets a dispatch path distinguish "nothing to do" from "something to do
+    /// that I cannot do" *before* it decides whether an exit is routine or
+    /// anomalous, without claiming anything — the claim must stay behind the
+    /// fail-closed posture guard.
+    pub(super) fn pending_probe_count(&self, run_id: &str) -> usize {
+        self.pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .get(run_id)
+            .map(VecDeque::len)
+            .unwrap_or(0)
+    }
+
+    /// Remove every not-yet-delivered probe queued for `run_id` and settle
+    /// each one at the terminal `state`, with `detail` recorded as the
+    /// operator-facing explanation. Returns the drained probe ids.
+    ///
+    /// **This is the only sanctioned way to remove a queued probe without
+    /// delivering it.** A bare `pending_probes.remove(run_id)` was the defect
+    /// behind the silently-dropped `probe-2`: it took the probe out of the
+    /// queue but left `probe_lifecycle` reading `Queued`, so `bossctl
+    /// probe-status` reported a probe as still on its way against a run whose
+    /// pane had already been reaped — indefinitely, since nothing else ever
+    /// revisits the record. Draining through here keeps the two tables in
+    /// step and logs one line per probe, so the drop is both visible in the
+    /// trace and answerable over the wire.
+    ///
+    /// Leaves any already-injected in-flight probe untouched: those are past
+    /// the queue and their outcome is settled by the reply path.
+    pub(super) fn drain_pending_probes(&self, run_id: &str, state: ProbeDeliveryState, detail: &str) -> Vec<String> {
+        debug_assert!(
+            state.is_undeliverable(),
+            "draining a queued probe means it will never be delivered; \
+             {} is not an undeliverable state",
+            state.as_str(),
+        );
+        let drained = self
+            .pending_probes
+            .lock()
+            .expect("pending_probes mutex poisoned")
+            .remove(run_id)
+            .unwrap_or_default();
+        let mut ids = Vec::with_capacity(drained.len());
+        for probe in drained {
+            tracing::warn!(
+                run_id,
+                probe_id = %probe.probe_id,
+                state = state.as_str(),
+                detail,
+                "queued probe drained undelivered; recording terminal delivery state",
+            );
+            self.set_probe_lifecycle_detail(&probe.probe_id, state, Some(detail.to_owned()));
+            ids.push(probe.probe_id);
+        }
+        ids
+    }
+
     /// Drop every not-yet-delivered probe queued for `run_id`. Used by
     /// the completion handler to discard a stale nudge (e.g. one
     /// requeued for retry after a failed `SendToPane`) once a Stop
     /// reveals the worker reported `[blocked]`/`[effort-escalation]` —
     /// otherwise `dispatch_probe_on_stop` would pop and deliver it
     /// regardless of that Stop's own (suppressed) completion outcome.
-    /// Leaves any already-injected in-flight probe untouched.
-    fn clear_pending_probes(&self, run_id: &str) {
-        self.pending_probes
-            .lock()
-            .expect("pending_probes mutex poisoned")
-            .remove(run_id);
+    ///
+    /// `reason` is required and lands in the probe's status record: a
+    /// deliberate discard is a legitimate outcome, but only if the caller who
+    /// was told "queued" can find out that it happened and why.
+    fn clear_pending_probes(&self, run_id: &str, reason: &str) {
+        self.drain_pending_probes(run_id, ProbeDeliveryState::Dropped, reason);
+    }
+
+    /// Settle every probe still queued for `run_id` as [`ProbeDeliveryState::Abandoned`],
+    /// because the run is going away: its pane is being released, so no
+    /// delivery boundary will ever arrive.
+    ///
+    /// Called from [`ServerState::release_worker_pane`], which is the single
+    /// choke point every teardown path funnels through (completion, `bossctl
+    /// agents stop`, the stale/terminal/dead-pid sweeps, engine shutdown).
+    /// Without this a probe accepted with a `next_turn_boundary` commitment
+    /// outlives the run it was addressed to and reports `queued` forever.
+    pub(super) fn abandon_pending_probes_for_terminated_run(&self, run_id: &str, cause: &str) {
+        let ids = self.drain_pending_probes(
+            run_id,
+            ProbeDeliveryState::Abandoned,
+            &format!("{cause}; the worker was gone before the probe's delivery boundary arrived"),
+        );
+        if !ids.is_empty() {
+            tracing::warn!(
+                run_id,
+                probe_ids = %ids.join(","),
+                cause,
+                "run terminated with probes still queued; the accepted delivery commitment could \
+                 not be honoured — recorded as abandoned rather than left queued",
+            );
+        }
+    }
+
+    /// Whether the worker process behind `run_id` probes *dead* right now.
+    ///
+    /// Used to keep [`ProbeDeliveryState::Consumed`] honest: a `SendToPane`
+    /// that returns `Ok` only proves the app wrote bytes into the pty, and a
+    /// pane whose foreground process has already exited will accept those
+    /// bytes with nobody to read them (observed with a `codex` pane, where the
+    /// probe was nonetheless recorded `consumed`). Reuses the shared
+    /// [`crate::dead_pid_sweep::probe_pid`] liveness probe rather than a
+    /// second `kill(pid, 0)` implementation.
+    ///
+    /// Deliberately conservative — this returns `true` only for a positive
+    /// `ESRCH` verdict on a recorded pid. No recorded pid (`0`, i.e. the app
+    /// has not reported one yet), `EPERM`, or any other errno all yield
+    /// `false`, so an unverifiable worker keeps the pre-existing behaviour
+    /// instead of being libelled as dead.
+    pub(super) fn run_process_probes_dead(&self, run_id: &str) -> bool {
+        let Some(shell_pid) = self.live_worker_states.shell_pid_for_run(run_id) else {
+            return false;
+        };
+        if shell_pid <= 0 {
+            return false;
+        }
+        matches!(
+            crate::dead_pid_sweep::probe_pid(shell_pid),
+            crate::dead_pid_sweep::PidStatus::Dead
+        )
     }
 
     /// Take and return the in-flight probe for `run_id`, if any.

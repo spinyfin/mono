@@ -98,6 +98,13 @@ pub async fn probe_run(
 /// field (`--json`) or the printed `state=`, so a consumer gets one predicate
 /// per question instead of an exit code that means both.
 ///
+/// An *undeliverable* state (`dropped` / `abandoned` / `orphaned`) also gets a
+/// stderr line, and that one IS a redelivery cue: the engine gave up before
+/// the text reached a live worker, so nothing landed and re-issuing cannot
+/// duplicate an instruction. These states exist so that a probe the engine
+/// stopped trying to deliver stops reporting `queued` — `queued` is a live
+/// promise, and a probe stuck on it against a finished run was the bug.
+///
 /// `unconfirmed` still gets an explanatory line on stderr: the engine wrote
 /// the text but could not prove the worker took it. That is deliberately
 /// *not* a redelivery instruction — the engine does not auto-redeliver an
@@ -151,6 +158,12 @@ pub async fn probe_status(socket_path: &Option<String>, json: bool, probe_id: St
                     "warning: probe {returned} is unconfirmed: the write reached the pane but the engine could \
                      not prove the worker took it. It may still have landed — check the worker's transcript \
                      before re-issuing, since a second copy would repeat the instruction."
+                );
+            } else if state.is_undeliverable() {
+                eprintln!(
+                    "warning: probe {returned} was never delivered (state={}): the engine gave up on it before \
+                     the text reached a live worker. Nothing landed, so re-issuing against a live run is safe.",
+                    state.as_str(),
                 );
             }
             Ok(())
