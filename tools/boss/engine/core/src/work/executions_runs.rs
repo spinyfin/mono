@@ -2037,6 +2037,60 @@ impl WorkDb {
         Ok(resumed)
     }
 
+    /// Persist the run's file-progress ingress resume point.
+    ///
+    /// Targets the same agent-session row as
+    /// [`Self::claim_run_progress_session_identity`], so the resume point and
+    /// the session identity can never end up describing different runs.
+    /// Errors when the execution has no run row: a checkpoint nobody can read
+    /// back is indistinguishable from no ingress at all, and the caller has to
+    /// know which of those it is.
+    pub fn set_run_progress_ingress_checkpoint(&self, execution_id: &str, checkpoint_json: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            bail!("no work_runs row for execution {execution_id}");
+        };
+        conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = ?2 WHERE id = ?1",
+            params![run_id, checkpoint_json],
+        )?;
+        Ok(())
+    }
+
+    /// Read back the run's file-progress ingress resume point.
+    ///
+    /// `Ok(None)` means "this run never recorded one" — a legitimate answer
+    /// for a run dispatched by an engine that predates the column, and a
+    /// distinct one from a read failure, which surfaces as `Err`.
+    pub fn get_run_progress_ingress_checkpoint(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT progress_ingress_checkpoint FROM work_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Drop the ingress resume point during normal execution teardown.
+    /// Returns `false` when no run row exists.
+    pub fn clear_run_progress_ingress_checkpoint(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Clear the engine-owned provider session identity during normal
     /// execution teardown. Returns `false` when no run row exists.
     ///

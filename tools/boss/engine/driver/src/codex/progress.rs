@@ -32,7 +32,7 @@ use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionN
 
 const MAX_TRACKED_ROLLOUT_CALLS: usize = 256;
 
-#[derive(Clone)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct RolloutToolCall {
     tool_name: String,
     tool_input: Value,
@@ -495,6 +495,90 @@ impl ProgressSessionNormalizer for CodexRolloutProgressSession {
         self.transcript_path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned())
+    }
+
+    fn resume_state(&self) -> Option<Value> {
+        serde_json::to_value(RolloutResumeState::capture(self)).ok()
+    }
+
+    fn restore_resume_state(&mut self, state: &Value) -> Result<(), String> {
+        let state: RolloutResumeState =
+            serde_json::from_value(state.clone()).map_err(|err| format!("rollout resume state: {err}"))?;
+        state.apply(self);
+        Ok(())
+    }
+}
+
+/// The part of a [`CodexRolloutProgressSession`] that a fresh session cannot
+/// re-derive from the bytes it is about to read.
+///
+/// Every field here has a wrong default under resumption, and each one is
+/// wrong in a way that is *observable* rather than cosmetic:
+///
+/// - `current_thread_id` is announced once, by the `session_meta` record at
+///   the head of the file. Resuming past that record with `None` makes every
+///   subsequent record fail [`CodexRolloutProgressSession::session_id`] and
+///   the whole rest of the run normalise to nothing.
+/// - `calls` / `call_order` hold tool calls whose output record has not
+///   arrived yet. Dropping them turns the matching `function_call_output`
+///   into an unpaired record and loses the `PostToolUse` for a tool call that
+///   really did complete.
+/// - `guard_trace_line` is a read cursor into an append-only decision log. A
+///   zero cursor re-announces every guard decision the run already reported.
+/// - `guard_records_seen` false, with tool calls then observed, fabricates the
+///   `GUARDS_SILENT_MARKER` signal — the one signal that is supposed to mean
+///   Codex skipped its hooks entirely.
+/// - `observed_tool_calls` and `turn_terminal` are the in-flight turn's own
+///   accounting; zeroing them mid-turn mis-scopes the guard comparison to a
+///   fragment of the turn.
+#[derive(Debug, bon::Builder, serde::Serialize, serde::Deserialize)]
+#[builder(on(String, into))]
+pub(super) struct RolloutResumeState {
+    #[serde(default)]
+    current_thread_id: Option<String>,
+    /// Open calls in `call_order` order, so the LRU eviction order survives
+    /// the round trip rather than being re-invented by `HashMap` iteration.
+    #[serde(default)]
+    open_calls: Vec<(String, RolloutToolCall)>,
+    #[serde(default)]
+    turn_terminal: bool,
+    #[serde(default)]
+    guard_trace_line: usize,
+    #[serde(default)]
+    observed_tool_calls: usize,
+    #[serde(default)]
+    guard_records_seen: bool,
+}
+
+impl RolloutResumeState {
+    fn capture(session: &CodexRolloutProgressSession) -> Self {
+        let open_calls = session
+            .call_order
+            .iter()
+            .filter_map(|call_id| session.calls.get(call_id).map(|call| (call_id.clone(), call.clone())))
+            .collect();
+        Self {
+            current_thread_id: session.current_thread_id.clone(),
+            open_calls,
+            turn_terminal: session.turn_terminal,
+            guard_trace_line: session.guard_trace_line,
+            observed_tool_calls: session.observed_tool_calls,
+            guard_records_seen: session.guard_records_seen,
+        }
+    }
+
+    fn apply(self, session: &mut CodexRolloutProgressSession) {
+        session.current_thread_id = self.current_thread_id;
+        session.calls = self
+            .open_calls
+            .iter()
+            .map(|(call_id, call)| (call_id.clone(), call.clone()))
+            .collect();
+        session.call_order = self.open_calls.into_iter().map(|(call_id, _)| call_id).collect();
+        session.turn_terminal = self.turn_terminal;
+        session.guard_trace_line = self.guard_trace_line;
+        session.observed_tool_calls = self.observed_tool_calls;
+        session.guard_records_seen = self.guard_records_seen;
     }
 }
 
@@ -1069,6 +1153,138 @@ mod tests {
             second.len(),
             1,
             "only the Stop should remain for a quiet turn: {second:?}"
+        );
+    }
+
+    /// The readoption contract for this session's per-run state.
+    ///
+    /// A session rebuilt from [`ProgressSessionNormalizer::resume_state`] must
+    /// carry the guard-trace read cursor and the "guards have been seen"
+    /// fact forward. Both are read cursors over an append-only log that the
+    /// rollout bytes themselves say nothing about, so a fresh session cannot
+    /// re-derive either one — it can only re-announce what the run already
+    /// reported.
+    #[test]
+    fn a_resumed_session_does_not_re_announce_guard_decisions_it_already_read() {
+        let dir = TempDir::new().unwrap();
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+
+        // The pre-restart engine: one turn, whose boundary reads and reports
+        // the one guard record.
+        let mut before = started_rollout_session(&trace);
+        let first = guard_trace_turn(&mut before, "call-1");
+        assert!(
+            first
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARD_TRACE_MARKER))),
+            "precondition — the first turn reports the guard record: {first:?}"
+        );
+        let state = before.resume_state().expect("a rollout session snapshots its state");
+
+        // The post-restart engine: a brand new session over the same run,
+        // re-seeded from that snapshot rather than from zero.
+        let mut after = CodexRolloutProgressSession::new(None, None, None).with_guard_trace_path(Some(trace.clone()));
+        after.restore_resume_state(&state).unwrap();
+
+        let second = guard_trace_turn(&mut after, "call-2");
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARD_TRACE_MARKER))),
+            "a restart must not re-report a guard decision the run already reported: {second:?}"
+        );
+        assert!(
+            !second
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARDS_SILENT_MARKER))),
+            "guards were seen before the restart, so the first post-restart turn must not claim \
+             they were inert: {second:?}"
+        );
+        assert_eq!(second.len(), 1, "only the Stop should remain: {second:?}");
+    }
+
+    /// The negative control for the test above: without the restore, the same
+    /// fresh session re-announces the decision and mis-reports the run. This
+    /// is what a readoption that rebuilt the session from nothing would do.
+    #[test]
+    fn an_unrestored_session_re_announces_guard_decisions_and_proves_the_restore_matters() {
+        let dir = TempDir::new().unwrap();
+        let trace = dir.path().join(guard_trace::GUARD_TRACE_FILENAME);
+        std::fs::write(
+            &trace,
+            "{\"guard\":\"01_boss_launch_guard\",\"decision\":\"approve\"}\n",
+        )
+        .unwrap();
+        let mut before = started_rollout_session(&trace);
+        let _ = guard_trace_turn(&mut before, "call-1");
+
+        // What a from-scratch re-attachment looks like: the session_meta
+        // record at the head of the file is read a second time (which is its
+        // own duplicate `SessionStart`), and nothing carries the guard cursor.
+        let mut after = started_rollout_session(&trace);
+        let second = guard_trace_turn(&mut after, "call-2");
+        assert!(
+            second
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::Notification { message, .. }
+                    if message.starts_with(super::super::GUARD_TRACE_MARKER))),
+            "the already-read guard record is reported a second time: {second:?}"
+        );
+    }
+
+    /// A tool call whose output record has not arrived yet is correlation the
+    /// rollout carries only once. Losing it across a restart turns the
+    /// matching `function_call_output` into an unpaired record and silently
+    /// drops a `PostToolUse` for a tool call that really did complete.
+    #[test]
+    fn a_resumed_session_still_pairs_a_tool_call_that_started_before_the_restart() {
+        let mut before = CodexRolloutProgressSession::new(None, None, None);
+        before
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-split","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        before
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"exec_command",
+                    "call_id":"call-split",
+                    "arguments":r#"{"cmd":"printf hi"}"#
+                }
+            }))
+            .unwrap();
+        let state = before.resume_state().unwrap();
+
+        let mut after = CodexRolloutProgressSession::new(None, None, None);
+        after.restore_resume_state(&state).unwrap();
+        let events = after
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-split",
+                    "output":"hi\n"
+                }
+            }))
+            .unwrap();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WorkerEvent::PostToolUse { session_id, tool_name, .. }]
+                    if session_id == "thread-split" && tool_name == "Bash"
+            ),
+            "the restored session must still know both the thread and the open call: {events:?}"
         );
     }
 

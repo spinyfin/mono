@@ -10,18 +10,18 @@
 //! The file writer is never coupled to the reader: bounded backpressure stops
 //! disk reads at the duplex boundary while the agent keeps appending normally.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{oneshot, watch};
 
 use crate::driver::{AgentDriver, AgentJsonlFileIngress, ProgressSessionConfig, ProgressStreamSource};
-use crate::stdout_progress::WorkerEventSink;
+use crate::stdout_progress::{ProgressCheckpointSink, WorkerEventSink};
 
 const DISCOVERY_POLL: Duration = Duration::from_millis(100);
 const FILE_POLL: Duration = Duration::from_millis(50);
@@ -31,6 +31,234 @@ const MAX_DISCOVERY_MATCHES: usize = 8;
 const MAX_SESSION_META_BYTES: u64 = 64 * 1024;
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
 const DUPLEX_BYTES: usize = 64 * 1024;
+
+/// Where a run's file ingress had got to, durably.
+///
+/// Written by the ingress itself and read back by
+/// [`crate::app::ServerState::readopt_live_worker`]. It exists because the
+/// two answers available without it are both wrong for a session that
+/// outlives an engine restart: re-tailing from byte 0 republishes every
+/// record of every prior turn — a second `SessionStart`, a second `Stop` per
+/// turn, every tool call again — and starting at end-of-file discards
+/// whatever the worker wrote while the engine was down, which for a turn that
+/// ended during the restart is the turn boundary itself.
+///
+/// Every variant is written by [`AgentJsonlProgressManager`] on the spawn
+/// path, so its *absence* is itself information: it means no engine ever
+/// armed an ingress for this run.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IngressCheckpoint {
+    /// The run's driver does not tail a file — its progress arrives over the
+    /// hook socket or its own stdout. Recorded rather than omitted so
+    /// readoption can tell "nothing to re-establish" apart from "the record
+    /// is missing and I cannot tell".
+    NotFileIngress,
+    /// A file ingress was armed at spawn but no correlated rollout had been
+    /// attached yet. `baseline` is the pre-spawn snapshot discovery diffs
+    /// against; without it a re-armed discovery would accept a rollout that
+    /// already existed before this run started.
+    Armed {
+        ingress: AgentJsonlFileIngress,
+        baseline: Vec<PathBuf>,
+    },
+    /// Attached to exactly one rollout and consumed through `consumed_bytes`.
+    ///
+    /// `consumed_bytes` is a byte offset into `path`, always immediately past
+    /// a newline, and always a position whose events have already been
+    /// through the engine's fan-out. `session_state` is the driver session
+    /// that belongs to that same offset — see
+    /// [`crate::driver::ProgressSessionNormalizer::resume_state`].
+    Attached {
+        ingress: AgentJsonlFileIngress,
+        path: PathBuf,
+        session_id: String,
+        consumed_bytes: u64,
+        #[serde(default)]
+        session_state: Option<serde_json::Value>,
+    },
+}
+
+/// Engine-owned durable storage for [`IngressCheckpoint`].
+///
+/// A seam, in the same shape and for the same reason as
+/// [`crate::driver::ProgressIdentityStore`]: the resume point must not live
+/// in an agent-writable home, and the ingress must not depend on the whole
+/// engine to write it.
+pub trait IngressCheckpointStore: Send + Sync {
+    fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String>;
+    fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String>;
+}
+
+impl IngressCheckpointStore for crate::work::WorkDb {
+    fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String> {
+        let json = serde_json::to_string(checkpoint).map_err(|err| format!("{err}"))?;
+        self.set_run_progress_ingress_checkpoint(run_id, &json)
+            .map_err(|err| format!("{err:#}"))
+    }
+
+    fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String> {
+        let Some(json) = self
+            .get_run_progress_ingress_checkpoint(run_id)
+            .map_err(|err| format!("{err:#}"))?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|err| format!("stored ingress checkpoint is not readable: {err}"))
+    }
+}
+
+/// One contiguous run of bytes shared by the reader's stream and the rollout
+/// file it came from.
+///
+/// `stream_len` and `file_len` differ only for the synthetic newline the tail
+/// injects when the file is truncated or rotated: that byte exists in the
+/// stream (it forces a line boundary so an old fragment cannot glue onto a
+/// new first line) and corresponds to no byte of any file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StreamSegment {
+    stream_start: u64,
+    stream_len: u64,
+    file_start: u64,
+    file_len: u64,
+}
+
+/// Translates the reader's consumed-byte position back into a rollout-file
+/// offset.
+///
+/// The two positions are usually the same number, and it would be tempting to
+/// treat them as one. They are not: the tail resumes at a non-zero file
+/// offset after a readoption, and truncation or same-path rotation resets the
+/// file offset to zero mid-stream. Recording the correspondence explicitly is
+/// what keeps a checkpoint from naming a byte in a file incarnation that no
+/// longer exists.
+#[derive(Debug, Default)]
+struct StreamFileMap {
+    segments: VecDeque<StreamSegment>,
+    stream_end: u64,
+}
+
+impl StreamFileMap {
+    /// Note that `len` bytes starting at `file_start` are about to be handed
+    /// to the reader. Called *before* the write so the map is never behind
+    /// bytes the reader could already have consumed.
+    fn record_bytes(&mut self, file_start: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = self.segments.back_mut()
+            && last.stream_len == last.file_len
+            && last.stream_start + last.stream_len == self.stream_end
+            && last.file_start + last.file_len == file_start
+        {
+            last.stream_len += len;
+            last.file_len += len;
+            self.stream_end += len;
+            return;
+        }
+        self.segments.push_back(StreamSegment {
+            stream_start: self.stream_end,
+            stream_len: len,
+            file_start,
+            file_len: len,
+        });
+        self.stream_end += len;
+    }
+
+    /// Note the one-byte synthetic line delimiter, after which the file
+    /// offset restarts at `next_file_start`.
+    fn record_delimiter(&mut self, next_file_start: u64) {
+        self.segments.push_back(StreamSegment {
+            stream_start: self.stream_end,
+            stream_len: 1,
+            file_start: next_file_start,
+            file_len: 0,
+        });
+        self.stream_end += 1;
+    }
+
+    /// The rollout-file offset the reader is at, having consumed
+    /// `stream_offset` bytes.
+    ///
+    /// Resolves against the newest segment that starts at or before the
+    /// position, so a position sitting exactly on an incarnation boundary
+    /// names the new incarnation rather than the dead one.
+    fn file_offset_for(&self, stream_offset: u64) -> Option<u64> {
+        self.segments
+            .iter()
+            .rev()
+            .find(|segment| segment.stream_start <= stream_offset)
+            .map(|segment| segment.file_start + (stream_offset - segment.stream_start).min(segment.file_len))
+    }
+
+    /// Drop segments the reader can never ask about again.
+    fn prune_through(&mut self, stream_offset: u64) {
+        while self.segments.len() > 1
+            && self
+                .segments
+                .get(1)
+                .is_some_and(|next| next.stream_start <= stream_offset)
+        {
+            self.segments.pop_front();
+        }
+    }
+}
+
+/// Writes the run's [`IngressCheckpoint::Attached`] record after every
+/// dispatched event.
+#[derive(bon::Builder)]
+#[builder(on(String, into))]
+struct AttachedCheckpointer {
+    run_id: String,
+    store: Arc<dyn IngressCheckpointStore>,
+    ingress: AgentJsonlFileIngress,
+    path: PathBuf,
+    session_id: String,
+    map: Arc<Mutex<StreamFileMap>>,
+}
+
+impl ProgressCheckpointSink for AttachedCheckpointer {
+    fn record_progress_checkpoint(&self, consumed_bytes: u64, session_state: Option<serde_json::Value>) {
+        let Ok(mut map) = self.map.lock() else {
+            tracing::warn!(
+                run_id = %self.run_id,
+                "agent JSONL progress: offset map poisoned; leaving the resume point where it was",
+            );
+            return;
+        };
+        let Some(file_offset) = map.file_offset_for(consumed_bytes) else {
+            // Cannot happen while the tail is the only writer — the reader
+            // consumes bytes the tail recorded first. Leaving the stored
+            // point alone re-reads a bounded prefix on resume, which is the
+            // safe direction; skipping ahead would drop records.
+            tracing::warn!(
+                run_id = %self.run_id,
+                consumed_bytes,
+                "agent JSONL progress: no file offset for the reader position; resume point unchanged",
+            );
+            return;
+        };
+        map.prune_through(consumed_bytes);
+        drop(map);
+        let checkpoint = IngressCheckpoint::Attached {
+            ingress: self.ingress.clone(),
+            path: self.path.clone(),
+            session_id: self.session_id.clone(),
+            consumed_bytes: file_offset,
+            session_state,
+        };
+        if let Err(err) = self.store.store_ingress_checkpoint(&self.run_id, &checkpoint) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                file_offset,
+                %err,
+                "agent JSONL progress: could not persist the resume point",
+            );
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
@@ -120,9 +348,19 @@ struct PreparedSource {
 impl PreparedSource {
     fn new(ingress: AgentJsonlFileIngress) -> Result<Self, String> {
         let root = VerifiedRoot::new(&ingress.directory)?;
+        let baseline = scan_matching_paths(&root, &ingress)?;
+        Self::with_baseline(ingress, baseline)
+    }
+
+    /// [`Self::new`] against a baseline that was captured earlier — the
+    /// pre-spawn snapshot read back off the run's durable checkpoint. Taking a
+    /// fresh snapshot on the readoption path would be worse than useless: the
+    /// run's own rollout already exists by then, so it would be baselined away
+    /// and discovery would wait out its timeout finding nothing.
+    fn with_baseline(ingress: AgentJsonlFileIngress, baseline: HashSet<PathBuf>) -> Result<Self, String> {
+        let root = VerifiedRoot::new(&ingress.directory)?;
         let canonical_workspace = fs::canonicalize(&ingress.workspace_path)
             .map_err(|err| format!("canonicalize workspace {}: {err}", ingress.workspace_path.display()))?;
-        let baseline = scan_matching_paths(&root, &ingress)?;
         Ok(Self {
             ingress,
             root,
@@ -130,6 +368,19 @@ impl PreparedSource {
             baseline,
         })
     }
+}
+
+/// How an ingress task gets hold of the rollout it is going to read.
+enum IngressStart {
+    /// Ordinary spawn: watch for the one new correlated rollout to appear.
+    Discover,
+    /// Readoption: attach to the exact rollout the previous engine was
+    /// reading, at the exact byte it had consumed through.
+    Resume {
+        candidate: Candidate,
+        file_offset: u64,
+        session_state: Option<serde_json::Value>,
+    },
 }
 
 /// How an in-flight file ingress is being brought to an end.
@@ -161,6 +412,15 @@ struct RunHandle {
     join: tokio::task::JoinHandle<()>,
 }
 
+/// What [`AgentJsonlProgressManager::resume_run`] did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResumeOutcome {
+    /// The run's ingress is live again and tailing from the recorded byte.
+    Reestablished,
+    /// The run's driver never had a file ingress to re-establish.
+    NotFileIngress,
+}
+
 /// Owns at most one prepared/active file ingress per execution id.
 #[derive(Default)]
 pub struct AgentJsonlProgressManager {
@@ -174,12 +434,132 @@ impl AgentJsonlProgressManager {
 
     /// Snapshot pre-existing candidates before the pane is spawned, then
     /// prepare a task that waits for [`Self::activate_run`].
+    ///
+    /// Records the snapshot as this run's [`IngressCheckpoint::Armed`] point
+    /// before the task exists, so an engine that dies between here and the
+    /// rollout appearing can still re-arm discovery against the right
+    /// baseline.
     pub fn prepare_run<S>(
         &self,
         run_id: &str,
         driver: std::sync::Arc<dyn AgentDriver>,
         ingress: AgentJsonlFileIngress,
         sink: S,
+        store: Arc<dyn IngressCheckpointStore>,
+    ) -> Result<(), String>
+    where
+        S: WorkerEventSink + Send + Sync + 'static,
+    {
+        let prepared = PreparedSource::new(ingress)?;
+        let armed = IngressCheckpoint::Armed {
+            ingress: prepared.ingress.clone(),
+            baseline: prepared.baseline.iter().cloned().collect(),
+        };
+        store.store_ingress_checkpoint(run_id, &armed)?;
+        self.spawn_ingress(run_id, driver, prepared, sink, store, IngressStart::Discover)
+    }
+
+    /// Re-establish an ingress the engine had already armed, from the durable
+    /// record of where it got to.
+    ///
+    /// Fallible and synchronous on purpose. Everything that can go wrong here
+    /// — the rollout is gone, it no longer correlates to this run, it is
+    /// shorter than the offset we consumed — is a condition an operator has to
+    /// be told about, and a background task that discovered it would have
+    /// nobody to tell. The caller reports; this never attaches "somewhere
+    /// near" the recorded point.
+    pub fn resume_run<S>(
+        &self,
+        run_id: &str,
+        driver: std::sync::Arc<dyn AgentDriver>,
+        checkpoint: IngressCheckpoint,
+        sink: S,
+        store: Arc<dyn IngressCheckpointStore>,
+    ) -> Result<ResumeOutcome, String>
+    where
+        S: WorkerEventSink + Send + Sync + 'static,
+    {
+        let (prepared, start) = match checkpoint {
+            IngressCheckpoint::NotFileIngress => return Ok(ResumeOutcome::NotFileIngress),
+            IngressCheckpoint::Armed { ingress, baseline } => {
+                let prepared = PreparedSource::with_baseline(ingress, baseline.into_iter().collect())?;
+                (prepared, IngressStart::Discover)
+            }
+            IngressCheckpoint::Attached {
+                ingress,
+                path,
+                session_id,
+                consumed_bytes,
+                session_state,
+            } => {
+                let prepared = PreparedSource::with_baseline(ingress, HashSet::new())?;
+                let candidate = validate_candidate(&prepared, &path)?
+                    .ok_or_else(|| format!("recorded rollout {} is no longer attachable", path.display()))?;
+                if candidate.session_id != session_id {
+                    return Err(format!(
+                        "recorded rollout {} now reports session {} rather than {session_id}",
+                        path.display(),
+                        candidate.session_id,
+                    ));
+                }
+                let size = candidate
+                    .file
+                    .metadata()
+                    .map_err(|err| format!("metadata {}: {err}", path.display()))?
+                    .len();
+                if size < consumed_bytes {
+                    // Shorter than what we already published means the file
+                    // was truncated or replaced under the same name and inode.
+                    // There is no offset in it that means what the checkpoint
+                    // meant, so there is nothing honest to resume from.
+                    return Err(format!(
+                        "recorded rollout {} is {size} bytes but {consumed_bytes} were already consumed",
+                        path.display(),
+                    ));
+                }
+                // Prove the driver can take its own recorded state back
+                // before anything is attached. The reader would otherwise
+                // discover this mid-flight, in a spawned task with nobody to
+                // report to — and a rejected state there means the run reads
+                // nothing at all, which is precisely the condition an
+                // operator has to hear about rather than infer from silence.
+                if let Some(state) = session_state.as_ref() {
+                    let mut probe = driver
+                        .progress_session(&ProgressSessionConfig {
+                            run_id: Some(run_id.to_owned()),
+                            source: ProgressStreamSource::AgentJsonlFile,
+                            ..ProgressSessionConfig::default()
+                        })
+                        .ok_or_else(|| "driver produced no progress session to resume".to_owned())?;
+                    probe.restore_resume_state(state)?;
+                }
+                (
+                    prepared,
+                    IngressStart::Resume {
+                        candidate,
+                        file_offset: consumed_bytes,
+                        session_state,
+                    },
+                )
+            }
+        };
+        self.spawn_ingress(run_id, driver, prepared, sink, store, start)?;
+        // Readoption has no second act: the pane is already live, so there is
+        // no later spawn acknowledgement to wait for. Activating here is what
+        // makes the sequence `re-establish → tail → turn boundary` and not
+        // `re-establish → wait forever`.
+        self.activate_run(run_id);
+        Ok(ResumeOutcome::Reestablished)
+    }
+
+    fn spawn_ingress<S>(
+        &self,
+        run_id: &str,
+        driver: std::sync::Arc<dyn AgentDriver>,
+        prepared: PreparedSource,
+        sink: S,
+        store: Arc<dyn IngressCheckpointStore>,
+        start: IngressStart,
     ) -> Result<(), String>
     where
         S: WorkerEventSink + Send + Sync + 'static,
@@ -193,12 +573,11 @@ impl AgentJsonlProgressManager {
             return Ok(());
         }
 
-        let prepared = PreparedSource::new(ingress)?;
         let (activate_tx, activate_rx) = oneshot::channel();
         let (halt_tx, halt_rx) = watch::channel(StreamHalt::Running);
         let task_run_id = run_id.to_owned();
         let join = tokio::spawn(async move {
-            run_prepared(task_run_id, driver, prepared, sink, activate_rx, halt_rx).await;
+            run_prepared(task_run_id, driver, prepared, sink, store, start, activate_rx, halt_rx).await;
         });
         runs.insert(
             run_id.to_owned(),
@@ -276,11 +655,14 @@ impl AgentJsonlProgressManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_prepared<S>(
     run_id: String,
     driver: std::sync::Arc<dyn AgentDriver>,
     prepared: PreparedSource,
     sink: S,
+    store: Arc<dyn IngressCheckpointStore>,
+    start: IngressStart,
     mut activate: oneshot::Receiver<()>,
     mut halt: watch::Receiver<StreamHalt>,
 ) where
@@ -298,27 +680,66 @@ async fn run_prepared<S>(
         }
     }
 
-    let candidate = match discover_candidate(&prepared, &mut halt).await {
-        Ok(Some(candidate)) => candidate,
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(run_id, %err, "agent JSONL progress: discovery failed");
-            return;
+    let (candidate, start_offset, session_state) = match start {
+        IngressStart::Discover => {
+            let candidate = match discover_candidate(&prepared, &mut halt).await {
+                Ok(Some(candidate)) => candidate,
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(run_id, %err, "agent JSONL progress: discovery failed");
+                    return;
+                }
+            };
+            // Promote the run's checkpoint from `Armed` to `Attached` the
+            // moment the rollout is identified, before a single byte is read.
+            // A restart in the window between attaching and the first event
+            // then resumes at offset 0 of the right file, rather than
+            // re-running discovery against a baseline the file now defeats.
+            let attached = IngressCheckpoint::Attached {
+                ingress: prepared.ingress.clone(),
+                path: candidate.path.clone(),
+                session_id: candidate.session_id.clone(),
+                consumed_bytes: 0,
+                session_state: None,
+            };
+            if let Err(err) = store.store_ingress_checkpoint(&run_id, &attached) {
+                tracing::warn!(
+                    run_id,
+                    %err,
+                    "agent JSONL progress: could not record the attached rollout",
+                );
+            }
+            (candidate, 0, None)
         }
+        IngressStart::Resume {
+            candidate,
+            file_offset,
+            session_state,
+        } => (candidate, file_offset, session_state),
     };
     tracing::info!(
         run_id,
         session_id = %candidate.session_id,
         path = %candidate.path.display(),
+        start_offset,
         "agent JSONL progress: attached rollout",
     );
     let transcript_path = candidate.path.clone();
+    let checkpointer = AttachedCheckpointer::builder()
+        .run_id(run_id.clone())
+        .store(store)
+        .ingress(prepared.ingress.clone())
+        .path(candidate.path.clone())
+        .session_id(candidate.session_id.clone())
+        .map(Arc::new(Mutex::new(StreamFileMap::default())))
+        .build();
 
     let (reader, writer) = tokio::io::duplex(DUPLEX_BYTES);
     let tail_halt = halt.clone();
     let tail_source = prepared.clone();
+    let tail_map = checkpointer.map.clone();
     let tail = tokio::spawn(async move {
-        if let Err(err) = stream_file_bytes(tail_source, candidate, writer, tail_halt).await {
+        if let Err(err) = stream_file_bytes(tail_source, candidate, start_offset, tail_map, writer, tail_halt).await {
             tracing::warn!(%err, "agent JSONL progress: file tail ended with error");
         }
     });
@@ -328,17 +749,26 @@ async fn run_prepared<S>(
         identity_store: sink.progress_identity_store(),
         source: ProgressStreamSource::AgentJsonlFile,
         transcript_path: Some(transcript_path),
+        resume_state: session_state,
     };
     let driver_slug = driver.descriptor().name;
-    let _stats = crate::stdout_progress::run_jsonl_progress_ingress_with_driver(
+    let stats = crate::stdout_progress::run_jsonl_progress_ingress_checkpointed(
         &run_id,
         driver_slug,
         driver,
         reader,
         &sink,
         config,
+        Some(&checkpointer),
     )
     .await;
+    if stats.resume_state_rejected {
+        tracing::error!(
+            run_id,
+            "agent JSONL progress: the driver refused the recorded session state, so this run's \
+             rollout is not being read. Its turns will not produce boundaries until it is restarted.",
+        );
+    }
     tail.abort();
     let _ = tail.await;
 }
@@ -671,10 +1101,22 @@ fn revalidate_truncated_stream(
 async fn stream_file_bytes(
     prepared: PreparedSource,
     candidate: Candidate,
+    start_offset: u64,
+    map: Arc<Mutex<StreamFileMap>>,
     writer: tokio::io::DuplexStream,
     halt: watch::Receiver<StreamHalt>,
 ) -> Result<(), String> {
-    stream_file_bytes_with_test_hooks(prepared, candidate, writer, halt, |_| Ok(()), |_| Ok(())).await
+    stream_file_bytes_with_test_hooks(
+        prepared,
+        candidate,
+        start_offset,
+        map,
+        writer,
+        halt,
+        |_| Ok(()),
+        |_| Ok(()),
+    )
+    .await
 }
 
 /// Stream only descriptors returned by [`validate_candidate`].
@@ -683,9 +1125,12 @@ async fn stream_file_bytes(
 /// descriptor read and between validating and installing a rotation.
 /// Production passes no-ops. They do not change the validation path exercised
 /// by tests.
+#[allow(clippy::too_many_arguments)]
 async fn stream_file_bytes_with_test_hooks<F, G>(
     prepared: PreparedSource,
     candidate: Candidate,
+    start_offset: u64,
+    map: Arc<Mutex<StreamFileMap>>,
     mut writer: tokio::io::DuplexStream,
     mut halt: watch::Receiver<StreamHalt>,
     mut before_descriptor_read: G,
@@ -701,7 +1146,7 @@ where
         mut file,
         identity: mut opened_identity,
     } = candidate;
-    let mut offset = 0u64;
+    let mut offset = start_offset;
     let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
 
     loop {
@@ -723,6 +1168,7 @@ where
             // Revalidate the restarted logical stream on this exact
             // descriptor before publishing either its prefix or a delimiter.
             revalidate_truncated_stream(&prepared, &path, &session_id, &mut file, opened_identity)?;
+            record_delimiter(&map, 0)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             offset = 0;
             continue;
@@ -746,6 +1192,11 @@ where
                     ));
                 }
                 validate_descriptor_before_publish(&prepared, &path, &file, opened_identity)?;
+                // Record the correspondence before the bytes are visible to
+                // the reader: the checkpointer resolves the reader's position
+                // through this map, and a position it cannot resolve leaves
+                // the durable resume point where it was.
+                record_bytes(&map, offset, count as u64)?;
                 offset += count as u64;
                 write_or_halt(&mut writer, &buffer[..count], &mut halt).await?;
                 continue;
@@ -796,6 +1247,7 @@ where
                 .filter(|new| new.session_id == session_id)
                 .ok_or_else(|| format!("rotated rollout {} lost run correlation", path.display()))?;
             after_rotation_validation(&rotated)?;
+            record_delimiter(&map, 0)?;
             write_or_halt(&mut writer, b"\n", &mut halt).await?;
             // Transfer the exact descriptor whose session/cwd/filename/link
             // and inode evidence was just validated. Never reopen `path`.
@@ -820,6 +1272,20 @@ where
             }
         }
     }
+}
+
+fn record_bytes(map: &Mutex<StreamFileMap>, file_start: u64, len: u64) -> Result<(), String> {
+    map.lock()
+        .map_err(|_| "rollout offset map poisoned".to_owned())?
+        .record_bytes(file_start, len);
+    Ok(())
+}
+
+fn record_delimiter(map: &Mutex<StreamFileMap>, next_file_start: u64) -> Result<(), String> {
+    map.lock()
+        .map_err(|_| "rollout offset map poisoned".to_owned())?
+        .record_delimiter(next_file_start);
+    Ok(())
 }
 
 /// Publish `bytes` to the reader, abandoning the write only on
@@ -885,6 +1351,82 @@ mod tests {
             self.events.lock().unwrap().push(incoming);
             self.notify.notify_waiters();
         }
+    }
+
+    /// In-memory stand-in for the `work_runs` column, so a test can read back
+    /// the resume point the ingress actually wrote.
+    #[derive(Clone, Default)]
+    struct MemoryCheckpointStore {
+        stored: Arc<Mutex<HashMap<String, IngressCheckpoint>>>,
+    }
+
+    impl MemoryCheckpointStore {
+        fn get(&self, run_id: &str) -> Option<IngressCheckpoint> {
+            self.stored.lock().unwrap().get(run_id).cloned()
+        }
+    }
+
+    impl IngressCheckpointStore for MemoryCheckpointStore {
+        fn store_ingress_checkpoint(&self, run_id: &str, checkpoint: &IngressCheckpoint) -> Result<(), String> {
+            self.stored
+                .lock()
+                .unwrap()
+                .insert(run_id.to_owned(), checkpoint.clone());
+            Ok(())
+        }
+
+        fn load_ingress_checkpoint(&self, run_id: &str) -> Result<Option<IngressCheckpoint>, String> {
+            Ok(self.get(run_id))
+        }
+    }
+
+    fn test_store() -> Arc<dyn IngressCheckpointStore> {
+        Arc::new(MemoryCheckpointStore::default())
+    }
+
+    /// The tail as every pre-existing test drives it: from byte zero, with an
+    /// offset map nobody reads back. Shadows the production name so those
+    /// tests keep asserting on exactly the code path they always did.
+    async fn stream_file_bytes(
+        prepared: PreparedSource,
+        candidate: Candidate,
+        writer: tokio::io::DuplexStream,
+        halt: watch::Receiver<StreamHalt>,
+    ) -> Result<(), String> {
+        super::stream_file_bytes(
+            prepared,
+            candidate,
+            0,
+            Arc::new(Mutex::new(StreamFileMap::default())),
+            writer,
+            halt,
+        )
+        .await
+    }
+
+    async fn stream_file_bytes_with_test_hooks<F, G>(
+        prepared: PreparedSource,
+        candidate: Candidate,
+        writer: tokio::io::DuplexStream,
+        halt: watch::Receiver<StreamHalt>,
+        before_descriptor_read: G,
+        after_rotation_validation: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(&Candidate) -> Result<(), String> + Send,
+        G: FnMut(&Path) -> Result<(), String> + Send,
+    {
+        super::stream_file_bytes_with_test_hooks(
+            prepared,
+            candidate,
+            0,
+            Arc::new(Mutex::new(StreamFileMap::default())),
+            writer,
+            halt,
+            before_descriptor_read,
+            after_rotation_validation,
+        )
+        .await
     }
 
     fn rollout_text(workspace: &Path, thread_id: &str) -> String {
@@ -1047,6 +1589,7 @@ mod tests {
                     workspace_path: workspace.clone(),
                 },
                 sink.clone(),
+                test_store(),
             )
             .unwrap();
 
@@ -1141,6 +1684,7 @@ mod tests {
                     workspace_path: workspace.clone(),
                 },
                 sink.clone(),
+                test_store(),
             )
             .unwrap();
 
@@ -1545,11 +2089,436 @@ mod tests {
                     Arc::new(crate::driver::CodexDriver::default()),
                     ingress.clone(),
                     sink.clone(),
+                    test_store(),
                 )
                 .unwrap();
         }
         assert_eq!(manager.runs.lock().unwrap().len(), 1);
         manager.stop_run("run-duplicate");
         assert!(manager.runs.lock().unwrap().is_empty());
+    }
+
+    /// A second turn on an already-attached rollout, appended after the
+    /// engine went away. Carries no `session_meta` of its own — the thread id
+    /// was announced once, at the head of the file — which is what makes the
+    /// restored session state load-bearing rather than decorative.
+    fn second_turn_text() -> String {
+        [
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{"type":"task_started","turn_id":"turn-two"}
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"exec_command",
+                    "call_id":"call-two",
+                    "arguments":r#"{"cmd":"printf two"}"#
+                }
+            }),
+            serde_json::json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-two",
+                    "output":"two\n"
+                }
+            }),
+            serde_json::json!({
+                "type":"event_msg",
+                "payload":{
+                    "type":"task_complete",
+                    "turn_id":"turn-two",
+                    "last_agent_message":"done two"
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|record| serde_json::to_string(&record).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n"
+    }
+
+    async fn wait_for_stop(sink: &CaptureSink, at_least: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if sink
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(event.event, WorkerEvent::Stop { .. }))
+                    .count()
+                    >= at_least
+                {
+                    break;
+                }
+                sink.notify.notified().await;
+            }
+        })
+        .await
+        .expect("a turn boundary should reach the fanout");
+    }
+
+    /// The whole point of the readoption path, end to end.
+    ///
+    /// One engine attaches, reads a turn to its boundary, and disappears. A
+    /// second engine — a fresh manager and a fresh sink, sharing only the
+    /// durable checkpoint — resumes the same live rollout, and a turn that
+    /// completes afterwards produces exactly the events it would have
+    /// produced without the restart: no second `SessionStart`, no replay of
+    /// the first turn's tool calls, no second `Stop` for a turn that already
+    /// ended.
+    #[tokio::test]
+    async fn a_turn_completing_after_a_restart_produces_its_own_events_and_only_those() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let ingress = AgentJsonlFileIngress {
+            directory: sessions.clone(),
+            filename_prefix: "rollout-".into(),
+            filename_suffix: ".jsonl".into(),
+            workspace_path: workspace.clone(),
+        };
+        let store: Arc<dyn IngressCheckpointStore> = Arc::new(MemoryCheckpointStore::default());
+
+        // Engine one.
+        let before = AgentJsonlProgressManager::new();
+        let before_sink = CaptureSink::default();
+        before
+            .prepare_run(
+                "run-restart",
+                Arc::new(crate::driver::CodexDriver::default()),
+                ingress.clone(),
+                before_sink.clone(),
+                store.clone(),
+            )
+            .unwrap();
+        let path = sessions.join("rollout-new-thread-restart.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-restart")).unwrap();
+        before.activate_run("run-restart");
+        wait_for_stop(&before_sink, 1).await;
+        assert!(
+            matches!(
+                before_sink.events.lock().unwrap()[0].event,
+                WorkerEvent::SessionStart { .. }
+            ),
+            "precondition: the first engine saw the session start",
+        );
+        // The engine process dies. Its ingress goes with it; the worker and
+        // its rollout do not.
+        before.stop_run("run-restart");
+
+        let checkpoint = store
+            .load_ingress_checkpoint("run-restart")
+            .unwrap()
+            .expect("the ingress records where it got to");
+        let consumed = match &checkpoint {
+            IngressCheckpoint::Attached {
+                path: recorded,
+                session_id,
+                consumed_bytes,
+                session_state,
+                ..
+            } => {
+                assert_eq!(recorded, &fs::canonicalize(&path).unwrap());
+                assert_eq!(session_id, "thread-restart");
+                assert!(
+                    session_state.is_some(),
+                    "the driver session state belongs to the same checkpoint as the offset",
+                );
+                *consumed_bytes
+            }
+            other => panic!("expected an attached checkpoint, got {other:?}"),
+        };
+        assert_eq!(
+            consumed,
+            fs::metadata(&path).unwrap().len(),
+            "the first engine consumed the whole first turn",
+        );
+
+        // The worker keeps working across the restart.
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+            file.write_all(second_turn_text().as_bytes()).unwrap();
+        }
+
+        // Engine two: nothing in common with engine one but the checkpoint.
+        let after = AgentJsonlProgressManager::new();
+        let after_sink = CaptureSink::default();
+        let outcome = after
+            .resume_run(
+                "run-restart",
+                Arc::new(crate::driver::CodexDriver::default()),
+                checkpoint,
+                after_sink.clone(),
+                store.clone(),
+            )
+            .expect("the recorded rollout is still attachable");
+        assert_eq!(outcome, ResumeOutcome::Reestablished);
+
+        wait_for_stop(&after_sink, 1).await;
+        let events = after_sink.events.lock().unwrap();
+        let kinds: Vec<&WorkerEvent> = events.iter().map(|event| &event.event).collect();
+        assert!(
+            !kinds
+                .iter()
+                .any(|event| matches!(event, WorkerEvent::SessionStart { .. })),
+            "a resumed tail must not re-read the session_meta it already published: {kinds:?}"
+        );
+        assert!(
+            matches!(kinds.first(), Some(WorkerEvent::UserPromptSubmit { session_id, .. }) if session_id == "thread-restart"),
+            "the second turn opens with its own prompt, correlated to the thread the restored \
+             session remembered: {kinds:?}"
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::Stop { .. }))
+                .count(),
+            1,
+            "exactly one turn ended after the restart: {kinds:?}"
+        );
+        assert!(
+            matches!(
+                kinds.last(),
+                Some(WorkerEvent::Stop {
+                    stop_reason: StopReason::Completed,
+                    ..
+                })
+            ),
+            "the post-restart turn reaches a real boundary: {kinds:?}"
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|event| matches!(event, WorkerEvent::PreToolUse { .. }))
+                .count(),
+            1,
+            "only the second turn's tool call, never the first turn's again: {kinds:?}"
+        );
+        drop(events);
+        after.stop_run("run-restart");
+    }
+
+    /// The forbidden fallbacks, refused. A recorded rollout that is gone has
+    /// no offset that means what the checkpoint meant, so the resume fails and
+    /// the caller — which files an operator attention item — hears about it.
+    #[tokio::test]
+    async fn resuming_a_vanished_rollout_fails_loudly_rather_than_starting_over() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-gone",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: sessions.join("rollout-new-thread-gone.jsonl"),
+                    session_id: "thread-gone".into(),
+                    consumed_bytes: 128,
+                    session_state: None,
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("a rollout that is not there cannot be resumed");
+        assert!(err.contains("rollout-new-thread-gone.jsonl"), "got {err}");
+        assert!(
+            manager.runs.lock().unwrap().is_empty(),
+            "a failed resume must leave no half-armed ingress behind",
+        );
+    }
+
+    /// A rollout shorter than what the engine already published was truncated
+    /// or replaced under the same name. Every byte offset in it now means
+    /// something else, so there is nothing honest to resume from — and
+    /// picking the nearest plausible offset would silently replay or silently
+    /// skip.
+    #[tokio::test]
+    async fn resuming_a_rollout_shorter_than_what_was_consumed_fails_loudly() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let path = sessions.join("rollout-new-thread-short.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-short")).unwrap();
+        let size = fs::metadata(&path).unwrap().len();
+
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-short",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: fs::canonicalize(&path).unwrap(),
+                    session_id: "thread-short".into(),
+                    consumed_bytes: size + 1,
+                    session_state: None,
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("an offset past the end of the file is not resumable");
+        assert!(err.contains("already consumed"), "got {err}");
+    }
+
+    /// A rollout that is still there but now belongs to a different session is
+    /// a different run's file wearing the recorded name.
+    #[tokio::test]
+    async fn resuming_a_rollout_that_lost_its_correlation_fails_loudly() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let path = sessions.join("rollout-new-thread-other.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-other")).unwrap();
+
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-other",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: fs::canonicalize(&path).unwrap(),
+                    session_id: "thread-expected".into(),
+                    consumed_bytes: 0,
+                    session_state: None,
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("a rollout for another session is not this run's resume point");
+        assert!(err.contains("thread-expected"), "got {err}");
+    }
+
+    /// A session state the driver cannot take back is a failed resume, not a
+    /// degraded one. Caught before anything attaches, so the caller can file
+    /// an attention item — inside the ingress task it would only be a log
+    /// line, and the run would read nothing while looking healthy.
+    #[tokio::test]
+    async fn resuming_with_a_session_state_the_driver_rejects_fails_loudly() {
+        let temp = TempDir::new().unwrap();
+        let sessions = temp.path().join("sessions");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let path = sessions.join("rollout-new-thread-badstate.jsonl");
+        fs::write(&path, rollout_text(&workspace, "thread-badstate")).unwrap();
+
+        let manager = AgentJsonlProgressManager::new();
+        let err = manager
+            .resume_run(
+                "run-badstate",
+                Arc::new(crate::driver::CodexDriver::default()),
+                IngressCheckpoint::Attached {
+                    ingress: AgentJsonlFileIngress {
+                        directory: sessions.clone(),
+                        filename_prefix: "rollout-".into(),
+                        filename_suffix: ".jsonl".into(),
+                        workspace_path: workspace.clone(),
+                    },
+                    path: fs::canonicalize(&path).unwrap(),
+                    session_id: "thread-badstate".into(),
+                    consumed_bytes: 0,
+                    session_state: Some(serde_json::json!("not a session snapshot")),
+                },
+                CaptureSink::default(),
+                test_store(),
+            )
+            .expect_err("an unreadable session snapshot is not resumable");
+        assert!(err.contains("rollout resume state"), "got {err}");
+        assert!(manager.runs.lock().unwrap().is_empty());
+    }
+
+    /// A driver that never tails a file records that fact, and readoption
+    /// reads it as "nothing to do" rather than having to guess from silence.
+    #[tokio::test]
+    async fn resuming_a_non_file_ingress_is_a_no_op_not_a_failure() {
+        let manager = AgentJsonlProgressManager::new();
+        let outcome = manager
+            .resume_run(
+                "run-hooks",
+                Arc::new(crate::driver::ClaudeDriver),
+                IngressCheckpoint::NotFileIngress,
+                CaptureSink::default(),
+                test_store(),
+            )
+            .unwrap();
+        assert_eq!(outcome, ResumeOutcome::NotFileIngress);
+        assert!(manager.runs.lock().unwrap().is_empty());
+    }
+
+    /// The reader's position and the file's are the same number right up
+    /// until they are not: a resumed tail starts at a non-zero file offset,
+    /// and the synthetic delimiter written on truncation/rotation is a stream
+    /// byte that corresponds to no file byte at all. Getting this wrong shifts
+    /// every checkpoint after the first anomaly.
+    #[test]
+    fn stream_positions_resolve_to_the_file_offsets_they_came_from() {
+        let mut map = StreamFileMap::default();
+        // A resumed tail: the reader's byte 0 is the file's byte 100.
+        map.record_bytes(100, 50);
+        assert_eq!(map.file_offset_for(0), Some(100));
+        assert_eq!(map.file_offset_for(50), Some(150));
+
+        // Contiguous growth stays one segment.
+        map.record_bytes(150, 25);
+        assert_eq!(map.segments.len(), 1);
+        assert_eq!(map.file_offset_for(75), Some(175));
+
+        // The file is truncated: one stream byte, no file bytes, and the file
+        // offset restarts.
+        map.record_delimiter(0);
+        map.record_bytes(0, 10);
+        assert_eq!(
+            map.file_offset_for(76),
+            Some(0),
+            "the delimiter itself maps to the start of the new incarnation",
+        );
+        assert_eq!(map.file_offset_for(80), Some(4));
+
+        // Positions the reader cannot have reached yet clamp rather than
+        // running off the end of the segment they land in.
+        assert_eq!(map.file_offset_for(999), Some(10));
+    }
+
+    /// Pruning must never move an answer the checkpointer could still ask for.
+    #[test]
+    fn pruning_consumed_segments_preserves_the_live_answer() {
+        let mut map = StreamFileMap::default();
+        map.record_bytes(0, 10);
+        map.record_delimiter(0);
+        map.record_bytes(0, 10);
+        map.prune_through(21);
+        assert_eq!(map.file_offset_for(21), Some(10));
     }
 }

@@ -12,7 +12,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex, Notify, oneshot};
 
-use crate::agent_jsonl_progress::AgentJsonlProgressManager;
+use crate::agent_jsonl_progress::{AgentJsonlProgressManager, IngressCheckpointStore};
 use crate::audit_effort;
 use crate::cli::Cli;
 use crate::completion::{
@@ -317,13 +317,27 @@ impl crate::spawn_flow::WorkerSpawner for ServerState {
         ingress: crate::driver::ProgressIngress,
     ) -> Result<(), String> {
         let crate::driver::ProgressIngress::AgentJsonlFile(ingress) = ingress else {
+            // Recorded, not skipped. Readoption reads this row to decide what
+            // to re-establish, and "no row" has to keep meaning "no engine
+            // ever armed an ingress here" rather than doubling as "this
+            // driver doesn't tail a file".
+            if let Err(err) = self
+                .work_db
+                .store_ingress_checkpoint(run_id, &crate::agent_jsonl_progress::IngressCheckpoint::NotFileIngress)
+            {
+                tracing::warn!(
+                    run_id,
+                    %err,
+                    "progress ingress: could not record that this run has no file ingress",
+                );
+            }
             return Ok(());
         };
         let Some(arc_self) = self._self_weak.upgrade() else {
             return Err("ServerState already dropped".to_owned());
         };
         self.agent_jsonl_progress_manager
-            .prepare_run(run_id, driver, ingress, arc_self)
+            .prepare_run(run_id, driver, ingress, arc_self, self.work_db.clone())
     }
 
     fn activate_progress_ingress(&self, run_id: &str) {

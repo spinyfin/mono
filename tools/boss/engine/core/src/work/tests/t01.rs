@@ -1403,6 +1403,20 @@ fn starts_ready_execution_run_and_attaches_workspace() {
             .unwrap()
     );
 
+    // The file-progress resume point rides the same run row, for the same
+    // reason: an engine restart has to be able to read back where the last
+    // engine's rollout tail had got to. Absent until written, exact once
+    // written, and cleared by teardown.
+    assert!(db.get_run_progress_ingress_checkpoint(&execution.id).unwrap().is_none());
+    db.set_run_progress_ingress_checkpoint(&execution.id, r#"{"kind":"attached","consumed_bytes":4096}"#)
+        .unwrap();
+    assert_eq!(
+        db.get_run_progress_ingress_checkpoint(&execution.id).unwrap(),
+        Some(r#"{"kind":"attached","consumed_bytes":4096}"#.to_owned()),
+    );
+    assert!(db.clear_run_progress_ingress_checkpoint(&execution.id).unwrap());
+    assert!(db.get_run_progress_ingress_checkpoint(&execution.id).unwrap().is_none());
+
     let _ = std::fs::remove_file(path);
 }
 

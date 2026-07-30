@@ -441,6 +441,26 @@ pub(crate) fn migrate_work_runs_turn_boundary_at(conn: &Connection) -> Result<()
     Ok(())
 }
 
+/// The run's file-progress ingress resume point, as JSON — see
+/// [`crate::agent_jsonl_progress::IngressCheckpoint`].
+///
+/// Engine-owned and durable for exactly the reason `progress_session_id`
+/// above is: an engine that restarts while a long-lived agent session is
+/// still running has to pick that session's rollout back up where it left
+/// off. In-memory state cannot answer "how far did the last engine get?",
+/// and the two wrong answers — offset 0 and end-of-file — replay every prior
+/// record or discard the ones that arrived during the restart.
+///
+/// On `work_runs` rather than `work_executions` for the same scoping reason
+/// as `turn_boundary_at`: the resume point describes one spawned process's
+/// rollout file, so a later run must never inherit an earlier one's offset.
+pub(crate) fn migrate_work_runs_progress_ingress_checkpoint(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_runs", "progress_ingress_checkpoint")? {
+        conn.execute("ALTER TABLE work_runs ADD COLUMN progress_ingress_checkpoint TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// Raw per-run agent usage captured incrementally from transcript records.
 ///
 /// Cache-write tokens keep both the provider's total and its 5-minute /

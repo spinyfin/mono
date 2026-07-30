@@ -689,6 +689,11 @@ impl WorkDb {
         // delivered a terminal result, so a one-turn-per-process worker's exit
         // can be told apart from a death across an engine restart.
         migrate_work_runs_turn_boundary_at(conn)?;
+        // `work_runs.progress_ingress_checkpoint`: where a file-tailing
+        // progress ingress had got to, so an engine restart re-attaches a
+        // long-lived agent session's rollout at the right byte rather than
+        // replaying it from zero or skipping to its end.
+        migrate_work_runs_progress_ingress_checkpoint(conn)?;
         // Backfill: tombstone `merge-conflict:*` / `ci-fix:*` revisions that
         // were cancelled by a human before their chain root's PR merged or
         // closed, and never revisited afterward because

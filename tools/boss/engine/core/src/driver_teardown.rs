@@ -58,6 +58,16 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
             "driver workspace teardown: failed to clear progress session identity (non-fatal)",
         );
     }
+    // Same lifecycle, same reason: the ingress resume point describes a
+    // rollout the terminated run will never append to again, and readoption
+    // only ever consults it for a run that is still live.
+    if let Err(err) = work_db.clear_run_progress_ingress_checkpoint(execution_id) {
+        tracing::warn!(
+            execution_id,
+            error = %format!("{err:#}"),
+            "driver workspace teardown: failed to clear progress ingress checkpoint (non-fatal)",
+        );
+    }
 
     let runtime_state = match work_db.get_driver_runtime_state(execution_id) {
         Ok(state) => state,

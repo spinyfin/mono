@@ -89,6 +89,14 @@ pub struct UnknownDriverError(pub String);
 /// produces.
 const DISPATCH_QUEUE_DEPTH: usize = 64;
 
+/// One decoded event travelling from the reader to the dispatch consumer,
+/// carrying the resume point that belongs to it.
+struct DispatchItem {
+    incoming: IncomingHookEvent,
+    consumed_bytes: u64,
+    session_state: Option<serde_json::Value>,
+}
+
 /// Read `stream` as `run_id`'s stdout-JSONL progress stream until it ends,
 /// dispatching every envelope the run's driver recognises to `sink`.
 ///
@@ -211,15 +219,57 @@ where
     R: AsyncRead + Unpin,
     S: WorkerEventSink + ?Sized,
 {
+    run_jsonl_progress_ingress_checkpointed(run_id, driver_slug, driver, stream, sink, session_config, None).await
+}
+
+/// Where a resumable ingress records how far it has got.
+///
+/// Called once per dispatched event, *after* the engine's fan-out for that
+/// event has returned, with the reader's own consumed-byte position and the
+/// driver session state that belongs to it. Both come from the same
+/// observation, so a restored ingress can never pair one record's offset with
+/// another record's session.
+///
+/// Deliberately synchronous and infallible from the ingress's point of view:
+/// it runs between dispatches, so it must not be able to stall or abort the
+/// stream. Implementations that persist do their own error reporting.
+pub trait ProgressCheckpointSink: Send + Sync {
+    fn record_progress_checkpoint(&self, consumed_bytes: u64, session_state: Option<serde_json::Value>);
+}
+
+/// [`run_jsonl_progress_ingress_with_driver`] with a durable resume point.
+///
+/// The checkpoint is taken **after** `dispatch_worker_event` returns for the
+/// event the offset belongs to, never before. That ordering is the whole
+/// contract: a checkpoint written ahead of dispatch would let an engine crash
+/// in the gap silently *skip* a record — and a skipped `Stop` is a turn
+/// boundary that never happens, which is the exact failure a resumable
+/// ingress exists to prevent. Writing it after instead bounds the crash
+/// window to re-reading the single record whose dispatch had completed.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_jsonl_progress_ingress_checkpointed<R, S>(
+    run_id: &str,
+    driver_slug: &str,
+    driver: std::sync::Arc<dyn crate::driver::AgentDriver>,
+    stream: R,
+    sink: &S,
+    session_config: crate::driver::ProgressSessionConfig,
+    checkpoint: Option<&dyn ProgressCheckpointSink>,
+) -> ReaderStats
+where
+    R: AsyncRead + Unpin,
+    S: WorkerEventSink + ?Sized,
+{
     tracing::info!(
         run_id,
         driver = driver_slug,
         source = ?session_config.source,
+        resuming = session_config.resume_state.is_some(),
         "jsonl progress: ingress started"
     );
 
     let mut reader = StdoutJsonlProgressReader::for_session(stream, driver.clone(), session_config);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DispatchItem>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {
         while let Some(envelope) = reader.next_event().await {
@@ -234,7 +284,16 @@ where
                 envelope.transcript_path,
                 None,
             );
-            if tx.send(incoming).await.is_err() {
+            // Snapshotted here, not in `consume`: by the time the dispatch
+            // completes the reader may already be several lines further on,
+            // and a checkpoint that named *that* position would skip
+            // everything in between.
+            let item = DispatchItem {
+                incoming,
+                consumed_bytes: reader.consumed_bytes(),
+                session_state: checkpoint.and_then(|_| reader.resume_state()),
+            };
+            if tx.send(item).await.is_err() {
                 // The consumer only ever exits when this end of the channel
                 // (held by this same future) is dropped, so this arm is
                 // unreachable in practice; break rather than panic if that
@@ -249,8 +308,11 @@ where
     };
 
     let consume = async {
-        while let Some(incoming) = rx.recv().await {
-            sink.dispatch_worker_event(incoming).await;
+        while let Some(item) = rx.recv().await {
+            sink.dispatch_worker_event(item.incoming).await;
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.record_progress_checkpoint(item.consumed_bytes, item.session_state);
+            }
         }
     };
 
@@ -266,6 +328,7 @@ where
         oversized_lines = stats.oversized_lines,
         unterminated_tails = stats.unterminated_tails,
         ended_with_io_error = stats.ended_with_io_error,
+        resume_state_rejected = stats.resume_state_rejected,
         "jsonl progress: ingress ended",
     );
     stats

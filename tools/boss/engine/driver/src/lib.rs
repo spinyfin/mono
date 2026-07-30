@@ -1046,7 +1046,12 @@ pub struct ProgressObservationWiring {
 /// `session_meta.payload.cwd` matches `workspace_path`. That two-part
 /// correlation prevents a stale transcript from an earlier process from
 /// being attached to the current execution.
-#[derive(Debug, Clone)]
+///
+/// Serializable because the engine persists the resolved descriptor with the
+/// run's ingress checkpoint: an engine that restarts mid-run re-establishes
+/// the tail from the descriptor the *spawn* resolved rather than re-deriving
+/// one from a config it would have to reconstruct after the fact.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AgentJsonlFileIngress {
     pub directory: PathBuf,
     pub filename_prefix: String,
@@ -1110,6 +1115,17 @@ pub struct ProgressSessionConfig {
     pub identity_store: Option<Arc<dyn ProgressIdentityStore>>,
     pub source: ProgressStreamSource,
     pub transcript_path: Option<PathBuf>,
+    /// A snapshot previously produced by [`ProgressSessionNormalizer::resume_state`]
+    /// for this same run, when the reader is being re-established over a
+    /// stream the engine was already part-way through.
+    ///
+    /// `None` is the ordinary spawn-time case: a brand new session starting at
+    /// the first byte. `Some` only ever appears on the readoption path, where
+    /// starting fresh would be wrong in both directions — a zeroed
+    /// guard-trace cursor re-announces decisions the run already reported, and
+    /// an empty call tracker orphans every tool call whose output has not
+    /// landed yet.
+    pub resume_state: Option<serde_json::Value>,
 }
 
 impl std::fmt::Debug for ProgressSessionConfig {
@@ -1119,6 +1135,7 @@ impl std::fmt::Debug for ProgressSessionConfig {
             .field("has_identity_store", &self.identity_store.is_some())
             .field("source", &self.source)
             .field("transcript_path", &self.transcript_path)
+            .field("resuming", &self.resume_state.is_some())
             .finish()
     }
 }
@@ -1151,6 +1168,28 @@ pub trait ProgressSessionNormalizer: Send {
     }
 
     fn transcript_path_for_session(&mut self, raw: &serde_json::Value) -> Option<String>;
+
+    /// Everything this session would lose if the engine process died and the
+    /// same stream had to be picked up again mid-run.
+    ///
+    /// The engine snapshots this next to the stream's durable byte offset,
+    /// event by event, so the two can never disagree about which record the
+    /// state describes. A driver whose session carries no cross-record
+    /// correlation returns `None` and is resumed by offset alone.
+    fn resume_state(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Re-seed this session from a snapshot [`Self::resume_state`] produced
+    /// for the same run.
+    ///
+    /// Only ever called with a state the same driver emitted, so the default
+    /// is an error rather than a silent no-op: a driver that snapshots state
+    /// and cannot restore it would resume with a zeroed session, which is the
+    /// exact failure this seam exists to prevent. Loud is correct here.
+    fn restore_resume_state(&mut self, _state: &serde_json::Value) -> Result<(), String> {
+        Err("this progress session declares no resumable state".to_owned())
+    }
 }
 
 /// Mutable normalizer owned by one transcript consumer.
