@@ -59,16 +59,16 @@ Most steps run on the `bazel-any` queue (`${BUILDKITE_ANY_QUEUE:-bazel-any}` in 
 
 For the Linux `bazel-any` hosts specifically — host inventory, the unprivileged-user-namespace requirement `linux-sandbox` depends on, the Bazel-server-restart procedure, and safe maintenance steps — see [`linux-agents-runbook.md`](linux-agents-runbook.md).
 
-## Pushing from CI (queue heterogeneity)
+## Pushing from CI (queue heterogeneity and push identity)
 
 The `bazel-any` queue is a **heterogeneous fleet** mixing personal Macs and Linux cloud agents. Both currently push successfully to `spinyfin/mono`:
 
 - **Personal Macs** run the agent under a real developer's user account using their `~/.ssh/` keys, so a push lands attributed to that person's personal identity.
-- **Linux cloud agents push successfully too**, on the same ambient-credential path (`git push origin`, no scoped token). This is not a one-off: Buildkite build [1360](https://buildkite.com/flunge/mono-checkleft-release/builds/1360) had its `checkleft-release.sh prepare` phase land on `zoologist-1` (a Linux `bazel-any` agent) and push the `checkleft-v0.1.0-alpha.122` tag without error; sampling the `prepare` phase across builds 1250–1368 in `mono-checkleft-release`'s history shows it landing on a Linux agent (`zoologist-1`, `diziet-1`, `empiricist-1`/`empiricist-2`) every time, always succeeding. No push failure attributable to a read-only deploy key has been observed in that history.
+- **Linux cloud agents push successfully too**, on the same ambient-credential path (`git push origin`, no scoped token). This is not a one-off: Buildkite build [1360](https://buildkite.com/flunge/mono-checkleft-release/builds/1360) had its `checkleft-release.sh prepare` phase land on `zoologist-1` (a Linux `bazel-any` agent) and push the `checkleft-v0.1.0-alpha.122` tag without error; sampling the `prepare` phase across builds 1250–1368 in `mono-checkleft-release`'s history shows it landing on a Linux agent (`zoologist-1`, `diziet-1`, `empiricist-1`/`empiricist-2`) in every sampled build, always succeeding. No push failure attributable to a read-only deploy key has been observed in that history.
 
 `spinyfin/mono` itself has **zero deploy keys** registered (`gh api repos/spinyfin/mono/keys` returns none) — pushes from Linux agents are authenticated some other way (the agent's own ambient git/SSH credential, per `checkleft-release.sh`'s comment that "every worker can push to the repo"), not via a repo-level deploy key. The exact credential mechanism on the Linux hosts has not been independently confirmed from the host side (root access would be needed to inspect `buildkite-agent`'s `~/.ssh`), but the observed behavior across the sampled build history is unambiguous: Linux `bazel-any` agents pushing tags to `spinyfin/mono` succeed reliably, not intermittently. `.buildkite/steps/checkleft-release.sh`'s `prepare` phase pushes the release tag with plain `git push origin` on the ambient agent credential — see the comment and `die` message around the `git push origin "refs/tags/${NEW_TAG}"` call in `checkleft-release.sh` — and this has not flapped in the sampled history regardless of which agent (Mac or Linux) it landed on.
 
-Diagnose push/auth flakiness by reading the per-job agent (`bk api "pipelines/<p>/builds/<n>"` → `.jobs[].agent.name`) and the job log's `known_hosts` path (a path under a personal `/Users/<name>/.ssh` indicates a Mac/personal key).
+Pushes don't fail here, but they still land under different identities depending on which agent class ran the job — if you ever need to attribute a push (or diagnose a future auth failure), read the per-job agent (`bk api "pipelines/<p>/builds/<n>"` → `.jobs[].agent.name`) and the job log's `known_hosts` path (a path under a personal `/Users/<name>/.ssh` indicates a Mac/personal key).
 
 ## Debugging a red build locally
 
