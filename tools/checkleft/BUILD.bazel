@@ -321,6 +321,33 @@ rust_test(
     ),
 )
 
+# Regression test for the actual process exit code of `checkleft run` when the
+# changeset cannot be determined: spawns the real built `:checkleft` binary
+# (staged via `data` + `CHECKLEFT_E2E_BIN`, resolved from runfiles) against a
+# real no-merge-base repo and asserts `status.code() == Some(3)` plus stderr
+# text — the one thing every other test in the suite only checks indirectly
+# through the pure `exit_code_for_error` helper.
+rust_test(
+    name = "changeset_undetermined_exit_code_e2e_test",
+    size = "small",
+    srcs = ["tests/changeset_undetermined_exit_code_e2e.rs"],
+    data = [":checkleft"],
+    edition = "2024",
+    env = {
+        "CHECKLEFT_E2E_BIN": "$(rlocationpath :checkleft)",
+    },
+    proc_macro_deps = all_crate_deps(
+        proc_macro = True,
+        proc_macro_dev = True,
+    ),
+    deps = [
+        ":checkleft_lib",
+    ] + all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ) + ["@rules_rust//rust/runfiles"],
+)
+
 # Functional / end-to-end test for `policy.changed_lines_only` (Phase 1 of
 # docs/investigations/checkleft-line-scoped-detection-and-fixes.md): drives a
 # real git repo through `Vcs::changeset_since` and the full `Runner` to

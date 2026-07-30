@@ -43,8 +43,8 @@ impl EmptyReason {
                  (root commit, unrelated histories, or the base ref does not exist)"
             }
             EmptyReason::DetachedHeadNoParent => {
-                "HEAD is detached and has no accessible parent commit \
-                 (root commit on a detached HEAD, or an orphaned checkout)"
+                "HEAD has no accessible parent commit \
+                 (a root commit, or a detached/orphaned checkout)"
             }
         }
     }

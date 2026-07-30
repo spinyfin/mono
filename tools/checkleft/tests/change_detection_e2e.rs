@@ -133,12 +133,17 @@ fn base_sha(plan: &ChangePlan) -> Option<&str> {
 }
 
 /// Translate a `ChangePlan` into the scoped file set exactly as `main.rs`'s
-/// `changeset_from_plan` does, returning the changed paths sorted.
+/// `changeset_from_plan` does for the `All` / `Scoped` cases, returning the
+/// changed paths sorted. `changeset_from_plan` treats `Empty` as an error
+/// (`ChangesetUndetermined`), not a changeset, so no caller here should pass
+/// an `Empty` plan.
 fn scoped_paths(vcs: &Vcs, plan: &ChangePlan) -> Vec<String> {
     let changeset: ChangeSet = match plan {
         ChangePlan::All => vcs.all_files_changeset().expect("all files changeset"),
         ChangePlan::Scoped { base_sha, .. } => vcs.changeset_since(base_sha).expect("changeset since base"),
-        ChangePlan::Empty { .. } => ChangeSet::default(),
+        ChangePlan::Empty { .. } => panic!(
+            "scoped_paths called with Empty plan; production code treats Empty as ChangesetUndetermined, not a changeset"
+        ),
     };
     let mut paths: Vec<String> = changeset
         .changed_files
@@ -608,7 +613,6 @@ fn first_commit_no_merge_base_yields_empty() {
         },
         "unrelated histories must yield Empty {{ NoMergeBase }}, got {plan:?}"
     );
-    assert!(scoped_paths(&vcs, &plan).is_empty(), "nothing should be scoped");
 }
 
 // ══ Row 8 — Detached HEAD ══════════════════════════════════════════════════════
