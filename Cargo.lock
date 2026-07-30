@@ -1263,6 +1263,7 @@ name = "checkleft-text-forbidden-pattern"
 version = "0.1.0"
 dependencies = [
  "checkleft-check-sdk",
+ "globset",
  "regex",
  "serde",
  "tempfile",

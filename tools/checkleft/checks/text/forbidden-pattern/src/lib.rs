@@ -41,6 +41,18 @@
 //! per line, a pattern containing a literal newline can never match and is
 //! rejected as a config error.
 //!
+//! An optional per-pattern `paths` key restricts a `"files"`-surface pattern
+//! to files whose repo-relative path matches one of the given globset
+//! patterns (same vocabulary as the framework's `applies_to` override — `**`
+//! matches across directory boundaries). This is for a rule whose forbidden
+//! text is only meaningful in one language or subtree (e.g. a Swift-only API
+//! name) — without it, a pattern like a Swift API name can false-positive on
+//! an unrelated file (a Rust string literal, a doc example) in a different
+//! language that happens to contain the same substring. When `paths` is
+//! omitted, the pattern applies to every file, unchanged from prior
+//! behaviour. `paths` has no effect on the `"changeset"` surface (PR/commit
+//! text has no file path to match against).
+//!
 //! `surfaces` controls which text sources every configured pattern is
 //! evaluated against. It is a list containing one or both of:
 //!
@@ -99,6 +111,7 @@
 //! instead of `<unknown>`.
 
 use checkleft_check_sdk::{ChangeKind, ChangeSet, CheckInput, Finding, Severity, Surface as FindingSurface, check};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use regex::Regex;
 use serde::Deserialize;
 
@@ -148,6 +161,8 @@ struct PatternConfig {
     message: String,
     #[serde(default)]
     severity: Option<String>,
+    #[serde(default)]
+    paths: Option<Vec<String>>,
 }
 
 struct CompiledPattern {
@@ -155,6 +170,17 @@ struct CompiledPattern {
     message: String,
     severity: Severity,
     regex: Regex,
+    /// `None` means the pattern applies to every file (no `paths` configured).
+    paths: Option<GlobSet>,
+}
+
+impl CompiledPattern {
+    fn applies_to_path(&self, path: &str) -> bool {
+        match &self.paths {
+            None => true,
+            Some(globset) => globset.is_match(path),
+        }
+    }
 }
 
 impl CompiledPattern {
@@ -242,6 +268,9 @@ fn scan_files(changeset: &ChangeSet, patterns: &[CompiledPattern], findings: &mu
         for (index, line) in content.lines().enumerate() {
             let line_number = (index + 1) as u32;
             for pattern in patterns {
+                if !pattern.applies_to_path(&file.path) {
+                    continue;
+                }
                 for m in pattern.regex.find_iter(line) {
                     let column = (line[..m.start()].chars().count() + 1) as u32;
                     let finding = pattern
@@ -332,11 +361,33 @@ fn compile_patterns(patterns: &[PatternConfig]) -> Result<Vec<CompiledPattern>, 
         let severity =
             parse_severity(pattern.severity.as_deref()).map_err(|e| format!("`{field_prefix}.severity` {e}"))?;
 
+        let paths = match &pattern.paths {
+            None => None,
+            Some(globs) => {
+                if globs.is_empty() {
+                    return Err(format!(
+                        "`{field_prefix}.paths` must not be empty when present; omit the key to match every file"
+                    ));
+                }
+                let mut builder = GlobSetBuilder::new();
+                for glob in globs {
+                    let compiled_glob =
+                        Glob::new(glob).map_err(|e| format!("invalid glob `{glob}` in `{field_prefix}.paths`: {e}"))?;
+                    builder.add(compiled_glob);
+                }
+                let globset = builder
+                    .build()
+                    .map_err(|e| format!("failed to build `{field_prefix}.paths` globset: {e}"))?;
+                Some(globset)
+            }
+        };
+
         compiled.push(CompiledPattern {
             name: pattern.name.clone(),
             message: pattern.message.clone(),
             severity,
             regex,
+            paths,
         });
     }
     Ok(compiled)
@@ -561,6 +612,50 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert!(findings[0].message.contains("severity"));
         assert!(findings[0].message.contains("critical"));
+    }
+
+    #[test]
+    fn paths_filter_skips_non_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_file(dir.path(), "guard_trace.rs", "sys.stdout.write(stdout)\n");
+
+        let findings = forbidden_pattern_check(make_input(
+            vec![ChangedFile {
+                path,
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            r#"{"patterns":[{"name":"filehandle-write-unlabeled","pattern":"\\.write\\(\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\)","message":"nope","paths":["**/*.swift"]}]}"#,
+        ));
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn paths_filter_flags_matching_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_temp_file(dir.path(), "DiagnosticWrite.swift", "handle.write(lineData)\n");
+
+        let findings = forbidden_pattern_check(make_input(
+            vec![ChangedFile {
+                path,
+                kind: ChangeKind::Modified,
+                old_path: None,
+            }],
+            r#"{"patterns":[{"name":"filehandle-write-unlabeled","pattern":"\\.write\\(\\s*[A-Za-z_][A-Za-z0-9_]*\\s*\\)","message":"nope","paths":["**/*.swift"]}]}"#,
+        ));
+
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn rejects_empty_paths_list() {
+        let findings = forbidden_pattern_check(make_input(
+            vec![],
+            r#"{"patterns":[{"name":"foo","pattern":"bar","message":"baz","paths":[]}]}"#,
+        ));
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0].message.contains("paths"));
     }
 
     #[test]

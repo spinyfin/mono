@@ -77,6 +77,14 @@ checks:
   # `write(contentsOf: ...)` call (the safe throwing API this check steers
   # callers toward) or a `write(to: ...)` call (`Data`'s unrelated,
   # already-safe throwing API), both of which take a labeled first argument.
+  #
+  # All three patterns carry `paths: ["**/*.swift"]`: `FileHandle` is a
+  # Foundation (Swift-only) API, so these are raw text patterns that can
+  # otherwise false-positive on unrelated languages (e.g. a Rust string
+  # literal embedding a Python `sys.stdout.write(...)` call matched
+  # `filehandle-write-unlabeled` and pointed at Swift remediation text that
+  # made no sense there). Scoping to Swift files keeps the check meaningful
+  # without narrowing what it catches within Swift.
   - id: boss/no-legacy-filehandle-write-api
     check: text/forbidden-pattern
     policy:
@@ -90,11 +98,17 @@ checks:
           pattern: '\.closeFile\(\)'
           message: "The legacy FileHandle closeFile method raises an uncatchable NSException on a failing close(2). Use DiagnosticWrite.closeQuietly(_:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
           severity: warning
+          paths:
+            - "**/*.swift"
         - name: filehandle-seek-to-end-of-file
           pattern: '\.seekToEndOfFile\(\)'
           message: "The legacy FileHandle seekToEndOfFile method raises an uncatchable NSException on a failing lseek(2). Use DiagnosticWrite.seekToEndQuietly(_:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
           severity: warning
+          paths:
+            - "**/*.swift"
         - name: filehandle-write-unlabeled
           pattern: '\.write\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)'
           message: "FileHandle.write(_:) raises an uncatchable NSException on a failing write(2). Use DiagnosticWrite.append(_:to:site:warned:) instead (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
           severity: warning
+          paths:
+            - "**/*.swift"
