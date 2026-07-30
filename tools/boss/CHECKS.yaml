@@ -70,6 +70,15 @@ checks:
   # a regression in an existing one) reintroducing a raw call is caught at
   # push time instead of silently reopening the same crash class.
   #
+  # A fourth pattern bans `FileHandle(forWritingAtPath:)`, which opens
+  # without `O_APPEND`; a following `seekToEnd()`+`write()` is two
+  # syscalls, so concurrent appenders (the app and the engine on the same
+  # log) can compute the same offset and splice records. This is a
+  # different failure mode from the NSException crash class above — it's
+  # a data-corruption bug, not a crash — but the fix is the same
+  # `DiagnosticWrite.openForAppending(atPath:)` call, so it lives in this
+  # check alongside the other three.
+  #
   # `closeFile`/`seekToEndOfFile`/`FileHandle(forWritingAtPath:` are
   # unambiguous — no other unrelated Swift API in this repo shares those
   # shapes. The `write` pattern is narrower: it matches only a single
@@ -101,5 +110,5 @@ checks:
           severity: warning
         - name: filehandle-for-writing-at-path
           pattern: 'FileHandle\(forWritingAtPath:'
-          message: "FileHandle(forWritingAtPath:) opens without O_APPEND, so a following seekToEnd()+write() is two separate syscalls — concurrent appenders (e.g. the app and the engine on the same log) can compute the same offset and splice each other's records. Use DiagnosticWrite.openForAppending(atPath:) instead, which opens with O_APPEND so the offset lookup and the write are atomic (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift)."
+          message: "FileHandle(forWritingAtPath:) opens without O_APPEND, so a following seekToEnd()+write() is two separate syscalls — concurrent appenders (e.g. the app and the engine on the same log) can compute the same offset and splice each other's records. Use DiagnosticWrite.openForAppending(atPath:) instead, which opens with O_APPEND so the offset lookup and the write are atomic (see tools/boss/app-macos/Sources/Diagnostics/DiagnosticWrite.swift). This warning only applies to append paths — a test constructing a handle to exercise a non-append write/close failure is fine and can be left as-is."
           severity: warning
