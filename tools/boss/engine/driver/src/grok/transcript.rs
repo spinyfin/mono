@@ -49,9 +49,10 @@ use crate::TranscriptSessionNormalizer;
 use super::progress::TOOL_NAME_MAP;
 
 /// Defensive bound on in-flight tool calls tracked per tail, matching
-/// Codex's own cap (`codex/progress.rs::MAX_TRACKED_ROLLOUT_CALLS`) — not a
-/// measured Grok-specific limit, just the same "don't grow unbounded on a
-/// tail that never sees a matching update" guard.
+/// Codex's own transcript-correlator cap
+/// (`codex/progress.rs::MAX_TRACKED_TRANSCRIPT_TOOL_CALLS`) — not a measured
+/// Grok-specific limit, just the same "don't grow unbounded on a tail that
+/// never sees a matching update" guard.
 const MAX_TRACKED_GROK_CALLS: usize = 256;
 
 /// Grok's own tool nomenclature -> Claude-canonical name, reusing the

@@ -211,13 +211,31 @@ pub(super) fn dispatch_codex_unobserved_command_on_notification(
     let Some(run_id) = incoming.run_id.as_deref() else {
         return;
     };
-    if server_state.staged_unobserved_commands.record(run_id, command.trim()) {
-        tracing::warn!(
-            execution_id = run_id,
-            command = command.trim(),
-            "codex_unobserved_command: staged an abandoned command_execution (item.started with no \
-             item.completed observed before the turn boundary)",
-        );
+    use crate::codex_unobserved_command::RecordOutcome;
+    match server_state.staged_unobserved_commands.record(run_id, command.trim()) {
+        RecordOutcome::Staged => {
+            tracing::warn!(
+                execution_id = run_id,
+                command = command.trim(),
+                "codex_unobserved_command: staged an abandoned command_execution (item.started with no \
+                 item.completed observed before the turn boundary)",
+            );
+        }
+        RecordOutcome::Duplicate => {}
+        RecordOutcome::CapExceeded => {
+            // Loud by design: the audit trail stopped growing, but the
+            // NO_CHANGES_NEEDED refusal gate (`consume_unresolved`) does not
+            // depend on this cap and still fires — see
+            // `codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION`.
+            crate::codex_unobserved_command::CODEX_UNOBSERVED_COMMAND_OVERFLOW.inc(&server_state.metrics);
+            tracing::error!(
+                execution_id = run_id,
+                command = command.trim(),
+                "codex_unobserved_command: audit trail exceeded MAX_COMMANDS_PER_EXECUTION distinct \
+                 abandoned commands for this execution; this command was not added to the trail (the \
+                 NO_CHANGES_NEEDED refusal gate still fires)",
+            );
+        }
     }
 }
 

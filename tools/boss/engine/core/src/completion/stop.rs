@@ -1110,15 +1110,27 @@ must not be asked to open one",
                     // trust the worker's verification. Refuse the no-op
                     // claim and fall through to the normal produce-a-PR
                     // nudge rather than closing the task as done.
-                    if self.staged_unobserved_commands.has_any(execution_id) {
+                    //
+                    // `consume_unresolved` (not `list`/`has_any`) is the
+                    // right read here: it answers "has a command gone
+                    // unobserved since the last time this gate fired?", not
+                    // "has this run ever left a command unobserved?" — see
+                    // `codex_unobserved_command::UnobservedCommandTracker`'s
+                    // type doc for why the latter question, in a long-lived
+                    // multi-turn Codex session that reaches this Stop many
+                    // times, would refuse every later no-op claim for the
+                    // rest of the run over one abandoned command from turns
+                    // ago. This read also clears the flag, so a clean turn
+                    // that follows gets a fair NO_CHANGES_NEEDED evaluation.
+                    if self.staged_unobserved_commands.consume_unresolved(execution_id) {
                         tracing::warn!(
                             execution_id,
                             expected_branch = %expected_branch,
                             kind = %execution.kind,
                             "stop event: worker emitted NO_CHANGES_NEEDED but this run left at least \
-                             one Codex command_execution unobserved (item.started with no \
-                             item.completed) — refusing the no-op claim; falling through to the \
-                             produce-a-PR nudge instead",
+                             one Codex command_execution unobserved since the gate last checked \
+                             (item.started with no item.completed) — refusing the no-op claim; \
+                             falling through to the produce-a-PR nudge instead",
                         );
                     } else {
                         tracing::info!(
