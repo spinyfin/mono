@@ -5,10 +5,10 @@
 //! tests. Both sides go through [`AgentDriver::normalize_progress_event`].
 
 use crate::conformance::fixtures::{
-    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, codex_shaped_driver, decode_jsonl,
-    expected_session_events, normalize_session_id,
+    CANONICAL_SESSION_ID, CLAUDE_HOOK_SESSION_JSONL, CODEX_STDOUT_SESSION_JSONL, GROK_HOOK_SESSION_JSONL,
+    codex_shaped_driver, decode_jsonl, expected_session_events, normalize_session_id, normalize_session_start_source,
 };
-use crate::driver::ClaudeDriver;
+use crate::driver::{ClaudeDriver, GrokDriver};
 
 #[test]
 fn hook_ingress_matches_expected_session_sequence() {
@@ -50,6 +50,42 @@ fn stdout_jsonl_and_hook_ingress_produce_identical_worker_event_sequences() {
     assert_eq!(
         hook_events, stdout_events,
         "core driver-seam claim: both transports must yield the same WorkerEvent sequence",
+    );
+}
+
+#[test]
+fn grok_hook_ingress_matches_expected_session_sequence() {
+    let events: Vec<_> = decode_jsonl(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(normalize_session_start_source)
+        .collect();
+    assert_eq!(
+        events,
+        expected_session_events(),
+        "Grok hook ingress must decode to the canonical activity-machine sequence",
+    );
+}
+
+#[test]
+fn claude_and_grok_hook_ingress_produce_identical_worker_event_sequences() {
+    // Second driver-seam claim (design §"Ingress equivalence"): Grok's hook
+    // ingress, despite a structurally different camelCase wire payload
+    // (`grok/progress.rs`), must decode to the same WorkerEvent sequence
+    // shape Claude's hook ingress produces for equivalent activity.
+    let claude_events: Vec<_> = decode_jsonl(&ClaudeDriver, CLAUDE_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .collect();
+    let grok_events: Vec<_> = decode_jsonl(&GrokDriver::default(), GROK_HOOK_SESSION_JSONL)
+        .into_iter()
+        .map(|e| normalize_session_id(e, CANONICAL_SESSION_ID))
+        .map(normalize_session_start_source)
+        .collect();
+    assert_eq!(
+        claude_events, grok_events,
+        "Claude hook ingress and Grok hook ingress must produce identical WorkerEvent sequences \
+         for equivalent activity",
     );
 }
 

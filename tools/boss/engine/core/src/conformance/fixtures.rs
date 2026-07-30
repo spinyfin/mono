@@ -102,6 +102,50 @@ pub const CODEX_STDOUT_SESSION_JSONL: &str = concat!(
     "\n",
 );
 
+/// Grok-hook ingress for the same logical session, in Grok's native
+/// camelCase payload dialect (design §"Payload shape" /
+/// `tools/boss/engine/driver/src/grok/progress.rs`).
+///
+/// Grok's hook payload is fully self-describing per invocation (own
+/// `sessionId`, own `hookEventName`) — one JSON object per hook firing, the
+/// same "one line per event" shape [`decode_jsonl`] already assumes for
+/// Claude. Field values are chosen so canonicalisation
+/// (`grok/progress.rs::canonicalize`) and the shared
+/// [`boss_protocol::normalize_hook_event`] produce exactly
+/// [`expected_session_events`] after [`normalize_session_id`] and
+/// [`normalize_session_start_source`]:
+/// `toolName: "run_terminal_command"` maps to Claude's `"Bash"`
+/// (`grok/progress.rs::TOOL_NAME_MAP`), and `toolResult` carries the same
+/// plain output string Claude's `tool_response` does (a real Grok
+/// `run_terminal_command` result is a richer `{"type":"Bash",...}` object —
+/// see `GrokDriver::pr_url_capture_feed` — but ingress equivalence here is
+/// about the canonicalisation/mapping shape, not the tool's own result
+/// schema).
+///
+/// `source: "new"` and no `model` field are the real wire values (see the
+/// committed capture
+/// `tools/boss/docs/investigations/ghostty-grok-pane-viability-artifacts/cli/hook_payloads/SessionStart.sample.json`).
+/// Grok's `"new"` is a genuine, accepted dialect difference from Claude's
+/// `"startup"` — `parse_session_start_source` maps only
+/// startup/resume/clear/compact, so `"new"` decodes to
+/// `SessionStartSource::Other` (pinned by the driver's own
+/// `grok/progress.rs::session_start_source_new_degrades_to_other_with_no_protocol_widening`
+/// test). [`normalize_session_start_source`] absorbs that accepted
+/// difference for the fixture comparison, the same way [`normalize_session_id`]
+/// absorbs identity and model differences.
+pub const GROK_HOOK_SESSION_JSONL: &str = concat!(
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"session_start","permissionMode":"bypassPermissions","source":"new"}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"user_prompt_submit","prompt":""}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"pre_tool_use","toolName":"run_terminal_command","toolUseId":"call_fixture","toolInput":{"command":"echo hooktest-exec"}}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"post_tool_use","toolName":"run_terminal_command","toolUseId":"call_fixture","toolInput":{"command":"echo hooktest-exec"},"toolResult":"hooktest-exec\n"}"#,
+    "\n",
+    r#"{"sessionId":"019f974c-3d59-7533-b320-3963123c809b","hookEventName":"stop","promptId":"call_fixture","stopHookActive":false,"lastAssistantMessage":"hooktest-exec"}"#,
+    "\n",
+);
+
 /// Expected activity-machine event sequence for both fixture sides.
 pub fn expected_session_events() -> Vec<WorkerEvent> {
     vec![
@@ -154,6 +198,29 @@ pub fn normalize_session_id(mut event: WorkerEvent, session_id: &str) -> WorkerE
         | WorkerEvent::SessionEnd { session_id: s, .. } => {
             *s = session_id.to_owned();
         }
+    }
+    event
+}
+
+/// Normalise a real-wire `SessionStart` source to the canonical fixture
+/// value so cross-dialect sequences compare equal under [`PartialEq`].
+///
+/// Claude's `"startup"` decodes to `SessionStartSource::Startup`; Grok's
+/// real `"new"` decodes to `SessionStartSource::Other`
+/// (`parse_session_start_source` in `boss_protocol::worker_event` maps only
+/// startup/resume/clear/compact). That divergence is a genuine, accepted
+/// dialect difference — pinned by the driver's own
+/// `grok/progress.rs::session_start_source_new_degrades_to_other_with_no_protocol_widening`
+/// test — not a normalisation bug. Ingress-equivalence assertions care about
+/// the overall event *sequence shape* over genuine payloads, not this one
+/// known-divergent field, so `Other` is folded onto `Startup` here the same
+/// way [`normalize_session_id`] folds together differing session-identity
+/// and model representations.
+pub fn normalize_session_start_source(mut event: WorkerEvent) -> WorkerEvent {
+    if let WorkerEvent::SessionStart { source, .. } = &mut event
+        && *source == SessionStartSource::Other
+    {
+        *source = SessionStartSource::Startup;
     }
     event
 }

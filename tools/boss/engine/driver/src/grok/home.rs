@@ -36,8 +36,12 @@ pub static GROK_HOMES_ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::ne
 const GROK_HOMES_DIR_NAME: &str = "boss-grok-homes";
 
 /// Pinned Grok CLI version characterised by the design + investigations.
-/// `grok inspect --json` reports this as `grokVersion`.
-pub const PINNED_GROK_VERSION: &str = "0.2.112";
+/// `grok inspect --json` reports this as `grokVersion`. `--trust`, `grok
+/// models`, and `grok inspect --json` posture are all verified against this
+/// version by the conformance version-pin tests in
+/// `tools/boss/engine/core/src/conformance/version_pin.rs`; re-run them and
+/// re-characterise before changing this value.
+pub const PINNED_GROK_VERSION: &str = "0.2.114";
 
 /// Filename of the Boss-assigned session UUID under `GROK_HOME`.
 const SESSION_ID_FILENAME: &str = "boss-session-id";
