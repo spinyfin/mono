@@ -2,9 +2,12 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
-use super::{AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver};
+use super::{
+    AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress, ProgressObservationConfig,
+};
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
 ///
@@ -46,8 +49,46 @@ impl Default for DriverRegistry {
         drivers.insert("claude", Arc::new(ClaudeDriver));
         drivers.insert("codex", Arc::new(CodexDriver::default()));
         drivers.insert("grok", Arc::new(GrokDriver::default()));
+        for (slug, driver) in &drivers {
+            refuse_stdout_jsonl_ingress(slug, driver.as_ref());
+        }
         Self { drivers }
     }
+}
+
+/// Registration-time guard for the discontinued engine-spawned
+/// stdout-JSONL topology: `codex-as-a-first-class-agent-driver.md` recorded,
+/// then reversed, a plan to keep `ProgressIngress::StdoutJsonl` for an
+/// engine-owns-the-pipe Codex topology. That topology was never pursued, and
+/// production ingress activation (`ServerState::prepare_progress_ingress`)
+/// only wires up `AgentJsonlFile` — a built-in driver that declared
+/// `StdoutJsonl` would register successfully but its run would silently
+/// stall in `Spawning` forever, since nothing would ever read the stream it
+/// named. Panicking here at registration turns that into a loud failure at
+/// startup instead of a silent hang discovered only via the staleness sweep.
+///
+/// Deliberately probes only the three built-in slugs constructed above, not
+/// [`DriverRegistry::with_driver`] generally: the shared JSONL reader crate
+/// (`boss-engine-stdout-progress`) legitimately registers synthetic
+/// `StdoutJsonl`-declaring test drivers to exercise that still-supported
+/// generic ingress kind in isolation from any real driver.
+fn refuse_stdout_jsonl_ingress(slug: &str, driver: &dyn AgentDriver) {
+    let probe_config = ProgressObservationConfig {
+        events_socket_path: PathBuf::new(),
+        lease_id: String::new(),
+        run_id: String::new(),
+        workspace_path: PathBuf::new(),
+        forwarder_binary: PathBuf::new(),
+    };
+    assert!(
+        !matches!(
+            driver.progress_observation_wiring(&probe_config),
+            ProgressIngress::StdoutJsonl
+        ),
+        "driver '{slug}' declared ProgressIngress::StdoutJsonl at registration; the engine-spawned \
+         stdout-JSONL topology was intentionally discontinued and production ingress activation does \
+         not wire it up — see tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md"
+    );
 }
 
 impl DriverRegistry {
