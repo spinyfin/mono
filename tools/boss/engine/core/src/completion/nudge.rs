@@ -348,6 +348,11 @@ status is otherwise left unchanged for re-dispatch or manual review."
     /// returns `work_item: None` in that case rather than erroring the
     /// whole finalize, so the work-item-changed publish is simply skipped.
     pub(super) async fn finalize_idle_park(&self, execution: &crate::work::WorkExecution, detail: &str) {
+        // Captured before `record_worker_idle_abandonment` below nulls
+        // `workspace_path` in the same transaction that terminalizes the
+        // execution — this path terminalizes a parked-live execution, so it
+        // owns driver teardown.
+        let workspace_path = execution.workspace_path.clone();
         let completion = match self.work_db.record_worker_idle_abandonment(&execution.id, detail) {
             Ok(Some(completion)) => completion,
             Ok(None) => return,
@@ -376,6 +381,15 @@ status is otherwise left unchanged for re-dispatch or manual review."
             );
         }
         self.pane_releaser.release_pane(&execution.id).await;
+        // Deliberately AFTER the pane release (mirrors `force_release`'s
+        // ordering) — see `finalize_pr_transition` for why teardown must not
+        // run while the worker process may still be alive.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         let work_item_id = completion.execution.work_item_id.clone();
         self.publisher
             .publish(

@@ -1684,3 +1684,4 @@ mod t02;
 mod t03;
 mod t04;
 mod t05;
+mod t06;

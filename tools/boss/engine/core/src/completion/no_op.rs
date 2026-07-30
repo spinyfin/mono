@@ -16,6 +16,11 @@ impl WorkerCompletionHandler {
     /// Idempotent against an already-finalized execution: the DB write
     /// returns `None` for a non-live row, which maps to `AlreadyTerminal`.
     pub(super) async fn finalize_no_op_completion(&self, execution: &crate::work::WorkExecution) -> StopOutcome {
+        // Captured before `record_worker_no_op_completion` below nulls
+        // `workspace_path` in the same transaction that terminalizes the
+        // execution — this path terminalizes a parked-live execution, so it
+        // owns driver teardown.
+        let workspace_path = execution.workspace_path.clone();
         let detail = "Worker verified the assigned work was already done (empty diff — no changes \
                       needed); closed as a no-op without a PR.";
         let completion = match self.work_db.record_worker_no_op_completion(&execution.id, detail) {
@@ -48,6 +53,15 @@ impl WorkerCompletionHandler {
             );
         }
         self.pane_releaser.release_pane(&execution.id).await;
+        // Deliberately AFTER the pane release (mirrors `force_release`'s
+        // ordering) — see `finalize_pr_transition` for why teardown must not
+        // run while the worker process may still be alive.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         let work_item_id = completion.execution.work_item_id.clone();
         self.publisher
             .publish(
