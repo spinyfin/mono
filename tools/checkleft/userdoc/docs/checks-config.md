@@ -216,7 +216,7 @@ An empty list is rejected — use `enabled: false` to disable a check entirely.
 
 ### Precedence vs `applies_to`
 
-Excludes are **subtractive and always win**: they apply as a second stage after positive file selection (`applies_to` for declarative checks; the intrinsic changed-file set for other check kinds). Whatever the positive selection produces, the effective file set subtracts any excluded paths.
+Excludes are **subtractive and always win**: they apply as a second stage after positive file selection (`applies_to` for declarative checks and, when configured, for component checks — see [Overriding `applies_to`](#overriding-applies_to) below; the intrinsic changed-file set otherwise). Whatever the positive selection produces, the effective file set subtracts any excluded paths.
 
 ```
 effective(check, file) = positive(check, file) AND NOT excluded(check, file)
@@ -252,7 +252,7 @@ Together these guarantees mean excluded paths:
 
 **`exclude` vs tool-native ignore files** (`.prettierignore`, `.gitignore`): the framework `exclude` is the authoritative mechanism. Because checkleft passes files explicitly to declarative check tools, whether a tool honors its own ignore file for explicitly-passed arguments is tool-specific and not guaranteed. Framework excludes work uniformly regardless of which tool a check wraps and do not depend on any ignore file on disk.
 
-## Overriding `applies_to` for declarative checks
+## Overriding `applies_to`
 
 Declarative checks (format/bazel, format/rust, format/prettier, lint/js, lint/rust, etc.) declare which files they run on via an `applies_to` glob list in their check definition. A consuming repo can restrict or retarget that file set from its CHECKS.yaml without forking the definition — by setting `applies_to` inside the per-check `config` block.
 
@@ -280,6 +280,21 @@ Rules:
 - Each glob uses the same syntax as the check definition's `applies_to` (globset patterns; `**` matches across directory boundaries).
 - When no `applies_to` key appears in `config`, the definition's own list is used unchanged.
 - The override applies to all declarative checks uniformly — it is a framework feature, not specific to any one check.
+
+### `applies_to` on component checks
+
+Component checks (wasm-based, e.g. `rust/giant-structs`) have no definition-side `applies_to` list — a check package manifest cannot declare one. For a component check, setting `applies_to` in the per-check `config` block is not an override of a prior list; it is the entire positive selection. When absent, a component check keeps receiving the full changed-file set, same as always.
+
+```yaml
+checks:
+  # Only run this component check against Swift files.
+  - id: boss/no-legacy-filehandle-write-api
+    config:
+      applies_to:
+        - "**/*.swift"
+```
+
+**Zero-match semantics differ from the declarative path in one respect.** For a declarative check, `applies_to` narrows the file list a single invocation is handed; if the glob(s) select none of the current changeset's files, the check simply reports a clean, empty result for this run. Component checks behave the same way for an ordinary, non-matching changeset (e.g. a Swift-only override running against an all-Rust PR) — a clean, empty result, not a failure. The check only fails loudly when the override doesn't match _any tracked file anywhere in the repo_ — that condition is treated as evidence of a typo'd glob (nothing under that pattern could ever run), and it is reported the same way an invalid `applies_to` value is: as a failed check execution.
 
 ## Pattern: First-party (bundled) check — zero install
 

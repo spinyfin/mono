@@ -312,6 +312,20 @@ pub fn override_applies_to(config: &toml::Value) -> Option<Result<Vec<String>>> 
     Some(Ok(globs))
 }
 
+/// Build a [`globset::GlobSet`] from an `applies_to` glob list, using the one
+/// dialect (`globset::Glob::new` with default options) every `applies_to`
+/// consumer in this crate must share — the declarative path's
+/// [`super::executor::select_files`] and the component path's
+/// `external::runtime::narrow_by_applies_to` both call this rather than
+/// re-building their own `GlobSetBuilder`, so the two paths cannot drift.
+pub fn applies_to_globset(globs: &[String]) -> Result<globset::GlobSet> {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in globs {
+        builder.add(globset::Glob::new(pattern).with_context(|| format!("invalid applies_to glob `{pattern}`"))?);
+    }
+    builder.build().context("failed to build applies_to glob set")
+}
+
 /// Read an optional binding override from `config` at `needs.<name>.{path|bazel|npm}`.
 ///
 /// An `npm` override may set only the field it wants to change; any omitted

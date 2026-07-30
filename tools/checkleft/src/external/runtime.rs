@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
-use globset::{Glob, GlobSetBuilder};
 use sha2::{Digest, Sha256};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, ResourceLimiter, Store};
@@ -586,9 +585,9 @@ impl DefaultExternalCheckExecutor {
 }
 
 /// Narrow `changeset` to the files selected by a component check's `applies_to`
-/// config override, using the same glob dialect and repo-relative path
-/// coordinates as the declarative path's `select_files` (`executor.rs:280-313`):
-/// `globset::Glob::new` with default options, matched against `ChangedFile::path`.
+/// config override, using the shared glob dialect and repo-relative path
+/// coordinates the declarative path's `select_files` (`executor.rs:280-313`)
+/// also uses: [`resolve::applies_to_globset`], matched against `ChangedFile::path`.
 ///
 /// Returns `Ok(None)` when `config` carries no `applies_to` key — component
 /// checks then keep receiving the full changeset, unchanged from prior
@@ -596,34 +595,42 @@ impl DefaultExternalCheckExecutor {
 /// to fall back to; `mod.rs`'s `reject_declarative_fields` rejects the field on
 /// the manifest side, so "override, or match-all" is the entire semantics).
 ///
-/// Errors loudly — instead of silently returning a changeset with zero
-/// matching files — when the override is present, `changeset` has at least one
-/// non-deleted file, and the glob(s) select none of them. This is the same
-/// failure mode the stale-exclusion audit (`crate::exclusion`) exists to catch
-/// on the `exclude` side: a config key that quietly weakens coverage. That
-/// audit is diff-gated to re-evaluate only when a file a *declared exclusion
-/// depends on* changes, and requires a guest round trip
-/// (`declared_exclusions_for_component` / `evaluate_exclusion_for_component`)
-/// to re-read that file's content — machinery built for "was this exclusion
-/// still justified", which needs external state. Whether `applies_to` matches
-/// zero files has no such dependency: it is a pure function of the current
-/// changeset and glob set, decidable inline on every run without any guest
-/// call. So this reuses the audit's *outcome*, not its *mechanism*: the error
-/// path below is the exact same `Result<CheckResult>` → "check execution
-/// failed" finding conversion `runner.rs` already applies to an invalid
-/// `applies_to` override (see `resolve::override_applies_to` errors), rather
-/// than a parallel diagnostic channel.
-fn narrow_by_applies_to(changeset: &ChangeSet, config: &toml::Value) -> Result<Option<ChangeSet>> {
+/// When the override is present but selects none of `changeset`'s non-deleted
+/// files, that is treated the same as the declarative path treats a
+/// zero-match `select_files` result: a clean, empty selection, not an error
+/// (`declarative/executor.rs:115-120`). A `scope: files` check's changeset is
+/// exactly the files that resolved to the CHECKS entry declaring it
+/// (`runner.rs:1133-1196`), so "none of *this changeset's* files match" is the
+/// ordinary case for e.g. a Swift-only override sitting in a manifest that a
+/// Rust-only PR also schedules — it must not fail the check.
+///
+/// `source_tree` is used only to distinguish that ordinary case from a typo'd
+/// glob: when the zero-match condition triggers and `source_tree` is
+/// provided, this additionally audits the override against every tracked
+/// file in the *repo* (not just the current changeset) via `SourceTree::glob`,
+/// and errors loudly only when the glob(s) match nothing anywhere in the
+/// repo. This is the same failure mode the stale-exclusion audit
+/// (`crate::exclusion`) exists to catch on the `exclude` side: a config key
+/// that quietly weakens coverage. That audit is diff-gated to re-evaluate
+/// only when a file a *declared exclusion depends on* changes, and requires a
+/// guest round trip to re-read that file's content — machinery built for "was
+/// this exclusion still justified", which needs external state. Whether
+/// `applies_to` is satisfiable at all has no such dependency: it is a pure
+/// function of the glob set and the repo's tracked files, decidable inline on
+/// every run without any guest call. Callers that only need an estimate (e.g.
+/// `eligible_file_count`, which has no `SourceTree` to hand) pass `None` and
+/// get the narrowed — possibly empty — changeset without the repo audit or
+/// its error path.
+fn narrow_by_applies_to(
+    changeset: &ChangeSet,
+    config: &toml::Value,
+    source_tree: Option<&dyn SourceTree>,
+) -> Result<Option<ChangeSet>> {
     let globs = match resolve::override_applies_to(config) {
         None => return Ok(None),
         Some(result) => result.context("invalid `applies_to` config override")?,
     };
-
-    let mut builder = GlobSetBuilder::new();
-    for pattern in &globs {
-        builder.add(Glob::new(pattern).with_context(|| format!("invalid `applies_to` glob `{pattern}`"))?);
-    }
-    let globset = builder.build().context("failed to build `applies_to` glob set")?;
+    let globset = resolve::applies_to_globset(&globs).context("invalid `applies_to` config override")?;
 
     let non_deleted_before = changeset
         .changed_files
@@ -644,12 +651,23 @@ fn narrow_by_applies_to(changeset: &ChangeSet, config: &toml::Value) -> Result<O
         .filter(|f| !matches!(f.kind, ChangeKind::Deleted))
         .count();
 
-    if non_deleted_before > 0 && non_deleted_after == 0 {
-        bail!(
-            "`applies_to` config override {globs:?} matched none of {non_deleted_before} changed \
-             file(s) in this changeset; check the glob(s) for a typo, or remove `applies_to` to \
-             match every file"
-        );
+    if non_deleted_before > 0
+        && non_deleted_after == 0
+        && let Some(source_tree) = source_tree
+    {
+        let repo_has_match = globs
+            .iter()
+            .map(|pattern| source_tree.glob(pattern))
+            .collect::<Result<Vec<_>>>()
+            .context("failed to evaluate `applies_to` glob(s) against the repo")?
+            .iter()
+            .any(|matches| !matches.is_empty());
+        if !repo_has_match {
+            bail!(
+                "`applies_to` config override {globs:?} matched no tracked file in the repo; \
+                 check the glob(s) for a typo, or remove `applies_to` to match every file"
+            );
+        }
     }
 
     Ok(Some(narrowed))
@@ -672,7 +690,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 // so the guest never sees an excluded or out-of-scope path and cannot
                 // target it.
                 let filtered = exclusion.filter_changeset(changeset);
-                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
+                let filtered = narrow_by_applies_to(&filtered, config, Some(source_tree))?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -718,7 +736,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
                 // so the guest never sees an excluded or out-of-scope path and cannot
                 // target it.
                 let filtered = exclusion.filter_changeset(changeset);
-                let filtered = narrow_by_applies_to(&filtered, config)?.unwrap_or(filtered);
+                let filtered = narrow_by_applies_to(&filtered, config, Some(source_tree))?.unwrap_or(filtered);
                 self.execute_component_check(package, component, &filtered, source_tree, config, config_dir)
             }
             ExternalCheckPackageImplementation::Declarative(declarative) => {
@@ -753,11 +771,15 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
             ExternalCheckPackageImplementation::Declarative(d) => {
                 super::declarative::eligible_file_count(&self.root, d, changeset, config)
             }
-            // A malformed or zero-match override causes `execute`/`execute_with_progress`
-            // to fail; here we fall back to the full changeset size so the progress
-            // count is conservative and consistent with the "something went wrong"
-            // signal the runner will surface when the check actually runs.
-            ExternalCheckPackageImplementation::Component(_) => narrow_by_applies_to(changeset, config)
+            // No `SourceTree` is available here, so pass `None`: this reflects
+            // the narrowed (possibly empty, e.g. a same-changeset zero-match)
+            // count without the repo-wide unsatisfiability audit `execute`/
+            // `execute_with_progress` perform. Only a malformed override still
+            // errors here; fall back to the full changeset size so the
+            // progress count is conservative and consistent with the
+            // "something went wrong" signal the runner will surface when the
+            // check actually runs.
+            ExternalCheckPackageImplementation::Component(_) => narrow_by_applies_to(changeset, config, None)
                 .ok()
                 .flatten()
                 .map(|narrowed| narrowed.changed_files.len())
