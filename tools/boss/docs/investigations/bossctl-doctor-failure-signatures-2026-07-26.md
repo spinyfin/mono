@@ -116,21 +116,21 @@ Verified against the built `bossctl --help` / subcommand help on this host (2026
 
 Landed in mono#2549. This is a durable operator- and automation-facing contract for `bossctl dispatch diagnose`, so it belongs here next to the surfaces it changes. Implementation: `bossctl/src/stream_integrity.rs` (reporting), `engine/dispatch-reader/src/integrity.rs` (recovery + accounting).
 
-`diagnose` reasons from **two** evidence streams — dispatch JSONL and `engine-trace.jsonl` (+ rotated segments; SIG-4b / SIG-5 / SIG-5c / SIG-G read only the latter). Both are reported the same way. There is no flag that suppresses any of it.
+Scope is the **dispatch** stream. `diagnose` also reads `engine-trace.jsonl` (+ rotated segments; SIG-4b / SIG-5 / SIG-5c / SIG-G read only the latter), which is deliberately not covered: the same corpus survey that found 25 damaged lines in one rotated `current.jsonl` segment measured the engine-trace segments as well — 6 files, 102,066 records, **zero** blank lines, **zero** concatenated records, **zero** torn records. There is nothing there to recover or account for, so no parallel accounting path exists for it. There is no flag that suppresses any of the below.
 
 #### Exit status
 
-| Code | Meaning                                                                                                                                                                                       |
-| ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `0`  | Report produced; every line of every evidence stream read cleanly.                                                                                                                            |
-| `1`  | The command itself failed. No usable report.                                                                                                                                                  |
-| `3`  | **Report produced but incomplete** — records were genuinely lost (not merely concatenated and recovered), or the engine-trace scan failed. The output is usable; it just may not be complete. |
+| Code | Meaning                                                                                                                                                      |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`  | Report produced; every line of the dispatch stream read cleanly.                                                                                             |
+| `1`  | The command itself failed. No usable report.                                                                                                                 |
+| `3`  | **Report produced but incomplete** — records were genuinely lost (not merely concatenated and recovered). The output is usable; it just may not be complete. |
 
-Exit `3` is a claim about **this report**, not about the id you asked for. It latches on any file the command read, which includes the fleet-wide `current.jsonl` (the SIG-2 recurrence scan) and the trace segments — so it can fire for damage unrelated to `<id>`. A script that wants "is `<id>`'s own timeline complete" must read `timelines.<id>.complete` from `--json`, which uses per-execution attribution (a mirror's damage is that execution's; flat-stream damage counts only when that timeline was reconstructed from the flat stream). The same attribution decides whether a finding gets the `UNRELIABLE:` prefix.
+Exit `3` is a claim about **this report**, not about the id you asked for. It latches on any file the command read, which includes the fleet-wide `current.jsonl` (the SIG-2 recurrence scan) — so it can fire for damage unrelated to `<id>`. A script that wants "is `<id>`'s own timeline complete" must read `timelines.<id>.complete` from `--json`, which uses per-execution attribution (a mirror's damage is that execution's; flat-stream damage counts only when that timeline was reconstructed from the flat stream). The same attribution decides whether a finding gets the `UNRELIABLE:` prefix.
 
 #### Human output
 
-- An integrity **banner** printed _above_ the timeline (so damage is read before any conclusion it undermines). Names the unreadable line counts per stream, and, when the trace scan failed, spells out that the trace-only signatures did not run at all.
+- An integrity **banner** printed _above_ the timeline (so damage is read before any conclusion it undermines). Names the unreadable line count, how much was recovered, and how many lines lost records.
 - An in-timeline `!! UNREADABLE …` **marker** at the position the unreadable bytes actually occupied.
 - `UNRELIABLE: …` prefixed to any finding whose conclusion rests on an **absence** when damage could be hiding the missing event.
 - `signatures: no matches` and "no dispatch events" are **never printed bare** over a damaged stream — each gets an explicit caveat, because "there is nothing here" and "I could not read what is here" otherwise look identical.
@@ -138,7 +138,7 @@ Exit `3` is a claim about **this report**, not about the id you asked for. It la
 
 #### `--json`
 
-- Top-level `stream_integrity`: `intact`, `dispatch_stream_intact`, `unreadable_lines`, `recovered_records`, `lines_with_lost_records`, `exit_code`, `lines[]`, `absence_findings_qualified`, plus a sibling `trace_integrity` block (`intact`, `scan_failed`, `scan_error`, `unreadable_lines`, `recovered_records`, `lines_with_lost_records`, `evidence_degraded`, `lines[]`). The trace is a sibling rather than pooled into `lines[]` so a caller can tell "the timeline has holes" from "the trace signatures never ran".
+- Top-level `stream_integrity`: `intact`, `unreadable_lines`, `recovered_records`, `lines_with_lost_records`, `exit_code`, `lines[]`, `absence_findings_qualified`.
 - Per timeline: `timelines.<exec_id>.complete` (bool) and `.unreadable_records[]`, so an automated caller reading one timeline out of the map cannot consume it without the reason it may be incomplete.
 - Findings whose absence conclusion was qualified carry `details.absence_unreliable: true`.
 

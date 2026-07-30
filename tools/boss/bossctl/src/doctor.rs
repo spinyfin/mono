@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader::{self, DamagedLine, is_terminal_event};
 use serde::Serialize;
@@ -1460,54 +1460,22 @@ pub fn load_scope_events(root: &Path, scope: &DiagnoseScope) -> Result<ScopeEven
     Ok(loaded)
 }
 
-/// True when a value recovered by resyncing into a damaged engine-trace line is
-/// plausibly a trace record rather than a nested payload the resync stumbled on.
+/// Parse engine-trace live + rotated segments, returning JSON objects that
+/// touch the scope. Tolerates torn lines (skips unparseable).
 ///
-/// Same reasoning as the dispatch-side gate (see
-/// `boss_dispatch_reader::integrity`): recovery must not invent evidence. Trace
-/// records are uniformly `{timestamp, level, target, fields}`, so requiring the
-/// two fields the emitter always writes is a cheap, strong filter — and trace
-/// `fields` payloads routinely embed sub-objects that would otherwise parse.
-fn trace_record_is_plausible(value: &Value) -> bool {
-    value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .is_some_and(|ts| !ts.is_empty())
-        && value.get("level").and_then(Value::as_str).is_some()
-}
-
-/// Engine-trace records for a diagnose scope, plus the integrity of the scan
-/// that produced them.
-///
-/// The integrity is a field, not a warning: the scan reads the *second* evidence
-/// source `dispatch diagnose` reasons from, and several signatures (SIG-4b,
-/// SIG-5, SIG-5c, SIG-G) exist only here. A caller that could take `records`
-/// without also taking "…and some of it was unreadable" is a caller that can
-/// print `signatures: no matches` over evidence it dropped.
-#[derive(Debug, Default)]
-pub struct TraceScan {
-    pub records: Vec<Value>,
-    pub integrity: crate::stream_integrity::TraceIntegrity,
-}
-
-/// Parse engine-trace live + rotated segments, returning JSON objects that touch
-/// the scope together with an accounting of everything that would not parse.
-///
-/// Torn lines are salvaged the same way dispatch lines are (whole records
-/// concatenated by an interleaved write are the dominant shape in both files, and
-/// they are fully recoverable), and whatever cannot be recovered is reported as a
-/// [`DamagedLine`]. A read failure that stops the scan is captured in
-/// `integrity.scan_error` rather than returned as an `Err` — returning it invited
-/// exactly the bug this replaces, a caller that logged the error to stderr and
-/// carried on with an empty evidence set.
+/// Unlike the dispatch stream, this one is read as-is: the same survey that
+/// found 25 damaged lines in a single rotated `current.jsonl` segment found no
+/// damage at all across the engine-trace segments (6 files, 102,066 records —
+/// zero blank lines, zero concatenated records, zero torn records), so there is
+/// nothing here to salvage or account for.
 pub fn load_scope_trace_records(
     root: &Path,
     scope_execution_ids: &BTreeSet<String>,
     scope_work_item_ids: &BTreeSet<String>,
-) -> TraceScan {
+) -> Result<Vec<Value>> {
     let base = root.join(boss_log_files::ENGINE_TRACE_FILENAME);
     let paths = boss_log_files::segments_with_live(&base);
-    let mut scan = TraceScan::default();
+    let mut out = Vec::new();
     for path in paths {
         if !path.is_file() {
             continue;
@@ -1516,52 +1484,23 @@ pub fn load_scope_trace_records(
             Ok(t) => t,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
-                scan.integrity.scan_error = Some(format!("reading {}: {err}", path.display()));
-                return scan;
+                return Err(err).with_context(|| format!("reading {}", path.display()));
             }
         };
-        for (idx, line) in text.lines().enumerate() {
+        for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<Value>(line) {
-                Ok(value) => {
-                    if record_in_scope(&value, scope_execution_ids, scope_work_item_ids) {
-                        scan.records.push(value);
-                    }
-                }
-                Err(_) => {
-                    let salvage: dispatch_reader::Salvage<Value> =
-                        dispatch_reader::salvage_records_with(line, trace_record_is_plausible);
-                    for value in &salvage.records {
-                        if record_in_scope(value, scope_execution_ids, scope_work_item_ids) {
-                            scan.records.push(value.clone());
-                        }
-                    }
-                    // Unbracketed in time on purpose: trace timestamps are
-                    // RFC3339 strings and this binary has no clock library to
-                    // convert them to the epoch milliseconds a bracket is
-                    // expressed in. `None` on both sides is the documented
-                    // conservative reading ("treat as overlapping everything"),
-                    // which is why trace damage qualifies trace-derived findings
-                    // wholesale instead of by window.
-                    scan.integrity.damage.push(
-                        DamagedLine::builder()
-                            .path(path.clone())
-                            .line_number(idx as u64 + 1)
-                            .byte_len(line.len())
-                            .recovered(salvage.records.len())
-                            .lost_bytes(salvage.lost_bytes)
-                            .lost_excerpt(salvage.lost_excerpt.clone())
-                            .shape(salvage.shape())
-                            .build(),
-                    );
-                }
+            let Ok(value) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if record_in_scope(&value, scope_execution_ids, scope_work_item_ids) {
+                out.push(value);
             }
         }
     }
-    scan
+    Ok(out)
 }
 
 /// Mark every absence-based finding whose evidence could be hiding the event it
@@ -1582,24 +1521,17 @@ pub fn load_scope_trace_records(
 ///   caveat readers learn to skip.
 /// - A finding with no execution id, or about an execution outside the load, has
 ///   no narrower window available, so it falls back to the pooled view.
-/// - A finding derived from **engine-trace** (`trace_derived_sig_ids`) is
-///   qualified whenever trace evidence is degraded at all. Trace damage cannot be
-///   time-windowed (see `stream_integrity::TraceIntegrity`), and a trace-only
-///   signature is precisely a claim about what the trace does or does not
-///   contain.
 ///
-/// The window for the dispatch test is `[first event of this finding's execution,
-/// now]` — the span over which the missing event could have occurred.
+/// The window is `[first event of this finding's execution, now]` — the span
+/// over which the missing event could have occurred.
 pub fn qualify_absence_findings(
     findings: &mut [Finding],
     events: &[DispatchEvent],
     loaded: &ScopeEvents,
     integrity: &crate::stream_integrity::IntegrityReport,
-    trace_derived_sig_ids: &BTreeSet<String>,
     now_ms: u128,
 ) -> usize {
-    let trace_degraded = integrity.trace().evidence_degraded();
-    if integrity.lost_lines().next().is_none() && !trace_degraded {
+    if integrity.lost_lines().next().is_none() {
         return 0;
     }
     let mut qualified = 0;
@@ -1615,7 +1547,7 @@ pub fn qualify_absence_findings(
                     .min()
             })
             .unwrap_or(0);
-        let dispatch_could_hide = match finding.execution_id.as_deref() {
+        let could_hide = match finding.execution_id.as_deref() {
             Some(exec) if loaded.covers(exec) => loaded
                 .damage_for(exec)
                 .iter()
@@ -1623,16 +1555,12 @@ pub fn qualify_absence_findings(
                 .any(|line| line.overlaps_window(window_start, now_ms)),
             _ => integrity.could_hide_event_in(window_start, now_ms),
         };
-        let trace_could_hide = trace_degraded && trace_derived_sig_ids.contains(&finding.sig_id);
-        if !dispatch_could_hide && !trace_could_hide {
+        if !could_hide {
             continue;
         }
-        let caveat = if dispatch_could_hide {
-            crate::stream_integrity::ABSENCE_CAVEAT
-        } else {
-            crate::stream_integrity::TRACE_ABSENCE_CAVEAT
-        };
-        finding.evidence.push(caveat.to_owned());
+        finding
+            .evidence
+            .push(crate::stream_integrity::ABSENCE_CAVEAT.to_owned());
         if let Some(obj) = finding.details.as_object_mut() {
             obj.insert("absence_unreliable".into(), Value::Bool(true));
         } else {
@@ -1746,12 +1674,7 @@ pub fn run_diagnose(
     let mut all_damage = loaded.all_damage();
     all_damage.extend(fleet_read.damage);
 
-    // Second evidence source. Read before the integrity report is built so its
-    // damage — and a whole-scan failure — is part of the one report every
-    // surface below renders from, rather than a stderr warning that scrolls away
-    // while the report claims to be intact.
-    let trace_scan = load_scope_trace_records(root, &scope_execs, &scope_items);
-    let integrity = crate::stream_integrity::IntegrityReport::new(all_damage).with_trace(trace_scan.integrity.clone());
+    let integrity = crate::stream_integrity::IntegrityReport::new(all_damage);
 
     let mut db_facts = ExecDbFacts::default();
     if let Some(work_db) = db {
@@ -1786,21 +1709,16 @@ pub fn run_diagnose(
 
     let mut findings = match_dispatch_signatures(&events, now_ms, Some(&fleet), Some(&db_facts), &scope_execs);
 
-    let trace_findings = match_trace_signatures(&trace_scan.records, &scope_execs, &scope_items);
-    // Captured before the merge: after `sort_findings` there is no way to tell
-    // which findings came from the trace, and that is exactly what decides
-    // whether degraded trace evidence undermines a given absence conclusion.
-    let trace_derived_sig_ids: BTreeSet<String> = trace_findings.iter().map(|f| f.sig_id.clone()).collect();
-    findings.extend(trace_findings);
+    match load_scope_trace_records(root, &scope_execs, &scope_items) {
+        Ok(records) => {
+            findings.extend(match_trace_signatures(&records, &scope_execs, &scope_items));
+        }
+        Err(err) => {
+            eprintln!("warning: engine-trace scan skipped: {err:#}");
+        }
+    }
     sort_findings(&mut findings);
-    let qualified = qualify_absence_findings(
-        &mut findings,
-        &events,
-        &loaded,
-        &integrity,
-        &trace_derived_sig_ids,
-        now_ms,
-    );
+    let qualified = qualify_absence_findings(&mut findings, &events, &loaded, &integrity, now_ms);
 
     if json {
         let mut timelines = serde_json::Map::new();
@@ -2672,14 +2590,7 @@ mod tests {
 
         let intact = crate::stream_integrity::IntegrityReport::default();
         assert_eq!(
-            qualify_absence_findings(
-                &mut findings,
-                &events,
-                &ScopeEvents::default(),
-                &intact,
-                &BTreeSet::new(),
-                now
-            ),
+            qualify_absence_findings(&mut findings, &events, &ScopeEvents::default(), &intact, now),
             0,
             "an intact stream must leave the finding stated as fact"
         );
@@ -2688,7 +2599,7 @@ mod tests {
         // Damage in THIS execution's own mirror.
         let (loaded, damaged) = damaged_scope(exec_id, "damage-qualify");
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, &BTreeSet::new(), now),
+            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, now),
             1,
             "damage overlapping the window must qualify the conclusion"
         );
@@ -2737,7 +2648,7 @@ mod tests {
         assert!(pooled.lost_lines().next().is_some(), "the pooled view IS damaged");
 
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, &BTreeSet::new(), now),
+            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, now),
             0,
             "damage in a sibling execution's mirror must not qualify this execution's finding"
         );
@@ -2760,7 +2671,7 @@ mod tests {
         let (mut findings, events, now) = sig1_finding(exec_id);
         let pooled = crate::stream_integrity::IntegrityReport::new(from_mirror.all_damage());
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &from_mirror, &pooled, &BTreeSet::new(), now),
+            qualify_absence_findings(&mut findings, &events, &from_mirror, &pooled, now),
             0,
             "the mirror was intact, so a torn fleet-stream line hides nothing from this timeline"
         );
@@ -2774,7 +2685,7 @@ mod tests {
         let (mut findings, events, now) = sig1_finding(exec_id);
         let pooled = crate::stream_integrity::IntegrityReport::new(reconstructed.all_damage());
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &reconstructed, &pooled, &BTreeSet::new(), now),
+            qualify_absence_findings(&mut findings, &events, &reconstructed, &pooled, now),
             1,
             "when the flat stream IS the only record of this timeline, its damage is this timeline's"
         );
@@ -2797,7 +2708,7 @@ mod tests {
         };
         let pooled = crate::stream_integrity::IntegrityReport::new(loaded.all_damage());
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, &BTreeSet::new(), now),
+            qualify_absence_findings(&mut findings, &events, &loaded, &pooled, now),
             1,
             "no narrower window is available, so the conservative reading applies"
         );
@@ -2818,7 +2729,7 @@ mod tests {
 
         let (loaded, damaged) = damaged_scope("exec_presence", "damage-presence");
         assert_eq!(
-            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, &BTreeSet::new(), 1_000),
+            qualify_absence_findings(&mut findings, &events, &loaded, &damaged, 1_000),
             0
         );
         assert!(!findings[0].evidence.iter().any(|e| e.contains("UNRELIABLE")));
@@ -2833,154 +2744,26 @@ mod tests {
         root
     }
 
-    fn trace_line(ts: &str, message: &str) -> String {
+    fn trace_line(ts: &str, message: &str, exec_id: &str) -> String {
         format!(
-            r#"{{"timestamp":"{ts}","level":"INFO","target":"boss_engine::coordinator","fields":{{"message":"{message}","execution_id":"exec_trace"}}}}"#
+            r#"{{"timestamp":"{ts}","level":"INFO","target":"boss_engine::coordinator","fields":{{"message":"{message}","execution_id":"{exec_id}"}}}}"#
         )
     }
 
-    /// The engine-trace scan used to drop a torn line silently, which is how a
-    /// diagnose could print `signatures: no matches` and `intact: true` over
-    /// evidence it never read. Concatenated trace lines must be recovered, and
-    /// anything unrecoverable must show up as damage.
+    /// The trace scan keeps the records that touch the scope, skips the rest,
+    /// and tolerates an unparseable line rather than failing the whole scan.
     #[test]
-    fn a_torn_engine_trace_line_is_recovered_and_reported() {
+    fn the_trace_scan_keeps_in_scope_records_and_skips_unreadable_lines() {
         let contents = format!(
-            "{}\n{}{}\n{{\"timestamp\":\"2026-07-26T00:00:03Z\",\"level\":\"IN\n",
-            trace_line("2026-07-26T00:00:00Z", "one"),
-            trace_line("2026-07-26T00:00:01Z", "two"),
-            trace_line("2026-07-26T00:00:02Z", "three"),
+            "{}\n{}\n{{\"timestamp\":\"2026-07-26T00:00:02Z\",\"level\":\"IN\n",
+            trace_line("2026-07-26T00:00:00Z", "mine", "exec_trace"),
+            trace_line("2026-07-26T00:00:01Z", "someone else's", "exec_other"),
         );
-        let root = trace_root("torn", &contents);
-        let scan = load_scope_trace_records(&root, &scope(&["exec_trace"]), &BTreeSet::new());
+        let root = trace_root("scope", &contents);
+        let records = load_scope_trace_records(&root, &scope(&["exec_trace"]), &BTreeSet::new()).unwrap();
         let _ = std::fs::remove_dir_all(&root);
 
-        assert_eq!(
-            scan.records.len(),
-            3,
-            "the interleaved pair must be recovered, not dropped: {:?}",
-            scan.records.len()
-        );
-        assert_eq!(scan.integrity.damage.len(), 2, "both non-clean lines are reported");
-        assert!(
-            scan.integrity.evidence_degraded(),
-            "the truncated line lost a record, so trace evidence is degraded"
-        );
-        assert!(scan.integrity.scan_error.is_none());
-    }
-
-    /// A clean trace must not manufacture damage.
-    #[test]
-    fn an_intact_engine_trace_reports_intact() {
-        let contents = format!(
-            "{}\n{}\n",
-            trace_line("2026-07-26T00:00:00Z", "one"),
-            trace_line("2026-07-26T00:00:01Z", "two"),
-        );
-        let root = trace_root("intact", &contents);
-        let scan = load_scope_trace_records(&root, &scope(&["exec_trace"]), &BTreeSet::new());
-        let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(scan.records.len(), 2);
-        assert!(scan.integrity.is_intact());
-        assert!(!scan.integrity.evidence_degraded());
-    }
-
-    /// A scan that cannot be completed must land in the report, not on stderr.
-    /// This is the exact failure the old `eprintln!("warning: engine-trace scan
-    /// skipped")` path hid: an entire evidence source gone while the report still
-    /// said `intact`.
-    #[test]
-    fn a_failed_engine_trace_scan_is_reported_not_warned_about() {
-        let root = std::env::temp_dir().join(format!("bossctl-trace-unreadable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        // Bytes that are not valid UTF-8: `read_to_string` fails with something
-        // that is neither NotFound nor per-line recoverable, so the whole scan
-        // stops. This is the class of failure the old stderr warning swallowed.
-        std::fs::write(root.join(boss_log_files::ENGINE_TRACE_FILENAME), [0xffu8, 0xfe, 0xfd]).unwrap();
-        let scan = load_scope_trace_records(&root, &scope(&["exec_trace"]), &BTreeSet::new());
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert!(
-            scan.integrity.scan_error.is_some(),
-            "a scan failure must be a field on the report"
-        );
-        assert!(scan.integrity.evidence_degraded());
-
-        let report = crate::stream_integrity::IntegrityReport::new(Vec::new()).with_trace(scan.integrity);
-        assert!(
-            !report.is_intact(),
-            "a report over a failed trace scan is not an intact report"
-        );
-        assert!(
-            report.dispatch_stream_is_intact(),
-            "the dispatch stream itself was fine — the two must stay distinguishable"
-        );
-        let banner = report.render_banner();
-        assert!(banner.contains("engine-trace scan FAILED"), "{banner}");
-        assert!(
-            banner.contains("SIG-4b"),
-            "the banner must name what did not run: {banner}"
-        );
-        assert_eq!(
-            report.to_json()["exit_code"],
-            serde_json::json!(crate::stream_integrity::EXIT_UNRECOVERED_RECORDS)
-        );
-        assert_eq!(report.to_json()["trace_integrity"]["scan_failed"], Value::Bool(true));
-
-        // And the absence claim `render_findings` would otherwise make bare.
-        let rendered = render_findings(&[], &report);
-        assert!(rendered.contains("no matches"));
-        assert!(
-            rendered.contains(crate::stream_integrity::NO_MATCHES_CAVEAT),
-            "\"no matches\" over a trace that was never read must be qualified: {rendered}"
-        );
-    }
-
-    /// Trace damage qualifies the findings derived FROM the trace, and leaves a
-    /// dispatch-derived finding about an intact timeline alone.
-    #[test]
-    fn degraded_trace_evidence_qualifies_only_trace_derived_findings() {
-        let exec_id = "exec_trace_qual";
-        let (mut findings, events, now) = sig1_finding(exec_id);
-        findings.push(Finding {
-            sig_id: "SIG-4b".into(),
-            absence_based: true,
-            severity: Severity::P2,
-            title: "Hook after terminal".into(),
-            execution_id: Some(exec_id.to_owned()),
-            work_item_id: None,
-            count: 1,
-            evidence: vec!["target=x".to_owned()],
-            recovery: "…".into(),
-            details: Value::Null,
-        });
-
-        let loaded = ScopeEvents {
-            covered: scope(&[exec_id]),
-            ..ScopeEvents::default()
-        };
-        let trace = crate::stream_integrity::TraceIntegrity {
-            damage: vec![lost_line("/state/engine-trace.jsonl", 12)],
-            scan_error: None,
-        };
-        let report = crate::stream_integrity::IntegrityReport::new(Vec::new()).with_trace(trace);
-
-        let qualified = qualify_absence_findings(&mut findings, &events, &loaded, &report, &scope(&["SIG-4b"]), now);
-        assert_eq!(qualified, 1, "only the trace-derived finding is qualified");
-        let sig1 = findings.iter().find(|f| f.sig_id == "SIG-1").unwrap();
-        let sig4b = findings.iter().find(|f| f.sig_id == "SIG-4b").unwrap();
-        assert!(
-            !sig1.evidence.iter().any(|e| e.contains("UNRELIABLE")),
-            "a dispatch-derived finding over an intact mirror stays stated as fact"
-        );
-        assert!(
-            sig4b
-                .evidence
-                .iter()
-                .any(|e| e == crate::stream_integrity::TRACE_ABSENCE_CAVEAT),
-            "{:?}",
-            sig4b.evidence
-        );
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert_eq!(records[0]["fields"]["execution_id"], Value::String("exec_trace".into()));
     }
 }

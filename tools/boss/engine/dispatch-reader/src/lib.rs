@@ -58,7 +58,7 @@ use serde::Serialize;
 use boss_dispatch_events::{DispatchEvent, DispatchEventSink, Outcome as DispatchOutcome, Stage};
 
 pub use index::{RefreshStats, SharedTimelineIndex, TimelineIndex};
-pub use integrity::{DamageShape, DamagedLine, Salvage, StreamRead, salvage_records_with};
+pub use integrity::{DamageShape, DamagedLine, StreamRead};
 pub use timeline::{StageThresholds, StalledStage, TimelineState, is_terminal_event};
 
 /// Default Boss state root used by the file-scan readers when the

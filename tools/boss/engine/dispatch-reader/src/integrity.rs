@@ -9,13 +9,12 @@
 //! record's body and its trailing newline as two separate `write()` calls.
 //! `O_APPEND` makes each individual write atomic but not the pair, so two
 //! concurrent appenders *in the same process* produced `bodyA` `bodyB` `\n`
-//! `\n` on disk: ONE line
-//! holding two complete records, followed by a blank line. A JSON parser reads
-//! that as `trailing characters at line 1 column <len(bodyA)+1>` — which is
-//! exactly the error, and exactly the column distribution (clustered at
-//! whole-record lengths, never mid-token), observed in production. Both
-//! records are fully present; dropping the line discarded recoverable events.
-//! [`salvage_damaged_line`] recovers them.
+//! `\n` on disk: ONE line holding two complete records, followed by a blank
+//! line. A JSON parser reads that as `trailing characters at line 1 column
+//! <len(bodyA)+1>` — which is exactly the error, and exactly the column
+//! distribution (clustered at whole-record lengths, never mid-token), observed
+//! in production. Both records are fully present; dropping the line discarded
+//! recoverable events. [`salvage_damaged_line`] recovers them.
 //!
 //! **A warning is not an accounting.** A diagnostic tool whose whole purpose
 //! is to answer "why did nothing happen here" cannot treat "some records in
@@ -35,16 +34,17 @@
 //! stay in `lost_bytes`: a fabricated event in a forensic timeline is worse than
 //! a reported loss, because it reads as real.
 //!
-//! The salvage machinery is generic ([`salvage_records_with`]) so the *other*
-//! evidence stream a diagnose reads — engine-trace JSONL, whose records are open
-//! JSON objects — gets the same recovery and the same accounting instead of
-//! silently skipping its torn lines.
+//! **Scope is this stream.** `bossctl dispatch diagnose` also reads
+//! `engine-trace.jsonl`, which is not salvaged or accounted for here. The same
+//! survey that found the damage above measured the engine-trace segments too —
+//! 6 files, 102,066 records, zero blank lines, zero concatenated records, zero
+//! torn records — so there is nothing in that stream to recover, and a parallel
+//! accounting path for it would be machinery with no evidence behind it.
 
 use std::path::{Path, PathBuf};
 
 use boss_dispatch_events::{DispatchEvent, Outcome, Stage};
 use serde::Serialize;
-use serde::de::DeserializeOwned;
 
 /// Longest excerpt of unrecoverable bytes carried on a [`DamagedLine`].
 /// Enough to recognise the shape of what was lost without reproducing a whole
@@ -202,30 +202,14 @@ impl StreamRead {
 }
 
 /// Recovered records and unrecoverable remainder from one damaged line.
-///
-/// Generic over the record type so the same resync-and-account machinery serves
-/// both evidence streams a diagnose reads: dispatch JSONL (`DispatchEvent`) and
-/// engine-trace JSONL (open `serde_json::Value` objects). Sharing it is what
-/// keeps the two streams' integrity reporting honest in the same way — a torn
-/// engine-trace line is as much a hole in the evidence as a torn dispatch line.
-#[derive(Debug, Clone)]
-pub struct Salvage<T = DispatchEvent> {
-    pub records: Vec<T>,
+#[derive(Debug, Clone, Default)]
+pub struct Salvage {
+    pub records: Vec<DispatchEvent>,
     pub lost_bytes: usize,
     pub lost_excerpt: String,
 }
 
-impl<T> Default for Salvage<T> {
-    fn default() -> Self {
-        Self {
-            records: Vec::new(),
-            lost_bytes: 0,
-            lost_excerpt: String::new(),
-        }
-    }
-}
-
-impl<T> Salvage<T> {
+impl Salvage {
     pub fn shape(&self) -> DamageShape {
         match (self.records.len(), self.lost_bytes) {
             (0, _) => DamageShape::Unrecoverable,
@@ -279,19 +263,6 @@ fn dispatch_record_is_plausible(event: &DispatchEvent, prev_ts_epoch_ms: Option<
 /// Pull every dispatch record salvageable from `line`, which is known not to
 /// parse as exactly one record.
 ///
-/// `prev_ts_epoch_ms` is the timestamp of the last record read before this line
-/// in the same file; it tightens the plausibility gate applied to records
-/// recovered by resync (see [`dispatch_record_is_plausible`]). `None` — damage
-/// at the head of a file — simply skips that one check.
-pub fn salvage_damaged_line(line: &str, prev_ts_epoch_ms: Option<u128>) -> Salvage<DispatchEvent> {
-    salvage_records_with(line, |event: &DispatchEvent| {
-        dispatch_record_is_plausible(event, prev_ts_epoch_ms)
-    })
-}
-
-/// Pull every record salvageable from `line`, which is known not to parse as
-/// exactly one record.
-///
 /// Walks `line` with a streaming deserializer, which handles the dominant
 /// corruption shape (complete records concatenated) in a single pass. On a
 /// parse error it resyncs to the next plausible record start and tries again,
@@ -299,18 +270,19 @@ pub fn salvage_damaged_line(line: &str, prev_ts_epoch_ms: Option<u128>) -> Salva
 /// Every byte not consumed by an *accepted* record is counted in `lost_bytes` —
 /// salvage never quietly improves the accounting for itself.
 ///
-/// `plausible` gates records recovered **after a resync**, and only those. The
-/// distinction is the point: the first streaming pass starts at byte 0 of the
-/// line, which is a genuine record boundary (it is where the writer's `write()`
-/// began), so records it yields need no second-guessing and a forward-compatible
-/// stream is never rejected for the dominant concatenated case. Every later pass
-/// starts at a `{` this code *guessed* at inside damaged bytes, and a guess that
-/// happens to parse is exactly how a phantom record enters a timeline.
-pub fn salvage_records_with<T, F>(line: &str, plausible: F) -> Salvage<T>
-where
-    T: DeserializeOwned,
-    F: Fn(&T) -> bool,
-{
+/// [`dispatch_record_is_plausible`] gates records recovered **after a resync**,
+/// and only those. The distinction is the point: the first streaming pass starts
+/// at byte 0 of the line, which is a genuine record boundary (it is where the
+/// writer's `write()` began), so records it yields need no second-guessing and a
+/// forward-compatible stream is never rejected for the dominant concatenated
+/// case. Every later pass starts at a `{` this code *guessed* at inside damaged
+/// bytes, and a guess that happens to parse is exactly how a phantom record
+/// enters a timeline.
+///
+/// `prev_ts_epoch_ms` is the timestamp of the last record read before this line
+/// in the same file; it tightens that gate. `None` — damage at the head of a
+/// file — simply skips that one check.
+pub fn salvage_damaged_line(line: &str, prev_ts_epoch_ms: Option<u128>) -> Salvage {
     let mut records = Vec::new();
     let mut lost: Vec<&str> = Vec::new();
     let mut cursor = 0usize;
@@ -321,7 +293,7 @@ where
         }
         let after_resync = attempt > 0;
         let rest = &line[cursor..];
-        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<T>();
+        let mut stream = serde_json::Deserializer::from_str(rest).into_iter::<DispatchEvent>();
         // Bytes of `rest` consumed by records that actually parsed. Advanced
         // only on a successful yield, so an error leaves it pointing at the end
         // of the last good record rather than wherever the parser gave up.
@@ -331,7 +303,7 @@ where
             match stream.next() {
                 Some(Ok(record)) => {
                     let end = stream.byte_offset();
-                    if after_resync && !plausible(&record) {
+                    if after_resync && !dispatch_record_is_plausible(&record, prev_ts_epoch_ms) {
                         // Parsed, but not something the writer could have
                         // written here. Account for its bytes rather than
                         // emitting it: a reported loss beats a phantom event.
@@ -670,20 +642,6 @@ mod tests {
             salvage.lost_bytes,
             implausible.len()
         );
-    }
-
-    /// The generic entry point serves engine-trace lines, whose records are open
-    /// `Value` objects rather than `DispatchEvent`s. Same recovery, same
-    /// accounting, caller-supplied plausibility.
-    #[test]
-    fn salvage_records_with_recovers_concatenated_open_json_objects() {
-        let line = "{\"timestamp\":\"2026-07-26T00:00:00Z\",\"level\":\"INFO\",\"fields\":{}}\
-                    {\"timestamp\":\"2026-07-26T00:00:01Z\",\"level\":\"WARN\",\"fields\":{}}";
-        let salvage: Salvage<serde_json::Value> =
-            salvage_records_with(line, |value: &serde_json::Value| value.get("timestamp").is_some());
-        assert_eq!(salvage.records.len(), 2);
-        assert_eq!(salvage.lost_bytes, 0);
-        assert_eq!(salvage.shape(), DamageShape::Concatenated);
     }
 
     #[test]
