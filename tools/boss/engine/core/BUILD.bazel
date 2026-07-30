@@ -72,6 +72,7 @@ rust_library(
         "//tools/boss/engine/event-bus",
         "//tools/boss/engine/feature-flags",
         "//tools/boss/engine/gh-invocation",
+        "//tools/boss/engine/grok-home-retention",
         "//tools/boss/engine/live-status-redact",
         "//tools/boss/engine/metrics",
         "//tools/boss/engine/planner-validation",

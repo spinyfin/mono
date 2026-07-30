@@ -433,6 +433,7 @@ dependencies = [
  "boss-engine-driver",
  "boss-engine-effort",
  "boss-engine-gh-invocation",
+ "boss-engine-grok-home-retention",
  "boss-engine-live-status-redact",
  "boss-engine-planner-validation",
  "boss-engine-proposal-validation",
@@ -608,6 +609,18 @@ dependencies = [
  "anyhow",
  "boss-github",
  "regex",
+]
+
+[[package]]
+name = "boss-engine-grok-home-retention"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bon",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "walkdir",
 ]
 
 [[package]]

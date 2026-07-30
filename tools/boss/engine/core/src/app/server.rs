@@ -1263,6 +1263,17 @@ pub async fn serve_with_merge_probe(
         crate::codex_home_retention_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic grok-home retention sweep: mirrors the Codex-home sweep
+    // immediately above, reclaiming Boss-owned per-run Grok run containers
+    // (`grok-home/` + `process-home/`) past retention policy. Operates
+    // only on paths stored in driver_runtime_state — never scans ~/.grok
+    // or cwd under cube workspaces. Live (non-terminal) executions are
+    // never touched.
+    let _grok_home_retention_sweep_handle = crate::grok_home_retention_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::grok_home_retention_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic execution-retention sweep: prunes terminal `work_executions`
     // rows (abandoned/failed/orphaned/cancelled) past the retention bound,
     // keeping a per-work-item diagnostics floor of recent failures. Bounds

@@ -2139,6 +2139,42 @@ pub mod test_support {
         }
     }
 
+    /// RAII override of [`crate::grok::GROK_HOMES_ROOT_ENV`], obtained from
+    /// [`grok_homes_override`]. Mirrors [`CodexHomesOverride`] /
+    /// [`codex_homes_override`] above — see those docs for the
+    /// lock-and-set-together rationale.
+    pub struct GrokHomesOverride {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    /// Point per-run `GROK_HOME` resolution at `root` for as long as the
+    /// returned guard lives. Mirrors [`codex_homes_override`].
+    pub fn grok_homes_override(root: &Path) -> GrokHomesOverride {
+        let lock = crate::grok::GROK_HOMES_ENV_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let prior = std::env::var_os(crate::grok::GROK_HOMES_ROOT_ENV);
+        // SAFETY: `lock` is held for the lifetime of the returned guard and
+        // is the process-wide gate on this key, so no other thread is
+        // reading or writing it concurrently. The prior value is restored
+        // in `Drop` before the lock is released.
+        unsafe { std::env::set_var(crate::grok::GROK_HOMES_ROOT_ENV, root) };
+        GrokHomesOverride { _lock: lock, prior }
+    }
+
+    impl Drop for GrokHomesOverride {
+        fn drop(&mut self) {
+            // SAFETY: same as in `grok_homes_override` — the lock this guard
+            // owns is still held, and is released only after this body
+            // returns.
+            match self.prior.as_ref() {
+                Some(value) => unsafe { std::env::set_var(crate::grok::GROK_HOMES_ROOT_ENV, value) },
+                None => unsafe { std::env::remove_var(crate::grok::GROK_HOMES_ROOT_ENV) },
+            }
+        }
+    }
+
     /// A minimal [`DriverDescriptor`] to pair with [`StubDriver`]. Its menu
     /// resolves everything to one `"stub-model"` slug, which is enough for
     /// tests that only exercise capability declaration or the seams a stub
