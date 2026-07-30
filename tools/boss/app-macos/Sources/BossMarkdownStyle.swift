@@ -1,17 +1,53 @@
 import SwiftUI
 import Textual
 
+/// Opt-in prose measure clamp, read by `proseMeasureClamped()`. `nil` (the
+/// default) is a no-op, so `bossMarkdown()` on its own — the transcript
+/// viewer, comment sidebar, and release notes all use it bare — renders
+/// prose at its natural width exactly as before this clamp existed. Only
+/// `MarkdownDocumentColumn` sets this, scoped to the document body it wraps,
+/// so widening the *document* column (`MarkdownDocumentMeasure.wide`) for a
+/// table doesn't also widen prose on surfaces that never asked for a wide
+/// column in the first place.
+private struct MarkdownProseMeasureKey: EnvironmentKey {
+    static let defaultValue: CGFloat? = nil
+}
+
+extension EnvironmentValues {
+    var markdownProseMeasure: CGFloat? {
+        get { self[MarkdownProseMeasureKey.self] }
+        set { self[MarkdownProseMeasureKey.self] = newValue }
+    }
+}
+
+/// Applies `proseMeasureClamped()`'s frame math, but only once `measure` is
+/// read from the environment — the modifier itself has no property wrapper
+/// access, so the read has to happen in a view.
+private struct ProseMeasureClamped<Content: View>: View {
+    @Environment(\.markdownProseMeasure) private var measure
+    let content: Content
+
+    var body: some View {
+        if let measure {
+            content
+                .frame(maxWidth: measure, alignment: .leading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        } else {
+            content
+        }
+    }
+}
+
 extension View {
-    /// Clamps prose content to the readable measure, left-aligned. A plain
-    /// `.frame(maxWidth:)` sizes to the child's *ideal* width, so a short
-    /// block (e.g. a list item) centered inside a wider document column
-    /// would otherwise become a narrow box that no longer lines up with its
-    /// neighbors — `alignment: .leading` on both frames keeps every prose
-    /// block anchored to the same left edge regardless of its own width.
+    /// Clamps prose content to `markdownProseMeasure` (when set), left-
+    /// aligned. A plain `.frame(maxWidth:)` sizes to the child's *ideal*
+    /// width, so a short block (e.g. a list item) centered inside a wider
+    /// document column would otherwise become a narrow box that no longer
+    /// lines up with its neighbors — `alignment: .leading` on both frames
+    /// keeps every prose block anchored to the same left edge regardless of
+    /// its own width.
     fileprivate func proseMeasureClamped() -> some View {
-        self
-            .frame(maxWidth: MarkdownDocumentMeasure.readable, alignment: .leading)
-            .frame(maxWidth: .infinity, alignment: .leading)
+        ProseMeasureClamped(content: self)
     }
 }
 
@@ -51,9 +87,16 @@ extension StructuredText.HeadingStyle where Self == BossHeadingStyle {
 // MARK: - Paragraph
 
 struct BossParagraphStyle: StructuredText.ParagraphStyle {
+    // Inlined from `StructuredText.GitHubParagraphStyle.makeBody` (Textual
+    // 0.3.1) rather than delegated to, since `ParagraphStyle` refines
+    // `DynamicProperty` — constructing that style and calling
+    // `makeBody(configuration:)` on it directly, as the delegation used to,
+    // never installs its dynamic-property storage in the view hierarchy.
+    // Harmless today only because the library style is stateless.
     func makeBody(configuration: Configuration) -> some View {
-        StructuredText.GitHubParagraphStyle()
-            .makeBody(configuration: configuration)
+        configuration.label
+            .textual.lineSpacing(.fontScaled(0.25))
+            .textual.blockSpacing(.init(top: 0, bottom: 16))
             .proseMeasureClamped()
     }
 }
@@ -65,6 +108,15 @@ extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
 // MARK: - List item
 
 struct BossListItemStyle: StructuredText.ListItemStyle {
+    // Delegates to `StructuredText.DefaultListItemStyle` (Textual 0.3.1)
+    // rather than inlining it, unlike the paragraph/thematic-break styles
+    // below — its body reads a private `WithFontScaledValue` helper that
+    // isn't part of the module's public surface. `ListItemStyle` refines
+    // `DynamicProperty`, so constructing the style and calling
+    // `makeBody(configuration:)` on it directly (as here) skips installing
+    // its dynamic-property storage; this is a no-op today only because
+    // `DefaultListItemStyle` is stateless at the pinned revision. Re-check
+    // this delegation on any Textual upgrade.
     func makeBody(configuration: Configuration) -> some View {
         StructuredText.DefaultListItemStyle.default
             .makeBody(configuration: configuration)
@@ -79,9 +131,23 @@ extension StructuredText.ListItemStyle where Self == BossListItemStyle {
 // MARK: - Thematic break
 
 struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        StructuredText.GitHubThematicBreakStyle()
-            .makeBody(configuration: configuration)
+    // Same GitHub-style border color `StructuredText.GitHubThematicBreakStyle`
+    // (Textual 0.3.1) uses, reproduced here rather than referenced —
+    // `DynamicColor.gitHubBorder` is `internal` to the Textual module.
+    private static let border = DynamicColor(
+        light: Color(red: 228 / 255, green: 228 / 255, blue: 232 / 255),
+        dark: Color(red: 66 / 255, green: 68 / 255, blue: 78 / 255)
+    )
+
+    // Inlined from `StructuredText.GitHubThematicBreakStyle.makeBody`
+    // rather than delegated to — see `BossParagraphStyle` for why
+    // constructing the library style and calling `makeBody(configuration:)`
+    // on it directly bypasses `DynamicProperty` installation.
+    func makeBody(configuration _: Configuration) -> some View {
+        Divider()
+            .textual.frame(height: .fontScaled(0.25))
+            .overlay(Self.border)
+            .textual.blockSpacing(.init(top: 24, bottom: 24))
             .proseMeasureClamped()
     }
 }
@@ -148,8 +214,14 @@ struct BossTableStyle: StructuredText.TableStyle {
     // third shade.
     private static let stripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
     // Hard cap on top of the document's own width, for tables wide enough to
-    // still overflow it — mirrors Textual's own `OverflowTableStyle` default.
-    private static let relativeWidth: CGFloat = 1.5
+    // still overflow it. Anything above 1.0 guarantees a table with even one
+    // prose-length column resolves at or near the cap — which is by
+    // definition wider than the scroll container — so its rightmost column
+    // is permanently clipped rather than reachable by resizing the window;
+    // 1.0 keeps the cap at "grow to fill the column, no further" and lets
+    // `Overflow` scrolling be the safety valve only once the table's own
+    // minimum content width exceeds the column.
+    private static let relativeWidth: CGFloat = 1.0
 
     func makeBody(configuration: Configuration) -> some View {
         // `Overflow` is Textual's sanctioned horizontal-scroll container: a
