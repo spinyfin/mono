@@ -1098,8 +1098,16 @@ pub async fn serve_with_merge_probe(
     // "O'Brien": twelve `request_recorded` → `worker_claimed=skipped` cycles
     // while a stray husk pane held a slot the pool believed free). Runs every
     // 60s.
+    // The DB goes in alongside the app source so the sweep can weigh each
+    // husk candidate against the engine's own execution row — a record the
+    // husk classification never reads and the 2026-07-26 `SessionEnd` burst
+    // could not corrupt. That is what lets a genuine mass-orphan event
+    // (every row already `orphaned`) reclaim its slots while the
+    // mass-retirement breaker stays tight for candidates the DB still
+    // considers live.
     let _husk_pane_sweep_handle = crate::husk_pane_sweep::spawn_loop(
         Arc::clone(&server_state) as Arc<dyn crate::husk_pane_sweep::HuskPaneSweepSource>,
+        server_state.work_db.clone(),
         server_state.dispatch_events.clone(),
         crate::husk_pane_sweep::DEFAULT_INTERVAL,
     );
