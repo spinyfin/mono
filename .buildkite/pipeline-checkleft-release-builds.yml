@@ -2,12 +2,17 @@
 # when a release is actually being cut. Never used as a standalone pipeline.
 #
 # Uploaded via `buildkite-agent pipeline upload` inside phase_prepare() in
-# .buildkite/steps/checkleft-release.sh after the tag and GitHub Release are
-# created. On a no-release run (scheduled build, nothing changed) prepare exits
-# without uploading this fragment, so these steps never appear in the build.
+# .buildkite/steps/checkleft-release.sh after the tag and (draft) GitHub
+# Release are created. On a no-release run (scheduled build, nothing changed)
+# prepare exits without uploading this fragment, so these steps never appear
+# in the build.
 #
-# No `depends_on` is needed here: these steps are injected by prepare itself
-# and will only be scheduled after prepare exits successfully.
+# The release created by prepare is a DRAFT. linux/musl/darwin need no
+# `depends_on` here beyond being injected by prepare itself (they only run
+# after prepare exits successfully) and run in parallel. `publish` DOES need
+# `depends_on` on all three: it verifies every uploaded asset and flips the
+# release to published, and must not run until every build phase has had its
+# chance to upload (or fail).
 
 steps:
   - label: ":rust: checkleft-release (linux)"
@@ -34,5 +39,18 @@ steps:
     agents:
       queue: bazel-any
       os: darwin
+    retry:
+      automatic: false
+
+  - label: ":white_check_mark: checkleft-release (publish)"
+    key: "checkleft-release-publish"
+    command: ".buildkite/steps/checkleft-release.sh publish"
+    depends_on:
+      - "checkleft-release-linux"
+      - "checkleft-release-musl"
+      - "checkleft-release-darwin"
+    agents:
+      queue: bazel-any
+      os: linux
     retry:
       automatic: false

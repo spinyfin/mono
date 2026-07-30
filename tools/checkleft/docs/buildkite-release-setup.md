@@ -95,9 +95,9 @@ No release token or secret is needed. The release pushes the tag with `git push 
 
 No branch-protection bypass is involved either: the release only pushes a **tag** (which protected branches permit) and never a commit to `main`.
 
-### 7. (If musl is wanted) ensure the Linux agents have musl tooling
+### 7. Ensure the Linux agents have musl tooling
 
-The static `x86_64-unknown-linux-musl` asset is **best-effort**: the script builds it with `cargo` and skips it (with a warning, not a failure) if the toolchain is missing. To enable it, the Linux agents need `rustup target add x86_64-unknown-linux-musl` to succeed and a musl C toolchain (`musl-tools` / `musl-gcc`) on `PATH` for the tree-sitter C deps. If you do not need a static binary, you can leave this unprovisioned.
+The static `x86_64-unknown-linux-musl` asset is built hermetically via Bazel (`//tools/checkleft:checkleft_musl`) by its own `musl` build phase, and it is **release-blocking**: it is a `REQUIRED_ASSETS` entry, so a failed musl build fails the whole release and leaves it as an unpublished draft rather than shipping without it. The Bazel hermetic toolchain means no host-side musl provisioning is required beyond what Bazel already fetches.
 
 ---
 
@@ -117,8 +117,8 @@ Because `BUILDKITE_SOURCE` is `api`/`ui`, change-detection is skipped and a rele
 ## Verifying the setup
 
 1. Trigger a manual build (above) and open the build URL.
-2. The **prepare** step should compute the next version, push the tag, and create the GitHub Release.
-3. The **linux** and **darwin** steps then run in parallel, each building its binaries and uploading them to that release.
+2. The **prepare** step should compute the next version, push the tag, and create the GitHub Release as a **draft** (not yet visible to normal `gh release view` / `gh release list` consumers as a published release).
+3. The **linux**, **musl**, and **darwin** steps then run in parallel, each building its binaries and uploading them to that draft release. The **publish** step runs last (`depends_on` all three): it re-downloads and re-verifies every required asset's checksum, then flips the release from draft to published.
 4. Confirm the release and its assets:
 
 ```sh
@@ -127,26 +127,41 @@ gh release view checkleft-v0.1.0-alpha.9 --repo spinyfin/mono
 
 Expected assets (named by Rust target triple, each with a `.sha256` sidecar):
 
-- `checkleft-x86_64-unknown-linux-gnu`
-- `checkleft-x86_64-unknown-linux-musl` (if musl tooling is present)
-- `checkleft-aarch64-apple-darwin`
-- `checkleft-x86_64-apple-darwin`
+- `checkleft-x86_64-unknown-linux-gnu` — **required**
+- `checkleft-x86_64-unknown-linux-musl` — **required**
+- `checkleft-aarch64-apple-darwin` — **required**
+- `checkleft-x86_64-apple-darwin` — **optional**: verified if present, but does not block publish if the darwin x86_64 cross-build fails (see `phase_darwin`'s warning-only fallback)
+
+A missing or checksum-mismatched **required** asset fails the `publish` step and leaves the release as an unpublished draft; the required/optional split is declared explicitly as `REQUIRED_ASSETS`/`OPTIONAL_ASSETS` in `checkleft-release.sh`.
 
 ---
 
 ## Recovering from a partial release
 
-`prepare` creates the tag and the GitHub Release before any build runs, then the `linux` and `darwin` build steps attach their assets in parallel. If a build step fails, the release exists but is missing that platform's assets. To recover:
+`prepare` creates the tag and the GitHub Release as a **draft** before any build runs, then the `linux`, `musl`, and `darwin` build steps attach their assets in parallel, and `publish` verifies + publishes at the end. If a build step fails, or `publish` finds a missing/mismatched asset, the release is left as a draft — never published — with whatever assets did upload still attached. To recover:
 
-- **Re-run the failed build job** (`bk job retry <job-id>`) — it reads the tag from build meta-data and re-uploads, so it picks up where it left off.
+- **Re-run the failed build job** (`bk job retry <job-id>`) — it reads the tag from build meta-data and re-uploads (assets use `--clobber`), so it picks up where it left off. Re-run `publish` afterwards (or it re-runs automatically as part of a full pipeline retry) to verify and publish.
 - **Or upload manually** from an agent of the right OS, checked out at the tag:
 
   ```sh
   CHECKLEFT_RELEASE_TAG=checkleft-v0.1.0-alpha.9 \
-    .buildkite/steps/checkleft-release.sh darwin   # or: linux
+    .buildkite/steps/checkleft-release.sh darwin   # or: linux / musl
   ```
 
-A brand-new build will **not** redo a missing upload: the idempotency guard sees `HEAD` already at the release commit and no-ops. Use the job retry or the manual override above. (If `prepare` itself fails before the Release is created, its cleanup trap deletes any tag it pushed, so a fresh run starts clean.)
+- **Or re-trigger the whole pipeline manually** (`bk build create` / BK UI **New Build**) on the same commit. Because the trigger is manual (`BUILDKITE_SOURCE` is `ui`/`api`), `prepare`'s resume-existing-draft check re-adopts the existing draft/tag instead of computing a new version, and re-uploads the build fragment (skipping the upload if the fragment is already present in this build, e.g. a retried `prepare` job) — so the leftover draft is not orphaned and the fan-out build phases attach the remaining assets. A **scheduled (cron)** trigger will refuse to auto-resume a stranded draft — see "Abandoning a draft release" below — to avoid silently retrying a stuck release forever.
+
+(If `prepare` itself fails before the Release is created, its cleanup trap deletes any tag it pushed, so a fresh run starts clean.)
+
+## Abandoning a draft release
+
+If a draft release is stuck (e.g. a persistent agent-pool problem keeps failing the same build/publish phase) and you do not want to keep resuming it, delete the draft and its tag so the next run — scheduled or manual — computes a fresh version instead of finding the stranded draft:
+
+```sh
+gh release delete checkleft-v0.1.0-alpha.9 --repo spinyfin/mono --yes
+git push origin :refs/tags/checkleft-v0.1.0-alpha.9
+```
+
+A scheduled build that finds a draft for the current `HEAD` refuses to resume it on its own (see above) and names this exact recovery in its failure message, so a cron tick never gets stuck retrying indefinitely. To force a scheduled build to resume a draft instead of abandoning it, set `CHECKLEFT_RESUME_DRAFT=1` on that build.
 
 ---
 
@@ -154,7 +169,7 @@ A brand-new build will **not** redo a missing upload: the idempotency guard sees
 
 - **Version:** only the `-alpha.N` counter is revved (the base `X.Y.Z` is carried through). The next N is `max(Cargo.toml alpha, highest published checkleft-v* alpha) + 1`, so a stale Cargo.toml can never reuse a published alpha — which is exactly why the bump never has to be committed back to `main`. The new version is patched into `tools/checkleft/Cargo.toml` + `Cargo.lock` in the release checkout (never committed) and the release **commit** (`BUILDKITE_COMMIT`) is tagged `checkleft-vX.Y.Z-alpha.N`. `main`'s `Cargo.toml` stays at whatever version it last held, so developer builds carry a non-meaningful version — intentional and harmless (see Build tool).
 - **Build tool:** native binaries are built with `bazel build -c opt //tools/checkleft:checkleft` (matches how mono builds checkleft and reuses the CI disk cache); the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`, since those triples are not registered in mono's bazel toolchains. checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string — the patched-in version is for tree-consistency, not the artifact bytes; all phases build at `BUILDKITE_COMMIT`.
-- **Structure:** a `prepare` step (skip-logic + version + tag + GitHub Release) fans out to the `linux` and `darwin` build steps, which depend only on `prepare` and run in **parallel** on separate agents — wall-clock is `prepare + max(linux, darwin)` rather than the sum. The `concurrency_group` lives on `prepare` so two release runs can't create tags at once.
+- **Structure:** a `prepare` step (skip-logic + version + tag + GitHub Release, created as a **draft**) fans out to the `linux`, `musl`, and `darwin` build steps, which depend only on `prepare` and run in **parallel** on separate agents. A `publish` step depends on all three build steps, verifies every required asset's checksum, and flips the release from draft to published — wall-clock is `prepare + max(linux, musl, darwin) + publish`. The `concurrency_group` lives on `prepare` so two release runs can't create tags at once.
 - **Loop prevention:** no commit is pushed to `main` (only a tag), so there is no self-trigger; push-triggered builds are disabled; and the idempotency guard no-ops any run whose `HEAD` is already the latest release commit.
 
 ---

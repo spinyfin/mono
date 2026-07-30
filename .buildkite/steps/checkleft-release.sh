@@ -7,17 +7,30 @@
 # as assets on a GitHub Release.
 #
 # Unlike boss (a single macOS .app produced on one agent), checkleft needs
-# binaries for both Linux and macOS, so the work is split into three phases:
+# binaries for both Linux and macOS, so the work is split into phases:
 #
 #   prepare — the orchestrator. Runs the skip-logic, computes the alpha version,
-#             tags the release commit, and creates the GitHub Release. Hands the
-#             tag to the build phases via buildkite-agent meta-data.
+#             tags the release commit, and creates the GitHub Release as a
+#             DRAFT. Hands the tag to the build phases via buildkite-agent
+#             meta-data. If the newest checkleft-v* release is already a draft
+#             for this exact commit (an interrupted prior run), resumes that
+#             tag/draft instead of computing a new version — see the
+#             resume-existing-draft block in phase_prepare.
 #   linux   — builds the Linux binaries and uploads them to the release.
+#   musl    — builds the static musl binary (Bazel-hermetic, release-blocking)
+#             and uploads it to the release.
 #   darwin  — builds the macOS binaries and uploads them to the release.
+#   publish — verifies every REQUIRED_ASSETS entry (plus any present
+#             OPTIONAL_ASSETS entry) is on the release and checksum-correct,
+#             then flips the release from draft to published. This is the
+#             ONLY step that publishes — the release is never public with a
+#             missing or unverified asset. A verification failure leaves the
+#             draft (and its assets) in place for inspection and fails the
+#             build.
 #
-# The linux and darwin build phases both depend only on `prepare`, so they run
-# in PARALLEL on separate agents; wall-clock is prepare + max(linux, darwin)
-# rather than the sum.
+# The linux, musl, and darwin build phases all depend only on `prepare`, so
+# they run in PARALLEL on separate agents; `publish` depends on all three, so
+# wall-clock is prepare + max(linux, musl, darwin) + publish.
 #
 # The version bump is NEVER committed to main. It is patched into each build
 # phase's checkout (so the release builds embed the new version) and recorded in
@@ -48,6 +61,24 @@ CARGO_LOCK="Cargo.lock"
 BIN_TARGET="//tools/checkleft:checkleft"
 ASSET_PREFIX="checkleft"
 META_TAG_KEY="checkleft-release-tag"
+
+# Expected asset set — declared explicitly so the publish phase verifies against
+# a known-complete list rather than "whatever happened to upload". Each entry
+# gets an accompanying "<name>.sha256" sidecar (see stage_asset).
+#
+# REQUIRED_ASSETS must ALL be present and checksum-verified before the release
+# is published; a missing or mismatched required asset fails the release and
+# leaves it as a draft. OPTIONAL_ASSETS are checksum-verified if present but do
+# not block publish if absent — this mirrors the existing darwin x86_64
+# fallback (build_cross_cargo failure there only warns, see phase_darwin).
+REQUIRED_ASSETS=(
+  "${ASSET_PREFIX}-x86_64-unknown-linux-gnu"
+  "${ASSET_PREFIX}-x86_64-unknown-linux-musl"
+  "${ASSET_PREFIX}-aarch64-apple-darwin"
+)
+OPTIONAL_ASSETS=(
+  "${ASSET_PREFIX}-x86_64-apple-darwin"
+)
 
 # Mutable state read by the EXIT trap. Globals (not function-locals) so the trap
 # can reference them under `set -u` after the phase function has returned.
@@ -212,19 +243,42 @@ is_manual() {
   [[ "${BUILDKITE_SOURCE:-}" == "ui" || "${BUILDKITE_SOURCE:-}" == "api" ]]
 }
 
-# resolve_last_release — sets LAST_TAG and LAST_SHA for the newest checkleft-v* release.
-resolve_last_release() {
-  log "[checkleft-release] resolving last ${TAG_PREFIX}* release"
-  LAST_TAG="$(gh release list --repo "${REPO}" --limit 300 --json tagName \
-    --jq "[.[] | select(.tagName | startswith(\"${TAG_PREFIX}\"))] | .[0].tagName" 2>/dev/null || true)"
-  LAST_SHA=""
-  if [[ -n "${LAST_TAG}" ]]; then
-    git fetch origin "refs/tags/${LAST_TAG}:refs/tags/${LAST_TAG}" 2>/dev/null || true
-    LAST_SHA="$(git rev-list -n 1 "${LAST_TAG}" 2>/dev/null || true)"
-    if [[ -z "${LAST_SHA}" ]]; then
-      LAST_SHA="$(gh api "repos/${REPO}/commits/${LAST_TAG}" --jq '.sha' 2>/dev/null || true)"
+# _resolve_tag_sha TAG — echoes the commit sha a tag points at (empty if TAG is
+# empty or unresolvable). Fetches the tag ref first so a warm agent workspace
+# sees it even if it predates the workspace's last full fetch.
+_resolve_tag_sha() {
+  local tag="$1" sha=""
+  if [[ -n "${tag}" ]]; then
+    git fetch origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null || true
+    sha="$(git rev-list -n 1 "${tag}" 2>/dev/null || true)"
+    if [[ -z "${sha}" ]]; then
+      sha="$(gh api "repos/${REPO}/commits/${tag}" --jq '.sha' 2>/dev/null || true)"
     fi
   fi
+  echo "${sha}"
+}
+
+# resolve_last_release — sets LAST_TAG/LAST_SHA (newest PUBLISHED checkleft-v*
+# release only) and LAST_DRAFT_TAG/LAST_DRAFT_SHA (newest DRAFT checkleft-v*
+# release only), kept strictly separate because their consumers want different
+# things: should_skip()'s idempotency guard and the changelog `--from` range
+# must never land on a draft — a release that was never published is not "the
+# last release" for either change-detection or changelog purposes, and doing
+# so would silently drop the commits/changes between a stranded draft and the
+# next real release. Only phase_prepare's resume check wants the draft.
+resolve_last_release() {
+  log "[checkleft-release] resolving last ${TAG_PREFIX}* release"
+  local releases_json
+  releases_json="$(gh release list --repo "${REPO}" --limit 300 --json tagName,isDraft \
+    --jq "[.[] | select(.tagName | startswith(\"${TAG_PREFIX}\"))]" 2>/dev/null || true)"
+  releases_json="${releases_json:-[]}"
+  [[ "${releases_json}" == "null" ]] && releases_json="[]"
+
+  LAST_TAG="$(jq -r '[.[] | select(.isDraft == false)][0].tagName // empty' <<<"${releases_json}")"
+  LAST_DRAFT_TAG="$(jq -r '[.[] | select(.isDraft == true)][0].tagName // empty' <<<"${releases_json}")"
+
+  LAST_SHA="$(_resolve_tag_sha "${LAST_TAG}")"
+  LAST_DRAFT_SHA="$(_resolve_tag_sha "${LAST_DRAFT_TAG}")"
 }
 
 # should_skip — echoes a skip reason and returns 0 when this run is a no-op.
@@ -305,6 +359,52 @@ phase_prepare() {
     || die "git fetch --tags failed; aborting release to avoid computing a stale next version"
   resolve_last_release
 
+  # Resume-existing-draft check: if the newest checkleft-v* release is for THIS
+  # commit and is still a draft, a prior run got interrupted before publishing
+  # (e.g. the pipeline was re-triggered on the same commit after a build or
+  # publish phase failed). should_skip()'s idempotency guard would otherwise
+  # treat "HEAD == last release commit" as "nothing to do" — which is correct
+  # for an already PUBLISHED release, but wrong here: a draft means the
+  # release never finished, so silently skipping would strand it forever.
+  # Resume it deterministically by re-adopting the existing tag/version rather
+  # than computing a new one (which would orphan the draft and its uploaded
+  # assets). Chosen over failing the build because the fan-out build phases
+  # are already idempotent (asset upload uses --clobber; publish re-verifies),
+  # so resuming is safe and avoids manual tag cleanup for a routine retry.
+  #
+  # Only auto-resume on a manual trigger (or an explicit override): a cron
+  # tick that resumes an unpublishable draft would otherwise re-fan-out and
+  # fail every time it runs, forever, burning three release builds per tick
+  # with no bound. A scheduled run that sees a stranded draft stops instead
+  # and points at how to recover it — see "Abandoning a draft release" in
+  # tools/checkleft/docs/buildkite-release-setup.md.
+  local head_sha
+  head_sha="$(git rev-parse HEAD 2>/dev/null || echo "${BUILDKITE_COMMIT:-}")"
+  if [[ -n "${LAST_DRAFT_SHA}" && "${head_sha}" == "${LAST_DRAFT_SHA}" ]]; then
+    if ! is_manual && [[ "${CHECKLEFT_RESUME_DRAFT:-}" != "1" ]]; then
+      die "release ${LAST_DRAFT_TAG} exists as an unpublished draft for this commit (${head_sha:0:12}), and this is a scheduled trigger — refusing to auto-resume it forever on every cron tick. To resume it, either re-trigger this pipeline manually (ui/api), or set CHECKLEFT_RESUME_DRAFT=1 on a scheduled build. To abandon it instead, delete the draft and its tag (see 'Abandoning a draft release' in tools/checkleft/docs/buildkite-release-setup.md): gh release delete ${LAST_DRAFT_TAG} --repo ${REPO} --yes && git push origin :refs/tags/${LAST_DRAFT_TAG}"
+    fi
+    NEW_TAG="${LAST_DRAFT_TAG}"
+    NEW_VERSION="${NEW_TAG#"${TAG_PREFIX}"}"
+    log "[checkleft-release] resuming existing draft release ${NEW_TAG} for ${head_sha:0:12} — skipping tag/release creation"
+    meta_set "${META_TAG_KEY}" "${NEW_TAG}"
+    if command -v buildkite-agent &>/dev/null; then
+      # The build fragment may already be uploaded in THIS build (e.g. the
+      # prepare job itself was retried after uploading it the first time
+      # around) — Buildkite step keys are unique per build, so re-uploading
+      # would fail on a duplicate-key collision. Only upload if the publish
+      # step (the last one in the fragment) isn't already present.
+      if buildkite-agent step get id --step "checkleft-release-publish" &>/dev/null; then
+        log "[checkleft-release] build phases already present in this build — not re-uploading"
+      else
+        log "[checkleft-release] uploading build phases for ${NEW_TAG}"
+        buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release-builds.yml
+      fi
+    fi
+    log "[checkleft-release] prepare done — resumed draft ${NEW_TAG}; build phases will attach remaining assets"
+    return 0
+  fi
+
   local skip_reason
   skip_reason="$(should_skip)" || true
   if [[ -n "${skip_reason}" ]]; then
@@ -365,24 +465,34 @@ phase_prepare() {
     printf 'Initial checkleft release.\n' > "${NOTES_FILE}"
   fi
 
-  log "[checkleft-release] creating GitHub Release ${NEW_TAG}"
-  gh release create "${NEW_TAG}" --repo "${REPO}" \
+  # Created as a DRAFT: a published release must mean "every expected asset is
+  # present and verified" (see phase_publish). Publishing up front, before any
+  # binary exists, would advertise a resolvable-but-unfetchable version to
+  # rules_multitool consumers for the whole build window. The draft is
+  # published only by phase_publish, after all build phases have uploaded and
+  # every REQUIRED_ASSETS entry has been checksum-verified.
+  log "[checkleft-release] creating GitHub Release ${NEW_TAG} (draft)"
+  gh release create "${NEW_TAG}" --repo "${REPO}" --draft \
     --title "checkleft ${NEW_VERSION}" \
     --notes-file "${NOTES_FILE}"
 
   # Hand the tag to the parallel build phases.
   meta_set "${META_TAG_KEY}" "${NEW_TAG}"
-  TAG_PUSHED=0  # release created; stop guarding the tag
+  TAG_PUSHED=0  # release created; stop guarding the tag. A build/publish
+                # failure from here on intentionally leaves the tag + draft in
+                # place (recoverable by retrying a phase, or inspectable as a
+                # failed draft) rather than deleting them.
 
-  # Fan out the build phases. The linux/musl/darwin steps live in a separate
-  # fragment file and are only injected into the running build now that we know
-  # a release is being cut. On a no-release run this block is never reached, so
-  # those steps never appear in the build and no bazel builds are wasted.
+  # Fan out the build phases. The linux/musl/darwin/publish steps live in a
+  # separate fragment file and are only injected into the running build now
+  # that we know a release is being cut. On a no-release run this block is
+  # never reached, so those steps never appear in the build and no bazel
+  # builds are wasted.
   if command -v buildkite-agent &>/dev/null; then
     log "[checkleft-release] uploading build phases for ${NEW_TAG}"
     buildkite-agent pipeline upload .buildkite/pipeline-checkleft-release-builds.yml
   fi
-  log "[checkleft-release] prepare done — ${NEW_TAG} created; build phases will attach assets"
+  log "[checkleft-release] prepare done — ${NEW_TAG} created as a draft; build phases will attach assets, then publish will verify and publish"
 }
 
 # resolve_release_tag — set NEW_TAG/NEW_VERSION from the tag prepare published to
@@ -439,9 +549,9 @@ phase_musl() {
   STAGE="$(mktemp -d)"
 
   local musl_target="//tools/checkleft:checkleft_musl"
-  # The --define must be forwarded to both the build and the cquery so their
-  # configuration hashes match; without it the Make-variable $(CHECKLEFT_VERSION)
-  # falls back to the .bazelrc default of "0.0.0-dev" (T1329/T1328 seam).
+  # The --define must reach both the build and the cquery invocation — their
+  # configuration hashes must match, or the Make-variable $(CHECKLEFT_VERSION)
+  # silently falls back to the .bazelrc default of "0.0.0-dev".
   local version_define="--define=CHECKLEFT_VERSION=${NEW_VERSION}"
   log "[checkleft-release] bazel build -c opt ${version_define} ${musl_target}"
   bazel build -c opt "${version_define}" "${musl_target}"
@@ -501,6 +611,77 @@ phase_darwin() {
   log "[checkleft-release] darwin phase done — macOS assets attached to ${NEW_TAG}"
 }
 
+# verify_asset NAME — download NAME + its .sha256 sidecar from the release into
+# STAGE and confirm the downloaded binary's checksum matches the sidecar. This
+# verifies what actually landed on GitHub, not just what a build phase staged
+# locally — the whole point is to catch a truncated/corrupted upload before
+# publish, not to re-trust the build phase's own local computation.
+verify_asset() {
+  local name="$1"
+  log "[checkleft-release] verifying ${name}"
+  gh release download "${NEW_TAG}" --repo "${REPO}" --dir "${STAGE}" --clobber \
+    --pattern "${name}" --pattern "${name}.sha256" \
+    || die "failed to download ${name} (or its .sha256 sidecar) from ${NEW_TAG} for verification — leaving release as a draft for inspection"
+  [[ -f "${STAGE}/${name}" && -f "${STAGE}/${name}.sha256" ]] \
+    || die "${name} or its .sha256 sidecar did not download from ${NEW_TAG} — leaving release as a draft for inspection"
+
+  local expected actual
+  expected="$(awk '{print $1}' "${STAGE}/${name}.sha256")"
+  actual="$(_sha256 "${STAGE}/${name}")"
+  [[ -n "${expected}" && "${expected}" == "${actual}" ]] \
+    || die "checksum mismatch for ${name} on ${NEW_TAG}: sidecar says ${expected:-<empty>}, downloaded binary hashes to ${actual} — the asset is corrupt or truncated; leaving release as a draft for inspection"
+}
+
+# phase_publish — verify every REQUIRED_ASSETS entry (and any present
+# OPTIONAL_ASSETS entry) is on the release and checksum-correct, then flip the
+# draft to published. This is the ONLY place that publishes: a missing or
+# mismatched required asset dies here, which (via the EXIT trap) leaves the
+# draft and its assets in place for inspection rather than publishing a
+# partial release. Runs after linux/musl/darwin via `depends_on` in the build
+# fragment, so it observes the final state of all uploads.
+phase_publish() {
+  echo "[checkleft-release] agent: $(uname -a)"
+  resolve_release_tag
+
+  log "[checkleft-release] fetching asset list for ${NEW_TAG}"
+  local remote_assets
+  remote_assets="$(gh release view "${NEW_TAG}" --repo "${REPO}" --json assets --jq '.assets[].name')" \
+    || die "could not list assets for ${NEW_TAG} — leaving release as a draft"
+
+  local name missing=()
+  for name in "${REQUIRED_ASSETS[@]}"; do
+    grep -qFx "${name}" <<<"${remote_assets}" || missing+=("${name}")
+    grep -qFx "${name}.sha256" <<<"${remote_assets}" || missing+=("${name}.sha256")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    die "release ${NEW_TAG} is missing required assets: ${missing[*]} — leaving release as a draft for inspection (this is expected if a build phase failed or hasn't run yet)"
+  fi
+
+  STAGE="$(mktemp -d)"
+
+  local to_verify=("${REQUIRED_ASSETS[@]}")
+  for name in "${OPTIONAL_ASSETS[@]}"; do
+    if grep -qFx "${name}" <<<"${remote_assets}"; then
+      if grep -qFx "${name}.sha256" <<<"${remote_assets}"; then
+        to_verify+=("${name}")
+      else
+        die "optional asset ${name} is present on ${NEW_TAG} without its .sha256 sidecar — leaving release as a draft for inspection"
+      fi
+    else
+      log "[checkleft-release] optional asset ${name} not present — skipping (not release-blocking)"
+    fi
+  done
+
+  for name in "${to_verify[@]}"; do
+    verify_asset "${name}"
+  done
+
+  log "[checkleft-release] all required assets present and checksum-verified for ${NEW_TAG} — publishing"
+  gh release edit "${NEW_TAG}" --repo "${REPO}" --draft=false \
+    || die "verification passed but publishing ${NEW_TAG} failed — release remains a draft; retry the publish phase"
+  log "[checkleft-release] published ${NEW_TAG}"
+}
+
 # ── entrypoint ────────────────────────────────────────────────────────────────
 
 main() {
@@ -511,7 +692,8 @@ main() {
     linux)   phase_linux ;;
     musl)    phase_musl ;;
     darwin)  phase_darwin ;;
-    *) die "usage: $0 <prepare|linux|musl|darwin>" ;;
+    publish) phase_publish ;;
+    *) die "usage: $0 <prepare|linux|musl|darwin|publish>" ;;
   esac
 }
 
