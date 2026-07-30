@@ -252,7 +252,9 @@ impl CodexProgressSession {
                         }
                     }
                     StdoutEnvelope::CommandStarted { id, command } => {
-                        self.open_commands.insert(id.to_owned(), command.to_owned());
+                        if let Some(id) = id {
+                            self.open_commands.insert(id.to_owned(), command.to_owned());
+                        }
                         vec![WorkerEvent::PreToolUse {
                             session_id,
                             tool_name: "Bash".to_owned(),
@@ -266,7 +268,9 @@ impl CodexProgressSession {
                         exit_code,
                         status,
                     } => {
-                        self.open_commands.remove(id);
+                        if let Some(id) = id {
+                            self.open_commands.remove(id);
+                        }
                         let mut events = vec![WorkerEvent::PostToolUse {
                             session_id: session_id.clone(),
                             tool_name: "Bash".to_owned(),
@@ -405,9 +409,15 @@ impl CodexRolloutProgressSession {
     /// every rollout tool call that started (`function_call` /
     /// `custom_tool_call`) but never received its matching output into a
     /// [`WorkerEvent::Notification`] carrying
-    /// [`super::UNOBSERVED_COMMAND_MARKER`], oldest-first. Called immediately
-    /// before a `Stop` is emitted so a later, unrelated turn never re-flags
-    /// the same call.
+    /// [`super::UNOBSERVED_COMMAND_MARKER`], oldest-first. Scoped to
+    /// exec/shell-shaped calls only — those whose `tool_input` carries a
+    /// `command` field, matching what [`rollout_call_command_display`]
+    /// prefers and mirroring the stdout dialect, which only tracks
+    /// `command_execution`. A pending non-shell call (`apply_patch`, file
+    /// reads, MCP tools) is dropped from tracking without a notification;
+    /// it never gates `NO_CHANGES_NEEDED`. Called immediately before a
+    /// `Stop` is emitted so a later, unrelated turn never re-flags the same
+    /// call.
     fn drain_abandoned_command_notifications(&mut self, session_id: &str) -> Vec<WorkerEvent> {
         if self.calls.is_empty() {
             return Vec::new();
@@ -416,6 +426,7 @@ impl CodexRolloutProgressSession {
         let events = ordered_ids
             .into_iter()
             .filter_map(|call_id| self.calls.remove(&call_id))
+            .filter(|call| call.tool_input.get("command").and_then(Value::as_str).is_some())
             .map(|call| WorkerEvent::Notification {
                 session_id: session_id.to_owned(),
                 message: super::unobserved_command_notification(&rollout_call_command_display(&call)),
@@ -674,11 +685,11 @@ enum StdoutEnvelope<'a> {
         message: &'a str,
     },
     CommandStarted {
-        id: &'a str,
+        id: Option<&'a str>,
         command: &'a str,
     },
     CommandCompleted {
-        id: &'a str,
+        id: Option<&'a str>,
         command: &'a str,
         output: &'a str,
         exit_code: Option<i64>,
@@ -736,10 +747,7 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                 .ok_or(NormalizeError::MissingField("item.type"))?;
             match (envelope_type, item_type) {
                 ("item.started", "command_execution") => {
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or(NormalizeError::MissingField("item.id"))?;
+                    let id = item.get("id").and_then(Value::as_str);
                     let command = item
                         .get("command")
                         .and_then(Value::as_str)
@@ -747,10 +755,7 @@ fn parse_stdout_envelope(obj: &Map<String, Value>) -> Result<StdoutEnvelope<'_>,
                     Ok(StdoutEnvelope::CommandStarted { id, command })
                 }
                 ("item.completed", "command_execution") => {
-                    let id = item
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .ok_or(NormalizeError::MissingField("item.id"))?;
+                    let id = item.get("id").and_then(Value::as_str);
                     let command = item
                         .get("command")
                         .and_then(Value::as_str)
@@ -1301,6 +1306,56 @@ mod tests {
             events,
             vec![WorkerEvent::Stop {
                 session_id: "thread-clean".into(),
+                stop_hook_active: false,
+                stop_reason: StopReason::Completed,
+            }]
+        );
+    }
+
+    #[test]
+    fn stdout_command_execution_with_no_item_id_still_emits_tool_events() {
+        let mut session = session();
+        session
+            .normalize_stdout(&json!({"type":"thread.started","thread_id":"thread-no-id"}))
+            .unwrap();
+        session.normalize_stdout(&json!({"type":"turn.started"})).unwrap();
+        assert_eq!(
+            session
+                .normalize_stdout(&json!({
+                    "type":"item.started",
+                    "item":{"type":"command_execution","command":"echo hi"}
+                }))
+                .unwrap(),
+            WorkerEvent::PreToolUse {
+                session_id: "thread-no-id".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command":"echo hi"}),
+            }
+        );
+        assert_eq!(
+            session
+                .normalize_stdout(&json!({
+                    "type":"item.completed",
+                    "item":{"type":"command_execution","command":"echo hi","aggregated_output":"hi\n"}
+                }))
+                .unwrap(),
+            WorkerEvent::PostToolUse {
+                session_id: "thread-no-id".into(),
+                tool_name: "Bash".into(),
+                tool_input: json!({"command":"echo hi"}),
+                tool_response: json!("hi\n"),
+            }
+        );
+
+        // No `id` means nothing was ever tracked in `open_commands`, so the
+        // turn boundary must not flag an abandoned command.
+        let events = session
+            .normalize_stdout_events(&json!({"type":"turn.completed","usage":{}}))
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![WorkerEvent::Stop {
+                session_id: "thread-no-id".into(),
                 stop_hook_active: false,
                 stop_reason: StopReason::Completed,
             }]
@@ -2021,6 +2076,53 @@ mod tests {
                 },
                 WorkerEvent::Stop {
                     session_id: "thread-abort".into(),
+                    stop_hook_active: false,
+                    stop_reason: StopReason::Interrupted,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rollout_pending_non_shell_call_is_not_flagged_abandoned() {
+        let mut session = CodexRolloutProgressSession::new(None, None, None);
+        session
+            .normalize_progress_events(&json!({
+                "type":"session_meta",
+                "payload":{"id":"thread-patch","cwd":"/tmp/workspace"}
+            }))
+            .unwrap();
+        session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call",
+                    "name":"apply_patch",
+                    "call_id":"call-patch",
+                    "input":{"patch":"*** Begin Patch\n*** End Patch"}
+                }
+            }))
+            .unwrap();
+
+        // No matching call output ever arrives for call-patch, but it is not
+        // exec/shell-shaped (no `command` field on its tool_input), so the
+        // turn boundary must not flag it as an unobserved command.
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"event_msg",
+                "payload":{"type":"turn_aborted","reason":"interrupted"}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                WorkerEvent::Notification {
+                    session_id: "thread-patch".into(),
+                    message: "turn aborted: interrupted".into(),
+                },
+                WorkerEvent::Stop {
+                    session_id: "thread-patch".into(),
                     stop_hook_active: false,
                     stop_reason: StopReason::Interrupted,
                 },
