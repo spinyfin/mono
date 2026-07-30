@@ -10,12 +10,11 @@
 //!   `<boss-state-root>/ipc/engine-ipc-YYYY-MM-DD.jsonl`
 //!
 //! (App side: `ipc/ipc-YYYY-MM-DD.jsonl`, written by the Swift `IpcLog`.)
-//! The two files were originally a single shared file with both processes
-//! appending the same schema to it; that made every exchange appear
-//! twice (each side logs both directions) with no field to tell the
-//! writers apart, so the two are kept as independent per-writer
-//! transcripts instead — see the file split rationale in this module's
-//! git history.
+//! Each process writes its own file: both sides log both directions, so a
+//! single shared file would record every exchange twice with no field
+//! distinguishing the writers. Keep them separate — a record present on
+//! one side and absent from the other is the drop/timeout signature this
+//! exists to make visible.
 //!
 //! Each line is a JSON object:
 //!   `ts_epoch_ms`  – milliseconds since Unix epoch
@@ -27,13 +26,18 @@
 //! # Correlation
 //!
 //! `request_id` is minted by [`crate::app::AppSessionHandle::allocate_request_id`]
-//! as `<session_id>-eng-req-<n>` and echoed back verbatim by the app, so it
-//! is the join key with `ipc-*.jsonl`: `(request_id, direction, kind)`
-//! identifies one exchange leg on either side. The `<session_id>` prefix
-//! (unique per app registration) is load-bearing — the per-handle counter
-//! alone restarts at 1 on every app reconnect, so without it `request_id`
-//! would recur within a single day's file and a join could not tell which
-//! app-side record answers which engine-side one.
+//! as `<session_id>-eng-req-<n>`, where `session_id` is itself
+//! `session-<boot_id>-<n>` (see [`crate::app::ServerState::allocate_session_id`]),
+//! and echoed back verbatim by the app, so it is the join key with
+//! `ipc-*.jsonl`: `(request_id, direction, kind)` identifies one exchange
+//! leg on either side. The `<boot_id>` component (a millisecond epoch
+//! timestamp captured once at engine construction) is load-bearing — the
+//! per-handle request counter restarts at 1 on every app reconnect, and
+//! the per-boot session counter it's nested in also restarts at 1 on
+//! every engine restart, so neither alone keeps `request_id` unique
+//! across a restart; without `boot_id` it would recur within a single
+//! day's file and a join could not tell which app-side record answers
+//! which engine-side one.
 //!
 //! Built on the generic day-rotated writer in [`boss_engine_day_rotated_log`],
 //! shared with `crate::population_timing`.
@@ -285,12 +289,12 @@ mod tests {
             slot_id: 3,
             kill_grace_seconds: 5,
         });
-        logger.log_request("eng-req-42", &req);
+        logger.log_request("session-1-eng-req-42", &req);
 
         let resp = EngineToAppResponse::ReleaseWorkerPane {
             result: Ok(ReleaseWorkerPaneResult {}),
         };
-        logger.log_response("eng-req-42", &resp);
+        logger.log_response("session-1-eng-req-42", &resp);
 
         // Let the background task flush.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -304,6 +308,12 @@ mod tests {
         files.sort();
         assert_eq!(files.len(), 1, "one daily log file");
 
+        let name = files[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert!(
+            name.starts_with("engine-ipc-") && name.ends_with(".jsonl"),
+            "engine writes its own prefix, not the app's: {name}"
+        );
+
         let content = std::fs::read_to_string(&files[0]).unwrap();
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -311,12 +321,12 @@ mod tests {
         let req_entry: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(req_entry["direction"], "engine→app");
         assert_eq!(req_entry["kind"], "release_worker_pane");
-        assert_eq!(req_entry["request_id"], "eng-req-42");
+        assert_eq!(req_entry["request_id"], "session-1-eng-req-42");
         assert!(req_entry["ts_epoch_ms"].is_number());
 
         let resp_entry: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
         assert_eq!(resp_entry["direction"], "app→engine");
         assert_eq!(resp_entry["kind"], "release_worker_pane");
-        assert_eq!(resp_entry["request_id"], "eng-req-42");
+        assert_eq!(resp_entry["request_id"], "session-1-eng-req-42");
     }
 }

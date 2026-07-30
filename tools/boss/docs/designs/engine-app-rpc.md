@@ -142,12 +142,12 @@ Wire shape:
 
 ```
 engine → app: FrontendEvent::EngineRequest {
-                  request_id: "eng-req-7",
+                  request_id: "session-1717000000000-1-eng-req-7",
                   request: EngineToAppRequest::SpawnWorkerPane(...)
               }
 
 app → engine: FrontendRequest::EngineResponse {
-                  request_id: "eng-req-7",
+                  request_id: "session-1717000000000-1-eng-req-7",
                   response: EngineToAppResponse::SpawnWorkerPane(Ok(...))
               }
 ```

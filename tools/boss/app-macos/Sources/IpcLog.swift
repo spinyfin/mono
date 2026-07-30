@@ -11,10 +11,11 @@ import Foundation
 ///   `~/Library/Application Support/Boss/ipc/ipc-YYYY-MM-DD.jsonl`
 ///
 /// (Engine side: `ipc/engine-ipc-YYYY-MM-DD.jsonl`, written by the Rust
-/// `ipc_log` module.) The two used to be one shared file; since both
-/// processes log both directions, that made every exchange appear twice
-/// with no field distinguishing the writers, so each side now keeps its
-/// own file.
+/// `ipc_log` module.) Each process writes its own file: both sides log
+/// both directions, so a single shared file would record every exchange
+/// twice with no field distinguishing the writers. Keep them separate —
+/// a record present on one side and absent from the other is the
+/// drop/timeout signature this exists to make visible.
 ///
 /// Each line is a JSON object:
 ///   `ts_epoch_ms`  – milliseconds since Unix epoch
@@ -24,9 +25,13 @@ import Foundation
 ///   `body`         – the full request or response payload
 ///
 /// Correlation: `request_id` is minted by the engine as
-/// `<session_id>-eng-req-<n>` and echoed back verbatim here, so it is the
-/// join key with `engine-ipc-*.jsonl`: `(request_id, direction, kind)`
-/// identifies one exchange leg on either side.
+/// `<session_id>-eng-req-<n>`, where `session_id` is itself
+/// `session-<boot_id>-<n>` (a millisecond epoch timestamp captured once at
+/// engine construction, so it survives an engine restart even though both
+/// counters nested inside it restart at 1), and echoed back verbatim
+/// here, so it is the join key with `engine-ipc-*.jsonl`:
+/// `(request_id, direction, kind)` identifies one exchange leg on either
+/// side.
 final class IpcLog: @unchecked Sendable {
     static let shared: IpcLog = {
         let appSupport = FileManager.default
