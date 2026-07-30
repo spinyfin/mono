@@ -701,7 +701,7 @@ The pane-viability spike (PR #2392) then established that the engine cannot read
 
 **What this means, stated plainly: "Boss must use `codex exec`" does not imply "the pane must display raw JSON."** Those two were conflated in practice, and by the time of this revision the conflation has been fixed in code, not just diagnosed here.
 
-**Rejected (keeping `--json`) — and resolved.** `mono#2532`, "Codex panes: drop vestigial `--json` from the pane spawn line," has merged to `main` (`b692473a414d181a91325962d346a5acb44da037`). The spawn line no longer carries `--json` (`engine/driver/src/codex.rs:774`, now `codex exec --color always --strict-config --skip-git-repo-check --sandbox workspace-write`), `--color always` keeps the transcript colorized under a pane pty where Codex's own tty auto-detection is unreliable, and `--json` is now forbidden outright in the spawn-line contract test (`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`, `engine/core/src/conformance/fixtures.rs:191`). This branch predates that merge and has not been rebased onto it, so this workspace's own `codex.rs:735` still shows `--json` on the spawn line; the citations above are to `main` as of this writing, not to this branch's parent commit. `--json` was never required for progress tracking once ingress moved to `AgentJsonlFile` — this section's conclusion and the landed fix agree.
+**Rejected (keeping `--json`) — and resolved.** `mono#2532`, "Codex panes: drop vestigial `--json` from the pane spawn line," has merged to `main` (`b692473a414d181a91325962d346a5acb44da037`). The spawn line no longer carries `--json` (`engine/driver/src/codex.rs:774`, now `codex exec --color always --strict-config --skip-git-repo-check --sandbox workspace-write`), `--color always` keeps the transcript colorized under a pane pty where Codex's own tty auto-detection is unreliable, and `--json` is now forbidden outright in the spawn-line contract test (`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`, `engine/core/src/conformance/fixtures.rs:258`). `--json` was never required for progress tracking once ingress moved to `AgentJsonlFile` — this section's conclusion and the landed fix agree.
 
 ---
 
@@ -711,25 +711,26 @@ Drive **`codex exec` as the worker CLI, without `--json`** (positional prompt, `
 
 **The earlier phrasing — "pane-embedded worker with stdout JSONL as the progress transport" — is not implementable as written for the engine under the current app/engine split.** Empirically (pane-viability spike):
 
-- **Engine-spawned** `codex exec --json` (engine owns stdout pipe/pty master): stdout JSONL + PR #2363's reader **worked**, but this topology is not the one Boss runs — Codex is pane-hosted, per the next bullet — and the operator has decided not to pursue it. The stdout-JSONL dialect parser (`CodexProgressSession`, `StdoutEnvelope`, `parse_stdout_envelope`) this topology fed has been removed as unreachable dead code rather than kept "just in case"; if the engine-spawned topology is ever pursued, its progress reader should be designed against that day's requirements, not resurrected from this removal. `ProgressIngress::StdoutJsonl` itself is retained as a registration-time admission check — `DriverRegistry::default()` panics if a built-in driver ever declares it — rather than deleted outright, since the shared generic JSONL reader crate (`boss-engine-stdout-progress`) still legitimately exercises that ingress kind against synthetic test drivers.
+- **Engine-spawned** `codex exec --json` (engine owns stdout pipe/pty master): stdout JSONL + PR #2363's reader **worked** as a topology, but this topology is not the one Boss runs — Codex is pane-hosted, per the next bullet — and `--json` is forbidden outright on the spawn line Boss actually issues ([Chosen approach](#chosen-approach)). The stdout-JSONL dialect parser (`CodexProgressSession`, `StdoutEnvelope`, `parse_stdout_envelope`) this topology fed has been removed as unreachable dead code rather than kept "just in case"; if the engine-spawned topology is ever pursued, its progress reader should be designed against that day's requirements, not resurrected from this removal. `ProgressIngress::StdoutJsonl` itself is retained as a registration-time admission check — `DriverRegistry::default()` panics if a built-in driver ever declares it — rather than deleted outright, since the shared generic JSONL reader crate (`boss-engine-stdout-progress`) still legitimately exercises that ingress kind against synthetic test drivers; it remains reachable code but is not wired into any path the driver currently selects.
 - **Pane-hosted** worker (app owns GhosttyKit/pty; engine receives `shell_pid` only): the engine **cannot** attach to that stdout. The selected transport is the engine-side, run-correlated rollout-file tail (`ProgressIngress::AgentJsonlFile`), not rendered scrollback, PTY reads, or new app IPC.
 
 What remains decided for v1: non-interactive `codex exec` **without `--json`** is the **agent CLI shape**; pane progress normalisation targets the distinct rollout dialect (`session_meta` / `event_msg` / `response_item`) read off the tailed rollout file, and does not pretend rollout is stdout; hooks carry guardrails; structured output uses the file contract above.
 
 ### Execution shape
 
-The production spawn line (`CodexDriver::spawn_invocation`, `engine/driver/src/codex.rs:860-861`, read at `main@19473a98`):
+The production spawn line (`build_codex_exec_command`, `engine/driver/src/codex.rs:835-878`, called from `CodexDriver::spawn_invocation` at `codex.rs:1292`, read at `main@19473a98`):
 
 ```
 CODEX_HOME=<run-dir>/codex-home \
   codex exec --color always --strict-config --skip-git-repo-check \
     --sandbox workspace-write \
-    -C <workspace> \
     -m <model> \
     -c model_reasoning_effort=<resolved-per-model> \
     "$(cat AGENTS-initial-prompt.txt)" \
     < /dev/null
 ```
+
+There is no `-C <workspace>` on this line — Codex inherits its working directory from the pane process, which the app already launches with `workingDirectory` set to the workspace (`TerminalPaneSession`, `app-macos/Sources/Ghostty/TerminalPaneSession.swift:77-94`), not from a flag the driver passes.
 
 No `--json` and no `-o/--output-last-message`: progress reaches the engine by tailing the rollout file Codex writes unconditionally under `CODEX_HOME` (`ProgressIngress::AgentJsonlFile`, `engine/driver/src/codex.rs:1501-1516`), and structured results reach it through the `BOSS_STRUCTURED_OUTPUT` environment-file contract (`CodexDriver::structured_output_wiring`, `engine/driver/src/codex.rs:1732-1741`). `--json` is forbidden outright on this spawn line by the conformance contract (`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`, `engine/core/src/conformance/fixtures.rs:258`); `--color always` is a pane-rendering flag, not a transport one. See [Alternative 8](#alternative-8-keep---json-on-the-codex-exec-spawn-line-for-progress-transport) for why the doc's original `--json`-based design was superseded.
 
@@ -743,7 +744,7 @@ The argv remains pane-hosted. Progress is additive: the engine tails Codex's ind
 
 ### The five engine seams this needs
 
-1. **A progress reader matched to topology.** Codex is pane-hosted, so `ProgressIngress::AgentJsonlFile` tails one run-correlated rollout and feeds the reader/fan-out with a rollout-dialect session normaliser; PR-URL capture reads `response_item.payload.output`, not stdout `aggregated_output`. The engine-owned-stdout topology and the `ProgressIngress::StdoutJsonl` dialect it would have fed (landed alongside #2363) are not pursued — see [Chosen approach](#chosen-approach) above — and the stdout-dialect parser has been removed.
+1. **A progress reader matched to topology.** For a hypothetical **engine-owned** stdout topology (not the one Boss spawns Codex under today): the landed #2363 JSONL reader + `ProgressIngress::StdoutJsonl`, reachable but unselected by any current path — that topology is not pursued (see [Chosen approach](#chosen-approach) above), and the stdout-dialect parser has been removed. For **pane-hosted** Codex, the topology Boss actually runs: `ProgressIngress::AgentJsonlFile` tails one run-correlated rollout and feeds the same reader/fan-out with a rollout-dialect session normaliser. PR-URL capture reads `response_item.payload.output`, not stdout `aggregated_output`.
 2. **A `TurnBoundary` trait method.** `turn.completed` → `WorkerEvent::Stop` when that event is on the channel the engine actually sees, so `completion/stop.rs` stops being hardwired to a Claude hook.
 3. **Driver-supplied transcript path discovery**, via `thread_id` **glob** under `$CODEX_HOME/sessions` (filename embeds a local timestamp — not a hard-coded path template), plus actually calling `normalize_transcript_entry` on the **rollout** dialect (≠ stdout dialect).
 4. **Codex hook config carrying Boss's existing guard scripts.** Not a new engine seam so much as a driver-supplied one: the guard-script emission at `worker_setup.rs:918,1072` currently writes Claude settings-file grammar, and must become driver-supplied so the same scripts can be wired into `CODEX_HOME`'s `[[hooks.PreToolUse]]` TOML. Gated on [T-01](#t-01-codex-hook-trust-provisioning) for trust provisioning; landed in [T-11](#t-11-codexdriver-spawn-and-workspace-provisioning).
