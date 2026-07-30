@@ -284,6 +284,55 @@ mod tests {
         }
     }
 
+    /// Acceptance for Phase 2 of the Grok rollout (agent-driver design doc
+    /// §"Which work-item kinds are Grok-eligible"): the dispatch gate must
+    /// resolve for `grok` on every document-producing kind — not just
+    /// Design — because `KindRequirements::for_kind` escalates
+    /// `StructuredOutput` + `ToolUseInterception` identically for Design,
+    /// Investigation, and DesignPostmortem, and Grok's declared
+    /// `CapabilitySet` provides both. A second driver missing either
+    /// capability must be refused cleanly for the same three kinds, proving
+    /// the gate is a real check rather than one that happens to pass for
+    /// every driver.
+    #[test]
+    fn grok_dispatch_gate_covers_all_document_producing_kinds() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let resolver = reg.resolver("grok").expect("grok is registered");
+        for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+            resolver
+                .check_dispatch(&kind)
+                .unwrap_or_else(|e| panic!("Grok must clear the {kind:?} dispatch gate: {e}"));
+        }
+
+        // A driver that declares neither StructuredOutput nor
+        // ToolUseInterception — i.e. Grok before the canonicalisation
+        // adapter's honesty gates were satisfied — must be refused for
+        // every document-producing kind, not just Design.
+        let incomplete: Arc<dyn AgentDriver> = Arc::new(StubDriver::new(
+            stub_descriptor(),
+            CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]),
+        ));
+        let reg = DriverRegistry::default().with_driver("incomplete", incomplete);
+        let resolver = reg.resolver("incomplete").expect("incomplete is registered");
+        for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+            let err = resolver
+                .check_dispatch(&kind)
+                .expect_err("a driver missing StructuredOutput/ToolUseInterception must be refused");
+            assert!(
+                err.refused.contains(&Capability::StructuredOutput),
+                "{kind:?} must refuse StructuredOutput when absent: {:?}",
+                err.refused,
+            );
+            assert!(
+                err.refused.contains(&Capability::ToolUseInterception),
+                "{kind:?} must refuse ToolUseInterception when absent: {:?}",
+                err.refused,
+            );
+        }
+    }
+
     #[test]
     fn slugs_enumerates_every_registered_driver() {
         let reg = DriverRegistry::default();

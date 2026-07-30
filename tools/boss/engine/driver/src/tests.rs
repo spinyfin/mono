@@ -52,19 +52,21 @@ fn worker_process_lifetime_defaults_to_persistent() {
 /// the same pair to required-strict, not just `Design`.
 #[test]
 fn required_strict_capabilities_refuse_absent_driver() {
+    // Design, Investigation, and DesignPostmortem are the document-
+    // producing kinds (Phase 2 of the Grok rollout) and share the same
+    // required-strict escalation.
     for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
         let reqs = KindRequirements::for_kind(kind.clone());
         let no_caps = CapabilitySet::new([]);
-
         assert_eq!(
             reqs.resolve_absence_disposition(Capability::StructuredOutput, &no_caps),
             Some(AbsenceDisposition::Refuse),
-            "{kind:?} should refuse absent StructuredOutput",
+            "{kind:?} must refuse absent StructuredOutput",
         );
         assert_eq!(
             reqs.resolve_absence_disposition(Capability::ToolUseInterception, &no_caps),
             Some(AbsenceDisposition::Refuse),
-            "{kind:?} should refuse absent ToolUseInterception",
+            "{kind:?} must refuse absent ToolUseInterception",
         );
     }
 }
@@ -93,6 +95,31 @@ fn provided_capability_resolves_to_none() {
 }
 
 #[test]
+fn document_producing_kinds_share_required_strict_capabilities() {
+    // Design, Investigation, and DesignPostmortem must resolve
+    // identically — they are the three document-producing kinds gated
+    // together for Phase 2 of the Grok rollout.
+    for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+        let reqs = KindRequirements::for_kind(kind.clone());
+        assert!(
+            reqs.is_required_strict(Capability::StructuredOutput),
+            "{kind:?} must require-strict StructuredOutput",
+        );
+        assert!(
+            reqs.is_required_strict(Capability::ToolUseInterception),
+            "{kind:?} must require-strict ToolUseInterception",
+        );
+
+        let all_caps = CapabilitySet::new([Capability::StructuredOutput, Capability::ToolUseInterception]);
+        assert_eq!(
+            reqs.resolve_absence_disposition(Capability::StructuredOutput, &all_caps),
+            None,
+            "{kind:?} must resolve to None when the driver provides the capability",
+        );
+    }
+}
+
+#[test]
 fn absence_override_takes_precedence_over_default() {
     let caps =
         CapabilitySet::new([]).with_absence_override(Capability::ToolUseInterception, AbsenceDisposition::Refuse);
@@ -109,8 +136,13 @@ fn absence_override_takes_precedence_over_default() {
 /// `required_strict_capabilities_refuse_absent_driver` — they DO escalate.
 #[test]
 fn task_kind_has_no_strict_requirements_by_default() {
+    // Design, Investigation, and DesignPostmortem are deliberately
+    // excluded here — they are the document-producing kinds and DO
+    // carry strict requirements (see `required_strict_capabilities_refuse_absent_driver`
+    // and `document_producing_kinds_share_required_strict_capabilities`).
     for kind in [
         TaskKind::Chore,
+        TaskKind::Followup,
         TaskKind::ProjectTask,
         TaskKind::Revision,
         TaskKind::Task,
@@ -285,20 +317,26 @@ fn capability_resolver_returns_ok_plan_when_no_refused_caps() {
 
 #[test]
 fn capability_resolver_refuses_design_task_without_structured_output() {
-    let caps = CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]);
-    let driver = StubDriver::new(stub_descriptor(), caps);
-    let resolver = CapabilityResolver::new(&driver);
-    let err = resolver.check_dispatch(&TaskKind::Design).unwrap_err();
-    assert!(
-        err.refused.contains(&Capability::StructuredOutput),
-        "Design kind must refuse StructuredOutput when absent: {:?}",
-        err.refused,
-    );
-    assert!(
-        err.refused.contains(&Capability::ToolUseInterception),
-        "Design kind must refuse ToolUseInterception when absent: {:?}",
-        err.refused,
-    );
+    // Design, Investigation, and DesignPostmortem must all refuse
+    // cleanly for a driver that declares neither required-strict
+    // capability — proving the refuse path is real for every
+    // document-producing kind, not just Design.
+    for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+        let caps = CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]);
+        let driver = StubDriver::new(stub_descriptor(), caps);
+        let resolver = CapabilityResolver::new(&driver);
+        let err = resolver.check_dispatch(&kind).unwrap_err();
+        assert!(
+            err.refused.contains(&Capability::StructuredOutput),
+            "{kind:?} must refuse StructuredOutput when absent: {:?}",
+            err.refused,
+        );
+        assert!(
+            err.refused.contains(&Capability::ToolUseInterception),
+            "{kind:?} must refuse ToolUseInterception when absent: {:?}",
+            err.refused,
+        );
+    }
 }
 
 #[test]
