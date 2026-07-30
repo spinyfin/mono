@@ -1,0 +1,61 @@
+Grok leader process — raw measurements (grok 0.2.114, macOS aarch64, 2026-07-29)
+All process tables captured with `ps -eo pid,ppid,pgid,stat,comm` (external and
+authoritative; in-process kill(pid,0) was discarded after it reported zombies as live).
+
+L1. Boss-shaped TUI (no [cli] use_leader) — no leader is ever started
+    GROK_HOME=<isolated>, flags: --no-alt-screen --always-approve --trust
+                                 --no-subagents --no-memory
+    $ grok leader list --json            -> []
+    $ find $GROK_HOME -name '*.sock'     -> (nothing)
+    TUI process has no children.
+    Repeated across probes P2, P3, P5, P6, P7, P8, P9 — leader never appeared.
+
+L2. Explicit leader, socket path 157 bytes (under the long scratch root)
+    $ grok agent leader --relay-on-demand --no-auto-update
+    leader.out: "Error: Timeout waiting for IPC socket to be created"
+    exit code 1, no socket, no lock.
+
+L3. Same command, socket path 20 bytes (/tmp/gl1/leader.sock)
+    alive after 10s: True
+    $GROK_HOME contents: ['leader.lock', 'leader.sock']
+    -> socket + lock are HOME-DERIVED ($GROK_HOME/leader.sock), so a per-run
+       GROK_HOME does give each worker its own leader.
+    SIGTERM to the leader's OWN process group -> dead in <4s, exit code 143.
+    Stale leader.sock + leader.lock REMAIN on disk after the reap.
+
+L4. TUI with [cli] use_leader = true — leader is auto-spawned into its OWN group
+      PID  PPID  PGID  COMM
+    35105 35104 35105  grok                      <- TUI (pane leaf)
+    35170 35105 35170  .../.grok/bin/grok        <- leader: child of TUI,
+                                                     but pgid 35170 != 35105
+    $ grok leader list --json
+    [{"pid":35170,"pidLive":35170,"classification":"Reachable",
+      "socketPath":"/tmp/gl2/leader.sock", ...}]
+
+L5. Leader outlives its worker
+    After the TUI was terminated:
+    35170     1 35170  .../.grok/bin/grok        <- reparented to launchd (ppid 1)
+    $ grok leader list --json  -> still "Reachable", socket still live.
+    Independently reproduced in a second run (leader 52231, ppid 1).
+    Exit-on-disconnect did NOT reclaim either leader within the observation
+    window; both had to be killed by hand.
+
+L6. Boss's pane reap (killpg(pane_pgid, SIGTERM)) does not reach the leader
+    TUI pid=46324 pgid=46324
+      child(leader) pid=47696 pgid=47696 in_pane_group=False
+    killpg(46324, SIGTERM):
+      t+2s / t+5s / t+10s  -> leader 47696 still live
+    Structural, not a race: the leader is not a member of the signalled group.
+
+L7. Control — the interactive TUI itself DOES exit on SIGTERM
+    $ kill -TERM <tui_pid>
+      after ~2s: '55348 ZN <defunct>'   (zombie => the process exited)
+    The TUI is reaped correctly; only the leader escapes.
+
+L8. Pre-existing field evidence of an orphan
+    19176     1 19176  Rs  grok   ELAPSED 02-00:39:29
+    grok --no-alt-screen --always-approve --session-id eca19633-... \
+         --cwd /tmp/grok-pane-spike/cwd ...
+    A TUI left over from the 2026-07-27 pane-viability spike, reparented to
+    launchd and still alive two days later. Not produced by this investigation
+    and deliberately left untouched (it is not this run's to clean up).
