@@ -1,0 +1,22 @@
+[
+  {
+    "question_type": "yes_no",
+    "prompt": "Naming: adopt `applies_to` as the canonical unified include key and DROP the rename to `include`? (This reverses the input investigation's §5.1/§6 recommendation. Rationale: the definition-manifest field is required under `deny_unknown_fields`, so `applies_to` survives either way — renaming only the check-entry key ends at two permanent spellings rather than one. Cost accepted: `applies_to`/`exclude` never read as opposites, and nested selectors become `patterns[].applies_to`.) Answer No to rename to `include` with `applies_to` as a permanent alias.",
+    "anchor": "decision-1--naming-keep-applies_to-do-not-rename-to-include"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "Composition: should a check-entry `applies_to` INTERSECT the check's definition scope rather than REPLACE it? (This reverses today's shipped behaviour at `executor.rs:113` and the documented semantics at `userdoc/docs/checks-config.md:259`. Rationale: replace is structurally unimplementable for built-in and wasm checks, whose intrinsic predicates the framework cannot reach, so choosing replace ships replace-for-declarative and intersect-for-everything-else. Measured cost: zero live configs break — there are no `config.applies_to` overrides in mono, flunge, checkleft-sandbox, or appoint. Capability lost: a repo can no longer WIDEN a definition's scope from its CHECKS file.) Answer No to keep replace semantics.",
+    "anchor": "decision-2--composition-a-check-entry-applies_to-intersects-the-definition-scope"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The migration verification protocol needs a per-check selected-file surface: `CheckResult` carries only `check_id` and `findings` (`src/output.rs:6-9`), so a migration that narrows a GREEN check's scope to zero files produces an identical (empty) finding set on both sides and is undetectable. Which surface should the project build? This is the one place the design adds product surface area rather than reorganising it.",
+    "choices": [
+      "A new read-only `checkleft explain-scope` subcommand (what the design proposes — keeps run output untouched, also feeds the --all zero-match warning)",
+      "Add a selected-file list to the existing `checkleft run --format json` output (no new subcommand, but changes a consumed output schema)",
+      "Build no new surface and accept the weaker finding-only protocol (cheapest, leaves zero-to-zero narrowing undetectable)"
+    ],
+    "anchor": "decision-5--migration-verification-protocol"
+  }
+]
