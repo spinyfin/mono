@@ -718,12 +718,12 @@ What remains decided for v1: non-interactive `codex exec` **without `--json`** i
 
 ### Execution shape
 
-The production spawn line (`build_codex_exec_command`, `engine/driver/src/codex.rs:835-878`, called from `CodexDriver::spawn_invocation` at `codex.rs:1292`, read at `main@19473a98`):
+The production spawn line body (`build_codex_exec_command`, `engine/driver/src/codex.rs:835-878`, called from `CodexDriver::spawn_invocation` at `codex.rs:1292`, read at `main@19473a98`) — `build_codex_exec_command` itself emits no env prefix; `spawn_invocation` sets `CODEX_HOME` separately as an `EnvDirective::Set` on the `SpawnPlan` (`codex.rs:1303-1307`), resolved to `<codex-homes-root>/<sanitized-run-id>` by `codex_home_for_run` (`codex.rs:331`), where the root is `$BOSS_CODEX_HOMES_DIR` or `$TMPDIR/boss-codex-homes` (`codex_homes_root`, `codex.rs:287-291`), never a `codex-home` leaf under a run dir. The pane actually runs `exec <body>` (`wrap_codex_command_for_pane`, `codex.rs:882-887`):
 
 ```
-CODEX_HOME=<run-dir>/codex-home \
+CODEX_HOME=<codex-homes-root>/<run-id> \
   codex exec --color always --strict-config --skip-git-repo-check \
-    --sandbox workspace-write \  # baked-in fallback only — replaced by PermissionArtifacts::extra_args; see Update below
+    --sandbox <replaced by permission policy — see Update below> \
     -m <model> \
     -c model_reasoning_effort=<resolved-per-model> \
     "$(cat .codex/initial-prompt.txt)" \
