@@ -96,6 +96,11 @@ mod tests_fix_block;
 #[cfg(test)]
 mod parity_e2e;
 
+/// Hermetic end-to-end regression test for the format/rust fix path against a
+/// real (runfiles-staged), pinned-toolchain rustfmt.
+#[cfg(test)]
+mod rustfmt_skip_children_fix_e2e;
+
 pub(crate) use executor::eligible_file_count;
 pub(crate) use executor::run_declarative_check_with_progress;
 pub use executor::{FixInvocationOutcome, run_declarative_check, run_declarative_fix};

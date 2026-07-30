@@ -58,8 +58,23 @@ invocations:
       # Drop --check and -l; rustfmt writes the file in place and exits 0 on success.
       # --config-path pin is kept so the repo's rustfmt.toml governs the rewrite.
       # Mode inherits per_file from the parent invocation — one process per file.
+      #
+      # --config=skip_children=true: the fix sandbox stages only the fixable set
+      # (WritableSandbox::stage, tools/checkleft/src/fix/safety.rs:91-125), so a
+      # target file's `mod foo;` declarations may point at siblings that were never
+      # staged. Without this flag rustfmt tries to resolve and format the whole
+      # reachable module tree and hard-aborts when a sibling is missing from disk.
+      # Any bytes it would produce for those siblings are discarded by copy_back's
+      # airlock anyway (safety.rs:190-196), since only the staged file can be
+      # written back — so skipping them costs nothing and avoids a guaranteed abort.
+      # skip_children is unstable but honoured via CLI --config= override on the
+      # pinned stable toolchain (rustfmt 1.9.0-stable on rustc 1.95.0); see the
+      # hermetic regression test guarding against a future toolchain closing that
+      # loophole. Check invocation above is intentionally left untouched — do not
+      # add this flag there, it would narrow read scope for no gain.
       args:
         - "--config-path={{repo_root}}"
+        - "--config=skip_children=true"
         - "{{file}}"
       exit:
         "0": ok
