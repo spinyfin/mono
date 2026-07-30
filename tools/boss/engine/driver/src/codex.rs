@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 mod guard_chain;
 pub mod guard_trace;
 mod progress;
+mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};

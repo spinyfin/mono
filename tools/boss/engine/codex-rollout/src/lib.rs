@@ -12,6 +12,8 @@
 //! (`turn started` / `turn completed`) — those are progress-pipeline
 //! concerns that belong only in the driver.
 
+pub mod cell;
+
 use serde_json::{Map, Value, json};
 
 /// Canonicalised rollout tool call ready for progress or transcript use.
@@ -75,18 +77,7 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
     };
 
     let (tool_name, tool_input) = match provider_name {
-        "exec" | "exec_command" => {
-            let command = parsed_input
-                .get("cmd")
-                .or_else(|| parsed_input.get("command"))
-                .cloned()
-                .or_else(|| parsed_input.as_str().map(|value| Value::String(value.to_owned())))
-                .unwrap_or(parsed_input);
-            (
-                "Bash".to_owned(),
-                json!({"command": coerce_command_to_string(&command)}),
-            )
-        }
+        "exec" | "exec_command" => ("Bash".to_owned(), json!({"command": exec_command(&parsed_input)})),
         other => (other.to_owned(), parsed_input),
     };
     Some(CanonicalRolloutToolCall {
@@ -94,6 +85,31 @@ pub fn canonical_rollout_tool_call(item_type: &str, payload: &Map<String, Value>
         tool_name,
         tool_input,
     })
+}
+
+/// The command an `exec` / `exec_command` tool call runs.
+///
+/// Two input dialects reach this, and they are not variants of one shape:
+///
+/// - a JSON object carrying `cmd` / `command` — the plain shell-tool form.
+/// - **JavaScript source** — the cell harness form (`gpt-5.6-terra`), where
+///   the command is an argument to a `tools.exec_command({…})` call inside
+///   the script. Parsing the input as JSON fails outright here, so without
+///   [`cell::cell_script_command`] the whole script becomes "the command"
+///   and renders into live status, operator notifications, and the
+///   editorial audit as such.
+///
+/// A script with no command-bearing call (a pure `tools.write_stdin`
+/// continuation) still falls back to its source: it genuinely has no
+/// command of its own, and showing the script is more honest than
+/// attributing someone else's command to it.
+fn exec_command(parsed_input: &Value) -> String {
+    parsed_input
+        .get("cmd")
+        .or_else(|| parsed_input.get("command"))
+        .map(coerce_command_to_string)
+        .or_else(|| parsed_input.as_str().and_then(cell::cell_script_command))
+        .unwrap_or_else(|| coerce_command_to_string(parsed_input))
 }
 
 /// Coerce a Bash `command` value to a single string for rendering / capture.
@@ -113,6 +129,21 @@ pub fn coerce_command_to_string(command: &Value) -> String {
             .collect::<Vec<_>>()
             .join(" "),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// Flatten a rollout tool-output `payload.output` value to the text the
+/// model actually saw, with no structural interpretation.
+///
+/// Distinct from [`canonical_rollout_tool_output`], which *unwraps* the
+/// structured chunk form and hands back its inner `output` field. Dialect
+/// classification — is this a [`cell`] harness envelope? — has to run
+/// against the unwrapped text, before any such interpretation.
+pub fn flatten_tool_output_text(output: &Value) -> String {
+    match output {
+        Value::Array(blocks) => extract_text_blocks(blocks),
+        Value::String(text) => text.clone(),
+        _ => String::new(),
     }
 }
 
@@ -252,6 +283,52 @@ mod tests {
         let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
         assert_eq!(call.tool_name, "Bash");
         assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some("echo hi"));
+    }
+
+    #[test]
+    fn cell_harness_exec_reshapes_to_the_shell_command_not_the_script() {
+        // Verbatim `custom_tool_call` from probe 6 of the exit-code
+        // investigation: the input is JavaScript, so it never parses as
+        // JSON and the command has to come out of the script.
+        let payload = json!({
+            "type": "custom_tool_call",
+            "name": "exec",
+            "call_id": "call_aW1HJVpKwjjhVOK85B8payHB",
+            "input": "const r = await tools.exec_command({\"cmd\":\"cube pr create --branch b\",\"workdir\":\"/w\",\"yield_time_ms\":30000,\"max_output_tokens\":2000});\ntext(JSON.stringify(r));"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert_eq!(call.tool_name, "Bash");
+        assert_eq!(
+            call.tool_input.get("command").and_then(Value::as_str),
+            Some("cube pr create --branch b")
+        );
+    }
+
+    #[test]
+    fn continuation_only_cell_script_still_falls_back_to_its_source() {
+        let source = "const r = load(\"run\");\nconst p = await tools.write_stdin({\"session_id\":r.session_id});";
+        let payload = json!({"name": "exec", "call_id": "c9", "input": source})
+            .as_object()
+            .unwrap()
+            .clone();
+        let call = canonical_rollout_tool_call("custom_tool_call", &payload).expect("call");
+        assert_eq!(call.tool_input.get("command").and_then(Value::as_str), Some(source));
+    }
+
+    #[test]
+    fn flatten_tool_output_text_covers_the_observed_output_shapes() {
+        assert_eq!(flatten_tool_output_text(&json!("plain")), "plain");
+        assert_eq!(
+            flatten_tool_output_text(&json!([
+                {"type":"input_text","text":"Script completed"},
+                {"type":"input_text","text":"{}"}
+            ])),
+            "Script completed\n{}"
+        );
+        assert_eq!(flatten_tool_output_text(&Value::Null), "");
     }
 
     #[test]

@@ -442,6 +442,105 @@ mod tests {
     }
 
     #[test]
+    fn codex_cell_harness_wait_continuation_reaches_the_primary_capture_path() {
+        // The whole primary path for a Codex worker whose `cube pr create`
+        // outlives its JS cell's yield window: rollout records → the
+        // driver's rollout progress normaliser → `pr_url_capture_feed` →
+        // this module's extraction and Layer-1 gates.
+        //
+        // The URL only ever appears on the output of a *`wait`* record. Before
+        // the cell correlation landed, the record fed to capture held the
+        // `Script running with cell ID 1` placeholder and the record holding
+        // the URL was attributed to a tool named `wait` and dropped — so this
+        // whole path produced nothing and success depended on the worker
+        // optionally writing the fallback artifact file.
+        use crate::driver::{DriverRegistry, ProgressSessionConfig, ProgressStreamSource};
+
+        let registry = DriverRegistry::default();
+        let driver = registry.get("codex").expect("codex driver is registered");
+        let mut session = driver
+            .progress_session(&ProgressSessionConfig {
+                run_id: None,
+                identity_store: None,
+                source: ProgressStreamSource::AgentJsonlFile,
+                transcript_path: None,
+                resume_state: None,
+            })
+            .expect("codex declares a rollout progress session");
+
+        let script = concat!(
+            r#"const r = await tools.exec_command({"cmd":"cube pr create --branch boss/exec_x --title t","#,
+            r#""workdir":"/ws","yield_time_ms":30000,"max_output_tokens":2000});"#,
+            "\ntext(JSON.stringify(r));"
+        );
+        for record in [
+            json!({"type":"session_meta","payload":{"id":"thread-cell","cwd":"/ws"}}),
+            json!({
+                "type":"response_item",
+                "payload":{"type":"custom_tool_call","name":"exec","call_id":"call-pr","input":script}
+            }),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"custom_tool_call_output",
+                    "call_id":"call-pr",
+                    "output":"Script running with cell ID 1\nWall time 11.1 seconds\nOutput:\n"
+                }
+            }),
+            json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call",
+                    "name":"wait",
+                    "call_id":"call-wait",
+                    "arguments":"{\"cell_id\":\"1\",\"yield_time_ms\":30000}"
+                }
+            }),
+        ] {
+            session
+                .normalize_progress_events(&record)
+                .expect("every record in the observed sequence must normalise");
+        }
+
+        let chunk = r#"{"chunk_id":"ab","exit_code":0,"output":"https://github.com/spinyfin/mono/pull/9\n"}"#;
+        let events = session
+            .normalize_progress_events(&json!({
+                "type":"response_item",
+                "payload":{
+                    "type":"function_call_output",
+                    "call_id":"call-wait",
+                    "output":[
+                        {"type":"input_text","text":"Script completed\nWall time 17.7 seconds\nOutput:\n"},
+                        {"type":"input_text","text":chunk}
+                    ]
+                }
+            }))
+            .expect("the wait continuation must normalise");
+
+        let Some(crate::protocol::WorkerEvent::PostToolUse {
+            tool_name,
+            tool_input,
+            tool_response,
+            ..
+        }) = events.first()
+        else {
+            panic!("the wait continuation must produce a tool observation, got {events:?}");
+        };
+        let feed = driver
+            .pr_url_capture_feed(tool_name, tool_input, tool_response)
+            .expect("a correlated Bash observation feeds capture");
+        assert_eq!(
+            extract_pr_url_from_text(&feed.output_text).as_deref(),
+            Some("https://github.com/spinyfin/mono/pull/9"),
+        );
+        assert!(
+            is_gh_pr_command_str(&feed.command),
+            "Layer-1 must see the originating `cube pr create`, not the cell script: {:?}",
+            feed.command
+        );
+    }
+
+    #[test]
     fn driver_feed_plus_shared_regex_captures_codex_zsh_lc_bare_gh_pr() {
         // Codex shell-wraps bare `gh pr …` the same way as `cube pr …`.
         // Without peeling the `-lc` payload, classify's quote strip empties
