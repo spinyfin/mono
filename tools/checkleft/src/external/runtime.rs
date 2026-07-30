@@ -655,13 +655,17 @@ fn narrow_by_applies_to(
         && non_deleted_after == 0
         && let Some(source_tree) = source_tree
     {
-        let repo_has_match = globs
-            .iter()
-            .map(|pattern| source_tree.glob(pattern))
-            .collect::<Result<Vec<_>>>()
-            .context("failed to evaluate `applies_to` glob(s) against the repo")?
-            .iter()
-            .any(|matches| !matches.is_empty());
+        let mut repo_has_match = false;
+        for pattern in &globs {
+            if !source_tree
+                .glob(pattern)
+                .context("failed to evaluate `applies_to` glob(s) against the repo")?
+                .is_empty()
+            {
+                repo_has_match = true;
+                break;
+            }
+        }
         if !repo_has_match {
             bail!(
                 "`applies_to` config override {globs:?} matched no tracked file in the repo; \

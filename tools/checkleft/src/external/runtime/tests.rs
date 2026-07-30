@@ -1254,10 +1254,10 @@ fn applies_to_config_override_zero_match_fails_component_execution() {
     assert!(message.contains("applies_to"), "got: {message}");
 }
 
-/// End-to-end: the regression this revision fixes. An `applies_to` override
-/// (e.g. `boss/no-legacy-filehandle-write-api`'s `**/*.swift`) that matches
-/// nothing in THIS run's changeset, but does match a tracked file elsewhere in
-/// the repo, must run cleanly with zero findings — not fail the check. This is
+/// End-to-end: an `applies_to` override (e.g.
+/// `boss/no-legacy-filehandle-write-api`'s `**/*.swift`) that matches nothing
+/// in THIS run's changeset, but does match a tracked file elsewhere in the
+/// repo, must run cleanly with zero findings — not fail the check. This is
 /// the ordinary shape of an all-Rust PR under a `scope: files` check whose
 /// manifest also covers Swift: every such PR's changeset is legitimately
 /// Swift-free, and that must not be treated as a typo'd glob.
