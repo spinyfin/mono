@@ -370,12 +370,6 @@ status is otherwise left unchanged for re-dispatch or manual review."
         self.build_wait_tracker.forget(&execution.id);
         self.background_children_tracker.forget(&execution.id);
         self.hold_registry.release(&execution.id);
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
-            &execution.id,
-            workspace_path.as_deref().map(std::path::Path::new),
-        )
-        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -387,6 +381,15 @@ status is otherwise left unchanged for re-dispatch or manual review."
             );
         }
         self.pane_releaser.release_pane(&execution.id).await;
+        // Deliberately AFTER the pane release (mirrors `force_release`'s
+        // ordering) — see `finalize_pr_transition` for why teardown must not
+        // run while the worker process may still be alive.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         let work_item_id = completion.execution.work_item_id.clone();
         self.publisher
             .publish(

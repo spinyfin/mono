@@ -796,12 +796,6 @@ impl WorkerCompletionHandler {
             "pr_review pass duration",
         );
 
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
-            &execution.id,
-            workspace_path.as_deref().map(std::path::Path::new),
-        )
-        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -813,6 +807,15 @@ impl WorkerCompletionHandler {
             );
         }
         self.pane_releaser.release_pane(&execution.id).await;
+        // Deliberately AFTER the pane release (mirrors `force_release`'s
+        // ordering) — see `finalize_pr_transition` for why teardown must not
+        // run while the worker process may still be alive.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            &execution.id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
 
         let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);

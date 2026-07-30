@@ -16,16 +16,29 @@ impl WorkerCompletionHandler {
         target: WorkerPrCompletionTarget,
         source: &'static str,
     ) -> StopOutcome {
-        // Captured before `record_worker_pr_completion` below nulls
-        // `workspace_path` in the same transaction that terminalizes the
-        // execution — this IS the path that terminalizes a parked-live
-        // (`waiting_human` / `running`) execution on PR success, so it owns
-        // driver teardown; nothing downstream of this call reaps it.
-        let workspace_path = self
-            .work_db
-            .get_execution(execution_id)
-            .ok()
-            .and_then(|execution| execution.workspace_path);
+        // Read once and reuse below for the reviewer-enqueue check, so both
+        // spots agree on the same execution snapshot instead of racing two
+        // independent reads. Captured before `record_worker_pr_completion`
+        // below nulls `workspace_path` in the same transaction that
+        // terminalizes the execution — this IS the path that terminalizes a
+        // parked-live (`waiting_human` / `running`) execution on PR success,
+        // so it owns driver teardown; nothing downstream of this call reaps
+        // it. A DB error here is distinct from a legitimately-absent path —
+        // teardown still runs per this function's contract, but the failure
+        // must be loud rather than silently collapsed into `None`.
+        let execution_result = self.work_db.get_execution(execution_id);
+        let workspace_path = match &execution_result {
+            Ok(execution) => execution.workspace_path.clone(),
+            Err(err) => {
+                tracing::warn!(
+                    execution_id,
+                    ?err,
+                    "pr completion: could not read workspace_path for driver teardown; \
+                     tearing down with None",
+                );
+                None
+            }
+        };
 
         let merged = matches!(target, WorkerPrCompletionTarget::Done);
 
@@ -38,8 +51,8 @@ impl WorkerCompletionHandler {
         // If the pr_review execution cannot be created (DB error), fall back
         // to the normal InReview path so the task is never left stuck.
         let enqueued_reviewer = if !merged && matches!(target, WorkerPrCompletionTarget::InReview) {
-            match self.work_db.get_execution(execution_id) {
-                Ok(ref producing)
+            match execution_result.as_ref() {
+                Ok(producing)
                     if should_enqueue_reviewer_for_primary(&producing.kind)
                         || (producing.kind == ExecutionKind::RevisionImplementation
                             && self.enable_revision_triggered_reviews) =>
@@ -238,17 +251,6 @@ impl WorkerCompletionHandler {
         self.build_wait_tracker.forget(execution_id);
         self.background_children_tracker.forget(execution_id);
         self.hold_registry.release(execution_id);
-        // Stop → pr_transition termination path: this call just moved the
-        // execution to `completed` (see `record_worker_pr_completion`), so it
-        // owns driver teardown — mirrors `force_release`'s and the automation
-        // triage / answer-agent finalizers' ordering (teardown before the
-        // actual cube release).
-        crate::driver_teardown::teardown_driver_workspace(
-            &self.work_db,
-            execution_id,
-            workspace_path.as_deref().map(std::path::Path::new),
-        )
-        .await;
         if let Some(lease_id) = completion.released_lease_id.as_deref()
             && let Err(err) = self.cube_client.release_workspace(lease_id).await
         {
@@ -261,6 +263,20 @@ impl WorkerCompletionHandler {
             );
         }
         self.pane_releaser.release_pane(execution_id).await;
+        // Stop → pr_transition termination path: this call just moved the
+        // execution to `completed` (see `record_worker_pr_completion`), so it
+        // owns driver teardown. Deliberately AFTER the pane release (mirrors
+        // `force_release`'s ordering): the worker process is still alive
+        // until `release_pane` reaps it, and running teardown first would let
+        // a still-live Codex process refresh its auth token again after the
+        // per-run credential file has already been adopted back to the
+        // source, silently dropping that refresh.
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            execution_id,
+            workspace_path.as_deref().map(std::path::Path::new),
+        )
+        .await;
         let product_id = completion.work_item.product_id().to_string();
         let work_item_id = work_item_id(&completion.work_item);
         let publish_reason = match (merged, source) {
