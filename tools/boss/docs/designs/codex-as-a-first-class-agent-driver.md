@@ -14,7 +14,7 @@
 
 Codex is a **better** fit for the P1422 abstraction than the abstraction currently assumes, and a **worse** fit for the parts of Boss that never went through the abstraction at all.
 
-The brief's highest-severity claim — _"Codex has no Stop hook, so a Codex worker would never complete"_ — **is wrong, but the conclusion it drives is still right, for a different reason.** Codex emits `turn.started` / `turn.completed` as native, typed events on its `--json` stdout stream, so turn boundaries are strictly _better_ than Claude's (in-band and structural, not a hook that must be installed). Codex also ships a stable, Claude-wire-compatible hooks system — including a `Stop` hook.
+The brief's highest-severity claim — _"Codex has no Stop hook, so a Codex worker would never complete"_ — **is wrong, but the conclusion it drives is still right, for a different reason.** Codex emits `turn.started` / `turn.completed` as native, typed events in its structured event stream, so turn boundaries are strictly _better_ than Claude's (in-band and structural, not a hook that must be installed). That stream reaches Boss over the rollout file the engine tails under the run-private `CODEX_HOME` (`ProgressIngress::AgentJsonlFile`, `engine/driver/src/codex.rs:1501`), not over `codex exec --json` stdout — see [Chosen approach](#chosen-approach) and [Alternative 8](#alternative-8-keep---json-on-the-codex-exec-spawn-line-for-progress-transport). Codex also ships a stable, Claude-wire-compatible hooks system — including a `Stop` hook.
 
 The real blocker was one layer down: **Boss's only production progress ingress was a unix socket fed by the `boss-event` shim.** PR #2363 added a generic stdout JSONL reader, but that reader only helps directly when the **engine owns the pipe/pty master**. Under the pane-hosted Boss shape the **app** owns the pty and the engine receives only `shell_pid`; an outsider with only `shell_pid` **cannot** read that stdout on macOS (pane-viability spike Q1). The resolved design therefore adds a distinct engine-side `AgentJsonlFile` transport that tails the raw Codex rollout under the run-private `CODEX_HOME` and feeds the same reader/fan-out.
 
@@ -68,6 +68,8 @@ error: unexpected argument '-a' found
 ```
 
 Approval policy is now fixed for headless exec: a debug-log capture of a real run shows `approval_policy=Never` with no flag supplied. The requirement the flag encoded — _"any other policy can block a headless worker forever waiting for an approval nobody will give"_ — is now satisfied **by default**. The [execution shape](#execution-shape) drops the flag. Removing a stable flag in a minor release is also the single clearest argument for pinning.
+
+The launch command quoted above is this design's own original one, and it still carries `--json` because that was the transport choice at the time. `--json` was later dropped for an unrelated reason — see [Alternative 8](#alternative-8-keep---json-on-the-codex-exec-spawn-line-for-progress-transport) and [Chosen approach](#chosen-approach) — so no command Boss actually spawns carries `--json` today.
 
 **D-2 — Hooks fire. `PreToolUse` deny genuinely blocks. [OQ-1](#oq-1-hook-trust-provisioning) is resolved and inverted.**
 
@@ -176,6 +178,8 @@ One clarification for the landed stdout-reader work: **`--json` events go to std
 | `-i, --image <FILE>...`                                          | Attach image(s) to the initial prompt                                |
 
 **`-a/--ask-for-approval` no longer exists on `codex exec`** — it was removed between 0.137.0 and 0.145.0, and passing it is a hard error. Headless exec now runs `approval_policy=Never` unconditionally (observed in a debug-log capture), which is what Boss wanted anyway. See [D-1](#deltas-that-change-the-design).
+
+The table above is `codex exec --help`'s full flag surface, not Boss's chosen invocation. Two rows in particular are not on the spawn line Boss actually uses: `--json` is forbidden outright (`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`, `engine/core/src/conformance/fixtures.rs:258`) because production progress ingress tails the rollout file instead (`ProgressIngress::AgentJsonlFile`, `engine/driver/src/codex.rs:1501`); `-o, --output-last-message` is not passed either — `CodexDriver::structured_output_wiring` (`engine/driver/src/codex.rs:1732`) uses only the common-denominator `BOSS_STRUCTURED_OUTPUT` environment-file contract today and names `--output-last-message` as a possible future extension ([T-15](#t-15-structuredoutput-trait-method-and---output-schema-wiring-a-5)), not something wired in yet. See [Chosen approach](#chosen-approach).
 
 `codex exec resume [--last | <id>]` resumes a session. `codex exec review` runs a native non-interactive code review ([D-3](#delta-that-changes-a-tasks-scope)).
 
@@ -703,28 +707,31 @@ The pane-viability spike (PR #2392) then established that the engine cannot read
 
 ## Chosen approach
 
-Drive **`codex exec --json` as the worker CLI** (positional prompt, `< /dev/null`, non-interactive one-turn-per-process), with `--output-last-message` + the existing `BOSS_STRUCTURED_OUTPUT` file contract for structured results, per-worker `CODEX_HOME` for isolation, Codex's OS sandbox for filesystem guardrails, and **Codex's `PreToolUse` hook for command guardrails** — the same mechanism the Claude path enforces with today ([operator decision](#operator-decision)).
+Drive **`codex exec` as the worker CLI, without `--json`** (positional prompt, `< /dev/null`, non-interactive one-turn-per-process), with the existing `BOSS_STRUCTURED_OUTPUT` environment-file contract for structured results, per-worker `CODEX_HOME` for isolation, Codex's OS sandbox for filesystem guardrails, and **Codex's `PreToolUse` hook for command guardrails** — the same mechanism the Claude path enforces with today ([operator decision](#operator-decision)). `--json` is forbidden on the spawn line ([Alternative 8](#alternative-8-keep---json-on-the-codex-exec-spawn-line-for-progress-transport)); progress reaches Boss via the rollout-file tail described next, not stdout. `--output-last-message` is not part of the shape today — it is a possible future extension of the file contract ([T-15](#t-15-structuredoutput-trait-method-and---output-schema-wiring-a-5)), not something the driver currently passes (`CodexDriver::structured_output_wiring`, `engine/driver/src/codex.rs:1732`).
 
 **The earlier phrasing — "pane-embedded worker with stdout JSONL as the progress transport" — is not implementable as written for the engine under the current app/engine split.** Empirically (pane-viability spike):
 
 - **Engine-spawned** `codex exec --json` (engine owns stdout pipe/pty master): stdout JSONL + PR #2363's reader **worked**, but this topology is not the one Boss runs — Codex is pane-hosted, per the next bullet — and the operator has decided not to pursue it. The stdout-JSONL dialect parser (`CodexProgressSession`, `StdoutEnvelope`, `parse_stdout_envelope`) this topology fed has been removed as unreachable dead code rather than kept "just in case"; if the engine-spawned topology is ever pursued, its progress reader should be designed against that day's requirements, not resurrected from this removal. `ProgressIngress::StdoutJsonl` itself is retained as a registration-time admission check — `DriverRegistry::default()` panics if a built-in driver ever declares it — rather than deleted outright, since the shared generic JSONL reader crate (`boss-engine-stdout-progress`) still legitimately exercises that ingress kind against synthetic test drivers.
 - **Pane-hosted** worker (app owns GhosttyKit/pty; engine receives `shell_pid` only): the engine **cannot** attach to that stdout. The selected transport is the engine-side, run-correlated rollout-file tail (`ProgressIngress::AgentJsonlFile`), not rendered scrollback, PTY reads, or new app IPC.
 
-What remains decided for v1: non-interactive `codex exec --json` is the **agent CLI shape**; pane progress normalisation targets the distinct rollout dialect (`session_meta` / `event_msg` / `response_item`) and does not pretend rollout is stdout; hooks carry guardrails; structured output uses the file contracts above.
+What remains decided for v1: non-interactive `codex exec` **without `--json`** is the **agent CLI shape**; pane progress normalisation targets the distinct rollout dialect (`session_meta` / `event_msg` / `response_item`) read off the tailed rollout file, and does not pretend rollout is stdout; hooks carry guardrails; structured output uses the file contract above.
 
 ### Execution shape
 
+The production spawn line (`CodexDriver::spawn_invocation`, `engine/driver/src/codex.rs:860-861`, read at `main@19473a98`):
+
 ```
 CODEX_HOME=<run-dir>/codex-home \
-  codex exec --json \
+  codex exec --color always --strict-config --skip-git-repo-check \
     --sandbox workspace-write \
     -C <workspace> \
     -m <model> \
     -c model_reasoning_effort=<resolved-per-model> \
-    -o <run-dir>/last-message.txt \
     "$(cat AGENTS-initial-prompt.txt)" \
     < /dev/null
 ```
+
+No `--json` and no `-o/--output-last-message`: progress reaches the engine by tailing the rollout file Codex writes unconditionally under `CODEX_HOME` (`ProgressIngress::AgentJsonlFile`, `engine/driver/src/codex.rs:1501-1516`), and structured results reach it through the `BOSS_STRUCTURED_OUTPUT` environment-file contract (`CodexDriver::structured_output_wiring`, `engine/driver/src/codex.rs:1732-1741`). `--json` is forbidden outright on this spawn line by the conformance contract (`CODEX_EXEC_FORBIDDEN_LONG_FLAGS`, `engine/core/src/conformance/fixtures.rs:258`); `--color always` is a pane-rendering flag, not a transport one. See [Alternative 8](#alternative-8-keep---json-on-the-codex-exec-spawn-line-for-progress-transport) for why the doc's original `--json`-based design was superseded.
 
 **No `--ask-for-approval`.** The flag was removed from `codex exec` between 0.137.0 and 0.145.0 and now produces a hard argument error; headless exec runs `approval_policy=Never` unconditionally, which is exactly the property Boss needed (any other policy can block a headless worker forever waiting for an approval nobody will give). This is the one place where the version delta would have broken the design outright rather than merely dating it — see [D-1](#deltas-that-change-the-design).
 
@@ -1003,7 +1010,7 @@ The crate and struct: `DriverDescriptor` (`AGENTS.md`, `.codex`), `CapabilitySet
 
 ### T-11 `CodexDriver` spawn and workspace provisioning
 
-Implement `spawn_invocation` (the `codex exec --json` line, including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `auth.json` symlink, `AGENTS.md`, pre-stamped project trust, `external_config_migration_prompts` disabled). Produces a Codex worker that starts, but whose progress is not yet observed end-to-end.
+Implement `spawn_invocation` (the `codex exec` line, without `--json` — see [Chosen approach](#chosen-approach) — including `< /dev/null`) and `provision_workspace` (per-run `CODEX_HOME`, `auth.json` symlink, `AGENTS.md`, pre-stamped project trust, `external_config_migration_prompts` disabled). Produces a Codex worker that starts, but whose progress is not yet observed end-to-end.
 
 **Pane launch half-answer from the viability spike:** the CLI line is fine in a pane (positional prompt auto-runs; `< /dev/null` still required). What is **not** answered by implementing spawn alone: how the engine observes that pane. Do **not** assume #2363 attaches via `shell_pid`. T-11 must either (a) document that progress depends on a later [seam 5](#the-five-engine-seams-this-needs) decision and leave observation to a follow-on task, or (b) implement the chosen channel once that decision exists. Spawning without a chosen ingress is a valid intermediate milestone; claiming "pane-hosted Codex works" without seam 5 is not.
 
