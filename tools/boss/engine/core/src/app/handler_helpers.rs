@@ -57,6 +57,24 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSED_SINCE: &str = "dispatch_paused_sin
 /// non-exempt `breaker` origin — see
 /// [`crate::coordinator::DispatchPauseOrigin::from_metadata_str`].
 pub(crate) const METADATA_KEY_DISPATCH_PAUSE_ORIGIN: &str = "dispatch_paused_origin";
+/// Metadata key storing why dispatch is currently paused. Absent (or
+/// empty) while running; always set alongside [`METADATA_KEY_DISPATCH_PAUSED`]
+/// `"1"` and cleared alongside it going back to `"0"` — see
+/// [`crate::coordinator::ExecutionCoordinator::pause_dispatch`] /
+/// `resume_dispatch`. `pub(crate)` for the same reason as
+/// `METADATA_KEY_DISPATCH_PAUSED`: the spawn-capability breaker persists
+/// its own reason through this key.
+pub(crate) const METADATA_KEY_DISPATCH_PAUSE_REASON: &str = "dispatch_paused_reason";
+
+/// Fallback reason used only when restoring a persisted pause at boot whose
+/// `METADATA_KEY_DISPATCH_PAUSE_REASON` (or the automation equivalent) is
+/// absent — i.e. a pause that was set before this field existed. Never
+/// reachable from a live pause call: [`pause_dispatch`](
+/// crate::coordinator::ExecutionCoordinator::pause_dispatch) and
+/// `pause_automation` both require a real [`boss_protocol::PauseReason`],
+/// so this exists solely to give restart-time restoration something
+/// non-empty to carry forward instead of panicking on missing history.
+pub(super) const LEGACY_PAUSE_REASON_FALLBACK: &str = "reason not recorded (pause predates reason tracking)";
 
 /// Metadata key for the interactive-pool concurrency cap (`bossctl dispatch
 /// concurrency --set N`). Stores the decimal `usize` limit; absent or
@@ -74,6 +92,11 @@ pub(super) const METADATA_KEY_AUTOMATION_PAUSED: &str = "automation_paused";
 /// Metadata key storing the epoch-seconds timestamp at which automation was
 /// last paused. Zero (or absent) means not paused.
 pub(super) const METADATA_KEY_AUTOMATION_PAUSED_SINCE: &str = "automation_paused_since_epoch_s";
+/// Metadata key storing why automation is currently paused. Same
+/// present-iff-paused contract as [`METADATA_KEY_DISPATCH_PAUSE_REASON`] —
+/// see [`crate::coordinator::ExecutionCoordinator::pause_automation`] /
+/// `resume_automation`.
+pub(super) const METADATA_KEY_AUTOMATION_PAUSE_REASON: &str = "automation_paused_reason";
 
 /// Persist the disabled-slot snapshot to the metadata KV. Called
 /// from the toggle handler. Errors bubble up so the caller can log
@@ -117,19 +140,22 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
 
     if dispatch_paused {
         let reviews_exempt = server_state.execution_coordinator.dispatch_pause_exempts_reviews();
-        let body = if reviews_exempt {
+        let scope_body = if reviews_exempt {
             "The engine is not dispatching new executions from the main or automation pools. \
              PR-review executions are exempt and keep dispatching — a review is the lifecycle \
              of a change already in flight, not new work. Currently-running workers continue to \
              completion. Run `bossctl dispatch resume` to restore normal dispatch."
-                .to_owned()
         } else {
             "The engine is not dispatching new executions from any source, including PR \
              reviews — the spawn-capability circuit breaker tripped, so review dispatch is held \
              too until the app's spawn path is confirmed healthy. Currently-running workers \
              continue to completion. Run `bossctl dispatch resume` to restore normal dispatch."
-                .to_owned()
         };
+        let reason = server_state
+            .execution_coordinator
+            .dispatch_paused_reason()
+            .unwrap_or_else(|| LEGACY_PAUSE_REASON_FALLBACK.to_owned());
+        let body = format!("Reason: {reason}\n\n{scope_body}");
         // Same human "since" phrasing as automation_paused — never a raw
         // Zulu ISO timestamp in the user-facing banner title.
         let now = boss_engine_utils::epoch_time::now_epoch_secs();
@@ -161,16 +187,22 @@ pub(super) fn build_engine_health_report(server_state: &Arc<ServerState>) -> bos
             .filter(|s| !s.is_empty())
             .map(|s| format!(" {s}"))
             .unwrap_or_default();
+        let reason = server_state
+            .execution_coordinator
+            .automation_paused_reason()
+            .unwrap_or_else(|| LEGACY_PAUSE_REASON_FALLBACK.to_owned());
         issues.push(EngineHealthIssue {
             kind: "automation_paused".to_owned(),
             severity: "warning".to_owned(),
             title: format!("Automations paused{since_suffix}"),
-            body: "The automation scheduler is not starting new triage passes, and the \
-                   automation pool is not claiming new work, including tasks a triage worker \
-                   produces. Currently-running automation workers continue to completion. \
-                   This is independent of dispatch pause. Run `bossctl automation resume` to \
-                   restore normal automation activity."
-                .to_owned(),
+            body: format!(
+                "Reason: {reason}\n\n\
+                 The automation scheduler is not starting new triage passes, and the \
+                 automation pool is not claiming new work, including tasks a triage worker \
+                 produces. Currently-running automation workers continue to completion. \
+                 This is independent of dispatch pause. Run `bossctl automation resume` to \
+                 restore normal automation activity."
+            ),
         });
     }
 
@@ -354,10 +386,16 @@ pub(super) fn load_live_status_disabled_slots(work_db: &WorkDb) -> Vec<u8> {
 }
 
 /// Read the persisted dispatch-pause state from the metadata KV. Returns
-/// `(paused, paused_since_epoch_s, origin)`. On first boot or if
-/// absent/malformed defaults to `(false, 0, DispatchPauseOrigin::Breaker)` —
-/// the origin is irrelevant when `paused` is `false`.
-pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64, crate::coordinator::DispatchPauseOrigin) {
+/// `(paused, paused_since_epoch_s, origin, reason)`. On first boot or if
+/// absent/malformed defaults to `(false, 0, DispatchPauseOrigin::Breaker,
+/// None)` — origin and reason are irrelevant when `paused` is `false`.
+/// `reason` is `Some(LEGACY_PAUSE_REASON_FALLBACK)` when `paused` is `true`
+/// but no reason key was persisted — a pause set before this field existed;
+/// no live pause call can produce that combination (see
+/// [`LEGACY_PAUSE_REASON_FALLBACK`]).
+pub(super) fn load_dispatch_paused_state(
+    work_db: &WorkDb,
+) -> (bool, u64, crate::coordinator::DispatchPauseOrigin, Option<String>) {
     let paused = work_db
         .get_metadata(METADATA_KEY_DISPATCH_PAUSED)
         .ok()
@@ -372,13 +410,16 @@ pub(super) fn load_dispatch_paused_state(work_db: &WorkDb) -> (bool, u64, crate:
         .unwrap_or(0);
     let origin_raw = work_db.get_metadata(METADATA_KEY_DISPATCH_PAUSE_ORIGIN).ok().flatten();
     let origin = crate::coordinator::DispatchPauseOrigin::from_metadata_str(origin_raw.as_deref());
-    (paused, since_epoch_s, origin)
+    let reason = load_persisted_pause_reason(work_db, METADATA_KEY_DISPATCH_PAUSE_REASON, paused);
+    (paused, since_epoch_s, origin, reason)
 }
 
 /// Read the persisted automation-pause state from the metadata KV. Returns
-/// `(paused, paused_since_epoch_s)`. On first boot or if absent/malformed
-/// defaults to `(false, 0)`. Independent of [`load_dispatch_paused_state`].
-pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64) {
+/// `(paused, paused_since_epoch_s, reason)`. On first boot or if
+/// absent/malformed defaults to `(false, 0, None)`. Independent of
+/// [`load_dispatch_paused_state`]. See that function's doc for the
+/// `reason` legacy-fallback rule.
+pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64, Option<String>) {
     let paused = work_db
         .get_metadata(METADATA_KEY_AUTOMATION_PAUSED)
         .ok()
@@ -391,7 +432,24 @@ pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64) {
         .flatten()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    (paused, since_epoch_s)
+    let reason = load_persisted_pause_reason(work_db, METADATA_KEY_AUTOMATION_PAUSE_REASON, paused);
+    (paused, since_epoch_s, reason)
+}
+
+/// Shared helper for the dispatch/automation reason-restore rule: `None`
+/// when not paused; otherwise the persisted reason, or
+/// [`LEGACY_PAUSE_REASON_FALLBACK`] when a pause is active but no reason
+/// was persisted for it.
+fn load_persisted_pause_reason(work_db: &WorkDb, key: &str, paused: bool) -> Option<String> {
+    if !paused {
+        return None;
+    }
+    let stored = work_db
+        .get_metadata(key)
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty());
+    Some(stored.unwrap_or_else(|| LEGACY_PAUSE_REASON_FALLBACK.to_owned()))
 }
 
 /// Read the persisted interactive-pool concurrency cap from the metadata KV.

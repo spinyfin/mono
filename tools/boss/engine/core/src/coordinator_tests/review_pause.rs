@@ -4,6 +4,8 @@
 
 use super::helpers::*;
 
+use boss_protocol::PauseReason;
+
 /// A `pr_review` execution must route to the review pool; a normal
 /// chore execution must continue to route to the main pool. Review is
 /// checked before automation so the reviewer of an automation-produced
@@ -444,7 +446,11 @@ async fn operator_pause_exempts_ready_pr_review_execution() {
     coord.set_review_pool(WorkerPool::new_review(1));
     let coordinator = Arc::new(coord);
 
-    coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution.id, ExecutionStatus::Running).await;
 
@@ -479,7 +485,11 @@ async fn operator_pause_holds_main_pool_row_until_resume() {
         runner.clone(),
     ));
 
-    coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
     coordinator.kick();
 
     // No positive event to wait on — the assertion is that nothing
@@ -498,7 +508,7 @@ async fn operator_pause_holds_main_pool_row_until_resume() {
 
     // Resume mirrors `handle_set_dispatch_paused`: flip the flag, then
     // kick so the held row drains immediately.
-    coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Operator);
+    coordinator.resume_dispatch();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 }
@@ -531,7 +541,11 @@ async fn breaker_pause_holds_pr_review_execution_too() {
     coord.set_review_pool(WorkerPool::new_review(1));
     let coordinator = Arc::new(coord);
 
-    coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Breaker);
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Breaker,
+        PauseReason::new("test: breaker pause").unwrap(),
+    );
     coordinator.kick();
 
     sleep(Duration::from_millis(100)).await;
@@ -572,7 +586,11 @@ async fn resume_kick_drains_held_row_exactly_once() {
         runner.clone(),
     ));
 
-    coordinator.set_dispatch_paused(true, 0, DispatchPauseOrigin::Operator);
+    coordinator.pause_dispatch(
+        0,
+        DispatchPauseOrigin::Operator,
+        PauseReason::new("test: operator pause").unwrap(),
+    );
     // Multiple kicks while paused must not cause multiple dispatches once resumed.
     coordinator.kick();
     coordinator.kick();
@@ -584,7 +602,7 @@ async fn resume_kick_drains_held_row_exactly_once() {
         "must stay held across repeated kicks"
     );
 
-    coordinator.set_dispatch_paused(false, 0, DispatchPauseOrigin::Operator);
+    coordinator.resume_dispatch();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 
@@ -648,7 +666,7 @@ async fn automation_pause_holds_automation_pool_row_until_resume() {
     coord.set_automation_pool(WorkerPool::new_automation(1));
     let coordinator = Arc::new(coord);
 
-    coordinator.set_automation_paused(true, 0);
+    coordinator.pause_automation(0, PauseReason::new("test: automation pause").unwrap());
     coordinator.kick();
 
     sleep(Duration::from_millis(100)).await;
@@ -663,7 +681,7 @@ async fn automation_pause_holds_automation_pool_row_until_resume() {
         "the held execution must remain `ready` while automation-paused"
     );
 
-    coordinator.set_automation_paused(false, 0);
+    coordinator.resume_automation();
     coordinator.kick();
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;
 }
@@ -693,7 +711,7 @@ async fn automation_pause_does_not_hold_main_pool_row() {
         runner.clone(),
     ));
 
-    coordinator.set_automation_paused(true, 0);
+    coordinator.pause_automation(0, PauseReason::new("test: automation pause").unwrap());
     coordinator.kick();
 
     wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Running).await;

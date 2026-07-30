@@ -1408,6 +1408,7 @@ fn tag_cases() -> Vec<TagCase> {
                 paused: false,
                 paused_since_epoch_s: None,
                 reviews_exempt: false,
+                reason: None,
             },
             expected_tag: "dispatch_state_result",
         },
@@ -1701,6 +1702,7 @@ fn tag_cases() -> Vec<TagCase> {
             event: FrontendEvent::AutomationStateResult {
                 paused: false,
                 paused_since_epoch_s: None,
+                reason: None,
             },
             expected_tag: "automation_state_result",
         },

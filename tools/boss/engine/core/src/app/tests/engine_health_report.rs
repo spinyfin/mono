@@ -84,9 +84,11 @@ async fn engine_health_report_flags_dispatch_paused() {
 
     // Pause dispatch through the same coordinator API the human toggle
     // and the spawn-health circuit breaker use.
-    state
-        .execution_coordinator
-        .set_dispatch_paused(true, 0, crate::coordinator::DispatchPauseOrigin::Operator);
+    state.execution_coordinator.pause_dispatch(
+        0,
+        crate::coordinator::DispatchPauseOrigin::Operator,
+        boss_protocol::PauseReason::new("test: operator pause").unwrap(),
+    );
 
     let report = build_engine_health_report(&state);
     assert!(
@@ -102,6 +104,11 @@ async fn engine_health_report_flags_dispatch_paused() {
     assert!(
         !issue.title.is_empty() && !issue.body.is_empty(),
         "title and body must be populated so the banner has user-visible text",
+    );
+    assert!(
+        issue.body.contains("test: operator pause"),
+        "body must surface the stored pause reason; got {:?}",
+        issue.body,
     );
 }
 
@@ -134,7 +141,10 @@ async fn engine_health_report_flags_automation_paused() {
     // Use a real (non-zero) pause start so the banner title includes a
     // human "since" phrase rather than a bare "Automations paused".
     let paused_since = (boss_engine_utils::epoch_time::now_epoch_secs() as u64).saturating_sub(3 * 86_400);
-    state.execution_coordinator.set_automation_paused(true, paused_since);
+    state.execution_coordinator.pause_automation(
+        paused_since,
+        boss_protocol::PauseReason::new("test: automation pause").unwrap(),
+    );
 
     let report = build_engine_health_report(&state);
     assert!(
@@ -180,10 +190,10 @@ async fn engine_health_report_flags_automation_paused() {
 async fn engine_health_report_dispatch_paused_title_is_human_local() {
     let (state, _dir) = test_server_state();
     let paused_since = (boss_engine_utils::epoch_time::now_epoch_secs() as u64).saturating_sub(2 * 3600);
-    state.execution_coordinator.set_dispatch_paused(
-        true,
+    state.execution_coordinator.pause_dispatch(
         paused_since,
         crate::coordinator::DispatchPauseOrigin::Operator,
+        boss_protocol::PauseReason::new("test: operator pause").unwrap(),
     );
 
     let report = build_engine_health_report(&state);

@@ -1835,12 +1835,21 @@ pub enum FrontendRequest {
     /// triage passes, and `drain_ready_queue` stops claiming executions
     /// bound for the automation pool (both fresh triage executions and
     /// tasks a triage worker produces) until a subsequent
-    /// `SetAutomationPaused { paused: false }` call. Already-running
+    /// `SetAutomationPaused { paused: false, .. }` call. Already-running
     /// automation workers are NOT interrupted — they complete normally,
     /// including recording whatever task their triage decision produces.
     /// The flag is persisted to `state.db` so it survives an engine
     /// restart. Idempotent: pausing while already paused (or resuming
     /// while already running) is a no-op.
+    ///
+    /// `reason` is **required** when `paused = true` — the engine rejects
+    /// a missing or empty reason with [`FrontendEvent::WorkError`] rather
+    /// than falling back to a default, so automation can never be paused
+    /// anonymously. Ignored when `paused = false`; resuming always clears
+    /// any previously-stored reason. `bossctl automation pause` defaults
+    /// `--reason` to "the operator asked me to" for a human caller who
+    /// omits it — that default is applied client-side, never by the
+    /// engine.
     ///
     /// Independent of [`FrontendRequest::SetDispatchPaused`]: a dispatch
     /// pause already holds automation-pool *spawns* (automation rows are
@@ -1853,6 +1862,8 @@ pub enum FrontendRequest {
     /// changes the other. Replies with [`FrontendEvent::AutomationStateResult`].
     SetAutomationPaused {
         paused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// Set (or clear) a work item's per-PR `tasks.ci_attempt_budget`
@@ -1889,11 +1900,24 @@ pub enum FrontendRequest {
     /// Pause or resume global dispatch. When `paused = true` the engine
     /// stops dispatching new executions from every source (auto-dispatch,
     /// reconciliation, dependency-gate-clear, manual start) until a
-    /// subsequent `SetDispatchPaused { paused: false }` call. Already-running
-    /// executions are NOT interrupted — they complete normally. The flag is
-    /// persisted to `state.db` so it survives an engine restart. Idempotent:
-    /// pausing while already paused (or resuming while already running) is a
-    /// no-op.
+    /// subsequent `SetDispatchPaused { paused: false, .. }` call.
+    /// Already-running executions are NOT interrupted — they complete
+    /// normally. The flag is persisted to `state.db` so it survives an
+    /// engine restart. Idempotent: pausing while already paused (or
+    /// resuming while already running) is a no-op.
+    ///
+    /// `reason` is **required** when `paused = true` — the engine rejects
+    /// a missing or empty reason with [`FrontendEvent::WorkError`] rather
+    /// than falling back to a default, so dispatch can never be paused
+    /// anonymously (this is what
+    /// [`crate::PauseReason`] enforces at the engine layer). Ignored when
+    /// `paused = false`; resuming always clears any previously-stored
+    /// reason, so a later pause never inherits a stale one. `bossctl
+    /// dispatch pause` defaults `--reason` to "the operator asked me to"
+    /// for a human caller who omits it — programmatic pausers (e.g. the
+    /// spawn-capability circuit breaker) always supply their own specific
+    /// reason instead; that default is applied client-side, never by the
+    /// engine.
     ///
     /// Independent of [`FrontendRequest::SetAutomationPaused`]: this pause
     /// already holds automation-pool executions from claiming a slot (they
@@ -1905,6 +1929,8 @@ pub enum FrontendRequest {
     /// with [`FrontendEvent::DispatchStateResult`].
     SetDispatchPaused {
         paused: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 
     /// Toggle one feature flag on or off. The engine updates the

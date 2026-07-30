@@ -151,17 +151,18 @@ use boss_protocol::{ProbeDeliveryExpectation, ProbeDeliveryState, WorkerTierDeni
 
 // Re-import handler helpers so all handler submodules can access them via `use super::*`.
 use handler_helpers::{
-    METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE, METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT,
-    METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE,
-    TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX, TranscriptResolution, active_chore_run_id, active_to_todo_execution,
-    build_chore_update_message, build_effort_audit_report, build_engine_health_report, build_live_status_debug_report,
-    duplicate_or_work_error, handle_create_many, in_review_chore_execution, live_execution_for_task_id,
-    load_automation_paused_state, load_dispatch_concurrency_limit, load_dispatch_paused_state,
-    load_live_status_disabled_slots, open_review_terminal_async, persist_live_status_disabled_slots,
-    publish_comment_invalidation, publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail,
-    segment_to_wire, send_push, send_response, send_response_with_revision, send_work_error, tail_lines_from_content,
-    task_name_description_for_id, task_status_for_id, task_transitioned_to_active, terminal_chore_execution,
-    transport_default_created_via, validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
+    METADATA_KEY_AUTOMATION_PAUSE_REASON, METADATA_KEY_AUTOMATION_PAUSED, METADATA_KEY_AUTOMATION_PAUSED_SINCE,
+    METADATA_KEY_DISPATCH_CONCURRENCY_LIMIT, METADATA_KEY_DISPATCH_PAUSE_ORIGIN, METADATA_KEY_DISPATCH_PAUSE_REASON,
+    METADATA_KEY_DISPATCH_PAUSED, METADATA_KEY_DISPATCH_PAUSED_SINCE, TRANSCRIPT_NOT_YET_AVAILABLE_PREFIX,
+    TranscriptResolution, active_chore_run_id, active_to_todo_execution, build_chore_update_message,
+    build_effort_audit_report, build_engine_health_report, build_live_status_debug_report, duplicate_or_work_error,
+    handle_create_many, in_review_chore_execution, live_execution_for_task_id, load_automation_paused_state,
+    load_dispatch_concurrency_limit, load_dispatch_paused_state, load_live_status_disabled_slots,
+    open_review_terminal_async, persist_live_status_disabled_slots, publish_comment_invalidation,
+    publish_work_invalidation, read_transcript_tail, resolve_transcript_for_tail, segment_to_wire, send_push,
+    send_response, send_response_with_revision, send_work_error, tail_lines_from_content, task_name_description_for_id,
+    task_status_for_id, task_transitioned_to_active, terminal_chore_execution, transport_default_created_via,
+    validate_external_tracker_config, work_item_id, work_item_needs_dispatch,
 };
 
 /// Per-request handler context: the connection-scoped state every
@@ -1340,15 +1341,27 @@ impl ServerState {
         // A persisted pause survives an engine restart — the flag is set
         // here before any scheduler kicks so no executions slip through
         // the gap between boot and pause restoration.
-        let (dispatch_paused, dispatch_paused_since, dispatch_pause_origin) =
+        let (dispatch_paused, dispatch_paused_since, dispatch_pause_origin, dispatch_paused_reason) =
             load_dispatch_paused_state(&server_state.work_db);
         if dispatch_paused {
+            // `load_dispatch_paused_state` already substitutes
+            // `LEGACY_PAUSE_REASON_FALLBACK` when `dispatch_paused` is
+            // `true` but no reason was persisted. A garbage persisted value
+            // (e.g. whitespace-only, from a future writer bug) still falls
+            // back here rather than aborting engine startup.
+            let reason = dispatch_paused_reason
+                .and_then(|r| boss_protocol::PauseReason::new(r).ok())
+                .unwrap_or_else(|| {
+                    boss_protocol::PauseReason::new(handler_helpers::LEGACY_PAUSE_REASON_FALLBACK)
+                        .expect("LEGACY_PAUSE_REASON_FALLBACK is a non-empty literal")
+                });
             server_state
                 .execution_coordinator
-                .set_dispatch_paused(true, dispatch_paused_since, dispatch_pause_origin);
+                .pause_dispatch(dispatch_paused_since, dispatch_pause_origin, reason);
             tracing::info!(
                 paused_since_epoch_s = dispatch_paused_since,
                 origin = dispatch_pause_origin.as_metadata_str(),
+                reason = server_state.execution_coordinator.dispatch_paused_reason().as_deref(),
                 "dispatch: restoring persisted pause state — dispatch remains \
                  globally paused until `bossctl dispatch resume` is called",
             );
@@ -1359,13 +1372,24 @@ impl ServerState {
         // rationale: set before any scheduler kicks so no automation triage
         // pass or automation-pool spawn slips through the gap between boot
         // and pause restoration.
-        let (automation_paused, automation_paused_since) = load_automation_paused_state(&server_state.work_db);
+        let (automation_paused, automation_paused_since, automation_paused_reason) =
+            load_automation_paused_state(&server_state.work_db);
         if automation_paused {
+            // Same graceful-fallback rationale as the dispatch-pause restore
+            // above: a garbage persisted reason must not abort engine
+            // startup.
+            let reason = automation_paused_reason
+                .and_then(|r| boss_protocol::PauseReason::new(r).ok())
+                .unwrap_or_else(|| {
+                    boss_protocol::PauseReason::new(handler_helpers::LEGACY_PAUSE_REASON_FALLBACK)
+                        .expect("LEGACY_PAUSE_REASON_FALLBACK is a non-empty literal")
+                });
             server_state
                 .execution_coordinator
-                .set_automation_paused(true, automation_paused_since);
+                .pause_automation(automation_paused_since, reason);
             tracing::info!(
                 paused_since_epoch_s = automation_paused_since,
+                reason = server_state.execution_coordinator.automation_paused_reason().as_deref(),
                 "automation: restoring persisted pause state — automation remains \
                  globally paused until `bossctl automation resume` is called",
             );

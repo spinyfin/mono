@@ -214,7 +214,7 @@ fn pause_system_all_covers_every_registry_variant() {
 
 #[test]
 fn pause_arg_targets_defaults_to_every_system_when_empty() {
-    assert_eq!(pause_arg_targets(&[]), PauseSystem::all());
+    assert_eq!(pause::pause_arg_targets(&[]), PauseSystem::all());
 }
 
 #[test]
@@ -222,73 +222,80 @@ fn pause_arg_targets_filters_out_the_state_sentinel() {
     // `state` is handled before this function is ever called (it
     // dispatches to `unified_state` instead), but the filter should
     // still drop it defensively rather than mapping to a phantom system.
-    let targets = pause_arg_targets(&[PauseArg::Dispatch, PauseArg::State]);
+    let targets = pause::pause_arg_targets(&[PauseArg::Dispatch, PauseArg::State]);
     assert_eq!(targets, vec![PauseSystem::Dispatch]);
 }
 
 #[test]
 fn pause_arg_targets_preserves_explicit_subset_and_order() {
-    let targets = pause_arg_targets(&[PauseArg::Automation]);
+    let targets = pause::pause_arg_targets(&[PauseArg::Automation]);
     assert_eq!(targets, vec![PauseSystem::Automation]);
 }
 
 #[test]
 fn format_dispatch_set_line_matches_existing_dispatch_pause_text() {
-    let paused = DispatchPauseState {
+    let paused = pause::DispatchPauseState {
         paused: true,
         paused_since_epoch_s: Some(123),
         reviews_exempt: true,
+        reason: Some("the operator asked me to".to_string()),
     };
     assert_eq!(
-        format_dispatch_set_line(&paused),
-        "dispatch paused (since epoch 123) — PR reviews are exempt and keep dispatching"
+        pause::format_dispatch_set_line(&paused),
+        "dispatch paused (since epoch 123) — PR reviews are exempt and keep dispatching — \
+         reason: the operator asked me to"
     );
 
-    let resumed = DispatchPauseState {
+    let resumed = pause::DispatchPauseState {
         paused: false,
         paused_since_epoch_s: None,
         reviews_exempt: false,
+        reason: None,
     };
-    assert_eq!(format_dispatch_set_line(&resumed), "dispatch resumed");
+    assert_eq!(pause::format_dispatch_set_line(&resumed), "dispatch resumed");
 }
 
 #[test]
 fn format_dispatch_set_line_flags_non_exempt_breaker_pause() {
-    let paused = DispatchPauseState {
+    let paused = pause::DispatchPauseState {
         paused: true,
         paused_since_epoch_s: None,
         reviews_exempt: false,
+        reason: Some("spawn-capability circuit breaker tripped".to_string()),
     };
     assert_eq!(
-        format_dispatch_set_line(&paused),
-        "dispatch paused — PR reviews are held too (spawn-capability breaker)"
+        pause::format_dispatch_set_line(&paused),
+        "dispatch paused — PR reviews are held too (spawn-capability breaker) — \
+         reason: spawn-capability circuit breaker tripped"
     );
 }
 
 #[test]
 fn format_automation_set_line_matches_existing_automation_pause_text() {
-    let paused = AutomationPauseState {
+    let paused = pause::AutomationPauseState {
         paused: true,
         paused_since_epoch_s: Some(456),
+        reason: Some("the operator asked me to".to_string()),
     };
     assert_eq!(
-        format_automation_set_line(&paused),
-        "automation paused (since epoch 456) — new triage passes and automation-pool spawns are held; \
-         already-running automation workers finish normally"
+        pause::format_automation_set_line(&paused),
+        "automation paused (since epoch 456) — reason: the operator asked me to — new triage passes \
+         and automation-pool spawns are held; already-running automation workers finish normally"
     );
 
-    let resumed = AutomationPauseState {
+    let resumed = pause::AutomationPauseState {
         paused: false,
         paused_since_epoch_s: None,
+        reason: None,
     };
-    assert_eq!(format_automation_set_line(&resumed), "automation resumed");
+    assert_eq!(pause::format_automation_set_line(&resumed), "automation resumed");
 }
 
 #[test]
 fn format_state_summary_reports_paused_with_and_without_since() {
-    assert_eq!(format_state_summary(true, Some(789)), "paused (since epoch 789)");
-    assert_eq!(format_state_summary(true, None), "paused");
-    assert_eq!(format_state_summary(false, None), "running");
+    assert_eq!(pause::format_state_summary(true, Some(789)), "paused (since epoch 789)");
+    assert_eq!(pause::format_state_summary(true, None), "paused");
+    assert_eq!(pause::format_state_summary(false, None), "running");
 }
 
 // ── metrics github: rate arithmetic ──────────────────────────────────────
@@ -326,4 +333,14 @@ fn points_per_hour_refuses_a_span_shorter_than_a_minute() {
 #[test]
 fn points_per_hour_handles_zero_spend_over_a_real_span() {
     assert_eq!(points_per_hour(0, 3_600_000), Some(0.0));
+}
+
+#[test]
+fn operator_pause_reason_falls_back_to_the_client_side_default_when_omitted() {
+    assert_eq!(pause::operator_pause_reason(None), pause::DEFAULT_OPERATOR_PAUSE_REASON);
+}
+
+#[test]
+fn operator_pause_reason_passes_through_an_explicit_reason() {
+    assert_eq!(pause::operator_pause_reason(Some("disk full".to_owned())), "disk full");
 }

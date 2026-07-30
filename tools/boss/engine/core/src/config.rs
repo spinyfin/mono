@@ -204,7 +204,7 @@ pub struct WorkConfig {
     /// change, and why it is safe to default on again now. Configured via
     /// `BOSS_ENABLE_SPAWN_CAPABILITY_BREAKER`. When `false`, the breaker
     /// still tracks failures, logs, raises its attention item, and emits its
-    /// dispatch event on trip — it just never calls `set_dispatch_paused`.
+    /// dispatch event on trip — it just never calls `pause_dispatch`.
     #[builder(default = DEFAULT_ENABLE_SPAWN_CAPABILITY_BREAKER)]
     pub enable_spawn_capability_breaker: bool,
     /// Whether the coordinator's `kick()` routes through the event bus

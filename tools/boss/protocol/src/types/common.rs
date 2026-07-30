@@ -525,3 +525,86 @@ pub struct TruncationInfo {
     pub shown_bytes: usize,
     pub total_bytes: usize,
 }
+
+/// A required, non-empty explanation for why something was paused.
+///
+/// The only way to construct one is [`PauseReason::new`], which rejects
+/// empty/whitespace-only input — so simply holding a `PauseReason` value is
+/// proof that a real reason was supplied. `ExecutionCoordinator`'s pause
+/// APIs (`boss_engine`) take this type rather than a bare `String` or
+/// `Option<String>` specifically so a pause can never be entered without
+/// one: see the incident this exists to prevent, where dispatch was found
+/// paused with no record of who paused it or why.
+///
+/// The wire protocol (`FrontendRequest::SetDispatchPaused`/
+/// `SetAutomationPaused`, and the `*StateResult` events) deliberately keeps
+/// this as a bare `Option<String>` rather than `Option<PauseReason>`: the
+/// handler validates it explicitly and replies with
+/// [`crate::FrontendEvent::WorkError`] on an empty/whitespace reason, which
+/// gives a normal application-level error a client can display, instead of
+/// a frame-level deserialization failure. `Serialize`/`Deserialize` are
+/// still derived here so the type can be used directly wherever an
+/// internal (non-wire) API wants the same enforced-non-empty guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct PauseReason(String);
+
+impl PauseReason {
+    /// Trims `reason` and rejects it if that leaves nothing behind.
+    pub fn new(reason: impl Into<String>) -> Result<Self, PauseReasonError> {
+        let trimmed = reason.into();
+        let trimmed = trimmed.trim();
+        if trimmed.is_empty() {
+            Err(PauseReasonError::Empty)
+        } else {
+            Ok(Self(trimmed.to_owned()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PauseReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for PauseReason {
+    type Error = PauseReasonError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<PauseReason> for String {
+    fn from(value: PauseReason) -> Self {
+        value.0
+    }
+}
+
+/// Why [`PauseReason::new`] rejected an input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum PauseReasonError {
+    #[error("pause reason must not be empty")]
+    Empty,
+}
+
+#[cfg(test)]
+mod pause_reason_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_empty_and_whitespace_only() {
+        assert_eq!(PauseReason::new(""), Err(PauseReasonError::Empty));
+        assert_eq!(PauseReason::new("   \t\n"), Err(PauseReasonError::Empty));
+    }
+
+    #[test]
+    fn trims_and_accepts_a_real_reason() {
+        let reason = PauseReason::new("  the operator asked me to  ").unwrap();
+        assert_eq!(reason.as_str(), "the operator asked me to");
+    }
+}
