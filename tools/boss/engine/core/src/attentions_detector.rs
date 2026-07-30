@@ -34,7 +34,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use boss_protocol::{Attention, AttentionGroup, CreateAttentionInput};
-use boss_transcript_markdown::{TranscriptEventKind, parse_transcript};
+use boss_transcript_markdown::TranscriptEventKind;
 use serde::Deserialize;
 
 use crate::claude_client::{self, CallConfig, Message, MessagesRequest};
@@ -360,8 +360,13 @@ pub async fn reconcile_task_followups(
                     return None;
                 }
             };
-            let assistant_text = extract_assistant_text(&jsonl);
-            followups_from_driver_fallback(&assistant_text, execution_id)
+            let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id);
+            let assistant_text = extract_assistant_text(driver.as_deref(), &jsonl);
+            followups_from_driver_fallback(
+                crate::driver_transcript::driver_or_default(driver.as_deref()),
+                &assistant_text,
+                execution_id,
+            )
         }
     };
     if entries.is_empty() {
@@ -481,8 +486,14 @@ fn read_followups_artifact(structured_output_dir: Option<&Path>, execution_id: &
 /// We scan only assistant text (never the user prompt or tool output) so the
 /// `FOLLOWUPS:` instructions in the worker's *prompt* can never be mistaken
 /// for an emitted block.
-fn extract_assistant_text(jsonl: &str) -> String {
-    parse_transcript(jsonl)
+/// `driver` is the resolved [`crate::driver::AgentDriver`] governing this
+/// transcript's dialect (see [`crate::driver_transcript`]'s module doc for
+/// why parsing every driver's native output with the Claude-only
+/// `boss_transcript_markdown::parse_transcript` is wrong): `None` only when
+/// the execution's driver could not be resolved, in which case the raw parse
+/// is the same fallback every other post-hoc reader uses.
+fn extract_assistant_text(driver: Option<&dyn AgentDriver>, jsonl: &str) -> String {
+    crate::driver_transcript::parse_transcript_with_driver(driver, jsonl)
         .into_iter()
         .filter_map(|event| match event.kind {
             TranscriptEventKind::AssistantText(text) => Some(text),
@@ -492,15 +503,15 @@ fn extract_assistant_text(jsonl: &str) -> String {
         .join("\n")
 }
 
-/// Recover followups from worker prose via the driver's fallback producer —
+/// Recover followups from worker prose via `driver`'s fallback producer —
 /// for the Claude driver, the `FOLLOWUPS:` sentinel plus the JSON array after
 /// it (see `boss_engine_driver::claude::structured_output`).
 ///
 /// Returns an empty `Vec` when the driver offers nothing, or when what it
 /// offers does not validate: followups are optional and best effort, so a bad
 /// payload must never block the PR transition.
-fn followups_from_driver_fallback(text: &str, execution_id: &str) -> Vec<FollowupEntry> {
-    crate::driver::ClaudeDriver
+fn followups_from_driver_fallback(driver: &dyn AgentDriver, text: &str, execution_id: &str) -> Vec<FollowupEntry> {
+    driver
         .structured_output_fallback(StructuredOutputKind::Followups, text)
         .iter()
         .find_map(
@@ -780,7 +791,16 @@ pub async fn extract_followups_backstop(
         }
     };
 
-    let assistant_text = extract_assistant_text(&jsonl);
+    // The transcript must be normalized through the run's own driver: an
+    // un-normalized parse of a non-Claude rollout yields zero assistant turns
+    // (see `driver_transcript::codex_rollout_yields_no_assistant_text_without_driver_normalization`),
+    // which would make this backstop silently inert for every codex/grok run.
+    // The lookup costs a SQLite round trip, dwarfed by the utility-model API
+    // call this function goes on to make. The Claude pinning that's actually
+    // intentional lives one level down, in `followups_from_driver_fallback`'s
+    // parse of the utility model's own (always Claude-shaped) answer.
+    let driver = crate::driver_transcript::driver_for_execution(work_db, execution_id);
+    let assistant_text = extract_assistant_text(driver.as_deref(), &jsonl);
     if assistant_text.is_empty() {
         return None;
     }
@@ -825,10 +845,12 @@ pub async fn extract_followups_backstop(
     };
 
     let response_text = response.first_text().unwrap_or_default();
-    // The backstop asks a Claude model for the same `FOLLOWUPS:` block shape a
-    // Claude worker emits, so the Claude driver's producer is the right parser
-    // for its answer too.
-    let entries = followups_from_driver_fallback(response_text, execution_id);
+    // The backstop always asks a Claude utility model for the same
+    // `FOLLOWUPS:` block shape a Claude worker emits, regardless of which
+    // driver ran the original execution — so the Claude driver's producer is
+    // the right (and only correct) parser for its answer, not the run's own
+    // driver.
+    let entries = followups_from_driver_fallback(&crate::driver::ClaudeDriver, response_text, execution_id);
     if entries.is_empty() {
         return None;
     }
@@ -967,7 +989,7 @@ mod tests {
     #[test]
     fn followups_fallback_handles_fenced_json() {
         let text = "Some summary.\n\nFOLLOWUPS:\n```json\n[\n  {\"proposed_name\": \"Wire retries\", \"proposed_description\": \"add backoff\", \"proposed_effort\": \"small\"}\n]\n```\n";
-        let entries = followups_from_driver_fallback(text, "e1");
+        let entries = followups_from_driver_fallback(&crate::driver::ClaudeDriver, text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "Wire retries");
         assert_eq!(entries[0].proposed_effort.as_deref(), Some("small"));
@@ -976,7 +998,7 @@ mod tests {
     #[test]
     fn followups_fallback_handles_unfenced_array() {
         let text = "FOLLOWUPS: [{\"proposed_name\": \"X\", \"proposed_description\": \"y\"}]";
-        let entries = followups_from_driver_fallback(text, "e1");
+        let entries = followups_from_driver_fallback(&crate::driver::ClaudeDriver, text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "X");
     }
@@ -986,14 +1008,29 @@ mod tests {
         // An earlier mention (e.g. echoing instructions) is ignored in favour
         // of the final, real block.
         let text = "I will emit FOLLOWUPS: later.\n\nFOLLOWUPS:\n[{\"proposed_name\": \"Real\", \"proposed_description\": \"d\"}]";
-        let entries = followups_from_driver_fallback(text, "e1");
+        let entries = followups_from_driver_fallback(&crate::driver::ClaudeDriver, text, "e1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].proposed_name, "Real");
     }
 
     #[test]
     fn followups_fallback_empty_without_sentinel() {
-        assert!(followups_from_driver_fallback("no block here [1,2,3]", "e1").is_empty());
+        assert!(followups_from_driver_fallback(&crate::driver::ClaudeDriver, "no block here [1,2,3]", "e1").is_empty());
+    }
+
+    /// `followups_from_driver_fallback` must dispatch to whichever driver it
+    /// is given, not a hardcoded `ClaudeDriver`: Codex declares no
+    /// FOLLOWUPS-block convention (`structured_output_fallback` always
+    /// returns `Vec::new()`), so the exact text that parses under Claude's
+    /// convention must yield nothing under Codex's.
+    #[test]
+    fn followups_fallback_is_empty_for_a_driver_with_no_convention() {
+        let text = "Some summary.\n\nFOLLOWUPS:\n```json\n[{\"proposed_name\": \"Wire retries\", \"proposed_description\": \"add backoff\"}]\n```\n";
+        assert!(!followups_from_driver_fallback(&crate::driver::ClaudeDriver, text, "e1").is_empty());
+        assert!(
+            followups_from_driver_fallback(&crate::driver::CodexDriver::default(), text, "e1").is_empty(),
+            "Codex declares no FOLLOWUPS convention; this must not silently reuse Claude's parser",
+        );
     }
 
     #[test]

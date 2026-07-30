@@ -656,6 +656,60 @@ async fn on_stop_recovers_pr_url_from_the_driver_final_message_producer() {
     }
 }
 
+/// The driver's PR-URL fallback used to hardcode `ClaudeDriver`
+/// unconditionally, so a Codex-attributed execution's Claude-shaped "bare
+/// URL on its own line" transcript would still be recovered even though
+/// Codex declares no PR-URL prose convention
+/// (`CodexDriver::structured_output_fallback` always returns `Vec::new()`).
+/// After the fix, the fallback resolves the run's *actual* driver, so a
+/// Codex-attributed chore must fall through to the cold-path detector
+/// instead of parsing the Claude-shaped line.
+///
+/// This is sound only because `fixture()` spawns a main-pool worker
+/// (`"worker-1"`) on a chore with no `source_automation_id` — the row's own
+/// `driver` column genuinely governs a main-pool run, unlike a `pr_review` or
+/// `automation_triage` execution, which always runs on the review/automation
+/// pool and so always resolves to that pool's fixed driver regardless of the
+/// row's `driver` column (see `driver_transcript::driver_for_execution`).
+/// Assert that precondition here so this test does not silently start
+/// asserting the wrong invariant if `fixture()` ever gains automation
+/// provenance.
+#[tokio::test]
+async fn on_stop_ignores_claude_shaped_driver_fallback_for_non_claude_driver() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) | WorkItem::Task(t) => assert_eq!(
+            t.source_automation_id, None,
+            "precondition: this test's invariant (row driver governs) only holds for a \
+             main-pool execution with no automation provenance",
+        ),
+        other => panic!("expected chore, got {other:?}"),
+    }
+    set_work_item_driver(&db, &chore_id, "codex");
+    let detector = StubPrDetector::ok(Some("https://github.com/spinyfin/mono/pull/999"));
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "Done. Tests pass.\n\nhttps://github.com/spinyfin/mono/pull/458",
+    );
+
+    let TestHarness { handler, .. } = TestHarness::new(db.clone(), detector.clone());
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewerEnqueued { ref pr_url }
+            if pr_url == "https://github.com/spinyfin/mono/pull/999"),
+        "a Codex-attributed run must fall through to the cold-path detector \
+         instead of Claude's fallback convention; got {outcome:?}",
+    );
+    assert_eq!(
+        detector.call_count(),
+        1,
+        "the cold-path detector must be consulted since Codex offers no driver fallback",
+    );
+}
+
 #[tokio::test]
 async fn on_stop_uses_staged_pr_url_and_skips_detector() {
     // Primary path: the worker ran `gh pr create` mid-run, the

@@ -374,6 +374,101 @@ async fn pr_review_pass_clean_advances_to_in_review_without_revision() {
     );
 }
 
+/// The `ReviewResult` fallback used to resolve the *reviewed row's* driver
+/// (`tasks.driver`) rather than the driver the reviewer run actually used.
+/// But `pr_review` executions always dispatch on the review pool
+/// (`pr_review_exec_fixture`'s fixed `"review-worker-1"` worker id), which
+/// always runs Claude regardless of the producing row's own driver column
+/// (see `coordinator::pool_dispatch_policy_for_worker_id`) — so a
+/// codex-attributed producing chore still gets reviewed by Claude, and its
+/// Claude-shaped fenced-JSON transcript must still be recovered exactly as
+/// for a Claude-attributed chore. `driver_transcript::driver_for_execution`
+/// resolves the pool's driver ahead of the row's, so this must advance to
+/// `in_review` rather than falling into the re-prompt path.
+#[tokio::test]
+async fn pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_chore() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json = clean_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json));
+
+    set_work_item_driver(&db, &chore_id, "codex");
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+        "a codex-attributed chore's reviewer is still a Claude reviewer pane (review-pool \
+         dispatch always overrides the row's driver), so its Claude-shaped transcript must \
+         still be recovered; got {outcome:?}",
+    );
+
+    let item = db.get_work_item(&chore_id).unwrap();
+    let task = match item {
+        WorkItem::Chore(t) | WorkItem::Task(t) => t,
+        other => panic!("expected task/chore, got {other:?}"),
+    };
+    assert_eq!(
+        task.status,
+        TaskStatus::InReview,
+        "chore must advance to in_review even though its own `driver` column is codex",
+    );
+}
+
+/// The automation-triage counterpart of the pr_review test above.
+/// `finalize_automation_triage` always dispatches on the automation pool
+/// (`auto-worker-N`), which forces Claude regardless of what the automated
+/// row/product carries — but `automation_triage_fixture`'s execution's own
+/// `work_item_id` is the automation id, not a `tasks` row, so
+/// `get_execution_driver_slug`'s join never reaches it and the row-driver
+/// fallback resolves `None` today. The pool override makes this correct *by
+/// construction* rather than by that (fragile) coincidence: pin it here so a
+/// future change to the join or the pool prefixes can't silently change which
+/// parser reads a triage transcript.
+#[tokio::test]
+async fn automation_triage_recovers_claude_shaped_fallback_dispatched_on_the_automation_pool() {
+    let workspace = tempdir().unwrap();
+    let (_dir, db, automation_id, execution_id) =
+        automation_triage_fixture_dispatched_as(workspace.path(), "auto-worker-1");
+
+    // A non-Claude product default driver, so a regression that made the row
+    // side reachable (a widened join) would still resolve non-Claude without
+    // the pool override.
+    let product_id = db.get_automation(&automation_id).unwrap().unwrap().product_id;
+    db.update_work_item(
+        &product_id,
+        crate::work::WorkItemPatch {
+            default_driver: Some("codex".to_owned()),
+            ..crate::work::WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "automation: skip — nothing actionable found",
+    );
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None)).handler;
+
+    let outcome = handler.on_stop(&execution_id).await;
+    match &outcome {
+        StopOutcome::AutomationTriage { outcome } => {
+            assert_eq!(
+                outcome, AUTOMATION_OUTCOME_SKIPPED,
+                "the Claude-shaped skip marker must still be recovered on the automation pool",
+            );
+        }
+        other => panic!("expected AutomationTriage(skipped), got {other:?}"),
+    }
+}
+
 /// A `ReviewResult` with a HIGH severity finding must trigger the engine's
 /// severity gate and create a revision on the producing task with the
 /// correct `created_via` prefix and rendered instructions.

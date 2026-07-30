@@ -219,3 +219,41 @@ checks:
           pattern: '\b[TP]\d{3,}\b'
           message: "Internal Boss work-item ids (T<n>/P<n>) must not appear in source. Remove the reference; if provenance is genuinely needed, put it in the PR description instead."
           severity: warning
+
+  # `structured_output_fallback` must always be invoked on the driver the run
+  # actually used, resolved via `driver_transcript::driver_for_execution` (or
+  # `driver_transcript::driver_or_default` on an already-resolved
+  # `Option<&dyn AgentDriver>`). A pool-dispatched execution (review/automation
+  # pool) runs a different driver than its own `tasks.driver` column, so a
+  # hardcoded `ClaudeDriver` receiver silently discards a valid
+  # prose-recovered result whenever the two disagree.
+  #
+  # The pattern requires the dot to follow `ClaudeDriver` with no intervening
+  # `)`, so it does NOT flag the sanctioned fail-safe idiom
+  # (`driver_or_default(driver.as_deref()).structured_output_fallback(...)`),
+  # where a `)` from `driver_or_default(...)` always separates the two — only
+  # a direct, unconditional `ClaudeDriver.structured_output_fallback(` (with no
+  # resolution step at all) matches.
+  #
+  # Known narrow spot: this does not cover a hardcoded `ClaudeDriver` passed as
+  # an argument into a forwarder that itself calls `structured_output_fallback`
+  # (e.g. `followups_from_driver_fallback(&ClaudeDriver, ..)`). That shape is
+  # legitimately sanctioned at `extract_followups_backstop`'s own forwarding
+  # call — it parses the utility model's own answer, which is always
+  # Claude-shaped regardless of the run's driver — so a pattern matching it
+  # would flag correct code, not just the regression this check exists to
+  # catch. Enforcing that half requires call-site-aware review, not a text
+  # pattern.
+  - id: boss-ism/hardcoded-claude-driver-fallback
+    check: text/forbidden-pattern
+    policy:
+      severity: error
+      changed_lines_only: false
+    config:
+      surfaces:
+        - files
+      patterns:
+        - name: hardcoded-claude-driver-structured-output-fallback
+          pattern: 'ClaudeDriver\.structured_output_fallback\('
+          message: "Do not call ClaudeDriver.structured_output_fallback(...) directly. Resolve the run's actual driver via driver_transcript::driver_for_execution (or driver_transcript::driver_or_default) first — a pool-dispatched or non-Claude-driven execution must not be parsed as if it always ran Claude."
+          severity: error

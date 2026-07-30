@@ -38,9 +38,22 @@ use crate::transcript_markdown::TranscriptEvent;
 use crate::work::WorkDb;
 
 /// The [`AgentDriver`] governing `execution_id`, resolved through the same
-/// `tasks.driver` → `products.default_driver` → engine-default precedence
-/// used at spawn time ([`WorkDb::get_execution_driver_slug`]) and the same
-/// [`DriverRegistry`] every other call site looks slugs up in.
+/// precedence used at spawn time: a pool-dispatched run (review/automation
+/// pool worker) always resolves to
+/// [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed driver,
+/// ahead of and overriding the reviewed/automated row's own
+/// `tasks.driver` → `products.default_driver` → engine-default chain
+/// ([`WorkDb::get_execution_driver_slug`]) — exactly the precedence
+/// `worker_spawn::effective_task_driver_for_worker` applies at spawn. The
+/// resolved slug is looked up in the same [`DriverRegistry`] every other call
+/// site uses.
+///
+/// Without this override, a `pr_review` or `automation_triage` execution
+/// (both always dispatched on the review/automation pool, which forces
+/// Claude regardless of the row's own driver) would resolve the *reviewed
+/// row's* driver instead of the driver the run actually used — parsing a
+/// Claude reviewer's transcript with a non-Claude producer, which silently
+/// discards a valid prose-recovered result.
 ///
 /// `None` (with a WARN) when the execution has no resolvable slug or the slug
 /// is not registered in this binary. Callers fall back to an un-normalized
@@ -48,26 +61,7 @@ use crate::work::WorkDb;
 /// historical behaviour, and dropping a whole Stop-boundary read on a slug
 /// lookup would lose markers that a raw parse can still recover.
 pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<dyn AgentDriver>> {
-    let slug = match work_db.get_execution_driver_slug(execution_id) {
-        Ok(Some(slug)) => slug,
-        Ok(None) => {
-            tracing::debug!(
-                execution_id,
-                "driver transcript: no driver slug resolves for this execution; \
-                 reading the transcript without driver normalization",
-            );
-            return None;
-        }
-        Err(err) => {
-            tracing::warn!(
-                execution_id,
-                error = %format!("{err:#}"),
-                "driver transcript: driver slug lookup failed; reading the transcript \
-                 without driver normalization",
-            );
-            return None;
-        }
-    };
+    let slug = resolve_execution_driver_slug(work_db, execution_id)?;
     match DriverRegistry::default().require(&slug) {
         Ok(driver) => Some(driver),
         Err(err) => {
@@ -77,6 +71,76 @@ pub fn driver_for_execution(work_db: &WorkDb, execution_id: &str) -> Option<Arc<
                 %err,
                 "driver transcript: unknown driver slug; reading the transcript without \
                  driver normalization",
+            );
+            None
+        }
+    }
+}
+
+/// The `ClaudeDriver` fail-safe every Stop-boundary fallback site falls back
+/// to when its own driver resolution came up empty.
+static CLAUDE_FALLBACK: crate::driver::ClaudeDriver = crate::driver::ClaudeDriver;
+
+/// Defaults an already-resolved `Option<&dyn AgentDriver>` — the shape every
+/// Stop-boundary fallback site holds after calling [`driver_for_execution`] or
+/// the `read_final_triage_message_with_driver` helper those sites share — to
+/// [`crate::driver::ClaudeDriver`]. The single documented home for the
+/// `driver.as_deref().unwrap_or(&ClaudeDriver)` idiom, instead of that idiom
+/// being spelled out at each call site.
+pub fn driver_or_default(driver: Option<&dyn AgentDriver>) -> &dyn AgentDriver {
+    driver.unwrap_or(&CLAUDE_FALLBACK)
+}
+
+/// The driver slug that actually governed `execution_id`'s run: the pool's
+/// fixed driver for a review/automation-pool worker, else the reviewed row's
+/// own `tasks.driver` → `products.default_driver` → engine-default chain.
+///
+/// `pub(crate)` so call sites that only need the slug (not a resolved
+/// [`AgentDriver`]) — e.g. [`crate::worker_process_exit::one_turn_per_process`],
+/// which asks a driver for its [`crate::driver::WorkerProcessLifetime`] rather
+/// than for transcript parsing — go through the same pool-dispatch-aware
+/// resolution instead of reading `tasks.driver` directly and mis-resolving a
+/// pool-dispatched run's actual driver.
+pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+    if let Some(slug) = pool_override_driver_slug(work_db, execution_id) {
+        return Some(slug);
+    }
+    match work_db.get_execution_driver_slug(execution_id) {
+        Ok(Some(slug)) => Some(slug),
+        Ok(None) => {
+            tracing::debug!(
+                execution_id,
+                "driver transcript: no driver slug resolves for this execution; \
+                 reading the transcript without driver normalization",
+            );
+            None
+        }
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: driver slug lookup failed; reading the transcript \
+                 without driver normalization",
+            );
+            None
+        }
+    }
+}
+
+/// The pool's fixed driver slug when `execution_id`'s latest run's worker id
+/// is a review/automation-pool worker, else `None` (main-pool workers fall
+/// through to the row's own driver, unchanged).
+fn pool_override_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+    match work_db.latest_run_agent_id_for_execution(execution_id) {
+        Ok(Some(worker_id)) => {
+            crate::coordinator::pool_dispatch_policy_for_worker_id(&worker_id).map(|policy| policy.driver.to_owned())
+        }
+        Ok(None) => None,
+        Err(err) => {
+            tracing::warn!(
+                execution_id,
+                error = %format!("{err:#}"),
+                "driver transcript: worker id lookup failed; skipping pool-dispatch override",
             );
             None
         }
@@ -256,6 +320,66 @@ mod tests {
         assert!(
             assistant_texts(&events).iter().any(|text| text.contains(marker)),
             "parse_execution_transcript must normalize through the execution's own driver",
+        );
+    }
+
+    /// A review-pool worker id (`review-N`) must override a codex-attributed
+    /// row's own driver: the reviewer pane is always a Claude pane regardless
+    /// of what the row under review carries. Mirrors
+    /// `worker_spawn::effective_task_driver_for_worker`'s precedence and pins
+    /// the same shape `completion/tests/t04.rs::
+    /// pr_review_pass_recovers_claude_shaped_fallback_for_codex_attributed_chore`
+    /// exercises end-to-end, but in the module that actually owns the
+    /// precedence decision.
+    #[test]
+    fn pool_override_wins_over_a_codex_attributed_row_for_a_review_pool_worker() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "review-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+
+        let driver = driver_for_execution(&db, &execution.id).expect("claude driver must resolve");
+        assert_eq!(
+            driver.descriptor().name,
+            "claude",
+            "a review-pool worker id must override the row's own codex driver",
+        );
+    }
+
+    /// The main-pool counterpart of the above: a `worker-N` agent id is not a
+    /// pool-dispatch override, so the row's own codex driver must still win.
+    #[test]
+    fn main_pool_worker_falls_through_to_the_row_driver() {
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "codex chore");
+        db.update_work_item(
+            &chore.id,
+            WorkItemPatch {
+                driver: Some("codex".to_owned()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        db.start_execution_run(&execution.id, "worker-1", "mono", "lease-1", "ws-1", "/tmp/ws-1")
+            .unwrap();
+
+        let driver = driver_for_execution(&db, &execution.id).expect("codex driver must resolve");
+        assert_eq!(
+            driver.descriptor().name,
+            "codex",
+            "a main-pool worker id must not override the row's own driver",
         );
     }
 

@@ -231,20 +231,21 @@ impl WorkerCompletionHandler {
         true
     }
 
-    /// Stage a PR URL recovered from the worker's prose by the **driver's**
-    /// fallback producer — for Claude, the "print the PR URL on its own line
-    /// as the final thing in your final response" convention. Returns `true`
-    /// when a URL was newly staged.
+    /// Stage a PR URL recovered from the worker's prose by the **run's own
+    /// driver's** fallback producer — for Claude, the "print the PR URL on
+    /// its own line as the final thing in your final response" convention.
+    /// Returns `true` when a URL was newly staged.
     ///
     /// Consulted only after the artifact and the hook stream have both come up
     /// empty, and only for a parked worker, because it costs a transcript read
     /// and the alternative it competes with is the far more expensive cold-path
     /// `detect_pr` reconstruction.
     async fn stage_pr_url_from_driver_prose(&self, execution: &crate::work::WorkExecution) -> bool {
-        let Some(text) = self.read_final_triage_message(&execution.id).await.into_message() else {
+        let (driver, transcript) = self.read_final_triage_message_with_driver(&execution.id).await;
+        let Some(text) = transcript.into_message() else {
             return false;
         };
-        let candidates = crate::driver::ClaudeDriver
+        let candidates = crate::driver_transcript::driver_or_default(driver.as_deref())
             .structured_output_fallback(crate::structured_output::StructuredOutputKind::PrUrl, &text);
         let staged = candidates
             .iter()

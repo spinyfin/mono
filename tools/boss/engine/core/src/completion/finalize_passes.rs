@@ -62,13 +62,13 @@ impl WorkerCompletionHandler {
         // no-decision detail below distinguishes "ran but reported nothing"
         // from "produced no transcript at all" — but it is only the *fallback*
         // channel for the decision itself.
-        let transcript = self.read_final_triage_message(&execution.id).await;
+        let (driver, transcript) = self.read_final_triage_message_with_driver(&execution.id).await;
         let final_message = match &transcript {
             TriageTranscript::FinalMessage(text) => Some(text.as_str()),
             TriageTranscript::NoPath | TriageTranscript::Unreadable | TriageTranscript::NoAssistantText { .. } => None,
         };
         let decision = crate::automation_triage::resolve_triage_decision(
-            &crate::driver::ClaudeDriver,
+            crate::driver_transcript::driver_or_default(driver.as_deref()),
             &self.structured_output_dir,
             &execution.id,
             final_message,
@@ -551,29 +551,33 @@ impl WorkerCompletionHandler {
         };
         let review_result = match from_artifact {
             Some(result) => Some(result),
-            None => match self.read_final_triage_message(&execution.id).await.into_message() {
-                None => None,
-                Some(text) => {
-                    let candidates = crate::driver::ClaudeDriver.structured_output_fallback(
-                        crate::structured_output::StructuredOutputKind::ReviewResult,
-                        &text,
-                    );
-                    let (result, err) = crate::pr_review::review_result_from_candidates(&candidates);
-                    if let Some(ref e) = err {
-                        tracing::warn!(
-                            execution_id = %execution.id,
-                            producing_task_id,
-                            error = %e,
-                            "pr_review finalize: transcript JSON block present but did not \
-                             validate as ReviewResult",
-                        );
-                        if parse_error.is_none() {
-                            parse_error = err;
+            None => {
+                let (driver, transcript) = self.read_final_triage_message_with_driver(&execution.id).await;
+                match transcript.into_message() {
+                    None => None,
+                    Some(text) => {
+                        let candidates = crate::driver_transcript::driver_or_default(driver.as_deref())
+                            .structured_output_fallback(
+                                crate::structured_output::StructuredOutputKind::ReviewResult,
+                                &text,
+                            );
+                        let (result, err) = crate::pr_review::review_result_from_candidates(&candidates);
+                        if let Some(ref e) = err {
+                            tracing::warn!(
+                                execution_id = %execution.id,
+                                producing_task_id,
+                                error = %e,
+                                "pr_review finalize: transcript JSON block present but did not \
+                                 validate as ReviewResult",
+                            );
+                            if parse_error.is_none() {
+                                parse_error = err;
+                            }
                         }
+                        result
                     }
-                    result
                 }
-            },
+            }
         };
 
         // Neither the artifact nor the transcript yielded a valid ReviewResult.
@@ -1018,6 +1022,33 @@ impl WorkerCompletionHandler {
     /// text). Re-reading the same durable path a few times catches the write
     /// once it lands instead of racing it once.
     pub(super) async fn read_final_triage_message(&self, execution_id: &str) -> TriageTranscript {
+        self.read_final_triage_message_with_driver(execution_id).await.1
+    }
+
+    /// [`Self::read_final_triage_message`], additionally handing back the
+    /// driver it resolved while reading. Callers that need both the message
+    /// text and the driver (the `pr_review` and PR-URL-prose fallbacks, which
+    /// both feed the text into that same driver's `structured_output_fallback`)
+    /// should call this instead of `read_final_triage_message` followed by a
+    /// second, separate [`crate::driver_transcript::driver_for_execution`] —
+    /// the driver lookup is a DB round trip, and this function already pays
+    /// it once.
+    pub(super) async fn read_final_triage_message_with_driver(
+        &self,
+        execution_id: &str,
+    ) -> (Option<std::sync::Arc<dyn crate::driver::AgentDriver>>, TriageTranscript) {
+        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, execution_id);
+        let transcript = self
+            .read_final_triage_message_inner(execution_id, driver.as_deref())
+            .await;
+        (driver, transcript)
+    }
+
+    async fn read_final_triage_message_inner(
+        &self,
+        execution_id: &str,
+        driver: Option<&dyn crate::driver::AgentDriver>,
+    ) -> TriageTranscript {
         let path = match self.work_db.transcript_path_for_execution(execution_id) {
             Ok(Some(path)) => path,
             Ok(None) => {
@@ -1033,9 +1064,10 @@ impl WorkerCompletionHandler {
             }
         };
 
-        // Resolved once, outside the retry loop: the run's driver cannot
-        // change between attempts, and the lookup is a DB round trip.
-        let driver = crate::driver_transcript::driver_for_execution(&self.work_db, execution_id);
+        // `driver` is resolved once by the caller (see
+        // `read_final_triage_message_with_driver`), outside the retry loop:
+        // the run's driver cannot change between attempts, and the lookup is
+        // a DB round trip.
         let mut last_event_count = 0usize;
         let mut last_content_len = 0usize;
         for attempt in 1..=TRIAGE_TRANSCRIPT_READ_ATTEMPTS {
@@ -1050,7 +1082,7 @@ impl WorkerCompletionHandler {
                     return TriageTranscript::Unreadable;
                 }
             };
-            let events = crate::driver_transcript::parse_transcript_with_driver(driver.as_deref(), &content);
+            let events = crate::driver_transcript::parse_transcript_with_driver(driver, &content);
             // Collect ALL assistant text turns, not just the last one.
             //
             // The triage agent emits its decision marker in the turn AFTER the
@@ -1104,10 +1136,7 @@ impl WorkerCompletionHandler {
         // driver wrote it so the ambiguity is attributable rather than silent.
         tracing::warn!(
             execution_id,
-            driver = driver
-                .as_ref()
-                .map(|driver| driver.descriptor().name)
-                .unwrap_or("(unresolved)"),
+            driver = driver.map(|driver| driver.descriptor().name).unwrap_or("(unresolved)"),
             transcript_bytes = last_content_len,
             event_count = last_event_count,
             attempts = TRIAGE_TRANSCRIPT_READ_ATTEMPTS,
