@@ -89,7 +89,7 @@ invocations:
         message: "{{item.msg}}"
         severity: "{{item.sev}}"
         remediations:
-          - "Fix the ESLint violation, or suppress with a justified `// eslint-disable-next-line` comment."
+          - "`checkleft fix` applies ESLint's auto-fixable violations. If the violation remains afterward, fix it manually, or suppress it with a justified `// eslint-disable-next-line` comment."
     fix:
       # --fix applies auto-fixable violations in place. Exit 1 means unfixable errors
       # remain — that is not a fix error; the post-verify pass will report the residue.

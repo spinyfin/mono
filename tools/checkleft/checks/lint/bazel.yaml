@@ -38,7 +38,7 @@ invocations:
         message: "{{item.category}}: {{item.message}}"
         severity: warning
         remediations:
-          - "Run `buildifier --lint=fix {{input.file}}` to auto-fix, or resolve manually."
+          - "If `checkleft fix` cannot resolve it, run `buildifier --lint=fix {{input.file}}`, or resolve manually."
     fix:
       # -lint=fix -mode=fix applies lint fixes and rewrites files in place (batch).
       # Override mode to batch: one process covers all files, unlike the per_file check.
