@@ -30,8 +30,18 @@ private struct ProseMeasureClamped<Content: View>: View {
     var body: some View {
         if let measure {
             content
-                .frame(maxWidth: measure, alignment: .leading)
+                // Fill the incoming proposal (the document column, which may
+                // be wider than `measure` when a table widened it) *first*.
+                // Without this, the next `.frame(maxWidth:)` sizes to the
+                // child's own *ideal* width — a short block (e.g. a list
+                // item) would collapse to a narrow box, and centering that
+                // would misalign it against its neighbors.
                 .frame(maxWidth: .infinity, alignment: .leading)
+                // Clamp the now-full-width column to the readable measure.
+                .frame(maxWidth: measure)
+                // Center that fixed-measure column within the document
+                // column, on the same axis tables are centered on.
+                .frame(maxWidth: .infinity, alignment: .center)
         } else {
             content
         }
@@ -39,13 +49,11 @@ private struct ProseMeasureClamped<Content: View>: View {
 }
 
 extension View {
-    /// Clamps prose content to `markdownProseMeasure` (when set), left-
-    /// aligned. A plain `.frame(maxWidth:)` sizes to the child's *ideal*
-    /// width, so a short block (e.g. a list item) centered inside a wider
-    /// document column would otherwise become a narrow box that no longer
-    /// lines up with its neighbors — `alignment: .leading` on both frames
-    /// keeps every prose block anchored to the same left edge regardless of
-    /// its own width.
+    /// Clamps prose content to `markdownProseMeasure` (when set) and centers
+    /// the resulting column within the document measure, while keeping every
+    /// prose block's own left edge aligned with its neighbors — see
+    /// `ProseMeasureClamped` for why the fill-then-clamp-then-center order
+    /// matters.
     fileprivate func proseMeasureClamped() -> some View {
         ProseMeasureClamped(content: self)
     }
@@ -213,25 +221,32 @@ struct BossTableStyle: StructuredText.TableStyle {
     // code span inside a striped row blends rather than stacking into a
     // third shade.
     private static let stripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
-    // Hard cap on top of the document's own width, for tables wide enough to
-    // still overflow it. Anything above 1.0 guarantees a table with even one
-    // prose-length column resolves at or near the cap — which is by
-    // definition wider than the scroll container — so its rightmost column
-    // is permanently clipped rather than reachable by resizing the window;
-    // 1.0 keeps the cap at "grow to fill the column, no further" and lets
-    // `Overflow` scrolling be the safety valve only once the table's own
-    // minimum content width exceeds the column.
-    private static let relativeWidth: CGFloat = 1.0
 
     func makeBody(configuration: Configuration) -> some View {
         // `Overflow` is Textual's sanctioned horizontal-scroll container: a
         // bare `ScrollView(.horizontal)` here would interfere with the
         // AppKit text-selection gestures the document view relies on.
-        // Content still sizes to itself (the `Grid` the library renders a
-        // table as) up to `relativeWidth` of the available width — content-
-        // driven-up-to-a-cap, not a fixed or proportionally stretched width.
+        //
+        // Previously this applied `.frame(maxWidth: state.containerWidth,
+        // alignment: .leading)` to `configuration.label` (the `Grid` the
+        // library renders a table as) to cap its width at the visible
+        // column. That clamp is what clipped table content: a `Grid` given
+        // a *bounded* proposal shrinks its columns to fit rather than
+        // reporting its true content width, so `Overflow`'s `ScrollView`
+        // believed the content was exactly `containerWidth` wide (no scroll
+        // room) while the `Grid` still painted its uncompressed content
+        // past that boundary — clipped by the `ScrollView`'s own bounds,
+        // and unreachable by scrolling since the scroll extent never grew
+        // to match.
+        //
+        // The fix is `minWidth`, not `maxWidth`: it only ever *grows* the
+        // box to fill a container wider than the table's natural content
+        // (centering a narrow table on the document's axis), and never
+        // shrinks the `Grid` below its natural width — so it can never
+        // compress a column or clip content. A table wider than
+        // `containerWidth` keeps its full natural size and `Overflow`
+        // scrolls to reach all of it.
         Overflow { state in
-            let maxWidth = state.containerWidth.map { $0 * Self.relativeWidth }
             configuration.label
                 .fixedSize(horizontal: false, vertical: true)
                 .textual.tableBackground { layout in
@@ -254,7 +269,7 @@ struct BossTableStyle: StructuredText.TableStyle {
                         }
                     }
                 }
-                .frame(maxWidth: maxWidth, alignment: .leading)
+                .frame(minWidth: state.containerWidth, alignment: .center)
                 .padding(Self.borderWidth)
                 .overlay(
                     RoundedRectangle(cornerRadius: Self.cornerRadius)
