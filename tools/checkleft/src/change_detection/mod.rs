@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::vcs::{Vcs, VcsKind};
 
+pub use self::base::ChangesetUndetermined;
 use self::base::{BaseSelection, EmptyReason, GitHeadProber, HeadProber, JjHeadProber, select_base};
 use self::default_branch::{RefProber, resolve_default_branch};
 use self::environment::CiEnvironment;
@@ -95,9 +96,19 @@ pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOve
     if let Some(base_ref) = overrides.base_ref.as_deref().filter(|s| !s.trim().is_empty()) {
         info!(base_ref, "--base-ref override: computing merge-base(ref, HEAD)");
         let prober = head_prober_for(vcs.kind(), vcs.root());
-        let base_sha = prober
-            .merge_base(base_ref)
-            .ok_or_else(|| anyhow::anyhow!("git merge-base: no common ancestor between `{base_ref}` and HEAD"))?;
+        let base_sha = match prober.merge_base(base_ref) {
+            Some(sha) => sha,
+            None => {
+                return Err(ChangesetUndetermined {
+                    reason: EmptyReason::NoMergeBase,
+                    detail: Some(format!(
+                        "--base-ref `{base_ref}` has no common ancestor with HEAD \
+                         (typo in the ref, unrelated histories, or a root commit)."
+                    )),
+                }
+                .into());
+            }
+        };
         info!(base_ref, base_sha, "--base-ref resolved to sha");
         return Ok(ChangePlan::Scoped {
             base_sha,
@@ -140,18 +151,22 @@ pub fn resolve_change_plan(env: &CiEnvironment, vcs: &Vcs, overrides: &ChangeOve
             // does not exist on the remote (wrong default-branch config, orphaned branch,
             // etc.).
             Scenario::PullRequest { .. } | Scenario::PushToBranch { .. } | Scenario::Local => {
-                anyhow::bail!(
-                    "base ref `{needed_ref}` is unreachable even after attempting to fetch \
-                     and unshallow the repository.\n\
-                     Tried: explicit fetch, --deepen={}, --deepen={}, --deepen={}, --unshallow\n\
-                     The base branch may not exist on the remote or may not have been fetched. Run:\n\
-                     \n    git fetch origin {}\n\n\
-                     then re-run checkleft.",
-                    crate::change_detection::shallow::DEEPEN_LADDER[0],
-                    crate::change_detection::shallow::DEEPEN_LADDER[1],
-                    crate::change_detection::shallow::DEEPEN_LADDER[2],
-                    needed_ref.strip_prefix("origin/").unwrap_or(&needed_ref),
-                );
+                return Err(ChangesetUndetermined {
+                    reason: EmptyReason::NoMergeBase,
+                    detail: Some(format!(
+                        "base ref `{needed_ref}` is unreachable even after attempting to fetch \
+                         and unshallow the repository.\n\
+                         Tried: explicit fetch, --deepen={}, --deepen={}, --deepen={}, --unshallow\n\
+                         The base branch may not exist on the remote or may not have been fetched. Run:\n\
+                         \n    git fetch origin {}\n\n\
+                         then re-run checkleft.",
+                        crate::change_detection::shallow::DEEPEN_LADDER[0],
+                        crate::change_detection::shallow::DEEPEN_LADDER[1],
+                        crate::change_detection::shallow::DEEPEN_LADDER[2],
+                        needed_ref.strip_prefix("origin/").unwrap_or(&needed_ref),
+                    )),
+                }
+                .into());
             }
             // MergeQueue and PushToDefault only need HEAD^1; deepen=1 always
             // succeeds for non-root commits, so base_reachable is always true here.

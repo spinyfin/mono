@@ -1816,3 +1816,226 @@ async fn attach_description_context_splits_tip_leakage_from_range_bypass() {
         "bypass_reason must resolve directives from the full-range surface"
     );
 }
+
+// ── changeset_from_plan: "could not determine what changed" must be an error ──
+//
+// `ChangePlan::Empty` means checkleft could not determine what changed (never
+// "there were no changes" — that's a `Scoped` plan with a zero-length
+// changeset, covered separately below). Each `EmptyReason` must surface as a
+// `ChangesetUndetermined` naming that reason, mapped by `exit_code_for_error`
+// to a distinct, non-zero exit code.
+
+mod changeset_undetermined {
+    use std::fs;
+    use std::process::Command;
+
+    use checkleft::change_detection::base::EmptyReason;
+    use checkleft::change_detection::environment::CiEnvironment;
+    use checkleft::change_detection::{ChangeOverrides, ChangePlan, ChangesetUndetermined, resolve_change_plan};
+    use checkleft::vcs::Vcs;
+    use tempfile::tempdir;
+
+    fn git(root: &std::path::Path, args: &[&str]) {
+        let out = Command::new("git").args(args).current_dir(root).output().expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn git_out(root: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(root).output().expect("git");
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).expect("utf-8").trim().to_owned()
+    }
+
+    fn init_repo(default_branch: &str) -> tempfile::TempDir {
+        let dir = tempdir().expect("tempdir");
+        git(dir.path(), &["init", "-b", default_branch]);
+        git(dir.path(), &["config", "user.email", "test@checkleft.example"]);
+        git(dir.path(), &["config", "user.name", "Checkleft Test"]);
+        dir
+    }
+
+    fn commit(root: &std::path::Path, name: &str, content: &str, msg: &str) -> String {
+        fs::write(root.join(name), content).expect("write file");
+        git(root, &["add", name]);
+        git(root, &["commit", "-m", msg]);
+        git_out(root, &["rev-parse", "HEAD"])
+    }
+
+    fn auto() -> ChangeOverrides {
+        ChangeOverrides {
+            all: false,
+            base_ref: None,
+            default_branch: None,
+        }
+    }
+
+    /// Requirement 1 (Done definition): a genuinely empty diff — a `Scoped`
+    /// plan whose changeset happens to be empty — is unaffected by this fix
+    /// and must still resolve `Ok` with no changed files.
+    #[test]
+    fn genuinely_empty_diff_stays_ok_not_undetermined() {
+        let dir = init_repo("main");
+        let head = commit(dir.path(), "base.txt", "base\n", "initial");
+        let vcs = Vcs::detect(dir.path()).expect("detect vcs");
+        let plan = ChangePlan::Scoped {
+            base_sha: head,
+            scenario: checkleft::change_detection::scenario::Scenario::Local,
+        };
+
+        let changeset = super::super::changeset_from_plan(&vcs, &plan).expect("genuinely empty diff must be Ok");
+        assert!(
+            changeset.changed_files.is_empty(),
+            "base_sha == HEAD must yield zero changed files"
+        );
+    }
+
+    /// Reason 1/2: no merge base (root commit / unrelated histories). Fixture:
+    /// an orphan branch sharing no history with `main`.
+    #[test]
+    fn no_merge_base_reports_reason_and_distinct_exit_code() {
+        let dir = init_repo("main");
+        commit(dir.path(), "base.txt", "base\n", "A: base on main");
+        git(dir.path(), &["checkout", "--orphan", "feature"]);
+        git(dir.path(), &["rm", "-rf", "--cached", "."]);
+        std::fs::remove_file(dir.path().join("base.txt")).ok();
+        commit(dir.path(), "feature.rs", "fn feature() {}\n", "X: orphan root");
+
+        let vcs = Vcs::detect(dir.path()).expect("detect vcs");
+        let env = CiEnvironment {
+            github_actions: true,
+            github_event_name: Some("pull_request".to_owned()),
+            github_base_ref: Some("main".to_owned()),
+            ci: true,
+            ..Default::default()
+        };
+        let plan = resolve_change_plan(&env, &vcs, &auto()).expect("resolve_change_plan");
+        assert_eq!(
+            plan,
+            ChangePlan::Empty {
+                reason: EmptyReason::NoMergeBase
+            }
+        );
+
+        let err = super::super::changeset_from_plan(&vcs, &plan).expect_err("must not silently pass");
+        let undetermined = err
+            .downcast_ref::<ChangesetUndetermined>()
+            .expect("error must be ChangesetUndetermined");
+        assert_eq!(undetermined.reason, EmptyReason::NoMergeBase);
+        let message = err.to_string();
+        assert!(
+            message.contains("no common ancestor"),
+            "message must name the specific reason: {message}"
+        );
+
+        let code = super::super::exit_code_for_error(&err);
+        assert_eq!(code, super::super::EXIT_CHANGESET_UNDETERMINED);
+        assert_ne!(
+            code,
+            super::super::EXIT_CHECKS_FAILED,
+            "'could not determine changes' must use a different exit code than 'checks found problems'"
+        );
+    }
+
+    /// Reason 2/2: detached HEAD with no accessible parent commit. Fixture: an
+    /// orphan root commit, checked out detached.
+    #[test]
+    fn detached_head_no_parent_reports_reason_and_distinct_exit_code() {
+        let dir = init_repo("main");
+        commit(dir.path(), "base.txt", "base\n", "A: base on main");
+        git(dir.path(), &["checkout", "--orphan", "orphan"]);
+        git(dir.path(), &["rm", "-rf", "--cached", "."]);
+        std::fs::remove_file(dir.path().join("base.txt")).ok();
+        commit(dir.path(), "z.txt", "z\n", "Z: orphan root");
+        let root_commit = git_out(dir.path(), &["rev-parse", "HEAD"]);
+        git(dir.path(), &["checkout", &root_commit]);
+
+        let vcs = Vcs::detect(dir.path()).expect("detect vcs");
+        let plan = resolve_change_plan(&CiEnvironment::default(), &vcs, &auto()).expect("resolve_change_plan");
+        assert_eq!(
+            plan,
+            ChangePlan::Empty {
+                reason: EmptyReason::DetachedHeadNoParent
+            }
+        );
+
+        let err = super::super::changeset_from_plan(&vcs, &plan).expect_err("must not silently pass");
+        let undetermined = err
+            .downcast_ref::<ChangesetUndetermined>()
+            .expect("error must be ChangesetUndetermined");
+        assert_eq!(undetermined.reason, EmptyReason::DetachedHeadNoParent);
+        let message = err.to_string();
+        assert!(
+            message.contains("detached") || message.contains("parent"),
+            "message must name the specific reason: {message}"
+        );
+
+        let code = super::super::exit_code_for_error(&err);
+        assert_eq!(code, super::super::EXIT_CHANGESET_UNDETERMINED);
+        assert_ne!(code, super::super::EXIT_CHECKS_FAILED);
+    }
+
+    /// An unresolvable `--base-ref` override must also be reported as
+    /// "could not determine what changed", not a generic error indistinguishable
+    /// from "checks found problems".
+    #[test]
+    fn unresolvable_base_ref_override_is_changeset_undetermined() {
+        let dir = init_repo("main");
+        commit(dir.path(), "base.txt", "base\n", "initial");
+        // A second, disconnected root commit: "totally-unrelated" shares no
+        // history with HEAD, so `git merge-base` returns nothing for it.
+        git(dir.path(), &["checkout", "--orphan", "unrelated"]);
+        git(dir.path(), &["rm", "-rf", "--cached", "."]);
+        std::fs::remove_file(dir.path().join("base.txt")).ok();
+        commit(dir.path(), "u.txt", "u\n", "unrelated root");
+        git(dir.path(), &["checkout", "main"]);
+
+        let vcs = Vcs::detect(dir.path()).expect("detect vcs");
+        let overrides = ChangeOverrides {
+            all: false,
+            base_ref: Some("unrelated".to_owned()),
+            default_branch: None,
+        };
+        let err = resolve_change_plan(&CiEnvironment::default(), &vcs, &overrides)
+            .expect_err("unresolvable --base-ref must error, not silently mis-scope");
+        let undetermined = err
+            .downcast_ref::<ChangesetUndetermined>()
+            .expect("error must be ChangesetUndetermined");
+        assert_eq!(undetermined.reason, EmptyReason::NoMergeBase);
+        assert!(
+            err.to_string().contains("--base-ref `unrelated`"),
+            "message must name the offending --base-ref value: {}",
+            err
+        );
+
+        let code = super::super::exit_code_for_error(&err);
+        assert_eq!(code, super::super::EXIT_CHANGESET_UNDETERMINED);
+    }
+
+    /// `exit_code_for_error` must map `ChangesetUndetermined` to a code distinct
+    /// from both success and the generic-failure code any other error gets.
+    #[test]
+    fn exit_code_for_error_distinguishes_undetermined_from_generic_failure() {
+        let undetermined: anyhow::Error = ChangesetUndetermined {
+            reason: EmptyReason::NoMergeBase,
+            detail: None,
+        }
+        .into();
+        assert_eq!(
+            super::super::exit_code_for_error(&undetermined),
+            super::super::EXIT_CHANGESET_UNDETERMINED
+        );
+
+        let generic = anyhow::anyhow!("some other failure");
+        assert_eq!(super::super::exit_code_for_error(&generic), 1);
+
+        assert_ne!(
+            super::super::EXIT_CHANGESET_UNDETERMINED,
+            super::super::EXIT_CHECKS_FAILED,
+            "the 'could not determine changes' code must differ from the 'checks found problems' code"
+        );
+    }
+}

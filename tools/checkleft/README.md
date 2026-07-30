@@ -94,6 +94,20 @@ The flags below exist as **escape hatches** for unusual situations:
 `checkleft` looks for `CHECKS.yaml` or `CHECKS.toml` files from the repository
 root down to the file being evaluated.
 
+### Exit codes
+
+`checkleft run` and `checkleft fix` use three distinct exit codes so a caller
+can tell "the gate ran clean", "the gate ran and found problems", and "the gate
+could not run at all" apart — the third case demands a different response
+(fix the environment) than the second (fix the code), and must never be
+confused with the first (nothing to do):
+
+| Code | Meaning                                                                                                                                                                                                                                                                                                                                                            |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `0`  | Clean pass: either checks ran and found nothing, or there genuinely were no changes to check.                                                                                                                                                                                                                                                                      |
+| `1`  | Checks ran and at least one `Error`-severity finding was reported.                                                                                                                                                                                                                                                                                                 |
+| `3`  | checkleft could not determine what changed — a missing merge base (root commit, unrelated histories, an unresolvable `--base-ref`), a detached HEAD with no accessible parent commit, or a shallow clone whose history never reaches the base even after deepening. This is **never** treated as "no changes"; it always fails loudly instead of silently passing. |
+
 ### Run before every push
 
 `checkleft install` drops a git `pre-push` hook that runs `checkleft run`
