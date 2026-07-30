@@ -67,7 +67,11 @@ const EVENT_NAME_MAP: &[(&str, &str)] = &[
 /// `spawn_subagent`, `get_command_or_subagent_output`, …) is left as-is —
 /// the safe default, since nothing downstream depends on those names being
 /// Claude-shaped.
-const TOOL_NAME_MAP: &[(&str, &str)] = &[
+///
+/// `pub(super)`: `grok/transcript.rs` reuses this same table for the ACP
+/// `tool_call` dialect — it is Grok's own tool vocabulary, observed on both
+/// wires, not a cross-driver parser reuse.
+pub(super) const TOOL_NAME_MAP: &[(&str, &str)] = &[
     ("run_terminal_command", "Bash"),
     ("write", "Write"),
     ("search_replace", "Edit"),

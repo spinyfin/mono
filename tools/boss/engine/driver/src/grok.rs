@@ -6,14 +6,16 @@
 //! [`hooks`]), the four ControlVerbs and Grok/xAI error classification
 //! (design T-13, see [`classify_error`] and this file's `probe`/`interrupt`/
 //! `stop`/`reap` overrides), and turn-end recovery for Esc-cancelled turns
-//! (design T-12, see [`turn_end_recovery`]). Full permission-policy artifacts
-//! (`--sandbox`/`--allow`/`--deny`, T-17) and transcript access remain
-//! follow-on work — see
+//! (design T-12, see [`turn_end_recovery`]). `TranscriptAccess` (design T-11)
+//! is implemented via [`transcript`]: `transcript_path_for_session` reads
+//! Grok's stamped `transcriptPath`, and [`GrokTranscriptSession`] normalises
+//! the ACP `sessionUpdate` dialect. Full permission-policy artifacts
+//! (`--sandbox`/`--allow`/`--deny`, T-17) remain follow-on work — see
 //! `tools/boss/docs/designs/grok-as-a-first-class-interactive-agent-driver.md`.
 //!
 //! Behavioural fan-out lives under the `grok/` submodule directory so
-//! concurrent follow-on tasks (transcript, output capture, characterisation)
-//! do not serialise on this file.
+//! concurrent follow-on tasks (output capture, characterisation) do not
+//! serialise on this file.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -24,7 +26,7 @@ use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{NormalizeError, PaneMonitorSpec, WorkerEvent};
 use boss_ssh_transport::shell_quote;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 mod classify_error;
 mod home;
@@ -32,6 +34,7 @@ mod hooks;
 mod model_menu;
 mod permissions;
 mod progress;
+mod transcript;
 mod turn_end_recovery;
 
 pub use home::{
@@ -44,6 +47,7 @@ pub use home::{
 use classify_error::classify_grok_error;
 use home::{assert_grok_home_safe_to_delete, provision_grok_home, read_session_id, read_workspace_path_stamp};
 use progress::GrokProgressSession;
+use transcript::GrokTranscriptSession;
 use turn_end_recovery::{is_cancelled_turn_end, prepare_snapshot};
 
 use super::{
@@ -51,8 +55,8 @@ use super::{
     InterruptDelivery, InterruptRecoverySnapshot, ModelMenu, PermissionArtifacts, PermissionInput, PrUrlCaptureFeed,
     ProbeDelivery, ProgressFidelity, ProgressIngress, ProgressObservationConfig, ProgressObservationWiring,
     ProgressSessionNormalizer, ReapDelivery, SpawnPlan, SpawnRequest, StopDelivery, StructuredOutputArtifacts,
-    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TurnEnd, WorkerErrorClass,
-    WorkerKind, default_structured_output_wiring,
+    StructuredOutputRequest, ToolUseInterceptionConfig, ToolUseInterceptionWiring, TranscriptSessionNormalizer,
+    TurnEnd, WorkerErrorClass, WorkerKind, default_structured_output_wiring,
 };
 
 // ---------------------------------------------------------------------------
@@ -588,20 +592,33 @@ impl AgentDriver for GrokDriver {
             .join(GROK_DESCRIPTOR.agent_rules_filename)
     }
 
-    fn transcript_path_for_session(&self, _raw: &serde_json::Value) -> Option<String> {
-        // Follow-on: Grok stamps `transcriptPath` on every hook payload.
-        None
+    fn transcript_path_for_session(&self, raw: &serde_json::Value) -> Option<String> {
+        // Grok stamps the absolute path to the session's ACP update stream
+        // on every hook payload it emits — `transcriptPath`, pointing at
+        // `$GROK_HOME/sessions/<pct-encoded-cwd>/<sid>/updates.jsonl`
+        // (design §"Session, turn, and transcript identity"). Same key
+        // rename ClaudeDriver's own field read is, per that section — no
+        // glob, no derivation, no directory watch. Empty strings are
+        // treated as missing, mirroring ClaudeDriver::transcript_path_for_session.
+        let s = raw.get("transcriptPath")?.as_str()?;
+        if s.is_empty() { None } else { Some(s.to_owned()) }
+    }
+
+    fn transcript_session(&self) -> Option<Box<dyn TranscriptSessionNormalizer>> {
+        // `tool_call` and `tool_call_update` arrive as separate ACP
+        // records, joined only by `toolCallId` — GrokTranscriptSession
+        // owns that per-tail correlation (see `grok/transcript.rs`).
+        Some(Box::new(GrokTranscriptSession::default()))
     }
 
     fn normalize_transcript_entry(&self, raw: serde_json::Value) -> serde_json::Value {
-        // Minimal ACP updates.jsonl → canonical reshape so Stop-boundary
-        // marker scans can read Grok transcripts once `transcript_path`
-        // points at `$GROK_HOME/sessions/…/updates.jsonl`. Full multi-chunk
-        // accumulation and tool_call correlation remain follow-on work
-        // (TranscriptSessionNormalizer); a single final `agent_message_chunk`
-        // is the common shape for short `[blocked]` answers and is enough
-        // for the conformance fixture.
-        normalize_acp_updates_entry(raw)
+        // Isolated single-record reshape for direct callers that do not
+        // hold a `transcript_session()` tail. Each call starts a fresh,
+        // empty correlation state, so an isolated `tool_call_update` never
+        // finds its matching `tool_call` and normalises to a bare system
+        // filler — the live-status tail instead calls `transcript_session()`
+        // so the pairing survives across the whole tail.
+        transcript::normalize_acp_update(raw)
     }
 
     fn extract_error_from_transcript(&self, _lines: &[serde_json::Value]) -> Option<String> {
@@ -734,62 +751,6 @@ fn grok_bash_output_text(tool_response: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// ACP updates.jsonl → canonical entry reshape
-// ---------------------------------------------------------------------------
-//
-// Spike samples (ghostty-grok-pane-viability-artifacts) write records like:
-//   {"method":"session/update","params":{"update":{
-//     "sessionUpdate":"agent_message_chunk",
-//     "content":{"type":"text","text":"…"}
-//   }}}
-// Unrecognised / non-prose records pass through unchanged so the Claude-family
-// values parser skips them; this must never panic on the live-status path.
-
-fn normalize_acp_updates_entry(raw: Value) -> Value {
-    let Some(update) = raw
-        .get("params")
-        .and_then(|params| params.get("update"))
-        .and_then(|update| update.as_object())
-    else {
-        return raw;
-    };
-    let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
-        return raw;
-    };
-    match kind {
-        "agent_message_chunk" => {
-            let Some(text) = update
-                .get("content")
-                .and_then(|content| content.get("text"))
-                .and_then(Value::as_str)
-            else {
-                return raw;
-            };
-            json!({
-                "type": "assistant",
-                "content": [{"type": "text", "text": text}],
-            })
-        }
-        "user_message_chunk" => {
-            let Some(text) = update
-                .get("content")
-                .and_then(|content| content.get("text"))
-                .and_then(Value::as_str)
-            else {
-                return raw;
-            };
-            json!({
-                "type": "user",
-                "text": text,
-            })
-        }
-        // Non-prose ACP records (tool_call, turn_completed, hook_execution, …)
-        // stay opaque until the full session normalizer lands.
-        _ => raw,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -798,6 +759,7 @@ mod tests {
     use super::*;
     use crate::{AbsenceDisposition, Capability, MidTurnPaneInput};
     use boss_protocol::{EffortLevel, ReasoningMode};
+    use serde_json::json;
     use std::fs;
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -1013,6 +975,60 @@ mod tests {
         assert_eq!(artifacts, default_structured_output_wiring(&request));
         // No native --json-schema flag adopted (T-18: evaluated, not wired).
         assert!(artifacts.extra_args.is_empty());
+    }
+
+    // ── TranscriptAccess ─────────────────────────────────────────────────────
+
+    #[test]
+    fn transcript_path_for_session_reads_transcript_path_field() {
+        let raw = json!({
+            "sessionId": "sess-1",
+            "hookEventName": "stop",
+            "transcriptPath": "/tmp/grok-home/sessions/%2Fprivate%2Ftmp/sess-1/updates.jsonl",
+        });
+        assert_eq!(
+            GrokDriver::default().transcript_path_for_session(&raw).as_deref(),
+            Some("/tmp/grok-home/sessions/%2Fprivate%2Ftmp/sess-1/updates.jsonl"),
+        );
+    }
+
+    #[test]
+    fn transcript_path_for_session_is_none_when_missing_or_empty() {
+        let missing = json!({"sessionId": "sess-1"});
+        assert_eq!(GrokDriver::default().transcript_path_for_session(&missing), None);
+
+        let empty = json!({"transcriptPath": ""});
+        assert_eq!(GrokDriver::default().transcript_path_for_session(&empty), None);
+    }
+
+    #[test]
+    fn transcript_session_correlates_tool_call_and_tool_call_update() {
+        let mut session = GrokDriver::default()
+            .transcript_session()
+            .expect("GrokDriver supplies a per-tail transcript session");
+
+        let call = session.normalize_transcript_entry(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call-1",
+                "title": "run_terminal_command",
+                "rawInput": {"command": "echo hi"}
+            }}
+        }));
+        assert_eq!(call["content"][0]["name"], "Bash");
+
+        let result = session.normalize_transcript_entry(json!({
+            "method": "session/update",
+            "params": {"sessionId": "s1", "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "call-1",
+                "rawOutput": {"exit_code": 0}
+            }}
+        }));
+        assert_eq!(result["type"], "user");
+        assert_eq!(result["tool_name"], "Bash");
+        assert_eq!(result["tool_response"], json!({"exit_code": 0}));
     }
 
     #[test]
