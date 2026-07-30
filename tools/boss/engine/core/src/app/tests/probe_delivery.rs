@@ -9,9 +9,9 @@
 //!    sets the activity to `Working` before it runs. A parked-only guard is
 //!    therefore false 100% of the time at that boundary, on every driver — so
 //!    it could not deliver at all. The fix splits the decision into activity ×
-//!    driver, so an interactive-TUI driver takes mid-turn input while
-//!    `codex exec` (which leaves unread bytes in the tty for the shell to
-//!    execute) is still refused.
+//!    driver, so a driver measured to buffer mid-turn input takes it while one
+//!    that has not measured it (which could leave unread bytes in the tty for
+//!    the shell to execute) is still refused.
 //!
 //! 2. `ProbeRun` accepted every probe unconditionally, so the CLI could not
 //!    distinguish "arriving shortly" from "never going to arrive". The engine
@@ -23,6 +23,14 @@
 //!    a long autonomous run, is effectively its terminal one. Transport now
 //!    follows the worker's pane posture and the flag is queue priority only;
 //!    the expectation tests below pin which posture yields which boundary.
+//!
+//! A fourth concern joins them here: a driver that buffers mid-turn input may
+//! **fold** the delivered prompt into the turn that is already running rather
+//! than starting a new one for it. Codex's TUI does, measured. Such a prompt
+//! is acted on but produces no turn boundary of its own, so the tests below
+//! also pin that the probe machinery reaches its reply on the *single*
+//! boundary that turn emits rather than waiting for a second one that never
+//! comes.
 
 use super::*;
 
@@ -142,14 +150,55 @@ async fn probe_injects_mid_turn_for_a_working_claude_worker() {
     );
 }
 
-/// The safety half: the same mid-turn boundary on a `codex` worker must still
-/// write nothing. `codex exec` runs one turn per process with stdin on
-/// `/dev/null`, so injected bytes would survive in the tty and be executed by
-/// the shell after it exits. The probe stays queued for the Stop boundary.
+/// The same delivery, on Codex. This is what flipping
+/// `CodexDriver::mid_turn_pane_input` to `Buffers` buys: before it, a probe
+/// against a mid-turn Codex worker wrote nothing at every tool boundary and
+/// waited for a `Stop` that a long autonomous turn may never reach.
+#[tokio::test(start_paused = true)]
+async fn probe_injects_mid_turn_for_a_working_codex_worker() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, Some("codex"));
+    let responder = app_session_capturing_one_send(&server_state).await;
+
+    let probe_id = server_state.queue_probe(run_id.clone(), "re-read the spec".into(), false);
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+
+    let (slot, text) = responder
+        .await
+        .expect("app responder task")
+        .expect("a probe to a mid-turn Codex worker must issue a SendToPane");
+    assert_eq!(slot, 3);
+    assert_eq!(text, "[coordinator-nudge] re-read the spec");
+    assert!(
+        server_state.pop_pending_probe(&run_id).is_none(),
+        "a delivered probe must not remain queued",
+    );
+    // `Buffered`, and it can never be anything better on this driver: Codex's
+    // progress normaliser mints `UserPromptSubmit` from `task_started` alone,
+    // with an empty prompt, so the delivery waiter has nothing to match — and
+    // a folded prompt never starts a turn, so no `task_started` follows it
+    // either. The transcript scan is the only channel that could confirm, and
+    // `Buffered` is the honest answer until it does.
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Buffered),
+    );
+}
+
+/// The safety half: the same mid-turn boundary on a driver that has not
+/// measured its mid-turn stdin behaviour must still write nothing. `grok` is
+/// that driver today — it deliberately leaves `mid_turn_pane_input` at the
+/// trait default (`Rejects`) rather than flipping it on a structural argument
+/// — so injected bytes could survive in the tty and be executed by the shell.
+/// The probe stays queued for the Stop boundary.
+///
+/// This used to assert against `codex`, which has since *measured* that its
+/// TUI buffers mid-turn input and now declares `Buffers`. The property under
+/// test is unchanged; only the driver that still has it has moved.
 #[tokio::test]
 async fn probe_still_refused_mid_turn_for_a_driver_that_rejects_stdin() {
     let (server_state, _dir) = test_server_state();
-    let run_id = register_working_worker_with_driver(&server_state, 4, Some("codex"));
+    let run_id = register_working_worker_with_driver(&server_state, 4, Some("grok"));
     let app_sink = make_session_sink();
     server_state
         .register_app_session("session-app".into(), app_sink.clone())
@@ -391,7 +440,7 @@ async fn probe_run_refuses_when_the_run_has_no_live_pane() {
 #[tokio::test]
 async fn probe_run_accepts_urgent_for_a_driver_that_rejects_mid_turn_input() {
     let (server_state, _dir) = test_server_state();
-    let run_id = register_working_worker_with_driver(&server_state, 2, Some("codex"));
+    let run_id = register_working_worker_with_driver(&server_state, 2, Some("grok"));
     let sink = make_session_sink();
     executions::handle_probe_run(
         dispatch_for(&server_state, &sink),
@@ -456,7 +505,7 @@ async fn probe_run_promises_the_tool_boundary_for_a_spawning_buffering_worker() 
 #[tokio::test]
 async fn probe_run_promises_the_turn_boundary_for_a_spawning_non_buffering_worker() {
     let (server_state, _dir) = test_server_state();
-    let run_id = register_spawning_worker_with_driver(&server_state, 4, Some("codex"));
+    let run_id = register_spawning_worker_with_driver(&server_state, 4, Some("grok"));
     let sink = make_session_sink();
     executions::handle_probe_run(
         dispatch_for(&server_state, &sink),
@@ -930,16 +979,149 @@ async fn every_exit_from_the_stop_drain_path_names_itself() {
     );
 
     // Queued against a slot whose posture forbids a write (mid-turn on a
-    // driver that does not read stdin). Fail closed, probe stays queued.
-    let codex_run = register_working_worker_with_driver(&server_state, 4, Some("codex"));
-    let deferred_probe = server_state.queue_probe(codex_run.clone(), "hi".into(), false);
+    // driver whose mid-turn stdin behaviour is unmeasured, so it holds the
+    // `Rejects` default). Fail closed, probe stays queued.
+    let unmeasured_run = register_working_worker_with_driver(&server_state, 4, Some("grok"));
+    let deferred_probe = server_state.queue_probe(unmeasured_run.clone(), "hi".into(), false);
     assert_eq!(
-        dispatch_probe_on_stop(&server_state, &stop_event(&codex_run)).await,
+        dispatch_probe_on_stop(&server_state, &stop_event(&unmeasured_run)).await,
         ProbeDispatchOutcome::PostureRefused,
     );
     assert_eq!(
         server_state.probe_lifecycle_state(&deferred_probe),
         Some(ProbeDeliveryState::Queued),
+    );
+}
+
+// ── The folded turn ─────────────────────────────────────────────────────────
+
+/// Attach a `work_runs` row carrying `content` as this execution's transcript,
+/// so `transcript_path_for_execution` resolves and the probe-reply read has
+/// real bytes to work from. Returns the path; the `TempDir` must outlive it.
+fn attach_transcript(server_state: &ServerState, execution_id: &str, content: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout.jsonl");
+    std::fs::write(&path, content).unwrap();
+    server_state
+        .work_db
+        .create_run(crate::protocol::CreateRunInput {
+            execution_id: execution_id.to_owned(),
+            agent_id: "agent-1".into(),
+            status: Some("active".into()),
+            transcript_path: Some(path.display().to_string()),
+            artifacts_path: None,
+            result_summary: None,
+            error_text: None,
+            started_at: None,
+            finished_at: None,
+        })
+        .unwrap();
+    (dir, path)
+}
+
+/// The folded turn, end to end, and the reason `mid_turn_pane_input` could not
+/// be flipped as a declaration on its own.
+///
+/// A probe is injected into a mid-turn Codex worker. Codex buffers it, folds
+/// it into the turn that was already running, answers it there, and emits
+/// **one** turn boundary for the two prompts — the rollout carries two
+/// `user_message` records but a single `task_started`/`task_complete` pair
+/// (codex-tui-pivot-pricing V4).
+///
+/// So the whole reply cycle has to complete on that single boundary. This
+/// pins both halves:
+///
+/// * `ProbeReplied` carries the answer to the *folded* prompt, read out of
+///   the rollout dialect. Before the probe-reply read went through the run's
+///   driver it used a Claude-shaped scan, which matches no rollout record —
+///   the probe was delivered, answered, and still never replied.
+/// * the in-flight slot is released by that same boundary, so the next queued
+///   probe is not stranded behind a second boundary that a folding driver
+///   never produces.
+#[tokio::test(start_paused = true)]
+async fn a_folded_codex_turn_completes_the_probe_cycle_on_its_single_boundary() {
+    let (server_state, _dir) = test_server_state();
+    let run_id = register_working_worker_with_driver(&server_state, 3, Some("codex"));
+    // The rollout as it stands mid-turn: the session is open, the turn has
+    // started, and the worker has produced prose for the original prompt.
+    let (_transcript_dir, transcript_path) = attach_transcript(
+        &server_state,
+        &run_id,
+        concat!(
+            r#"{"type":"session_meta","payload":{"id":"thread-1"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working on the original ask"}}"#,
+            "\n",
+        ),
+    );
+
+    let observer = "session-folded-probe-observer".to_owned();
+    let sink = make_session_sink();
+    server_state
+        .topic_broker
+        .register_session(&observer, sink.clone())
+        .await;
+    server_state
+        .topic_broker
+        .subscribe(&observer, &[probe_topic(&run_id)])
+        .await;
+
+    let responder = app_session_capturing_one_send(&server_state).await;
+    let probe_id = server_state.queue_probe(run_id.clone(), "what is your status?".into(), false);
+    dispatch_probe_on_post_tool_use(&server_state, &post_tool_use(&run_id)).await;
+    responder
+        .await
+        .expect("app responder task")
+        .expect("the mid-turn probe must reach the pane");
+    assert!(
+        server_state.has_in_flight_probe(&run_id),
+        "a delivered probe holds the run's single reply slot until a boundary clears it",
+    );
+
+    // Codex delivers the buffered prompt at its next tool-call boundary and
+    // answers it *inside* the running turn — one `task_complete` for both
+    // prompts. Note there is no second `task_started`: that absence is the
+    // whole caveat.
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new().append(true).open(&transcript_path).unwrap();
+        for line in [
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"[coordinator-nudge] what is your status?"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        ] {
+            writeln!(file, "{line}").unwrap();
+        }
+    }
+
+    dispatch_probe_reply_on_stop(&server_state, &stop_event(&run_id)).await;
+
+    let envelope = sink.next().await.expect("ProbeReplied must be published");
+    match envelope.payload {
+        FrontendEvent::ProbeReplied {
+            run_id: emitted_run,
+            probe_id: emitted_probe,
+            text,
+        } => {
+            assert_eq!(emitted_run, run_id);
+            assert_eq!(emitted_probe, probe_id);
+            assert_eq!(
+                text, "status: pushed, waiting on CI",
+                "the reply must be the answer to the folded prompt, read out of the rollout dialect",
+            );
+        }
+        other => panic!("expected ProbeReplied, got {other:?}"),
+    }
+    assert_eq!(
+        server_state.probe_lifecycle_state(&probe_id),
+        Some(ProbeDeliveryState::Replied),
+    );
+    assert!(
+        !server_state.has_in_flight_probe(&run_id),
+        "the single boundary a folded turn produces must release the reply slot; waiting for a \
+         second one would strand every later probe for this run",
     );
 }
 

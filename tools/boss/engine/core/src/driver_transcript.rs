@@ -156,15 +156,34 @@ fn pool_override_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<Str
 /// For the Claude driver the normalization is the identity, so its events are
 /// byte-for-byte what they always were.
 pub fn parse_transcript_with_driver(driver: Option<&dyn AgentDriver>, content: &str) -> Vec<TranscriptEvent> {
-    // A stateful session where the driver has one (Codex correlates a tool
-    // call with its output across two records), the stateless entry point
-    // otherwise — the same two-tier selection `live_status_loop::normalize_lines`
-    // makes for the live tail.
-    // Stream line → normalize → parse without materialising a whole-transcript
-    // `Vec<Value>`: a multi-turn Codex rollout can be large, and the only
-    // consumer of the intermediate form is the next parse step.
+    crate::transcript_markdown::parse_transcript_values(normalized_transcript_values(driver, content))
+}
+
+/// Stream the JSONL lines of `content` through `driver`'s transcript
+/// normalizer, yielding one canonical-shape [`Value`] per parseable line.
+///
+/// This is the reshape half of [`parse_transcript_with_driver`], exposed on
+/// its own for the readers that need the canonical *records* rather than
+/// [`TranscriptEvent`]s — the probe-reply extractor has to group text blocks
+/// by the message they came from, which the flattened event stream no longer
+/// distinguishes from two adjacent messages.
+///
+/// A stateful session is used where the driver has one (Codex correlates a
+/// tool call with its output across two records), the stateless entry point
+/// otherwise — the same two-tier selection `live_status_loop::normalize_lines`
+/// makes for the live tail. `driver` is `None` only when the run's driver
+/// could not be resolved; the entries are then yielded as written, which is
+/// what every call site did before normalization existed here.
+///
+/// Streams rather than materialising a whole-transcript `Vec<Value>`: a
+/// multi-turn Codex rollout can be large, and the only consumer of the
+/// intermediate form is whatever parse step follows.
+pub fn normalized_transcript_values<'a>(
+    driver: Option<&'a dyn AgentDriver>,
+    content: &'a str,
+) -> impl Iterator<Item = Value> + 'a {
     let mut session = driver.and_then(|driver| driver.transcript_session());
-    let normalized = content.lines().filter_map(|line| {
+    content.lines().filter_map(move |line| {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -175,8 +194,7 @@ pub fn parse_transcript_with_driver(driver: Option<&dyn AgentDriver>, content: &
             (None, Some(driver)) => driver.normalize_transcript_entry(raw),
             (None, None) => raw,
         })
-    });
-    crate::transcript_markdown::parse_transcript_values(normalized)
+    })
 }
 
 /// Resolve `execution_id`'s driver and parse `content` through it — the

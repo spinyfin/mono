@@ -8,10 +8,23 @@
 //! mid-turn — the urgent `PostToolUse` probe path, and the chore-update
 //! auto-notice, which can land at any point in a turn — depends on what
 //! the driver's foreground process does with mid-turn stdin: when it
-//! does not consume stdin at all (e.g. `codex exec`), injected bytes
-//! survive in the tty input buffer and are later executed by the
-//! interactive shell (ghostty-codex-pane-viability investigation, Q2
-//! Layer D). That is a **safety** issue, not hygiene.
+//! does not consume stdin at all, injected bytes survive in the tty input
+//! buffer and are later executed by the interactive shell
+//! (ghostty-codex-pane-viability investigation, Q2 Layer D, measured
+//! against the retired `codex exec` shape). That is a **safety** issue,
+//! not hygiene, and it is why the trait default is
+//! [`crate::driver::MidTurnPaneInput::Rejects`] — a driver earns
+//! `Buffers` by measurement, not by argument.
+//!
+//! **A buffering driver may fold the write into the running turn.** Codex's
+//! bare TUI does: the injected text is queued, delivered at the next
+//! tool-call boundary, and answered *inside* the turn that was already
+//! running, which emits one turn boundary for the two prompts. Claude
+//! defers it into a fresh turn instead. Nothing in this module depends on
+//! which — a write either reaches the agent or it does not — but callers
+//! that go on to wait for a boundary do depend on it, so "the next turn
+//! boundary" below means "the next one the driver actually emits", which for
+//! a folding driver is the running turn's own.
 //!
 //! Before any write, [`ServerState::inject_pane_text_verified`] therefore
 //! consults a [`PaneInputPosture`], which combines two orthogonal facts:
@@ -76,8 +89,16 @@ pub(crate) enum PaneInputPosture {
     /// The worker is mid-turn ([`WorkerActivity::Working`]) and its driver
     /// declares [`crate::driver::MidTurnPaneInput::Buffers`]: the foreground
     /// process is reading stdin, so the write is held in the agent's composer
-    /// and submitted when the current turn ends — the same thing a human gets
-    /// by typing into the pane while the agent works.
+    /// — the same thing a human gets by typing into the pane while the agent
+    /// works.
+    ///
+    /// *When* the agent then acts on it is the driver's business and differs
+    /// between them: Claude submits it as a fresh turn once the current one
+    /// ends; Codex's TUI folds it into the running turn, delivering it at the
+    /// next tool-call boundary and answering it before that turn's single
+    /// boundary. Both are "buffered"; only one of them yields a turn boundary
+    /// of its own, which is why nothing downstream may assume one per
+    /// delivered prompt.
     MidTurnBuffered,
     /// No write may be issued. Either there is no live state for the slot
     /// (fail closed — unknown is not "accepting"), the worker is pre-session
@@ -151,8 +172,17 @@ pub(crate) enum PaneInjectOutcome {
     /// mid-turn delivery: the agent is still finishing its turn, so it has
     /// not submitted the buffered text yet and cannot be expected to. The
     /// end-to-end confirmation for this case is the worker's reply at the
-    /// next turn boundary, which the in-flight probe machinery already
-    /// captures.
+    /// next turn boundary the driver emits, which the in-flight probe
+    /// machinery already captures.
+    ///
+    /// For a driver that folds the buffered prompt into the running turn
+    /// (Codex's TUI) that boundary is the running turn's own, and the reply
+    /// is already inside it — there is no second boundary to wait for and
+    /// nothing may wait for one. A `UserPromptSubmit` confirmation is
+    /// additionally unreachable on such a driver, because the folded prompt
+    /// never starts a turn and so never mints one; the transcript fallback
+    /// above is the only signal that can confirm it, and `Buffered` is the
+    /// honest answer when neither lands inside the window.
     Buffered,
     /// `SendToPane` succeeded (bytes reached the app/pty) but neither a
     /// `UserPromptSubmit` hook nor a transcript scan confirmed delivery
@@ -455,7 +485,9 @@ impl ServerState {
                     tracing::info!(
                         run_id,
                         slot_id,
-                        "pane injection buffered by a mid-turn agent; prompt submission awaits the turn boundary",
+                        "pane injection buffered by a mid-turn agent; the agent submits it when its \
+                         composer next drains — for a folding driver that is inside the running turn, \
+                         for a deferring one it is the turn after",
                     );
                     return PaneInjectOutcome::Buffered;
                 }

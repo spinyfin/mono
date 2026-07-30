@@ -217,8 +217,9 @@ impl ServerState {
                 tracing::info!(
                     run_id,
                     slot_id,
-                    "send_input_to_worker: text buffered by a mid-turn agent; it will surface as the \
-                     worker's next prompt at the turn boundary",
+                    "send_input_to_worker: text buffered by a mid-turn agent; it surfaces as a prompt \
+                     when the agent's composer next drains — inside the running turn on a driver that \
+                     folds it there, at the next turn otherwise. Nothing here waits for either.",
                 );
                 Ok(slot_id)
             }

@@ -268,6 +268,15 @@ impl ServerState {
     /// unconditionally (`take_in_flight_probe` in
     /// `dispatch_probe_reply_on_stop`), so a probe held back by this is
     /// deferred by at most one reply cycle rather than stalled.
+    ///
+    /// "Unconditionally" is what keeps that true for a driver that folds a
+    /// mid-turn prompt into the running turn instead of starting a new one
+    /// for it (Codex, measured). Such a prompt produces no boundary of its
+    /// own, so a slot released only on "the probe's own turn boundary" would
+    /// never be released and every later probe for the run would queue behind
+    /// it forever. Releasing on the next boundary of any kind — which the
+    /// running turn still reaches — is what makes the folded case a shorter
+    /// wait rather than an infinite one.
     pub(super) fn has_in_flight_probe(&self, run_id: &str) -> bool {
         self.in_flight_probes
             .lock()

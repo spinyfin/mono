@@ -1518,12 +1518,23 @@ const MID_TURN_PROBE_VERIFY_TIMEOUT: Duration = Duration::from_secs(6);
 /// mid-turn writes when — and only when — the run's driver declares
 /// [`crate::driver::MidTurnPaneInput::Buffers`]. For Claude Code that is the
 /// ordinary case, so a probe delivers at the next tool boundary. For a driver
-/// whose foreground process does not read mid-turn stdin (`codex exec`) the
-/// write is still refused, preserving the tty-leak protection; the probe
-/// stays queued (no pop) for the next Stop boundary via
+/// whose foreground process is not known to read mid-turn stdin — the trait
+/// default — the write is still refused, preserving the tty-leak protection;
+/// the probe stays queued (no pop) for the next Stop boundary via
 /// [`dispatch_probe_on_stop`], and that deferral is treated as normal — no
 /// `ProbeDeliveryEscalated` per tool, since multi-tool turns would otherwise
 /// spam once per `PostToolUse`.
+///
+/// **A folded turn does not change the accounting here, and this is the place
+/// it would have.** A buffering driver may fold the delivered prompt into the
+/// turn that is already running rather than starting a new one for it (Codex,
+/// measured), so that prompt yields no boundary of its own. Nothing in this
+/// path counts turns or waits for a per-prompt boundary: it defers on
+/// [`ServerState::has_in_flight_probe`], and that slot is cleared
+/// unconditionally by whatever boundary comes next
+/// ([`dispatch_probe_reply_on_stop`]) — one that the folding driver still
+/// emits, because the *running* turn ends. So "deferred by at most one reply
+/// cycle" holds for a folding driver too, on one boundary rather than two.
 ///
 /// When the guard passes, the write is not trusted just because
 /// `SendToPane` returned Ok: confirmation still requires a matching
@@ -1687,16 +1698,21 @@ async fn inject_probe_mid_turn(
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Consumed)
         }
         PaneInjectOutcome::Buffered => {
-            // The normal successful shape of a mid-turn delivery: the
-            // text is in the agent's composer and it submits it when the
-            // current turn ends. No escalation — the reply at the next turn
-            // boundary is the confirmation.
+            // The normal successful shape of a mid-turn delivery: the text is
+            // in the agent's composer. No escalation — the reply at the next
+            // boundary the driver emits is the confirmation, and
+            // `dispatch_probe_reply_on_stop` reads it there. That is the
+            // running turn's own boundary on a driver that folds the prompt
+            // into it, and the following turn's on one that defers; this path
+            // deliberately does not distinguish them, because waiting for a
+            // boundary the folding driver never produces would strand the
+            // probe in flight forever.
             tracing::info!(
                 run_id,
                 slot_id,
                 probe_id = %probe_id,
                 "probe injected and buffered by the mid-turn agent; \
-                 it will be picked up as the worker's next prompt",
+                 it will be picked up as a prompt when the composer drains",
             );
             server_state.set_probe_lifecycle(&probe_id, ProbeDeliveryState::Buffered);
             ProbeDispatchOutcome::Dispatched(ProbeDeliveryState::Buffered)
@@ -1906,6 +1922,28 @@ pub(super) async fn transcript_offset_for_run(server_state: &ServerState, run_id
 /// probe topic. Idempotent: a duplicate boundary with no in-flight
 /// probe is a no-op, so observers never see the same `probe_id`
 /// reported twice.
+///
+/// **This is the one path that waits for a turn boundary after a prompt was
+/// delivered mid-turn**, so it is the path a folded turn can break. A driver
+/// that folds a buffered prompt into the *running* turn — Codex's bare TUI,
+/// measured — answers the probe inside that turn and emits exactly one
+/// boundary for the two prompts. Taking the in-flight entry at the *first*
+/// boundary after dispatch is therefore still right: for a folding driver
+/// that boundary already carries the reply, and for a non-folding one it is
+/// the boundary at which the buffered text becomes the next prompt. What must
+/// not happen — and is why this is called out here — is any attempt to wait
+/// for a *second* boundary "for the probe's own turn": a folding driver never
+/// produces one, and the probe would sit in flight forever, blocking every
+/// later probe for the run behind [`ServerState::has_in_flight_probe`].
+///
+/// The read itself goes through the run's driver
+/// ([`crate::driver_transcript`]). The transcript at
+/// `in_flight.transcript_path` is written in the agent's own dialect, and
+/// this used to parse it with a hand-rolled Claude-shaped scan — which
+/// returned nothing for every Codex rollout record, so a Codex probe could be
+/// delivered, answered, and still never produce a `ProbeReplied`. Reaching a
+/// folding driver's reply at the right boundary is worth nothing if the
+/// reader cannot read the dialect it is written in.
 pub(super) async fn dispatch_probe_reply_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
@@ -1958,7 +1996,8 @@ pub(super) async fn dispatch_probe_reply_on_stop(
         );
         return;
     };
-    let text = match read_assistant_reply(transcript_path, in_flight.offset_bytes).await {
+    let driver = crate::driver_transcript::driver_for_execution(&server_state.work_db, run_id);
+    let text = match read_assistant_reply(driver.as_deref(), transcript_path, in_flight.offset_bytes).await {
         Ok(Some(text)) => text,
         Ok(None) => {
             tracing::warn!(
@@ -1995,11 +2034,19 @@ pub(super) async fn dispatch_probe_reply_on_stop(
 }
 
 /// Read transcript bytes from `offset_bytes` to the end of the file
-/// at `transcript_path`, parse each new JSONL line, and return the
-/// last assistant-turn text found. Returns `Ok(None)` when no
-/// assistant turn appears in the new region (e.g. the worker
+/// at `transcript_path`, normalize each new JSONL line through `driver`,
+/// and return the last assistant-turn text found. Returns `Ok(None)` when
+/// no assistant turn appears in the new region (e.g. the worker
 /// errored out before producing one).
-async fn read_assistant_reply(transcript_path: &str, offset_bytes: u64) -> std::io::Result<Option<String>> {
+///
+/// `driver` is the run's own driver, `None` only when it could not be
+/// resolved — in which case the entries are read as written, which is what
+/// this path did for every driver before it became driver-aware.
+async fn read_assistant_reply(
+    driver: Option<&dyn crate::driver::AgentDriver>,
+    transcript_path: &str,
+    offset_bytes: u64,
+) -> std::io::Result<Option<String>> {
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
     let mut file = tokio::fs::File::open(transcript_path).await?;
     let metadata = file.metadata().await?;
@@ -2018,33 +2065,56 @@ async fn read_assistant_reply(transcript_path: &str, offset_bytes: u64) -> std::
             ));
         }
     };
-    Ok(extract_last_assistant_text(&chunk))
+    Ok(extract_last_assistant_text(driver, &chunk))
 }
 
-/// Walk JSONL `chunk` and return the most recent assistant turn's
-/// text content, concatenating all `text` blocks inside its message.
-/// Tolerates the two shapes claude transcripts use today —
-/// `message.content[*].text` (current) and `message.text` (older
-/// snapshots) — and skips lines that aren't valid JSON rather than
-/// rejecting the whole chunk.
-pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
+/// Normalize JSONL `chunk` through `driver` and return the most recent
+/// assistant turn's text, concatenating all `text` blocks inside that one
+/// entry.
+///
+/// **The normalization is the load-bearing part.** The bytes on disk are in
+/// the agent's own dialect: Claude writes `message`-enveloped JSONL, Codex
+/// writes a `session_meta`/`event_msg`/`response_item` rollout. This function
+/// used to scan for `type == "assistant"` directly, which no Codex record has
+/// — so a probe delivered into a Codex worker, answered by it, and reaching
+/// this reader at the right boundary still produced "transcript had no
+/// assistant turn after dispatch offset" and no `ProbeReplied` at all. It is
+/// the same defect [`crate::driver_transcript`] was written for on the
+/// Stop-boundary marker-scan side; the probe-reply read was the site that
+/// never got wired to it.
+///
+/// After [`crate::driver_transcript::normalized_transcript_values`] every
+/// dialect arrives in the canonical entry shape, so the only shapes handled
+/// here are that canonical one (`content` / `text` at top level, which is
+/// what Codex's normalizer emits) and Claude's `message`-enveloped pair
+/// (`message.content[*].text`, and `message.text` from older snapshots) —
+/// mirroring `transcript_markdown`'s own `turn_content` precedence.
+///
+/// Entries are inspected one at a time rather than via
+/// [`crate::driver_transcript::parse_transcript_with_driver`] because that
+/// flattens each message into per-block events, and two adjacent
+/// single-block assistant messages then look identical to one two-block
+/// message — the difference between "the newest reply" and "the newest reply
+/// glued onto the previous one".
+///
+/// Lines that aren't valid JSON are skipped rather than rejecting the whole
+/// chunk: a read that lands mid-flush must still recover the entries that did
+/// arrive intact.
+pub(super) fn extract_last_assistant_text(
+    driver: Option<&dyn crate::driver::AgentDriver>,
+    chunk: &str,
+) -> Option<String> {
     let mut latest: Option<String> = None;
-    for line in chunk.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
-            continue;
-        };
+    for value in crate::driver_transcript::normalized_transcript_values(driver, chunk) {
         if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(message) = value.get("message") else {
-            continue;
-        };
+        // Canonical normalized entries carry `content`/`text` at the top
+        // level; Claude's carry them under `message`. Prefer the envelope so
+        // a Claude entry is read exactly as it always was.
+        let body = value.get("message").unwrap_or(&value);
         let mut buf = String::new();
-        if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
+        if let Some(content) = body.get("content").and_then(|c| c.as_array()) {
             for block in content {
                 if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                     buf.push_str(text);
@@ -2052,7 +2122,7 @@ pub(super) fn extract_last_assistant_text(chunk: &str) -> Option<String> {
             }
         }
         if buf.is_empty()
-            && let Some(text) = message.get("text").and_then(|t| t.as_str())
+            && let Some(text) = body.get("text").and_then(|t| t.as_str())
         {
             buf.push_str(text);
         }
