@@ -32,6 +32,25 @@
 //!    4. Emit a `dead_pid_reconcile` dispatch event.
 //!    5. Kick the coordinator.
 //!
+//! ## What this sweep can NOT see, and who covers it
+//!
+//! `kill(pid, 0)` answers "does this pid exist?" — not "is this pid the
+//! driver?". A worker pane whose driver binary never executed still hosts
+//! an idle login shell, and that shell answers `kill(pid, 0)` alive
+//! forever, so this sweep skips the slot on every pass. On 2026-07-30 that
+//! made this module the named-but-ineffective backstop for a slot that
+//! held an interactive slot and a cube workspace lease indefinitely.
+//!
+//! That gap is deliberately NOT closed here: probing whether a pid is "the
+//! right process" from the engine is a heuristic, and this sweep's whole
+//! value is that its signal (`ESRCH`) is unambiguous. Instead
+//! [`crate::spawn_ack_sweep`]'s driver-start pass owns the question, using
+//! a structural driver-originated signal (a hook event or a
+//! `transcript_path`) rather than process introspection. This sweep
+//! remains the correct and sole owner of "a pid we did observe has since
+//! died"; it is no longer the last line of defence for "the driver never
+//! started".
+//!
 //! ## False-positive guards
 //!
 //! The [`DEAD_PID_GRACE_SECS`] (30 s) guard skips executions whose

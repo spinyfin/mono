@@ -84,6 +84,33 @@ pub const DEFAULT_LAUNCH_MODEL: &str = "opus";
 /// the 2026-07-03/04 false-live incident this split addresses.
 pub const STALLED_SPAWN_THRESHOLD_SECS: i64 = 30;
 
+/// How long a spawn may go without a **driver-originated** signal
+/// before [`LiveWorkerStateRegistry::unverified_driver_starts`] reports
+/// it as a never-started driver for
+/// [`crate::spawn_ack_sweep`] to reap.
+///
+/// ## Why this is a separate, longer window than the two above
+///
+/// [`STALLED_SPAWN_THRESHOLD_SECS`] and
+/// [`crate::spawn_ack_sweep::SPAWN_ACK_GRACE_SECS`] both answer "did the
+/// *pane* come up?". This one answers the strictly stronger question
+/// "did the *driver binary* come up?" — the question no check in Boss
+/// asked before, and the one the 2026-07-30 incident turned on: a pane
+/// hosting nothing but an idle login shell reported `shell_pid=92697`
+/// and satisfied every pane-level check forever.
+///
+/// 300s is deliberately far above any real driver startup. A healthy
+/// driver's first hook (`SessionStart`) fires within seconds of exec.
+/// The one historically legitimate multi-minute pre-hook wait — claude's
+/// first-run folder-trust dialog, which is the entire reason
+/// [`LiveWorkerStateRegistry::mark_stalled_spawns`] exists — is
+/// *pre-suppressed* at provision time by
+/// `boss_engine_driver::claude`'s `hasTrustDialogAccepted` seeding, so
+/// no driver should ever legitimately sit pre-hook for minutes. Five
+/// minutes leaves an order of magnitude of headroom over that reality
+/// while still bounding the hold: before this, the hold was unbounded.
+pub const DRIVER_START_GRACE_SECS: i64 = 300;
+
 /// How long after the most recent hook a slot may keep advertising
 /// `Spawning` before [`LiveWorkerStateRegistry::downgrade_stale_activity`]
 /// moves it to `Idle`.
@@ -104,7 +131,7 @@ pub struct LiveWorkerStateRegistry {
     inner: Mutex<Inner>,
 }
 
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
 struct Inner {
     by_slot: HashMap<u8, LiveWorkerState>,
     /// Per-slot flag set when a `Notification` hook arrives, cleared on
@@ -153,6 +180,76 @@ struct Inner {
     /// forgotten follow-up call — see that method's doc for why the honest
     /// default on absence is "never fake it", not a lower-fidelity guess.
     awaiting_input_capable: HashMap<u8, bool>,
+    /// Epoch-seconds timestamp of the first **driver-originated** signal
+    /// observed for the slot's current run — the moment Boss gained
+    /// positive evidence that the driver binary itself is running.
+    ///
+    /// ## Why this is not `LiveWorkerState::last_event_at`
+    ///
+    /// `last_event_at` is a *display* timestamp and is written by paths
+    /// that are not the driver: [`LiveWorkerStateRegistry::mark_stalled_spawns`]
+    /// synthesizes one when it promotes a slot to `WaitingForInput`, and
+    /// [`LiveWorkerStateRegistry::mark_errored`] stamps one on an
+    /// engine-side verdict. Treating it as proof of driver start would
+    /// let the engine's own guesses vouch for a driver that never ran.
+    /// This map is written by exactly one method
+    /// ([`LiveWorkerStateRegistry::record_driver_signal`]) from exactly
+    /// two call sites in the hook ingress — a real worker hook, and
+    /// receipt of a `transcript_path` — so "has this driver started?"
+    /// has a single, unforgeable answer.
+    ///
+    /// Note what is deliberately absent: `shell_pid`. A reported
+    /// foreground pid is the *shell hosting the pane*, not the driver
+    /// (`GhosttyTerminalView.swift`'s `onSurfaceAttached` reads
+    /// `ghostty_surface_foreground_pid`, which is the login shell when
+    /// the driver was never exec'd). Every check that treated a positive
+    /// pid as evidence of a working worker is what the 2026-07-30
+    /// incident walked through untouched.
+    driver_signal_at: HashMap<u8, i64>,
+}
+
+/// Which driver-originated signal proved the driver is running. Recorded
+/// for the log line and the reap's dispatch event; both variants are
+/// equally authoritative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverSignalKind {
+    /// A worker hook event arrived over the events socket.
+    HookEvent,
+    /// A `transcript_path` was resolved for the run. Proof the driver
+    /// created its transcript, even if the hook's slot fan-out was
+    /// dropped (a hook can race `register_run_slot`).
+    TranscriptPath,
+}
+
+impl DriverSignalKind {
+    /// Stable, greppable label for logs and dispatch-event details.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DriverSignalKind::HookEvent => "hook_event",
+            DriverSignalKind::TranscriptPath => "transcript_path",
+        }
+    }
+}
+
+/// A slot whose spawn has gone [`DRIVER_START_GRACE_SECS`] without any
+/// driver-originated signal — i.e. Boss has no evidence the driver
+/// binary ever executed. Returned by
+/// [`LiveWorkerStateRegistry::unverified_driver_starts`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnverifiedDriverStart {
+    pub slot_id: u8,
+    pub run_id: String,
+    /// The shell pid the app reported, if any. Carried purely so the
+    /// reap can name it in the log and the attention item — it is
+    /// explicitly NOT part of the decision.
+    pub shell_pid: i32,
+    /// How long the slot has gone without a driver signal, in seconds.
+    pub silent_secs: i64,
+    /// Activity the slot is advertising. Recorded for diagnosis: the
+    /// 2026-07-30 grok occurrence sat at `Spawning`, while a
+    /// capability-declaring driver's identical failure would have been
+    /// promoted to `WaitingForInput` by `mark_stalled_spawns` first.
+    pub activity: WorkerActivity,
 }
 
 impl LiveWorkerStateRegistry {
@@ -279,6 +376,13 @@ impl LiveWorkerStateRegistry {
         // `set_progress_fidelity` — never inherit the prior occupant's tier
         // across a slot recycle.
         guard.progress_fidelity.remove(&slot_id);
+        // Same reasoning, but load-bearing rather than hygienic: a
+        // recycled slot MUST NOT inherit the previous occupant's
+        // driver-start proof. Leaving it would let a slot whose prior
+        // run had a healthy driver vouch for a new run whose driver
+        // never exec'd — precisely the "one process stands in for
+        // another" confusion this signal exists to remove.
+        guard.driver_signal_at.remove(&slot_id);
         drop(guard);
 
         tracing::info!(
@@ -405,6 +509,7 @@ impl LiveWorkerStateRegistry {
         guard.awaiting_input_capable.remove(&slot_id);
         guard.spawned_at.remove(&slot_id);
         guard.progress_fidelity.remove(&slot_id);
+        guard.driver_signal_at.remove(&slot_id);
         drop(guard);
 
         match removed {
@@ -449,6 +554,117 @@ impl LiveWorkerStateRegistry {
             }
         }
         None
+    }
+
+    /// Record that a **driver-originated** signal arrived for `run_id` —
+    /// positive proof the driver binary is running.
+    ///
+    /// This is the single writer of `driver_signal_at`, and the only
+    /// thing in Boss that may answer "has this driver started?". It is
+    /// deliberately keyed by `run_id` rather than slot: the hook ingress
+    /// resolves `transcript_path` *before* it looks up the slot mapping
+    /// (`worker_events.rs`), and that lookup can legitimately miss for a
+    /// hook racing `register_run_slot`. Keying on the run means the
+    /// proof lands whenever the live-state registry knows the run, not
+    /// only when the slot fan-out survives.
+    ///
+    /// Idempotent and monotonic: the FIRST signal wins and later ones do
+    /// not move the timestamp. The question this answers is "did the
+    /// driver ever start?", not "when was it last alive" — that is
+    /// `last_event_at`'s job, and conflating the two is what let a
+    /// synthesized timestamp masquerade as driver evidence.
+    ///
+    /// Returns the slot id when a live entry matched, `None` otherwise
+    /// (a hook for a released or unknown run — a benign no-op).
+    pub fn record_driver_signal(&self, run_id: &str, kind: DriverSignalKind) -> Option<u8> {
+        let mut guard = self.inner.lock().expect("registry mutex poisoned");
+        let slot_id = guard
+            .by_slot
+            .values()
+            .find(|state| state.run_id == run_id)
+            .map(|state| state.slot_id)?;
+        if guard.driver_signal_at.contains_key(&slot_id) {
+            // Already proven; keep the first timestamp.
+            return Some(slot_id);
+        }
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        guard.driver_signal_at.insert(slot_id, now);
+        drop(guard);
+        tracing::info!(
+            slot_id,
+            run_id,
+            signal = kind.as_str(),
+            "driver-start verified: first driver-originated signal received for this run",
+        );
+        Some(slot_id)
+    }
+
+    /// Whether a driver-originated signal has been recorded for `slot_id`.
+    pub fn driver_signal_at(&self, slot_id: u8) -> Option<i64> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        guard.driver_signal_at.get(&slot_id).copied()
+    }
+
+    /// Every live slot that has gone `threshold_secs` past its spawn
+    /// **without any driver-originated signal** — Boss has no evidence
+    /// the driver binary ever executed.
+    ///
+    /// ## What this deliberately does NOT look at
+    ///
+    /// - **`shell_pid`.** A positive pid is the login shell hosting the
+    ///   pane, not the driver. `crate::spawn_ack_sweep`'s old
+    ///   `shell_pid > 0` skip and `mark_stalled_spawns`'s inverse
+    ///   `shell_pid <= 0` skip between them left a slot with a live
+    ///   shell and no driver owned by neither.
+    /// - **`activity`.** Restricting to `Spawning` would re-open the
+    ///   same hole from the other side: `mark_stalled_spawns` promotes a
+    ///   capability-declaring driver's identical failure to
+    ///   `WaitingForInput`, which would then escape this check.
+    /// - **`awaiting_input_capable`.** The capability gates whether Boss
+    ///   may *interpret* a `Notification` as "awaiting a human". It has
+    ///   nothing to say about whether a process exists, so it must not
+    ///   gate driver-start verification — that exemption is exactly why
+    ///   grok's occurrence went undetected.
+    /// - **`last_event_at`.** Written by `mark_stalled_spawns` and
+    ///   `mark_errored` from engine-side inference. Only
+    ///   `driver_signal_at` is unforgeable.
+    ///
+    /// The result is that this check fires for every driver, with any
+    /// capability set, in any activity, with or without a reported pid.
+    /// A slot with no recorded spawn time is skipped — it cannot be aged
+    /// — and that is a loud `warn`, not a silent pass, because a live
+    /// entry without a spawn stamp means the registry itself is
+    /// inconsistent and the check has no ground truth to work from.
+    pub fn unverified_driver_starts(&self, now_epoch_secs: i64, threshold_secs: i64) -> Vec<UnverifiedDriverStart> {
+        let guard = self.inner.lock().expect("registry mutex poisoned");
+        let cutoff = now_epoch_secs.saturating_sub(threshold_secs);
+        let mut out = Vec::new();
+        for (slot_id, state) in guard.by_slot.iter() {
+            if guard.driver_signal_at.contains_key(slot_id) {
+                continue;
+            }
+            let Some(&spawned_at) = guard.spawned_at.get(slot_id) else {
+                tracing::warn!(
+                    slot_id,
+                    run_id = %state.run_id,
+                    "driver-start check: live slot has no recorded spawn time; cannot age it, so \
+                     driver-start verification cannot run for this slot",
+                );
+                continue;
+            };
+            if spawned_at > cutoff {
+                continue;
+            }
+            out.push(UnverifiedDriverStart {
+                slot_id: *slot_id,
+                run_id: state.run_id.clone(),
+                shell_pid: state.shell_pid,
+                silent_secs: now_epoch_secs.saturating_sub(spawned_at),
+                activity: state.activity,
+            });
+        }
+        out.sort_by_key(|c| c.slot_id);
+        out
     }
 
     /// Set the `held` flag for the slot that owns `run_id` — mirrors
@@ -799,6 +1015,26 @@ impl LiveWorkerStateRegistry {
     /// of "no events for N seconds ⇒ assume the worker awaits a human"
     /// guess `apply_event` refuses to make for an untrusted `Notification`.
     ///
+    /// ## Reconciliation with driver-start verification
+    ///
+    /// Both skips above are *presentation* decisions — "may Boss claim
+    /// this worker awaits a human?" — and both remain correct as stated.
+    /// What they must never do is decide whether the slot keeps its
+    /// resources, and before driver-start verification existed they did
+    /// exactly that by omission: the `awaiting_input_capable` skip left
+    /// grok's never-started spawn parked at `Spawning` forever, and the
+    /// promotion in the capability-declaring case moved the slot out of
+    /// `Spawning` where `spawn_ack_sweep`'s activity filter could no
+    /// longer see it. Neither escape survives now:
+    ///
+    /// - [`Self::unverified_driver_starts`] reads only `driver_signal_at`
+    ///   and `spawned_at`, so it is blind to activity, capability and pid
+    ///   and covers both branches identically.
+    /// - The `last_event_at` this method synthesizes below is explicitly
+    ///   NOT a driver signal. It moves the display timestamp only;
+    ///   `driver_signal_at` is untouched, so a promotion here can never
+    ///   vouch for a driver that never ran.
+    ///
     /// Returns the slot IDs that were changed so callers can broadcast
     /// the updated snapshot. Normal-running workers (whose `SessionStart`
     /// hook fires within seconds of spawn) always have `last_event_at`
@@ -846,6 +1082,11 @@ impl LiveWorkerStateRegistry {
                 continue;
             }
             state.activity = WorkerActivity::WaitingForInput;
+            // Display timestamp only — this is the engine narrating its
+            // own inference, not the driver reporting in. `driver_signal_at`
+            // is deliberately NOT written here: if it were, this promotion
+            // would silently satisfy driver-start verification and re-open
+            // the hole. See `unverified_driver_starts`.
             state.last_event_at = Some(iso8601_utc(now_epoch_secs));
             changed.push(*slot_id);
         }
@@ -1959,5 +2200,188 @@ mod tests {
         let changed = reg.downgrade_stale_activity(now, STALE_ACTIVITY_DOWNGRADE_SECS);
         assert!(changed.is_empty());
         assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Working);
+    }
+
+    // ─── driver-start verification ──────────────────────────────────────────
+
+    /// Register a slot aged past `DRIVER_START_GRACE_SECS`, with a live
+    /// foreground shell pid — the 2026-07-30 shape.
+    fn aged_slot_with_live_shell(reg: &LiveWorkerStateRegistry, slot: u8, run: &str, awaiting_input_capable: bool) {
+        reg.register_spawn_with_capabilities(
+            slot,
+            run,
+            "grok-4.5",
+            92697,
+            None,
+            awaiting_input_capable,
+            LiveSpawnRouting::none(),
+        );
+        reg.set_spawn_time_for_test(
+            slot,
+            boss_engine_utils::epoch_time::now_epoch_secs() - (DRIVER_START_GRACE_SECS + 60),
+        );
+    }
+
+    #[test]
+    fn unverified_driver_starts_reports_a_pane_with_a_live_shell_and_no_driver() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let found = reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS);
+
+        assert_eq!(found.len(), 1, "a live shell pid must not exempt the slot");
+        assert_eq!(found[0].slot_id, 1);
+        assert_eq!(found[0].run_id, "run-a");
+        assert_eq!(found[0].shell_pid, 92697);
+        assert_eq!(found[0].activity, WorkerActivity::Spawning);
+        assert!(found[0].silent_secs >= DRIVER_START_GRACE_SECS);
+    }
+
+    #[test]
+    fn a_driver_signal_removes_the_slot_from_the_unverified_set() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert_eq!(reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).len(), 1);
+
+        assert_eq!(reg.record_driver_signal("run-a", DriverSignalKind::HookEvent), Some(1));
+
+        assert!(
+            reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty(),
+            "a driver-originated signal is proof the driver started",
+        );
+    }
+
+    #[test]
+    fn either_driver_signal_kind_counts_as_proof() {
+        for kind in [DriverSignalKind::HookEvent, DriverSignalKind::TranscriptPath] {
+            let reg = LiveWorkerStateRegistry::new();
+            aged_slot_with_live_shell(&reg, 1, "run-a", false);
+            assert_eq!(reg.record_driver_signal("run-a", kind), Some(1));
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            assert!(
+                reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty(),
+                "{kind:?} must count as driver-start proof",
+            );
+        }
+    }
+
+    /// The signal is first-write-wins: it answers "did the driver ever
+    /// start?", not "when was it last alive". Later signals must not move it.
+    #[test]
+    fn record_driver_signal_keeps_the_first_timestamp() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        reg.record_driver_signal("run-a", DriverSignalKind::HookEvent);
+        let first = reg.driver_signal_at(1).unwrap();
+        reg.record_driver_signal("run-a", DriverSignalKind::TranscriptPath);
+        assert_eq!(reg.driver_signal_at(1), Some(first));
+    }
+
+    #[test]
+    fn record_driver_signal_is_a_no_op_for_an_unknown_run() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        assert_eq!(reg.record_driver_signal("run-other", DriverSignalKind::HookEvent), None);
+        assert!(reg.driver_signal_at(1).is_none());
+    }
+
+    /// The reconciliation that closes the grok hole: `mark_stalled_spawns`
+    /// declines to promote a driver without `Capability::AwaitingInputSignal`,
+    /// and that exemption must not carry over to driver-start verification.
+    #[test]
+    fn mark_stalled_spawns_capability_exemption_does_not_extend_to_driver_start() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(
+            reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS).is_empty(),
+            "precondition: the capability-less driver is exempt from promotion",
+        );
+        assert_eq!(reg.get(1).unwrap().activity, WorkerActivity::Spawning);
+
+        assert_eq!(
+            reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).len(),
+            1,
+            "driver-start verification must cover the driver mark_stalled_spawns skips",
+        );
+    }
+
+    /// The promotion path's synthesized `last_event_at` must not be mistaken
+    /// for driver evidence, and leaving `Spawning` must not hide the slot.
+    #[test]
+    fn mark_stalled_spawns_promotion_is_not_driver_evidence() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", true);
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert_eq!(reg.mark_stalled_spawns(now, STALLED_SPAWN_THRESHOLD_SECS), vec![1]);
+        let state = reg.get(1).unwrap();
+        assert_eq!(state.activity, WorkerActivity::WaitingForInput);
+        assert!(state.last_event_at.is_some());
+
+        assert!(
+            reg.driver_signal_at(1).is_none(),
+            "an engine-synthesized timestamp is not a driver signal",
+        );
+        let found = reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS);
+        assert_eq!(found.len(), 1, "a promoted slot stays subject to verification");
+        assert_eq!(found[0].activity, WorkerActivity::WaitingForInput);
+    }
+
+    #[test]
+    fn unverified_driver_starts_respects_the_grace_window() {
+        let reg = LiveWorkerStateRegistry::new();
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        reg.register_spawn(1, "run-a", "grok-4.5", 92697, None);
+        reg.set_spawn_time_for_test(1, now - 5);
+
+        assert!(
+            reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS).is_empty(),
+            "a fresh spawn must be given its window before being judged",
+        );
+    }
+
+    /// A recycled slot must not inherit the previous occupant's driver-start
+    /// proof — otherwise a healthy prior run would vouch for a new run whose
+    /// driver never exec'd.
+    #[test]
+    fn re_registering_a_slot_clears_the_prior_driver_signal() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        reg.record_driver_signal("run-a", DriverSignalKind::HookEvent);
+        assert!(reg.driver_signal_at(1).is_some());
+
+        aged_slot_with_live_shell(&reg, 1, "run-b", false);
+
+        assert!(reg.driver_signal_at(1).is_none());
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let found = reg.unverified_driver_starts(now, DRIVER_START_GRACE_SECS);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].run_id, "run-b");
+    }
+
+    #[test]
+    fn releasing_a_slot_clears_its_driver_signal() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        reg.record_driver_signal("run-a", DriverSignalKind::HookEvent);
+        reg.release_slot(1);
+        assert!(reg.driver_signal_at(1).is_none());
+    }
+
+    /// A real hook through the normal `apply_event` path does NOT by itself
+    /// stamp the driver signal — the hook ingress records it explicitly. This
+    /// pins that the two are separate concerns so a future refactor of
+    /// `apply_event` cannot silently start (or stop) vouching for a driver.
+    #[test]
+    fn apply_event_alone_does_not_stamp_the_driver_signal() {
+        let reg = LiveWorkerStateRegistry::new();
+        aged_slot_with_live_shell(&reg, 1, "run-a", false);
+        reg.apply_event(1, &pre_tool("Bash"));
+        assert!(reg.get(1).unwrap().last_event_at.is_some());
+        assert!(reg.driver_signal_at(1).is_none());
     }
 }

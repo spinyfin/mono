@@ -189,6 +189,7 @@ fn execution_id_with_driver(server_state: &ServerState, driver: Option<&str>) ->
 mod app_channel;
 mod context;
 mod dispatch_pause;
+mod driver_start_signal;
 mod engine_health_report;
 mod open_document;
 mod pr_status;

@@ -349,6 +349,27 @@ pub enum Stage {
     /// `details` object carries `shell_pid` (always `0`) and the
     /// `threshold_secs` grace window that elapsed.
     SpawnAckTimeout,
+    /// A worker pane came up, but no **driver-originated** signal — a hook
+    /// event or a `transcript_path` — ever arrived, so the driver binary
+    /// itself never executed. The execution is marked `orphaned`, the pane
+    /// torn down, the pool slot released, the cube workspace lease
+    /// force-released, and an attention item raised.
+    ///
+    /// Distinct from [`Stage::SpawnAckTimeout`] in exactly the way that
+    /// matters: that stage fires only when NOTHING reported in (`shell_pid`
+    /// is always `0`), whereas here a shell pid is typically alive and
+    /// healthy-looking. It is the login shell hosting the pane, not the
+    /// driver. That distinction is the 2026-07-30 incident: the pid made the
+    /// slot pass `spawn_ack_sweep` (which skipped `shell_pid > 0`),
+    /// `mark_stalled_spawns` (which skips drivers without
+    /// `Capability::AwaitingInputSignal`), and `dead_pid_sweep` (whose
+    /// `kill(pid, 0)` found the shell alive), so the slot and its cube lease
+    /// were held indefinitely with no attention item.
+    ///
+    /// The `details` object carries `slot_id`, the (possibly live)
+    /// `shell_pid`, the `threshold_secs` window that elapsed, `silent_secs`,
+    /// and the `activity` the slot was advertising.
+    DriverStartTimeout,
     /// The periodic dispatch-failure-recovery sweep found a work item the
     /// engine had bounced to Backlog after a pre-spawn dispatch failure
     /// exhausted its immediate retries (`bounce_dispatch_failed_to_backlog`
@@ -609,6 +630,7 @@ impl Stage {
             Stage::RemoteLeaseReconcile => "remote_lease_reconcile",
             Stage::HostDrainReconcile => "host_drain_reconcile",
             Stage::SpawnAckTimeout => "spawn_ack_timeout",
+            Stage::DriverStartTimeout => "driver_start_timeout",
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
             Stage::SpawnNack => "spawn_nack",
             Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
@@ -1368,6 +1390,7 @@ mod tests {
         assert_eq!(Stage::RemoteLeaseReconcile.as_str(), "remote_lease_reconcile");
         assert_eq!(Stage::HostDrainReconcile.as_str(), "host_drain_reconcile");
         assert_eq!(Stage::SpawnAckTimeout.as_str(), "spawn_ack_timeout");
+        assert_eq!(Stage::DriverStartTimeout.as_str(), "driver_start_timeout");
         assert_eq!(
             Stage::DispatchFailureRecoveryRedispatch.as_str(),
             "dispatch_failure_recovery_redispatch"
