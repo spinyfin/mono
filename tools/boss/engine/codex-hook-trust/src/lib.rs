@@ -1090,6 +1090,72 @@ fn trusted_hash_in_config(config_raw: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Read an attestation previously written by [`write_attestation_file`].
+///
+/// A missing or unparseable file is [`TrustGateError::AttestationStale`], not
+/// an absence to shrug at: the file is written at arming time and is the only
+/// record of which guards Boss believes are armed. If it is gone, Boss cannot
+/// prove anything about them.
+pub fn read_attestation_file(path: &Path) -> Result<HookTrustAttestation, TrustGateError> {
+    let raw = fs::read_to_string(path).map_err(|err| TrustGateError::AttestationStale {
+        detail: format!("attestation unreadable at {}: {err}", path.display()),
+    })?;
+    serde_json::from_str(&raw).map_err(|err| TrustGateError::AttestationStale {
+        detail: format!("attestation unparseable at {}: {err}", path.display()),
+    })
+}
+
+/// Re-check that the guard chain named by `attestation` is *still* on disk and
+/// still has the bytes that were attested — without re-observing Codex.
+///
+/// # Why this is separate from [`verify_attestation`]
+///
+/// [`verify_attestation`] answers "does this attestation still describe the
+/// config we armed?", which needs the caller to hold the `CommandHookSpec`
+/// list. This answers the narrower question a long-lived worker needs at every
+/// turn boundary — "is the thing Codex will `exec` still there, unchanged?" —
+/// from the attestation alone.
+///
+/// # Why a re-check is needed at all
+///
+/// Arming happens once, at run start. Under a one-turn-per-process run that is
+/// effectively the same instant as the run's only turn boundary, so "armed at
+/// arming time" and "armed now" are the same statement. Under a long-lived
+/// session they are hours apart, and every guard lives in a Boss-owned
+/// `CODEX_HOME` under a temp root that retention reclaim and the OS both
+/// delete from. Codex's hook failures are silent and fail-open, so a wrapper
+/// that vanishes mid-session disarms every guardrail with nothing in Codex's
+/// own stream to say so.
+///
+/// Only the hook `command` paths are checked here: those are what Codex
+/// invokes, and they are the only files whose disappearance is *silent*. The
+/// trace shim and the guard bodies behind each wrapper carry their own
+/// content checks, which run inside the wrapper and fail **closed** with a
+/// recorded decision — a loud failure that needs no external detection.
+pub fn verify_armed_chain_on_disk(attestation: &HookTrustAttestation) -> Result<(), TrustGateError> {
+    if attestation.hooks.is_empty() {
+        return Err(TrustGateError::AttestationIncomplete {
+            detail: "attestation carries no hook entries".into(),
+        });
+    }
+    for entry in &attestation.hooks {
+        let command = resolve_absolute(Path::new(&entry.command));
+        let observed = ensure_guard_executable(&command)?;
+        let Some(attested) = entry.guard_content_sha256.as_deref() else {
+            continue;
+        };
+        if observed != attested {
+            return Err(TrustGateError::AttestationStale {
+                detail: format!(
+                    "guard {} changed since arming (attested {attested}, on disk {observed})",
+                    command.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Write the attestation as pretty JSON next to the run (audit trail).
 pub fn write_attestation_file(path: &Path, attestation: &HookTrustAttestation) -> Result<(), TrustGateError> {
     let json = serde_json::to_string_pretty(attestation).map_err(|err| TrustGateError::ConfigWriteFailed {

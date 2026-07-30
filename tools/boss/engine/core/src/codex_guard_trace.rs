@@ -11,16 +11,20 @@
 //!   failure. This is the signal that makes "did the guard fire for this
 //!   execution, and what did it decide?" answerable for a Codex run at all;
 //!   nothing in Codex's own stream carries it.
-//! - [`boss_engine_driver::codex::GUARDS_SILENT_MARKER`] — tool calls have run
-//!   and **no** guard invocation has been recorded for the run at all (guards
-//!   are armed once per run, so one recorded invocation settles it and the
-//!   signal goes quiet for good). Codex's hook failures are
-//!   documented as silent and fail-open (an untrusted hook is skipped with no
-//!   stream event; an unexecutable handler produces no diagnostic), so this is
-//!   the only observable difference between "guardrails enforced" and
-//!   "guardrails inert". Boss's worker prompt asserts pushes are blocked, so
-//!   this is recorded at `error` level: it means that assertion was not being
-//!   enforced.
+//! - [`boss_engine_driver::codex::GUARDS_SILENT_MARKER`] — the guardrails are
+//!   not being enforced. Codex's hook failures are documented as silent and
+//!   fail-open (an untrusted hook is skipped with no stream event; an
+//!   unexecutable handler produces no diagnostic), so this is the only
+//!   observable difference between "guardrails enforced" and "guardrails
+//!   inert". Boss's worker prompt asserts pushes are blocked, so this is
+//!   recorded at `error` level: it means that assertion was not being enforced.
+//!
+//!   Two conditions raise it, and the detail string says which. Either the
+//!   armed guard chain is no longer on disk with the bytes Boss attested — a
+//!   per-turn re-check, because arming is a one-time act and a persistent
+//!   session outlives it by hours — or no guard invocation has been recorded
+//!   for the run at all while tool calls ran. Only the second is run-scoped;
+//!   the first fires on every turn the chain stays broken.
 //!
 //! This module owns the counters; the dispatch that feeds them lives in
 //! `app/worker_events.rs` alongside the other notification-marker handlers.
@@ -35,9 +39,9 @@ crate::register_counter!(
 crate::register_counter!(
     CODEX_GUARDS_SILENT,
     "codex.guard_trace.silent",
-    "A Codex run ran tool calls with no PreToolUse guard invocation recorded for the whole run — \
-     the observable signature of Codex's silent hook fail-open. Command guardrails were not being \
-     enforced.",
+    "A Codex turn ended with its PreToolUse guardrails unenforced — either the armed guard chain \
+     is no longer intact on disk, or tool calls ran with no guard invocation recorded for the \
+     whole run. Both are the observable signature of Codex's silent hook fail-open.",
 );
 
 /// Register both guard-trace counters with `registry`. Called from
