@@ -5,8 +5,16 @@ import Foundation
 /// `retainDays` days. All I/O runs on a private serial queue so log
 /// writes never block the calling thread.
 ///
-/// Log files live at:
+/// This is the app's own half of the transcript, written alongside the
+/// engine-side one:
+///
 ///   `~/Library/Application Support/Boss/ipc/ipc-YYYY-MM-DD.jsonl`
+///
+/// (Engine side: `ipc/engine-ipc-YYYY-MM-DD.jsonl`, written by the Rust
+/// `ipc_log` module.) The two used to be one shared file; since both
+/// processes log both directions, that made every exchange appear twice
+/// with no field distinguishing the writers, so each side now keeps its
+/// own file.
 ///
 /// Each line is a JSON object:
 ///   `ts_epoch_ms`  – milliseconds since Unix epoch
@@ -14,6 +22,11 @@ import Foundation
 ///   `request_id`   – opaque id that pairs a request with its response
 ///   `kind`         – snake_case discriminant (e.g. `"release_worker_pane"`)
 ///   `body`         – the full request or response payload
+///
+/// Correlation: `request_id` is minted by the engine as
+/// `<session_id>-eng-req-<n>` and echoed back verbatim here, so it is the
+/// join key with `engine-ipc-*.jsonl`: `(request_id, direction, kind)`
+/// identifies one exchange leg on either side.
 final class IpcLog: @unchecked Sendable {
     static let shared: IpcLog = {
         let appSupport = FileManager.default

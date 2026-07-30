@@ -32,8 +32,15 @@ impl AppSessionHandle {
         }
     }
 
+    /// Mints `<session_id>-eng-req-<n>`. The session prefix (unique per app
+    /// registration, see [`ServerState::allocate_session_id`]) is what makes
+    /// this id — and therefore the IPC log's join key — unique across app
+    /// reconnects and engine restarts; `next_request_id` alone is a
+    /// per-handle counter that restarts at 1 on every new registration and
+    /// would otherwise collide across sessions. See `ipc_log`'s `#
+    /// Correlation` doc block.
     pub(super) fn allocate_request_id(&mut self) -> String {
-        let id = format!("eng-req-{}", self.next_request_id);
+        let id = format!("{}-eng-req-{}", self.session_id, self.next_request_id);
         self.next_request_id += 1;
         id
     }

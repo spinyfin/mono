@@ -4,7 +4,18 @@
 //! the hot path (send_to_app / deliver_app_response) is never blocked
 //! on disk I/O.
 //!
-//! Log lives at: `<boss-state-root>/ipc/ipc-YYYY-MM-DD.jsonl`
+//! This is the engine's own half of the transcript, written alongside the
+//! app-side one:
+//!
+//!   `<boss-state-root>/ipc/engine-ipc-YYYY-MM-DD.jsonl`
+//!
+//! (App side: `ipc/ipc-YYYY-MM-DD.jsonl`, written by the Swift `IpcLog`.)
+//! The two files were originally a single shared file with both processes
+//! appending the same schema to it; that made every exchange appear
+//! twice (each side logs both directions) with no field to tell the
+//! writers apart, so the two are kept as independent per-writer
+//! transcripts instead — see the file split rationale in this module's
+//! git history.
 //!
 //! Each line is a JSON object:
 //!   `ts_epoch_ms`  – milliseconds since Unix epoch
@@ -13,7 +24,19 @@
 //!   `kind`         – snake_case discriminant (e.g. `"release_worker_pane"`)
 //!   `body`         – the full serialised request or response payload
 //!
-//! Built on the generic day-rotated writer in [`boss_engine_day_rotated_log`].
+//! # Correlation
+//!
+//! `request_id` is minted by [`crate::app::AppSessionHandle::allocate_request_id`]
+//! as `<session_id>-eng-req-<n>` and echoed back verbatim by the app, so it
+//! is the join key with `ipc-*.jsonl`: `(request_id, direction, kind)`
+//! identifies one exchange leg on either side. The `<session_id>` prefix
+//! (unique per app registration) is load-bearing — the per-handle counter
+//! alone restarts at 1 on every app reconnect, so without it `request_id`
+//! would recur within a single day's file and a join could not tell which
+//! app-side record answers which engine-side one.
+//!
+//! Built on the generic day-rotated writer in [`boss_engine_day_rotated_log`],
+//! shared with `crate::population_timing`.
 
 use std::path::PathBuf;
 
@@ -23,7 +46,7 @@ use serde_json::Value;
 use crate::protocol::{EngineToAppRequest, EngineToAppResponse};
 use boss_engine_day_rotated_log::{DayRotatedLogger, TimestampedRecord};
 
-const FILE_PREFIX: &str = "ipc-";
+const FILE_PREFIX: &str = "engine-ipc-";
 
 #[derive(Debug, Serialize)]
 struct IpcLogEntry {
