@@ -886,6 +886,29 @@ mod tests {
         async fn dispatch_worker_event(&self, _incoming: crate::events_socket::IncomingHookEvent) {}
     }
 
+    /// Checkpoint store for the spawn-ordering tests, which have no DB. What
+    /// they assert is the *sequence* of collaborator calls, not the durable
+    /// resume point — that is covered where the tail actually runs, in
+    /// `agent_jsonl_progress`.
+    struct DiscardCheckpoints;
+
+    impl crate::agent_jsonl_progress::IngressCheckpointStore for DiscardCheckpoints {
+        fn store_ingress_checkpoint(
+            &self,
+            _run_id: &str,
+            _checkpoint: &crate::agent_jsonl_progress::IngressCheckpoint,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn load_ingress_checkpoint(
+            &self,
+            _run_id: &str,
+        ) -> Result<Option<crate::agent_jsonl_progress::IngressCheckpoint>, String> {
+            Ok(None)
+        }
+    }
+
     /// One observable step of `start_worker`'s collaborator sequence,
     /// recorded in call order by [`LiveStateSpawner`].
     ///
@@ -1000,7 +1023,13 @@ mod tests {
                     return Ok(());
                 }
             };
-            self.jsonl.prepare_run(run_id, driver, ingress, NoopEventSink)
+            self.jsonl.prepare_run(
+                run_id,
+                driver,
+                ingress,
+                NoopEventSink,
+                std::sync::Arc::new(DiscardCheckpoints),
+            )
         }
 
         fn activate_progress_ingress(&self, run_id: &str) {

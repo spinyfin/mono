@@ -771,3 +771,61 @@ async fn interrupted_read_is_retried_not_treated_as_fatal() {
     assert_eq!(kinds(&[envelope.event]), vec!["stop"]);
     assert!(!reader.stats().ended_with_io_error);
 }
+
+// ─── Resume support ─────────────────────────────────────────────────────────
+
+/// The number a durable resume point is written from.
+///
+/// `consumed_bytes` read immediately after `next_event` returns must name the
+/// end of the line that produced that envelope — including any skipped lines
+/// crossed on the way there, because a skipped line produced nothing that a
+/// resume could duplicate. If it lagged, a checkpoint would replay the events
+/// of every line between the reported position and the real one.
+#[tokio::test]
+async fn consumed_bytes_tracks_the_end_of_the_line_that_produced_each_event() {
+    let stream = concat!(
+        r#"{"type":"thread.started","thread_id":"t"}"#,
+        "\n",
+        "interleaved non-JSON chatter\n",
+        r#"{"type":"turn.completed","usage":{}}"#,
+        "\n",
+    );
+    let first_line_end = stream.find('\n').unwrap() as u64 + 1;
+    let mut reader = StdoutJsonlProgressReader::new(stream.as_bytes(), CodexShapedDriver::arc());
+
+    let first = reader.next_event().await.expect("the thread start");
+    assert_eq!(kinds(&[first.event]), vec!["session_start"]);
+    assert_eq!(reader.consumed_bytes(), first_line_end);
+
+    let second = reader.next_event().await.expect("the turn boundary");
+    assert_eq!(kinds(&[second.event]), vec!["stop"]);
+    assert_eq!(
+        reader.consumed_bytes(),
+        stream.len() as u64,
+        "the skipped chatter line is behind the resume point, not ahead of it",
+    );
+
+    assert!(reader.next_event().await.is_none());
+    assert_eq!(reader.consumed_bytes(), stream.len() as u64);
+}
+
+/// A resume state the driver cannot restore must stop the reader outright.
+///
+/// Reading a mid-stream file with a zeroed session is worse than reading
+/// nothing: it looks healthy while re-announcing state the run already
+/// reported, and there is no downstream filter that could tell the difference.
+#[tokio::test]
+async fn a_rejected_resume_state_yields_no_events_at_all() {
+    let mut reader = StdoutJsonlProgressReader::for_session(
+        CODEX_TURN.as_bytes(),
+        CodexShapedDriver::arc(),
+        ProgressSessionConfig {
+            resume_state: Some(serde_json::json!({"anything": true})),
+            ..ProgressSessionConfig::default()
+        },
+    );
+    assert!(reader.next_event().await.is_none());
+    let stats = reader.stats();
+    assert!(stats.resume_state_rejected);
+    assert_eq!(stats.events_emitted, 0);
+}

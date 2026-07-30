@@ -2037,6 +2037,93 @@ impl WorkDb {
         Ok(resumed)
     }
 
+    /// Persist the run's file-progress ingress resume point.
+    ///
+    /// Targets the same agent-session row as
+    /// [`Self::claim_run_progress_session_identity`], so the resume point and
+    /// the session identity can never end up describing different runs.
+    /// Errors when the execution has no run row: a checkpoint nobody can read
+    /// back is indistinguishable from no ingress at all, and the caller has to
+    /// know which of those it is.
+    pub fn set_run_progress_ingress_checkpoint(&self, execution_id: &str, checkpoint_json: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            bail!("no work_runs row for execution {execution_id}");
+        };
+        conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = ?2 WHERE id = ?1",
+            params![run_id, checkpoint_json],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve the `work_runs` row an execution's agent-session state lives
+    /// on, for a caller that is about to write to it repeatedly.
+    ///
+    /// Same row [`Self::set_run_progress_ingress_checkpoint`] picks, exposed
+    /// separately so the file-progress ingress — which writes after every
+    /// dispatched event — resolves it once at attach time instead of on each
+    /// write. The derivation is an ordered scan over `work_runs` under the
+    /// shared connection lock, and its answer is fixed for the life of a run.
+    pub fn resolve_run_row_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        resolve_run_id_for_execution_hooks(&conn, execution_id)
+    }
+
+    /// [`Self::set_run_progress_ingress_checkpoint`] against an already
+    /// resolved [`Self::resolve_run_row_for_execution`] row: one keyed UPDATE,
+    /// one acquisition of the shared connection.
+    ///
+    /// Errors when the row has gone (an execution whose run rows were pruned
+    /// mid-flight), for the same reason the run-id keyed form does: a resume
+    /// point that silently went nowhere reads back exactly like a run that
+    /// never had an ingress.
+    pub fn set_run_progress_ingress_checkpoint_by_row(&self, run_row_id: &str, checkpoint_json: &str) -> Result<()> {
+        let conn = self.connect()?;
+        let updated = conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = ?2 WHERE id = ?1",
+            params![run_row_id, checkpoint_json],
+        )?;
+        if updated == 0 {
+            bail!("no work_runs row {run_row_id}");
+        }
+        Ok(())
+    }
+
+    /// Read back the run's file-progress ingress resume point.
+    ///
+    /// `Ok(None)` means "this run never recorded one" — a legitimate answer
+    /// for a run dispatched by an engine that predates the column, and a
+    /// distinct one from a read failure, which surfaces as `Err`.
+    pub fn get_run_progress_ingress_checkpoint(&self, execution_id: &str) -> Result<Option<String>> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(None);
+        };
+        Ok(conn
+            .query_row(
+                "SELECT progress_ingress_checkpoint FROM work_runs WHERE id = ?1",
+                params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// Drop the ingress resume point during normal execution teardown.
+    /// Returns `false` when no run row exists.
+    pub fn clear_run_progress_ingress_checkpoint(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
+            return Ok(false);
+        };
+        let updated = conn.execute(
+            "UPDATE work_runs SET progress_ingress_checkpoint = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(updated > 0)
+    }
+
     /// Clear the engine-owned provider session identity during normal
     /// execution teardown. Returns `false` when no run row exists.
     ///

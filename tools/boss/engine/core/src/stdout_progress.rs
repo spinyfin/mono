@@ -89,6 +89,21 @@ pub struct UnknownDriverError(pub String);
 /// produces.
 const DISPATCH_QUEUE_DEPTH: usize = 64;
 
+/// One decoded event travelling from the reader to the dispatch consumer,
+/// carrying the resume point that belongs to it.
+///
+/// `consumed_bytes` is `None` for every envelope but the last of a line. The
+/// reader's byte position advances at the *line* boundary, so a line that
+/// normalises to several envelopes has only one position that is true for all
+/// of them — the one taken once the last has been handed out. Persisting the
+/// end-of-line offset from an earlier envelope of the same line would name a
+/// resume point past records still queued for dispatch.
+struct DispatchItem {
+    incoming: IncomingHookEvent,
+    consumed_bytes: Option<u64>,
+    session_state: Option<serde_json::Value>,
+}
+
 /// Read `stream` as `run_id`'s stdout-JSONL progress stream until it ends,
 /// dispatching every envelope the run's driver recognises to `sink`.
 ///
@@ -211,15 +226,66 @@ where
     R: AsyncRead + Unpin,
     S: WorkerEventSink + ?Sized,
 {
+    run_jsonl_progress_ingress_checkpointed(run_id, driver_slug, driver, stream, sink, session_config, None).await
+}
+
+/// Where a resumable ingress records how far it has got.
+///
+/// Called once per dispatched event, *after* the engine's fan-out for that
+/// event has returned, with the reader's own consumed-byte position and the
+/// driver session state that belongs to it. Both come from the same
+/// observation, so a restored ingress can never pair one record's offset with
+/// another record's session.
+///
+/// Deliberately synchronous and infallible from the ingress's point of view:
+/// it runs between dispatches, so it must not be able to stall or abort the
+/// stream. Implementations that persist do their own error reporting.
+pub trait ProgressCheckpointSink: Send + Sync {
+    fn record_progress_checkpoint(&self, consumed_bytes: u64, session_state: Option<serde_json::Value>);
+}
+
+/// [`run_jsonl_progress_ingress_with_driver`] with a durable resume point.
+///
+/// The checkpoint is taken **after** `dispatch_worker_event` returns for the
+/// event the offset belongs to, never before. That ordering is the whole
+/// contract: a checkpoint written ahead of dispatch would let an engine crash
+/// in the gap silently *skip* a record — and a skipped `Stop` is a turn
+/// boundary that never happens, which is the exact failure a resumable
+/// ingress exists to prevent. Writing it after instead bounds the crash
+/// window to re-reading the single record whose dispatch had completed.
+///
+/// "After the event the offset belongs to" is per *record*, not per envelope.
+/// The reader's byte position is a line-framing position, and one line can
+/// normalise to several events; the offset belongs to the last of them and to
+/// no earlier one. So the checkpoint is skipped for every envelope but the
+/// line's last — see [`StdoutJsonlProgressReader::at_record_boundary`]. A
+/// `task_complete` record that yields `[Notification, Stop]` therefore
+/// records nothing until the `Stop` has been through the fan-out, and a crash
+/// between the two replays the whole record rather than losing the boundary.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_jsonl_progress_ingress_checkpointed<R, S>(
+    run_id: &str,
+    driver_slug: &str,
+    driver: std::sync::Arc<dyn crate::driver::AgentDriver>,
+    stream: R,
+    sink: &S,
+    session_config: crate::driver::ProgressSessionConfig,
+    checkpoint: Option<&dyn ProgressCheckpointSink>,
+) -> ReaderStats
+where
+    R: AsyncRead + Unpin,
+    S: WorkerEventSink + ?Sized,
+{
     tracing::info!(
         run_id,
         driver = driver_slug,
         source = ?session_config.source,
+        resuming = session_config.resume_state.is_some(),
         "jsonl progress: ingress started"
     );
 
     let mut reader = StdoutJsonlProgressReader::for_session(stream, driver.clone(), session_config);
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<IncomingHookEvent>(DISPATCH_QUEUE_DEPTH);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<DispatchItem>(DISPATCH_QUEUE_DEPTH);
 
     let produce = async {
         while let Some(envelope) = reader.next_event().await {
@@ -234,7 +300,22 @@ where
                 envelope.transcript_path,
                 None,
             );
-            if tx.send(incoming).await.is_err() {
+            // Snapshotted here, not in `consume`: by the time the dispatch
+            // completes the reader may already be several lines further on,
+            // and a checkpoint that named *that* position would skip
+            // everything in between.
+            //
+            // And only at a record boundary: mid-line the position already
+            // names the end of a line whose remaining envelopes are still
+            // queued behind this one, so there is no honest offset to carry.
+            let resume_point = (checkpoint.is_some() && reader.at_record_boundary())
+                .then(|| (reader.consumed_bytes(), reader.resume_state()));
+            let item = DispatchItem {
+                incoming,
+                consumed_bytes: resume_point.as_ref().map(|(bytes, _)| *bytes),
+                session_state: resume_point.and_then(|(_, state)| state),
+            };
+            if tx.send(item).await.is_err() {
                 // The consumer only ever exits when this end of the channel
                 // (held by this same future) is dropped, so this arm is
                 // unreachable in practice; break rather than panic if that
@@ -249,8 +330,11 @@ where
     };
 
     let consume = async {
-        while let Some(incoming) = rx.recv().await {
-            sink.dispatch_worker_event(incoming).await;
+        while let Some(item) = rx.recv().await {
+            sink.dispatch_worker_event(item.incoming).await;
+            if let (Some(checkpoint), Some(consumed_bytes)) = (checkpoint, item.consumed_bytes) {
+                checkpoint.record_progress_checkpoint(consumed_bytes, item.session_state);
+            }
         }
     };
 
@@ -266,6 +350,7 @@ where
         oversized_lines = stats.oversized_lines,
         unterminated_tails = stats.unterminated_tails,
         ended_with_io_error = stats.ended_with_io_error,
+        resume_state_rejected = stats.resume_state_rejected,
         "jsonl progress: ingress ended",
     );
     stats
@@ -479,6 +564,10 @@ mod tests {
     /// unreachable from this ingress path and left `unimplemented!()`.
     struct MinimalStdoutDriver {
         descriptor: crate::driver::DriverDescriptor,
+        /// When set, the driver hands out a [`FanOutSession`] so one line
+        /// normalises to `[Notification, Stop]` — the multi-event record
+        /// shape a real Codex `task_complete` has.
+        fan_out: bool,
     }
 
     fn no_effort_value(_level: boss_protocol::EffortLevel) -> Option<&'static str> {
@@ -500,9 +589,56 @@ mod tests {
         true
     }
 
+    /// One line in, `[Notification, Stop]` out — the shape
+    /// `CodexRolloutProgressSession` produces for a `task_complete` record
+    /// that also drains a queued notification.
+    struct FanOutSession;
+
+    impl crate::driver::ProgressSessionNormalizer for FanOutSession {
+        fn normalize_progress_event(
+            &mut self,
+            _raw: &serde_json::Value,
+        ) -> Result<boss_protocol::WorkerEvent, boss_protocol::NormalizeError> {
+            unreachable!("the batch form below is what the reader calls for a session driver")
+        }
+
+        fn normalize_progress_events(
+            &mut self,
+            raw: &serde_json::Value,
+        ) -> Result<Vec<boss_protocol::WorkerEvent>, boss_protocol::NormalizeError> {
+            match raw.get("type").and_then(serde_json::Value::as_str) {
+                Some("turn.completed") => Ok(vec![
+                    boss_protocol::WorkerEvent::Notification {
+                        session_id: "stub-session".to_owned(),
+                        message: "drained".to_owned(),
+                    },
+                    boss_protocol::WorkerEvent::Stop {
+                        session_id: "stub-session".to_owned(),
+                        stop_hook_active: false,
+                        stop_reason: boss_protocol::StopReason::Completed,
+                    },
+                ]),
+                other => Err(boss_protocol::NormalizeError::UnknownEvent(format!("{other:?}"))),
+            }
+        }
+
+        fn transcript_path_for_session(&mut self, _raw: &serde_json::Value) -> Option<String> {
+            None
+        }
+
+        fn resume_state(&self) -> Option<serde_json::Value> {
+            Some(serde_json::json!({"stub": true}))
+        }
+    }
+
     impl MinimalStdoutDriver {
         fn arc() -> std::sync::Arc<dyn crate::driver::AgentDriver> {
+            Self::arc_with_fan_out(false)
+        }
+
+        fn arc_with_fan_out(fan_out: bool) -> std::sync::Arc<dyn crate::driver::AgentDriver> {
             std::sync::Arc::new(Self {
+                fan_out,
                 descriptor: crate::driver::DriverDescriptor {
                     name: "stub-stdout-driver",
                     label: "Stub stdout-JSONL driver",
@@ -583,6 +719,13 @@ mod tests {
                 other => Err(boss_protocol::NormalizeError::UnknownEvent(format!("{other:?}"))),
             }
         }
+        fn progress_session(
+            &self,
+            _: &crate::driver::ProgressSessionConfig,
+        ) -> Option<Box<dyn crate::driver::ProgressSessionNormalizer>> {
+            self.fan_out
+                .then(|| Box::new(FanOutSession) as Box<dyn crate::driver::ProgressSessionNormalizer>)
+        }
         fn turn_boundary(&self, event: &boss_protocol::WorkerEvent) -> Option<crate::driver::TurnEnd> {
             match event {
                 boss_protocol::WorkerEvent::Stop {
@@ -646,6 +789,85 @@ mod tests {
         assert_eq!(stats.events_emitted, 1);
         assert_eq!(stats.unrecognised_envelopes, 1);
         assert_eq!(*sink.seen.lock().unwrap(), vec![WorkerActivity::Idle]);
+    }
+
+    // ─── checkpoint ordering ────────────────────────────────────────────────
+
+    /// Interleaved log of dispatches and checkpoints, so a test can assert on
+    /// their *order* rather than on each in isolation — the ordering is the
+    /// whole guarantee here.
+    #[derive(Default)]
+    struct OrderLog(Mutex<Vec<String>>);
+
+    struct LoggingSink(Arc<OrderLog>);
+
+    #[async_trait::async_trait]
+    impl WorkerEventSink for LoggingSink {
+        async fn dispatch_worker_event(&self, incoming: IncomingHookEvent) {
+            let label = match incoming.event {
+                boss_protocol::WorkerEvent::Notification { .. } => "notification",
+                boss_protocol::WorkerEvent::Stop { .. } => "stop",
+                ref other => panic!("unexpected event {other:?}"),
+            };
+            self.0.0.lock().unwrap().push(format!("dispatch:{label}"));
+        }
+    }
+
+    struct LoggingCheckpoint(Arc<OrderLog>);
+
+    impl ProgressCheckpointSink for LoggingCheckpoint {
+        fn record_progress_checkpoint(&self, consumed_bytes: u64, session_state: Option<serde_json::Value>) {
+            assert!(
+                session_state.is_some(),
+                "the session state belongs to the same observation as the offset",
+            );
+            self.0.0.lock().unwrap().push(format!("checkpoint:{consumed_bytes}"));
+        }
+    }
+
+    /// **The multi-event record invariant.** `consumed_bytes` advances a whole
+    /// line at a time, but one record can normalise to several events — the
+    /// `[Notification, Stop]` shape a Codex `task_complete` has when it also
+    /// drains a queued notification. Checkpointing on the *first* of those
+    /// would persist the end of the line while the `Stop` is still queued: an
+    /// engine that died in that window would resume past the whole record and
+    /// the turn boundary would never be emitted, which is precisely the
+    /// failure a resumable ingress exists to prevent.
+    #[tokio::test]
+    async fn a_multi_event_record_checkpoints_only_after_its_last_envelope() {
+        let line = concat!(r#"{"type":"turn.completed"}"#, "\n");
+        let stream = format!("{line}{line}");
+        let log = Arc::new(OrderLog::default());
+        let sink = LoggingSink(log.clone());
+        let checkpoint = LoggingCheckpoint(log.clone());
+
+        run_jsonl_progress_ingress_checkpointed(
+            "exec-1",
+            "stub-multi",
+            MinimalStdoutDriver::arc_with_fan_out(true),
+            stream.as_bytes(),
+            &sink,
+            crate::driver::ProgressSessionConfig {
+                run_id: Some("exec-1".to_owned()),
+                ..crate::driver::ProgressSessionConfig::default()
+            },
+            Some(&checkpoint),
+        )
+        .await;
+
+        let first_line = line.len() as u64;
+        assert_eq!(
+            *log.0.lock().unwrap(),
+            vec![
+                "dispatch:notification".to_owned(),
+                "dispatch:stop".to_owned(),
+                format!("checkpoint:{first_line}"),
+                "dispatch:notification".to_owned(),
+                "dispatch:stop".to_owned(),
+                format!("checkpoint:{}", first_line * 2),
+            ],
+            "no checkpoint may be written between the two envelopes of one record",
+        );
     }
 
     /// The default entry point must still refuse a slug that only exists on

@@ -158,6 +158,15 @@ pub struct ReaderStats {
     /// Set when the read failed with an I/O error and the reader stopped early
     /// rather than at a clean end of stream.
     pub ended_with_io_error: bool,
+    /// Set when the caller supplied a
+    /// [`ProgressSessionConfig::resume_state`] the driver's session refused.
+    ///
+    /// The reader then yields nothing at all rather than reading a resumed
+    /// stream with an un-resumed session: mid-stream bytes decoded against a
+    /// zeroed session are worse than no events, because they look like a
+    /// healthy run while re-announcing state the run already reported. The
+    /// caller is expected to surface this to an operator.
+    pub resume_state_rejected: bool,
 }
 
 /// One framed line, or the reason there wasn't one.
@@ -186,6 +195,15 @@ pub struct StdoutJsonlProgressReader<R> {
     pending_events: VecDeque<ProgressEnvelope>,
     config: ReaderConfig,
     stats: ReaderStats,
+    /// Bytes taken off the stream so far, counted at the framing boundary.
+    ///
+    /// This is the reader's own position, not the writer's: it advances only
+    /// as [`Self::next_raw_line`] consumes from the buffer, so immediately
+    /// after [`Self::next_event`] returns it names the end of the line that
+    /// produced the returned envelope. That is precisely the position a
+    /// durable resume point has to record — anything derived from the
+    /// *writer* would be ahead of what the engine has actually acted on.
+    consumed_bytes: u64,
 }
 
 impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
@@ -248,20 +266,77 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
         config: ReaderConfig,
         session_config: ProgressSessionConfig,
     ) -> Self {
-        let progress_session = driver.progress_session(&session_config);
+        let mut progress_session = driver.progress_session(&session_config);
+        let mut stats = ReaderStats::default();
+        if let Some(state) = session_config.resume_state.as_ref() {
+            let restored = match progress_session.as_mut() {
+                Some(session) => session.restore_resume_state(state),
+                None => Err("driver produced no progress session to resume".to_owned()),
+            };
+            if let Err(err) = restored {
+                tracing::error!(
+                    %err,
+                    "jsonl progress: refusing to read a resumed stream with an un-resumed session",
+                );
+                stats.resume_state_rejected = true;
+                progress_session = None;
+            }
+        }
         Self {
             reader: BufReader::new(stream),
             driver,
             progress_session,
             pending_events: VecDeque::new(),
             config,
-            stats: ReaderStats::default(),
+            stats,
+            consumed_bytes: 0,
         }
     }
 
     /// What the reader has seen so far.
     pub fn stats(&self) -> ReaderStats {
         self.stats
+    }
+
+    /// Bytes consumed off the stream through the end of the last framed line.
+    ///
+    /// Read this immediately after [`Self::next_event`] returns `Some` and it
+    /// names the end of the line that produced that envelope — including any
+    /// blank, non-JSON or driver-declined lines skipped on the way to it,
+    /// which is correct, because a skipped line produced nothing to replay.
+    ///
+    /// It advances a whole *line* at a time, while [`Self::next_event`] yields
+    /// one *envelope* at a time, so it is only a truthful resume point when
+    /// [`Self::at_record_boundary`] agrees — see that method.
+    pub fn consumed_bytes(&self) -> u64 {
+        self.consumed_bytes
+    }
+
+    /// Whether the reader holds no further envelopes from the line it last
+    /// framed.
+    ///
+    /// One record can normalise to several [`WorkerEvent`]s — a Codex
+    /// `task_complete` that also drains queued notifications yields
+    /// `[Notification.., Stop]` — and they are handed out one call at a time
+    /// from a buffer this drains. [`Self::consumed_bytes`] is already at the
+    /// end of that whole line from the *first* of them, so a caller that
+    /// persisted it there would name a position past envelopes it has not
+    /// dispatched yet: a crash in that window skips the rest of the line,
+    /// including a `Stop`.
+    ///
+    /// Read immediately after [`Self::next_event`] returns `Some`, this is
+    /// `true` exactly when that envelope was the line's last, which is the
+    /// only moment `consumed_bytes` is safe to make durable.
+    pub fn at_record_boundary(&self) -> bool {
+        self.pending_events.is_empty()
+    }
+
+    /// The driver session's resumable state as of the last line consumed.
+    ///
+    /// Snapshotted alongside [`Self::consumed_bytes`] so a persisted resume
+    /// point carries the session state that belongs to exactly that offset.
+    pub fn resume_state(&self) -> Option<serde_json::Value> {
+        self.progress_session.as_ref()?.resume_state()
     }
 
     /// Yield the next envelope the driver recognised.
@@ -273,6 +348,9 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
     /// nothing left to read, and returning `None` lets the caller finish its
     /// loop normally instead of unwinding.
     pub async fn next_event(&mut self) -> Option<ProgressEnvelope> {
+        if self.stats.resume_state_rejected {
+            return None;
+        }
         loop {
             if let Some(envelope) = self.pending_events.pop_front() {
                 self.stats.events_emitted += 1;
@@ -405,6 +483,7 @@ impl<R: AsyncRead + Unpin> StdoutJsonlProgressReader<R> {
                 }
             };
             self.reader.consume(chunk.len());
+            self.consumed_bytes += chunk.len() as u64;
 
             if terminated {
                 // Drop the terminator; `\r` (if any) is handled by the trim in
