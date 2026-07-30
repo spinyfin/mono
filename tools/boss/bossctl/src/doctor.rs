@@ -157,6 +157,14 @@ pub fn match_dispatch_signatures(
     findings.extend(match_sig_d_transient_exhausted(events, scope_execution_ids));
     findings.extend(match_sig_e_spawn_nack(events, scope_execution_ids));
     findings.extend(match_sig_f_worker_parse(events, scope_execution_ids));
+    // Fleet scan: a wedged husk breaker is a pool-level fact, and the
+    // execution an operator diagnoses is usually the redispatch it blocked,
+    // not one of the held-back runs.
+    findings.extend(match_sig_h_husk_breaker_wedge(
+        events,
+        fleet_events.unwrap_or(events),
+        scope_execution_ids,
+    ));
 
     sort_findings(&mut findings);
     findings
@@ -752,10 +760,7 @@ fn match_sig_b_slot_busy(events: &[DispatchEvent], scope: &BTreeSet<String>) -> 
         if !in_scope(&event.execution_id, scope) {
             continue;
         }
-        if event.stage != "pane_spawned" || event.outcome != "error" {
-            continue;
-        }
-        if event.details.get("slot_busy").is_none() || event.details.get("slot_busy").is_some_and(|v| v.is_null()) {
+        if !e_is_slot_busy(event) {
             continue;
         }
         out.push(Finding {
@@ -774,6 +779,97 @@ fn match_sig_b_slot_busy(events: &[DispatchEvent], scope: &BTreeSet<String>) -> 
         });
     }
     out
+}
+
+// ── SIG-H ──────────────────────────────────────────────────────────────
+
+/// The husk-retirement circuit breaker is refusing to reclaim panes, so the
+/// slots it is holding stay desynced and every dispatch that lands on one is
+/// rejected `SlotBusy`.
+///
+/// Scanned fleet-wide rather than per-scope: the breaker's own dispatch
+/// events carry the *held-back husk's* execution id, while the execution an
+/// operator is actually diagnosing is normally the redispatch that cannot
+/// land. Keying only on scope is why this combination previously reported
+/// "signatures: no matches" during an hour-long pool wedge. P0 when the
+/// scoped execution is itself being rejected `SlotBusy` — that is the
+/// operator watching their own work fail to start — otherwise P1.
+fn match_sig_h_husk_breaker_wedge(
+    events: &[DispatchEvent],
+    fleet_events: &[DispatchEvent],
+    scope: &BTreeSet<String>,
+) -> Vec<Finding> {
+    let held_back: Vec<&DispatchEvent> = fleet_events
+        .iter()
+        .filter(|event| {
+            event.stage == "husk_pane_reconcile"
+                && event.outcome == "skipped"
+                && event.details.get("skipped_reason").and_then(|v| v.as_str())
+                    == Some("mass_retirement_circuit_breaker")
+        })
+        .collect();
+    if held_back.is_empty() {
+        return Vec::new();
+    }
+
+    let mut slots: BTreeSet<u64> = BTreeSet::new();
+    for event in &held_back {
+        if let Some(slot) = event.details.get("slot_id").and_then(|v| v.as_u64()) {
+            slots.insert(slot);
+        }
+    }
+    // Did the breaker escalate? A trip that could not file its attention item
+    // is strictly worse, and the operator should be told which they are in.
+    let escalated = held_back
+        .iter()
+        .any(|event| event.details.get("escalated").and_then(|v| v.as_bool()) == Some(true));
+    let scoped_slot_busy = events
+        .iter()
+        .any(|event| in_scope(&event.execution_id, scope) && e_is_slot_busy(event));
+
+    let retire_commands = slots
+        .iter()
+        .map(|slot| format!("bossctl agents retire-pane {slot}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    vec![Finding {
+        sig_id: "SIG-H".into(),
+        severity: if scoped_slot_busy { Severity::P0 } else { Severity::P1 },
+        title: "Husk-retirement circuit breaker is wedging worker slots".into(),
+        execution_id: held_back.first().map(|e| e.execution_id.clone()),
+        work_item_id: held_back.first().and_then(|e| work_item_of(e)),
+        count: held_back.len(),
+        evidence: held_back.iter().take(5).map(|e| evidence_line(e)).collect(),
+        recovery: format!(
+            "The husk-pane sweep confirmed more husks than its per-pass mass-retirement limit \
+             allows for candidates it cannot independently confirm dead, so it retired NONE of \
+             them. Those slots stay claimed by panes the pool believes are free, which is what \
+             produces the co-occurring SIG-B `SlotBusy` rejections. Held-back slot(s): {slots:?}. \
+             Panes whose execution row the engine has already marked terminal are exempt and \
+             reclaim themselves — anything listed here has a row that still says the run is LIVE, \
+             so first confirm those workers really are dead. If they are, reclaim by hand: \
+             {retire_commands}. {escalation}",
+            escalation = if escalated {
+                "An attention item was filed for this."
+            } else {
+                "NO attention item was filed — escalation itself failed, so nothing but the engine log recorded this."
+            },
+        ),
+        details: serde_json::json!({
+            "held_back_events": held_back.len(),
+            "slots": slots.iter().copied().collect::<Vec<u64>>(),
+            "escalated": escalated,
+            "scoped_slot_busy": scoped_slot_busy,
+        }),
+    }]
+}
+
+/// Shared `SlotBusy` predicate for SIG-B and SIG-H.
+fn e_is_slot_busy(event: &DispatchEvent) -> bool {
+    event.stage == "pane_spawned"
+        && event.outcome == "error"
+        && event.details.get("slot_busy").is_some_and(|v| !v.is_null())
 }
 
 // ── SIG-C historical ───────────────────────────────────────────────────
@@ -1791,6 +1887,67 @@ mod tests {
         );
         let findings = match_dispatch_signatures(&[event], 0, None, None, &scope(&["exec_slot"]));
         assert!(findings.iter().any(|f| f.sig_id == "SIG-B"));
+    }
+
+    /// The wedge as it actually presented: the operator diagnoses the
+    /// redispatch that keeps failing `SlotBusy`, while the breaker events
+    /// that explain it are attributed to entirely different (held-back)
+    /// execution ids. Matching only in scope is what produced "signatures:
+    /// no matches" for an hour.
+    #[test]
+    fn sig_h_husk_breaker_wedge_is_found_from_the_blocked_redispatch() {
+        let blocked = ev_from_json(
+            r#"{"ts_epoch_ms":1784927838618,"stage":"pane_spawned","outcome":"error","execution_id":"exec_resume","error_message":"SlotBusy","details":{"slot_busy":{"slot_id":7,"occupying_run_id":"exec_husk_7"}}}"#,
+        );
+        let mut fleet = vec![blocked.clone()];
+        for slot in 4..9u64 {
+            fleet.push(ev_from_json(&format!(
+                r#"{{"ts_epoch_ms":1784927840000,"stage":"husk_pane_reconcile","outcome":"skipped","execution_id":"exec_husk_{slot}","details":{{"slot_id":{slot},"skipped_reason":"mass_retirement_circuit_breaker","max_per_pass":3,"escalated":true}}}}"#,
+            )));
+        }
+
+        let findings = match_dispatch_signatures(&[blocked], 0, Some(&fleet), None, &scope(&["exec_resume"]));
+        let sig_h: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-H").collect();
+        assert_eq!(sig_h.len(), 1, "{findings:?}");
+        assert_eq!(
+            sig_h[0].severity,
+            Severity::P0,
+            "the diagnosed execution is itself being rejected SlotBusy",
+        );
+        assert_eq!(sig_h[0].count, 5);
+        assert_eq!(
+            sig_h[0].details["slots"],
+            serde_json::json!([4, 5, 6, 7, 8]),
+            "every held-back slot must be named",
+        );
+        assert!(sig_h[0].recovery.contains("bossctl agents retire-pane 7"));
+    }
+
+    /// A trip that could not file its attention item is worse, not better,
+    /// and the diagnosis must say so rather than implying someone was told.
+    #[test]
+    fn sig_h_reports_when_the_breaker_could_not_escalate() {
+        let event = ev_from_json(
+            r#"{"ts_epoch_ms":1784927840000,"stage":"husk_pane_reconcile","outcome":"skipped","execution_id":"exec_husk_1","details":{"slot_id":1,"skipped_reason":"mass_retirement_circuit_breaker","max_per_pass":3,"escalated":false}}"#,
+        );
+        let fleet = std::slice::from_ref(&event);
+        let findings = match_dispatch_signatures(fleet, 0, Some(fleet), None, &scope(&["exec_husk_1"]));
+        let sig_h: Vec<_> = findings.iter().filter(|f| f.sig_id == "SIG-H").collect();
+        assert_eq!(sig_h.len(), 1);
+        assert_eq!(sig_h[0].severity, Severity::P1, "no SlotBusy in scope yet");
+        assert_eq!(sig_h[0].details["escalated"], false);
+        assert!(sig_h[0].recovery.contains("NO attention item was filed"));
+    }
+
+    /// A husk sweep that retires normally must not look like a wedge.
+    #[test]
+    fn sig_h_ignores_ordinary_husk_retirements() {
+        let event = ev_from_json(
+            r#"{"ts_epoch_ms":1784927840000,"stage":"husk_pane_reconcile","outcome":"ok","execution_id":"exec_husk_2","details":{"slot_id":2,"death_evidence":"db_confirmed_terminal"}}"#,
+        );
+        let fleet = std::slice::from_ref(&event);
+        let findings = match_dispatch_signatures(fleet, 0, Some(fleet), None, &scope(&["exec_husk_2"]));
+        assert!(!findings.iter().any(|f| f.sig_id == "SIG-H"), "{findings:?}");
     }
 
     #[test]
