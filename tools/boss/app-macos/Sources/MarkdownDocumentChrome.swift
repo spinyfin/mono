@@ -6,6 +6,46 @@ import Textual
 
 private let designDocTimingLog = Logger(subsystem: "com.boss.app", category: "DesignDocTiming")
 
+/// Selects how wide the document scroll column clamps to. Prose-only
+/// documents keep today's centered reading column (`readable`); documents
+/// containing a table widen the column (`wide`) so the table can use the
+/// freed-up margin space, while `BossMarkdownStyle`'s per-block prose clamp
+/// (not this container) is what keeps paragraphs at the readable measure
+/// inside the wider column. A pure function of the source text — no view
+/// state, no layout feedback — so widening never triggers a relayout loop.
+enum MarkdownDocumentMeasure {
+    /// The prose reading measure, matched by `BossMarkdownStyle`'s per-block
+    /// clamp so paragraphs stay this width even inside `wide` documents.
+    static let readable: CGFloat = 720
+    /// The document column width once a table is present.
+    static let wide: CGFloat = 1440
+
+    static func forSource(_ source: String) -> CGFloat {
+        containsTable(source) ? wide : readable
+    }
+
+    /// Detects a GitHub-flavored Markdown table via its delimiter row (e.g.
+    /// `| --- | --- |`), not a bare `|`, since prose and inline code
+    /// routinely contain pipes without forming a table.
+    static func containsTable(_ source: String) -> Bool {
+        source.components(separatedBy: "\n").contains { line in
+            isTableDelimiterRow(line)
+        }
+    }
+
+    private static func isTableDelimiterRow(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("-") else { return false }
+        let cells = trimmed
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .components(separatedBy: "|")
+        guard cells.count >= 2 else { return false }
+        return cells.allSatisfy { cell in
+            cell.range(of: #"^\s*:?-{3,}:?\s*$"#, options: .regularExpression) != nil
+        }
+    }
+}
+
 /// The single reconciled chrome every in-app markdown document viewer renders
 /// through. Previously the app had one markdown render core
 /// (`StructuredText(...).bossMarkdown()`) wrapped in three independently
@@ -184,7 +224,7 @@ private struct MarkdownDocumentColumn: View {
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
-                .frame(maxWidth: 720)
+                .frame(maxWidth: MarkdownDocumentMeasure.forSource(source))
                 .frame(maxWidth: .infinity)
                 .background(MarkdownScrollViewCapture(controller: scrollController))
             }

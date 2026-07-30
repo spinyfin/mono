@@ -1,6 +1,20 @@
 import SwiftUI
 import Textual
 
+extension View {
+    /// Clamps prose content to the readable measure, left-aligned. A plain
+    /// `.frame(maxWidth:)` sizes to the child's *ideal* width, so a short
+    /// block (e.g. a list item) centered inside a wider document column
+    /// would otherwise become a narrow box that no longer lines up with its
+    /// neighbors — `alignment: .leading` on both frames keeps every prose
+    /// block anchored to the same left edge regardless of its own width.
+    fileprivate func proseMeasureClamped() -> some View {
+        self
+            .frame(maxWidth: MarkdownDocumentMeasure.readable, alignment: .leading)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
 // MARK: - Heading
 
 struct BossHeadingStyle: StructuredText.HeadingStyle {
@@ -26,10 +40,53 @@ struct BossHeadingStyle: StructuredText.HeadingStyle {
             .textual.lineSpacing(.fontScaled(0.125))
             .textual.blockSpacing(.init(top: 16, bottom: 8))
             .fontWeight(Self.weights[level - 1])
+            .proseMeasureClamped()
     }
 }
 
 extension StructuredText.HeadingStyle where Self == BossHeadingStyle {
+    static var boss: Self { .init() }
+}
+
+// MARK: - Paragraph
+
+struct BossParagraphStyle: StructuredText.ParagraphStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        StructuredText.GitHubParagraphStyle()
+            .makeBody(configuration: configuration)
+            .proseMeasureClamped()
+    }
+}
+
+extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
+    static var boss: Self { .init() }
+}
+
+// MARK: - List item
+
+struct BossListItemStyle: StructuredText.ListItemStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        StructuredText.DefaultListItemStyle.default
+            .makeBody(configuration: configuration)
+            .proseMeasureClamped()
+    }
+}
+
+extension StructuredText.ListItemStyle where Self == BossListItemStyle {
+    static var boss: Self { .init() }
+}
+
+// MARK: - Thematic break
+
+struct BossThematicBreakStyle: StructuredText.ThematicBreakStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        StructuredText.GitHubThematicBreakStyle()
+            .makeBody(configuration: configuration)
+            .proseMeasureClamped()
+    }
+}
+
+extension StructuredText.ThematicBreakStyle where Self == BossThematicBreakStyle {
     static var boss: Self { .init() }
 }
 
@@ -73,6 +130,7 @@ struct BossBlockQuoteStyle: StructuredText.BlockQuoteStyle {
                 .foregroundStyle(.secondary)
                 .textual.padding(.horizontal, .fontScaled(1))
         }
+        .proseMeasureClamped()
     }
 }
 
@@ -89,39 +147,53 @@ struct BossTableStyle: StructuredText.TableStyle {
     // code span inside a striped row blends rather than stacking into a
     // third shade.
     private static let stripeColor = Color(nsColor: .quaternaryLabelColor).opacity(0.35)
+    // Hard cap on top of the document's own width, for tables wide enough to
+    // still overflow it — mirrors Textual's own `OverflowTableStyle` default.
+    private static let relativeWidth: CGFloat = 1.5
 
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .textual.tableCellSpacing(
-                horizontal: Self.borderWidth,
-                vertical: Self.borderWidth
-            )
-            .textual.blockSpacing(.init(top: 0, bottom: 16))
-            .textual.tableBackground { layout in
-                Canvas { context, _ in
-                    for bounds in layout.stripedBodyRowBounds() {
-                        context.fill(
-                            Path(bounds.integral),
-                            with: .style(Self.stripeColor)
-                        )
+        // `Overflow` is Textual's sanctioned horizontal-scroll container: a
+        // bare `ScrollView(.horizontal)` here would interfere with the
+        // AppKit text-selection gestures the document view relies on.
+        // Content still sizes to itself (the `Grid` the library renders a
+        // table as) up to `relativeWidth` of the available width — content-
+        // driven-up-to-a-cap, not a fixed or proportionally stretched width.
+        Overflow { state in
+            let maxWidth = state.containerWidth.map { $0 * Self.relativeWidth }
+            configuration.label
+                .fixedSize(horizontal: false, vertical: true)
+                .textual.tableBackground { layout in
+                    Canvas { context, _ in
+                        for bounds in layout.stripedBodyRowBounds() {
+                            context.fill(
+                                Path(bounds.integral),
+                                with: .style(Self.stripeColor)
+                            )
+                        }
                     }
                 }
-            }
-            .textual.tableOverlay { layout in
-                Canvas { context, _ in
-                    for divider in layout.dividers() {
-                        context.fill(
-                            Path(divider),
-                            with: .style(Color(nsColor: .separatorColor).opacity(0.4))
-                        )
+                .textual.tableOverlay { layout in
+                    Canvas { context, _ in
+                        for divider in layout.dividers() {
+                            context.fill(
+                                Path(divider),
+                                with: .style(Color(nsColor: .separatorColor).opacity(0.4))
+                            )
+                        }
                     }
                 }
-            }
-            .padding(Self.borderWidth)
-            .overlay(
-                RoundedRectangle(cornerRadius: Self.cornerRadius)
-                    .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
-            )
+                .frame(maxWidth: maxWidth, alignment: .leading)
+                .padding(Self.borderWidth)
+                .overlay(
+                    RoundedRectangle(cornerRadius: Self.cornerRadius)
+                        .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
+                )
+        }
+        .textual.tableCellSpacing(
+            horizontal: Self.borderWidth,
+            vertical: Self.borderWidth
+        )
+        .textual.blockSpacing(.init(top: 0, bottom: 16))
     }
 }
 
@@ -159,16 +231,16 @@ extension InlineStyle {
 struct BossStructuredTextStyle: StructuredText.Style {
     let inlineStyle: InlineStyle = .boss
     let headingStyle: BossHeadingStyle = .boss
-    let paragraphStyle: StructuredText.GitHubParagraphStyle = .gitHub
+    let paragraphStyle: BossParagraphStyle = .boss
     let blockQuoteStyle: BossBlockQuoteStyle = .boss
     let codeBlockStyle: BossCodeBlockStyle = .boss
-    let listItemStyle: StructuredText.DefaultListItemStyle = .default
+    let listItemStyle: BossListItemStyle = .boss
     let unorderedListMarker: StructuredText.HierarchicalSymbolListMarker =
         .hierarchical(.disc, .circle, .square)
     let orderedListMarker: StructuredText.DecimalListMarker = .decimal
     let tableStyle: BossTableStyle = .boss
     let tableCellStyle: StructuredText.GitHubTableCellStyle = .gitHub
-    let thematicBreakStyle: StructuredText.GitHubThematicBreakStyle = .gitHub
+    let thematicBreakStyle: BossThematicBreakStyle = .boss
 }
 
 extension StructuredText.Style where Self == BossStructuredTextStyle {
