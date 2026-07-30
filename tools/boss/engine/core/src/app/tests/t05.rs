@@ -3,8 +3,8 @@
 //
 //   1. `AppChannelHealth` — the engine→app push-channel liveness state
 //      machine (consecutive-failure streak + failure-time snapshot).
-//   2. `AppSessionHandle::allocate_request_id` — the monotonic
-//      `eng-req-N` request-id allocator.
+//   2. `AppSessionHandle::allocate_request_id` — the monotonic,
+//      session-scoped `<session_id>-eng-req-N` request-id allocator.
 //
 // Both types need no sockets or IO, so these tests are deterministic and
 // self-contained. Assertions target the observable contract (returned
@@ -139,10 +139,16 @@ fn allocate_request_id_is_monotonic_and_unique() {
 
     let ids: Vec<String> = (0..5).map(|_| handle.allocate_request_id()).collect();
 
-    // The documented sequence: eng-req-1, eng-req-2, ...
+    // The documented sequence: <session_id>-eng-req-1, -2, ...
     assert_eq!(
         ids,
-        vec!["eng-req-1", "eng-req-2", "eng-req-3", "eng-req-4", "eng-req-5",]
+        vec![
+            "sess-1-eng-req-1",
+            "sess-1-eng-req-2",
+            "sess-1-eng-req-3",
+            "sess-1-eng-req-4",
+            "sess-1-eng-req-5",
+        ]
     );
 
     // And every id is distinct.
@@ -151,15 +157,18 @@ fn allocate_request_id_is_monotonic_and_unique() {
 }
 
 #[test]
-fn allocate_request_id_sequences_are_independent_per_handle() {
+fn allocate_request_id_sequences_are_independent_per_handle_but_globally_unique() {
     // Each handle owns its own counter starting at 1, so a fresh session
-    // does not inherit another session's position in the sequence.
+    // does not inherit another session's position in the sequence — but the
+    // session-id prefix means two handles never mint the same id, which is
+    // exactly what the ipc_log join key across app reconnects depends on.
     let mut a = AppSessionHandle::new("sess-a".to_owned(), make_session_sink());
     let mut b = AppSessionHandle::new("sess-b".to_owned(), make_session_sink());
 
-    assert_eq!(a.allocate_request_id(), "eng-req-1");
-    assert_eq!(a.allocate_request_id(), "eng-req-2");
+    assert_eq!(a.allocate_request_id(), "sess-a-eng-req-1");
+    assert_eq!(a.allocate_request_id(), "sess-a-eng-req-2");
 
-    // `b` is unaffected by activity on `a`.
-    assert_eq!(b.allocate_request_id(), "eng-req-1");
+    // `b` is unaffected by activity on `a`, and its ids never collide with
+    // `a`'s despite both counters restarting at 1.
+    assert_eq!(b.allocate_request_id(), "sess-b-eng-req-1");
 }

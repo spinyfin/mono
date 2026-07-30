@@ -4,6 +4,8 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::{Context, Result, bail};
 use boss_event_bus::{EventBus, EventKind, TopicFilter};
@@ -202,6 +204,16 @@ fn github_oauth_http_client() -> reqwest::Client {
         .timeout(Duration::from_secs(30))
         .build()
         .expect("reqwest::Client build should not fail with default config")
+}
+
+/// Milliseconds since the Unix epoch, used to seed [`ServerState::boot_id`].
+/// Saturates rather than panics on a clock set before 1970 — an id
+/// collision on a broken clock is not this function's problem to solve.
+fn boot_id_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -665,6 +677,16 @@ struct ServerState {
     /// reads it to raise a banner when the daemon wedges and stalls all
     /// builds. See [`crate::syspolicyd_monitor`].
     syspolicyd_health: Arc<crate::syspolicyd_monitor::SyspolicydHealth>,
+    /// Millisecond epoch timestamp captured once at engine construction.
+    /// [`Self::allocate_session_id`] mints ids as `session-<boot_id>-<n>`
+    /// so restarting the engine — which always resets `next_session_id`
+    /// back to 1 — cannot reproduce a prior boot's session ids; two
+    /// restarts landing in the same millisecond is the only remaining
+    /// collision window, which the join key does not need to rule out.
+    /// Defaults to `SystemTime::now()` so tests that build a `ServerState`
+    /// without setting it still get a real (non-zero) boot id.
+    #[builder(default = boot_id_millis())]
+    boot_id: u64,
     next_session_id: AtomicU64,
     work_revision: Arc<AtomicU64>,
     /// Pid of the process the engine trusts as the macOS app — must
