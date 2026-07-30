@@ -13,7 +13,9 @@ use checkleft::annotate::upload::{SarifUploadContext, upload_sarif};
 use checkleft::annotate::{Annotation, annotation_from_finding, cap_gha_annotations, format_gha_workflow_commands};
 use checkleft::change_detection::environment::{CiEnvironment, resolve_head_sha, resolve_owner_repo};
 use checkleft::change_detection::scenario::Scenario;
-use checkleft::change_detection::{ChangeOverrides, ChangePlan, base_revision_from_plan, resolve_change_plan};
+use checkleft::change_detection::{
+    ChangeOverrides, ChangePlan, ChangesetUndetermined, base_revision_from_plan, resolve_change_plan,
+};
 use checkleft::check::CheckRegistry;
 use checkleft::checks::register_builtin_checks;
 use checkleft::config::{ConfigResolver, ConfigResolverOptions};
@@ -262,13 +264,44 @@ enum ExternalProviderMode {
     Off,
 }
 
+/// Exit code for "checkleft ran and at least one check reported an
+/// `Error`-severity finding" (see `has_error` / `findings_error` in
+/// `dispatch_run` / `dispatch_fix`).
+const EXIT_CHECKS_FAILED: u8 = 1;
+
+/// Exit code for "checkleft could not determine what changed" — a missing
+/// merge base, a detached HEAD with no parent, an unresolvable `--base-ref`,
+/// or a shallow clone whose history never reaches the base. Deliberately
+/// distinct from both `ExitCode::SUCCESS` (0, a genuinely empty diff or a
+/// clean run) and [`EXIT_CHECKS_FAILED`] (1, checks ran and found problems):
+/// a caller needs to be able to tell "the gate could not run at all" apart
+/// from "the gate ran and something failed review", since those demand
+/// different responses. See the "Exit codes" section of `tools/checkleft/README.md`.
+const EXIT_CHANGESET_UNDETERMINED: u8 = 3;
+
+/// Maps a `run_cli()` failure to its process exit code, distinguishing
+/// "checkleft could not determine what changed" from any other failure.
+/// Returns the raw `u8` (rather than `ExitCode`, which is intentionally
+/// opaque and has no public equality) so the mapping itself is unit-testable.
+fn exit_code_for_error(error: &anyhow::Error) -> u8 {
+    if error.downcast_ref::<ChangesetUndetermined>().is_some() {
+        EXIT_CHANGESET_UNDETERMINED
+    } else {
+        1 // matches ExitCode::FAILURE
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run_cli().await {
         Ok(exit_code) => exit_code,
         Err(error) => {
-            eprintln!("error: {error:#}");
-            ExitCode::FAILURE
+            if let Some(undetermined) = error.downcast_ref::<ChangesetUndetermined>() {
+                eprintln!("checkleft: {undetermined}");
+            } else {
+                eprintln!("error: {error:#}");
+            }
+            ExitCode::from(exit_code_for_error(&error))
         }
     }
 }
@@ -346,7 +379,7 @@ async fn run_cli() -> Result<ExitCode> {
             let plan = resolve_change_plan(&env, &vcs, &overrides)?;
             match &plan {
                 ChangePlan::All => println!("plan=all"),
-                ChangePlan::Empty { .. } => println!("plan=empty"),
+                ChangePlan::Empty { reason } => println!("plan=empty reason={reason:?}"),
                 ChangePlan::Scoped { base_sha, scenario } => {
                     let changeset = changeset_from_plan(&vcs, &plan)?;
                     let scenario_str = match scenario {
@@ -672,7 +705,7 @@ async fn dispatch_run(
     emit_annotations(&annotations, annotations_strict, &results, env, vcs).await?;
 
     Ok(if has_error {
-        ExitCode::from(1)
+        ExitCode::from(EXIT_CHECKS_FAILED)
     } else {
         ExitCode::SUCCESS
     })
@@ -1509,7 +1542,7 @@ async fn dispatch_fix(
     };
 
     Ok(if fix_has_error || findings_error {
-        ExitCode::from(1)
+        ExitCode::from(EXIT_CHECKS_FAILED)
     } else {
         ExitCode::SUCCESS
     })
@@ -1586,11 +1619,22 @@ async fn build_runner(
     ))
 }
 
+/// Resolve the changeset for a plan. `ChangePlan::Empty` means checkleft could
+/// not determine what changed (never "there were no changes" — that is a
+/// `Scoped` plan whose changeset happens to be empty), so it is reported as an
+/// error carrying the `EmptyReason` rather than silently collapsing to an
+/// empty `ChangeSet`. `dispatch_run` / `dispatch_fix` / the `list` command all
+/// propagate this via `?`; `main()` recognizes it and maps it to
+/// `EXIT_CHANGESET_UNDETERMINED` instead of the generic failure exit code.
 fn changeset_from_plan(vcs: &Vcs, plan: &ChangePlan) -> Result<ChangeSet> {
     match plan {
         ChangePlan::All => vcs.all_files_changeset(),
         ChangePlan::Scoped { base_sha, .. } => vcs.changeset_since(base_sha),
-        ChangePlan::Empty { .. } => Ok(ChangeSet::default()),
+        ChangePlan::Empty { reason } => Err(ChangesetUndetermined {
+            reason: reason.clone(),
+            detail: None,
+        }
+        .into()),
     }
 }
 

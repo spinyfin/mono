@@ -33,6 +33,52 @@ pub enum EmptyReason {
     DetachedHeadNoParent,
 }
 
+impl EmptyReason {
+    /// Human-readable explanation, used when reporting a
+    /// [`ChangesetUndetermined`] failure to the user.
+    pub fn description(&self) -> &'static str {
+        match self {
+            EmptyReason::NoMergeBase => {
+                "no common ancestor could be found between the base and HEAD \
+                 (root commit, unrelated histories, or the base ref does not exist)"
+            }
+            EmptyReason::DetachedHeadNoParent => {
+                "HEAD has no accessible parent commit \
+                 (a root commit, or a detached/orphaned checkout)"
+            }
+        }
+    }
+}
+
+/// checkleft could not determine what changed. This is an environment/config
+/// failure, and is a distinct condition from "there were no changes" (which is
+/// a [`crate::change_detection::ChangePlan::Scoped`] whose changeset happens to
+/// be empty, and keeps exiting 0 as before). Any caller that needs to tell
+/// "the gate could not run" apart from "the gate ran and found problems" should
+/// match on this type; see `EXIT_CHANGESET_UNDETERMINED` in `main.rs` for the
+/// dedicated exit code and message this maps to.
+#[derive(Debug)]
+pub struct ChangesetUndetermined {
+    pub reason: EmptyReason,
+    /// Extra, situation-specific detail beyond `reason.description()` — e.g.
+    /// the literal `--base-ref` value that failed to resolve, or the fetch
+    /// attempts already made against a shallow clone. `None` when the
+    /// reason's own description is sufficient on its own.
+    pub detail: Option<String>,
+}
+
+impl std::fmt::Display for ChangesetUndetermined {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "could not determine what changed: {}", self.reason.description())?;
+        if let Some(detail) = &self.detail {
+            write!(f, "\n{detail}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ChangesetUndetermined {}
+
 /// Git-level probes used by [`select_base`]. Injectable for unit testing.
 pub(crate) trait HeadProber {
     /// `git rev-parse <rev>` — returns the SHA if the revision exists, `None` if
