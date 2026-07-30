@@ -237,6 +237,24 @@ pub struct WorkItemPatch {
     pub ordinal: Option<i64>,
     pub pr_url: Option<String>,
     pub priority: Option<String>,
+
+    /// Move a leaf work item's project membership. `None` → leave
+    /// unchanged. `Some("")` → move to the no-project state: a
+    /// `project_task` becomes a `chore` and its `ordinal` is cleared.
+    /// `Some(<project id>)` → move into that project (must belong to
+    /// the same product as the task): a `chore` becomes a
+    /// `project_task` and is assigned a fresh next-ordinal in the
+    /// target project via the same allocator task creation uses. A
+    /// no-op when the target is the item's current project. Only
+    /// `chore` and `project_task` rows are movable — `design`,
+    /// `investigation`, `revision`, `design_postmortem`, `followup`,
+    /// and the legacy generic `task` kind carry their own membership
+    /// semantics and reject this patch. When both `project_id` and
+    /// `ordinal` are set on the same patch, the project move's
+    /// auto-assigned ordinal wins. Only honoured on task/chore
+    /// updates; ignored for product/project.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub repo_remote_url: Option<String>,
     pub status: Option<String>,
     /// Product-level worker branch-name prefix. Only honoured on

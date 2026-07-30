@@ -621,6 +621,7 @@ mod decision_tests;
 mod design_doc_audit_tests;
 mod effort_model_tests;
 mod human_driven_tests;
+mod project_membership_move_tests;
 mod resolve_repo_tests;
 mod schema_migration_tests;
 mod short_id_alloc_tests;

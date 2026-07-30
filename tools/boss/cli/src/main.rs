@@ -99,6 +99,7 @@ mod decision_commands;
 mod engine_cmds;
 mod output;
 mod status_args;
+mod task_update_args;
 mod work_cmds;
 
 pub(crate) use automation_cmds::*;
@@ -109,6 +110,7 @@ pub(crate) use decision_commands::*;
 pub(crate) use engine_cmds::*;
 pub(crate) use output::*;
 pub(crate) use status_args::*;
+pub(crate) use task_update_args::*;
 pub(crate) use work_cmds::*;
 
 #[cfg(test)]

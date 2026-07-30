@@ -2419,7 +2419,8 @@ pub(crate) fn ensure_patch_present(patch: &WorkItemPatch, message: &str) -> Resu
         || patch.blocked_detail.is_some()
         || patch.tags.is_some()
         || patch.add_tags.is_some()
-        || patch.remove_tags.is_some();
+        || patch.remove_tags.is_some()
+        || patch.project_id.is_some();
 
     if has_fields {
         Ok(())
