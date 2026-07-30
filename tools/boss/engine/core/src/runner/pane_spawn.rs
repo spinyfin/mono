@@ -136,7 +136,108 @@ mod apply_permission_extra_args_tests {
         assert!(merged.contains("--color always"), "{merged}");
         assert!(merged.contains("--strict-config"), "{merged}");
     }
+
+    /// Grok spells its model flag `--model` (not ` -m `) and has no stdin
+    /// redirect, so `apply_permission_extra_args`'s insertion-point search
+    /// (before ` -m `, else before ` < `, else at the last `\n`) falls
+    /// through to the newline fallback — the ONE branch no existing test of
+    /// this function exercised (every prior test above is Codex-only, and
+    /// Codex always hits the ` -m ` branch). Confirms the fallback lands the
+    /// extras before the trailing newline (still the single typed pty line)
+    /// rather than dropping or interleaving them.
+    #[test]
+    fn grok_extra_args_compose_via_the_newline_fallback_not_the_dash_m_branch() {
+        use crate::driver::GrokDriver;
+        use crate::driver::grok::{GROK_HOMES_ENV_TEST_LOCK, GROK_HOMES_ROOT_ENV, grok_home_for_run};
+
+        // Stamp a disposable `$GROK_HOME` (session id + workspace-path
+        // files) so `spawn_invocation` can build a real command without
+        // running the network-touching `provision_workspace` — same shape
+        // as `grok::tests::spawn_invocation_matches_execution_shape`,
+        // reachable here only through `grok`'s public re-exports.
+        let _lock = GROK_HOMES_ENV_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prior_homes_env = std::env::var_os(GROK_HOMES_ROOT_ENV);
+        let homes_root = tempfile::TempDir::new().unwrap();
+        // SAFETY: serialised by `_lock`, held for this whole test.
+        unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, homes_root.path()) };
+        let run_id = "run-grok-extra-args-1";
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        std::fs::create_dir_all(&grok_home).unwrap();
+        std::fs::write(
+            grok_home.join("boss-session-id"),
+            "22222222-3333-4444-8555-666666666666\n",
+        )
+        .unwrap();
+        std::fs::write(grok_home.join("boss-workspace-path"), "/tmp/ws-extra-args\n").unwrap();
+
+        let plan = GrokDriver::default().spawn_invocation(SpawnRequest {
+            model: "grok-4.5",
+            effort: Some("high"),
+            settings_path: None,
+            non_opus_auto_mode: false,
+            permission_mode_override: None,
+            run_id: Some(run_id),
+        });
+
+        assert!(
+            !plan.command.contains(" -m "),
+            "grok spells its model flag --model, not -m: {}",
+            plan.command
+        );
+        assert!(
+            !plan.command.contains(" < "),
+            "grok has no stdin redirect: {}",
+            plan.command
+        );
+        assert_eq!(
+            plan.command.matches('\n').count(),
+            1,
+            "must be a single typed line before extras are applied: {}",
+            plan.command
+        );
+
+        let extra_args = vec![
+            "--sandbox".to_owned(),
+            "boss-workspace".to_owned(),
+            "--deny".to_owned(),
+            "Bash(rm -rf *)".to_owned(),
+        ];
+        let merged = apply_permission_extra_args(&plan.command, &extra_args);
+
+        // Every token — including flag names — comes back individually
+        // shell-quoted (`boss_ssh_transport::shell_quote` applied per
+        // element), not just values.
+        assert!(merged.contains("'--sandbox' 'boss-workspace'"), "{merged}");
+        assert!(merged.contains("'--deny' 'Bash(rm -rf *)'"), "{merged}");
+        assert_eq!(
+            merged.matches('\n').count(),
+            1,
+            "extras must land on the single typed line, not add a second: {merged}"
+        );
+        assert!(
+            merged.contains("\"$(cat .grok/initial-prompt.txt)\""),
+            "prompt substitution must survive composition: {merged}"
+        );
+        // Newline-fallback: extras land right before the trailing '\n' —
+        // i.e. AFTER everything else, including the positional prompt
+        // substitution — confirmed safe by the work item's own CLI
+        // characterisation (flags placed after the positional prompt
+        // parse fine for the installed grok CLI).
+        assert!(
+            merged.trim_end().ends_with("'--deny' 'Bash(rm -rf *)'"),
+            "extras must be appended after the rest of the command, not interleaved: {merged}"
+        );
+
+        // SAFETY: still serialised by `_lock`.
+        match prior_homes_env {
+            Some(v) => unsafe { std::env::set_var(GROK_HOMES_ROOT_ENV, v) },
+            None => unsafe { std::env::remove_var(GROK_HOMES_ROOT_ENV) },
+        }
+    }
 }
+
+#[cfg(test)]
+mod pty_initial_input_tests;
 
 /// `ExecutionRunner` that drives the libghostty pane RPC: writes the
 /// per-lease worker config files, asks the macOS app to host a
@@ -255,6 +356,75 @@ pub(crate) fn resolve_boss_event_binary(
 /// *last* one emitted ends up first on `PATH`.
 fn path_prepend_clause(var: &str) -> String {
     format!("[ -n \"${var}\" ] && export PATH=\"${var}:$PATH\"; ")
+}
+
+/// macOS tty canonical-mode line cap (`MAX_CANON`,
+/// `/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/sys/syslimits.h:89`).
+/// Past this many bytes in one canonical-mode pty input line — content plus
+/// its terminating newline — the kernel silently discards the ENTIRE line,
+/// not just the overflow, while the tty still echoes the first `MAX_CANON`
+/// bytes. The shell never receives a newline, so the typed command is never
+/// run and the worker never starts. Confirmed by a local pty experiment: a
+/// 1023-byte line + `\n` (1024 bytes total) is delivered whole; a 1024-byte
+/// line + `\n` (1025 bytes total) delivers zero bytes.
+const MAX_CANON_LINE_BYTES: usize = 1024;
+
+/// Workspace-relative path of the script holding the full assembled pane
+/// spawn command. Kept relative — never embedded as an absolute path in the
+/// typed line — so the *typed* line's length never grows with the
+/// workspace path. The pane's cwd is always the workspace root (see
+/// `SpawnWorkerPaneInput::workspace_path` / `GhosttyTerminalView`'s
+/// `config.working_directory`), so a relative reference resolves correctly.
+const INITIAL_INPUT_SCRIPT_REL_PATH: &str = ".boss/initial-input.sh";
+
+/// Write the full assembled pane-spawn shell script (`PATH` prepends,
+/// driver env directives, driver command) to
+/// `<workspace_path>/.boss/initial-input.sh` and return the short,
+/// fixed-length line to actually type into the pty.
+///
+/// Exists because pane spawn used to type the WHOLE assembled command
+/// directly into the pty. On macOS the tty line discipline in canonical
+/// mode silently drops any single input line over [`MAX_CANON_LINE_BYTES`]
+/// bytes instead of truncating it, so a long enough driver/permission/
+/// workspace-path/prompt combination meant the worker never started, with
+/// no error surfaced anywhere. Sourcing a file keeps the typed line's
+/// length independent of all of those — mirroring the remote-spawn path,
+/// which already ships its initial input as a file for the same class of
+/// reason (`ssh_spawn::RemoteSpawnPlan::initial_input_file`).
+fn write_initial_input_script(workspace_path: &Path, script: &str) -> Result<String> {
+    let script_path = workspace_path.join(INITIAL_INPUT_SCRIPT_REL_PATH);
+    if let Some(parent) = script_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {} for the pane's initial-input script", parent.display()))?;
+    }
+    std::fs::write(&script_path, script)
+        .with_context(|| format!("writing pane initial-input script to {}", script_path.display()))?;
+    Ok(format!(". {INITIAL_INPUT_SCRIPT_REL_PATH}\n"))
+}
+
+/// Fail loudly rather than let a too-long canonical-mode pty line vanish
+/// silently. `line` is what will actually be typed into the pane;
+/// `driver_name` is named in the error so a `bossctl dispatch diagnose`-style
+/// read immediately shows which driver tripped it.
+///
+/// This is a regression backstop, not the fix itself: after
+/// [`write_initial_input_script`], `line` is a small fixed string regardless
+/// of driver, permission-rule count, workspace path, or prompt size. But if
+/// some future change reintroduces typing the full command (or otherwise
+/// grows this line), this is what catches it at the very first spawn
+/// attempt — as a loud dispatch failure — instead of a human noticing a
+/// pane that silently never starts.
+fn check_initial_input_length(line: &str, driver_name: &str) -> Result<()> {
+    let len = line.len();
+    if len > MAX_CANON_LINE_BYTES {
+        return Err(anyhow!(
+            "refusing to spawn {driver_name} worker: pane initial_input is {len} bytes, over the \
+             macOS tty canonical-mode line cap of {MAX_CANON_LINE_BYTES} bytes (MAX_CANON); past \
+             this length the kernel silently drops the ENTIRE typed line rather than just the \
+             overflow, so the shell never receives a newline and the worker never starts"
+        ));
+    }
+    Ok(())
 }
 
 /// Materialize the per-workspace launcher directory and return it, so the
@@ -646,12 +816,37 @@ impl ExecutionRunner for PaneSpawnRunner {
         // repobin shim was winning.
         let worker_bin_dir = ensure_worker_bin_dir(&settings_dir, workspace_path);
         let env_prefix: String = spawn_plan.env.iter().map(render_env_directive).collect();
-        let initial_input = format!(
+        let assembled_command = format!(
             "{}{}{env_prefix}{}",
             path_prepend_clause("BOSS_BIN_DIR"),
             path_prepend_clause(boss_engine_worker_bin::WORKER_BIN_DIR_ENV),
             spawn_plan.command,
         );
+        // Write the full assembled command to a workspace-relative script and
+        // type only a short, fixed-length line that sources it — never the
+        // command itself. See `MAX_CANON_LINE_BYTES` for why: the pty's tty
+        // line discipline in canonical mode silently drops an entire typed
+        // line once it crosses macOS's MAX_CANON (1024 bytes), rather than
+        // truncating it, so a long enough driver/permission/prompt
+        // combination previously meant the worker never started at all —
+        // with no error, just a pane that looked stuck mid-argument. This
+        // mirrors the remote-spawn path, which already ships its initial
+        // input as a file for the same class of reason (see
+        // `ssh_spawn::RemoteSpawnPlan::initial_input_file`).
+        let initial_input = write_initial_input_script(workspace_path, &assembled_command).with_context(|| {
+            format!(
+                "writing pane initial-input script for execution {} in workspace {}",
+                execution.id,
+                workspace_path.display(),
+            )
+        })?;
+        // Hard backstop: `initial_input` above is now a small fixed string
+        // regardless of driver, permission-rule count, workspace path, or
+        // prompt size, so this should never trip. It stays in place so that
+        // if some future change reintroduces typing the full command, the
+        // very first spawn attempt fails loudly instead of silently vanishing
+        // into a pane that never starts.
+        check_initial_input_length(&initial_input, driver.descriptor().name)?;
 
         // Look up (or generate) a 2–4 word pane-titlebar summary for
         // this work item. The full run id is still used for logs and
@@ -1190,21 +1385,40 @@ mod pane_spawn_tests {
         assert_eq!(spec.idle_debounce_polls, 2);
     }
 
+    /// Read back the full assembled command `initial_input` now sources —
+    /// see `write_initial_input_script`. Tests that assert on the composed
+    /// command (model/effort/permission flags, prompt-file read, PATH
+    /// prepends) read this instead of `SpawnWorkerPaneInput::initial_input`,
+    /// which after the MAX_CANON fix is always a short fixed line.
+    fn initial_input_script(workspace: &Path) -> String {
+        std::fs::read_to_string(workspace.join(".boss").join("initial-input.sh"))
+            .expect("initial-input script must exist in the workspace after a successful spawn")
+    }
+
     #[tokio::test]
-    async fn initial_input_reads_prompt_from_disk() {
+    async fn initial_input_types_a_short_fixed_line_sourcing_the_workspace_script() {
         let workspace = TempDir::new().unwrap();
         let spawner = run_once(&workspace, None).await.unwrap();
         let input = spawner.spawn_input();
 
-        // The pane needs to type a `claude` invocation that picks up
-        // the rendered prompt as its first user message — going
-        // through a file avoids shell-quoting issues with multi-line
-        // markdown. Without this, the worker just sits at the bash
-        // prompt forever (as it did before #174).
+        // The pty is typed a short, fixed-length line regardless of driver,
+        // permission-rule count, workspace path, or prompt size — never the
+        // assembled command itself. See `MAX_CANON_LINE_BYTES`'s doc for why:
+        // a canonical-mode tty line over 1024 bytes is silently dropped in
+        // its entirety (not truncated), so the previous behaviour of typing
+        // the whole command meant a long enough combination of the above
+        // meant the worker never started, with nothing surfaced anywhere.
+        assert_eq!(input.initial_input, ". .boss/initial-input.sh\n");
+
+        let script = initial_input_script(workspace.path());
+        // The pane needs a `claude` invocation that picks up the rendered
+        // prompt as its first user message — going through a file avoids
+        // shell-quoting issues with multi-line markdown. Without this, the
+        // worker just sits at the bash prompt forever (as it did before
+        // #174).
         assert!(
-            input.initial_input.contains(".claude/initial-prompt.txt"),
-            "expected initial_input to read from prompt file, got: {:?}",
-            input.initial_input
+            script.contains(".claude/initial-prompt.txt"),
+            "expected the initial-input script to read from the prompt file, got: {script:?}",
         );
         // The first shell line re-prepends BOSS_BIN_DIR to PATH (so the
         // bundled `cube`/`boss` win over any `~/bin` repobin shim the
@@ -1214,14 +1428,13 @@ mod pane_spawn_tests {
         // no-op), then unsets the API key and invokes claude. See the
         // comment at the construction site.
         assert!(
-            input.initial_input.starts_with(
+            script.starts_with(
                 "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
                  unset ANTHROPIC_API_KEY; claude"
             ),
-            "expected initial_input to re-prepend BOSS_BIN_DIR then the worker launcher dir, \
-             unset ANTHROPIC_API_KEY, and invoke claude, got: {:?}",
-            input.initial_input
+            "expected the initial-input script to re-prepend BOSS_BIN_DIR then the worker \
+             launcher dir, unset ANTHROPIC_API_KEY, and invoke claude, got: {script:?}",
         );
     }
 
@@ -1335,17 +1548,17 @@ mod pane_spawn_tests {
             .name("Untagged chore")
             .description("plain row, no effort/model")
             .build();
-        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
+        let (_spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
             .await
             .unwrap();
-        let input = spawner.spawn_input();
+        let script = initial_input_script(workspace.path());
 
         // The worker settings file lives outside the workspace; the
         // engine points claude at it with `--settings '<abs-path>'`,
         // positioned before the positional prompt arg.
         let settings_path = crate::worker_setup::worker_settings_path(workspace.path());
         assert_eq!(
-            input.initial_input,
+            script,
             format!(
                 "[ -n \"$BOSS_BIN_DIR\" ] && export PATH=\"$BOSS_BIN_DIR:$PATH\"; \
                  [ -n \"$BOSS_WORKER_BIN_DIR\" ] && export PATH=\"$BOSS_WORKER_BIN_DIR:$PATH\"; \
@@ -1388,23 +1601,20 @@ mod pane_spawn_tests {
             .effort_level(EffortLevel::Large)
             .reasoning(boss_protocol::ReasoningMode::Standard)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
-        let input = spawner.spawn_input();
+        let (_spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let script = initial_input_script(workspace.path());
 
         assert!(
-            input.initial_input.contains("--model sonnet"),
-            "large + standard must spawn Sonnet, got: {:?}",
-            input.initial_input,
+            script.contains("--model sonnet"),
+            "large + standard must spawn Sonnet, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--effort xhigh"),
-            "the size signal is untouched — still --effort xhigh, got: {:?}",
-            input.initial_input,
+            script.contains("--effort xhigh"),
+            "the size signal is untouched — still --effort xhigh, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--dangerously-skip-permissions"),
-            "Sonnet takes the non-auto permission branch, got: {:?}",
-            input.initial_input,
+            script.contains("--dangerously-skip-permissions"),
+            "Sonnet takes the non-auto permission branch, got: {script:?}",
         );
 
         let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
@@ -1427,8 +1637,8 @@ mod pane_spawn_tests {
             .effort_level(EffortLevel::Small)
             .reasoning(boss_protocol::ReasoningMode::Investigation)
             .build();
-        let (spawner, chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
-        let input = spawner.spawn_input();
+        let (_spawner, chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let script = initial_input_script(workspace.path());
 
         assert_eq!(
             chore.effort_level,
@@ -1436,19 +1646,16 @@ mod pane_spawn_tests {
             "the row still says what it is: a small job",
         );
         assert!(
-            input.initial_input.contains("--model opus"),
-            "small + investigation must spawn Opus, got: {:?}",
-            input.initial_input,
+            script.contains("--model opus"),
+            "small + investigation must spawn Opus, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--effort medium"),
-            "the effort knob still follows `small`, got: {:?}",
-            input.initial_input,
+            script.contains("--effort medium"),
+            "the effort knob still follows `small`, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--permission-mode auto"),
-            "Opus takes the auto-permission branch, got: {:?}",
-            input.initial_input,
+            script.contains("--permission-mode auto"),
+            "Opus takes the auto-permission branch, got: {script:?}",
         );
 
         let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
@@ -1473,33 +1680,28 @@ mod pane_spawn_tests {
             .description("one-line CSS tweak")
             .effort_level(EffortLevel::Trivial)
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
-        let input = spawner.spawn_input();
+        let (_spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let script = initial_input_script(workspace.path());
 
         assert!(
-            input.initial_input.contains("--model sonnet"),
-            "trivial row must spawn Sonnet (#746: never Haiku), got: {:?}",
-            input.initial_input,
+            script.contains("--model sonnet"),
+            "trivial row must spawn Sonnet (#746: never Haiku), got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--model haiku"),
-            "trivial row must NOT spawn Haiku (#746), got: {:?}",
-            input.initial_input,
+            !script.contains("--model haiku"),
+            "trivial row must NOT spawn Haiku (#746), got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--effort low"),
-            "trivial row must pass --effort low, got: {:?}",
-            input.initial_input,
+            script.contains("--effort low"),
+            "trivial row must pass --effort low, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--dangerously-skip-permissions"),
-            "trivial row (Sonnet, non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
-            input.initial_input,
+            script.contains("--dangerously-skip-permissions"),
+            "trivial row (Sonnet, non-Opus) must carry --dangerously-skip-permissions, got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--permission-mode"),
-            "trivial row (Sonnet, non-Opus) must NOT carry --permission-mode, got: {:?}",
-            input.initial_input,
+            !script.contains("--permission-mode"),
+            "trivial row (Sonnet, non-Opus) must NOT carry --permission-mode, got: {script:?}",
         );
 
         let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
@@ -1525,28 +1727,24 @@ mod pane_spawn_tests {
             .effort_level(EffortLevel::Medium)
             .model_override("opus")
             .build();
-        let (spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
-        let input = spawner.spawn_input();
+        let (_spawner, _chore) = run_once_with_chore(&workspace, chore_input, None).await.unwrap();
+        let script = initial_input_script(workspace.path());
 
         assert!(
-            input.initial_input.contains("--model opus"),
-            "model_override should win precedence, got: {:?}",
-            input.initial_input,
+            script.contains("--model opus"),
+            "model_override should win precedence, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--effort high"),
-            "medium effort_level must still produce --effort high, got: {:?}",
-            input.initial_input,
+            script.contains("--effort high"),
+            "medium effort_level must still produce --effort high, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--permission-mode auto"),
-            "model_override=opus must carry --permission-mode auto, got: {:?}",
-            input.initial_input,
+            script.contains("--permission-mode auto"),
+            "model_override=opus must carry --permission-mode auto, got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--dangerously-skip-permissions"),
-            "model_override=opus must NOT carry --dangerously-skip-permissions, got: {:?}",
-            input.initial_input,
+            !script.contains("--dangerously-skip-permissions"),
+            "model_override=opus must NOT carry --dangerously-skip-permissions, got: {script:?}",
         );
 
         let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
@@ -1572,30 +1770,26 @@ mod pane_spawn_tests {
         // `large` row that has since been classified `standard` resolves to
         // Sonnet instead — see
         // `large_standard_row_spawns_sonnet_but_keeps_xhigh_and_the_addendum`.
-        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
+        let (_spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, None)
             .await
             .unwrap();
-        let input = spawner.spawn_input();
+        let script = initial_input_script(workspace.path());
 
         assert!(
-            input.initial_input.contains("--model opus"),
-            "large row must spawn Opus, got: {:?}",
-            input.initial_input,
+            script.contains("--model opus"),
+            "large row must spawn Opus, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--effort xhigh"),
-            "large row must pass --effort xhigh, got: {:?}",
-            input.initial_input,
+            script.contains("--effort xhigh"),
+            "large row must pass --effort xhigh, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--permission-mode auto"),
-            "large row (Opus) must carry --permission-mode auto, got: {:?}",
-            input.initial_input,
+            script.contains("--permission-mode auto"),
+            "large row (Opus) must carry --permission-mode auto, got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--dangerously-skip-permissions"),
-            "large row (Opus) must NOT carry --dangerously-skip-permissions, got: {:?}",
-            input.initial_input,
+            !script.contains("--dangerously-skip-permissions"),
+            "large row (Opus) must NOT carry --dangerously-skip-permissions, got: {script:?}",
         );
 
         let prompt = std::fs::read_to_string(workspace.path().join(".claude").join("initial-prompt.txt")).unwrap();
@@ -1617,30 +1811,26 @@ mod pane_spawn_tests {
             .product_id(String::new())
             .name("Untagged on Sonnet-defaulted product")
             .build();
-        let (spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
+        let (_spawner, _chore) = run_once_with_unclassified_chore(&workspace, chore_input, Some("claude-sonnet-4-6"))
             .await
             .unwrap();
-        let input = spawner.spawn_input();
+        let script = initial_input_script(workspace.path());
 
         assert!(
-            input.initial_input.contains("--model claude-sonnet-4-6"),
-            "product default_model should fill in, got: {:?}",
-            input.initial_input,
+            script.contains("--model claude-sonnet-4-6"),
+            "product default_model should fill in, got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--effort"),
-            "untagged row must not pass --effort, got: {:?}",
-            input.initial_input,
+            !script.contains("--effort"),
+            "untagged row must not pass --effort, got: {script:?}",
         );
         assert!(
-            input.initial_input.contains("--dangerously-skip-permissions"),
-            "Sonnet (non-Opus) must carry --dangerously-skip-permissions, got: {:?}",
-            input.initial_input,
+            script.contains("--dangerously-skip-permissions"),
+            "Sonnet (non-Opus) must carry --dangerously-skip-permissions, got: {script:?}",
         );
         assert!(
-            !input.initial_input.contains("--permission-mode"),
-            "Sonnet (non-Opus) must NOT carry --permission-mode, got: {:?}",
-            input.initial_input,
+            !script.contains("--permission-mode"),
+            "Sonnet (non-Opus) must NOT carry --permission-mode, got: {script:?}",
         );
     }
 
