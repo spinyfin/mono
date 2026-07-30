@@ -802,6 +802,7 @@ fn tag_cases() -> Vec<TagCase> {
                 transcript_path: "/tmp/t.jsonl".into(),
                 lines: vec![],
                 truncated: false,
+                driver: Some("claude".into()),
             },
             expected_tag: "run_transcript_tail",
         },

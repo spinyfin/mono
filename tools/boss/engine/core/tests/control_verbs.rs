@@ -338,6 +338,7 @@ async fn agents_transcript_returns_tail_lines() -> Result<()> {
             transcript_path: returned_path,
             lines,
             truncated,
+            ..
         } => {
             assert_eq!(run_id, run.id);
             assert_eq!(returned_path, transcript_path.display().to_string());
@@ -460,6 +461,83 @@ async fn agents_transcript_via_execution_id_returns_tail_lines() -> Result<()> {
                 vec!["{\"event\":\"beta\"}".to_owned(), "{\"event\":\"gamma\"}".to_owned()]
             );
             assert!(truncated, "asking for 2 of 3 lines must set truncated");
+        }
+        other => return Err(anyhow!("expected RunTranscriptTail, got: {other:?}")),
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn agents_transcript_reports_the_execution_driver_slug() -> Result<()> {
+    // `bossctl agents transcript` needs the run's driver alongside the raw
+    // tail to normalize non-Claude/Codex dialects (e.g. Grok's ACP
+    // `session/update` envelope, which carries no schema-detectable
+    // top-level `type` field) before rendering. Pins that `RunTranscriptTail`
+    // actually carries the resolved slug for both the `run_*` and `exec_*`
+    // id namespaces `bossctl` may pass.
+    let engine = spawn_engine().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let SeededExecution {
+        execution_id,
+        work_item_id,
+    } = seed_execution(&mut client).await?;
+
+    let work_db = WorkDb::open(engine.db_path.clone())?;
+    work_db.update_work_item(
+        &work_item_id,
+        WorkItemPatch {
+            driver: Some("grok".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )?;
+
+    let transcript_dir = tempfile::tempdir()?;
+    let transcript_path = transcript_dir.path().join("transcript.jsonl");
+    std::fs::write(&transcript_path, "{\"event\":\"alpha\"}\n")?;
+    let run = work_db.create_run(CreateRunInput {
+        execution_id: execution_id.clone(),
+        agent_id: "test-agent".to_owned(),
+        status: Some("done".to_owned()),
+        transcript_path: Some(transcript_path.display().to_string()),
+        artifacts_path: None,
+        result_summary: None,
+        error_text: None,
+        started_at: None,
+        finished_at: None,
+    })?;
+
+    // exec_* namespace.
+    let response = client
+        .send_request(&FrontendRequest::TailRunTranscript {
+            run_id: execution_id.clone(),
+            lines: 0,
+        })
+        .await?;
+    match response {
+        FrontendEvent::RunTranscriptTail { driver, .. } => {
+            assert_eq!(
+                driver.as_deref(),
+                Some("grok"),
+                "exec_* lookup must resolve the driver slug"
+            );
+        }
+        other => return Err(anyhow!("expected RunTranscriptTail, got: {other:?}")),
+    }
+
+    // run_* namespace.
+    let response = client
+        .send_request(&FrontendRequest::TailRunTranscript {
+            run_id: run.id,
+            lines: 0,
+        })
+        .await?;
+    match response {
+        FrontendEvent::RunTranscriptTail { driver, .. } => {
+            assert_eq!(
+                driver.as_deref(),
+                Some("grok"),
+                "run_* lookup must resolve the driver slug"
+            );
         }
         other => return Err(anyhow!("expected RunTranscriptTail, got: {other:?}")),
     }

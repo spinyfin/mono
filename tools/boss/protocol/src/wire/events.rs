@@ -426,13 +426,19 @@ pub enum FrontendEvent {
     },
     /// Trailing transcript chunk for a run. `lines` are the raw JSONL
     /// lines the engine read off the recorded transcript path
-    /// (newest-last). `truncated` is set when the file had more lines
-    /// than were returned.
+    /// (newest-last), verbatim in the producing driver's own dialect —
+    /// callers that render text/markdown must normalize them through
+    /// `driver` first (see `boss_engine::driver_transcript`) rather than
+    /// assuming the Claude/Codex schema every raw line matches. `truncated`
+    /// is set when the file had more lines than were returned. `driver` is
+    /// the slug that governed the run (e.g. `"claude"`, `"codex"`,
+    /// `"grok"`), or `None` when it could not be resolved.
     RunTranscriptTail {
         run_id: String,
         transcript_path: String,
         lines: Vec<String>,
         truncated: bool,
+        driver: Option<String>,
     },
     /// Rendered transcript for an execution. Segments are ordered by
     /// `seq` (conversation order). `is_live` is true when the execution
