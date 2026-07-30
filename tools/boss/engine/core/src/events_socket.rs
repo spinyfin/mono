@@ -1173,6 +1173,64 @@ mod tests {
         }
     }
 
+    /// Regression for the answer-agent strand: an `answer_agent` execution's
+    /// `work_item_id` is a `work_comments.id`, so the task-bound driver-slug
+    /// lookup found nothing and EVERY hook event from an answer-agent worker
+    /// was rejected here as `UnresolvedDriver` — including the `Stop` that
+    /// `finalize_answer_agent` is the sole consumer of. The execution then sat
+    /// `waiting_human` holding a worker slot until a human killed the pane.
+    /// The `Stop` must decode.
+    #[tokio::test]
+    async fn answer_agent_stop_resolves_a_driver_instead_of_being_dropped() {
+        let (_db_dir, db) = crate::test_support::open_db();
+        let comment = db
+            .create_comment(boss_protocol::CreateCommentInput {
+                artifact_kind: "pr_doc".to_owned(),
+                artifact_id: "pr_doc:git@github.com:spinyfin/mono.git:main:docs/design.md".to_owned(),
+                doc_version: "v1".to_owned(),
+                anchor: boss_protocol::CommentAnchor {
+                    exact: "the quoted text".to_owned(),
+                    prefix: String::new(),
+                    suffix: String::new(),
+                },
+                body: "why does this retry three times?".to_owned(),
+                author: "operator".to_owned(),
+                plain_text_projection_version: 0,
+            })
+            .unwrap();
+        let run_id = db
+            .create_answer_agent_execution(&comment.id, "git@github.com:spinyfin/mono.git")
+            .unwrap()
+            .id;
+        let registry = DriverRegistry::default();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("events.sock");
+        let listener = bind_events_socket(&path).unwrap();
+
+        let payload = format!(
+            r#"{{"hook_event_name":"Stop","session_id":"answer-sess-1","stop_hook_active":false,"_boss_run_id":"{run_id}"}}"#
+        );
+        let path_owned = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut stream = StdUnixStream::connect(&path_owned).unwrap();
+            stream.write_all(payload.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+        });
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let incoming = handle_connection(stream, &registry, &db)
+            .await
+            .expect("an answer-agent Stop must reach the completion handler, not be dropped");
+        client.await.unwrap();
+
+        assert_eq!(incoming.run_id.as_deref(), Some(run_id.as_str()));
+        assert!(
+            incoming.is_turn_boundary(),
+            "the resolved driver must read this Stop as the turn boundary completion hangs off",
+        );
+    }
+
     #[tokio::test]
     async fn peer_pid_matches_self_when_client_stays_connected() {
         let dir = TempDir::new().unwrap();
