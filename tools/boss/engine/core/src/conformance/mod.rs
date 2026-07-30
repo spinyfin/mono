@@ -28,6 +28,15 @@
 //!    `[blocked]` marker. Fails closed when a driver is registered without a
 //!    fixture (the all-drivers completion test only exercises the post-normalize
 //!    canonical shape).
+//! 6. **Codex `PreToolUse` guard conformance** — for every model Codex can
+//!    dispatch, a fixed live probe exercises the tool-surface routes known to
+//!    matter (a plain shell command, a push attempt, `apply_patch`, the
+//!    `exec_command`/`write_stdin` bypass, an MCP app tool) against the exact
+//!    production guard set, and asserts the observed `(tool_name,
+//!    tool_input` key set`, decision)` shape against a checked-in fixture. A
+//!    mismatch fails the build — it means Codex's tool surface (or Boss's
+//!    guard wiring) drifted from what the fixture recorded. Soft-skip without
+//!    a live credential; see `guard_conformance`.
 //!
 //! Tolerance policy (Codex stream): tolerate additive fields and unknown enum
 //! variants (forward-compatible). Fail loudly on removals and on semantic
@@ -39,6 +48,7 @@ mod boundary_equivalence;
 mod claude_goldens;
 mod fixtures;
 mod grok_goldens;
+mod guard_conformance;
 mod ingress_equivalence;
 mod native_transcript;
 mod version_pin;

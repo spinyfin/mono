@@ -21,8 +21,9 @@
 //!
 //! 1. runs the real guard with the payload on stdin,
 //! 2. appends one JSON line per invocation to
-//!    `$CODEX_HOME/`[`GUARD_TRACE_FILENAME`] — guard name, tool name,
-//!    decision, reason head,
+//!    `$CODEX_HOME/`[`GUARD_TRACE_FILENAME`] — guard name, tool name, the
+//!    sorted `tool_input` key set (not values, to avoid leaking payload
+//!    content into the trace), decision, reason head,
 //! 3. **translates** that decision into the vocabulary Codex accepts — the
 //!    guards are written in Claude Code's dialect, which Codex refuses, and a
 //!    refused response is fail-open (see [`super::decision`]), and
@@ -201,17 +202,26 @@ def record(payload_text, decision, reason, exit_code, detail):
         return
     tool = None
     session = None
+    tool_input_keys = None
     try:
         payload = json.loads(payload_text)
         if isinstance(payload, dict):
             tool = payload.get("tool_name")
             session = payload.get("session_id")
+            tool_input = payload.get("tool_input")
+            if isinstance(tool_input, dict):
+                tool_input_keys = sorted(tool_input.keys())
+            elif tool_input is not None:
+                # Non-object tool_input (e.g. a bare string) is itself a
+                # signal worth keeping visible, not just dropping to null.
+                tool_input_keys = "<non-object: %s>" % type(tool_input).__name__
     except Exception:
         pass
     line = {
         "ts": round(time.time(), 3),
         "guard": os.environ.get("BOSS_GUARD_NAME") or "unknown",
         "tool": tool if isinstance(tool, str) else None,
+        "tool_input_keys": tool_input_keys,
         "session_id": session if isinstance(session, str) else None,
         "decision": decision,
         "reason": (reason or "")[:400],
@@ -397,6 +407,20 @@ pub(super) fn wrapper_body(
     body
 }
 
+/// The `tool_input_keys` field of one [`GuardTraceRecord`].
+///
+/// Untagged: the shim writes either a sorted JSON array of key strings (the
+/// `tool_input` was an object) or a `"<non-object: ...>"` string (it was
+/// present but not an object). Serde distinguishes the two by shape.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(untagged)]
+pub enum ToolInputKeys {
+    /// Sorted key set of an object-shaped `tool_input`.
+    Keys(Vec<String>),
+    /// `tool_input` was present but not a JSON object.
+    NonObject(String),
+}
+
 /// One recorded guard invocation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GuardTraceRecord {
@@ -406,6 +430,12 @@ pub struct GuardTraceRecord {
     /// Tool name from the hook payload, when it carried one.
     #[serde(default)]
     pub tool: Option<String>,
+    /// Sorted `tool_input` key set from the hook payload, when `tool_input`
+    /// was a JSON object. `None` when the payload carried no `tool_input` at
+    /// all; [`ToolInputKeys::NonObject`] when it was present but not an
+    /// object (e.g. a bare string) — itself a signal, not an absence.
+    #[serde(default)]
+    pub tool_input_keys: Option<ToolInputKeys>,
     /// `approve`, `block`, or `guard_error`.
     #[serde(default)]
     pub decision: String,
@@ -682,6 +712,21 @@ mod tests {
         assert_eq!(lines[0]["tool"], "Bash");
         assert_eq!(lines[0]["guard"], "stub_guard");
         assert_eq!(lines[0]["session_id"], "sess-1");
+        assert_eq!(lines[0]["tool_input_keys"], serde_json::json!(["command"]));
+    }
+
+    #[test]
+    fn non_object_tool_input_is_recorded_as_a_signal_not_dropped() {
+        // A bare-string tool_input (the code-mode shape a guard must fail
+        // closed on) must still show up in the trace, not read as absent.
+        let payload = r#"{"tool_name":"Bash","session_id":"sess-1","tool_input":"js source"}"#;
+        let (_, lines) = run_shim(
+            "non-object-input",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'block','reason':'x'}))\n",
+            payload,
+        );
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["tool_input_keys"], "<non-object: str>");
     }
 
     #[test]
@@ -957,18 +1002,21 @@ mod tests {
             GuardTraceRecord {
                 guard: "01_boss_launch_guard".into(),
                 tool: Some("Bash".into()),
+                tool_input_keys: None,
                 decision: "approve".into(),
                 reason: String::new(),
             },
             GuardTraceRecord {
                 guard: "02_pr_redirect_guard".into(),
                 tool: Some("Bash".into()),
+                tool_input_keys: None,
                 decision: "block".into(),
                 reason: "use cube".into(),
             },
             GuardTraceRecord {
                 guard: "03_checkleft_push_guard".into(),
                 tool: Some("Bash".into()),
+                tool_input_keys: None,
                 decision: "guard_error".into(),
                 reason: "guard exited 3".into(),
             },
