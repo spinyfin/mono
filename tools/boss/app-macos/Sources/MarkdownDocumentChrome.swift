@@ -254,16 +254,18 @@ private struct MarkdownDocumentColumn: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
                     // Chrome rows stay at the readable measure even when the
-                    // document column widens for a table, so the title row
-                    // and rule don't stretch across a table's freed-up
-                    // margin while the prose in `documentBody` stays narrow
-                    // beneath them.
+                    // document column widens for a table, and are centered
+                    // on that same axis, so the title row and rule share the
+                    // prose's centered column instead of hugging the wide
+                    // document column's left edge.
                     header
-                        .frame(maxWidth: MarkdownDocumentMeasure.readable, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     Divider()
-                        .frame(maxWidth: MarkdownDocumentMeasure.readable, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .frame(maxWidth: MarkdownDocumentMeasure.readable)
+                        .frame(maxWidth: .infinity, alignment: .center)
                     documentBody
                 }
                 .padding(.horizontal, 24)

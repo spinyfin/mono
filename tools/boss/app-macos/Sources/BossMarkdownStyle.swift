@@ -96,11 +96,11 @@ extension StructuredText.HeadingStyle where Self == BossHeadingStyle {
 
 struct BossParagraphStyle: StructuredText.ParagraphStyle {
     // Inlined from `StructuredText.GitHubParagraphStyle.makeBody` (Textual
-    // 0.3.1) rather than delegated to, since `ParagraphStyle` refines
-    // `DynamicProperty` — constructing that style and calling
-    // `makeBody(configuration:)` on it directly, as the delegation used to,
-    // never installs its dynamic-property storage in the view hierarchy.
-    // Harmless today only because the library style is stateless.
+    // 0.3.1) rather than delegated to: `ParagraphStyle` refines
+    // `DynamicProperty`, and constructing that style and calling
+    // `makeBody(configuration:)` on it directly would never install its
+    // dynamic-property storage in the view hierarchy. Harmless today only
+    // because the library style is stateless.
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .textual.lineSpacing(.fontScaled(0.25))
@@ -118,8 +118,9 @@ extension StructuredText.ParagraphStyle where Self == BossParagraphStyle {
 struct BossListItemStyle: StructuredText.ListItemStyle {
     // Delegates to `StructuredText.DefaultListItemStyle` (Textual 0.3.1)
     // rather than inlining it, unlike the paragraph/thematic-break styles
-    // below — its body reads a private `WithFontScaledValue` helper that
-    // isn't part of the module's public surface. `ListItemStyle` refines
+    // elsewhere in this file — its body reads a private
+    // `WithFontScaledValue` helper that isn't part of the module's public
+    // surface. `ListItemStyle` refines
     // `DynamicProperty`, so constructing the style and calling
     // `makeBody(configuration:)` on it directly (as here) skips installing
     // its dynamic-property storage; this is a no-op today only because
@@ -185,6 +186,7 @@ struct BossCodeBlockStyle: StructuredText.CodeBlockStyle {
                 .stroke(Color(nsColor: .separatorColor), lineWidth: 0.5)
         )
         .textual.blockSpacing(.init(top: 0, bottom: 16))
+        .proseMeasureClamped()
     }
 }
 
@@ -227,25 +229,20 @@ struct BossTableStyle: StructuredText.TableStyle {
         // bare `ScrollView(.horizontal)` here would interfere with the
         // AppKit text-selection gestures the document view relies on.
         //
-        // Previously this applied `.frame(maxWidth: state.containerWidth,
-        // alignment: .leading)` to `configuration.label` (the `Grid` the
-        // library renders a table as) to cap its width at the visible
-        // column. That clamp is what clipped table content: a `Grid` given
-        // a *bounded* proposal shrinks its columns to fit rather than
-        // reporting its true content width, so `Overflow`'s `ScrollView`
-        // believed the content was exactly `containerWidth` wide (no scroll
-        // room) while the `Grid` still painted its uncompressed content
-        // past that boundary — clipped by the `ScrollView`'s own bounds,
-        // and unreachable by scrolling since the scroll extent never grew
-        // to match.
+        // Size the `Grid` with `minWidth`, never `maxWidth`. A bounded width
+        // proposal makes a `Grid` shrink its columns and under-report its
+        // size, so `Overflow`'s `ScrollView` would size its scroll extent to
+        // the container and clip the uncompressed content it still paints
+        // past that edge. `minWidth` only ever grows the box (centering a
+        // table narrower than the container) and never compresses a column,
+        // so a wide table keeps its natural width and stays fully reachable
+        // by scrolling.
         //
-        // The fix is `minWidth`, not `maxWidth`: it only ever *grows* the
-        // box to fill a container wider than the table's natural content
-        // (centering a narrow table on the document's axis), and never
-        // shrinks the `Grid` below its natural width — so it can never
-        // compress a column or clip content. A table wider than
-        // `containerWidth` keeps its full natural size and `Overflow`
-        // scrolls to reach all of it.
+        // The border/background chrome is applied to the `Grid` at its
+        // natural width, then the finished, chromed table is centered — so
+        // a narrow table's visible border sits on the same centered axis as
+        // the surrounding prose, rather than being stretched to the full
+        // container width.
         Overflow { state in
             configuration.label
                 .fixedSize(horizontal: false, vertical: true)
@@ -269,12 +266,12 @@ struct BossTableStyle: StructuredText.TableStyle {
                         }
                     }
                 }
-                .frame(minWidth: state.containerWidth, alignment: .center)
                 .padding(Self.borderWidth)
                 .overlay(
                     RoundedRectangle(cornerRadius: Self.cornerRadius)
                         .stroke(Color(nsColor: .separatorColor), lineWidth: Self.borderWidth)
                 )
+                .frame(minWidth: state.containerWidth, alignment: .center)
         }
         .textual.tableCellSpacing(
             horizontal: Self.borderWidth,
