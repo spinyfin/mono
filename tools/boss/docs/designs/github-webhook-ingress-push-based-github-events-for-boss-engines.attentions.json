@@ -4,7 +4,7 @@
     "prompt": "Cloudflare is recommended for the relay ($0 vs ~$15/mo, far less ops, and relay downtime degrades safely to polling), but Cloudflare's Rust path is wasm via workers-rs + wasm-bindgen, which integrates awkwardly with mono's bazel. If that friction exceeds its time-box during the deploy task, which fallback do you want taken?",
     "choices": [
       "Ship a TypeScript Worker, keep the wire format owned by the Rust relay_protocol crate (keeps $0 and the ops story; loses 'the service is Rust')",
-      "Move to Azure Container Apps with a plain axum Rust binary (keeps Rust end-to-end; costs ~$15/mo always-on plus a container registry and a second cloud's credentials in mono CI)",
+      "Move to Azure Container Instances with a plain axum Rust binary, mirroring flunge's own backend deploy (keeps Rust end-to-end; reuses flunge's existing ACR/oci_push/Azure-SP credentials already in the shared Buildkite cluster, so no second cloud's credentials to newly provision; costs ~$15/mo always-on since ACI has no scale-to-zero, plus a delete/recreate downtime window on every deploy)",
       "Stop and escalate rather than pick either — I want to decide with the actual friction in front of me"
     ],
     "anchor": "hosting-cloudflare-vs-azure"
@@ -34,5 +34,25 @@
       "Relax the general sweep to 600s but keep a cheap mergeability-only probe at 60s (more implementation work; needs its own task)"
     ],
     "anchor": "cutover"
+  },
+  {
+    "question_type": "multiple_choice",
+    "prompt": "The relay's Buildkite pipeline needs a trigger model, and mono is a monorepo so a naive push-to-main trigger fires on every merge regardless of what changed. Two in-org precedents pull opposite ways: flunge's staging release triggers on every push to main (a single-product repo, no path-filtering need), while mono-checkleft-release runs push/PR-triggers off with cron plus manual, specifically because mono is not single-product. Which trigger model do you want for the relay's deploy pipeline?",
+    "choices": [
+      "Push-to-main, but path-gated to the relay's own crates plus a durable release tag so unrelated mono merges don't redeploy it",
+      "Cron plus manual only, mirroring mono-checkleft-release exactly — no push trigger at all",
+      "Push-to-main with no path gate, mirroring flunge's staging pipeline exactly, accepting that unrelated mono merges will redeploy the relay"
+    ],
+    "anchor": "deploy-pipeline"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "The relay's deploy pipeline is proposed to run on the linux-release queue, which already exists in the shared Buildkite cluster and is unused by any mono pipeline today, but it is flunge's queue (single agent) and flunge's own release pipelines depend on it being available. Sharing it means mono's relay deploys and flunge's releases now contend for one agent. Do you want to confirm sharing linux-release with flunge's release train (needs sign-off from whoever owns flunge's release infra), rather than provisioning a new dedicated queue for the relay?",
+    "anchor": "deploy-pipeline"
+  },
+  {
+    "question_type": "yes_no",
+    "prompt": "All 25 existing secrets in the shared Buildkite cluster are currently unscoped (policy: \"\", readable by any pipeline in the cluster) because nothing has ever needed per-pipeline secret scoping before. The relay's webhook secret and Cloudflare API token would, by default, become readable by all seven of flunge's pipelines too, not just the relay's own — \"the deploy step runs only on main\" does not change this, since that restricts when the step runs, not which pipelines can read the secret once it exists in the cluster. Do you want secret-level pipeline scoping verified against the Buildkite plan tier and applied to the relay's secrets before they are created, rather than landing them unscoped with this exposure accepted?",
+    "anchor": "repo-placement"
   }
 ]
