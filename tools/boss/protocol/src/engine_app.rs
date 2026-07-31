@@ -592,6 +592,39 @@ mod tests {
         assert_eq!(parsed, original);
     }
 
+    /// The whole defer path hangs on one string agreeing across two
+    /// languages: the app hardcodes `"host_environment_unavailable"` in
+    /// `EngineClient+PaneResponses.swift`, while Rust derives the tag from
+    /// this variant's name. Renaming the variant would compile cleanly and
+    /// break the contract silently — the engine would fail to deserialise
+    /// the app's rejection and fall back to terminalizing the execution,
+    /// which is exactly the work-burning behaviour this surface exists to
+    /// prevent. Pin the tag so that rename fails here instead.
+    #[test]
+    fn host_environment_unavailable_wire_tag_is_pinned() {
+        let err = EngineToAppError::HostEnvironmentUnavailable {
+            reason: "no active display".into(),
+        };
+        let value = serde_json::to_value(&err).unwrap();
+        assert_eq!(
+            value["kind"], "host_environment_unavailable",
+            "wire tag must match what the app sends verbatim; got {value}"
+        );
+        assert_eq!(value["reason"], "no active display");
+
+        // And the exact payload the app emits must decode back to it.
+        let from_app = r#"{"kind":"host_environment_unavailable","reason":"no active display"}"#;
+        let parsed: EngineToAppError = serde_json::from_str(from_app).unwrap();
+        assert_eq!(parsed, err);
+
+        // Nested in the response envelope the spawn RPC actually carries.
+        let response = EngineToAppResponse::SpawnWorkerPane { result: Err(err) };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("host_environment_unavailable"));
+        let round_tripped: EngineToAppResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, response);
+    }
+
     #[test]
     fn slot_busy_display_teaches_desync_not_capacity() {
         // Operators and coordinator memory historically misread SlotBusy

@@ -188,7 +188,7 @@ fn report_worker_spawn_failed_round_trips_with_expected_tag() {
     }
 }
 
-/// A pre-#2579 app omits `environmental` entirely. It must decode as `false`
+/// An app predating the `environmental` field omits it entirely. It must decode as `false`
 /// — the historical orphan-the-execution behaviour — and never as `true`:
 /// silently requeueing a failure whose cause an old app could not classify
 /// would turn a real defect into an unbounded retry.
