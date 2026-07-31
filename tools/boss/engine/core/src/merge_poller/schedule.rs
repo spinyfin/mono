@@ -508,6 +508,7 @@ pub(crate) fn record_sweep_metrics(metrics: &Registry, outcome: &SweepOutcome) {
     REVISION_INVALIDATED.inc_by(metrics, outcome.revision_invalidated as u64);
     WORKER_STOPPED_ON_REVIEW.inc_by(metrics, outcome.worker_stopped_on_review as u64);
     COMMENTS_REOPENED.inc_by(metrics, outcome.comments_reopened as u64);
+    TRUNK_EPISODES_ADOPTED.inc_by(metrics, outcome.trunk_episodes_adopted as u64);
 }
 
 /// merged or developed a conflict while the engine was offline gets
@@ -639,6 +640,7 @@ pub fn spawn_loop(
                     revision_invalidated = outcome.revision_invalidated,
                     worker_stopped_on_review = outcome.worker_stopped_on_review,
                     comments_reopened = outcome.comments_reopened,
+                    trunk_episodes_adopted = outcome.trunk_episodes_adopted,
                     "merge poller: sweep transitions",
                 );
             }

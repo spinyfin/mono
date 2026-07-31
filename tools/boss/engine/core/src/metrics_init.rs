@@ -130,6 +130,7 @@ mod tests {
             "merge_poller.revision_invalidated",
             "merge_poller.worker_stopped_on_review",
             "merge_poller.comments_reopened",
+            "merge_poller.trunk_episodes_adopted",
         ] {
             assert!(
                 names.contains(&expected.to_owned()),
@@ -240,9 +241,9 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            87,
+            88,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
-             10 dispatcher + 14 merge_poller + 18 external_tracker + 2 speculative_conflict + \
+             10 dispatcher + 15 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \
              5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace counters"

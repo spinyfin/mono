@@ -2122,6 +2122,7 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
             raw_merge_state_status: "DIRTY".into(),
             auto_merge_enabled: false,
             auto_merge_enabled_at: None,
+            trunk_queue_check_failure: None,
         }),
     );
     let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
@@ -2149,6 +2150,70 @@ async fn rebounce_settles_then_conflicting_base_rebuckets_via_sweep() {
         }
         other => panic!("expected chore, got {other:?}"),
     }
+}
+
+/// The production wiring seam for Trunk queue adoption: `sweep_one` must
+/// actually call [`crate::trunk_queue_adopt::adopt_unattributed_trunk_queue_episode`]
+/// for an open PR and count what it adopted.
+///
+/// Every other test of this feature calls the adopt function directly, so
+/// none of them notices if the call is moved out of the `Open` arm or
+/// dropped: the field would silently stay `None`, nothing would ever be
+/// adopted, and the queue poller's candidate set would go back to "episodes
+/// Boss started" — the original bug — with a green test suite.
+#[tokio::test]
+async fn sweep_adopts_a_trunk_queue_eviction_and_counts_it() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/brianduff/flunge/pull/1156";
+    let (product_id, chore) = make_chore_in_review(&db, "C-trunk-adopt", pr);
+    db.set_product_merge_mechanism(&product_id, Some("trunk_queue"))
+        .unwrap();
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let probe = StubProbe::new();
+    let mut evicted = PrLifecycleProbe::builder()
+        .url(pr.to_owned())
+        .state(PrLifecycleState::Open(OpenPrStatus::clean()))
+        .head_ref_oid("a898daa34a0151810ec44b2d69722f5df21119dd")
+        .base_ref_name("main")
+        .labels(Vec::new())
+        .review(PrReviewState::Unknown)
+        .build();
+    evicted.trunk_queue_check_failure = Some(TrunkQueueCheckFailure {
+        name: "Trunk Merge Queue (main)".to_owned(),
+        conclusion: "FAILURE".to_owned(),
+        details_url: "https://app.trunk.io/flunge/merge-queue/c1478ade/1156".to_owned(),
+        completed_at: Some(
+            chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() - 120, 0)
+                .unwrap()
+                .to_rfc3339(),
+        ),
+    });
+    probe.states.lock().unwrap().insert(pr.into(), Ok(evicted));
+
+    let outcome = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(
+        outcome.trunk_episodes_adopted, 1,
+        "the sweep must adopt the eviction, not just carry the field on the probe",
+    );
+
+    // The adopted row is what makes the episode enumerable by the Trunk
+    // queue poller, which is the entire point of adopting.
+    let listed = db.list_active_trunk_merge_intents().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].intent.work_item_id, chore);
+    assert_eq!(listed[0].intent.target_branch, "main");
+    assert!(
+        listed[0].intent.adopted_at_head_sha.is_some(),
+        "provenance: a non-NULL head sha distinguishes an adopted episode from a merge click",
+    );
+
+    // A second pass observes the same still-failed leaf and must not adopt
+    // it again.
+    let second = run_one_pass(&db, probe.as_ref(), publisher.as_ref(), None, None, None).await;
+    assert_eq!(second.trunk_episodes_adopted, 0);
+    assert_eq!(db.list_active_trunk_merge_intents().unwrap().len(), 1);
 }
 
 /// Cold-path regression pin: when a conflict-resolution worker pushes

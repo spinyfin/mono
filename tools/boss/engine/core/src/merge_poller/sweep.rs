@@ -84,6 +84,15 @@ pub struct SweepOutcome {
     /// than folded into `merged`) so operators can tell "shipped" from
     /// "abandoned" retires apart in the sweep summary log.
     pub closed_unmerged: usize,
+    /// Number of Trunk merge-queue episodes adopted this sweep because
+    /// Trunk's own head check reported an eviction for a `trunk_queue`
+    /// product's PR that no active merge intent was tracking — i.e. a queue
+    /// episode a human started through Trunk's own affordance rather than
+    /// through Boss. See [`crate::trunk_queue_adopt`]. A non-zero value is
+    /// the operator-visible counterpart to the `warn!` each adoption logs:
+    /// these are evictions that, before adoption existed, were remediated by
+    /// nobody.
+    pub trunk_episodes_adopted: usize,
 }
 
 impl SweepOutcome {
@@ -102,6 +111,7 @@ impl SweepOutcome {
             + self.stranded_blocked_recanonicalized
             + self.comments_reopened
             + self.closed_unmerged
+            + self.trunk_episodes_adopted
     }
 }
 
@@ -1268,6 +1278,16 @@ pub(crate) async fn sweep_one(
     // transition away from `in_review` and the indicators become moot.
     if matches!(probe_result.state, PrLifecycleState::Open(_)) {
         update_pr_poll_state(work_db, publisher, candidate, &probe_result).await;
+        // Trunk merge-queue episodes Boss did not initiate. Runs for every
+        // open PR regardless of which mergeability arm above fired: a
+        // merge-side eviction lands on a CONFLICTING PR and a test-failure
+        // eviction on a clean one, and both need the episode enumerated
+        // before the Trunk lane can tell them apart. Costs one `Option`
+        // test on any PR without a failed Trunk check, which is all of them
+        // outside a Trunk repo.
+        if crate::trunk_queue_adopt::adopt_unattributed_trunk_queue_episode(work_db, candidate, &probe_result) {
+            outcome.trunk_episodes_adopted += 1;
+        }
     }
 }
 

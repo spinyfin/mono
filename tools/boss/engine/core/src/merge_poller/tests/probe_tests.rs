@@ -1094,6 +1094,92 @@ fn parse_probe_surfaces_conflict_and_ci_failure_together() {
     assert_eq!(probe.head_ref_oid.as_deref(), Some("head-1"));
 }
 
+/// The production wiring seam on the probe side: `parse_probe_json` must
+/// populate `trunk_queue_check_failure` off the real rollup document.
+///
+/// Every other test of the capture calls `trunk_queue_check_failure` on a
+/// raw leaf array, so none of them notices if the parser stops feeding it —
+/// e.g. if the per-org review-signal partition just above the call is
+/// reshaped and the Trunk leaf stops reaching `ci_leaves`. The field would
+/// silently stay `None` and adoption would never fire, with a green suite.
+///
+/// The rollup is `brianduff/flunge` #1156's real one: the PR's own required
+/// Buildkite context green, and Trunk's check failed because the eviction
+/// happened on the ephemeral construction branch.
+#[test]
+fn parse_probe_populates_the_trunk_queue_check_failure() {
+    let body = json_doc(
+        "OPEN",
+        "",
+        "MERGEABLE",
+        "CLEAN",
+        ("base-1", "a898daa34a0151810ec44b2d69722f5df21119dd"),
+        &[],
+        serde_json::json!([
+            {
+                "__typename": "CheckRun",
+                "name": "Trunk Merge Queue (main)",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "detailsUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+                "completedAt": "2026-07-28T09:14:02Z",
+            },
+            {
+                "__typename": "StatusContext",
+                "context": "buildkite/flunge-ci",
+                "state": "SUCCESS",
+                "targetUrl": "https://buildkite.com/flunge/flunge-ci/builds/2833",
+            },
+        ]),
+    );
+
+    let probe = parse_probe_json("https://github.com/brianduff/flunge/pull/1156", &body, None).unwrap();
+
+    let open = match probe.state {
+        PrLifecycleState::Open(open) => open,
+        other => panic!("expected Open, got {other:?}"),
+    };
+    assert_eq!(
+        open.ci,
+        OpenPrCiStatus::Clean,
+        "the Trunk check must stay excluded from the CI axis — that half of the contract is unchanged",
+    );
+
+    let trunk = probe
+        .trunk_queue_check_failure
+        .expect("the parser must hand the Trunk leaf to the adoption lane");
+    assert_eq!(trunk.name, "Trunk Merge Queue (main)");
+    assert_eq!(trunk.conclusion, "FAILURE");
+    assert_eq!(
+        trunk.details_url,
+        "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+    );
+    assert_eq!(trunk.completed_at.as_deref(), Some("2026-07-28T09:14:02Z"));
+}
+
+/// …and a rollup with no Trunk leaf leaves the field `None`, which is the
+/// case every PR outside a Trunk repo takes and the reason adoption costs
+/// one `Option` test on the common path.
+#[test]
+fn parse_probe_leaves_the_trunk_queue_check_failure_absent_without_one() {
+    let body = json_doc(
+        "OPEN",
+        "",
+        "MERGEABLE",
+        "CLEAN",
+        ("base-1", "head-1"),
+        &[],
+        serde_json::json!([{
+            "name": "ci/test",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+            "isRequired": true,
+        }]),
+    );
+    let probe = parse_probe_json("https://example.test/pr/no-trunk", &body, None).unwrap();
+    assert!(probe.trunk_queue_check_failure.is_none());
+}
+
 /// `mergeQueueEntry` field: non-null → `in_merge_queue = true`,
 /// null / absent → `in_merge_queue = false`.
 #[test]

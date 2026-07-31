@@ -450,6 +450,196 @@ fn classify_ci_excludes_trunk_merge_queue_check() {
     );
 }
 
+/// The verbatim `statusCheckRollup` GitHub returned for `brianduff/flunge`
+/// PR #1156 at head `a898daa3…` — the real Trunk merge-queue eviction that
+/// went undetected. Field-for-field what `PR_PROBE_FIELDS` selects, so this
+/// is the exact document the merge poller parses, not a stylised stand-in.
+///
+/// Note what it proves about the eviction: `buildkite/flunge-ci` — the
+/// repo's single required context — is **SUCCESS** on the PR's own head. The
+/// failing build (2837) was on the ephemeral `trunk-merge/pr-1156/…`
+/// construction branch, which never appears in a head rollup. So a
+/// head-based CI verdict of `Clean` here is correct, and the Trunk check is
+/// the only place this rollup carries the eviction at all.
+fn flunge_1156_evicted_rollup() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+            "completedAt": "2026-07-28T09:14:02Z",
+        }),
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/flunge-ci",
+            "state": "SUCCESS",
+            "targetUrl": "https://buildkite.com/flunge/flunge-ci/builds/2833",
+        }),
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/flunge-release-frontend",
+            "state": "SUCCESS",
+            "targetUrl": "https://buildkite.com/flunge/flunge-release-frontend/builds/1956",
+        }),
+    ]
+}
+
+/// Both halves of the Trunk-check contract, on the real payload: the head
+/// rollup still reads `Clean` (no duplicate `pr_branch_ci` remediation), and
+/// the eviction is nonetheless captured for the Trunk lane instead of being
+/// discarded — which, before `trunk_queue_adopt`, is exactly where the
+/// signal died for an episode Boss did not initiate.
+#[test]
+fn real_flunge_eviction_reads_clean_but_still_surfaces_the_trunk_check() {
+    let leaves = flunge_1156_evicted_rollup();
+
+    assert_eq!(
+        super::classify_ci(&leaves, None),
+        OpenPrCiStatus::Clean,
+        "the PR's own required check is green; the Trunk check must not spawn a pr_branch_ci remediation",
+    );
+
+    let trunk = super::trunk_queue_check_failure(&leaves).expect("the eviction must not be discarded");
+    assert_eq!(trunk.name, "Trunk Merge Queue (main)");
+    assert_eq!(trunk.conclusion, "FAILURE");
+    assert_eq!(
+        trunk.details_url,
+        "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+    );
+    assert_eq!(
+        trunk.completed_at.as_deref(),
+        Some("2026-07-28T09:14:02Z"),
+        "the episode discriminator: the head sha alone cannot tell two queue attempts on one commit apart",
+    );
+}
+
+/// `isRequired` is deliberately not consulted: Trunk's check is not part of
+/// branch protection on a real repo (`brianduff/flunge` requires exactly one
+/// context, `buildkite/flunge-ci`), so filtering on it would throw the
+/// eviction away again.
+#[test]
+fn trunk_queue_check_failure_ignores_is_required() {
+    let leaves = [serde_json::json!({
+        "name": "Trunk Merge Queue (main)",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "isRequired": false,
+    })];
+    assert!(super::trunk_queue_check_failure(&leaves).is_some());
+}
+
+/// Only a terminal failure is an eviction. A check that is still running, or
+/// that concluded successfully, describes an episode that needs nothing —
+/// and adopting on it would create an intent for a PR that is merely queued.
+#[test]
+fn trunk_queue_check_failure_ignores_non_failing_and_absent_leaves() {
+    for leaf in [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "IN_PROGRESS", "conclusion": null}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SKIPPED"}),
+        serde_json::json!({"name": "ci/test", "status": "COMPLETED", "conclusion": "FAILURE"}),
+    ] {
+        assert!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf)).is_none(),
+            "{leaf} must not read as an eviction",
+        );
+    }
+    assert!(super::trunk_queue_check_failure(&[]).is_none());
+}
+
+/// The eviction predicate is deliberately *narrower* than the CI failure set
+/// [`super::is_failure_conclusion`], which the Trunk lane must not inherit.
+///
+/// `CANCELLED` is the one that matters: a human cancelling the queue entry
+/// they just created is a decision, not a failure (the Trunk lane says so
+/// itself at its `TrunkPrState::Cancelled` arm). Reading it as an eviction
+/// would adopt an intent, resolve it as cancelled, and file the "PR was
+/// removed from the Trunk merge queue" attention item against a card that
+/// was never in the Merging lane — noise manufactured out of a benign click.
+#[test]
+fn trunk_queue_check_failure_rejects_conclusions_that_are_decisions_not_evictions() {
+    for conclusion in ["CANCELLED", "SKIPPED", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"] {
+        let leaf = serde_json::json!({
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        });
+        assert!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf)).is_none(),
+            "{conclusion} is not an eviction and must not adopt a merge intent",
+        );
+    }
+
+    // …while the conclusions that really do mean "Trunk kicked this PR out"
+    // still are one.
+    for conclusion in ["FAILURE", "TIMED_OUT"] {
+        let leaf = serde_json::json!({
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        });
+        assert_eq!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf))
+                .map(|f| f.conclusion)
+                .as_deref(),
+            Some(conclusion),
+        );
+    }
+}
+
+/// `classify_ci` resolves a leaf's identity as `name` falling back to
+/// `context` before applying the Trunk exclusion, so the capturing reader
+/// must resolve it the same way. If it did not, a Trunk-named leaf arriving
+/// in `StatusContext` shape would be dropped from the CI verdict *and* not
+/// captured by the Trunk lane — the "signal dies everywhere" hole, narrower.
+/// Trunk posts a `CheckRun` today, so this guards the asymmetry rather than
+/// a live payload.
+#[test]
+fn trunk_queue_check_failure_reads_a_status_context_shaped_leaf() {
+    let leaves = [serde_json::json!({
+        "__typename": "StatusContext",
+        "context": "Trunk Merge Queue (main)",
+        "state": "FAILURE",
+        "targetUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade/1156",
+    })];
+
+    assert_eq!(
+        super::classify_ci(&leaves, None),
+        OpenPrCiStatus::Clean,
+        "the exclusion already resolves `context`; this leaf must not spawn a pr_branch_ci remediation",
+    );
+
+    let trunk = super::trunk_queue_check_failure(&leaves).expect("…and it must not be dropped by the Trunk lane too");
+    assert_eq!(trunk.name, "Trunk Merge Queue (main)");
+    assert_eq!(
+        trunk.details_url,
+        "https://app.trunk.io/flunge/merge-queue/c1478ade/1156"
+    );
+    assert!(
+        trunk.completed_at.is_none(),
+        "a StatusContext has no completedAt; adoption falls back to NULL-safe exactly-once keying",
+    );
+}
+
+/// Re-runs land last in the rollup, so the newest leaf wins — a PR
+/// resubmitted after a fix must not keep reporting the stale eviction.
+#[test]
+fn trunk_queue_check_failure_takes_the_latest_leaf_for_the_name() {
+    let rerun_cleared = [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "FAILURE"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+    ];
+    assert!(super::trunk_queue_check_failure(&rerun_cleared).is_none());
+
+    let rerun_failed = [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "FAILURE"}),
+    ];
+    assert!(super::trunk_queue_check_failure(&rerun_failed).is_some());
+}
+
 #[test]
 fn leaf_matches_check_name_empty_names_is_false() {
     // Empty `names` short-circuits to false without inspecting the leaf —

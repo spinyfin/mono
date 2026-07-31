@@ -523,6 +523,7 @@ fn probe_with_queue_fields(
         raw_merge_state_status: String::new(),
         auto_merge_enabled,
         auto_merge_enabled_at: auto_merge_enabled_at.map(str::to_owned),
+        trunk_queue_check_failure: None,
     }
 }
 

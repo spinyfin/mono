@@ -81,6 +81,18 @@ pub struct PrLifecycleProbe {
     /// only as a deterministic secondary ordering key for the Merging
     /// section (earlier-armed PRs sort above later ones).
     pub auto_merge_enabled_at: Option<String>,
+    /// Trunk's own `"Trunk Merge Queue (<branch>)"` check, when it has
+    /// terminally failed on this head — GitHub's record that a Trunk
+    /// merge-queue episode for this PR was evicted.
+    ///
+    /// Deliberately carried *beside* the `ci` axis rather than folded into
+    /// it: [`classify_ci`] excludes this leaf from the required-failure set
+    /// on purpose (it is not a CI run and must not spawn a `pr_branch_ci`
+    /// remediation), but the observation itself is what
+    /// [`crate::trunk_queue_adopt`] needs to notice a queue episode Boss did
+    /// not initiate. `None` on every non-Trunk repo, and on a Trunk repo
+    /// whose PR has no live or concluded-badly episode.
+    pub trunk_queue_check_failure: Option<TrunkQueueCheckFailure>,
 }
 
 /// Lifecycle states the poller reacts to. The split between
@@ -388,7 +400,12 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
-    "__typename ... on CheckRun { name status conclusion detailsUrl } ",
+    // `completedAt` is requested for one reader only: it is the episode
+    // discriminator `trunk_queue_adopt` keys adoption on (a head sha is not
+    // one — a PR can be queued twice on an unchanged head) and the only
+    // datum that says how old an eviction is. It is a scalar on a node
+    // already being fetched, so it costs no extra GraphQL nodes.
+    "__typename ... on CheckRun { name status conclusion detailsUrl completedAt } ",
     "... on StatusContext { context state targetUrl } } } } } } }",
 );
 
@@ -944,6 +961,11 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         .into_iter()
         .partition(|leaf| leaf_matches_check_name(leaf, review_signal_names));
     let ci = classify_ci(&ci_leaves, combined_state);
+    // Read from the same post-partition leaf set `classify_ci` sees, so the
+    // two readers of the Trunk leaf can never disagree about which leaves
+    // were in scope. (The partition above only ever moves per-org review
+    // signal checks, never Trunk's.)
+    let trunk_queue_check_failure = trunk_queue_check_failure(&ci_leaves);
     let state = classify_state(raw_state, merged_at, mergeable, merge_state_status, ci);
     let review_signal = classify_review_signal(&review_signal_leaves);
     let review_decision = root.get("reviewDecision").and_then(|v| v.as_str()).unwrap_or("");
@@ -1003,5 +1025,6 @@ pub(crate) fn parse_probe_json(url: &str, body: &str, combined_state: Option<&st
         raw_merge_state_status: merge_state_status.to_owned(),
         auto_merge_enabled,
         auto_merge_enabled_at,
+        trunk_queue_check_failure,
     })
 }

@@ -348,21 +348,29 @@ pub(crate) fn normalize_leaf(leaf: &serde_json::Value) -> LeafVerdict {
 /// a prior regression. Phantom prevention belongs in withdraw,
 /// not in detection delay.
 ///
-/// Excludes Trunk's own bookkeeping check (`"Trunk Merge Queue (<branch>)"`,
-/// posted by the `trunk-io` app on the PR head) from the required-failure
-/// set unconditionally. Trunk flips that check to failure the moment a
-/// queue episode is evicted — a check name that can only exist on a repo
-/// with Trunk installed, whose failure is already the authoritative
-/// `ci_watch::on_trunk_queue_eviction_detected` path's own signal (driven
-/// by `TrunkQueueProbe`, not this rollup). Without this exclusion the same
-/// eviction would ALSO read as a failing required check here, on the PR's
-/// own head, and spawn a duplicate/misleading `pr_branch_ci` remediation
-/// from a check that isn't a real CI run (see the buildkite-log-access
-/// investigation's coordination note).
+/// Excludes Trunk's own bookkeeping check
+/// ([`TRUNK_QUEUE_CHECK_NAME_PREFIX`], posted by the `trunk-io` app on the
+/// PR head) from the required-failure set unconditionally. Trunk flips that
+/// check to failure the moment a queue episode is evicted — a check name
+/// that can only exist on a repo with Trunk installed, whose failure is
+/// already the authoritative `ci_watch::on_trunk_queue_eviction_detected`
+/// path's own signal (driven by `TrunkQueueProbe`, not this rollup).
+/// Without this exclusion the same eviction would ALSO read as a failing
+/// required check here, on the PR's own head, and spawn a
+/// duplicate/misleading `pr_branch_ci` remediation from a check that isn't a
+/// real CI run (see the buildkite-log-access investigation's coordination
+/// note). `isRequired` is not requested by `PR_PROBE_FIELDS` and defaults to
+/// `true` above, so this name check — not branch protection — is the only
+/// thing keeping that duplicate from being spawned.
+///
+/// The exclusion is scoped to *this* function's verdict, not to the leaf
+/// itself: [`trunk_queue_check_failure`] reads the same leaf and hands it to
+/// the Trunk lane, which is the lane that owns the signal. Excluding it here
+/// while capturing it there is what lets a Trunk eviction produce exactly one
+/// remediation — a `trunk_queue_eviction` one — instead of zero (the bug this
+/// exclusion used to cause for episodes Boss did not initiate) or two.
 pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&str>) -> OpenPrCiStatus {
     use std::collections::BTreeMap;
-
-    const TRUNK_QUEUE_CHECK_NAME_PREFIX: &str = "Trunk Merge Queue";
 
     // Group by name, keeping the most-recently-seen leaf per name.
     // The rollup is ordered oldest-to-newest for same-name re-runs.
@@ -374,16 +382,13 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
         if !required {
             continue;
         }
-        let name = leaf
-            .get("name")
-            .and_then(|v| v.as_str())
-            .or_else(|| leaf.get("context").and_then(|v| v.as_str()))
-            .unwrap_or("")
-            .to_owned();
-        if name.is_empty() || name.starts_with(TRUNK_QUEUE_CHECK_NAME_PREFIX) {
+        let Some(name) = leaf_check_name(leaf) else {
+            continue;
+        };
+        if name.starts_with(TRUNK_QUEUE_CHECK_NAME_PREFIX) {
             continue;
         }
-        by_name.insert(name, leaf);
+        by_name.insert(name.to_owned(), leaf);
     }
 
     let mut failures: Vec<RequiredCheckFailure> = Vec::new();
@@ -441,6 +446,168 @@ pub(crate) fn classify_ci(leaves: &[serde_json::Value], combined_state: Option<&
         }
     }
     OpenPrCiStatus::Clean
+}
+
+/// Name prefix of Trunk's own bookkeeping check run, posted by the
+/// `trunk-io` GitHub app on the PR head as `"Trunk Merge Queue (<branch>)"`.
+///
+/// Trunk only posts this check while a queue *episode* exists for the PR —
+/// a PR that has never been submitted carries no leaf with this name at all
+/// (verified against `brianduff/flunge` #1156: present on the evicted head
+/// `a898daa3`, absent on the head pushed after it) — and it flips the check
+/// to a terminal failure the moment an episode is evicted. That makes the
+/// leaf two different things to two different readers, which is why it is
+/// named once here and read twice below: [`classify_ci`] must *exclude* it
+/// from the required-failure set, while [`trunk_queue_check_failure`]
+/// *captures* it as the eviction signal it is.
+pub(crate) const TRUNK_QUEUE_CHECK_NAME_PREFIX: &str = "Trunk Merge Queue";
+
+/// A rollup leaf's check identity, or `None` when it reports neither.
+///
+/// The two leaf shapes name themselves differently — a `CheckRun` carries
+/// `name`, a legacy `StatusContext` carries `context` — and every reader of
+/// a leaf's *name* must resolve both, or the two readers disagree about
+/// which leaf they are looking at. That is not hypothetical here: the same
+/// leaf is read twice, once by [`classify_ci`] (which excludes Trunk's
+/// check) and once by [`trunk_queue_check_failure`] (which captures it). If
+/// only one of them fell back to `context`, a Trunk-named leaf arriving in
+/// `StatusContext` shape would be dropped from the CI verdict *and* not
+/// captured by the Trunk lane — the "signal dies everywhere" hole
+/// [`crate::trunk_queue_adopt`] exists to close, in miniature. Sharing one
+/// resolver is what makes that impossible rather than merely unlikely.
+pub(crate) fn leaf_check_name(leaf: &serde_json::Value) -> Option<&str> {
+    leaf.get("name")
+        .and_then(|v| v.as_str())
+        .or_else(|| leaf.get("context").and_then(|v| v.as_str()))
+        .filter(|name| !name.is_empty())
+}
+
+/// A terminally-failed `"Trunk Merge Queue (<branch>)"` leaf observed on a
+/// PR's head — i.e. GitHub's own record that a Trunk merge-queue episode
+/// for this PR ended in an eviction.
+///
+/// Deliberately *not* a [`RequiredCheckFailure`]: this must never be mixed
+/// into the `pr_branch_ci` failure set (see [`classify_ci`]'s exclusion),
+/// and the distinct type is what makes that impossible by construction
+/// rather than by convention.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkQueueCheckFailure {
+    /// Verbatim leaf name, e.g. `"Trunk Merge Queue (main)"`.
+    pub name: String,
+    /// Uppercased terminal conclusion, e.g. `"FAILURE"`.
+    pub conclusion: String,
+    /// Trunk's own episode page, e.g.
+    /// `https://app.trunk.io/<org>/merge-queue/<queue-uuid>/<pr-number>`.
+    /// Empty when GitHub omitted it. Diagnostic only — the queue uuid in
+    /// that path is per-queue, not per-episode, so it is not usable as an
+    /// idempotency key.
+    pub details_url: String,
+    /// The check run's `completedAt`, verbatim RFC 3339 (e.g.
+    /// `"2026-07-28T09:14:02Z"`). `None` for a `StatusContext` leaf, which
+    /// has no such field, and on any provider that omits it.
+    ///
+    /// This is the *episode* discriminator. A PR head sha is not one: a PR
+    /// can enter the queue more than once on an unchanged head (a human
+    /// cancels and re-checks the box; or Trunk retires the entry for a base
+    /// mismatch and Boss's own attention item tells them to requeue), and
+    /// Trunk concludes a fresh check run for each attempt. Pairing this with
+    /// the head sha is what lets a genuinely new episode be adopted while a
+    /// re-observation of the same one is not — see
+    /// [`crate::work::WorkDb::trunk_merge_intent_adopted_at_episode`]. It is
+    /// also the only datum that bounds how *old* an eviction is, which
+    /// [`crate::trunk_queue_adopt`] uses to refuse to resurrect an episode a
+    /// human walked away from days ago.
+    pub completed_at: Option<String>,
+}
+
+/// Closed set of conclusions on Trunk's own check that mean "this queue
+/// episode was evicted".
+///
+/// Deliberately narrower than [`is_failure_conclusion`], which is the CI
+/// predicate and is broad on purpose (it would rather over-trip on a
+/// third-party check than miss a real red). Trunk's check is not a CI run,
+/// and its conclusions are decisions:
+///
+///   - `FAILURE` / `ERROR` — the episode's construction build went red and
+///     Trunk kicked the PR out. This is the eviction, and `ERROR` is the
+///     `StatusContext`-shaped spelling of the same thing.
+///   - `TIMED_OUT` — the entry exceeded Trunk's queue timeout. Still an
+///     eviction: the PR left the queue unmerged and needs a human or a fix.
+///
+/// Everything else in the CI failure set is explicitly *not* an eviction:
+/// `CANCELLED` most of all, because a human cancelling their own queue entry
+/// is a decision, not a failure (the Trunk lane says exactly this at
+/// `trunk_queue_poller`'s `TrunkPrState::Cancelled` arm). Reading a cancel as
+/// an eviction would adopt an intent, resolve it as `Cancelled`, and file the
+/// "PR was removed from the Trunk merge queue" attention item against a card
+/// that was never in the Merging lane — operator-facing noise manufactured
+/// out of a benign click. `SKIPPED`, `ACTION_REQUIRED`, `STALE` and
+/// `STARTUP_FAILURE` are likewise not statements that the episode was
+/// evicted, so none of them may mint one.
+pub(crate) fn is_trunk_eviction_conclusion(conclusion: &str) -> bool {
+    matches!(
+        conclusion.to_ascii_uppercase().as_str(),
+        "FAILURE" | "ERROR" | "TIMED_OUT"
+    )
+}
+
+/// Pull the terminally-failed Trunk merge-queue check off a PR's rollup, if
+/// there is one — the GitHub-side record that *some* Trunk queue episode for
+/// this PR was evicted, whether or not Boss was the one that started it.
+///
+/// This is the half of the Trunk-check signal [`classify_ci`] deliberately
+/// throws away. Dropping it there is right (it is not a CI run and must not
+/// spawn a `pr_branch_ci` remediation); dropping it *everywhere* was the
+/// structural hole: the Trunk queue poller only enumerates episodes Boss
+/// itself submitted, so an episode a human started via Trunk's own
+/// affordance ("check the box to the left or comment `/trunk merge`") was
+/// visible to neither lane and no `ci-fix` revision was ever minted. See
+/// [`crate::trunk_queue_adopt`] for what the caller does with this.
+///
+/// Two deliberate asymmetries with [`classify_ci`]:
+///
+///   - **`isRequired` is not consulted.** Trunk's check is not part of
+///     branch protection (on `brianduff/flunge` the single required context
+///     is `buildkite/flunge-ci`), so filtering on it here would discard the
+///     signal outright.
+///   - **Only a terminal eviction conclusion counts**, and the set is
+///     [`is_trunk_eviction_conclusion`], *not* the broad CI
+///     [`is_failure_conclusion`]. A non-terminal leaf describes an episode
+///     that is merely in progress; a terminal one that concluded
+///     `CANCELLED`/`SKIPPED`/… describes a decision rather than an eviction.
+///     Neither needs remediation, and minting an intent for either is worse
+///     than doing nothing (see [`is_trunk_eviction_conclusion`]).
+pub(crate) fn trunk_queue_check_failure(leaves: &[serde_json::Value]) -> Option<TrunkQueueCheckFailure> {
+    // Last matching leaf wins, matching `classify_ci`'s "the most recent
+    // run for a given name lands last in the rollup" collapsing rule.
+    // Identity resolves through the same `name`-or-`context` helper
+    // `classify_ci` uses, so the excluder and the capturer can never
+    // disagree about which leaf is Trunk's.
+    let leaf = leaves
+        .iter()
+        .rev()
+        .find(|leaf| leaf_check_name(leaf).is_some_and(|name| name.starts_with(TRUNK_QUEUE_CHECK_NAME_PREFIX)))?;
+    let LeafVerdict::Fail { conclusion } = normalize_leaf(leaf) else {
+        return None;
+    };
+    if !is_trunk_eviction_conclusion(&conclusion) {
+        return None;
+    }
+    Some(TrunkQueueCheckFailure {
+        name: leaf_check_name(leaf).unwrap_or_default().to_owned(),
+        conclusion,
+        details_url: leaf
+            .get("detailsUrl")
+            .and_then(|v| v.as_str())
+            .or_else(|| leaf.get("targetUrl").and_then(|v| v.as_str()))
+            .unwrap_or_default()
+            .to_owned(),
+        completed_at: leaf
+            .get("completedAt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    })
 }
 
 /// Per-PR opt-out label that suppresses every auto-remediation flow
