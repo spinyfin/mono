@@ -45,9 +45,7 @@ fn claude_effort_value_for_level(level: EffortLevel) -> Option<&'static str> {
 
 /// Model slug for a given [`ReasoningMode`] — the capability lever.
 ///
-/// This is the table the operator's policy actually lives in: *"sonnet is best
-/// for well articulated coding tasks (these should be the bulk of what boss
-/// does, but when some investigation is required, opus is usually better)."*
+/// The tier table that distinction resolves against for the Claude driver.
 /// Neither arm consults [`EffortLevel`], which is the entire point — a small
 /// investigate-and-fix chore gets Opus without its effort level being inflated
 /// to `large`, and a big-but-mechanical `large` row gets Sonnet.

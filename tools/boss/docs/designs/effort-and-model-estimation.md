@@ -355,7 +355,7 @@ The split is the rough validation that the four-level enum tracks real work dist
 
 This design gave `effort_level` two jobs, and the second one was never really its to do. Effort is a **size** estimate — how long, how many files, how many subsystems — and this document correctly derives the `--effort` value and the prompt addendum from it. It also derived the **model** from it, and that is a different question: not how big the work is, but what kind of thinking it needs.
 
-The operator's position, which is the policy this amendment encodes:
+The policy this amendment encodes:
 
 > "I think sonnet is best for well articulated coding tasks (these should be the bulk of what boss does, but when some investigation is required, opus is usually better)."
 
