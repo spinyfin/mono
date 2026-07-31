@@ -391,6 +391,21 @@ pub struct RequestExecutionInput {
 pub struct WorkExecution {
     pub id: String,
     pub work_item_id: String,
+    /// The agent driver that actually launched this execution. `None` means
+    /// the execution predates launch-configuration recording or never made it
+    /// as far as a worker spawn; it must not be presented as a default driver.
+    #[serde(default)]
+    pub driver: Option<String>,
+    /// The model slug the launched driver actually received. This is frozen
+    /// with [`Self::driver`] rather than re-resolved from current policy, so a
+    /// later model-policy edit cannot rewrite execution history.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The work-item effort level at the moment this execution launched.
+    /// `None` with a recorded driver means the run was intentionally
+    /// unclassified; `None` with no driver is a pre-recording execution.
+    #[serde(default)]
+    pub effort_level: Option<super::common::EffortLevel>,
     /// When `true`, the cube lease call for this execution will include
     /// `--allow-dirty`, causing cube to reclaim the named preferred workspace
     /// with its uncommitted working copy intact rather than resetting it.

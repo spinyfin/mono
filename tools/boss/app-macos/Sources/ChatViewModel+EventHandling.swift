@@ -87,7 +87,7 @@ extension ChatViewModel {
             // permanently disabled since no work_error will ever arrive.
             deferredScopeActionInFlightIDs.removeAll()
             scheduleConnectionLostBannerCheck()
-        case .workInvalidated(let topic, let productId, _):
+        case .workInvalidated(let topic, let productId, let itemIDs):
             if CommentEngineBridge.isCommentTopic(topic) {
                 // A comment row on an open viewer's artifact changed elsewhere;
                 // the bridge reloads the bound layer(s). Invalidation-not-patch.
@@ -103,6 +103,13 @@ extension ChatViewModel {
             } else if let productId,
                       productId == currentSelectedProductID {
                 refetchForInvalidation(productID: productId)
+            }
+            // Execution history is loaded lazily, outside the work-tree
+            // snapshot. Refresh only already-visible histories so a spawned
+            // worker's persisted launch tuple appears live in its card
+            // popover and transcript viewer without broad polling.
+            for itemID in itemIDs where executionsByTaskID[itemID] != nil {
+                engine.sendListExecutions(taskId: itemID)
             }
         case .productsList(let products):
             self.products = products.sorted(by: { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending })

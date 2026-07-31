@@ -660,7 +660,9 @@ extension EngineClient {
             workItemId: workItemId,
             kind: kind,
             status: status,
+            driver: payload["driver"] as? String,
             model: payload["model"] as? String,
+            effortLevel: payload["effort_level"] as? String,
             runId: payload["run_id"] as? String,
             startedAt: payload["started_at"] as? String,
             endedAt: payload["ended_at"] as? String

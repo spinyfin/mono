@@ -15,11 +15,9 @@ struct ExecutionRow: View {
                 Spacer()
                 statusBadge
             }
-            if let model = exec.model, !model.isEmpty {
-                Text(model)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text(runtimeLabel)
+                .font(.caption)
+                .foregroundStyle(.secondary)
             if let start = exec.startedAt {
                 Text(formattedDate(start))
                     .font(.caption2)
@@ -37,6 +35,19 @@ struct ExecutionRow: View {
         case "investigation": "Investigation"
         default: exec.kind.replacingOccurrences(of: "_", with: " ").capitalized
         }
+    }
+
+    private var runtimeLabel: String {
+        guard let driver = exec.driver?.trimmingCharacters(in: .whitespacesAndNewlines), !driver.isEmpty else {
+            return "Runtime: not recorded"
+        }
+        let model = exec.model?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effort = exec.effortLevel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            driver,
+            (model?.isEmpty == false ? model! : "model not recorded"),
+            "effort " + (effort?.isEmpty == false ? effort! : "not set")
+        ].joined(separator: " · ")
     }
 
     private var statusBadge: some View {

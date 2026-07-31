@@ -549,7 +549,13 @@ struct ExecutionVM: Identifiable, Hashable {
     let workItemId: String
     let kind: String
     let status: String
+    /// The actual driver recorded at launch. `nil` means this execution
+    /// predates launch recording or never spawned; it is not Claude.
+    let driver: String?
     let model: String?
+    /// The effort level frozen at launch. A `nil` effort with a driver is an
+    /// intentionally unclassified execution, distinct from not-recorded.
+    let effortLevel: String?
     let runId: String?
     let startedAt: String?
     let endedAt: String?
