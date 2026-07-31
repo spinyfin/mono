@@ -1344,13 +1344,31 @@ pub(super) fn run_workspace(
                     force_reset,
                 ) {
                     Ok(ReleaseResetOutcome::Reset) => {
-                        // Opportunistically forget consumed boss/exec_* bookmarks.
-                        // The fetch above already updated main, so do_fetch = false.
-                        // Best-effort: log a warning but never block the release.
+                        // Forget consumed boss/exec_* bookmarks and pr/<n>
+                        // bookmarks no workspace is positioned on any more. The
+                        // fetch above already updated main, so do_fetch = false.
+                        //
+                        // The reset has just moved `@` off whatever branch this
+                        // lease was working on, which is what makes this the
+                        // right moment: the bookmarks that lease was holding
+                        // become unreferenced exactly here, so the set is pruned
+                        // at the point the workspace is done with them rather
+                        // than accumulating for the workspace's whole lifetime.
+                        //
+                        // A failure is NOT swallowed. This sweep is the only
+                        // thing that prunes either bookmark namespace, so a
+                        // sweep that silently fails is unbounded growth with no
+                        // signal — precisely the feedback loop that let the
+                        // `pr/*` set reach sixty entries in the live `mono`
+                        // store. It still does not fail the release (the lease
+                        // must come back either way), but it is reported as an
+                        // error and recorded in the audit log so the failure is
+                        // recoverable evidence rather than a line on a stderr
+                        // nobody reads.
                         match gc_workspace_bookmarks(runner, database_path, &workspace.workspace_path, false, false) {
                             Ok(forgotten) if !forgotten.is_empty() => {
                                 eprintln!(
-                                    "cube: release gc: {} consumed bookmark(s) forgotten in {}",
+                                    "cube: release gc: {} unreferenced bookmark(s) forgotten in {}",
                                     forgotten.len(),
                                     workspace.workspace_id,
                                 );
@@ -1358,8 +1376,20 @@ pub(super) fn run_workspace(
                             Ok(_) => {}
                             Err(e) => {
                                 eprintln!(
-                                    "warning: bookmark gc on release of {} failed: {e}",
+                                    "cube: error: bookmark gc on release of {} failed: {e}. \
+                                     Nothing was pruned, so consumed `boss/exec_*` and unreferenced \
+                                     `pr/<n>` bookmarks will keep accumulating in this repo's shared \
+                                     store until a sweep succeeds. Run `cube workspace gc --dry-run` \
+                                     to see the backlog, and `cube workspace gc` to clear it.",
                                     workspace.workspace_id,
+                                );
+                                audit!(
+                                    database_path,
+                                    "workspace.release_bookmark_gc_failed",
+                                    repo = workspace.repo,
+                                    workspace_id = workspace.workspace_id,
+                                    lease_id = lease,
+                                    error = e.to_string(),
                                 );
                             }
                         }
