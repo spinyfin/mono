@@ -194,6 +194,15 @@ impl WorkerCompletionHandler {
     /// satisfied (CI in-flight, CI failing, merge conflict) or the probe
     /// fails (safe fallback to the normal nudge path).
     ///
+    /// `contribution` is what the SHA-delta gate established about *this
+    /// run* moments earlier. It is load-bearing: for a
+    /// `revision_implementation` the "open + mergeable + CI clean" arm is
+    /// the state the run was DISPATCHED INTO, so it proves nothing on its
+    /// own and [`health_alone_satisfies_deliverable`] refuses it when the
+    /// gate proved the head did not move. See that function for the full
+    /// argument and for why the merged / merge-queue / conflict-cleared
+    /// arms are unaffected.
+    ///
     /// Safety: intentionally NOT called from `recheck_for_pr`. The merge-
     /// poller sweep runs for `waiting_human` executions even when the
     /// worker died without a clean Stop (crash, network cut). Applying
@@ -206,6 +215,7 @@ impl WorkerCompletionHandler {
         execution_id: &str,
         execution: &crate::work::WorkExecution,
         bound_pr_url: &str,
+        contribution: ContributionEvidence,
     ) -> Option<StopOutcome> {
         let probe = match self.merge_probe.probe(bound_pr_url).await {
             Ok(p) => p,
@@ -250,6 +260,15 @@ impl WorkerCompletionHandler {
         // normal nudge/park path like any other non-clean CI state.
         let queued_for_merge = probe.in_merge_queue && probe.merge_queue_entry_state.as_deref() != Some("UNMERGEABLE");
 
+        // Whether a merely-healthy PR may carry the finalize decision on
+        // its own for this run — false for a revision the SHA-delta gate
+        // just proved contributed nothing. The two arms below are ordered
+        // so a refusal on THIS ground is reported distinctly from the
+        // ordinary "PR isn't healthy yet" fallthrough: they are different
+        // findings and an operator reading the log must be able to tell
+        // them apart.
+        let health_alone_satisfies = health_alone_satisfies_deliverable(&execution.kind, contribution);
+
         let inner = match probe.state {
             PrLifecycleState::Merged => {
                 tracing::info!(
@@ -267,8 +286,33 @@ impl WorkerCompletionHandler {
             }
             PrLifecycleState::Open(ref open)
                 if mergeability_satisfies_deliverable(open.mergeability, merge_conflict_revision)
-                    && (matches!(open.ci, OpenPrCiStatus::Clean) || merge_conflict_revision || queued_for_merge) =>
+                    && (merge_conflict_revision
+                        || queued_for_merge
+                        || (matches!(open.ci, OpenPrCiStatus::Clean) && health_alone_satisfies)) =>
             {
+                // A health-alone finalize with no SHA baseline rests on a
+                // precondition nothing verified — say so at WARN rather
+                // than burying it in the ordinary finalize line. It stays
+                // permitted (refusing it re-opens the stuck-revision dead
+                // end, where a revision whose dispatch-time snapshot
+                // failed can never be finalized by any Stop), but an
+                // operator reading back a surprising completion must be
+                // able to see which evidence carried it.
+                if contribution == ContributionEvidence::Indeterminate
+                    && !merge_conflict_revision
+                    && !queued_for_merge
+                    && execution.kind == ExecutionKind::RevisionImplementation
+                {
+                    tracing::warn!(
+                        execution_id,
+                        bound_pr_url,
+                        kind = %execution.kind,
+                        "satisfied-deliverable gate: finalizing a revision on bound-PR health alone \
+                         with NO usable SHA-delta baseline — whether this run contributed was never \
+                         established (see the sha-delta gate's own log line for why it was \
+                         inconclusive)"
+                    );
+                }
                 tracing::info!(
                     execution_id,
                     bound_pr_url,
@@ -277,6 +321,7 @@ impl WorkerCompletionHandler {
                     ci_status = ?open.ci,
                     in_merge_queue = probe.in_merge_queue,
                     merge_queue_entry_state = ?probe.merge_queue_entry_state,
+                    ?contribution,
                     "satisfied-deliverable gate: PR open with no conflict (CI clean, CI irrelevant \
                      for a merge-conflict revision, or already queued for auto-merge) — finalizing \
                      without nudge"
@@ -288,6 +333,32 @@ impl WorkerCompletionHandler {
                     "stop_satisfied_clean",
                 )
                 .await
+            }
+            // Refused on EVIDENCE, not on the PR being unhealthy: the PR
+            // is open, mergeable and CI-clean, but that is precisely the
+            // state this revision was dispatched into and the SHA-delta
+            // gate proved its head did not move. Loud, because it is the
+            // difference between "delivered" and "never started", and
+            // because the run this closes was finalized as delivered 1.7 s
+            // after the engine logged that it had contributed nothing.
+            PrLifecycleState::Open(ref open)
+                if !health_alone_satisfies
+                    && mergeability_satisfies_deliverable(open.mergeability, merge_conflict_revision)
+                    && matches!(open.ci, OpenPrCiStatus::Clean) =>
+            {
+                tracing::warn!(
+                    execution_id,
+                    bound_pr_url,
+                    kind = %execution.kind,
+                    ci_status = ?open.ci,
+                    ?contribution,
+                    "satisfied-deliverable gate: bound PR is open, mergeable and CI-clean — but \
+                     that is the state this revision was DISPATCHED INTO, and the sha-delta gate \
+                     proved its head did not move this run. Refusing to finalize a run that \
+                     contributed nothing; falling through to the nudge/park path, which suppresses \
+                     for a worker still doing background work and otherwise bounds itself"
+                );
+                return None;
             }
             _ => {
                 tracing::debug!(

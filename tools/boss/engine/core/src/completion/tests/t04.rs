@@ -2253,63 +2253,6 @@ async fn revision_self_reported_pr_url_does_not_substitute_for_push_evidence() {
 }
 
 #[tokio::test]
-async fn on_stop_finalizes_satisfied_revision_when_pr_clean_and_sha_unchanged() {
-    // Regression: revision worker stopped without pushing
-    // (NoContribution — SHA unchanged), but the bound PR is open with
-    // CI green and no conflict. The deliverable-satisfied gate must
-    // finalize without nudging.
-    use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
-
-    let workspace = tempdir().unwrap();
-    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1490";
-    let head = "abcdef1111111111111111111111111111111111";
-    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
-    // SHA unchanged → SHA-delta gate returns NoContribution.
-    let verifier = StubBranchVerifier::ok("boss/exec_parent");
-    verifier.set_head_oid(Ok(head.into())).await;
-    // PR is open, CI clean, no conflict.
-    let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus::clean())));
-
-    let detector = StubPrDetector::ok(None);
-    let TestHarness {
-        handler,
-        cube,
-        pane,
-        probes,
-        ..
-    } = TestHarness::new(db.clone(), detector);
-    let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
-
-    let outcome = handler.on_stop(&execution_id).await;
-    assert!(
-        matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
-        "satisfied-deliverable gate must finalize a no-push revision whose PR is clean; \
-         got {outcome:?}",
-    );
-    // Revision advances to InReview — deliverable satisfied.
-    match db.get_work_item(&revision_id).unwrap() {
-        WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(
-            t.status,
-            TaskStatus::InReview,
-            "revision must advance to in_review when deliverable satisfied",
-        ),
-        other => panic!("expected task, got {other:?}"),
-    }
-    // Execution finalized, worker reaped.
-    let exec = db.get_execution(&execution_id).unwrap();
-    assert_eq!(exec.status, ExecutionStatus::Completed);
-    assert!(exec.cube_lease_id.is_none(), "lease must be released");
-    assert_eq!(cube.release_calls.lock().await.as_slice(), ["lease-1"]);
-    assert_eq!(pane.calls.lock().await.as_slice(), [execution_id.as_str()]);
-    // No nudge probe queued.
-    assert!(
-        probes.snapshot().is_empty(),
-        "satisfied deliverable must NOT nudge; got {:?}",
-        probes.snapshot(),
-    );
-}
-
-#[tokio::test]
 async fn on_stop_does_not_finalize_satisfied_revision_when_ci_inflight() {
     // When CI is still in-flight (checks running), the deliverable is NOT
     // yet satisfied. The gate must fall through to the nudge path.
@@ -2360,6 +2303,15 @@ async fn on_stop_finalizes_satisfied_chore_when_pr_clean_and_sha_unchanged() {
     // pushing new commits (PR was already open from a prior run,
     // NoContribution), but the PR is open with CI green and no conflict.
     // The deliverable-satisfied gate must finalize without nudging.
+    //
+    // Also the scope guard on
+    // `on_stop_refuses_to_finalize_revision_that_contributed_nothing`:
+    // the health-alone arm is refused for a REVISION specifically, not
+    // disabled wholesale. A primary implementation's deliverable IS a
+    // healthy PR for its work item, and a PR can only be bound to that
+    // item because some run of it pushed one — so reading the PR's health
+    // as "delivered" states something true here, unlike for a revision
+    // dispatched into a PR that was already healthy.
     use crate::merge_poller::{OpenPrStatus, PrLifecycleState};
 
     let workspace = tempdir().unwrap();

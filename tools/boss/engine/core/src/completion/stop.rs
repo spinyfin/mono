@@ -847,6 +847,16 @@ impl WorkerCompletionHandler {
                 // spin loop where workers park in waiting_for_input and
                 // hold their pool slot indefinitely.
                 //
+                // `ProvenAbsent` carries THIS arm's finding — the bound
+                // PR's head is byte-identical to the snapshot taken when
+                // this run started — into that gate, where it is
+                // load-bearing on the finalize decision. Without it, the
+                // gate's "open + mergeable + CI clean" predicate is
+                // trivially true at t=0 for every revision (that is the
+                // state a reviewer pass dispatches one into) and any Stop
+                // boundary terminalizes the run as delivered. See
+                // `health_alone_satisfies_deliverable`.
+                //
                 // IMPORTANT: this gate is intentionally placed only in
                 // on_stop, not in recheck_for_pr. The merge-poller sweep
                 // runs for waiting_human executions even when the worker
@@ -857,10 +867,56 @@ impl WorkerCompletionHandler {
                 // because the Stop hook fires only when the worker
                 // completed a turn (real activity boundary, not a crash).
                 if let Some(outcome) = self
-                    .try_finalize_satisfied_deliverable_on_stop(execution_id, &execution, &pr_url)
+                    .try_finalize_satisfied_deliverable_on_stop(
+                        execution_id,
+                        &execution,
+                        &pr_url,
+                        ContributionEvidence::ProvenAbsent,
+                    )
                     .await
                 {
                     return outcome;
+                }
+                // Sanctioned no-op terminal for a revision (the honest exit
+                // the gate above deliberately no longer manufactures). A
+                // revision that pushed nothing and emitted NO_CHANGES_NEEDED
+                // is making an explicit, checkable claim — "the finding I
+                // was dispatched for needs no code change" — rather than
+                // having that conclusion inferred for it from a PR whose
+                // health predates the run. Placed AFTER the conflict
+                // refusal above so the claim can never launder a conflict
+                // GitHub still reports, and after the satisfied gate so the
+                // stronger evidence (merged / queued / conflict cleared)
+                // wins where it applies.
+                if execution.kind == ExecutionKind::RevisionImplementation
+                    && self.worker_signalled_no_op(execution_id).await
+                {
+                    // Same refusal the primary-implementation no-op gate
+                    // applies, for the same reason: an unobserved command
+                    // is exactly what undermines a "I checked, nothing is
+                    // needed" claim — Boss never saw whether the check ran.
+                    // `consume_unresolved` (not `list`) so one abandoned
+                    // command from turns ago cannot refuse every later
+                    // claim for the rest of a long multi-turn run.
+                    if self.staged_unobserved_commands.consume_unresolved(execution_id) {
+                        tracing::warn!(
+                            execution_id,
+                            bound_pr_url = %pr_url,
+                            "stop event: revision emitted NO_CHANGES_NEEDED but this run left a \
+                             command_execution unobserved since the gate last checked — refusing \
+                             the no-op claim; falling through to the nudge instead",
+                        );
+                    } else {
+                        tracing::info!(
+                            execution_id,
+                            bound_pr_url = %pr_url,
+                            "stop event: revision pushed nothing and declared NO_CHANGES_NEEDED — \
+                             closing it as a declared no-op (no PR, no nudge) and filing an \
+                             attention item so the unaddressed finding is visible",
+                        );
+                        self.file_revision_no_op_attention(&execution, &pr_url).await;
+                        return self.finalize_no_op_completion(&execution).await;
+                    }
                 }
                 tracing::info!(
                     execution_id,
@@ -949,8 +1005,22 @@ impl WorkerCompletionHandler {
                             )
                             .await;
                     }
+                    // `Indeterminate`, not `ProvenAbsent`: this arm is
+                    // reached precisely because the SHA comparison could
+                    // not be made (no baseline, or the head fetch failed).
+                    // "We could not measure" is a different claim from "we
+                    // measured, and it did not move" — the gate still
+                    // accepts PR health here, and logs loudly that it did,
+                    // because refusing would strand any revision whose
+                    // dispatch-time snapshot failed in a state no Stop can
+                    // ever finalize (the stuck-revision dead end).
                     if let Some(outcome) = self
-                        .try_finalize_satisfied_deliverable_on_stop(execution_id, &execution, &bound_pr_url)
+                        .try_finalize_satisfied_deliverable_on_stop(
+                            execution_id,
+                            &execution,
+                            &bound_pr_url,
+                            ContributionEvidence::Indeterminate,
+                        )
                         .await
                     {
                         return outcome;
