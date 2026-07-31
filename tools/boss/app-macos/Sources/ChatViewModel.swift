@@ -156,7 +156,16 @@ final class ChatViewModel: ObservableObject {
     /// When non-nil, the Editorial Controls sheet is presented for this product id.
     @Published var editorialControlsProductID: String?
     @Published var selectedWorkProductID: String? {
-        didSet { notePublishedWorkInputChanged() }
+        didSet {
+            notePublishedWorkInputChanged()
+            // Every path that changes the chooser funnels through this
+            // property — explicit selection, card reveal, the archived-product
+            // fallback — so reporting here is what keeps the engine's copy
+            // from drifting, rather than having each call site remember.
+            if oldValue != selectedWorkProductID {
+                reportSelectedProductToEngine()
+            }
+        }
     }
     @Published var selectedProjectFilterIDs: Set<String> = [] {
         didSet { notePublishedWorkInputChanged() }
@@ -1265,6 +1274,20 @@ final class ChatViewModel: ObservableObject {
         } else {
             defaults.removeObject(forKey: selectedWorkProductDefaultsKey)
         }
+    }
+
+    /// Tell the engine which product the chooser is on, so a coordinator
+    /// asking `bossctl selected-product` gets the product actually on
+    /// screen instead of guessing one.
+    ///
+    /// Gated on `isAppSessionRegistered`, not merely `isConnected`: the
+    /// engine only trusts this report from the registered app session,
+    /// so a report sent before registration lands would be dropped. The
+    /// `.appSessionRegistered` handler calls this once registration
+    /// completes, which covers both cold start and reconnect.
+    func reportSelectedProductToEngine() {
+        guard isAppSessionRegistered else { return }
+        engine.sendReportSelectedProduct(productId: selectedWorkProductID)
     }
 
     func persistProjectFilterIDs() {

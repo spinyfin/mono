@@ -351,6 +351,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
+        | FrontendRequest::GetSelectedProduct
         | FrontendRequest::GetSettings
         | FrontendRequest::GetTaskRuntime { .. }
         | FrontendRequest::InterruptWorkerPane { .. }
@@ -404,6 +405,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RegisterAppSession
         | FrontendRequest::RegisterBossSession { .. }
         | FrontendRequest::RegisterCapabilities { .. }
+        | FrontendRequest::ReportSelectedProduct { .. }
         | FrontendRequest::ReportWorkerSpawnFailed { .. }
         | FrontendRequest::Shutdown { .. }
         | FrontendRequest::SpawnCapabilityRestored

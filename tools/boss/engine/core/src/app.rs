@@ -93,6 +93,7 @@ mod projects;
 pub(crate) mod proposals;
 mod readoption;
 mod review;
+mod selected_product;
 mod server;
 mod sessions;
 mod subscriptions;
@@ -743,6 +744,15 @@ struct ServerState {
     /// Currently-registered app session, if any. Engine→app requests
     /// are routed only to this session.
     app_session: Arc<Mutex<Option<AppSessionHandle>>>,
+    /// Last product-chooser selection the registered app reported, with
+    /// the session that reported it. In-memory only and cleared whenever
+    /// the app session changes: a selection is a fact about a *running*
+    /// UI, so outliving that UI would turn `GetSelectedProduct` into the
+    /// confidently-wrong answer it exists to prevent. A restarted engine
+    /// relearns it from the app's reconnect report instead of persisting
+    /// it. See [`selected_product`].
+    #[builder(default)]
+    selected_product: StdMutex<Option<selected_product::SelectedProductReport>>,
     /// Liveness signal for the engine→app push channel. Tracks the
     /// consecutive-send-failure streak so a wedged/saturated outbound
     /// queue surfaces as a single engine-health issue instead of only
@@ -2166,6 +2176,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetProductDesignDoc { .. } => design_docs::handle_get_product_design_doc(ctx, r).await,
             r @ FrontendRequest::GetPrStatus { .. } => pr_status::handle_get_pr_status(ctx, r).await,
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
+            r @ FrontendRequest::GetSelectedProduct => selected_product::handle_get_selected_product(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
             r @ FrontendRequest::GetTopCostConsumers { .. } => cost::handle_get_top_cost_consumers(ctx, r).await,
@@ -2346,6 +2357,9 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::UpdateAutomation { .. } => automations::handle_update_automation(ctx, r).await,
             r @ FrontendRequest::MoveWorkItemOnBoard { .. } => work_items::handle_move_work_item_on_board(ctx, r).await,
             r @ FrontendRequest::UpdateWorkItem { .. } => work_items::handle_update_work_item(ctx, r).await,
+            r @ FrontendRequest::ReportSelectedProduct { .. } => {
+                selected_product::handle_report_selected_product(ctx, r).await
+            }
             r @ FrontendRequest::ReportWorkerSpawnFailed { .. } => {
                 sessions::handle_report_worker_spawn_failed(ctx, r).await
             }

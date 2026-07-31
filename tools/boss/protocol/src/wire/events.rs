@@ -1008,6 +1008,25 @@ pub enum FrontendEvent {
         key: String,
         enabled: bool,
     },
+    /// Response to [`FrontendRequest::GetSelectedProduct`]: what the
+    /// engine knows about the Boss UI's product chooser, including the
+    /// specific reason when it knows nothing. Flattened, so the JSON is
+    /// `{"type":"selected_product_result","status":"selected",…}` —
+    /// `status` is the field a caller branches on, never an inferred
+    /// default.
+    SelectedProductResult {
+        #[serde(flatten)]
+        state: SelectedProductState,
+    },
+    /// Acknowledgement of [`FrontendRequest::ReportSelectedProduct`].
+    /// `accepted` is `false` when the reporting session is not the
+    /// registered app session, in which case the engine kept whatever
+    /// selection it already had. The app ignores this event; it exists
+    /// so the report is not silently swallowed and so tests can assert
+    /// the rejection.
+    SelectedProductReported {
+        accepted: bool,
+    },
     /// Response to [`FrontendRequest::ListHosts`]: every registered
     /// host (including `local`) with its capabilities.
     HostsList {

@@ -233,6 +233,11 @@ impl ServerState {
         // A fresh registration means whatever channel-health streak the old
         // session accumulated no longer applies.
         self.app_channel_health.record_success();
+        // Nor does the prior session's product-chooser selection: the newly
+        // registered app reports its own on connect. Clearing here means the
+        // window between registration and that report reads as "no
+        // selection" rather than as the previous app's stale answer.
+        self.clear_selected_product();
         match &prior {
             Some(prior) => tracing::info!(
                 session_id = %session_id,
@@ -261,6 +266,10 @@ impl ServerState {
         let take = matches!(guard.as_ref(), Some(handle) if handle.session_id == session_id);
         if take && let Some(prior) = guard.take() {
             drop(guard);
+            // The UI that held this selection is gone; a selection that
+            // outlived its app would answer `get_selected_product` with a
+            // product nobody is looking at.
+            self.clear_selected_product();
             tracing::warn!(
                 session_id = %session_id,
                 dropped_pending = prior.pending.len(),

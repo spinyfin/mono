@@ -30,6 +30,30 @@ extension EngineClient {
         ])
     }
 
+    /// Report which product the work board's chooser is now set to, so
+    /// the engine — not app-local view state — is the system of record
+    /// for the current selection. `productId` is nil when nothing is
+    /// selected.
+    ///
+    /// This exists so `bossctl selected-product` has something to read.
+    /// Short IDs (`T<n>`) are scoped per product, and until this report
+    /// existed the engine had no idea which product was on screen, so a
+    /// coordinator resolving a short ID had to guess — and a wrong guess
+    /// resolves *successfully*, to the wrong work item.
+    ///
+    /// Fire-and-forget: the engine's `selected_product_reported` ack
+    /// carries nothing the app acts on, and the app ignores it. Sent on
+    /// every selection change and once per app-session registration, so
+    /// a restarted engine relearns the selection rather than persisting
+    /// it.
+    func sendReportSelectedProduct(productId: String?) {
+        var line: [String: Any] = ["type": "report_selected_product"]
+        if let productId {
+            line["product_id"] = productId
+        }
+        sendLine(line)
+    }
+
     /// Ask the engine for the per-installation settings snapshot.
     /// Used by the Settings window on appear so the rendered state
     /// reflects what the engine has persisted.
