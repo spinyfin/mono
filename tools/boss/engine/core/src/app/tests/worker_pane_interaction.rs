@@ -333,8 +333,11 @@ async fn chore_update_notify_requeues_when_worker_not_accepting_input() {
 /// declares `MidTurnPaneInput::Buffers` (the engine default, `claude`) *is*
 /// injectable. `send_input_to_worker` writes the exact text to the pane and
 /// returns `Ok(slot_id)` on `PaneInjectOutcome::Buffered` — no
-/// `UserPromptSubmit` is expected, because the agent cannot submit the text
-/// until its current turn ends.
+/// `UserPromptSubmit` is expected inside the window, because the text is
+/// sitting in the agent's composer rather than having become a prompt. When
+/// the agent acts on it (a fresh turn on Claude, folded into the running turn
+/// on Codex's TUI) is the driver's business; this path returns without
+/// waiting for either, which is what keeps it correct on both.
 #[tokio::test(start_paused = true)]
 async fn send_input_to_worker_writes_to_a_mid_turn_worker_on_a_buffering_driver() {
     let (server_state, _dir) = test_server_state();

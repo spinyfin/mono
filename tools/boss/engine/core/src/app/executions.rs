@@ -478,9 +478,10 @@ fn probe_delivery_expectation(server_state: &ServerState, run_id: &str) -> Resul
             Ok(ProbeDeliveryExpectation::NextToolBoundary)
         }
         // Everything else that is still live waits for a turn boundary: a
-        // driver whose foreground process does not read mid-turn stdin
-        // (`codex exec`) has no earlier opportunity, and neither does a
-        // spawning worker on one.
+        // driver whose foreground process is not known to read mid-turn stdin
+        // has no earlier opportunity, and neither does a spawning worker on
+        // one. This is the trait default (`Rejects`), so it covers every
+        // driver that has not measured its mid-turn behaviour.
         PaneInputPosture::Refused => Ok(ProbeDeliveryExpectation::NextTurnBoundary),
     }
 }

@@ -1293,11 +1293,57 @@ impl AgentDriver for CodexDriver {
             // refusal, no synthesised tooling.
             //
             // AwaitingInputSignal — omitted → default Degrade (never
-            // Synthesize). `codex exec` is one turn per process; `turn.completed`
-            // means exit is imminent, not "blocked on a human". There is no
-            // channel that positively means awaiting-input (agent-driver design
-            // §Decision: AwaitingInput derivation; codex-progress-channel-
-            // decision investigation).
+            // Synthesize). The *old* reason for this omission has been
+            // retired and must not be cited again: it argued that
+            // `task_complete` means process exit is imminent rather than
+            // "blocked on a human". That argument inverts under the bare
+            // TUI, which is a persistent session — a Codex worker parked at
+            // its composer genuinely *is* waiting for someone to type.
+            //
+            // The omission survives the inversion, for a different and
+            // measured reason. This capability is a claim about the
+            // `ProgressObservation` *stream*: that some record in it
+            // positively means "blocked on a human", which
+            // `LiveWorkerStateRegistry::apply_event` may then promote to
+            // `WorkerActivity::WaitingForInput` on a `Notification`. Codex's
+            // `Notification` vocabulary is fully enumerated by this driver's
+            // own normaliser (`codex/progress.rs`), and every member of it
+            // means something else:
+            //
+            //   * `UNOBSERVED_COMMAND_MARKER` — a tool call whose output
+            //     record never arrived (engine-synthesised, not Codex's);
+            //   * guard-trace notifications — this run's own PreToolUse
+            //     decisions, replayed from the guard log;
+            //   * a command-denial notice — a guard said no;
+            //   * `turn aborted: <reason>` — an Esc/interrupt;
+            //   * a fatal `task_complete.error` diagnostic — the provider
+            //     failed and the turn is over.
+            //
+            // Not one of those means "waiting for a human". Binding the
+            // capability to `Notification` would therefore promote a denied
+            // command or an aborted turn into a fabricated WaitingForInput —
+            // precisely what Grok's precedent refuses to do on the same
+            // grounds (`grok.rs`, `AwaitingInputSignal` omission).
+            //
+            // The TUI liveness literals captured for the pivot (the `›`
+            // composer prefix, the absence of `esc to interrupt`) do not
+            // earn it either: those are *pane-render* strings for
+            // `pane_monitor_spec`, read by scraping the terminal surface.
+            // They are not records in the progress stream this capability
+            // describes, so declaring it on their strength would be a
+            // structural argument with no measured stream signal behind it.
+            //
+            // Nothing is lost by the omission. A parked composer already
+            // reaches the engine as `WorkerActivity::Idle` via the turn
+            // boundary, and `WorkerActivity::accepts_typed_input` treats
+            // Idle and WaitingForInput alike, so pane delivery to a parked
+            // Codex worker is unaffected. What stays unavailable is the
+            // narrower claim "this worker is blocked *specifically* on a
+            // human", which Codex does not report.
+            //
+            // This becomes earnable the moment Codex's stream carries a
+            // record that means it — an interactive approval request, say —
+            // at which point that record is the measured mapping.
         ])
     }
 
@@ -1558,11 +1604,34 @@ impl AgentDriver for CodexDriver {
     }
 
     fn turn_boundary(&self, event: &WorkerEvent) -> Option<TurnEnd> {
-        // The progress normaliser maps every terminal stdout envelope
-        // (`turn.completed`, `turn.failed`, and unrecoverable top-level
-        // `error`) to `WorkerEvent::Stop`, so the boundary is the same shape
-        // as Claude's: Stop means the turn ended. `codex exec` does not
-        // re-enter via stop-hooks, so continuation is always false.
+        // The progress normaliser maps every terminal rollout envelope
+        // (`task_complete`, `turn_aborted`, and a fatal `task_complete.error`)
+        // to `WorkerEvent::Stop`, so the boundary is the same shape as
+        // Claude's: Stop means the turn ended.
+        //
+        // `continuation: false` — re-reasoned for the persistent TUI, because
+        // the premise it used to rest on ("`codex exec` does not re-enter
+        // after a boundary") is gone: the session now continues, and the
+        // process outlives every boundary it reports.
+        //
+        // The conclusion survives, on the field's actual definition rather
+        // than on process lifetime. [`TurnEnd::continuation`] means "the
+        // agent was already stopping and something pulled it back into
+        // another turn" — Claude's `stop_hook_active`, and nothing else. It
+        // is a property of *this* boundary, not of what happens afterwards.
+        // Codex has no stop-hook mechanism at all: its hook surface is
+        // PreToolUse-only, there is no record in the rollout that can mark a
+        // `task_complete` as re-entrant, and a fresh prompt after a boundary
+        // starts a new `task_started`/`task_complete` pair — a fresh idle
+        // followed by a fresh turn, which is exactly `false`.
+        //
+        // A mid-turn prompt buffered by [`Self::mid_turn_pane_input`] does
+        // not weaken this either. Such a prompt folds into the *running*
+        // turn and produces no boundary of its own (measured; see that
+        // method), so there is no extra `Stop` here that could need
+        // distinguishing as a continuation — the risk runs the other way,
+        // toward one boundary for two prompts, which the engine's
+        // boundary-waiting paths handle rather than this declaration.
         match event {
             WorkerEvent::Stop {
                 session_id,
@@ -1676,10 +1745,11 @@ impl AgentDriver for CodexDriver {
         WorkerErrorClass::Indeterminate
     }
 
-    /// Existing engine path: probes still go through `SendToPane` at a turn
-    /// boundary (or are refused mid-turn via [`Self::mid_turn_pane_input`]).
-    /// Resume-as-new-process probing is a follow-on; this declares today's
-    /// behaviour so the seam is real without changing delivery.
+    /// Existing engine path: probes go through `SendToPane`, either at a turn
+    /// boundary or into a live composer mid-turn — the TUI buffers the latter
+    /// (see [`Self::mid_turn_pane_input`]), so there is no longer a refusal
+    /// case for this driver. This declares today's transport so the seam is
+    /// real without changing delivery.
     fn probe(&self) -> ProbeDelivery {
         ProbeDelivery::PaneText
     }
@@ -1701,15 +1771,46 @@ impl AgentDriver for CodexDriver {
         ReapDelivery::ProcessGroup
     }
 
-    /// `codex exec` is the driver the mid-turn injection guard exists for.
-    /// It runs one turn per process with stdin on `/dev/null`, so bytes
-    /// written into the pane mid-turn are never read by the agent, survive in
-    /// the tty input buffer, and are executed by the interactive shell once
-    /// the process exits (ghostty-codex-pane-viability, Q2 Layer D). Declared
-    /// explicitly rather than left to the trait default so that this — the
-    /// motivating case — is stated where the driver lives.
+    /// The bare TUI buffers mid-turn pane input, **measured**, and the
+    /// measurement carries a caveat that changes how the engine must treat
+    /// the buffered prompt.
+    ///
+    /// **Evidence.** Text was injected into a live Codex TUI turn through the
+    /// exact pane `submitText` path the engine uses, under a
+    /// GhosttyKit-embedded surface
+    /// (`docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`, V4).
+    /// Codex rendered its own first-class affordance —
+    /// `Messages to be submitted after next tool call (press esc to interrupt
+    /// and send immediately)` — queued the message, delivered it at the next
+    /// tool-call boundary and answered it. Nothing landed in a tty line
+    /// discipline and nothing was executed by a shell, which is the tty-leak
+    /// hazard the `Rejects` default exists to prevent. The predecessor
+    /// declaration was `Rejects` because `codex exec` ran one turn per
+    /// process with stdin on `/dev/null` (ghostty-codex-pane-viability, Q2
+    /// Layer D); that shape is retired, and this is the measurement it was
+    /// standing in for.
+    ///
+    /// **Caveat — the buffered prompt folds into the running turn.** It is
+    /// not deferred into a new one. The rollout for the measured session
+    /// carried two `user_message` records but only one `task_started` and one
+    /// `task_complete`, so the normaliser emits one `UserPromptSubmit` and
+    /// one `Stop` for two prompts, and `event_msg/user_message` is an
+    /// unmapped record in the progress dialect. A prompt delivered mid-turn
+    /// is acted on but **produces no turn boundary of its own**: any engine
+    /// path that waits for a boundary per delivered prompt would wait
+    /// forever, and any path that counts turns undercounts. The measured run
+    /// also showed the model answering the *newer* instruction and never
+    /// emitting the original turn's answer.
+    ///
+    /// The transcript dialect is the exception worth knowing: the *transcript*
+    /// normaliser does map `event_msg/user_message`, so a folded prompt is
+    /// visible to a post-hoc transcript read even though it is invisible to
+    /// the progress stream. That is what
+    /// `ServerState::inject_pane_text_verified`'s transcript fallback and the
+    /// probe-reply read have to lean on, since no `UserPromptSubmit` will
+    /// ever arrive for the folded prompt.
     fn mid_turn_pane_input(&self) -> MidTurnPaneInput {
-        MidTurnPaneInput::Rejects
+        MidTurnPaneInput::Buffers
     }
 
     /// The bare TUI is a long-lived, multi-turn session — the retired
@@ -1917,6 +2018,44 @@ mod tests {
             caps.absence_disposition(Capability::CommandOutcomeObservation),
             AbsenceDisposition::Degrade,
             "Boss must not synthesize a per-command outcome Codex never observed"
+        );
+    }
+
+    /// The `AwaitingInputSignal` omission must survive the persistent-session
+    /// inversion. Its original justification — "a completed turn means the
+    /// process is about to exit, not that anyone is blocked on a human" — is
+    /// dead: the driver now declares [`WorkerProcessLifetime::Persistent`],
+    /// and a TUI parked at its composer genuinely is awaiting input. The
+    /// capability stays undeclared anyway because it is a claim about the
+    /// *progress stream*, and every `Notification` Codex's normaliser can
+    /// emit means something else (unobserved command, guard trace, command
+    /// denial, turn abort, fatal error). Declaring it would let
+    /// `apply_event` promote one of those into a fabricated
+    /// `WaitingForInput` — Grok's precedent, same reasoning.
+    ///
+    /// Asserting both facts in one test is the point: it is the pairing that
+    /// is deliberate, and a future reader who flips the lifetime back, or
+    /// declares the capability on the strength of persistence alone, breaks
+    /// here.
+    #[test]
+    fn codex_persistence_does_not_earn_the_awaiting_input_capability() {
+        let driver = CodexDriver::default();
+        assert_eq!(
+            driver.worker_process_lifetime(),
+            WorkerProcessLifetime::Persistent,
+            "the premise that inverted the old omission reasoning",
+        );
+        assert!(
+            !driver.capabilities().provides(Capability::AwaitingInputSignal),
+            "a persistent session is a structural argument, not a measured stream signal; \
+             the capability must not be declared on it",
+        );
+        assert_eq!(
+            driver
+                .capabilities()
+                .absence_disposition(Capability::AwaitingInputSignal),
+            AbsenceDisposition::Degrade,
+            "absence must degrade, never synthesize a waiting state Codex never reported",
         );
     }
 
@@ -2385,6 +2524,14 @@ mod tests {
         );
     }
 
+    /// `continuation` is a property of the boundary itself — "something
+    /// pulled the agent back after it had already stopped" — not of whether
+    /// the process survives it. Codex has no stop-hook surface, so no rollout
+    /// record can ever mark a `task_complete` as re-entrant, and this stays
+    /// `false` even when the incoming event carries `stop_hook_active: true`
+    /// (which only a Claude-shaped payload would). Pinned deliberately: the
+    /// driver is now a persistent session, and "the process continues" must
+    /// not be mistaken for "the boundary was a continuation".
     #[test]
     fn codex_turn_boundary_on_stop_is_non_continuation() {
         let event = WorkerEvent::Stop {
@@ -2773,16 +2920,17 @@ mod tests {
         assert!(homes.is_dir(), "homes root must remain");
     }
 
-    /// `codex exec` is the motivating case for the mid-turn injection guard:
-    /// one turn per process with stdin on `/dev/null`, so bytes written
-    /// mid-turn are never read and are later executed by the interactive
-    /// shell. Declared explicitly rather than inherited from the trait
-    /// default, so this stays asserted even if the default ever changes.
+    /// The bare TUI buffers mid-turn pane input — measured by injecting
+    /// through the engine's own `submitText` path into a live turn, which
+    /// produced Codex's `Messages to be submitted after next tool call`
+    /// affordance and no tty leak (codex-tui-pivot-pricing V4). Declared
+    /// explicitly rather than inherited from the trait default, so this stays
+    /// asserted even if the default ever changes.
     #[test]
-    fn codex_rejects_mid_turn_pane_input() {
+    fn codex_buffers_mid_turn_pane_input() {
         let driver = CodexDriver::default();
-        assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Rejects);
-        assert!(!driver.mid_turn_pane_input().buffers());
+        assert_eq!(driver.mid_turn_pane_input(), MidTurnPaneInput::Buffers);
+        assert!(driver.mid_turn_pane_input().buffers());
     }
 
     #[test]

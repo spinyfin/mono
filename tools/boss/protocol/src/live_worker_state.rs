@@ -81,12 +81,20 @@ impl WorkerActivity {
     ///
     /// This is **not** the whole injection decision, and callers must not use
     /// it as one. Pre-session [`Self::Spawning`] and the terminal states are
-    /// never injectable. Mid-turn [`Self::Working`] depends on the driver:
-    /// an interactive-TUI driver (Claude Code) reads stdin continuously and
-    /// holds mid-turn input as the next prompt, whereas `codex exec` runs one
-    /// turn per process with stdin on `/dev/null`, so bytes written mid-turn
-    /// linger in the tty buffer and are executed by the interactive shell
-    /// after the process exits (ghostty-codex-pane-viability, Q2 Layer D).
+    /// never injectable. Mid-turn [`Self::Working`] depends on the driver: an
+    /// interactive-TUI driver (Claude Code, Codex's bare TUI) reads stdin
+    /// continuously and holds mid-turn input in its composer, whereas a
+    /// foreground process that never reads stdin leaves bytes written
+    /// mid-turn lingering in the tty buffer, to be executed by the
+    /// interactive shell once it exits (ghostty-codex-pane-viability, Q2
+    /// Layer D, measured against the retired `codex exec` shape). The trait
+    /// default is the latter, so a driver holds mid-turn input only once it
+    /// has measured that it does.
+    ///
+    /// A driver that holds it may still differ in *when* it acts on it —
+    /// Codex folds the buffered prompt into the running turn, Claude starts a
+    /// fresh one — which does not change injectability but does mean nothing
+    /// may assume one turn boundary per delivered prompt.
     ///
     /// Treating that difference as a property of activity alone is what made
     /// mid-turn probe delivery structurally impossible: the tool-boundary

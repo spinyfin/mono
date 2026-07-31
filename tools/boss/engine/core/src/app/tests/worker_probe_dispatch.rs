@@ -63,13 +63,25 @@ fn reserving_a_probe_claims_the_runs_only_delivery_slot() {
     assert_ne!(reclaimed.probe_id, second);
 }
 
+/// The Claude reader, driven through its own driver. Behaviour here is
+/// unchanged by the driver-aware rewrite: `ClaudeDriver`'s transcript
+/// normalization is the identity, so these entries reach the extractor
+/// byte-for-byte as they always did.
+fn claude_driver() -> std::sync::Arc<dyn crate::driver::AgentDriver> {
+    crate::driver::DriverRegistry::default().require("claude").unwrap()
+}
+
+fn codex_driver() -> std::sync::Arc<dyn crate::driver::AgentDriver> {
+    crate::driver::DriverRegistry::default().require("codex").unwrap()
+}
+
 #[test]
 fn extract_last_assistant_text_handles_modern_content_blocks() {
     let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"prompt"}]}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"alpha "},{"type":"text","text":"beta"}]}}
 {"type":"system","subtype":"ping"}
 "#;
-    let result = extract_last_assistant_text(chunk);
+    let result = extract_last_assistant_text(Some(claude_driver().as_ref()), chunk);
     assert_eq!(result.as_deref(), Some("alpha beta"));
 }
 
@@ -78,8 +90,13 @@ fn extract_last_assistant_text_picks_most_recent_when_multiple() {
     let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"old"}]}}
 {"type":"assistant","message":{"content":[{"type":"text","text":"new"}]}}
 "#;
-    let result = extract_last_assistant_text(chunk);
-    assert_eq!(result.as_deref(), Some("new"));
+    let result = extract_last_assistant_text(Some(claude_driver().as_ref()), chunk);
+    assert_eq!(
+        result.as_deref(),
+        Some("new"),
+        "two adjacent single-block messages must not be glued together the way two blocks \
+         inside one message are",
+    );
 }
 
 #[test]
@@ -87,13 +104,84 @@ fn extract_last_assistant_text_returns_none_when_no_assistant_turn() {
     let chunk = r#"{"type":"user","message":{"content":[{"type":"text","text":"hi"}]}}
 {"type":"system","subtype":"compact"}
 "#;
-    assert_eq!(extract_last_assistant_text(chunk), None);
+    assert_eq!(extract_last_assistant_text(Some(claude_driver().as_ref()), chunk), None);
 }
 
 #[test]
 fn extract_last_assistant_text_skips_unparseable_lines() {
     let chunk = "this is not json\n{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"survived\"}]}}\n";
-    assert_eq!(extract_last_assistant_text(chunk).as_deref(), Some("survived"),);
+    assert_eq!(
+        extract_last_assistant_text(Some(claude_driver().as_ref()), chunk).as_deref(),
+        Some("survived"),
+    );
+}
+
+/// An unresolvable driver falls back to reading the entries as written —
+/// exactly the pre-normalization behaviour — rather than losing the read.
+#[test]
+fn extract_last_assistant_text_without_a_driver_reads_entries_as_written() {
+    let chunk = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"raw"}]}}
+"#;
+    assert_eq!(extract_last_assistant_text(None, chunk).as_deref(), Some("raw"));
+}
+
+/// The regression this rewrite exists for. A Codex worker's transcript is a
+/// rollout: `session_meta` / `event_msg` / `response_item`, with the reply
+/// prose on an `event_msg`/`agent_message` record and again on the
+/// `response_item` message. No record in it has `type == "assistant"`, so the
+/// old Claude-shaped scan returned `None` for every Codex probe — the reply
+/// was delivered, answered and read at the right boundary, and `ProbeReplied`
+/// still never fired.
+#[test]
+fn extract_last_assistant_text_reads_a_codex_rollout_reply() {
+    let chunk = concat!(
+        r#"{"type":"session_meta","payload":{"id":"thread-1"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"still building, waiting"}}"#,
+        "\n",
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"still building, waiting"}]}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    assert_eq!(
+        extract_last_assistant_text(Some(codex_driver().as_ref()), chunk).as_deref(),
+        Some("still building, waiting"),
+    );
+    assert_eq!(
+        extract_last_assistant_text(None, chunk),
+        None,
+        "without the driver's normalization the same rollout is unreadable — which is what \
+         the shipped reader used to do to every Codex probe",
+    );
+}
+
+/// A folded mid-turn prompt and its answer land in the *same* Codex turn, so
+/// the single boundary that turn produces is the one the reply must be read
+/// at. The buffered prompt is visible in the rollout as an
+/// `event_msg`/`user_message` record — the progress dialect drops it, the
+/// transcript dialect does not — and the extractor must return the prose that
+/// follows it, not the pre-injection prose.
+#[test]
+fn extract_last_assistant_text_returns_the_folded_prompts_answer() {
+    let chunk = concat!(
+        r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working on the original ask"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"user_message","message":"[coordinator-nudge] what is your status?"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"status: pushed, waiting on CI"}}"#,
+        "\n",
+        r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+        "\n",
+    );
+    assert_eq!(
+        extract_last_assistant_text(Some(codex_driver().as_ref()), chunk).as_deref(),
+        Some("status: pushed, waiting on CI"),
+    );
 }
 
 #[tokio::test]
