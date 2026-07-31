@@ -48,13 +48,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use md5::{Digest, Md5};
+
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 use crate::metadata::WorkspaceRecord;
 use crate::store::{Store, WorkspaceListFilter};
 
 use crate::app::errors::{CubeError, Result};
 use crate::app::jj::budgeted_timeout;
-use crate::app::md5::md5_hex;
 
 /// Wall-clock bound for the `bazel info output_base` probe used to discover
 /// `output_user_root`. Generous relative to a warm bazel server (returns in
@@ -76,7 +77,7 @@ fn is_output_base_dir_name(name: &str) -> bool {
 
 /// The directory name bazel would use for a workspace at `workspace_path`.
 pub(super) fn hash_workspace_path(workspace_path: &Path) -> String {
-    md5_hex(workspace_path.to_string_lossy().as_bytes())
+    format!("{:x}", Md5::digest(workspace_path.to_string_lossy().as_bytes()))
 }
 
 /// The full output base path a workspace at `workspace_path` would have,

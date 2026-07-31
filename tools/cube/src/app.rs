@@ -17,7 +17,6 @@ mod gc;
 mod gh_pr;
 mod health;
 mod jj;
-mod md5;
 mod pr;
 mod provision;
 mod reclaim;
