@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use git_utils::pr_bookmark;
-use git_utils::repo_slug::parse_github_remote;
 
 use crate::command_runner::{CommandRunner, RealCommandRunner};
 use crate::metadata::{WorkspaceHealth, WorkspaceRecord, WorkspaceState};
@@ -15,9 +14,8 @@ use crate::{audit, config, paths};
 
 use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
-use crate::app::gh_pr;
 use crate::app::health::probe_workspace_reuse;
-use crate::app::jj::{self, network_cmd_timeout, run_jj, run_jj_network, workspace_path_exists};
+use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -78,24 +76,25 @@ pub(super) const POOL_GC_BACKLOG_RETRY_SECS: i64 = 5 * 60;
 /// pass that came up empty falls back to [`AUTO_GC_INTERVAL_SECS`].
 pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progress";
 
-/// List and optionally forget consumed `boss/exec_*` bookmarks and closed/merged
-/// `pr/<n>` bookmarks in a workspace.
+/// List and optionally forget consumed `boss/exec_*` bookmarks and
+/// unreferenced `pr/<n>` bookmarks in a workspace.
 ///
 /// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
 /// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
-/// for GC when its corresponding GitHub PR is in the MERGED or CLOSED state,
-/// resolved for every `pr/*` bookmark in the workspace via one batched `gh
-/// api graphql` round trip (see [`gh_pr::fetch_pr_states_batch`]); skipped
-/// silently when offline, and skipped (with a logged warning) if the batched
-/// lookup itself fails or times out.
+/// for GC when no workspace in the shared store is positioned on it any more
+/// (see [`collect_unreferenced_pr_bookmarks`]) — a purely local decision, with
+/// no network call and no dependence on GitHub's view of the PR.
 ///
 /// If `do_fetch` is true, runs `jj git fetch` first so `::main` reflects the
 /// latest merged PRs. If `dry_run` is true, lists what would be forgotten
 /// without acting.
 ///
 /// Returns the names of bookmarks forgotten (or that would be forgotten on
-/// dry-run). Failures are propagated to the caller; release-path callers
-/// should treat them as warnings.
+/// dry-run). **Every failure is propagated.** Neither half of the sweep may
+/// degrade to "found nothing": pruning is the only thing that bounds these
+/// bookmark sets, so a sweep that cannot decide has to say so loudly rather
+/// than report an empty result that reads identically to a clean pool. See
+/// the caller in `workspace::release` for how that surfaces.
 pub(super) fn gc_workspace_bookmarks(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -123,23 +122,19 @@ pub(super) fn gc_workspace_bookmarks(
                 "bookmarks(glob:\"boss/exec_*\") & ::main",
                 "--no-graph",
                 "-T",
-                "bookmarks ++ \"\\n\"",
+                BOOKMARK_NAMES_TEMPLATE,
             ],
         ),
     )?;
 
-    let mut bookmarks: Vec<String> = {
-        let mut seen = std::collections::HashSet::new();
-        output
-            .split_whitespace()
-            .filter(|s| s.starts_with("boss/exec_") && !s.contains('@'))
-            .filter(|s| seen.insert(s.to_string()))
-            .map(str::to_string)
-            .collect()
-    };
+    let mut bookmarks: Vec<String> = dedup_bookmark_names(&output, |s| s.starts_with("boss/exec_"));
 
-    // Also sweep pr/<n> bookmarks whose GitHub PR is closed or merged.
-    bookmarks.extend(gc_collect_closed_pr_bookmarks(runner, database_path, workspace_path));
+    // Also sweep pr/<n> bookmarks no workspace is positioned on any more.
+    bookmarks.extend(collect_unreferenced_pr_bookmarks(
+        runner,
+        database_path,
+        workspace_path,
+    )?);
 
     if bookmarks.is_empty() || dry_run {
         return Ok(bookmarks);
@@ -157,43 +152,93 @@ pub(super) fn gc_workspace_bookmarks(
     Ok(bookmarks)
 }
 
-/// Collect local `pr/<n>` bookmarks in `workspace_path` whose GitHub PR is
-/// MERGED or CLOSED. Returns an empty list when offline, the workspace has no
-/// GitHub remote, or there are no `pr/*` bookmarks. `jj` failures are
-/// swallowed; a failed or timed-out PR-state lookup is logged and skips the
-/// sweep. Either way this best-effort sweep never blocks the caller.
+/// Render bookmark names from a `jj log` template without jj's sync-status
+/// markers.
 ///
-/// A workspace is reused across many leases over its lifetime, and each
-/// `cube workspace goto`/`pr push` against it can leave behind a local
-/// `pr/<n>` bookmark — so by the time this sweep runs, "every `pr/*`
-/// bookmark in the workspace" can be an arbitrarily long, unrelated backlog
-/// rather than just the one bookmark from the release that just finished.
-/// The PR-state lookup for that whole backlog is a single batched GraphQL
-/// round trip ([`gh_pr::fetch_pr_states_batch`]), not one REST call per
-/// bookmark: that serial-per-bookmark shape (and its total absence of a
-/// timeout) is what let a single stuck `gh api` call block `cube workspace
-/// release` for 4-6+ minutes.
-pub(super) fn gc_collect_closed_pr_bookmarks(
+/// The bare `bookmarks` keyword decorates a name that is not synced with its
+/// remote counterpart — `pr/1648` renders as `pr/1648*`. The sweep used to
+/// read that keyword and split on whitespace, so a decorated name failed
+/// [`pr_bookmark::is_pr_bookmark`]'s all-digits check and was dropped from the
+/// candidate set entirely: six of the sixty `pr/*` bookmarks in the live
+/// `mono` store were permanently unforgettable for that reason alone. Mapping
+/// over `.name()` yields the undecorated name, which is both what the filters
+/// expect and what `jj bookmark forget` will accept.
+pub(super) const BOOKMARK_NAMES_TEMPLATE: &str = r#"bookmarks.map(|b| b.name()).join("\n") ++ "\n""#;
+
+/// Parse [`BOOKMARK_NAMES_TEMPLATE`] output into a de-duplicated list of the
+/// names matching `keep`, preserving first-seen order.
+fn dedup_bookmark_names(output: &str, keep: impl Fn(&str) -> bool) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.contains('@'))
+        .filter(|s| keep(s))
+        .filter(|s| seen.insert(s.to_string()))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Revset for `pr/<n>` bookmarks no workspace is positioned on any more: every
+/// `pr/*` bookmark, minus those reachable from some workspace's working copy.
+///
+/// `working_copies()` resolves the `@` of *every* workspace registered in the
+/// shared store, which is the right scope precisely because the store is
+/// shared — see [`collect_unreferenced_pr_bookmarks`].
+pub(super) const UNREFERENCED_PR_BOOKMARKS_REVSET: &str = r#"bookmarks(glob:"pr/*") ~ ::(working_copies())"#;
+
+/// Collect local `pr/<n>` bookmarks that no workspace in the shared store is
+/// positioned on any more, and which are therefore safe to forget.
+///
+/// ## Why the retained set is bounded by construction
+///
+/// Cube workspaces are *secondary jj workspaces sharing one object store per
+/// repo*, so `pr/*` bookmarks are repo-global, not per-workspace: the set one
+/// release walks is every PR any workspace of that repo has ever touched.
+/// Deciding eligibility from GitHub's view of the PR bounded that set at
+/// "every open PR the pool has ever touched", which is not a bound cube owns
+/// — measured on the live `mono` store, 57 of 60 accumulated bookmarks were
+/// for PRs still open, so a *fully successful* sweep would have forgotten
+/// three and left fifty-seven.
+///
+/// Reachability replaces that with a bound cube does own. A `pr/<n>` bookmark
+/// is retained only while some workspace's `@` sits at or below it, so the
+/// retained set is at most one PR stack per workspace. It cannot grow with
+/// elapsed time, with the number of PRs the pool has touched, with GitHub's
+/// PR lifecycle, or with whether the previous sweep succeeded — a workspace
+/// that has been in the pool for a year carries the stack it is on, not a
+/// year of stacks.
+///
+/// ## Why forgetting the rest cannot lose anything
+///
+/// These bookmarks are derivable on demand: every path that needs one also
+/// creates it (`cube workspace goto --pr`, `cube pr create`, `cube pr
+/// update`), so a worker returning to a PR re-establishes the bookmark as a
+/// side effect of the command it was going to run anyway. The one use that
+/// genuinely requires local state — `cube pr push` inferring its PR from
+/// `@`'s ancestry — only ever consults bookmarks that are reachable from `@`,
+/// which is exactly the set kept here. A workspace still holding unpushed
+/// work keeps its bookmarks for the same reason: its `@` is still on them,
+/// and the release path does not even reach this sweep when the reuse guard
+/// preserves a working copy.
+///
+/// ## Failure is not an empty result
+///
+/// The old collector returned `vec![]` on every error — unreachable remote,
+/// failed `jj log`, failed or timed-out PR-state lookup — and the release
+/// caller logged that as a warning and moved on. Pruning is the only thing
+/// that bounds this set, so "the sweep broke" and "there was nothing to
+/// prune" reported identically while the backlog grew and made the next
+/// sweep slower still. Every failure here is returned to the caller instead.
+///
+/// This runs no network commands at all, so unlike its predecessor it also
+/// works offline and cannot be wedged by a hung or rate-limited GitHub.
+pub(super) fn collect_unreferenced_pr_bookmarks(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
     workspace_path: &Path,
-) -> Vec<String> {
-    // Resolve the GitHub owner/repo slug from the workspace's jj remotes.
-    let remote_output = match runner.run(&RealCommandRunner::invocation(
-        workspace_path,
-        "jj",
-        &["git", "remote", "list"],
-    )) {
-        Ok(out) => out,
-        Err(_) => return vec![],
-    };
-    let (_remote_name, owner_repo) = match parse_github_remote(&remote_output) {
-        Some(r) => r,
-        None => return vec![],
-    };
-
-    // Find all local pr/* bookmarks in the workspace.
-    let bookmark_output = match run_jj(
+) -> Result<Vec<String>> {
+    let output = run_jj(
         runner,
         database_path,
         &RealCommandRunner::invocation(
@@ -202,74 +247,19 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
             &[
                 "log",
                 "-r",
-                "bookmarks(glob:\"pr/*\")",
+                UNREFERENCED_PR_BOOKMARKS_REVSET,
                 "--no-graph",
                 "-T",
-                "bookmarks ++ \"\\n\"",
+                BOOKMARK_NAMES_TEMPLATE,
             ],
         ),
-    ) {
-        Ok(out) => out,
-        Err(_) => return vec![],
-    };
+    )?;
 
-    let pr_bookmarks: Vec<String> = {
-        let mut seen = std::collections::HashSet::new();
-        bookmark_output
-            .split_whitespace()
-            .filter(|s| pr_bookmark::is_pr_bookmark(s) && !s.contains('@'))
-            .filter(|s| seen.insert(s.to_string()))
-            .map(str::to_string)
-            .collect()
-    };
-
-    if pr_bookmarks.is_empty() {
-        return vec![];
-    }
-
-    let pr_numbers: Vec<u64> = pr_bookmarks
-        .iter()
-        .filter_map(|b| b.strip_prefix("pr/").and_then(|n| n.parse::<u64>().ok()))
-        .collect();
-
-    // One batched round trip for every pr/<n> bookmark in this workspace,
-    // bounded by the same network timeout used elsewhere in cube — never an
-    // unbounded per-bookmark `gh api` call. A failure (including a timeout)
-    // skips the whole sweep for this workspace rather than hanging the
-    // caller or silently pretending nothing was closed.
-    let states = match gh_pr::fetch_pr_states_batch(
-        runner,
-        workspace_path,
-        &owner_repo,
-        &pr_numbers,
-        network_cmd_timeout(),
-    ) {
-        Ok(states) => states,
-        Err(e) => {
-            eprintln!(
-                "cube: gc: batched PR-state lookup for {} pr/* bookmark(s) in {} failed, skipping closed-PR sweep: {e}",
-                pr_numbers.len(),
-                workspace_path.display(),
-            );
-            return vec![];
-        }
-    };
-
-    pr_bookmarks
-        .into_iter()
-        .filter(|bookmark| {
-            let Some(pr_num) = bookmark.strip_prefix("pr/") else {
-                return false;
-            };
-            let Ok(pr_number) = pr_num.parse::<u64>() else {
-                return false;
-            };
-            matches!(
-                states.get(&pr_number).map(String::as_str),
-                Some("MERGED") | Some("CLOSED")
-            )
-        })
-        .collect()
+    // A commit carrying an unreferenced `pr/<n>` can also carry bookmarks in
+    // other namespaces (a `boss/exec_*` head, most commonly). Only the `pr/*`
+    // ones are this sweep's business; the `boss/exec_*` half has its own,
+    // stricter "reachable from main" test in `gc_workspace_bookmarks`.
+    Ok(dedup_bookmark_names(&output, pr_bookmark::is_pr_bookmark))
 }
 
 /// Cheap, read-only check for whether any aged-unhealthy candidate currently
@@ -571,8 +561,15 @@ pub(super) fn run_pool_gc_background(database_path: Option<std::path::PathBuf>, 
             budget_exhausted = true;
             break;
         }
+        // As on the release path, a failure here is reported as an error
+        // rather than absorbed: this sweep is the only thing that prunes
+        // either bookmark namespace, so a silent failure is unbounded growth
+        // with no signal.
         if let Err(e) = gc_workspace_bookmarks(&runner, database_path.as_deref(), &record.workspace_path, true, false) {
-            eprintln!("cube: auto gc: {}: {e}", record.workspace_id,);
+            eprintln!(
+                "cube: auto gc: error: bookmark gc for {} failed, nothing pruned: {e}",
+                record.workspace_id,
+            );
         }
     }
     if budget_exhausted {

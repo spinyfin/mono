@@ -1,7 +1,7 @@
 use super::support::{
-    ExpectedCommand, FakeRunner, audit_events, gc_noop_command, gc_pr_remote_noop_command, head_status_command,
-    head_status_output, lease_runner_for, release_guard_reusable_command, release_runner_for, seed_mono_repo,
-    unpushed_probe_command, with_database_path,
+    ExpectedCommand, FakeRunner, audit_events, gc_exec_sweep_command, gc_noop_command, gc_pr_noop_command,
+    gc_pr_sweep_command, head_status_command, head_status_output, lease_runner_for, release_guard_reusable_command,
+    release_runner_for, seed_mono_repo, unpushed_probe_command, with_database_path,
 };
 use clap::Parser;
 use tempfile::TempDir;
@@ -46,20 +46,8 @@ fn workspace_gc_verb_forgets_consumed_bookmarks_on_free_workspaces() {
     // gc: ws1 is leased → skipped; ws2 is free → fetch + forget.
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["git", "fetch"], ""),
-        ExpectedCommand::ok(
-            ws2_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"boss/exec_*\") & ::main",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "boss/exec_dead_01",
-        ),
-        gc_pr_remote_noop_command(&ws2_path),
+        gc_exec_sweep_command(&ws2_path, "boss/exec_dead_01"),
+        gc_pr_noop_command(&ws2_path),
         ExpectedCommand::ok(ws2_path.clone(), "jj", &["bookmark", "forget", "boss/exec_dead_01"], ""),
     ]);
     let gc_result = run_with_dependencies(
@@ -118,20 +106,8 @@ fn workspace_gc_dry_run_lists_without_forgetting() {
     // dry-run: fetch + log, but NO bookmark forget.
     let gc_runner = FakeRunner::new(vec![
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"boss/exec_*\") & ::main",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "boss/exec_dry_01",
-        ),
-        gc_pr_remote_noop_command(&workspace_path),
+        gc_exec_sweep_command(&workspace_path, "boss/exec_dry_01"),
+        gc_pr_noop_command(&workspace_path),
     ]);
     let gc_result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "gc", "--dry-run"]),
@@ -147,81 +123,67 @@ fn workspace_gc_dry_run_lists_without_forgetting() {
     assert_eq!(results[0]["bookmarks_forgotten"][0], "boss/exec_dry_01");
 }
 
+/// The command prefix every release issues before the bookmark sweep:
+/// fetch, reuse-guard probe, and the reset that moves `@` back onto `main`.
+/// Factored out so the sweep tests below show only the sweep.
+fn release_prefix_commands(workspace_path: &std::path::Path) -> Vec<ExpectedCommand> {
+    vec![
+        ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["git", "fetch"], ""),
+        release_guard_reusable_command(workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.to_path_buf(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
+    ]
+}
+
+/// Lease `mono-agent-001`, returning the lease id, so a test can get straight
+/// to the release whose sweep it actually cares about.
+fn lease_mono_agent_001(workspace_path: &std::path::Path, database_path: &std::path::Path, task: &str) -> String {
+    let lease_runner = lease_runner_for(workspace_path, "abc1234");
+    let lease_result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", task]),
+        Some(database_path),
+        &lease_runner,
+    )
+    .expect("lease");
+    lease_runner.assert_exhausted();
+    lease_result.payload["workspace"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
-fn gc_forgets_closed_pr_bookmark() {
-    // A pr/42 bookmark whose GitHub PR is CLOSED is forgotten by gc.
+fn gc_forgets_pr_bookmark_no_workspace_is_positioned_on() {
+    // The reset above has just moved `@` off whatever branch this lease was
+    // working on, so pr/42 is no longer in any workspace's ancestry and the
+    // revset returns it. That is the whole eligibility test — no GitHub call
+    // decides it.
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc test");
 
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc test"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Release runner: gc finds a closed pr/42 bookmark and forgets it.
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        // exec sweep: no consumed exec bookmarks.
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
         gc_noop_command(&workspace_path),
-        // pr sweep: GitHub remote resolved, pr/42 found, state = CLOSED.
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"pr/*\")",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "pr/42\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "gh",
-            &[
-                "api",
-                "graphql",
-                "-f",
-                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 42) { state } } }",
-            ],
-            r#"{"data":{"repository":{"pr0":{"state":"CLOSED"}}}}"#,
-        ),
+        gc_pr_sweep_command(&workspace_path, "pr/42\n"),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
     ]);
+    let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
         Some(&database_path),
@@ -231,78 +193,29 @@ fn gc_forgets_closed_pr_bookmark() {
     release_runner.assert_exhausted();
 }
 
+/// A `pr/<n>` bookmark some workspace is still positioned on is excluded by
+/// the revset itself, so an empty result must produce no `jj bookmark forget`
+/// call at all. `FakeRunner` is a strict FIFO of exact-match invocations, so
+/// a regression that forgot bookmarks the revset did not name would panic on
+/// "unexpected command invocation".
 #[test]
-fn gc_forgets_merged_pr_bookmark() {
-    // A pr/99 bookmark whose GitHub PR is MERGED is forgotten by gc.
+fn gc_retains_pr_bookmark_a_workspace_is_still_positioned_on() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc referenced");
 
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc merged"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
         gc_noop_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"pr/*\")",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "pr/99\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "gh",
-            &[
-                "api",
-                "graphql",
-                "-f",
-                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 99) { state } } }",
-            ],
-            r#"{"data":{"repository":{"pr0":{"state":"MERGED"}}}}"#,
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/99"], ""),
+        // The revset excludes anything reachable from a working copy, so a
+        // still-referenced pr/7 simply never appears here.
+        gc_pr_noop_command(&workspace_path),
     ]);
+    let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
         Some(&database_path),
@@ -312,174 +225,39 @@ fn gc_forgets_merged_pr_bookmark() {
     release_runner.assert_exhausted();
 }
 
+/// The growth defect this change exists to fix. A repo's shared object store
+/// accumulates one `pr/<n>` bookmark per PR *any* of its workspaces has ever
+/// touched — sixty of them in the live `mono` store, spanning PR 1586 to
+/// 2609 — and the sweep used to size a GitHub round trip by that backlog.
+///
+/// The whole backlog must now resolve in one local `jj log` and **zero**
+/// network commands. `FakeRunner` is a strict FIFO of exact-match
+/// invocations, so a regression that reintroduced any `gh` call — batched or
+/// per-bookmark — would panic on "unexpected command invocation" rather than
+/// silently pass.
 #[test]
-fn gc_retains_open_pr_bookmark() {
-    // A pr/7 bookmark whose GitHub PR is still OPEN is NOT forgotten.
+fn gc_sweeps_an_accumulated_backlog_with_one_local_command_and_no_network() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc backlog");
 
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc open"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Release runner: gc finds pr/7 but state is OPEN — no forget call.
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+    // Far apart in PR number, the way a long-lived pool accumulates them.
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
         gc_noop_command(&workspace_path),
+        gc_pr_sweep_command(&workspace_path, "pr/1579\npr/2201\npr/2332\n"),
         ExpectedCommand::ok(
             workspace_path.clone(),
             "jj",
-            &["git", "remote", "list"],
-            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"pr/*\")",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "pr/7\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "gh",
-            &[
-                "api",
-                "graphql",
-                "-f",
-                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 7) { state } } }",
-            ],
-            r#"{"data":{"repository":{"pr0":{"state":"OPEN"}}}}"#,
-        ),
-        // No bookmark forget — pr/7 is still open.
-    ]);
-    run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
-        Some(&database_path),
-        &release_runner,
-    )
-    .expect("release");
-    release_runner.assert_exhausted();
-}
-
-/// The actual regression this fix addresses: a workspace reused across many
-/// leases can accumulate several stale `pr/*` bookmarks, and the sweep must
-/// resolve all of them in one `gh api graphql` round trip, not one `gh api`
-/// call per bookmark. `FakeRunner` is a strict FIFO of exact-match
-/// invocations, so if the production code regressed to a per-bookmark REST
-/// walk, this test would panic on "unexpected command invocation" (a second
-/// `gh` call) rather than silently pass.
-#[test]
-fn gc_batches_pr_state_lookup_across_multiple_bookmarks() {
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let workspace_path = workspace_root.join("mono-agent-001");
-    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc batch"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Three stale bookmarks, far apart in PR number the way a long-lived
-    // reused workspace accumulates them: one closed, one merged, one still
-    // open. All three are resolved by exactly one `gh api graphql` call.
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"pr/*\")",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "pr/1579\npr/2201\npr/2332\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "gh",
-            &[
-                "api",
-                "graphql",
-                "-f",
-                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 1579) { state } pr1: pullRequest(number: 2201) { state } pr2: pullRequest(number: 2332) { state } } }",
-            ],
-            r#"{"data":{"repository":{"pr0":{"state":"CLOSED"},"pr1":{"state":"OPEN"},"pr2":{"state":"MERGED"}}}}"#,
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "forget", "pr/1579", "pr/2332"],
+            &["bookmark", "forget", "pr/1579", "pr/2201", "pr/2332"],
             "",
         ),
     ]);
+    let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
         Some(&database_path),
@@ -489,174 +267,138 @@ fn gc_batches_pr_state_lookup_across_multiple_bookmarks() {
     release_runner.assert_exhausted();
 }
 
-/// When the batched PR-state lookup itself fails (rate-limited, timed out,
-/// transport error), the sweep must forget nothing rather than guessing —
-/// `gc_collect_closed_pr_bookmarks` logs a warning and returns an empty list,
-/// so no `jj bookmark forget` call follows. `FakeRunner` is a strict FIFO of
-/// exact-match invocations, so if the production code regressed to treating
-/// a failed lookup as "nothing closed" (via `unwrap_or_default` or similar)
-/// and *forgot* a bookmark anyway, this test would panic on "unexpected
-/// commands remaining" (the queued forget would never be reached) — or if it
-/// prematurely called `forget`, on "unexpected command invocation".
+/// The sweep is purely local, so it works with no GitHub remote and no
+/// network at all. Previously an unresolvable remote skipped the `pr/*`
+/// sweep entirely — an offline pool pruned nothing and grew unboundedly.
+/// Here the release issues no `jj git remote list` for the sweep and no `gh`
+/// call, and still forgets the unreferenced bookmark.
 #[test]
-fn gc_forgets_nothing_when_batched_pr_state_lookup_fails() {
+fn gc_pr_sweep_runs_offline() {
     let (tempdir, database_path) = with_database_path();
     let workspace_root = tempdir.path().join("workspaces");
     let workspace_path = workspace_root.join("mono-agent-001");
     std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
 
     seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "offline gc");
 
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc batch failure"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
         gc_noop_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"pr/*\")",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "pr/42\n",
-        ),
+        gc_pr_sweep_command(&workspace_path, "pr/1586\n"),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/1586"], ""),
+    ]);
+    let release_runner = FakeRunner::new(commands);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+        Some(&database_path),
+        &release_runner,
+    )
+    .expect("release");
+    release_runner.assert_exhausted();
+}
+
+/// A commit can carry bookmarks in more than one namespace — a `pr/<n>` and
+/// the `boss/exec_*` head it was created from, which is the normal shape
+/// after `cube pr create`. The `pr/*` half of the sweep must take only the
+/// `pr/*` names from its revset: the `boss/exec_*` namespace has its own,
+/// stricter "reachable from main" test, and forgetting an exec bookmark
+/// merely because it shares a commit with a dead `pr/<n>` would drop a
+/// branch that has not landed yet.
+#[test]
+fn gc_pr_sweep_ignores_co_located_bookmarks_in_other_namespaces() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+    seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc namespaces");
+
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
+        // The exec half finds nothing consumed: this branch has not landed.
+        gc_noop_command(&workspace_path),
+        gc_pr_sweep_command(&workspace_path, "boss/exec_still_open_01\npr/2609\nmain\n"),
+        // Only pr/2609 is forgotten.
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/2609"], ""),
+    ]);
+    let release_runner = FakeRunner::new(commands);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+        Some(&database_path),
+        &release_runner,
+    )
+    .expect("release");
+    release_runner.assert_exhausted();
+}
+
+/// Failure must not look like "there was nothing to prune". This sweep is
+/// the only thing that bounds either bookmark namespace, so a sweep that
+/// silently returns an empty set on error is unbounded growth with no
+/// signal — the exact feedback loop that let the live `mono` store reach
+/// sixty `pr/*` bookmarks. The release still succeeds (the lease has to come
+/// back either way), but it forgets nothing and records the failure in the
+/// audit log.
+#[test]
+fn gc_release_records_an_audit_event_when_the_sweep_fails() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+    seed_mono_repo(&workspace_root, &database_path);
+    let lease_id = lease_mono_agent_001(&workspace_path, &database_path, "pr gc failure");
+
+    let mut commands = release_prefix_commands(&workspace_path);
+    commands.extend([
+        gc_noop_command(&workspace_path),
         ExpectedCommand {
             cwd: workspace_path.clone(),
-            program: "gh".to_string(),
+            program: "jj".to_string(),
             args: [
-                "api",
-                "graphql",
-                "-f",
-                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 42) { state } } }",
+                "log",
+                "-r",
+                crate::app::gc::UNREFERENCED_PR_BOOKMARKS_REVSET,
+                "--no-graph",
+                "-T",
+                crate::app::gc::BOOKMARK_NAMES_TEMPLATE,
             ]
             .iter()
             .map(|s| s.to_string())
             .collect(),
             result: Err(CubeError::CommandFailed {
-                program: "gh".to_string(),
-                args: vec!["api".to_string(), "graphql".to_string()],
-                status: Some(1),
-                stderr: "gh: API rate limit exceeded (HTTP 403)".to_string(),
-            }),
-            creates_dir: None,
-            duration: std::time::Duration::ZERO,
-        },
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "gh",
-            &["api", "rate_limit", "--jq", ".resources.graphql.reset"],
-            "9999999999",
-        ),
-        // No bookmark forget — the batched lookup failed, so the sweep skips
-        // this workspace entirely rather than forgetting pr/42 blind.
-    ]);
-    run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
-        Some(&database_path),
-        &release_runner,
-    )
-    .expect("release");
-    release_runner.assert_exhausted();
-}
-
-#[test]
-fn gc_skips_pr_sweep_when_offline() {
-    // When jj git remote list fails, pr/* GC is skipped entirely.
-    let (tempdir, database_path) = with_database_path();
-    let workspace_root = tempdir.path().join("workspaces");
-    let workspace_path = workspace_root.join("mono-agent-001");
-    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
-
-    seed_mono_repo(&workspace_root, &database_path);
-
-    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
-    let lease_result = run_with_dependencies(
-        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "offline gc"]),
-        Some(&database_path),
-        &lease_runner,
-    )
-    .expect("lease");
-    lease_runner.assert_exhausted();
-    let lease_id = lease_result.payload["workspace"]["lease_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-
-    // Release runner: remote list fails → pr sweep skipped, no extra commands.
-    let release_runner = FakeRunner::new(vec![
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
-        release_guard_reusable_command(&workspace_path),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["git", "remote", "list"],
-            "origin\tgit@github.com:spinyfin/mono.git\n",
-        ),
-        ExpectedCommand::ok(
-            workspace_path.clone(),
-            "jj",
-            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
-            "",
-        ),
-        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
-        gc_noop_command(&workspace_path),
-        ExpectedCommand {
-            cwd: workspace_path.clone(),
-            program: "jj".to_string(),
-            args: ["git", "remote", "list"].iter().map(|s| s.to_string()).collect(),
-            result: Err(CubeError::CommandFailed {
                 program: "jj".to_string(),
-                args: vec!["git".to_string(), "remote".to_string(), "list".to_string()],
+                args: vec!["log".to_string()],
                 status: Some(1),
-                stderr: "no jj repo".to_string(),
+                stderr: "Revision `working_copies()` doesn't exist".to_string(),
             }),
             creates_dir: None,
             duration: std::time::Duration::ZERO,
         },
+        // No `jj bookmark forget` follows: the sweep could not decide, so it
+        // forgets nothing rather than guessing.
     ]);
+    let release_runner = FakeRunner::new(commands);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
         Some(&database_path),
         &release_runner,
     )
-    .expect("release");
+    .expect("release still succeeds — a failed sweep must not strand the lease");
     release_runner.assert_exhausted();
+
+    let events = audit_events(&tempdir);
+    let failure = events
+        .iter()
+        .find(|e| e["event"] == "workspace.release_bookmark_gc_failed")
+        .expect("a failed sweep is recorded, not swallowed");
+    assert_eq!(failure["workspace_id"], "mono-agent-001");
+    assert_eq!(failure["repo"], "mono");
+    assert!(
+        failure["error"].as_str().unwrap().contains("working_copies()"),
+        "the audit event carries the underlying failure: {failure}"
+    );
 }
 
 #[test]
@@ -947,26 +689,14 @@ fn workspace_gc_verb_runs_unhealthy_recycler() {
     drop(store);
 
     // FakeRunner sequence:
-    // 1. gc_workspace_bookmarks: fetch, log (no consumed bookmarks), gc_collect pr remote
+    // 1. gc_workspace_bookmarks: fetch, exec sweep (nothing consumed), pr sweep
     // 2. gc_aged_unhealthy_workspaces → probe (fetch + head status), then
     //    remote list, bookmark set, jj new
     let gc_runner = FakeRunner::new(vec![
         // gc_workspace_bookmarks
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
-        ExpectedCommand::ok(
-            ws_path.clone(),
-            "jj",
-            &[
-                "log",
-                "-r",
-                "bookmarks(glob:\"boss/exec_*\") & ::main",
-                "--no-graph",
-                "-T",
-                "bookmarks ++ \"\\n\"",
-            ],
-            "",
-        ),
-        gc_pr_remote_noop_command(&ws_path),
+        gc_noop_command(&ws_path),
+        gc_pr_noop_command(&ws_path),
         // gc_aged_unhealthy_workspaces → probe (fetch + head status), then reset
         ExpectedCommand::ok(ws_path.clone(), "jj", &["git", "fetch"], ""),
         head_status_command(&ws_path, &head_status_output("abcd1234", true, "main", "main", "main")),

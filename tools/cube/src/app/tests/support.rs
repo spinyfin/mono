@@ -10,6 +10,7 @@ use crate::command_runner::{CommandInvocation, CommandRunner};
 use crate::reuse_guard;
 
 use crate::app::errors::{CubeError, Result};
+use crate::app::gc;
 
 /// Mutex serialising tests that touch the process environment — either
 /// mutating it (PATH, CUBE_CHECKLEFT_BIN) or depending on it, such as any
@@ -115,9 +116,10 @@ pub(super) fn unpushed_probe_command(workspace_path: &std::path::Path, output: &
     )
 }
 
-/// Returns an expected gc-log command that reports no consumed bookmarks.
-/// Add to any release runner after `jj new main@origin` to satisfy the gc check.
-pub(super) fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+/// The `boss/exec_*` half of the bookmark sweep, reporting `output` as the
+/// consumed set. Built from the production constants so a change to the
+/// template or revset drifts the tests rather than silently passing.
+pub(super) fn gc_exec_sweep_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         workspace_path.to_path_buf(),
         "jj",
@@ -127,21 +129,41 @@ pub(super) fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedComma
             "bookmarks(glob:\"boss/exec_*\") & ::main",
             "--no-graph",
             "-T",
-            "bookmarks ++ \"\\n\"",
+            gc::BOOKMARK_NAMES_TEMPLATE,
         ],
-        "",
+        output,
     )
 }
 
-/// Command that satisfies the `gc_collect_closed_pr_bookmarks` remote-list
-/// probe with a non-GitHub remote, causing the pr/* sweep to skip.
-pub(super) fn gc_pr_remote_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+/// Returns an expected gc-log command that reports no consumed bookmarks.
+/// Add to any release runner after `jj new main@origin` to satisfy the gc check.
+pub(super) fn gc_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+    gc_exec_sweep_command(workspace_path, "")
+}
+
+/// The `pr/<n>` half of the bookmark sweep, reporting `output` as the set of
+/// bookmarks no workspace is positioned on any more.
+pub(super) fn gc_pr_sweep_command(workspace_path: &std::path::Path, output: &str) -> ExpectedCommand {
     ExpectedCommand::ok(
         workspace_path.to_path_buf(),
         "jj",
-        &["git", "remote", "list"],
-        "origin /local/path/to/mirror\n",
+        &[
+            "log",
+            "-r",
+            gc::UNREFERENCED_PR_BOOKMARKS_REVSET,
+            "--no-graph",
+            "-T",
+            gc::BOOKMARK_NAMES_TEMPLATE,
+        ],
+        output,
     )
+}
+
+/// The `pr/<n>` half reporting that every `pr/*` bookmark is still
+/// referenced, so nothing is swept. Add to any release runner after
+/// [`gc_noop_command`].
+pub(super) fn gc_pr_noop_command(workspace_path: &std::path::Path) -> ExpectedCommand {
+    gc_pr_sweep_command(workspace_path, "")
 }
 
 /// The release-time reuse-guard probe that says "this working copy is
@@ -175,7 +197,7 @@ pub(super) fn release_runner_for(workspace_path: &std::path::Path) -> FakeRunner
         ),
         ExpectedCommand::ok(workspace_path.to_path_buf(), "jj", &["new", "main@origin"], ""),
         gc_noop_command(workspace_path),
-        gc_pr_remote_noop_command(workspace_path),
+        gc_pr_noop_command(workspace_path),
     ])
 }
 
