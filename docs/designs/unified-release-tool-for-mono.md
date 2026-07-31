@@ -26,7 +26,7 @@ The duplication is real and unusually literal: appoint's release script and chec
 - **A configuration language.** No inheritance, no interpolation, no conditionals, no per-branch overrides, no build commands in config. See "Configuration".
 - **Buildkite pipeline generation.** Each repo keeps its own `pipeline-*.yml` files and its own dynamic-fan-out `buildkite-agent pipeline upload` call.
 - **Changing artifact names or the `.sha256` sidecar convention.** External consumers resolve on them by URL (`multitool.lock.json`).
-- **Boss.app signing, notarisation, and `.pkg` assembly.** Out permanently. See "Boss.app: in or out".
+- **Boss.app signing, notarisation, and `.pkg` assembly.** Out of scope for this design. See "Boss.app: in or out".
 - **Converging checkleft's `-alpha.N` scheme onto plain semver.** A separate, consumer-visible decision. See open questions.
 - **Replacing `repobin` or `rules_multitool`.** The tool is distributed by exactly the mechanism checkleft already uses.
 
@@ -100,7 +100,7 @@ Two separate things wear the word "release", and conflating them is the main tra
 - §7 (`:98-106`) is **correct** at HEAD: musl is hermetically Bazel-built and release-blocking. The brief's "known trap" describes a state that has since been fixed here.
 - `:177` is **still wrong**, in the same document: it claims "the cross targets (`x86_64-apple-darwin`, `x86_64-unknown-linux-musl`) are built with `cargo --target`" — musl is not (`checkleft-release.sh:557`) — and that "checkleft's CLI does not embed `CARGO_PKG_VERSION`, so all binaries are byte-identical regardless of the version string". The binary _does_ embed a version, via `CHECKLEFT_BUILD_VERSION` ([`main.rs:145`](../../tools/checkleft/src/main.rs)), and `phase_musl:566-570` exists precisely to assert that the bytes differ per version.
 
-Fixing `:177` is filed as its own task below; it is independent of everything else here.
+Fixing `:177` is folded into the checkleft migration task below, as part of that doc's wholesale rewrite — deliberately not a standalone task, since spot-fixing one line of a document that task rewrites end to end would be work thrown away.
 
 ---
 
@@ -309,13 +309,15 @@ Each row is decided, not configurable. Where a difference is inherently a per-pr
 
 One constraint the shared tool must respect: **Boss's asset is `Boss-1.0.N.zip`, not `boss-<triple>`.** The `<name>-<triple>` shape is a checkleft/appoint convention, not a rule of the tool; asset names are per-product config precisely so Boss's existing name — which the auto-update design resolves by exact string — survives untouched.
 
-**Out of scope, permanently: Boss.app packaging.** Bundle assembly, `codesign`, `notarytool`, `stapler`, `pkgbuild`/`productbuild`/`productsign` stay in `tools/boss/installer/`. Three reasons, in order of weight:
+**Out of scope for this design: Boss.app packaging.** Bundle assembly, `codesign`, `notarytool`, `stapler`, `pkgbuild`/`productbuild`/`productsign` stay in `tools/boss/installer/`. Three reasons, in order of weight:
 
 1. **It is not part of the CI release path at all.** `tools/boss/installer/release.sh` is invoked by a human via `bazel run //tools/boss/installer:release`; `boss-release.sh` never calls it. There is no duplication here to remove — it is not a third copy of the same script, it is a different program doing a different job.
 2. **Its credentials do not exist in CI.** `BOSS_DEVELOPER_ID_*` and `AC_*` are developer-machine keychain and Apple-ID credentials. Pulling this in would mean provisioning notarisation secrets into Buildkite, which the brief's no-new-credentials constraint rules out without a separate, explicit decision.
 3. **Signing is a build step, not a publish step.** It transforms the artifact. The boundary this design draws is exactly "the tool does not transform artifacts", and signing is the clearest possible case of transformation.
 
 A design that pretended these three were alike would be worse than one that unifies the two that are and explains the third. The honest statement is: **two of the three products are the same program; the third is the same program plus a genuinely different artifact pipeline, and only the first half is shared.**
+
+Reopening this is a decision in its own right, not ordinary follow-on work: it means provisioning Developer ID and Apple notary credentials into Buildkite, which the brief's no-new-credentials constraint rules out on its own. The task breakdown carries it as deferred item 6(d) on exactly those terms — it cannot start until someone reverses the exclusion made here.
 
 ---
 
@@ -353,7 +355,7 @@ Changes: `boss-release.sh` shrinks from 416 lines to roughly 90 — secrets, stu
 
 ## Proposed implementation task breakdown
 
-Six entries. Tasks that may run in parallel are noted, and file-overlap warnings are called out where two otherwise-independent tasks would edit the same file. The breakdown is deliberately coarse: work a single worker would do in one sitting — the same crate, the same shell script, the same doc — is one task rather than several, because splitting it would only force each PR to forward-port the last for no gain in reviewability.
+Six entries. Tasks that may run in parallel are noted, and where two of them could plausibly be read as touching the same files, the entry says explicitly whether they actually do. The breakdown is deliberately coarse: work a single worker would do in one sitting — the same crate, the same shell script, the same doc — is one task rather than several, because splitting it would only force each PR to forward-port the last for no gain in reviewability.
 
 ### 1. Create the `//tools/release` crate: config, version resolution, and the release-state decisions
 
@@ -384,7 +386,7 @@ Add `tools/checkleft/release.toml` and rewrite `.buildkite/steps/checkleft-relea
 Add `tools/boss/release.toml` and rewrite `.buildkite/steps/boss-release.sh` to keep only the secret loading, GhosttyKit stub, `bazel build -c opt --define=...`, and `.zip` `cquery` discovery, delegating everything else to the tool. Boss gains draft-then-publish and a `Boss-1.0.N.zip.sha256` sidecar. The asset name `Boss-1.0.N.zip` and the `boss-v1.0.N` tag scheme are unchanged, so the auto-update design's resolution logic is unaffected. Rewrite `tools/boss/docs/buildkite-release-setup.md` in the same PR, for the same reasons and to the same shape as checkleft's in task 3.
 
 - Effort hint: `medium`
-- Dependencies: task 2. **May run in parallel with tasks 3 and 5** — it touches only `boss-release.sh`, `tools/boss/`, and Boss's own doc, none of which those tasks edit.
+- Dependencies: task 2. **May run in parallel with tasks 3 and 5** — it touches `.buildkite/steps/boss-release.sh`, Boss's release step at [`.buildkite/pipeline.yml:39-53`](../../.buildkite/pipeline.yml), `tools/boss/`, and Boss's own doc. Task 3 also writes under `.buildkite/`, but never to those files: it edits `.buildkite/steps/checkleft-release.sh` and adds the tool's own release pipeline as new top-level `pipeline-release*.yml` files — a separately registered pipeline, the shape [`.buildkite/pipeline-checkleft-release.yml`](../../.buildkite/pipeline-checkleft-release.yml) already uses, not a step added to `pipeline.yml`. Shared directory, disjoint files.
 - Scope: in-scope
 
 ### 5. Migrate appoint to the shared tool
@@ -397,7 +399,7 @@ A PR in `brianduff/appoint`, not mono. Add a `release` entry to `multitool.lock.
 
 ### 6. Deferred follow-ons: `gh`-runner extraction, version-scheme convergence, optional-asset retirement, and Boss.app signing
 
-Four post-v1 items, independent of each other and each gated on a human decision rather than on engineering readiness. **(a) Extract a product-neutral `gh` runner:** move the generic parts of `tools/boss/github/src/gh_runner.rs` into a lower-level crate both `boss_github` and `//tools/release` can depend on, removing the duplicated subprocess wrapper this design knowingly introduces; requires untangling the tokio and `boss_gh_telemetry` coupling and re-pointing `boss_github`'s call sites. **(b) Converge checkleft's version scheme onto `patch-counter`:** move checkleft from `X.Y.Z-alpha.N` to plain `X.Y.Z` and retire the `alpha-counter` enum variant, leaving one scheme in the tool; requires re-pinning every external consumer (`brianduff/appoint`, `brianduff/checkleft-sandbox`) and updating docs that name `checkleft-v*-alpha.*` tags. **(c) Drop the optional-asset tier:** retire `checkleft-x86_64-apple-darwin`, deleting `build_cross_cargo`, the last `cargo` invocation in any release path, and the entire required/optional asset distinction from the tool; requires first establishing whether anything actually fetches that asset. **(d) Bring Boss.app signing and notarisation into the release pipeline:** wire `tools/boss/installer/release.sh`'s codesign / notarytool / stapler / `.pkg` path into CI so releases ship a signed, notarised artifact; requires provisioning Developer ID and Apple notary credentials into Buildkite.
+Four post-v1 items, independent of each other and none of them a v1 blocker. What gates each differs: (b) and (d) need an explicit human decision; (a) is ordinary engineering work with nothing urgent behind it; (c) turns on an empirical question about consumers rather than on a decision at all. **(a) Extract a product-neutral `gh` runner:** move the generic parts of `tools/boss/github/src/gh_runner.rs` into a lower-level crate both `boss_github` and `//tools/release` can depend on, removing the duplicated subprocess wrapper this design knowingly introduces; requires untangling the tokio and `boss_gh_telemetry` coupling and re-pointing `boss_github`'s call sites. **(b) Converge checkleft's version scheme onto `patch-counter`:** move checkleft from `X.Y.Z-alpha.N` to plain `X.Y.Z` and retire the `alpha-counter` enum variant, leaving one scheme in the tool; requires re-pinning every external consumer (`brianduff/appoint`, `brianduff/checkleft-sandbox`) and updating docs that name `checkleft-v*-alpha.*` tags. **(c) Drop the optional-asset tier:** retire `checkleft-x86_64-apple-darwin`, deleting `build_cross_cargo`, the last `cargo` invocation in any release path, and the entire required/optional asset distinction from the tool; requires first establishing whether anything actually fetches that asset. **(d) Bring Boss.app signing and notarisation into the release pipeline:** wire `tools/boss/installer/release.sh`'s codesign / notarytool / stapler / `.pkg` path into CI so releases ship a signed, notarised artifact; requires provisioning Developer ID and Apple notary credentials into Buildkite.
 
 - Effort hint: `large` in aggregate — `medium` for (a) and (b), `small` for (c), `large` for (d).
 - Dependencies: (a) and (d) follow task 4; (b) follows task 5; (c) follows task 3.
