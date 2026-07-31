@@ -142,7 +142,7 @@ impl LogLevel {
 
 #[derive(Debug, Parser)]
 #[command(name = "checkleft")]
-#[command(version = option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")))]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Run repository convention checks")]
 struct Cli {
     /// Enable verbose tracing output (INFO level). Repeat for more detail:

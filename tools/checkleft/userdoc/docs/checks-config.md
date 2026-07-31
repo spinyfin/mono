@@ -102,6 +102,16 @@ Supported keys:
 - `bypass_name` (optional string): directive name; defaults to `BYPASS_<ID>` if omitted.
 - `changed_lines_only` (optional boolean, default `false`): restrict this check's findings to PR-changed lines. See [Line-scoped findings](#line-scoped-findings).
 
+### Unknown keys are rejected
+
+A check entry's own keys — the list above (`id`, `check`, `implementation`, `enabled`, `policy`, `config`, `exclude`, `scope`) — are the complete, closed set. A key that isn't one of these (a typo like `excludes`, or a `policy`-only key such as `severity` written as a sibling of `policy:` instead of nested inside it) is diagnosed, naming the check id, the offending key, and the `CHECKS` file it appeared in. When the key is a recognisable misspelling or misplacement, the diagnostic also names the fix — for example "did you mean `exclude`?" or "`severity` belongs inside `policy:`, not as a sibling of it."
+
+This check is scoped strictly to a check entry's own keys. It never looks inside `config:` — that block is opaque, check-specific configuration passed through verbatim to the check implementation, so an unrecognised key there is the check implementation's concern, not the framework's.
+
+This is a new strictness rule and ships with a one-release deprecation window: today it is diagnosed at `warning` severity (the check still loads). `0.1.0-alpha.9` is the last release that reports this as a warning; `0.1.0-alpha.10` and later report it as an `error` (the check entry is skipped, like any other invalid check entry). If `checkleft run` reports this, fix or remove the offending key before the next checkleft upgrade.
+
+Note what this does _not_ catch: a correctly-spelled key holding a value that can never match anything (for example a glob with a stray leading `./`) is valid shape and stays silent — this is a schema check on key names, not a semantic check on values.
+
 ## Changeset-scope checks
 
 Most checks look at individual files: `scope: files` (the default) schedules a check once per distinct configuration and runs it only against the changed files that resolved to it.

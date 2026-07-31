@@ -41,6 +41,60 @@ checks:
 }
 
 #[test]
+fn unknown_yaml_check_entry_key_with_null_value_is_diagnosed_without_dropping_the_check() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: rust/giant-structs
+    excludes:
+"#,
+    )
+    .expect("write config file");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+
+    assert!(
+        checks.get("rust/giant-structs").is_some(),
+        "the recognised fields still load"
+    );
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.message.contains("excludes") && diagnostic.message.contains("did you mean `exclude`?")
+    }));
+}
+
+#[test]
+fn unknown_keys_inside_yaml_config_block_are_not_diagnosed() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.yaml"),
+        r#"
+checks:
+  - id: file-size
+    config:
+      excludes: ["testdata/**"]
+      whatever_the_check_wants: 1
+"#,
+    )
+    .expect("write config file");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver
+        .resolve_for_file(Path::new("backend/src/lib.rs"))
+        .expect("resolve checks");
+
+    assert!(
+        checks.diagnostics().next().is_none(),
+        "config keys remain opaque to checkleft"
+    );
+}
+
+#[test]
 fn malformed_yaml_reports_diagnostic_instead_of_failing() {
     let temp = tempdir().expect("create temp dir");
     fs::write(
