@@ -505,9 +505,15 @@ pub struct DriverDescriptor {
 /// capabilities as *required-strict*, forcing [`AbsenceDisposition::Refuse`]
 /// on absence even when the capability's default is Degrade or Synthesize.
 ///
-/// Example: `TaskKind::Design` marks `StructuredOutput` and
-/// `ToolUseInterception` required-strict so a driver lacking them is refused
-/// for design tasks without a bespoke per-kind block.
+/// The document-producing / design-family kinds — `Design`, `Investigation`,
+/// `DesignPostmortem` (the same grouping `ReasoningMode::default_for` calls
+/// `design_family`) — mark `StructuredOutput` and `ToolUseInterception`
+/// required-strict: their deliverable is a doc whose task breakdown /
+/// followups must round-trip through the file-based structured-output
+/// contract, so a driver lacking either capability is refused for these
+/// kinds without a bespoke per-kind block (agent-driver design doc,
+/// Codex-eligibility Phase 2: "enable the document-producing kinds via
+/// `KindRequirements` once the structured-output contract is proven").
 pub struct KindRequirements {
     required_strict: HashSet<Capability>,
 }
@@ -517,9 +523,11 @@ impl KindRequirements {
     /// Empty means no escalations beyond per-capability defaults.
     pub fn for_kind(kind: TaskKind) -> Self {
         let required_strict = match kind {
-            TaskKind::Design => [Capability::StructuredOutput, Capability::ToolUseInterception]
-                .into_iter()
-                .collect(),
+            TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem => {
+                [Capability::StructuredOutput, Capability::ToolUseInterception]
+                    .into_iter()
+                    .collect()
+            }
             _ => HashSet::new(),
         };
         Self { required_strict }
