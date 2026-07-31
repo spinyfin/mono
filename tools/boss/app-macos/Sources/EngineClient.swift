@@ -592,6 +592,9 @@ final class EngineClient: @unchecked Sendable {
                 let rawIssues = report["issues"] as? [[String: Any]] ?? []
                 let issues = rawIssues.compactMap(parseEngineHealthIssue)
                 emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
+            case "codex_dispatch_percentage_result":
+                let percentage = (payload["percentage"] as? NSNumber)?.intValue ?? 0
+                emit(.codexDispatchPercentageResult(percentage: percentage))
             case "trunk_status":
                 let configured = (payload["configured"] as? NSNumber)?.boolValue ?? false
                 let source = payload["source"] as? String

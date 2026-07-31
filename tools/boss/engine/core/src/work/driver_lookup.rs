@@ -36,6 +36,18 @@ impl WorkDb {
         // (non-reentrant) connection lock.
         let binding = {
             let conn = self.connect()?;
+            // Codex-percentage routing decision (recorded once, at
+            // `insert_execution` time — see `work::codex_routing`) wins
+            // over the ordinary `tasks.driver` → `products.default_driver`
+            // precedence below when it names a driver. When the decision
+            // recorded no override (ineligible row, or a percentage roll
+            // that landed on "stay default"), fall through unchanged — this
+            // keeps every pre-existing execution (rows created before this
+            // feature landed, which have no decision row at all) resolving
+            // exactly as before.
+            if let Some(driver) = get_execution_driver_decision_conn(&conn, execution_id)?.and_then(|d| d.driver) {
+                return Ok(Some(driver));
+            }
             let row: Option<(Option<String>, Option<String>)> = conn
                 .query_row(
                     "SELECT t.driver, p.default_driver

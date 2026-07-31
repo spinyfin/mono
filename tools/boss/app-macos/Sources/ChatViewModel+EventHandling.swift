@@ -221,6 +221,8 @@ extension ChatViewModel {
         case .engineHealthResult(let apiKeyPresent, let issues):
             engineAnthropicApiKeyPresent = apiKeyPresent
             engineHealthIssues = issues
+        case .codexDispatchPercentageResult(let percentage):
+            codexDispatchPercentage = percentage
         case .trunkStatus(let configured, let source, let queueCheck, let note):
             trunkTokenConfigured = configured
             trunkTokenSource = source

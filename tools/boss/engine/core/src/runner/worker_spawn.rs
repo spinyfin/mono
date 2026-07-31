@@ -364,7 +364,19 @@ pub(crate) async fn compose_worker_spawn(
                 task.model_override.clone(),
                 product_default_model,
                 dispatch_preamble,
-                task.driver.clone(),
+                // Codex-percentage routing decision (recorded once at
+                // `insert_execution` time) wins when it names a driver —
+                // this is how a percentage-assigned row actually reaches
+                // Codex rather than the recorded decision being purely
+                // decorative. Falls back to the row's own `driver` column
+                // for executions predating this feature (no decision row
+                // recorded yet), preserving prior behavior exactly.
+                work_db
+                    .get_execution_driver_decision(&execution.id)
+                    .ok()
+                    .flatten()
+                    .and_then(|d| d.driver)
+                    .or_else(|| task.driver.clone()),
                 product_default_driver,
                 task.reasoning,
             )

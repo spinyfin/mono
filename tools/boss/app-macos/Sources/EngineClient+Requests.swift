@@ -37,6 +37,26 @@ extension EngineClient {
         sendLine(["type": "get_settings"])
     }
 
+    /// Ask the engine for the current Codex dispatch percentage — what
+    /// share of eligible, `standard`-reasoning implementation work routes
+    /// to the `codex` driver instead of its normal default. Replies with
+    /// `codex_dispatch_percentage_result`.
+    func sendGetCodexDispatchPercentage() {
+        sendLine(["type": "get_codex_dispatch_percentage"])
+    }
+
+    /// Set the Codex dispatch percentage (clamped server-side to
+    /// `0...100`; `0` sends nothing to Codex). Persisted to `state.db`
+    /// and applies to executions created from this point on only —
+    /// nothing already dispatched is disturbed. Replies with
+    /// `codex_dispatch_percentage_result`.
+    func sendSetCodexDispatchPercentage(percentage: Int) {
+        sendLine([
+            "type": "set_codex_dispatch_percentage",
+            "percentage": percentage,
+        ])
+    }
+
     /// Ask the engine for its user-visible configuration health.
     /// Called once at session-start (after `connected`) so the
     /// top-of-window banner surfaces a missing `ANTHROPIC_API_KEY`

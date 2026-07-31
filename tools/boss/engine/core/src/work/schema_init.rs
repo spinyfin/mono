@@ -701,6 +701,10 @@ impl WorkDb {
         // as already-terminal. Data-only, self-idempotent — see the function
         // doc comment.
         migrate_backfill_cancelled_moot_revision_tombstones(conn)?;
+        // `execution_driver_decisions`: one row per execution recording the
+        // Codex-percentage routing decision (driver + reason). New table
+        // only, independent of every migration above.
+        migrate_execution_driver_decisions_table(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

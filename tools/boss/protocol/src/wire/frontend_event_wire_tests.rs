@@ -1739,6 +1739,11 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "dispatch_concurrency_result",
         },
+        TagCase {
+            label: "CodexDispatchPercentageResult",
+            event: FrontendEvent::CodexDispatchPercentageResult { percentage: 25 },
+            expected_tag: "codex_dispatch_percentage_result",
+        },
     ]
 }
 
@@ -1882,6 +1887,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
+        | FrontendEvent::CodexDispatchPercentageResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }

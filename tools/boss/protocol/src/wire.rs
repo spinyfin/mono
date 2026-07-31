@@ -719,6 +719,12 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Query the current Codex dispatch percentage (what share of eligible
+    /// `standard`-reasoning implementation work routes to the `codex`
+    /// driver instead of its normal default) without changing it. Replies
+    /// with [`FrontendEvent::CodexDispatchPercentageResult`].
+    GetCodexDispatchPercentage,
+
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
     /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
@@ -1905,6 +1911,24 @@ pub enum FrontendRequest {
         work_item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         budget: Option<i64>,
+    },
+
+    /// Set the Codex dispatch percentage: what share of eligible
+    /// `standard`-reasoning implementation work (`task_implementation`,
+    /// `chore_implementation`, `revision_implementation`) routes to the
+    /// `codex` driver instead of its normal default. `percentage` is
+    /// clamped server-side to `0..=100`; `0` sends literally nothing to
+    /// Codex. Persisted to `state.db` so it survives an engine restart.
+    /// Applies to executions created from this point on only — an
+    /// execution already dispatched keeps whatever driver it was recorded
+    /// with at creation time; nothing live is reassigned. Assignment
+    /// within the eligible slice is a deterministic hash of the work
+    /// item's own id against the threshold, not a per-attempt coin flip,
+    /// so the same row always lands on the same driver. An explicit
+    /// `--driver` on a row always wins over this percentage. Replies with
+    /// [`FrontendEvent::CodexDispatchPercentageResult`].
+    SetCodexDispatchPercentage {
+        percentage: u8,
     },
 
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency

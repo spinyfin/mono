@@ -271,6 +271,13 @@ final class ChatViewModel: ObservableObject {
     /// so the banner doesn't flash on a transient reconnect.
     @Published var engineAnthropicApiKeyPresent: Bool = true
 
+    /// Current Codex dispatch percentage (0...100): the share of eligible,
+    /// `standard`-reasoning implementation work routed to the `codex`
+    /// driver instead of its normal default. Sourced from
+    /// `codex_dispatch_percentage_result`, fetched on Settings-pane
+    /// appear and refreshed after every `setCodexDispatchPercentage` call.
+    @Published var codexDispatchPercentage: Int = 0
+
     /// Whether a Trunk org API token is currently configured (env override
     /// or Keychain), sourced from `trunk_status` — on Settings-pane appear,
     /// after a `TrunkSetToken` save, and on product-settings appear so the
@@ -656,6 +663,23 @@ final class ChatViewModel: ObservableObject {
     /// without exposing the private `engine` field.
     func refreshEngineHealth() {
         engine.sendGetEngineHealth()
+    }
+
+    /// Ask the engine for the current Codex dispatch percentage. Called by
+    /// the Settings window on appear so the control reflects the persisted
+    /// value rather than whatever it last happened to show.
+    func refreshCodexDispatchPercentage() {
+        engine.sendGetCodexDispatchPercentage()
+    }
+
+    /// Set the Codex dispatch percentage. The engine echoes back the
+    /// clamped, applied value via `codex_dispatch_percentage_result`,
+    /// which updates `codexDispatchPercentage` — this call does not
+    /// optimistically patch local state first, since the server-side
+    /// clamp to `0...100` means the applied value can differ from what
+    /// was requested.
+    func setCodexDispatchPercentage(_ percentage: Int) {
+        engine.sendSetCodexDispatchPercentage(percentage: percentage)
     }
 
     /// User-initiated resume from the `dispatch_paused` health-banner
