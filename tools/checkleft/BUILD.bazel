@@ -40,9 +40,10 @@ rust_library(
     # THENCHANGE(Cargo.toml)
     #
     # CHECKLEFT_BUILD_VERSION mirrors the same-named rustc_env below on the
-    # `checkleft` binary target: it carries the release pipeline's `--define
-    # CHECKLEFT_VERSION=<ver>` (config.rs's `unknown_check_field_severity` reads
-    # it to decide when the unknown-check-entry-key deprecation window ends).
+    # `checkleft` binary target: it carries the version from Cargo.toml in local
+    # and CI builds, and the release pipeline's `--define CHECKLEFT_VERSION=<ver>`
+    # for release builds (config.rs reads it to decide when the deprecation window
+    # for unknown check-entry keys ends).
     # Needed here too because config.rs lives in the library, not main.rs.
     rustc_env = {
         "CHECKLEFT_WASMTIME_VERSION": "42.0.2",
@@ -62,7 +63,7 @@ rust_binary(
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
     # CHECKLEFT_VERSION is set via --define by the release pipeline; .bazelrc
-    # defaults it to "0.0.0-dev" for local and CI non-release builds.
+    # defaults it to Cargo.toml's package version for local and CI builds.
     rustc_env = {
         "CHECKLEFT_BUILD_VERSION": "$(CHECKLEFT_VERSION)",
     },

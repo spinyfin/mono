@@ -611,7 +611,7 @@ struct ParsedCheckConfig {
     /// suggests a correction, instead of aborting the whole CHECKS file on the first
     /// typo. See `diagnose_unknown_check_fields`.
     #[serde(flatten)]
-    unknown_fields: BTreeMap<String, toml::Value>,
+    unknown_fields: BTreeMap<String, serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1083,32 +1083,44 @@ fn config_file_diagnostic_with_severity(
     }
 }
 
-/// Released `checkleft` version as of which unknown check-entry keys are diagnosed
-/// at `Warning` severity rather than `Error` (see `ParsedCheckConfig::unknown_fields`).
-/// Any released version other than this one — i.e. the very next version the release
-/// pipeline cuts, whatever it turns out to be (`Cargo.toml` is the source of truth,
-/// see `docs/buildkite-release-setup.md`) — escalates to `Error` automatically. This
-/// gives the deprecation window real teeth without depending on a human remembering
-/// to flip a flag once the grace period has elapsed.
-const UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION: &str = "0.1.0-alpha.8";
-
-/// "Not yet released" marker: `.bazelrc`'s default for `--define CHECKLEFT_VERSION`,
-/// reported by every local/CI Bazel build that isn't the release pipeline itself.
-/// Treated the same as [`UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION`] so ordinary
-/// development builds stay in the grace period until an actual release ships past it.
-const CHECKLEFT_DEV_BUILD_VERSION: &str = "0.0.0-dev";
+/// Unknown check-entry keys remain warnings through the first release that carries
+/// this behavior. The release pipeline increments the alpha component before it
+/// builds, so the source tree's `0.1.0-alpha.8` becomes `0.1.0-alpha.9` there.
+const UNKNOWN_CHECK_FIELD_WARN_THROUGH_VERSION: &str = "0.1.0-alpha.9";
 
 fn unknown_check_field_severity() -> Severity {
     // `CHECKLEFT_BUILD_VERSION` carries the release pipeline's `--define
     // CHECKLEFT_VERSION` (see BUILD.bazel); a plain `cargo build`/crates.io consumer
     // has no such rustc_env, so fall back to Cargo.toml's own version, same as the
     // `--version` flag does in main.rs.
-    let effective_version = option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
-    if effective_version == UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION || effective_version == CHECKLEFT_DEV_BUILD_VERSION {
+    unknown_check_field_severity_for_version(
+        option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
+    )
+}
+
+fn unknown_check_field_severity_for_version(effective_version: &str) -> Severity {
+    if checkleft_alpha_version(effective_version)
+        .zip(checkleft_alpha_version(UNKNOWN_CHECK_FIELD_WARN_THROUGH_VERSION))
+        .is_some_and(|(effective, warn_through)| effective <= warn_through)
+    {
         Severity::Warning
     } else {
         Severity::Error
     }
+}
+
+/// Parse the alpha-version shape accepted by the release pipeline. An unrecognised
+/// version escalates immediately rather than silently extending the grace period.
+fn checkleft_alpha_version(version: &str) -> Option<(u64, u64, u64, u64)> {
+    let (base, alpha) = version.split_once("-alpha.")?;
+    let mut components = base.split('.').map(str::parse::<u64>);
+    let major = components.next()?.ok()?;
+    let minor = components.next()?.ok()?;
+    let patch = components.next()?.ok()?;
+    if components.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch, alpha.parse().ok()?))
 }
 
 /// Canonical field names on a check entry (`ParsedCheckConfig`), used to suggest a
@@ -1141,7 +1153,7 @@ const POLICY_ONLY_FIELD_NAMES: &[&str] = &[
 /// or misplacement (a `policy:`-only field written as a sibling of `policy:`).
 fn diagnose_unknown_check_fields(
     check_id: &str,
-    unknown_fields: &BTreeMap<String, toml::Value>,
+    unknown_fields: &BTreeMap<String, serde::de::IgnoredAny>,
     source_path: &Path,
     severity: Severity,
 ) -> Vec<ConfigDiagnostic> {

@@ -9,7 +9,7 @@ use crate::output::Severity;
 
 use super::{
     CheckScope, ConfigResolver, StaleExclusionMode, diagnose_unknown_check_fields, levenshtein_distance,
-    suggest_check_field_correction, unknown_check_field_severity,
+    suggest_check_field_correction, unknown_check_field_severity_for_version,
 };
 
 mod yaml;
@@ -1690,10 +1690,11 @@ fn unrelated_unknown_key_produces_generic_diagnostic_listing_known_fields() {
 }
 
 #[test]
-fn unknown_check_entry_key_is_currently_warning_and_does_not_block_loading() {
-    // Documents today's point in the deprecation window (see
-    // `unknown_check_field_severity`): during the grace period, a stray key is
-    // diagnosed but the check still loads with its recognised fields applied.
+fn unknown_check_entry_key_does_not_block_loading_during_grace_period() {
+    // During the grace period, a stray key is diagnosed but the check still
+    // loads with its recognised fields applied. Severity is tested below with
+    // an explicit value so this integration test does not depend on the
+    // build-time version injected by Bazel.
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -1703,9 +1704,8 @@ fn unknown_check_entry_key_is_currently_warning_and_does_not_block_loading() {
 
     let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
     let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
-    assert_eq!(unknown_check_field_severity(), Severity::Warning);
     let diagnostics: Vec<_> = checks.diagnostics().collect();
-    assert!(diagnostics.iter().all(|d| d.severity == Severity::Warning));
+    assert!(!diagnostics.is_empty(), "the stray key should be diagnosed");
     assert!(
         checks.get("rust/giant-structs").is_some(),
         "check should still load during the warning-only grace period"
@@ -1720,15 +1720,42 @@ fn unknown_check_field_diagnostics_are_tagged_with_the_requested_severity() {
     // the severity-tagging half of that contract directly, since the crate can't
     // fake being a different released version from within a test.
     let mut unknown_fields = BTreeMap::new();
-    unknown_fields.insert("excludes".to_owned(), toml::Value::Array(vec![]));
-    let diagnostics = diagnose_unknown_check_fields(
+    unknown_fields.insert("excludes".to_owned(), serde::de::IgnoredAny);
+    let warning_diagnostics = diagnose_unknown_check_fields(
+        "rust/giant-structs",
+        &unknown_fields,
+        Path::new("CHECKS.toml"),
+        Severity::Warning,
+    );
+    assert_eq!(warning_diagnostics.len(), 1);
+    assert_eq!(warning_diagnostics[0].severity, Severity::Warning);
+
+    let error_diagnostics = diagnose_unknown_check_fields(
         "rust/giant-structs",
         &unknown_fields,
         Path::new("CHECKS.toml"),
         Severity::Error,
     );
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].severity, Severity::Error);
+    assert_eq!(error_diagnostics.len(), 1);
+    assert_eq!(error_diagnostics[0].severity, Severity::Error);
+}
+
+#[test]
+fn unknown_check_field_severity_has_one_released_grace_version() {
+    assert_eq!(
+        unknown_check_field_severity_for_version("0.1.0-alpha.8"),
+        Severity::Warning
+    );
+    assert_eq!(
+        unknown_check_field_severity_for_version("0.1.0-alpha.9"),
+        Severity::Warning
+    );
+    assert_eq!(
+        unknown_check_field_severity_for_version("0.1.0-alpha.10"),
+        Severity::Error
+    );
+    assert_eq!(unknown_check_field_severity_for_version("0.1.0"), Severity::Error);
+    assert_eq!(unknown_check_field_severity_for_version("0.0.0-dev"), Severity::Error);
 }
 
 #[test]
