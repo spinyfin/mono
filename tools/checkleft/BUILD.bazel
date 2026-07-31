@@ -1,9 +1,22 @@
 load("@mono_crates//:defs.bzl", "all_crate_deps")
+load("@rules_rust//cargo:defs.bzl", "cargo_toml_env_vars")
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("//tools/checkleft/musl:transition.bzl", "musl_binary")
 load("//tools/checkleft/wasm:defs.bzl", "precompiled_cwasm_dir")
 
 exports_files(["Cargo.toml"])
+
+# Extracts CARGO_PKG_VERSION (and friends) straight from Cargo.toml at build time,
+# so the version checkleft reports is always the source-controlled value — never a
+# hand-copied duplicate that can drift out of sync. The release pipeline patches
+# Cargo.toml's `version` field in the release checkout before invoking bazel
+# (.buildkite/steps/checkleft-release.sh apply_version_edits), so release builds
+# pick up the bumped version through this same mechanism with no separate
+# --define needed.
+cargo_toml_env_vars(
+    name = "cargo_toml_env_vars",
+    src = "Cargo.toml",
+)
 
 rust_library(
     name = "checkleft_lib",
@@ -38,17 +51,15 @@ rust_library(
     # wasmtime is bumped so that stale .cwasm files are never deserialized.
     # build.rs emits the same value for cargo builds by reading Cargo.lock.
     # THENCHANGE(Cargo.toml)
-    #
-    # CHECKLEFT_BUILD_VERSION mirrors the same-named rustc_env below on the
-    # `checkleft` binary target: it carries the version from Cargo.toml in local
-    # and CI builds, and the release pipeline's `--define CHECKLEFT_VERSION=<ver>`
-    # for release builds (config.rs reads it to decide when the deprecation window
-    # for unknown check-entry keys ends).
-    # Needed here too because config.rs lives in the library, not main.rs.
     rustc_env = {
         "CHECKLEFT_WASMTIME_VERSION": "42.0.2",
-        "CHECKLEFT_BUILD_VERSION": "$(CHECKLEFT_VERSION)",
     },
+    # CARGO_PKG_VERSION (used by config.rs to decide when the deprecation window
+    # for unknown check-entry keys ends, and by main.rs for `--version`) is sourced
+    # from Cargo.toml itself via :cargo_toml_env_vars, so it can never drift from
+    # the package's real version. Needed here too because config.rs lives in the
+    # library, not main.rs.
+    rustc_env_files = [":cargo_toml_env_vars"],
     visibility = ["//:__subpackages__"],
     deps = all_crate_deps(normal = True) + [
         "//tools/checkleft/preinstalled-bundle:checkleft_wasm_bundle_lib",
@@ -62,11 +73,9 @@ rust_binary(
     crate_root = "src/main.rs",
     edition = "2024",
     proc_macro_deps = all_crate_deps(proc_macro = True),
-    # CHECKLEFT_VERSION is set via --define by the release pipeline; .bazelrc
-    # defaults it to Cargo.toml's package version for local and CI builds.
-    rustc_env = {
-        "CHECKLEFT_BUILD_VERSION": "$(CHECKLEFT_VERSION)",
-    },
+    # CARGO_PKG_VERSION is sourced from Cargo.toml via :cargo_toml_env_vars — see
+    # the comment on checkleft_lib's rustc_env_files for why.
+    rustc_env_files = [":cargo_toml_env_vars"],
     visibility = ["//tools/checkleft/bazel:__pkg__"],
     deps = [
         ":checkleft_lib",

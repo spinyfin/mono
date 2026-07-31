@@ -1691,10 +1691,10 @@ fn unrelated_unknown_key_produces_generic_diagnostic_listing_known_fields() {
 
 #[test]
 fn unknown_check_entry_key_does_not_block_loading_during_grace_period() {
-    // During the grace period, a stray key is diagnosed but the check still
-    // loads with its recognised fields applied. Severity is tested below with
-    // an explicit value so this integration test does not depend on the
-    // build-time version injected by Bazel.
+    // During the grace period (severity pinned to Warning explicitly, so this
+    // integration test does not depend on the ambient build-time version), a
+    // stray key is diagnosed but the check still loads with its recognised
+    // fields applied.
     let temp = tempdir().expect("create temp dir");
     fs::write(
         temp.path().join("CHECKS.toml"),
@@ -1702,13 +1702,43 @@ fn unknown_check_entry_key_does_not_block_loading_during_grace_period() {
     )
     .expect("write config");
 
-    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let resolver = ConfigResolver::new(temp.path())
+        .expect("create resolver")
+        .with_unknown_field_severity_for_test(Severity::Warning);
     let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
     let diagnostics: Vec<_> = checks.diagnostics().collect();
     assert!(!diagnostics.is_empty(), "the stray key should be diagnosed");
     assert!(
         checks.get("rust/giant-structs").is_some(),
         "check should still load during the warning-only grace period"
+    );
+}
+
+#[test]
+fn unknown_check_entry_key_blocks_loading_once_escalated_to_error() {
+    // Once the grace period ends (severity pinned to Error explicitly), a stray
+    // key's check is skipped entirely rather than silently loaded with the
+    // unknown key ignored.
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nexcludes = [\"testdata/**\"]\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path())
+        .expect("create resolver")
+        .with_unknown_field_severity_for_test(Severity::Error);
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(!diagnostics.is_empty(), "the stray key should be diagnosed");
+    assert!(
+        diagnostics.iter().any(|d| d.severity == Severity::Error),
+        "the diagnostic should be tagged Error, got {diagnostics:?}"
+    );
+    assert!(
+        checks.get("rust/giant-structs").is_none(),
+        "check should be skipped once the deprecation window has closed"
     );
 }
 

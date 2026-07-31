@@ -17,13 +17,6 @@ build --stamp
 build:release --workspace_status_command=tools/boss/installer/workspace-status.sh
 build:release --stamp
 
-# checkleft version: injected at release time via --define=CHECKLEFT_VERSION=<ver>.
-# Local and CI Bazel builds use the package version from tools/checkleft/Cargo.toml;
-# keep this default synchronized when that version changes. The release pipeline
-# overrides it with the version it is about to publish.
-# THENCHANGE(tools/checkleft/Cargo.toml)
-build --define=CHECKLEFT_VERSION=0.1.0-alpha.8
-
 # boss shake credentials: propagate the three env vars that embed the
 # GitHub App into the binary at compile time. Values must be set in your
 # shell (or via direnv) before running bazel build //tools/boss/cli:boss.

@@ -262,6 +262,13 @@ pub struct ConfigResolver {
     root: PathBuf,
     external_root_configs: Vec<LoadedChecksFile>,
     resolution_cache: Mutex<HashMap<PathBuf, ResolvedChecks>>,
+    /// Severity for an unknown check-entry key, resolved once at construction from
+    /// [`unknown_check_field_severity`]. Threading it through a field (rather than
+    /// re-reading the build-time version on every resolution) lets tests pin an
+    /// explicit severity via [`ConfigResolver::with_unknown_field_severity_for_test`]
+    /// instead of depending on the ambient `CARGO_PKG_VERSION` the test binary was
+    /// built with.
+    unknown_field_severity: Severity,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -277,7 +284,19 @@ impl ConfigResolver {
             root,
             external_root_configs: Vec::new(),
             resolution_cache: Mutex::new(HashMap::new()),
+            unknown_field_severity: unknown_check_field_severity(),
         })
+    }
+
+    /// Test-only override so integration tests can pin the unknown-check-field-key
+    /// severity explicitly instead of depending on the ambient `CARGO_PKG_VERSION`
+    /// the test binary happened to be built with (which will start reporting
+    /// `Error` once the deprecation window in [`UNKNOWN_CHECK_FIELD_WARN_THROUGH_VERSION`]
+    /// closes).
+    #[cfg(test)]
+    fn with_unknown_field_severity_for_test(mut self, severity: Severity) -> Self {
+        self.unknown_field_severity = severity;
+        self
     }
 
     pub async fn new_with_options(root: impl Into<PathBuf>, options: ConfigResolverOptions) -> Result<Self> {
@@ -300,6 +319,7 @@ impl ConfigResolver {
             root,
             external_root_configs,
             resolution_cache: Mutex::new(HashMap::new()),
+            unknown_field_severity: unknown_check_field_severity(),
         })
     }
 
@@ -420,7 +440,7 @@ impl ConfigResolver {
         for check in checks_file.checks {
             let configured_id = check.id;
             if !check.unknown_fields.is_empty() {
-                let severity = unknown_check_field_severity();
+                let severity = self.unknown_field_severity;
                 for diagnostic in diagnose_unknown_check_fields(
                     &configured_id,
                     &check.unknown_fields,
@@ -1089,13 +1109,13 @@ fn config_file_diagnostic_with_severity(
 const UNKNOWN_CHECK_FIELD_WARN_THROUGH_VERSION: &str = "0.1.0-alpha.9";
 
 fn unknown_check_field_severity() -> Severity {
-    // `CHECKLEFT_BUILD_VERSION` carries the release pipeline's `--define
-    // CHECKLEFT_VERSION` (see BUILD.bazel); a plain `cargo build`/crates.io consumer
-    // has no such rustc_env, so fall back to Cargo.toml's own version, same as the
-    // `--version` flag does in main.rs.
-    unknown_check_field_severity_for_version(
-        option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
-    )
+    // CARGO_PKG_VERSION is always the package's real version: for a plain `cargo
+    // build`/crates.io consumer it comes from Cargo.toml directly; for a Bazel
+    // build it's injected from Cargo.toml via the `:cargo_toml_env_vars`
+    // rustc_env_files target in BUILD.bazel, kept in sync automatically. The
+    // release pipeline patches Cargo.toml's version before building, so this
+    // reflects the version actually being released — no separate override needed.
+    unknown_check_field_severity_for_version(env!("CARGO_PKG_VERSION"))
 }
 
 fn unknown_check_field_severity_for_version(effective_version: &str) -> Severity {

@@ -108,7 +108,7 @@ A check entry's own keys — the list above (`id`, `check`, `implementation`, `e
 
 This check is scoped strictly to a check entry's own keys. It never looks inside `config:` — that block is opaque, check-specific configuration passed through verbatim to the check implementation, so an unrecognised key there is the check implementation's concern, not the framework's.
 
-This is a new strictness rule and ships with a one-release deprecation window: today it is diagnosed at `warning` severity (the check still loads); starting with the next released version of checkleft after `0.1.0-alpha.8`, it escalates to `error` (the check entry is skipped, like any other invalid check entry). If `checkleft run` reports this, fix or remove the offending key before the next checkleft upgrade.
+This is a new strictness rule and ships with a one-release deprecation window: today it is diagnosed at `warning` severity (the check still loads). `0.1.0-alpha.9` is the last release that reports this as a warning; `0.1.0-alpha.10` and later report it as an `error` (the check entry is skipped, like any other invalid check entry). If `checkleft run` reports this, fix or remove the offending key before the next checkleft upgrade.
 
 Note what this does _not_ catch: a correctly-spelled key holding a value that can never match anything (for example a glob with a stray leading `./`) is valid shape and stays silent — this is a schema check on key names, not a semantic check on values.
 

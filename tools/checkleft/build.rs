@@ -1,12 +1,9 @@
 fn main() {
-    // Release pipeline sets CHECKLEFT_VERSION before building.
-    // Emit CHECKLEFT_BUILD_VERSION so that option_env!("CHECKLEFT_BUILD_VERSION")
-    // in main.rs resolves to the tag version rather than the Cargo.toml placeholder.
-    // Dev Cargo builds that don't set CHECKLEFT_VERSION fall through to CARGO_PKG_VERSION.
-    if let Ok(v) = std::env::var("CHECKLEFT_VERSION") {
-        println!("cargo:rustc-env=CHECKLEFT_BUILD_VERSION={v}");
-    }
-    println!("cargo:rerun-if-env-changed=CHECKLEFT_VERSION");
+    // CARGO_PKG_VERSION is set automatically by Cargo from Cargo.toml — no manual
+    // wiring needed here. The release pipeline patches Cargo.toml's `version`
+    // field in the release checkout before building (see
+    // .buildkite/steps/checkleft-release.sh apply_version_edits), so Cargo builds
+    // during a release pick up the bumped version through the same mechanism.
 
     // Emit the wasmtime version so runtime.rs can include it in the .cwasm
     // cache key.  The cache key must change whenever wasmtime is bumped because
