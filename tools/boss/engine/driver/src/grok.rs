@@ -2108,6 +2108,210 @@ mod tests {
         );
     }
 
+    /// design T-23 acceptance (part 1/2, Phase 3 — review kind): the
+    /// `boss-read-only` sandbox that denies workspace writes must still
+    /// permit the write the `ReviewResult` file contract depends on. The
+    /// engine resolves that artifact under the system temp dir
+    /// ([`boss_engine_structured_output::default_dir`]), one of the paths
+    /// the built-in `read-only` profile always keeps writable regardless of
+    /// worker kind (`grok-permission-isolation-2026-07-27.md` §"`/tmp`
+    /// always writable"), so the reviewer's structured-output write and its
+    /// workspace-write denial are independent properties, not in tension.
+    ///
+    /// Runs the *actual* driver output (hooks + sandbox included, exactly as
+    /// a real reviewer spawns) and checks both properties by real
+    /// file-presence and a schema-validated parse via
+    /// [`boss_pr_review::ReviewResult::from_json`] — not the model's
+    /// self-report of either outcome.
+    #[tokio::test]
+    async fn write_permission_config_live_review_result_round_trips_under_reviewer_sandbox() {
+        if !live_enforcement_test_enabled() {
+            return;
+        }
+
+        let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for this test"));
+        let scratch_root = real_home
+            .join(".cache")
+            .join("boss-grok-permcfg-live-review-result-test");
+        let _cleanup = ScratchCleanup::new(&scratch_root);
+
+        let homes = scratch_root.join("grok-homes");
+        let workspace = scratch_root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes, &dirs_home_grok_auth(), true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-live-review-result-1";
+        driver
+            .provision_workspace(&workspace, "live review-result round-trip probe", run_id)
+            .await
+            .expect("provision must succeed");
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Reviewer,
+            workspace_path: workspace.clone(),
+            events_socket_path: scratch_root.join("boss-data").join("events.sock"),
+            boss_event_path: scratch_root.join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-live-review".into(),
+            execution_kind: "pr_review".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
+        };
+        let artifacts = driver
+            .write_permission_config(&input, scratch_root.as_path())
+            .await
+            .expect("write_permission_config must succeed");
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let process_home = process_home_for_run(run_id).unwrap();
+
+        // The same real destination the engine resolves for every reviewer
+        // run (not a stand-in scratch path), so the round trip is proven
+        // against the actual production location.
+        let output_dir = boss_engine_structured_output::default_dir();
+        fs::create_dir_all(&output_dir).unwrap();
+        let result_path =
+            boss_engine_structured_output::path_for(&output_dir, run_id, StructuredOutputKind::ReviewResult);
+        let _ = fs::remove_file(&result_path);
+
+        let probe_write = workspace.join("probe_write.txt");
+        let _ = fs::remove_file(&probe_write);
+
+        let review_json = r#"{"pr_url":"https://github.com/example/repo/pull/1","head_sha":"deadbeefcafe","summary":"Live round-trip probe: no real findings.","revision_warranted":false,"findings":[]}"#;
+        let prompt = format!(
+            "Do exactly two things, in order, then stop.\n\
+             1. Try to create a file named probe_write.txt in the current directory with content \
+             SHOULD_NOT_EXIST, using a write tool or shell. Report the outcome honestly, including any \
+             denial/permission error text.\n\
+             2. Write exactly this JSON, verbatim and unmodified, to the absolute path {}:\n\n{}\n\n\
+             Final line: LIVE_DONE",
+            result_path.display(),
+            review_json,
+        );
+
+        let output = run_grok_probe(&grok_home, &process_home, &workspace, &prompt, &artifacts.extra_args);
+        eprintln!(
+            "live review-result round-trip probe stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success(),
+            "live grok invocation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            !probe_write.exists(),
+            "workspace write must still be denied by the boss-read-only sandbox profile: probe_write.txt was created"
+        );
+
+        let written = fs::read_to_string(&result_path).unwrap_or_else(|err| {
+            panic!(
+                "ReviewResult artifact must exist at the engine-resolved path {}: {err}",
+                result_path.display()
+            )
+        });
+        let parsed = boss_pr_review::ReviewResult::from_json(&written).unwrap_or_else(|err| {
+            panic!("ReviewResult artifact must round-trip through the real parser: {err}\n{written}")
+        });
+        assert_eq!(parsed.pr_url, "https://github.com/example/repo/pull/1");
+        assert!(!parsed.revision_warranted);
+        assert!(parsed.findings.is_empty());
+
+        let _ = fs::remove_file(&result_path);
+    }
+
+    /// design T-23 acceptance (part 2/2, Phase 3 — conflict-resolution
+    /// kind): conflict resolution dispatches under `WorkerKind::Standard`
+    /// (`worker_setup::worker_kind_for_execution` maps
+    /// `ExecutionKind::ConflictResolution` to `Standard`, never `Reviewer`),
+    /// which needs real write access to resolve the conflict. This is the
+    /// positive-control complement to
+    /// `write_permission_config_live_sandbox_denies_workspace_write` above:
+    /// proves the `boss-workspace` sandbox profile `write_permission_config`
+    /// selects for `Standard` genuinely *permits* a workspace write, so
+    /// "conflict resolution has write access" is demonstrated rather than
+    /// merely inferred from "it isn't Reviewer".
+    #[tokio::test]
+    async fn write_permission_config_live_standard_sandbox_allows_workspace_write() {
+        if !live_enforcement_test_enabled() {
+            return;
+        }
+
+        let real_home = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set for this test"));
+        let scratch_root = real_home
+            .join(".cache")
+            .join("boss-grok-permcfg-live-standard-write-test");
+        let _cleanup = ScratchCleanup::new(&scratch_root);
+
+        let homes = scratch_root.join("grok-homes");
+        let workspace = scratch_root.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let _guard = env_for_provision(&homes, &dirs_home_grok_auth(), true);
+
+        let driver = GrokDriver::default();
+        let run_id = "run-permcfg-live-standard-write-1";
+        driver
+            .provision_workspace(&workspace, "live standard write-access probe", run_id)
+            .await
+            .expect("provision must succeed");
+
+        let input = PermissionInput {
+            worker_kind: crate::WorkerKind::Standard,
+            workspace_path: workspace.clone(),
+            events_socket_path: scratch_root.join("boss-data").join("events.sock"),
+            boss_event_path: scratch_root.join("boss-event"),
+            run_id: run_id.into(),
+            lease_id: "lease-live-standard".into(),
+            execution_kind: "conflict_resolution".into(),
+            task_kind: None,
+            is_remote: false,
+            path_guard_script: None,
+            checkleft_guard_script: None,
+            codex_sandbox_enforced: false,
+        };
+        let artifacts = driver
+            .write_permission_config(&input, scratch_root.as_path())
+            .await
+            .expect("write_permission_config must succeed");
+
+        let grok_home = grok_home_for_run(run_id).unwrap();
+        let process_home = process_home_for_run(run_id).unwrap();
+
+        let probe_write = workspace.join("probe_write.txt");
+        let _ = fs::remove_file(&probe_write);
+
+        let output = run_grok_probe(
+            &grok_home,
+            &process_home,
+            &workspace,
+            "Create a file named probe_write.txt in the current directory with content SHOULD_EXIST, \
+             using a write tool or shell. Report the outcome honestly. Final line: LIVE_DONE",
+            &artifacts.extra_args,
+        );
+        eprintln!(
+            "live standard-write probe stdout: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.status.success(),
+            "live grok invocation failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        assert!(
+            probe_write.exists(),
+            "conflict resolution's Standard worker kind must retain real workspace write access under its \
+             own sandbox profile: probe_write.txt was not created"
+        );
+    }
+
     struct ScratchCleanup(PathBuf);
     impl ScratchCleanup {
         fn new(path: &Path) -> Self {
