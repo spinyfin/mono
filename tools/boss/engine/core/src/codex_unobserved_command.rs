@@ -50,17 +50,27 @@ pub const UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND: &str = "codex_unobserved_c
 /// and counted on [`CODEX_UNOBSERVED_COMMAND_OVERFLOW`] by the caller in
 /// `app/worker_events.rs`, and [`UnobservedCommandTracker::overflowed`]
 /// drives a dedicated, one-time attention item filed by
-/// [`crate::completion::WorkerCompletionHandler::detect_and_file_unobserved_command_signal`].
+/// `detect_and_file_unobserved_command_overflow` in `completion/worker_signals.rs`.
 pub(crate) const MAX_COMMANDS_PER_EXECUTION: usize = 50;
 
 /// Outcome of [`UnobservedCommandTracker::record`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordOutcome {
-    /// Newly added to the audit trail.
+    /// Newly added to the audit trail. Arms the completion-gate signal
+    /// (`unresolved`) — this is a genuine abandonment the gate has not yet
+    /// acted on.
     Staged,
     /// The same command text is already in the audit trail for this
-    /// execution — the same cumulative signal re-observed (e.g. a duplicate
-    /// hook delivery).
+    /// execution — most commonly the same cumulative signal re-observed
+    /// (e.g. a duplicate hook delivery), but also reached if a later turn
+    /// abandons a command with identical text to one already recorded. Does
+    /// NOT arm the completion-gate signal: a redelivered notification for an
+    /// abandonment the gate has already consumed must not spuriously refuse
+    /// a later, genuinely clean turn's `NO_CHANGES_NEEDED` claim. The
+    /// trade-off this accepts: a command abandoned again on a later turn,
+    /// using text identical to an earlier abandonment, will not re-arm the
+    /// gate either — the audit trail cannot distinguish "redelivery" from
+    /// "genuine re-abandonment" on command text alone.
     Duplicate,
     /// [`MAX_COMMANDS_PER_EXECUTION`] was already reached; the command is
     /// NOT added to the audit trail. The completion-gate signal
@@ -122,9 +132,9 @@ struct ExecutionState {
 /// unrelated claim inheriting that same refusal for the rest of the session.
 /// This does not soften the refusal condition itself (still: an
 /// unconfirmed command makes the immediately-following no-op claim
-/// untrustworthy) — it only fixes which claims that condition reaches, per
-/// the project brief's "fix which conditions reach it" constraint. The
-/// permanent audit trail (`commands`, filed as attention items) is
+/// untrustworthy) — it only fixes which claims that condition reaches; the
+/// condition itself is unchanged. The permanent audit trail (`commands`,
+/// filed as attention items) is
 /// unaffected and keeps every abandonment visible to a human reviewer for
 /// the life of the run, regardless of how many times the gate has since
 /// reset.
@@ -138,25 +148,31 @@ impl UnobservedCommandTracker {
         Self::default()
     }
 
-    /// Stage one abandoned command for `execution_id`. Always arms
-    /// [`Self::consume_unresolved`] for this execution (even on
-    /// [`RecordOutcome::Duplicate`] / [`RecordOutcome::CapExceeded`] — the
-    /// gate signal is uncapped and must never be weakened by audit-trail
-    /// bookkeeping), and appends to the capped audit trail unless the
-    /// command text is already present or [`MAX_COMMANDS_PER_EXECUTION`] is
-    /// reached.
+    /// Stage one abandoned command for `execution_id`. Arms
+    /// [`Self::consume_unresolved`] for this execution on
+    /// [`RecordOutcome::Staged`] and [`RecordOutcome::CapExceeded`] — both
+    /// are a genuine abandonment the gate has not yet acted on, and the gate
+    /// signal is uncapped so [`RecordOutcome::CapExceeded`] must never weaken
+    /// it. Deliberately does NOT arm the gate on [`RecordOutcome::Duplicate`]:
+    /// the audit trail never clears, so a redelivered notification for an
+    /// abandonment the gate already consumed would otherwise spuriously
+    /// refuse a later, genuinely clean turn's `NO_CHANGES_NEEDED` claim —
+    /// see [`RecordOutcome::Duplicate`]'s doc for the trade-off this accepts.
+    /// Appends to the capped audit trail unless the command text is already
+    /// present or [`MAX_COMMANDS_PER_EXECUTION`] is reached.
     pub fn record(&self, execution_id: &str, command: &str) -> RecordOutcome {
         let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
         let state = guard.entry(execution_id.to_owned()).or_default();
-        state.unresolved = true;
         if state.commands.iter().any(|existing| existing == command) {
             return RecordOutcome::Duplicate;
         }
         if state.commands.len() >= MAX_COMMANDS_PER_EXECUTION {
             state.overflowed = true;
+            state.unresolved = true;
             return RecordOutcome::CapExceeded;
         }
         state.commands.push(command.to_owned());
+        state.unresolved = true;
         RecordOutcome::Staged
     }
 
@@ -175,8 +191,8 @@ impl UnobservedCommandTracker {
 
     /// Whether the audit trail for `execution_id` has ever overflowed
     /// [`MAX_COMMANDS_PER_EXECUTION`] — drives the one-time overflow
-    /// attention item in
-    /// [`crate::completion::WorkerCompletionHandler::detect_and_file_unobserved_command_signal`].
+    /// attention item filed by `detect_and_file_unobserved_command_overflow`
+    /// in `completion/worker_signals.rs`.
     /// Sticky (never clears): the operator-visible record that this
     /// execution abandoned more distinct commands than Boss keeps a written
     /// trail for must survive even after the trail itself stops growing.
@@ -194,6 +210,25 @@ impl UnobservedCommandTracker {
     /// the `NO_CHANGES_NEEDED` refusal gate's signal — see the type-level
     /// doc for why it must self-clear rather than latch for the life of the
     /// run.
+    ///
+    /// **Stated decision: this clears on being *read*, not on positive
+    /// evidence that the intervening turn's correlation pipeline is
+    /// healthy again.** The driver surfaces abandonment as a point-in-time
+    /// notification (`WorkerEvent::Notification` carrying
+    /// `UNOBSERVED_COMMAND_MARKER`), not an ongoing per-turn health signal —
+    /// there is no "this turn's commands all completed cleanly" fact
+    /// available to gate the clear on. The consequence: a worker only has to
+    /// re-emit the identical `NO_CHANGES_NEEDED` claim at the next `Stop` to
+    /// get it accepted, with Boss no better informed about the original
+    /// abandoned command's outcome than at the first refusal. That is a
+    /// weaker guarantee than "the run demonstrated it recovered," but it is
+    /// still strictly better than the permanent latch this replaced (see
+    /// above), and gating on real per-turn health evidence would require the
+    /// Codex progress normaliser to emit a new "turn completed with every
+    /// started command observed completing" fact — out of scope for this
+    /// self-clearing-signal change. The permanent, ungated audit trail (see
+    /// [`Self::list`]) is the durable record for a human reviewer regardless
+    /// of how the gate itself behaves.
     pub fn consume_unresolved(&self, execution_id: &str) -> bool {
         let mut guard = self.inner.lock().expect("UnobservedCommandTracker mutex poisoned");
         match guard.get_mut(execution_id) {
@@ -308,6 +343,26 @@ mod tests {
         assert!(
             !tracker.consume_unresolved("exec_2"),
             "unrelated execution must be unaffected"
+        );
+    }
+
+    #[test]
+    fn duplicate_hook_delivery_does_not_rearm_a_consumed_gate() {
+        let tracker = UnobservedCommandTracker::new();
+        assert_eq!(tracker.record("exec_1", "sleep 999"), RecordOutcome::Staged);
+        assert!(
+            tracker.consume_unresolved("exec_1"),
+            "the original abandonment is consumed by the gate"
+        );
+        assert_eq!(
+            tracker.record("exec_1", "sleep 999"),
+            RecordOutcome::Duplicate,
+            "a redelivered notification for the same command text is a duplicate"
+        );
+        assert!(
+            !tracker.consume_unresolved("exec_1"),
+            "a duplicate hook delivery for an already-consumed abandonment must not spuriously \
+             refuse a later, genuinely clean turn's NO_CHANGES_NEEDED claim"
         );
     }
 

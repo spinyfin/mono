@@ -630,8 +630,8 @@ impl WorkerCompletionHandler {
                  Command:\n\n```\n{command}\n```\n\n\
                  Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
                  run that depends on it — tests passing, a build succeeding, `NO_CHANGES_NEEDED` — \
-                 is treated as unconfirmed: the sanctioned no-op completion is refused for this \
-                 execution as a result, so the worker still gets the normal produce-a-PR nudge.",
+                 is treated as unconfirmed: the next `NO_CHANGES_NEEDED` claim after this abandonment \
+                 is refused and the worker gets the normal produce-a-PR nudge instead.",
                 execution_id = execution.id,
                 work_item_id = execution.work_item_id,
             );
