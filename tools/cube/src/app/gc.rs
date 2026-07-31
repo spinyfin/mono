@@ -159,8 +159,9 @@ pub(super) fn gc_workspace_bookmarks(
 
 /// Collect local `pr/<n>` bookmarks in `workspace_path` whose GitHub PR is
 /// MERGED or CLOSED. Returns an empty list when offline, the workspace has no
-/// GitHub remote, or there are no `pr/*` bookmarks. Failures from `jj` or
-/// `gh` are swallowed so this best-effort sweep never blocks the caller.
+/// GitHub remote, or there are no `pr/*` bookmarks. `jj` failures are
+/// swallowed; a failed or timed-out PR-state lookup is logged and skips the
+/// sweep. Either way this best-effort sweep never blocks the caller.
 ///
 /// A workspace is reused across many leases over its lifetime, and each
 /// `cube workspace goto`/`pr push` against it can leave behind a local

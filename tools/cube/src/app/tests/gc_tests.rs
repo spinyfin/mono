@@ -489,6 +489,112 @@ fn gc_batches_pr_state_lookup_across_multiple_bookmarks() {
     release_runner.assert_exhausted();
 }
 
+/// When the batched PR-state lookup itself fails (rate-limited, timed out,
+/// transport error), the sweep must forget nothing rather than guessing —
+/// `gc_collect_closed_pr_bookmarks` logs a warning and returns an empty list,
+/// so no `jj bookmark forget` call follows. `FakeRunner` is a strict FIFO of
+/// exact-match invocations, so if the production code regressed to treating
+/// a failed lookup as "nothing closed" (via `unwrap_or_default` or similar)
+/// and *forgot* a bookmark anyway, this test would panic on "unexpected
+/// commands remaining" (the queued forget would never be reached) — or if it
+/// prematurely called `forget`, on "unexpected command invocation".
+#[test]
+fn gc_forgets_nothing_when_batched_pr_state_lookup_fails() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+    let lease_result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc batch failure"]),
+        Some(&database_path),
+        &lease_runner,
+    )
+    .expect("lease");
+    lease_runner.assert_exhausted();
+    let lease_id = lease_result.payload["workspace"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let release_runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+        release_guard_reusable_command(&workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+        gc_noop_command(&workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"pr/*\")",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+            "pr/42\n",
+        ),
+        ExpectedCommand {
+            cwd: workspace_path.clone(),
+            program: "gh".to_string(),
+            args: [
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 42) { state } } }",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+            result: Err(CubeError::CommandFailed {
+                program: "gh".to_string(),
+                args: vec!["api".to_string(), "graphql".to_string()],
+                status: Some(1),
+                stderr: "gh: API rate limit exceeded (HTTP 403)".to_string(),
+            }),
+            creates_dir: None,
+            duration: std::time::Duration::ZERO,
+        },
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "gh",
+            &["api", "rate_limit", "--jq", ".resources.graphql.reset"],
+            "9999999999",
+        ),
+        // No bookmark forget — the batched lookup failed, so the sweep skips
+        // this workspace entirely rather than forgetting pr/42 blind.
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+        Some(&database_path),
+        &release_runner,
+    )
+    .expect("release");
+    release_runner.assert_exhausted();
+}
+
 #[test]
 fn gc_skips_pr_sweep_when_offline() {
     // When jj git remote list fails, pr/* GC is skipped entirely.
