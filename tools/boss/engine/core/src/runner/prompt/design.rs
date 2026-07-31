@@ -82,10 +82,7 @@ fn design_guidance_block(design_guidance: Option<&str>) -> String {
 /// count to scope, an explicit "the rules add, they do not multiply", and a
 /// required `Breakdown size:` line that makes the author defend N. No cap:
 /// a design that genuinely needs twenty entries may still propose twenty.
-pub(super) fn compose_design_directive(
-    parent_project: Option<&Project>,
-    design_guidance: Option<&str>,
-) -> String {
+pub(super) fn compose_design_directive(parent_project: Option<&Project>, design_guidance: Option<&str>) -> String {
     let mut out = String::new();
     out.push_str(&design_guidance_block(design_guidance));
     out.push_str("Expected outcome for this run:\n");
