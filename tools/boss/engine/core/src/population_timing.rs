@@ -20,6 +20,7 @@
 //!   db.task_runtimes N+1 hydration — carries db_queries (statements run)
 //!   db.dependencies
 //!   db.ai_reviewing
+//!   db.ai_review_state
 //!   db.doc_pointers  per-task doc-pointer resolution (gated N+1)
 //!   assemble         in-memory projection / flag attachment
 //!   queue_wait       handler enqueue → writer-task dequeue (session backlog)
@@ -93,6 +94,8 @@ pub mod segment {
     pub const DB_DEPENDENCIES: &str = "db.dependencies";
     /// Batched `IN (...)` query for the "AI reviewing" badge.
     pub const DB_AI_REVIEWING: &str = "db.ai_reviewing";
+    /// Batched `IN (...)` query for the resolved AI-review-state badge.
+    pub const DB_AI_REVIEW_STATE: &str = "db.ai_review_state";
     /// Per-task doc-pointer resolution loop — a secondary, gated N+1.
     pub const DB_DOC_POINTERS: &str = "db.doc_pointers";
     /// In-memory projection / flag attachment (no DB).

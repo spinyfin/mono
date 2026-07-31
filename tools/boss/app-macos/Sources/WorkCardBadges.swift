@@ -748,29 +748,95 @@ struct ResolvingCIFailureBadge: View {
     }
 }
 
-/// "AI reviewing" card chip. Rendered on Doing-column cards held in `active`
-/// while a `pr_review` reviewer execution is in flight (P992). The badge
-/// distinguishes a card that is intentionally waiting for the AI review pass
-/// from one that appears stuck with no explanation.
+/// AI-review-state badge for a kanban card. Engine-resolved via
+/// `WorkTask.aiReviewState`; the caller only builds this view when that
+/// field is non-nil (`nil` — "not reviewed yet" — renders no badge at all,
+/// so exactly one of the four states below is ever on screen at once).
+///
+/// Icon + tooltip, not a text pill — matching `PrCiIndicator`/
+/// `PrReviewIndicator` (the two other multi-state card indicators) rather
+/// than the capsule-chip style most other badges in this file use. Glyph
+/// vocabulary is deliberately borrowed from `PrReviewIndicator` rather than
+/// four ad-hoc "brain" variants (there is no distinct SF Symbol per review
+/// outcome): `reviewed_with_findings` reuses its `changes_requested` glyph/
+/// tint (orange `exclamationmark.circle.fill` — "needs attention"),
+/// `reviewed_all_clear` reuses its `approved` glyph/tint (green
+/// `checkmark.seal.fill` — "signed off"). `reviewing` keeps the plain
+/// `brain` glyph the pre-existing "AI reviewing" chip used, for
+/// continuity with the state this badge subsumes. `review_not_required`
+/// gets a plain `minus.circle` — a kind never touched by AI review at all.
+///
+/// Only `reviewed_with_findings` is actionable: tapping it reveals the
+/// follow-up revision that carries the review comments, when one exists
+/// (`onRevealFindings` is `nil` when revision creation itself failed —
+/// same optional-action pattern as `PrInRevisionIndicator`).
+struct AIReviewStateBadge: View {
+    let state: String
+    var onRevealFindings: (() -> Void)? = nil
 
-struct ReviewingAIBadge: View {
-    var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: "brain")
-                .font(.caption2)
-            Text("AI reviewing")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
-                .lineLimit(1)
-                .truncationMode(.tail)
+    private var systemImage: String {
+        switch state {
+        case "reviewing": return "brain"
+        case "reviewed_with_findings": return "exclamationmark.circle.fill"
+        case "reviewed_all_clear": return "checkmark.seal.fill"
+        case "review_not_required": return "minus.circle"
+        default: return "brain"
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 3)
-        .background(Color.accentColor.opacity(0.10))
-        .clipShape(Capsule())
-        .layoutPriority(-1)
-        .help("An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute).")
-        .accessibilityLabel("AI reviewing PR")
+    }
+
+    private var tint: Color {
+        switch state {
+        case "reviewing": return .accentColor
+        case "reviewed_with_findings": return .orange
+        case "reviewed_all_clear": return .green
+        case "review_not_required": return .secondary
+        default: return .secondary
+        }
+    }
+
+    private var tooltip: String {
+        switch state {
+        case "reviewing":
+            return "An AI reviewer pass is running on this PR. The card will move to Review once the pass completes (typically within a minute)."
+        case "reviewed_with_findings":
+            return onRevealFindings != nil
+                ? "The AI reviewer found issues on this PR — click to reveal the follow-up revision that addresses them."
+                : "The AI reviewer found issues on this PR, but the follow-up revision could not be created."
+        case "reviewed_all_clear":
+            return "The AI reviewer completed with no findings."
+        case "review_not_required":
+            return "This kind of work item is not reviewed by the AI reviewer."
+        default:
+            return "AI review state"
+        }
+    }
+
+    private var accessibilityLabel: String {
+        switch state {
+        case "reviewing": return "AI reviewing"
+        case "reviewed_with_findings": return "AI review found issues"
+        case "reviewed_all_clear": return "AI review: all clear"
+        case "review_not_required": return "AI review not required"
+        default: return "AI review state unknown"
+        }
+    }
+
+    var body: some View {
+        let icon = Image(systemName: systemImage)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(tint)
+
+        Group {
+            if state == "reviewed_with_findings", let onRevealFindings {
+                Button(action: onRevealFindings) { icon }
+                    .buttonStyle(.plain)
+                    .pointerStyle(.link)
+            } else {
+                icon
+            }
+        }
+        .help(tooltip)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 

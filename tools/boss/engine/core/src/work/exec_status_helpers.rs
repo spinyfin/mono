@@ -1,5 +1,26 @@
 use super::*;
 
+/// The `ExecutionKind` a task's own primary-implementation execution would
+/// run as. Extracted from [`execution_kind_for_work_item`] so callers that
+/// already have a `TaskKind` in hand (no DB round trip needed) — notably
+/// [`task_kind_excluded_from_ai_review`] — share this one mapping instead of
+/// hand-rolling a second copy of the kind list that could drift from it.
+pub(crate) fn execution_kind_for_task_kind(kind: &TaskKind) -> ExecutionKind {
+    match kind {
+        TaskKind::Chore | TaskKind::Followup => ExecutionKind::ChoreImplementation,
+        // Reuses `ProjectDesign`: a postmortem's deliverable is a doc PR
+        // against the project's *existing* design doc, same dispatch/
+        // lifecycle handling as an initial design task. The prompt
+        // composer (`compose_worker_prompt`) branches on the task's own
+        // `kind` to give it the postmortem-specific directive instead of
+        // the "write a new design" one.
+        TaskKind::Design | TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
+        TaskKind::Revision => ExecutionKind::RevisionImplementation,
+        TaskKind::Investigation => ExecutionKind::InvestigationImplementation,
+        TaskKind::ProjectTask | TaskKind::Task => ExecutionKind::TaskImplementation,
+    }
+}
+
 pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str) -> Result<ExecutionKind> {
     Ok(match classify_id(work_item_id)? {
         ItemKind::Product => ExecutionKind::ProductDesign,
@@ -15,21 +36,32 @@ pub(crate) fn execution_kind_for_work_item(conn: &Connection, work_item_id: &str
             let task = query_task(conn, work_item_id)?
                 .filter(|task| task.deleted_at.is_none())
                 .with_context(|| format!("unknown task: {work_item_id}"))?;
-            match task.kind {
-                TaskKind::Chore | TaskKind::Followup => ExecutionKind::ChoreImplementation,
-                // Reuses `ProjectDesign`: a postmortem's deliverable is a doc PR
-                // against the project's *existing* design doc, same dispatch/
-                // lifecycle handling as an initial design task. The prompt
-                // composer (`compose_worker_prompt`) branches on the task's own
-                // `kind` to give it the postmortem-specific directive instead of
-                // the "write a new design" one.
-                TaskKind::Design | TaskKind::DesignPostmortem => ExecutionKind::ProjectDesign,
-                TaskKind::Revision => ExecutionKind::RevisionImplementation,
-                TaskKind::Investigation => ExecutionKind::InvestigationImplementation,
-                TaskKind::ProjectTask | TaskKind::Task => ExecutionKind::TaskImplementation,
-            }
+            execution_kind_for_task_kind(&task.kind)
         }
     })
+}
+
+/// Whether a task of this `kind` is excluded from AI review entirely — no
+/// `pr_review` execution is ever enqueued for its own primary-implementation
+/// completion. Re-derives the exclusion from
+/// [`crate::completion::should_enqueue_reviewer_for_primary`] via the same
+/// `execution_kind_for_task_kind` mapping that function's other call site
+/// uses, rather than hand-listing `Design`/`DesignPostmortem`/`Investigation`
+/// here — the engine records nothing about the exclusion at review-skip
+/// time, so this is the only way to answer "was this kind reviewable" later
+/// without a second kind list that the exclusion predicate could drift from.
+///
+/// `Revision` is special-cased to `false` (never excluded): a revision's own
+/// push is reviewed via a separate, always-on trigger at the
+/// `finalize_pr_transition` call site
+/// (`producing.kind == ExecutionKind::RevisionImplementation`), independent
+/// of whether the chain root's kind is reviewable — so the primary-kind
+/// exclusion list does not apply to revision rows at all.
+pub(crate) fn task_kind_excluded_from_ai_review(kind: &TaskKind) -> bool {
+    if *kind == TaskKind::Revision {
+        return false;
+    }
+    !crate::completion::should_enqueue_reviewer_for_primary(&execution_kind_for_task_kind(kind))
 }
 
 /// Stage an [`Event::ExecutionTerminal`] for publish once the caller's

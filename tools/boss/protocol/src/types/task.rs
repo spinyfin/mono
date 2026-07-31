@@ -964,6 +964,35 @@ pub struct Task {
     #[builder(default)]
     pub ai_reviewing: bool,
 
+    /// Resolved AI-review state for this card, one of `"reviewing"`,
+    /// `"reviewed_with_findings"`, `"reviewed_all_clear"`, or
+    /// `"review_not_required"`. `None` means "not reviewed yet" — render no
+    /// badge — and must never be treated as a clean result: absence of
+    /// evidence is not evidence of a clean pass.
+    ///
+    /// This is a derived projection set by the engine's `get_work_tree` path
+    /// (not a stored DB column), computed from the durable
+    /// `pr_review_verdicts` ledger — never from `work_executions.status`,
+    /// which cannot distinguish a clean pass from one whose findings were
+    /// computed and then discarded (duplicate-head drop, failed revision
+    /// creation, or an auto-nudge give-up). For a chain-root task with at
+    /// least one revision that has reached `in_review`/`done`, this reflects
+    /// the review outcome of the most recently completed such revision
+    /// (rolled up here so the app never has to walk the revision chain
+    /// itself) rather than the root's own (possibly nonexistent) verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_review_state: Option<String>,
+
+    /// The revision task that carries the review comments for
+    /// `ai_review_state == "reviewed_with_findings"`, when one was
+    /// successfully created. `None` for every other `ai_review_state`
+    /// value, and also `None` for `"reviewed_with_findings"` itself when the
+    /// findings were computed but revision creation failed (parent PR
+    /// merged/closed between review and revision-create) — there is nothing
+    /// to reveal in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_review_findings_revision_id: Option<String>,
+
     /// `true` when this is a Review-lane card waiting on *the operator* and
     /// nothing else — it could be reviewed and merged right now. All of:
     /// `status == "in_review"` with a `pr_url` set, `blocked_reason` is

@@ -502,6 +502,7 @@ pub(crate) use migrations_boothby::*;
 pub(crate) use products_design::{parse_pr_doc_artifact_id, resolve_task_doc_pointer};
 pub(crate) use proposal_apply::*;
 pub(crate) use query_ensure::*;
+pub(crate) use review_verdicts::query_latest_informative_review_verdicts;
 pub(crate) use revision_helpers::*;
 pub(crate) use task_targets::*;
 

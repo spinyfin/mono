@@ -274,6 +274,11 @@ pub(crate) fn map_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         // in single-item query paths (get_work_item etc.) where the derived
         // projection is not computed.
         ai_reviewing: false,
+        // Computed by attach_ai_review_state in get_work_tree; always None
+        // in single-item query paths where the derived projection is not
+        // computed.
+        ai_review_state: None,
+        ai_review_findings_revision_id: None,
         // Computed by attach_ready_for_review_flag in get_work_tree; always
         // false in single-item query paths where the derived projection is
         // not computed.

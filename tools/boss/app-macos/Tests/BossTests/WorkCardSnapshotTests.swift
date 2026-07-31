@@ -52,6 +52,8 @@ final class WorkCardSnapshotTests: XCTestCase {
         "blockedReason",
         "blockedDetail",
         "aiReviewing",
+        "aiReviewState",
+        "aiReviewFindingsRevisionId",
         "ciRequiredState",
         "ciRequiredDetail",
         "reviewRequiredState",
@@ -496,6 +498,31 @@ final class WorkCardSnapshotTests: XCTestCase {
                 }
             ),
             Case(
+                name: "aiReviewState",
+                context: backlog,
+                base: {
+                    var t = Self.makeTask(id: "task_1")
+                    t.aiReviewState = nil
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.aiReviewState = "reviewing"; return t
+                }
+            ),
+            Case(
+                name: "aiReviewFindingsRevisionId",
+                context: backlog,
+                base: {
+                    var t = Self.makeTask(id: "task_1")
+                    t.aiReviewState = "reviewed_with_findings"
+                    t.aiReviewFindingsRevisionId = nil
+                    return t
+                },
+                mutate: {
+                    var t = $0; t.aiReviewFindingsRevisionId = "task_followup_1"; return t
+                }
+            ),
+            Case(
                 name: "ciRequiredState",
                 context: review,
                 base: {
@@ -708,24 +735,28 @@ final class WorkCardSnapshotTests: XCTestCase {
     func testIsAIReviewingInDoing() {
         var task = Self.makeTask(status: "active")
         task.aiReviewing = true
+        task.aiReviewState = "reviewing"
         let snap = WorkCardSnapshot.build(
             task: task,
             context: WorkCardSnapshotContext(column: .doing)
         )
         XCTAssertTrue(snap.isAIReviewing)
-        XCTAssertTrue(snap.showsAIReviewingBadge)
+        XCTAssertEqual(snap.aiReviewState, "reviewing")
     }
 
     func testIsAIReviewingFalseOutsideDoing() {
         var task = Self.makeTask(status: "active")
         task.aiReviewing = true
+        task.aiReviewState = "reviewing"
         let snap = WorkCardSnapshot.build(
             task: task,
             context: WorkCardSnapshotContext(column: .backlog)
         )
-        // Badge visibility follows task fields; the lane boolean is column-gated.
+        // Badge visibility follows the engine-resolved `aiReviewState`
+        // verbatim (no app-side column gating); the lane activity boolean
+        // is what's column-gated.
         XCTAssertFalse(snap.isAIReviewing)
-        XCTAssertTrue(snap.showsAIReviewingBadge)
+        XCTAssertEqual(snap.aiReviewState, "reviewing")
         XCTAssertNil(snap.activityState)
     }
 

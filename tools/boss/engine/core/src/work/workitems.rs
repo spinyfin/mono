@@ -867,6 +867,19 @@ impl WorkDb {
         }
         trace.record_plain(segment::DB_AI_REVIEWING, elapsed_ms(t));
 
+        // Resolve the single AI-review-state badge (reviewing / reviewed
+        // with findings / reviewed all clear / review not required / no
+        // badge) for every task and chore. Must run after the ai_reviewing
+        // attach above (reads it) and after attach_revision_projections
+        // above (reads revision_seq). Errors are non-fatal — log and leave
+        // the field at its default (no badge). Single batched `IN (...)`
+        // query against `pr_review_verdicts`.
+        let t = Instant::now();
+        if let Err(err) = attach_ai_review_state(&conn, &mut tasks, &mut chores) {
+            tracing::warn!(?err, "get_work_tree: failed to attach ai_review_state; ignoring");
+        }
+        trace.record_plain(segment::DB_AI_REVIEW_STATE, elapsed_ms(t));
+
         // Resolve the per-task doc-link state for project-less docs-backed
         // items (investigations / project-less designs) so their card renders
         // the Review-lane doc-link icon — parity with design cards, whose

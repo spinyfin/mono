@@ -20,7 +20,8 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
     let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
     let projectName: String?
-    let showsAIReviewingBadge: Bool
+    let aiReviewState: String?
+    let aiReviewFindingsRevisionId: String?
     let showsResolvingConflictsBadge: Bool
     let showsResolvingCIBadge: Bool
     let blockedBadgeText: String?
@@ -57,7 +58,8 @@ struct WorkBoardCardBadgeStripSlice: Equatable {
         self.showsHumanDrivenBadge = snapshot.showsHumanDrivenBadge
         self.showsProjectBadge = snapshot.showsProjectBadge
         self.projectName = snapshot.projectName
-        self.showsAIReviewingBadge = snapshot.showsAIReviewingBadge
+        self.aiReviewState = snapshot.aiReviewState
+        self.aiReviewFindingsRevisionId = snapshot.aiReviewFindingsRevisionId
         self.showsResolvingConflictsBadge = snapshot.showsResolvingConflictsBadge
         self.showsResolvingCIBadge = snapshot.showsResolvingCIBadge
         self.blockedBadgeText = snapshot.blockedBadgeText
@@ -98,6 +100,10 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
     var onOpenTerminal: (() -> Void)? = nil
     /// Merge-when-ready confirm; also gated by `slice.showsMergeWhenReady`.
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Invoked when the user taps the `reviewed_with_findings` badge —
+    /// reveals the follow-up revision that carries the review comments.
+    /// Only called when `slice.aiReviewFindingsRevisionId` is non-nil.
+    var onRevealAIReviewFindings: (() -> Void)? = nil
     var onAcceptDeferredScope: ((String) -> Void)? = nil
     var onCreateTaskFromDeferredScope: ((String) -> Void)? = nil
 
@@ -130,8 +136,11 @@ struct WorkBoardCardBadgeStrip: View, @MainActor Equatable {
             if slice.showsProjectBadge, let projectName = slice.projectName {
                 WorkStatusBadge(text: projectName)
             }
-            if slice.showsAIReviewingBadge {
-                ReviewingAIBadge()
+            if let aiReviewState = slice.aiReviewState {
+                AIReviewStateBadge(
+                    state: aiReviewState,
+                    onRevealFindings: slice.aiReviewFindingsRevisionId != nil ? onRevealAIReviewFindings : nil
+                )
             }
             if slice.showsResolvingConflictsBadge {
                 ResolvingConflictsBadge()

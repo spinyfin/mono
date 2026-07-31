@@ -1977,7 +1977,13 @@ fn work_item_id(item: &WorkItem) -> String {
 /// [`WorkerCompletionHandler::enable_revision_triggered_reviews`] kill-switch
 /// (2026-07-01 revision-review experiment — closes the gap where only the
 /// first push on a PR was ever reviewed).
-fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
+///
+/// Also reused (via [`crate::work::task_kind_excluded_from_ai_review`]) to
+/// derive the "review not required" AI-review-badge state for a task's
+/// *kind*, independent of any particular execution — sharing this predicate
+/// is what keeps that derivation from drifting out of sync with the actual
+/// enqueue gate.
+pub(crate) fn should_enqueue_reviewer_for_primary(kind: &ExecutionKind) -> bool {
     matches!(
         kind,
         ExecutionKind::ChoreImplementation | ExecutionKind::TaskImplementation

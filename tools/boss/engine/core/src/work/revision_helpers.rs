@@ -502,6 +502,154 @@ pub(crate) fn attach_ai_reviewing_flag(
     Ok(())
 }
 
+// ── AI review state ──────────────────────────────────────────────────────────
+
+/// Wire values for `Task.ai_review_state`. Plain string constants — not a
+/// dedicated protocol enum — matching the existing convention for polled
+/// PR-state fields (`ci_required_state`, `pr_mergeable_state`, ...).
+pub(crate) const AI_REVIEW_STATE_REVIEWING: &str = "reviewing";
+pub(crate) const AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS: &str = "reviewed_with_findings";
+pub(crate) const AI_REVIEW_STATE_REVIEWED_ALL_CLEAR: &str = "reviewed_all_clear";
+pub(crate) const AI_REVIEW_STATE_REVIEW_NOT_REQUIRED: &str = "review_not_required";
+
+/// Resolve and set `ai_review_state` (+ `ai_review_findings_revision_id`) on
+/// every task and chore — the single AI-review badge state a kanban card
+/// should show. Must run after [`attach_revision_projections`] (reads
+/// `revision_seq`) and after [`attach_ai_reviewing_flag`] (reads
+/// `ai_reviewing`) in `get_work_tree`.
+///
+/// Precedence, evaluated top to bottom for every row — a row can satisfy
+/// more than one of these at once (e.g. reopened to Doing after an earlier
+/// completed review), so this order is load-bearing, not incidental:
+///
+/// 1. **Kind-excluded** ([`task_kind_excluded_from_ai_review`]) → always
+///    `review_not_required`, regardless of status or revision history.
+///    Deliberate simplification: a `design`/`design_postmortem`/
+///    `investigation` chain root never gets an *initial* AI review
+///    (`should_enqueue_reviewer_for_primary` excludes it), but a revision
+///    under it CAN still be reviewed via the separate, kind-independent
+///    revision-review trigger — this rule does not look through to that; the
+///    chain root's own card still reads `review_not_required`.
+/// 2. **Active (Doing)** → `reviewing` when [`attach_ai_reviewing_flag`]
+///    already set `ai_reviewing` on this row, else no badge ("not reviewed
+///    yet"). Any older verdict is ignored here: a row back in Doing has
+///    fresh, not-yet-reviewed work in flight, so a stale `reviewed_*` badge
+///    would misrepresent the current head.
+/// 3. **In Review or Done** → resolve the most recent *informative* verdict
+///    (never `gave_up`/`dropped_duplicate_head` — see
+///    [`query_latest_informative_review_verdicts`]; a give-up or dropped
+///    duplicate is treated exactly like "no verdict at all," per the
+///    deliberate absence of a "review failed" state) for: the last
+///    completed (`in_review`/`done`) direct-child revision's own id when one
+///    exists, else the row's own id. `completed_clean` →
+///    `reviewed_all_clear`. `completed_with_findings` /
+///    `revision_creation_failed` → `reviewed_with_findings`, plus the
+///    verdict's `revision_task_id` (the follow-up revision carrying those
+///    review comments — `None` when revision creation itself failed, so
+///    there is nothing to reveal). No informative verdict → no badge.
+/// 4. Anything else (backlog/blocked/cancelled/archived) → no badge.
+pub(crate) fn attach_ai_review_state(conn: &Connection, tasks: &mut [Task], chores: &mut [Task]) -> Result<()> {
+    // The last completed (in_review/done) direct-child revision per parent
+    // id, keyed by the highest `revision_seq`. Revisions always parent
+    // directly to the chain root (never to another revision — see
+    // `insert_revision_in_tx`), so a single non-recursive group-by answers
+    // "last completed revision" with no chain walk.
+    let mut last_completed_by_parent: std::collections::HashMap<String, (i64, String)> =
+        std::collections::HashMap::new();
+    for t in tasks.iter() {
+        if t.kind != TaskKind::Revision || !matches!(t.status, TaskStatus::InReview | TaskStatus::Done) {
+            continue;
+        }
+        let parent_id = match t.parent_task_id.clone() {
+            Some(p) => p,
+            None => continue,
+        };
+        let seq = t.revision_seq.unwrap_or(0);
+        last_completed_by_parent
+            .entry(parent_id)
+            .and_modify(|(best_seq, best_id)| {
+                if seq > *best_seq {
+                    *best_seq = seq;
+                    *best_id = t.id.clone();
+                }
+            })
+            .or_insert((seq, t.id.clone()));
+    }
+
+    // Which id's verdict actually answers "is THIS card reviewed": the
+    // row's own id, unless it's a chain root in Review/Done with a last
+    // completed revision, in which case that revision's own id (verdicts
+    // are recorded against whichever row actually produced the reviewed
+    // push — see `pr_review_verdicts.work_item_id` — so a revision's own
+    // review is never recorded on the chain root).
+    let target_id = |row: &Task| -> String {
+        if row.kind != TaskKind::Revision
+            && matches!(row.status, TaskStatus::InReview | TaskStatus::Done)
+            && let Some((_, revision_id)) = last_completed_by_parent.get(&row.id)
+        {
+            return revision_id.clone();
+        }
+        row.id.clone()
+    };
+
+    // Only rows whose badge might depend on a verdict lookup — kind-
+    // reviewable and in Review/Done — need one; Active and everything-else
+    // rows resolve from `ai_reviewing`/kind alone. Collecting just those ids
+    // keeps the batched query no larger than it needs to be.
+    let mut lookup_ids: Vec<String> = tasks
+        .iter()
+        .chain(chores.iter())
+        .filter(|row| {
+            !task_kind_excluded_from_ai_review(&row.kind)
+                && matches!(row.status, TaskStatus::InReview | TaskStatus::Done)
+        })
+        .map(target_id)
+        .collect();
+    lookup_ids.sort_unstable();
+    lookup_ids.dedup();
+    let verdicts = query_latest_informative_review_verdicts(conn, &lookup_ids)?;
+
+    let resolve = |row: &Task| -> (Option<&'static str>, Option<String>) {
+        if task_kind_excluded_from_ai_review(&row.kind) {
+            return (Some(AI_REVIEW_STATE_REVIEW_NOT_REQUIRED), None);
+        }
+        match row.status {
+            TaskStatus::Active => {
+                if row.ai_reviewing {
+                    (Some(AI_REVIEW_STATE_REVIEWING), None)
+                } else {
+                    (None, None)
+                }
+            }
+            TaskStatus::InReview | TaskStatus::Done => match verdicts.get(&target_id(row)) {
+                None => (None, None),
+                Some(v) => match v.gate_outcome.as_str() {
+                    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN => (Some(AI_REVIEW_STATE_REVIEWED_ALL_CLEAR), None),
+                    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS | REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED => {
+                        (Some(AI_REVIEW_STATE_REVIEWED_WITH_FINDINGS), v.revision_task_id.clone())
+                    }
+                    // Not reachable: `query_latest_informative_review_verdicts`
+                    // already restricts to these three outcomes.
+                    _ => (None, None),
+                },
+            },
+            _ => (None, None),
+        }
+    };
+
+    for task in tasks.iter_mut() {
+        let (state, revision_id) = resolve(task);
+        task.ai_review_state = state.map(str::to_owned);
+        task.ai_review_findings_revision_id = revision_id;
+    }
+    for chore in chores.iter_mut() {
+        let (state, revision_id) = resolve(chore);
+        chore.ai_review_state = state.map(str::to_owned);
+        chore.ai_review_findings_revision_id = revision_id;
+    }
+    Ok(())
+}
+
 /// Default `effort_level` for a revision the caller didn't supply one for.
 ///
 /// Design-family chain roots (`design`/`investigation`/`design_postmortem`)
