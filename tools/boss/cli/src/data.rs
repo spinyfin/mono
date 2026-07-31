@@ -1,6 +1,7 @@
 //! RPC data-access helpers, resolvers, and selectors
 
 use crate::*;
+use boss_protocol::WorkRun;
 
 pub(crate) async fn connect_for_work(ctx: &RunContext) -> Result<BossClient, CliError> {
     BossClient::connect(&ctx.discovery)
@@ -1738,13 +1739,51 @@ pub(crate) async fn get_task_runtime(client: &mut BossClient, work_item_id: &str
     )
 }
 
-pub(crate) fn print_executions_section(executions: &[WorkExecution]) {
+/// An execution paired with its durable run history for `task show` / `chore
+/// show`. The completion outcome belongs to the run rather than the execution
+/// row, so keeping it nested here makes a terminal execution without a PR
+/// explainable without overloading user-authored task fields.
+#[derive(serde::Serialize)]
+pub(crate) struct ExecutionRuns {
+    #[serde(flatten)]
+    execution: WorkExecution,
+    runs: Vec<WorkRun>,
+}
+
+/// Fetch the run history for every execution shown by a leaf work-item detail.
+/// `ListRuns` is deliberately used here instead of a lossy execution-level
+/// projection: an execution can have multiple runs and each owns its own
+/// terminal `result_summary`.
+pub(crate) async fn list_execution_runs(
+    client: &mut BossClient,
+    executions: &[WorkExecution],
+) -> Result<Vec<ExecutionRuns>, CliError> {
+    let mut details = Vec::with_capacity(executions.len());
+    for execution in executions {
+        let runs = rpc_call!(
+            client,
+            FrontendRequest::ListRuns {
+                execution_id: execution.id.clone(),
+            },
+            "execution runs",
+            FrontendEvent::RunsList { runs, .. } => runs
+        )?;
+        details.push(ExecutionRuns {
+            execution: execution.clone(),
+            runs,
+        });
+    }
+    Ok(details)
+}
+
+pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
     if executions.is_empty() {
         return;
     }
     println!();
     println!("Executions ({}):", executions.len());
-    for exec in executions {
+    for detail in executions {
+        let exec = &detail.execution;
         let started = exec.started_at.as_deref().unwrap_or("-");
         let finished = exec.finished_at.as_deref().unwrap_or("-");
         print!(
@@ -1755,6 +1794,13 @@ pub(crate) fn print_executions_section(executions: &[WorkExecution]) {
             print!(" pr={pr}");
         }
         println!();
+        for run in &detail.runs {
+            print!("    run {} [{}]", run.id, run.status);
+            if let Some(summary) = &run.result_summary {
+                print!(" result={summary}");
+            }
+            println!();
+        }
     }
 }
 

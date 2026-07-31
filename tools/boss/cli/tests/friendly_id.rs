@@ -14,6 +14,7 @@
 
 use anyhow::{Result, anyhow};
 use boss_client::BossClient;
+use boss_protocol::{CreateExecutionInput, CreateRunInput, ExecutionKind, ExecutionStatus};
 
 use common::{run_boss, run_boss_expect_failure};
 use harness::{TestEngine, create_chore, create_product, create_project, create_task};
@@ -272,6 +273,44 @@ async fn chore_show_json_exposes_runtime_keys_when_empty() -> Result<()> {
     assert!(
         value["current_run_id"].is_null(),
         "pre-dispatch chore must have null current_run_id: {value}",
+    );
+    Ok(())
+}
+
+/// A completed execution without a PR is self-explaining in ordinary task
+/// inspection: its run history retains the engine-authored completion reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chore_show_json_includes_run_result_summary() -> Result<()> {
+    let engine = TestEngine::spawn().await?;
+    let mut client = BossClient::connect_socket(engine.socket_str()).await?;
+    let product = create_product(&mut client, "Boss").await?;
+    let chore = create_chore(&mut client, &product.id, "Already complete").await?;
+    let db = engine.db()?;
+    let execution = db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(chore.id.clone())
+            .kind(ExecutionKind::ChoreImplementation)
+            .status(ExecutionStatus::Completed)
+            .build(),
+    )?;
+    let reason = "Worker verified the assigned work was already done (empty diff — no changes needed); closed as a no-op without a PR.";
+    db.create_run(CreateRunInput {
+        execution_id: execution.id.clone(),
+        agent_id: "test-agent".to_owned(),
+        artifacts_path: None,
+        error_text: None,
+        finished_at: Some("1000".to_owned()),
+        result_summary: Some(reason.to_owned()),
+        started_at: Some("999".to_owned()),
+        status: Some("completed".to_owned()),
+        transcript_path: None,
+    })?;
+
+    let value = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
+    assert_eq!(value["executions"][0]["id"].as_str(), Some(execution.id.as_str()));
+    assert_eq!(
+        value["executions"][0]["runs"][0]["result_summary"].as_str(),
+        Some(reason)
     );
     Ok(())
 }
