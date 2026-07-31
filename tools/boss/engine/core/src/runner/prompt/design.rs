@@ -33,6 +33,23 @@ pub(super) fn doc_structure_conventions_block() -> String {
 /// a markdown design doc (not code), name the canonical path, and
 /// list the section shape the reader expects so the worker doesn't
 /// invent its own.
+///
+/// The breakdown block's split rules used to be one-directional: they named
+/// a concrete penalty for under-splitting (an oversize entry the scheduler
+/// rejects and re-plans) and no cost at all for over-splitting, so a worker
+/// unsure about a boundary was correctly reading "split" as the safe move.
+/// Counting entries in the merged design docs under `docs/designs/` showed
+/// where that lands: 31, 24, 24, 20, 14, 12, 9, 9, 8, 5, 4, 3 — a median
+/// near 10 but four of twelve at 20 or more, a tail as heavy as the
+/// materialised `project_task` counts, so the over-production originates in
+/// the breakdown step rather than in later accretion. The large ones blow up
+/// because the rules compound: a design spanning several subsystems, each
+/// with a multi-phase shape and a validation sweep, hits several split rules
+/// at once and multiplies instead of adding. Hence the calibration added
+/// below — a named cost for over-splitting, anchor bands relating entry
+/// count to scope, an explicit "the rules add, they do not multiply", and a
+/// required `Breakdown size:` line that makes the author defend N. No cap:
+/// a design that genuinely needs twenty entries may still propose twenty.
 pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> String {
     let mut out = String::new();
     out.push_str("Expected outcome for this run:\n");
@@ -63,6 +80,16 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
     out.push_str("    - sweeps and validation campaigns (\"validate/sweep/migrate all N X\", an all-lists reconciliation, a corpus-wide fixture sweep) are separate dependent entries, listed after the implementation they validate — do not fold them into the implementer.\n");
     out.push_str("    - unknown-format discovery (study / dump / reverse-engineer / reconcile-against-source) is its own investigation entry, sequenced before the implementation that consumes its findings.\n");
     out.push_str("    - if an entry needs a paragraph to describe, it is probably several tasks — split it.\n");
+    out.push_str("  - **size the breakdown as a whole to the size of the problem.** The rules above tell you where to cut; this tells you how many cuts the problem is worth. Both directions of miscalibration cost something real:\n");
+    out.push_str("    - **too few entries** — an oversize entry forces the scheduler to reject and re-plan it (the failure the split rules above exist to prevent).\n");
+    out.push_str("    - **too many entries** — each entry becomes its own worker session, PR, and review cycle. Entries carved below one reviewable unit serialise changes that belonged in a single PR, put sibling workers into merge conflicts over the same files, and bury the real critical path in bookkeeping. Splitting a one-seam change into eight entries is exactly as wrong as folding four subsystems into one; when you are unsure about a boundary, neither side is automatically safe.\n");
+    out.push_str("    - **the split rules add, they do not multiply.** A design touching four subsystems, each with a few phases and a validation sweep, must not be expanded to subsystems x phases x sweeps entries. Apply each rule only where the work genuinely needs cutting, and leave the rest whole: if two adjacent phases in the same subsystem would be reviewed as one PR by one worker, they are one entry, not two.\n");
+    out.push_str("    - calibrate the total against these anchors. They are reference points for a sanity check, not targets to hit and not a cap — a design that genuinely needs more may propose more, but a count well outside the band for its scope is a signal to re-check the breakdown before shipping it:\n");
+    out.push_str("      - a change behind one seam in one subsystem (a new flag, one new endpoint, a bounded refactor): **2-4 entries**.\n");
+    out.push_str("      - a feature contained in one subsystem, carrying its own schema/migration or test sweep: **4-8 entries**.\n");
+    out.push_str("      - a feature spanning two or three subsystems (e.g. engine + cli + app), or one subsystem plus a discovery step: **8-14 entries**.\n");
+    out.push_str("      - a genuinely large build-out — a new integration or subsystem reaching across most of the stack, with its own investigations and acceptance sweeps: **15+ entries**, and the count needs the justification below to earn it.\n");
+    out.push_str("    - **state the count and defend it.** Open the section with a single line, before the first entry, of exactly this shape: `Breakdown size: N entries (M in-scope, K deferred) — <one sentence on why this problem needs N entries rather than fewer>`. Name the anchor band you are calibrating against, and if you land above it, say what makes this design bigger than that band. If you cannot justify N, the breakdown is miscalibrated — merge entries until you can. This line is prose about the section, not an entry: it has no name/scope/effort/dependency shape and is not a task.\n");
     out.push_str("  - note which tasks at the same dependency depth may run in parallel, so the task graph (not just a linear list) is expressible.\n");
     out.push_str("  - when you mark tasks parallel, weigh **file** overlap, not just functional independence: two tasks can be independent in design yet edit the same file (e.g. a compact-view task and a detail-view task that both edit the same component/container). If two otherwise-parallel tasks are clearly and substantially likely to co-edit the same files, say so — give them a defined order and note that the later one must forward-port the earlier one's changes preservingly (integrate, never delete). Do not over-serialise: only flag clear, substantial overlap; incidental overlap stays parallel.\n");
     out.push_str("  - include items that are deferred or explicitly out of scope as their own entries (tagged `Scope: deferred (future / not a v1 blocker)`, see above) rather than silently omitting them — silent omissions force the coordinator to guess what was considered and rejected. Do not drop the entry just because it is deferred; the scope tag is what lets it stay visible without being auto-started.\n");
