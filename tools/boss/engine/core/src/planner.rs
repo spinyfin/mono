@@ -704,6 +704,13 @@ breakdown, set `breakdown_found` to false, return an empty `tasks` array and \
 empty `edges`, and explain in `notes`. This is a clean, valid result — not \
 an error. Never invent tasks the doc does not describe.\n\
 \n\
+The breakdown section may open with a `Breakdown size: N entries (M \
+in-scope, K deferred) — <rationale>` line before the first entry. That line \
+is the design author's self-check on how many entries the problem warranted; \
+it is prose about the section, NOT an entry. Never emit it as a task. Do use \
+it as a cross-check: if the entries you extracted differ materially in count \
+from N, say so in `notes`.\n\
+\n\
 Do NOT propose:\n\
 - The design task itself (it already exists and its PR has already merged).\n\
 - Any task whose name duplicates one already in the project (the existing \

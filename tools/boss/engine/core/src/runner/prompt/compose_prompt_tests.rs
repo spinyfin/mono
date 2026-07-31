@@ -2446,3 +2446,41 @@ fn design_directive_requires_the_scope_tag() {
     );
     assert!(directive.contains("rather than silently omitting them"), "{directive}");
 }
+
+/// The breakdown block must carry proportionality calibration, not just
+/// split rules: a named cost for over-splitting to balance the scheduler
+/// rejection named for under-splitting, anchor bands relating entry count
+/// to scope, and the `Breakdown size:` self-check line the author must
+/// defend N with. Without these the guidance is one-directional and
+/// designs over-produce entries — see `compose_design_directive`'s docs
+/// for the measured distribution that motivated this.
+#[test]
+fn design_directive_calibrates_breakdown_size_to_problem_size() {
+    let directive = compose_design_directive(None);
+    // The split rules this calibration must not displace.
+    assert!(directive.contains("keep each entry single-subsystem"), "{directive}");
+    assert!(
+        directive.contains("an oversize entry forces the scheduler to reject and re-plan it"),
+        "{directive}"
+    );
+    // The symmetric cost for over-splitting.
+    assert!(directive.contains("**too many entries**"), "{directive}");
+    assert!(directive.contains("neither side is automatically safe"), "{directive}");
+    // Non-compounding instruction and the anchor bands.
+    assert!(
+        directive.contains("split rules add, they do not multiply."),
+        "{directive}"
+    );
+    assert!(directive.contains("**2-4 entries**"), "{directive}");
+    assert!(directive.contains("**4-8 entries**"), "{directive}");
+    assert!(directive.contains("**8-14 entries**"), "{directive}");
+    assert!(directive.contains("**15+ entries**"), "{directive}");
+    // No cap: a genuinely large design may still propose more.
+    assert!(directive.contains("not a cap"), "{directive}");
+    // The count must be stated and justified.
+    assert!(
+        directive.contains("Breakdown size: N entries (M in-scope, K deferred)"),
+        "{directive}"
+    );
+    assert!(directive.contains("rather than fewer"), "{directive}");
+}
