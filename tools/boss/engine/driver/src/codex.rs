@@ -25,13 +25,14 @@ use boss_engine_codex_hook_trust::{
 };
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent};
+use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
 mod decision;
 mod guard_chain;
 pub mod guard_trace;
+mod pane_monitor;
 mod progress;
 mod tool_surface_guard;
 
@@ -1346,6 +1347,13 @@ impl AgentDriver for CodexDriver {
             // record that means it — an interactive approval request, say —
             // at which point that record is the measured mapping.
         ])
+    }
+
+    fn pane_monitor_spec(&self) -> Option<PaneMonitorSpec> {
+        // Measured Codex TUI chrome; see `codex/pane_monitor.rs` for the
+        // literals, their stability evidence, and why the startup banner
+        // alone cannot carry agent detection.
+        Some(pane_monitor::spec())
     }
 
     fn spawn_invocation(&self, request: SpawnRequest<'_>) -> SpawnPlan {
