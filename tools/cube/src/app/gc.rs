@@ -17,7 +17,7 @@ use crate::app::disk::human_bytes;
 use crate::app::errors::Result;
 use crate::app::gh_pr;
 use crate::app::health::probe_workspace_reuse;
-use crate::app::jj::{self, run_jj, run_jj_network, workspace_path_exists};
+use crate::app::jj::{self, network_cmd_timeout, run_jj, run_jj_network, workspace_path_exists};
 use crate::app::reclaim::{compact_free_workspaces, has_free_workspace_surplus, trim_free_workspaces_to_mark};
 use crate::app::reconcile::reconcile_free_workspace_health;
 use crate::app::reset::reset_workspace_after_fetch_within;
@@ -83,8 +83,11 @@ pub(super) const POOL_GC_TRIM_PROGRESS_KEY: &str = "last_pool_gc_trim_made_progr
 ///
 /// A `boss/exec_*` bookmark is "consumed" when its tip is reachable from `main`
 /// (`bookmarks(glob:"boss/exec_*") & ::main`). A `pr/<n>` bookmark is eligible
-/// for GC when its corresponding GitHub PR is in the MERGED or CLOSED state
-/// (resolved via `gh pr view`; skipped silently when offline).
+/// for GC when its corresponding GitHub PR is in the MERGED or CLOSED state,
+/// resolved for every `pr/*` bookmark in the workspace via one batched `gh
+/// api graphql` round trip (see [`gh_pr::fetch_pr_states_batch`]); skipped
+/// silently when offline, and skipped (with a logged warning) if the batched
+/// lookup itself fails or times out.
 ///
 /// If `do_fetch` is true, runs `jj git fetch` first so `::main` reflects the
 /// latest merged PRs. If `dry_run` is true, lists what would be forgotten
@@ -156,8 +159,20 @@ pub(super) fn gc_workspace_bookmarks(
 
 /// Collect local `pr/<n>` bookmarks in `workspace_path` whose GitHub PR is
 /// MERGED or CLOSED. Returns an empty list when offline, the workspace has no
-/// GitHub remote, or there are no `pr/*` bookmarks. Failures from `jj` or
-/// `gh` are swallowed so this best-effort sweep never blocks the caller.
+/// GitHub remote, or there are no `pr/*` bookmarks. `jj` failures are
+/// swallowed; a failed or timed-out PR-state lookup is logged and skips the
+/// sweep. Either way this best-effort sweep never blocks the caller.
+///
+/// A workspace is reused across many leases over its lifetime, and each
+/// `cube workspace goto`/`pr push` against it can leave behind a local
+/// `pr/<n>` bookmark — so by the time this sweep runs, "every `pr/*`
+/// bookmark in the workspace" can be an arbitrarily long, unrelated backlog
+/// rather than just the one bookmark from the release that just finished.
+/// The PR-state lookup for that whole backlog is a single batched GraphQL
+/// round trip ([`gh_pr::fetch_pr_states_batch`]), not one REST call per
+/// bookmark: that serial-per-bookmark shape (and its total absence of a
+/// timeout) is what let a single stuck `gh api` call block `cube workspace
+/// release` for 4-6+ minutes.
 pub(super) fn gc_collect_closed_pr_bookmarks(
     runner: &dyn CommandRunner,
     database_path: Option<&Path>,
@@ -212,8 +227,34 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
         return vec![];
     }
 
-    // For each pr/<n> bookmark, query GitHub for the PR state. Skip silently
-    // on network/auth failures so GC degrades gracefully when offline.
+    let pr_numbers: Vec<u64> = pr_bookmarks
+        .iter()
+        .filter_map(|b| b.strip_prefix("pr/").and_then(|n| n.parse::<u64>().ok()))
+        .collect();
+
+    // One batched round trip for every pr/<n> bookmark in this workspace,
+    // bounded by the same network timeout used elsewhere in cube — never an
+    // unbounded per-bookmark `gh api` call. A failure (including a timeout)
+    // skips the whole sweep for this workspace rather than hanging the
+    // caller or silently pretending nothing was closed.
+    let states = match gh_pr::fetch_pr_states_batch(
+        runner,
+        workspace_path,
+        &owner_repo,
+        &pr_numbers,
+        network_cmd_timeout(),
+    ) {
+        Ok(states) => states,
+        Err(e) => {
+            eprintln!(
+                "cube: gc: batched PR-state lookup for {} pr/* bookmark(s) in {} failed, skipping closed-PR sweep: {e}",
+                pr_numbers.len(),
+                workspace_path.display(),
+            );
+            return vec![];
+        }
+    };
+
     pr_bookmarks
         .into_iter()
         .filter(|bookmark| {
@@ -223,10 +264,10 @@ pub(super) fn gc_collect_closed_pr_bookmarks(
             let Ok(pr_number) = pr_num.parse::<u64>() else {
                 return false;
             };
-            let Ok(pr_info) = gh_pr::fetch_pr_json(runner, workspace_path, &owner_repo, pr_number) else {
-                return false;
-            };
-            matches!(gh_pr::state(&pr_info).as_str(), "MERGED" | "CLOSED")
+            matches!(
+                states.get(&pr_number).map(String::as_str),
+                Some("MERGED") | Some("CLOSED")
+            )
         })
         .collect()
 }
