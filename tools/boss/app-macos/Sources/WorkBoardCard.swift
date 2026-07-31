@@ -339,9 +339,15 @@ struct WorkBoardCardItem: View {
 /// auto-retry. Distinguishes "failing to start" from "waiting for a
 /// slot": the latter never sets `dispatchFailedReason`, so this banner
 /// never appears on a card that is merely queued behind a full worker
-/// pool (see `WorkTask.boardColumn`). Read-only — the underlying state
-/// clears itself the next time a human retries the dispatch (drag to
-/// Doing, or `bossctl work start`).
+/// pool (see `WorkTask.boardColumn`).
+///
+/// Read-only, and deliberately so: whether the failure is still live is
+/// the engine's call, not this view's. The engine clears
+/// `dispatch_failed_reason` the moment any execution for the item
+/// actually starts a run — the direct refutation of what the stamp
+/// asserts — so this banner comes down on its own without the card ever
+/// reasoning about lanes or elapsed time. See
+/// `tools/boss/docs/attention-lifecycle.md`.
 
 /// Kanban card body. Consumes a slim [[WorkCardSnapshot]] plus action
 /// closures, and conforms to `Equatable` over the snapshot alone so

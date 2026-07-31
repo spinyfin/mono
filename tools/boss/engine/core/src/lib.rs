@@ -5,6 +5,8 @@ pub mod agent_jsonl_progress;
 pub mod answer_agent;
 pub mod answer_agent_completion_sweep;
 pub mod app;
+pub mod attention_lifecycle;
+pub mod attention_reconcile_sweep;
 pub mod attentions_detector;
 pub mod audit;
 pub mod audit_effort;

@@ -56,7 +56,10 @@ pub const ORPHAN_REDISPATCH_CHURN_GUARD_THRESHOLD: i64 = 3;
 /// automatically the next time [`WorkDb::request_execution_with_live_check`]
 /// is called for the work item (either the sweep succeeding once the
 /// trailing window drains, or an operator running `bossctl work start`,
-/// which bypasses the guard entirely since it only lives in the sweeps).
+/// which bypasses the guard entirely since it only lives in the sweeps),
+/// and — as a backstop for every other way an item can start moving —
+/// whenever a run starts for it afterwards
+/// ([`crate::attention_lifecycle::ClearedBy::WorkResumed`]).
 pub const CHURN_GUARD_PARKED_ATTENTION_KIND: &str = "churn_guard_parked";
 
 /// `work_attention_items.kind` raised by [`crate::dispatch_stall_escalation`]
@@ -426,6 +429,7 @@ impl Clone for WorkDb {
 
 // ---- module tree (see PR description for the split rationale) ----
 mod answer_agent_runs;
+mod attention_reconcile;
 mod attentions;
 mod audit_misc;
 mod automations;
@@ -483,6 +487,7 @@ mod workitems;
 // attention item inside its own transaction (`WorkDb::create_automation_task`)
 // reaches for the in-tx variant; every other caller uses the public,
 // tx-owning `WorkDb::create_attention`.
+pub use attention_reconcile::AttentionReconcileOutcome;
 use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;

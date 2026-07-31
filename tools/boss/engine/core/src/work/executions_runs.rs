@@ -17,6 +17,28 @@ pub struct CancelExecutionOpts {
     pub queued_only: bool,
 }
 
+/// Emit a trace warning when an attention `kind` has no entry in
+/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`].
+///
+/// The original defect was structural, not local: raising a signal went
+/// through shared, well-tested plumbing while lowering it was left to each
+/// producer to remember, so kinds added later simply never got a resolution
+/// path and could be raised but never lowered. The registry is the fix; this
+/// is its enforcement at the filing boundary. Deliberately a warning rather
+/// than an error — refusing to file would trade an un-clearable signal for a
+/// missing one, which is strictly worse — and deliberately not a `panic!`,
+/// since callers file attentions on best-effort paths that must not abort.
+fn warn_if_lifecycle_undeclared(kind: &str) {
+    if crate::attention_lifecycle::lifecycle_for(kind).is_none() {
+        tracing::warn!(
+            attention_kind = kind,
+            "attention filed with no declared lifecycle — add an entry to \
+             crate::attention_lifecycle::ATTENTION_LIFECYCLES saying what lowers it (ClearedBy::HumanDecision \
+             is a valid answer; leaving it undeclared means it can never be lowered automatically)",
+        );
+    }
+}
+
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status
@@ -524,6 +546,11 @@ impl WorkDb {
     /// recovery-sweep passes don't pile up duplicate rows. Returns the
     /// existing or newly-created item's id. Used by the transient-recovery
     /// sweep to escalate non-retryable / retry-exhausted workers.
+    ///
+    /// Filing runs [`warn_if_lifecycle_undeclared`]: a signal the engine can
+    /// raise but has not declared a way to lower is the defect
+    /// [`crate::attention_lifecycle`] exists to prevent, so an unregistered
+    /// kind is surfaced in the trace rather than passing silently.
     pub fn upsert_work_item_attention(
         &self,
         work_item_id: &str,
@@ -531,6 +558,7 @@ impl WorkDb {
         title: &str,
         body_markdown: &str,
     ) -> Result<String> {
+        warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
@@ -1044,6 +1072,38 @@ impl WorkDb {
                  )
                )",
             params![execution.work_item_id, now],
+        )?;
+
+        // A run is starting for this work item, which refutes the one thing
+        // `dispatch_failed_reason` asserts: that the engine could not get an
+        // execution running for it. Clear the stamp so the card's red
+        // "Failed to start — …" banner comes down.
+        //
+        // Before this, the columns were cleared in exactly one place —
+        // `request_execution_in_tx_with_live_check` — so only a deliberate
+        // re-dispatch through *that* function lowered the banner. Every other
+        // way an item resumes (the reconciler minting an execution, a
+        // `pr_review` / `revision_implementation` / `ci_remediation`
+        // execution dispatched by the review pipeline) left it stamped
+        // forever: an item could reach Merging with a bound PR and four
+        // completed revisions while still showing a lease failure from hours
+        // earlier. Hooking the run start instead of any one dispatch caller
+        // means the rule holds for every path, present and future.
+        //
+        // Guarded on `dispatch_failed_reason IS NOT NULL` so it is a no-op
+        // for the overwhelming majority of starts, and deliberately NOT
+        // guarded on kanban status: the banner is about dispatch, not about
+        // which lane the card sits in. `crate::attention_reconcile_sweep`
+        // runs the same clear as a periodic backstop, for rows stamped by an
+        // engine process that predates this call.
+        tx.execute(
+            "UPDATE tasks
+             SET dispatch_failed_reason = NULL,
+                 dispatch_failed_error  = NULL,
+                 dispatch_failed_at     = NULL
+             WHERE id = ?1
+               AND dispatch_failed_reason IS NOT NULL",
+            params![execution.work_item_id],
         )?;
 
         let run_id = next_id("run");

@@ -1321,6 +1321,21 @@ pub async fn serve_with_merge_probe(
         crate::proposal_expiry_sweep::DEFAULT_INTERVAL,
     );
 
+    // Periodic attention-reconcile sweep: lowers failure signals whose
+    // condition is demonstrably over — open attention items whose declared
+    // clearing evidence has arrived, and stale `tasks.dispatch_failed_*`
+    // stamps (the card's red "Failed to start — …" banner) on work items
+    // that have since started a run. Every rule requires the evidence to
+    // postdate the signal, so an item that is still genuinely broken keeps
+    // showing. See `crate::attention_lifecycle` for the per-kind rules and
+    // `WorkDb::reconcile_stale_attention_signals` for the queries. This is a
+    // backstop for the inline resolves on the producer paths, not a
+    // replacement for them.
+    let _attention_reconcile_sweep_handle = crate::attention_reconcile_sweep::spawn_loop(
+        server_state.work_db.clone(),
+        crate::attention_reconcile_sweep::DEFAULT_INTERVAL,
+    );
+
     // Periodic syspolicyd CPU monitor: detects when macOS's `syspolicyd`
     // daemon wedges in a ~100% CPU spin. While it is stuck it stops
     // servicing code-signing assessments, so every `dlopen` of a

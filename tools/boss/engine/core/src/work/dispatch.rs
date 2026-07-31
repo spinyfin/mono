@@ -346,6 +346,21 @@ impl WorkDb {
     ///   and its underlying error inline, without a trip through
     ///   dispatch-events logs.
     ///
+    /// Those three columns are the *only* source of the card's red
+    /// "Failed to start — …" banner (`WorkDispatchFailureBanner` in the
+    /// macOS app). Their lifecycle is the mirror of this method: the stamp
+    /// asserts "the engine could not get an execution running for this
+    /// item", so it is cleared by the first execution that actually starts
+    /// a run — `start_execution_run_on_host`, in the same transaction that
+    /// flips the execution to `running`, with
+    /// [`crate::attention_reconcile_sweep`] as the periodic backstop. The
+    /// clear in [`Self::request_execution_with_live_check`] referenced above
+    /// is now the *earliest* of those, not the only one: relying on it alone
+    /// meant an item that resumed by any other path (the reconciler minting
+    /// an execution, a `pr_review` / `revision_implementation` /
+    /// `ci_remediation` dispatched by the review pipeline) kept showing a
+    /// long-dead failure forever. See [`crate::attention_lifecycle`].
+    ///
     /// Guarded on `status IN ('todo', 'active')` so a concurrent move to
     /// `done`/`archived`/`blocked`/`in_review` is never stomped — this
     /// also naturally excludes review-phase dispatch kinds (`pr_review`,

@@ -91,7 +91,10 @@ mod probes;
 mod products;
 mod projects;
 pub(crate) mod proposals;
-mod readoption;
+// `pub(crate)` so `crate::attention_lifecycle` can name
+// `PROGRESS_INGRESS_UNRECOVERABLE_ATTENTION_KIND` in the lifecycle registry
+// (crate-internal only — nothing outside the engine sees this module).
+pub(crate) mod readoption;
 mod review;
 mod selected_product;
 mod server;
