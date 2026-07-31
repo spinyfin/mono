@@ -195,9 +195,13 @@ checks:
 
 ### Canonical name and aliases
 
-The canonical key name is `exclude`. The aliases `exclude_files` and `exclude_globs` are also accepted for backward compatibility, both at the top level and inside a check entry. All three names are equivalent — choose `exclude` for new configuration.
+The canonical key name is `exclude`. Which spellings are actually read depends on _where_ the key is written — there are three distinct positions, and they are not uniform:
 
-Checks that historically placed their exclusion list inside the `config` block (e.g. `file/size`'s `exclude_files` key) continue to work unchanged; the framework reads from both positions and merges them into one matcher. For new configuration, prefer the framework-level position (sibling to `config:`, not inside it).
+- **Top level** (sibling to `checks:`, `settings:`, `check_definitions:`): `exclude`, `exclude_files`, and `exclude_globs` are all accepted as aliases of the same field. All three are equivalent here.
+- **Check entry** (sibling to `config:`, `policy:`, `enabled:`): `exclude`, `exclude_files`, and `exclude_globs` are likewise all accepted as aliases of the same field. All three are equivalent here too.
+- **Inside `config:`** (the legacy per-check position, e.g. `file/size`'s historical `config.exclude_files` key): only `exclude_files` and `exclude_globs` are read. Canonical `exclude` written inside `config:` is not read at all — it is silently ignored, with no diagnostic. Always use the framework-level check-entry position (sibling to `config:`) when you want the canonical `exclude` name.
+
+Checks that historically placed their exclusion list inside the `config` block continue to work unchanged using `exclude_files` / `exclude_globs`; the framework reads from both the check-entry position and the in-`config` legacy position and merges them into one matcher. For new configuration, prefer the framework-level position (sibling to `config:`, not inside it) — it accepts the canonical `exclude` name, which the in-`config` position does not.
 
 ```yaml
 checks:
