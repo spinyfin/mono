@@ -47,6 +47,12 @@ pub struct TrunkMergeIntent {
     /// auto-resubmit.
     pub submit_count: i64,
     pub created_at: String,
+    /// The PR head sha whose Trunk merge-queue check
+    /// [`crate::trunk_queue_adopt`] observed when it adopted a queue
+    /// episode Boss did not submit. `None` for every intent created by the
+    /// merge verb, so this doubles as the "who started this episode?"
+    /// provenance marker and as the per-episode adoption idempotency key.
+    pub adopted_at_head_sha: Option<String>,
 }
 
 /// Pre-insert payload for [`WorkDb::insert_trunk_merge_intent`].
@@ -58,6 +64,10 @@ pub struct TrunkMergeIntentInsertInput {
     pub pr_number: i64,
     pub repo: String,
     pub target_branch: String,
+    /// Set only by [`crate::trunk_queue_adopt`], to the PR head sha
+    /// carrying the failed Trunk merge-queue check. Left unset by the merge
+    /// verb — see [`TrunkMergeIntent::adopted_at_head_sha`].
+    pub adopted_at_head_sha: Option<String>,
 }
 
 /// One `active` intent joined with the two facts about its task the
@@ -74,7 +84,7 @@ pub struct ActiveTrunkMergeIntent {
 }
 
 const TRUNK_MERGE_INTENT_COLUMNS: &str = "id, work_item_id, pr_url, pr_number, repo, target_branch, status, \
-     last_trunk_state, last_trunk_state_at, submit_count, created_at";
+     last_trunk_state, last_trunk_state_at, submit_count, created_at, adopted_at_head_sha";
 
 fn map_trunk_merge_intent(row: &Row<'_>) -> rusqlite::Result<TrunkMergeIntent> {
     Ok(TrunkMergeIntent {
@@ -89,6 +99,7 @@ fn map_trunk_merge_intent(row: &Row<'_>) -> rusqlite::Result<TrunkMergeIntent> {
         last_trunk_state_at: row.get(8)?,
         submit_count: row.get(9)?,
         created_at: row.get(10)?,
+        adopted_at_head_sha: row.get(11)?,
     })
 }
 
@@ -106,8 +117,9 @@ impl WorkDb {
         let now = now_string();
         let rows = tx.execute(
             "INSERT OR IGNORE INTO trunk_merge_intents
-                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7)",
+                (id, work_item_id, pr_url, pr_number, repo, target_branch, status, submit_count, created_at,
+                 adopted_at_head_sha)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', 1, ?7, ?8)",
             params![
                 id,
                 input.work_item_id,
@@ -116,6 +128,7 @@ impl WorkDb {
                 input.repo,
                 input.target_branch,
                 now,
+                input.adopted_at_head_sha,
             ],
         )?;
         if rows == 0 {
@@ -154,15 +167,22 @@ impl WorkDb {
     /// remediate). Tasks that reached a terminal status are deliberately
     /// *included* so the poller can retire their now-moot intents; it
     /// filters them out before deciding which queues to probe.
+    ///
+    /// This list is the Trunk queue poller's *entire* candidate set, which
+    /// is why [`crate::trunk_queue_adopt`] exists: while the merge verb was
+    /// the only writer of this table, an episode a human started through
+    /// Trunk's own affordance was enumerated by nobody and its eviction was
+    /// remediated by nobody. Adopted rows join this list on equal terms.
     pub fn list_active_trunk_merge_intents(&self) -> Result<Vec<ActiveTrunkMergeIntent>> {
         let conn = self.connect()?;
         // Spelled out rather than derived from `TRUNK_MERGE_INTENT_COLUMNS`:
         // `map_trunk_merge_intent` reads by ordinal, so the join's two extra
-        // columns must land at index 11/12 and the intent's own must stay in
+        // columns must land at index 12/13 and the intent's own must stay in
         // exactly their declared order.
         let mut stmt = conn.prepare(
             "SELECT i.id, i.work_item_id, i.pr_url, i.pr_number, i.repo, i.target_branch, i.status,
                     i.last_trunk_state, i.last_trunk_state_at, i.submit_count, i.created_at,
+                    i.adopted_at_head_sha,
                     t.product_id, t.status
              FROM trunk_merge_intents i
              JOIN tasks t ON t.id = i.work_item_id
@@ -172,11 +192,37 @@ impl WorkDb {
         let rows = stmt.query_map([], |row| {
             Ok(ActiveTrunkMergeIntent {
                 intent: map_trunk_merge_intent(row)?,
-                product_id: row.get(11)?,
-                task_status: row.get(12)?,
+                product_id: row.get(12)?,
+                task_status: row.get(13)?,
             })
         })?;
         collect_rows(rows)
+    }
+
+    /// Whether a Trunk queue episode has already been adopted for this
+    /// `(work_item_id, head_sha)` pair — regardless of what became of the
+    /// resulting intent.
+    ///
+    /// Deliberately *not* scoped to `status = 'active'`: the whole point is
+    /// to stop re-adopting an episode whose intent has since been retired.
+    /// Without that, a head whose Trunk check stays failed (an episode the
+    /// poller retired as `cancelled`, say) would be re-adopted on every
+    /// sweep, and the retire path's Review snap-back and attention item
+    /// would re-fire each time. Keying on the head sha rather than a
+    /// timestamp is what makes the guard episode-scoped rather than
+    /// permanent: a fix that lands moves the head, and the next eviction
+    /// adopts again exactly as it should.
+    pub fn trunk_merge_intent_adopted_at_head(&self, work_item_id: &str, head_sha: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM trunk_merge_intents
+                 WHERE work_item_id = ?1 AND adopted_at_head_sha = ?2
+             )",
+            params![work_item_id, head_sha],
+            |row| row.get(0),
+        )?;
+        Ok(exists)
     }
 
     /// Record the Trunk PR state the poller just observed for an intent.
@@ -463,6 +509,58 @@ mod tests {
         db.retire_trunk_merge_intent(&intent.id, "cancelled").unwrap();
 
         assert!(!db.record_trunk_merge_intent_state(&intent.id, "testing").unwrap());
+    }
+
+    /// The adoption idempotency key survives the intent's own lifecycle:
+    /// once an episode has been adopted at a head, it stays adopted at that
+    /// head even after the row is retired. That is what stops the merge
+    /// poller re-adopting the same still-failed head check every sweep.
+    #[test]
+    fn adopted_at_head_is_recorded_and_outlives_the_intents_status() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "adopted");
+        const HEAD: &str = "a898daa34a0151810ec44b2d69722f5df21119dd";
+
+        assert!(!db.trunk_merge_intent_adopted_at_head(&task_id, HEAD).unwrap());
+        let intent = db
+            .insert_trunk_merge_intent(
+                TrunkMergeIntentInsertInput::builder()
+                    .work_item_id(task_id.clone())
+                    .pr_url("https://github.com/brianduff/flunge/pull/1156")
+                    .pr_number(1156)
+                    .repo("brianduff/flunge")
+                    .target_branch("main")
+                    .adopted_at_head_sha(HEAD)
+                    .build(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.adopted_at_head_sha.as_deref(), Some(HEAD));
+        assert!(db.trunk_merge_intent_adopted_at_head(&task_id, HEAD).unwrap());
+
+        db.retire_trunk_merge_intent(&intent.id, "cancelled").unwrap();
+        assert!(
+            db.trunk_merge_intent_adopted_at_head(&task_id, HEAD).unwrap(),
+            "a retired adoption still counts — otherwise the episode is re-adopted forever",
+        );
+        // A different head is a different episode, and a different work item
+        // sharing a head sha is somebody else's episode.
+        assert!(!db.trunk_merge_intent_adopted_at_head(&task_id, "c6ce7e3a").unwrap());
+        assert!(!db.trunk_merge_intent_adopted_at_head("task_other", HEAD).unwrap());
+    }
+
+    /// A merge-verb intent leaves the column NULL, which is what makes it
+    /// usable as the "who started this episode?" provenance marker.
+    #[test]
+    fn merge_verb_intents_are_not_marked_adopted() {
+        let db = test_db();
+        let (_, task_id) = seed_task(&db, "merge-verb");
+        let intent = db.insert_trunk_merge_intent(input_for(&task_id)).unwrap().unwrap();
+        assert!(intent.adopted_at_head_sha.is_none());
+        assert!(
+            !db.trunk_merge_intent_adopted_at_head(&task_id, "any-sha").unwrap(),
+            "a NULL adopted_at_head_sha must never match an existence probe",
+        );
     }
 
     #[test]

@@ -12,6 +12,13 @@
 //!
 //! 1. Read every `active` `trunk_merge_intents` row (a cheap local-DB
 //!    read; no Trunk traffic) and group it by `(repo, target_branch)`.
+//!    That set is not merge-verb-only: an episode a human started through
+//!    Trunk's own affordance is adopted into it by
+//!    [`crate::trunk_queue_adopt`] the moment the merge poller sees Trunk's
+//!    head check report an eviction — otherwise this pass would enumerate
+//!    only the episodes Boss itself submitted and every other one would go
+//!    unremediated. Adopted rows are ordinary members here and take every
+//!    path below unchanged.
 //! 2. For each group whose cadence tier has elapsed, issue **one**
 //!    `getQueue` call — it returns queue state plus every enqueued PR, so
 //!    position and per-PR state for every tracked entry arrive together.

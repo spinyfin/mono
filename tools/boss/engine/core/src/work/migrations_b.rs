@@ -1162,6 +1162,32 @@ pub(crate) fn migrate_trunk_merge_intents_table(conn: &Connection) -> Result<()>
          CREATE INDEX IF NOT EXISTS trunk_merge_intents_status_idx
              ON trunk_merge_intents(status);",
     )?;
+    migrate_trunk_merge_intents_adopted_at_head_sha(conn)
+}
+
+/// `trunk_merge_intents.adopted_at_head_sha`: the PR head sha whose Trunk
+/// merge-queue check `crate::trunk_queue_adopt` observed when it adopted a
+/// queue episode Boss did not itself submit.
+///
+/// `NULL` for every intent created by the Boss merge verb
+/// (`app::review::handle_trunk_queue_merge`), so the column doubles as the
+/// provenance marker: non-NULL means "a human enqueued this via Trunk's own
+/// affordance and Boss adopted the episode so its queue lane could see it".
+/// It is also the adoption idempotency key — Trunk posts its check per
+/// commit, so one adoption per `(work_item_id, head sha)` is exactly one
+/// adoption per episode, and a re-eviction after a fix lands (a new head)
+/// correctly adopts again. The index serves that existence check.
+pub(crate) fn migrate_trunk_merge_intents_adopted_at_head_sha(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "trunk_merge_intents", "adopted_at_head_sha")? {
+        conn.execute(
+            "ALTER TABLE trunk_merge_intents ADD COLUMN adopted_at_head_sha TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS trunk_merge_intents_adopted_head_idx
+             ON trunk_merge_intents(work_item_id, adopted_at_head_sha);",
+    )?;
     Ok(())
 }
 

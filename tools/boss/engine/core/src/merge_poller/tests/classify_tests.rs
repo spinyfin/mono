@@ -450,6 +450,116 @@ fn classify_ci_excludes_trunk_merge_queue_check() {
     );
 }
 
+/// The verbatim `statusCheckRollup` GitHub returned for `brianduff/flunge`
+/// PR #1156 at head `a898daa3…` — the real Trunk merge-queue eviction that
+/// went undetected. Field-for-field what `PR_PROBE_FIELDS` selects, so this
+/// is the exact document the merge poller parses, not a stylised stand-in.
+///
+/// Note what it proves about the eviction: `buildkite/flunge-ci` — the
+/// repo's single required context — is **SUCCESS** on the PR's own head. The
+/// failing build (2837) was on the ephemeral `trunk-merge/pr-1156/…`
+/// construction branch, which never appears in a head rollup. So a
+/// head-based CI verdict of `Clean` here is correct, and the Trunk check is
+/// the only place this rollup carries the eviction at all.
+fn flunge_1156_evicted_rollup() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "__typename": "CheckRun",
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+            "detailsUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+        }),
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/flunge-ci",
+            "state": "SUCCESS",
+            "targetUrl": "https://buildkite.com/flunge/flunge-ci/builds/2833",
+        }),
+        serde_json::json!({
+            "__typename": "StatusContext",
+            "context": "buildkite/flunge-release-frontend",
+            "state": "SUCCESS",
+            "targetUrl": "https://buildkite.com/flunge/flunge-release-frontend/builds/1956",
+        }),
+    ]
+}
+
+/// Both halves of the Trunk-check contract, on the real payload: the head
+/// rollup still reads `Clean` (no duplicate `pr_branch_ci` remediation), and
+/// the eviction is nonetheless captured for the Trunk lane instead of being
+/// discarded — which, before `trunk_queue_adopt`, is exactly where the
+/// signal died for an episode Boss did not initiate.
+#[test]
+fn real_flunge_eviction_reads_clean_but_still_surfaces_the_trunk_check() {
+    let leaves = flunge_1156_evicted_rollup();
+
+    assert_eq!(
+        super::classify_ci(&leaves, None),
+        OpenPrCiStatus::Clean,
+        "the PR's own required check is green; the Trunk check must not spawn a pr_branch_ci remediation",
+    );
+
+    let trunk = super::trunk_queue_check_failure(&leaves).expect("the eviction must not be discarded");
+    assert_eq!(trunk.name, "Trunk Merge Queue (main)");
+    assert_eq!(trunk.conclusion, "FAILURE");
+    assert_eq!(
+        trunk.details_url,
+        "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+    );
+}
+
+/// `isRequired` is deliberately not consulted: Trunk's check is not part of
+/// branch protection on a real repo (`brianduff/flunge` requires exactly one
+/// context, `buildkite/flunge-ci`), so filtering on it would throw the
+/// eviction away again.
+#[test]
+fn trunk_queue_check_failure_ignores_is_required() {
+    let leaves = [serde_json::json!({
+        "name": "Trunk Merge Queue (main)",
+        "status": "COMPLETED",
+        "conclusion": "FAILURE",
+        "isRequired": false,
+    })];
+    assert!(super::trunk_queue_check_failure(&leaves).is_some());
+}
+
+/// Only a terminal failure is an eviction. A check that is still running, or
+/// that concluded successfully, describes an episode that needs nothing —
+/// and adopting on it would create an intent for a PR that is merely queued.
+#[test]
+fn trunk_queue_check_failure_ignores_non_failing_and_absent_leaves() {
+    for leaf in [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "IN_PROGRESS", "conclusion": null}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SKIPPED"}),
+        serde_json::json!({"name": "ci/test", "status": "COMPLETED", "conclusion": "FAILURE"}),
+    ] {
+        assert!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf)).is_none(),
+            "{leaf} must not read as an eviction",
+        );
+    }
+    assert!(super::trunk_queue_check_failure(&[]).is_none());
+}
+
+/// Re-runs land last in the rollup, so the newest leaf wins — a PR
+/// resubmitted after a fix must not keep reporting the stale eviction.
+#[test]
+fn trunk_queue_check_failure_takes_the_latest_leaf_for_the_name() {
+    let rerun_cleared = [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "FAILURE"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+    ];
+    assert!(super::trunk_queue_check_failure(&rerun_cleared).is_none());
+
+    let rerun_failed = [
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "SUCCESS"}),
+        serde_json::json!({"name": "Trunk Merge Queue (main)", "status": "COMPLETED", "conclusion": "FAILURE"}),
+    ];
+    assert!(super::trunk_queue_check_failure(&rerun_failed).is_some());
+}
+
 #[test]
 fn leaf_matches_check_name_empty_names_is_false() {
     // Empty `names` short-circuits to false without inspecting the leaf —

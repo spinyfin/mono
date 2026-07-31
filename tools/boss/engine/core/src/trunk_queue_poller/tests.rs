@@ -820,6 +820,142 @@ async fn an_evicted_entry_with_state_changed_at_triggers_ci_watch() {
     );
 }
 
+/// End-to-end regression for the reported failure: a Trunk queue episode
+/// **Boss did not initiate** — an operator used Trunk's own affordance
+/// ("check the box to the left or comment `/trunk merge`") — evicted for
+/// failing tests, with no `trunk_merge_intents` row anywhere.
+///
+/// Every input here is the real `brianduff/flunge` #1156 episode:
+///
+///   * the PR's own head (`a898daa3…`) with `buildkite/flunge-ci` **green**
+///     — the eviction was never on the head, so the merge poller's
+///     `ci_required_state: "success"` was correct all along;
+///   * Trunk's `"Trunk Merge Queue (main)"` check at `COMPLETED / FAILURE`,
+///     which is the *only* place the head rollup carries the eviction;
+///   * the failing construction build `flunge-ci` 2837 on
+///     `trunk-merge/pr-1156/bb172831-…`, which is what a fix worker must
+///     actually be pointed at.
+///
+/// Before adoption this produced nothing: no intent meant the poller
+/// enumerated no episode, `ci_attempts_used` stayed 0, and a human found the
+/// red queue by hand 85 minutes later. The assertion is that the same inputs
+/// now mint the `ci-fix` remediation.
+#[tokio::test]
+async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
+    let (_tmp, db) = crate::test_support::open_db();
+    const PR: i64 = 1156;
+    const EVICTED_HEAD: &str = "a898daa34a0151810ec44b2d69722f5df21119dd";
+
+    // A `trunk_queue` product whose PR is in review with NO merge intent —
+    // Boss never ran the merge verb for it.
+    let product = create_test_product_named(&db, "Flunge");
+    db.set_product_merge_mechanism(&product.id, Some("trunk_queue"))
+        .unwrap();
+    let task = create_test_chore_manual(&db, product.id.clone(), "stable per-standing key");
+    db.update_work_item(
+        &task.id,
+        WorkItemPatch {
+            status: Some("in_review".into()),
+            pr_url: Some(pr_url(PR)),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        db.list_active_trunk_merge_intents().unwrap().is_empty(),
+        "precondition: the queue poller's entire candidate set is empty, so it sees nothing",
+    );
+
+    // Lane 1: the merge poller probes the PR and sees Trunk's failed check.
+    let candidate = crate::work::PendingMergeCheck {
+        work_item_id: task.id.clone(),
+        product_id: product.id.clone(),
+        pr_url: pr_url(PR),
+    };
+    let head_probe = crate::merge_poller::PrLifecycleProbe::builder()
+        .url(pr_url(PR))
+        .state(crate::merge_poller::PrLifecycleState::Open(
+            crate::merge_poller::OpenPrStatus {
+                mergeability: crate::merge_poller::OpenPrMergeability::Clean,
+                // Green on the head: the required `buildkite/flunge-ci`
+                // context passed (build 2833). The failure is elsewhere.
+                ci: crate::merge_poller::OpenPrCiStatus::Clean,
+            },
+        ))
+        .head_ref_oid(EVICTED_HEAD.to_owned())
+        .base_ref_name("main".to_owned())
+        .labels(Vec::new())
+        .review(crate::merge_poller::PrReviewState::Unknown)
+        .trunk_queue_check_failure(crate::merge_poller::TrunkQueueCheckFailure {
+            name: "Trunk Merge Queue (main)".to_owned(),
+            conclusion: "FAILURE".to_owned(),
+            details_url: "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156".to_owned(),
+        })
+        .build();
+    assert!(
+        crate::trunk_queue_adopt::adopt_unattributed_trunk_queue_episode(&db, &candidate, &head_probe),
+        "an eviction no intent tracks must be adopted, not discarded",
+    );
+
+    // Lane 2: the queue poller now enumerates the episode. The entry has
+    // already left the queue (Trunk evicted it before Boss ever looked), so
+    // this is the `getSubmittedPullRequest` resolution path.
+    let api = StubTrunkApi::with_queue(vec![Ok(queue_of(TrunkQueueState::Running, Vec::new()))]);
+    api.set_entry(
+        PR as u64,
+        Ok(entry_of_with_state_changed_at(
+            PR as u64,
+            TrunkPrState::Failed,
+            "2026-07-31T05:59:34.000Z",
+        )),
+    );
+    // What `bk` returns for `trunk-merge/pr-1156/*`: build 2837, one failed job.
+    let evidence = Arc::new(StubEvictionEvidence {
+        failing_jobs: vec![RequiredCheckFailure {
+            name: "Trunk merge queue: flunge-ci".to_owned(),
+            conclusion: "failure".to_owned(),
+            target_url: "https://buildkite.com/flunge/flunge-ci/builds/2837#019fb6c1-0457-482f-9181-3f18f31701e7"
+                .to_owned(),
+            provider: crate::merge_poller::CiProvider::Buildkite,
+            provider_job_id: Some("019fb6c1-0457-482f-9181-3f18f31701e7".to_owned()),
+        }],
+        ..StubEvictionEvidence::default()
+    });
+    let publisher = RecordingPublisher::default();
+    let mut probe = probe_with(evidence);
+    let ctx = TrunkSweepContext {
+        work_db: &db,
+        publisher: &publisher,
+        api: &api,
+    };
+
+    let outcome = probe.run_pass(&ctx, Instant::now()).await;
+
+    assert_eq!(
+        outcome.evictions_detected, 1,
+        "the adopted episode must reach ci_watch::on_trunk_queue_eviction_detected",
+    );
+    let attempt = db
+        .active_ci_remediation_for_work_item(&task.id)
+        .unwrap()
+        .expect("a ci-fix remediation for the eviction");
+    assert_eq!(attempt.failure_kind.as_deref(), Some("trunk_queue_eviction"));
+    assert_eq!(
+        attempt.head_sha_at_trigger, "trunk:entry_1156@2026-07-31T05:59:34.000Z",
+        "keyed on the Trunk episode, not the PR head — the head's own CI is green",
+    );
+    assert!(
+        attempt.failed_checks.contains("2837"),
+        "the fix worker must be pointed at the construction build, not the PR's green head: {}",
+        attempt.failed_checks,
+    );
+    assert_eq!(
+        revision_count(&db, &task.id),
+        1,
+        "the deliverable is a ci-fix revision a worker picks up",
+    );
+}
+
 // ── Eviction cause classification (T792/T793) ─────────────────────────────
 
 /// Rows in `ci_remediations` for `task_id`, and the CI attempt budget it has

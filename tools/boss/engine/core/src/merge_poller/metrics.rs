@@ -101,6 +101,11 @@ crate::register_counter!(
     "in_revision comments reopened because their task's PR closed without merging in one sweep."
 );
 crate::register_counter!(
+    TRUNK_EPISODES_ADOPTED,
+    "merge_poller.trunk_episodes_adopted",
+    "Trunk merge-queue evictions on episodes Boss did not initiate, adopted into the Trunk queue lane so they can be remediated."
+);
+crate::register_counter!(
     PASS_OVERRUN,
     "merge_poller.pass_overrun",
     "Detection passes that took longer than their own sweep cadence."
@@ -180,6 +185,7 @@ pub fn init(registry: &Registry) {
     registry.register_counter(&REVISION_INVALIDATED);
     registry.register_counter(&WORKER_STOPPED_ON_REVIEW);
     registry.register_counter(&COMMENTS_REOPENED);
+    registry.register_counter(&TRUNK_EPISODES_ADOPTED);
     registry.register_counter(&PASS_OVERRUN);
     registry.register_counter(&PASS_TIMED_OUT);
     registry.register_counter(&ADAPTIVE_BATCHES);
