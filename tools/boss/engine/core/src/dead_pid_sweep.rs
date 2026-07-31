@@ -345,7 +345,6 @@ pub async fn reconcile_orphans_on_reattach(
 /// pid verdict is corroborated against recent in-execution event activity
 /// before reaping, and whether each reap files a durable pane-death
 /// attention item. See [`DeadPidSweepMode`].
-///
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -456,8 +455,8 @@ pub async fn run_one_pass(
         // The process is gone with no corroborating activity: the worker is
         // presumed genuinely dead. Capture what the probe and live-state
         // actually observed so the reap is explainable from the run's record
-        // and the dispatch tail (the operator's "a transcript must never
-        // just stop with no reason" ask).
+        // and the dispatch tail — so a reaped run's transcript never just
+        // stops with no indication of why.
         let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
         let reason = format!(
             "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
@@ -551,7 +550,6 @@ fn corroborating_liveness(state: &LiveWorkerState, started_epoch: i64, now_epoch
 /// relaunch can kill many panes at once and an operator needs a durable
 /// record. A single reported pane death is comparatively rare and
 /// already surfaced via the `dead_pid_reconcile` dispatch event.
-///
 pub async fn reap_reported_pane_death(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
@@ -609,8 +607,8 @@ pub async fn reap_reported_pane_death(
 /// What the liveness probe and live-state observed at the moment a
 /// periodic-sweep reap was decided. Recorded on the reap's `tracing` log
 /// and `dead_pid_reconcile` dispatch-event details so a future death is
-/// explainable from the run's record — the operator's explicit ask that a
-/// reaped run's transcript never "just stops" with no indication of why.
+/// explainable from the run's record — a reaped run's transcript must
+/// never "just stop" with no indication of why.
 /// Only produced on the speculative periodic path; the app-reported
 /// pane-death reap has no probe to describe.
 struct LivenessProbeObservation {
@@ -1712,8 +1710,8 @@ mod tests {
 
         // The reap event carries what the liveness probe observed (probe
         // type, result, and the live-state activity snapshot) so a future
-        // death is explainable from the dispatch tail — the operator's ask
-        // that a reaped run never "just stops" with no indication of why.
+        // death is explainable from the dispatch tail — a reaped run must
+        // never "just stop" with no indication of why.
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
@@ -2039,12 +2037,12 @@ mod tests {
         assert_eq!(events[0].stage, Stage::DeadPidReconcile.as_str());
     }
 
-    /// The exemption is bought with evidence, not with a driver name. A Codex
-    /// worker that died mid-turn delivered no boundary, so it is reaped
-    /// exactly as any other dead worker — otherwise a genuinely crashed pane
-    /// would hold its slot forever.
+    /// A dead pid is a dead pane regardless of driver. A Codex worker that
+    /// died mid-turn delivered no boundary, so it is reaped exactly as any
+    /// other dead worker — otherwise a genuinely crashed pane would hold
+    /// its slot forever.
     #[tokio::test]
-    async fn one_shot_exit_without_a_turn_boundary_is_still_reaped() {
+    async fn an_exit_without_a_turn_boundary_is_still_reaped() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         let db = Arc::new(db);
@@ -2065,7 +2063,7 @@ mod tests {
         )
         .await;
 
-        assert!(reaped, "a one-shot worker that never finished a turn is a death");
+        assert!(reaped, "a worker that never finished a turn is still a death");
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
@@ -2109,10 +2107,45 @@ mod tests {
         );
     }
 
+    /// [`reap_reported_pane_death`]'s own contract (see its doc) is that it
+    /// never files a [`PANE_DEATH_ATTENTION_KIND`] item — that kind is
+    /// reserved for [`reconcile_orphans_on_reattach`], where a single app
+    /// relaunch can kill many panes at once and an operator needs a durable
+    /// record. A single reported pane death does not get one.
+    #[tokio::test]
+    async fn reap_reported_pane_death_files_no_attention_item() {
+        let (_dir, db) = open_db();
+        let (work_item_id, execution_id) = create_codex_run(&db);
+        db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
+            .unwrap();
+        let db = Arc::new(db);
+
+        let live_states = Arc::new(LiveWorkerStateRegistry::new());
+        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.worker_pool().claim_worker(&execution_id, None).await;
+
+        reap_reported_pane_death(
+            db.as_ref(),
+            &live_states,
+            coordinator.clone(),
+            Arc::new(RecordingDispatchEventSink::new()).as_ref(),
+            &execution_id,
+            "child process exited",
+        )
+        .await;
+
+        let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
+        assert!(
+            !items.iter().any(|i| i.kind == PANE_DEATH_ATTENTION_KIND),
+            "reap_reported_pane_death never files this kind: {items:?}",
+        );
+    }
+
     /// Claude's process is contracted to outlive its turns, so a recorded turn
     /// boundary says nothing about whether it is alive. Its pane dying is still
-    /// a reap — the sweeps must behave exactly as they did before the one-shot
-    /// exemption existed.
+    /// a reap — a dead durable pid is a dead pane and the turn-boundary record
+    /// is not consulted.
     #[tokio::test]
     async fn a_persistent_driver_pane_death_is_still_reaped_after_a_turn_boundary() {
         let (_dir, db) = open_db();

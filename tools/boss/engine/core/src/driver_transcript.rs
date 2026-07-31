@@ -92,14 +92,11 @@ pub fn driver_or_default(driver: Option<&dyn AgentDriver>) -> &dyn AgentDriver {
 }
 
 /// The driver slug that actually governed `execution_id`'s run: the pool's
-/// fixed driver for a review/automation-pool worker, else the reviewed row's
-/// own `tasks.driver` → `products.default_driver` → engine-default chain.
-///
-/// `pub(crate)` so call sites that only need the slug (not a resolved
-/// [`AgentDriver`]) go through the same pool-dispatch-aware resolution
-/// instead of reading `tasks.driver` directly and mis-resolving a
-/// pool-dispatched run's actual driver.
-pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+/// fixed driver for a review/automation-pool worker (via
+/// [`pool_override_driver_slug`]), else the reviewed row's own
+/// `tasks.driver` → `products.default_driver` → engine-default chain (via
+/// `WorkDb::get_execution_driver_slug`).
+fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
     if let Some(slug) = pool_override_driver_slug(work_db, execution_id) {
         return Some(slug);
     }

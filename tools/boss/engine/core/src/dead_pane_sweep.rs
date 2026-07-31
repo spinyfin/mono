@@ -705,9 +705,9 @@ mod tests {
     /// Codex is now `Persistent` (the bare interactive TUI pivot — see
     /// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), so a
     /// dead durable pid on a `waiting_human` Codex row is a genuine dead
-    /// pane, delivered turn boundary or not — the one-shot exemption this
-    /// sweep used to grant Codex no longer applies, and a dead pid is
-    /// reconciled exactly as it already was for Claude.
+    /// pane, delivered turn boundary or not: a dead durable pid is a dead
+    /// pane, the turn-boundary record is not consulted, and reconciliation
+    /// runs exactly as it already did for Claude.
     #[tokio::test]
     async fn a_finished_persistent_codex_worker_is_still_reconciled_as_a_dead_pane() {
         let (_d, db) = open_db();
@@ -722,17 +722,17 @@ mod tests {
     }
 
     /// No delivered turn boundary is also still reconciled — unchanged by
-    /// the `Persistent` flip, since this path never depended on the
-    /// one-shot exemption in the first place.
+    /// the `Persistent` flip, since this path never consulted the
+    /// turn-boundary record in the first place.
     #[tokio::test]
-    async fn a_one_shot_worker_that_never_finished_is_still_reconciled() {
+    async fn a_worker_whose_run_delivered_no_turn_boundary_is_still_reconciled() {
         let (_d, db) = open_db();
         let exec = parked_codex_execution(&db, None);
 
         let sink = NoopDispatchEventSink;
         assert!(
             reconcile_if_pane_dead(&db, &sink, &exec, now_epoch_secs()).await,
-            "a one-shot worker with no delivered turn is a genuine dead pane",
+            "a worker with no delivered turn boundary is a genuine dead pane",
         );
         assert_eq!(db.get_execution(&exec.id).unwrap().status, ExecutionStatus::Orphaned);
     }
