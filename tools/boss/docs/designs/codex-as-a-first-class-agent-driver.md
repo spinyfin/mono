@@ -302,6 +302,8 @@ The wire format is **deliberately Claude-Code-compatible**, and on 0.145.0 this 
 - `PreToolUse hook returned unsupported continue:false` / `...stopReason` / `...suppressOutput`
 - deny requires a non-empty `permissionDecisionReason`
 
+**Deny-only means there is no allow token at all — the allow path is silence.** The list above records what Codex _rejects_; it left unstated what a guard should emit to let a call through, and the first Codex guards shipped emitting Claude's `{"decision":"approve"}` on that path, which produced one hook error per guard on every tool call. Measured against 0.145.0: the accepted allow response is **no output** (`{}` also works), the accepted refusals are `{"decision":"block","reason":<non-empty>}` and `permissionDecision:deny` + `permissionDecisionReason`, and two further traps apply — `decision:deny` is _not_ a synonym for `block` and is rejected, and a `block` whose reason is missing or empty is rejected too. Because a rejected response is fail-open, an unexplained refusal silently runs the call. Full matrix and post-fix verification: [`investigations/codex-pretooluse-decision-vocabulary-2026-07-30.md`](../investigations/codex-pretooluse-decision-vocabulary-2026-07-30.md).
+
 Since `updatedInput` requires `permissionDecision:allow`, and `allow` is rejected, **tool-input rewriting is unreachable** even if hooks work. `PostToolUse` supports `decision: block` + `reason`. Handler kinds `async`, `prompt`, and `agent` are parsed but skipped — _"not supported yet"_.
 
 Configuration _(confirmed against `learn.chatgpt.com/docs/config-file/config-advanced`)_:
