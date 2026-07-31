@@ -159,7 +159,7 @@ fn no_fix_block_returns_no_outcomes_and_leaves_originals_untouched() {
         &paths(&["a.txt"]),
         &tree,
         &empty_config(),
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         |_| {},
     );
 
@@ -208,7 +208,7 @@ printf 'ESCAPED' > sandbox_escape.txt"#,
         &paths(&["a.txt"]),
         &tree,
         &empty_config(),
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         |_| {},
     );
 
@@ -252,7 +252,7 @@ done"#,
     );
 
     let package = declarative_with_fixer(&script.to_string_lossy());
-    let exclusion = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+    let exclusion = crate::path_scope::PathScope::exclude_only(&["vendor/**".to_owned()]).expect("matcher");
 
     let outcomes = run_declarative_fix(
         DeclarativeFixContext {
@@ -318,7 +318,7 @@ exit 1"#,
         &paths(&["a.rs", "b.rs"]),
         &tree,
         &empty_config(),
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         |_| {},
     );
 
@@ -380,7 +380,7 @@ done"#,
         &paths(&["a.txt"]),
         &tree,
         &config,
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         |_| {},
     );
     assert_eq!(outcomes1.len(), 1, "one invocation outcome on first pass");
@@ -406,7 +406,7 @@ done"#,
         &paths(&["a.txt"]),
         &tree,
         &config,
-        &crate::exclusion_matcher::ExclusionMatcher::default(),
+        &crate::path_scope::PathScope::default(),
         |_| {},
     );
     assert_eq!(outcomes2.len(), 1, "one invocation outcome on second pass");

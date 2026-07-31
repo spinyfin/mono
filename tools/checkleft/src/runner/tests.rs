@@ -46,7 +46,7 @@ impl ExternalCheckExecutor for StaticExternalExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
-        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
+        _exclusion: &crate::path_scope::PathScope,
     ) -> Result<CheckResult> {
         self.seen_packages
             .lock()
@@ -89,7 +89,7 @@ impl ExternalCheckExecutor for MockExclusionExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
-        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
+        _exclusion: &crate::path_scope::PathScope,
     ) -> Result<CheckResult> {
         Ok(CheckResult {
             check_id: package.id.clone(),
@@ -562,7 +562,7 @@ id = "emits"
 /// findings located on an excluded path.
 #[test]
 fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
-    let matcher = crate::exclusion_matcher::ExclusionMatcher::new(&["vendor/**".to_owned()]).expect("matcher");
+    let matcher = crate::path_scope::PathScope::exclude_only(&["vendor/**".to_owned()]).expect("matcher");
     let mut result = CheckResult {
         check_id: "demo".to_owned(),
         findings: vec![

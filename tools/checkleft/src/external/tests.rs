@@ -219,6 +219,49 @@ artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
     assert!(message.contains("api_vesion"));
 }
 
+/// The manifest side must keep rejecting a definition-side include key on a
+/// `mode = "component"` package — the check-entry `applies_to` (sibling of
+/// `config:` in a `CHECKS` file, see `config.rs`) is the only supported route
+/// to scoping a component check; the manifest itself must never carry one.
+#[test]
+fn component_mode_rejects_applies_to() {
+    let manifest = r#"
+id = "workflow-shell-strict-v2"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+applies_to = ["**/*.sh"]
+"#;
+
+    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
+    assert!(error.to_string().contains("applies_to"), "unexpected error: {error:#}");
+}
+
+/// A spelling not already declared on `RawExternalCheckPackage` (e.g. an
+/// `include`/`paths`-shaped key) is rejected too, but earlier and more
+/// bluntly: `deny_unknown_fields` on the manifest struct means any word not in
+/// its known field list fails to parse in *any* mode, component included —
+/// there is no spelling that reaches `reject_declarative_fields` un-rejected.
+#[test]
+fn component_mode_rejects_novel_include_spelling_as_unknown_field() {
+    let manifest = r#"
+id = "workflow-shell-strict-v2"
+mode = "component"
+runtime = "component-v1"
+api_version = "v1"
+artifact_path = "check.wasm"
+artifact_sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+include = ["**/*.sh"]
+"#;
+
+    let error = parse_external_check_package_manifest(manifest).expect_err("must fail");
+    let message = format!("{error:#}");
+    assert!(message.contains("unknown field"), "unexpected error: {message}");
+    assert!(message.contains("include"), "unexpected error: {message}");
+}
+
 #[test]
 fn rejects_non_canonical_artifact_sha256() {
     let manifest = r#"

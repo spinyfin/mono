@@ -1136,7 +1136,7 @@ impl ExternalCheckExecutor for DeclarativeEligibleCountExecutor {
         _config: &toml::Value,
         _config_dir: &std::path::Path,
         _effective_severity: Option<crate::output::Severity>,
-        _exclusion: &crate::exclusion_matcher::ExclusionMatcher,
+        _exclusion: &crate::path_scope::PathScope,
     ) -> anyhow::Result<crate::output::CheckResult> {
         Ok(crate::output::CheckResult {
             check_id: package.id.clone(),
@@ -1148,11 +1148,11 @@ impl ExternalCheckExecutor for DeclarativeEligibleCountExecutor {
         &self,
         package: &ExternalCheckPackage,
         changeset: &ChangeSet,
-        config: &toml::Value,
+        _config: &toml::Value,
     ) -> usize {
         match &package.implementation {
             ExternalCheckPackageImplementation::Declarative(d) => {
-                crate::external::declarative::eligible_file_count(&self.root, d, changeset, config)
+                crate::external::declarative::eligible_file_count(&self.root, d, changeset)
             }
             _ => changeset.changed_files.len(),
         }
