@@ -469,6 +469,7 @@ fn flunge_1156_evicted_rollup() -> Vec<serde_json::Value> {
             "status": "COMPLETED",
             "conclusion": "FAILURE",
             "detailsUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
+            "completedAt": "2026-07-28T09:14:02Z",
         }),
         serde_json::json!({
             "__typename": "StatusContext",
@@ -507,6 +508,11 @@ fn real_flunge_eviction_reads_clean_but_still_surfaces_the_trunk_check() {
         trunk.details_url,
         "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156",
     );
+    assert_eq!(
+        trunk.completed_at.as_deref(),
+        Some("2026-07-28T09:14:02Z"),
+        "the episode discriminator: the head sha alone cannot tell two queue attempts on one commit apart",
+    );
 }
 
 /// `isRequired` is deliberately not consulted: Trunk's check is not part of
@@ -541,6 +547,80 @@ fn trunk_queue_check_failure_ignores_non_failing_and_absent_leaves() {
         );
     }
     assert!(super::trunk_queue_check_failure(&[]).is_none());
+}
+
+/// The eviction predicate is deliberately *narrower* than the CI failure set
+/// [`super::is_failure_conclusion`], which the Trunk lane must not inherit.
+///
+/// `CANCELLED` is the one that matters: a human cancelling the queue entry
+/// they just created is a decision, not a failure (the Trunk lane says so
+/// itself at its `TrunkPrState::Cancelled` arm). Reading it as an eviction
+/// would adopt an intent, resolve it as cancelled, and file the "PR was
+/// removed from the Trunk merge queue" attention item against a card that
+/// was never in the Merging lane — noise manufactured out of a benign click.
+#[test]
+fn trunk_queue_check_failure_rejects_conclusions_that_are_decisions_not_evictions() {
+    for conclusion in ["CANCELLED", "SKIPPED", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"] {
+        let leaf = serde_json::json!({
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        });
+        assert!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf)).is_none(),
+            "{conclusion} is not an eviction and must not adopt a merge intent",
+        );
+    }
+
+    // …while the conclusions that really do mean "Trunk kicked this PR out"
+    // still are one.
+    for conclusion in ["FAILURE", "TIMED_OUT"] {
+        let leaf = serde_json::json!({
+            "name": "Trunk Merge Queue (main)",
+            "status": "COMPLETED",
+            "conclusion": conclusion,
+        });
+        assert_eq!(
+            super::trunk_queue_check_failure(std::slice::from_ref(&leaf))
+                .map(|f| f.conclusion)
+                .as_deref(),
+            Some(conclusion),
+        );
+    }
+}
+
+/// `classify_ci` resolves a leaf's identity as `name` falling back to
+/// `context` before applying the Trunk exclusion, so the capturing reader
+/// must resolve it the same way. If it did not, a Trunk-named leaf arriving
+/// in `StatusContext` shape would be dropped from the CI verdict *and* not
+/// captured by the Trunk lane — the "signal dies everywhere" hole, narrower.
+/// Trunk posts a `CheckRun` today, so this guards the asymmetry rather than
+/// a live payload.
+#[test]
+fn trunk_queue_check_failure_reads_a_status_context_shaped_leaf() {
+    let leaves = [serde_json::json!({
+        "__typename": "StatusContext",
+        "context": "Trunk Merge Queue (main)",
+        "state": "FAILURE",
+        "targetUrl": "https://app.trunk.io/flunge/merge-queue/c1478ade/1156",
+    })];
+
+    assert_eq!(
+        super::classify_ci(&leaves, None),
+        OpenPrCiStatus::Clean,
+        "the exclusion already resolves `context`; this leaf must not spawn a pr_branch_ci remediation",
+    );
+
+    let trunk = super::trunk_queue_check_failure(&leaves).expect("…and it must not be dropped by the Trunk lane too");
+    assert_eq!(trunk.name, "Trunk Merge Queue (main)");
+    assert_eq!(
+        trunk.details_url,
+        "https://app.trunk.io/flunge/merge-queue/c1478ade/1156"
+    );
+    assert!(
+        trunk.completed_at.is_none(),
+        "a StatusContext has no completedAt; adoption falls back to NULL-safe exactly-once keying",
+    );
 }
 
 /// Re-runs land last in the rollup, so the newest leaf wins — a PR

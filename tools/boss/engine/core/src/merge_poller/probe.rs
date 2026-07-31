@@ -400,7 +400,12 @@ pub(crate) const PR_PROBE_FIELDS: &str = concat!(
     "mergeQueueEntry { state position enqueuedAt } ",
     "autoMergeRequest { enabledAt } ",
     "commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 30) { nodes { ",
-    "__typename ... on CheckRun { name status conclusion detailsUrl } ",
+    // `completedAt` is requested for one reader only: it is the episode
+    // discriminator `trunk_queue_adopt` keys adoption on (a head sha is not
+    // one — a PR can be queued twice on an unchanged head) and the only
+    // datum that says how old an eviction is. It is a scalar on a node
+    // already being fetched, so it costs no extra GraphQL nodes.
+    "__typename ... on CheckRun { name status conclusion detailsUrl completedAt } ",
     "... on StatusContext { context state targetUrl } } } } } } }",
 );
 

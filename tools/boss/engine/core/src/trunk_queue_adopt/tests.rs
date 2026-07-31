@@ -30,11 +30,33 @@ fn seed(db: &WorkDb, name: &str, mechanism: Option<&str>) -> PendingMergeCheck {
     }
 }
 
+/// An RFC 3339 instant `secs_ago` seconds in the past, in the shape GitHub
+/// reports a check run's `completedAt`.
+fn completed_secs_ago(secs_ago: i64) -> String {
+    chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() - secs_ago, 0)
+        .unwrap()
+        .to_rfc3339()
+}
+
+/// A `completedAt` comfortably inside the adoption window, computed once per
+/// test process so that repeated [`evicted_probe`] calls describe the *same*
+/// episode rather than two episodes a second apart.
+fn recent_completed_at() -> &'static str {
+    static AT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    AT.get_or_init(|| completed_secs_ago(60))
+}
+
 /// The probe shape the merge poller produces for #1156 at its evicted head:
 /// open, mergeable, CI clean on the PR's own head (both Buildkite contexts
 /// were green — the failure was on the construction branch), and carrying
 /// the failed Trunk check.
 fn evicted_probe(head_sha: &str) -> PrLifecycleProbe {
+    evicted_probe_at(head_sha, Some(recent_completed_at().to_owned()))
+}
+
+/// [`evicted_probe`] with an explicit episode discriminator — the check
+/// run's `completedAt`, or `None` for the rare leaf that reports none.
+fn evicted_probe_at(head_sha: &str, completed_at: Option<String>) -> PrLifecycleProbe {
     PrLifecycleProbe::builder()
         .url(PR_URL)
         .state(PrLifecycleState::Open(OpenPrStatus {
@@ -49,6 +71,7 @@ fn evicted_probe(head_sha: &str) -> PrLifecycleProbe {
             name: "Trunk Merge Queue (main)".to_owned(),
             conclusion: "FAILURE".to_owned(),
             details_url: "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156".to_owned(),
+            completed_at,
         })
         .build()
 }
@@ -181,12 +204,12 @@ fn does_not_adopt_while_an_eviction_episode_is_still_being_remediated() {
     assert_eq!(count_intents(&db, &candidate.work_item_id), 1);
 }
 
-/// Exactly once per episode. Trunk posts its check per commit, so a head
-/// whose check stays failed must not be re-adopted on every 60 s sweep —
-/// especially once the poller has retired the resulting intent, which is
-/// when the active-intent gate above stops covering it.
+/// Exactly once per episode. The same still-failed check leaf is observed on
+/// every sweep, so it must not be re-adopted each time — especially once the
+/// poller has retired the resulting intent, which is when the active-intent
+/// gate above stops covering it.
 #[test]
-fn adopts_at_most_once_per_head_even_after_the_intent_is_retired() {
+fn adopts_at_most_once_per_episode_even_after_the_intent_is_retired() {
     let db = test_db();
     let candidate = seed(&db, "flunge-once", Some("trunk_queue"));
 
@@ -210,6 +233,143 @@ fn adopts_at_most_once_per_head_even_after_the_intent_is_retired() {
         );
     }
     assert_eq!(count_intents(&db, &candidate.work_item_id), 1);
+}
+
+/// A commit is not an episode. A human can cancel their queue entry and
+/// re-check Trunk's box — or requeue after the base-mismatch retire whose
+/// own attention item tells them to — without the head ever moving, and
+/// Trunk then evicts *that* attempt and concludes a fresh check run. Keying
+/// adoption on the head sha alone declined this silently, which is precisely
+/// the unattributable-eviction-goes-unnoticed failure adoption exists to
+/// end; the check run's `completedAt` is what tells the two apart.
+#[test]
+fn adopts_a_second_episode_on_an_unchanged_head() {
+    let db = test_db();
+    let candidate = seed(&db, "flunge-requeued", Some("trunk_queue"));
+
+    // Episode 1: queued, then cancelled by the human who queued it. The
+    // poller retires the intent; the head never moves.
+    let first_at = completed_secs_ago(900);
+    assert!(adopt_unattributed_trunk_queue_episode(
+        &db,
+        &candidate,
+        &evicted_probe_at(EVICTED_HEAD, Some(first_at.clone()))
+    ));
+    let first = db
+        .get_active_trunk_merge_intent(&candidate.work_item_id)
+        .unwrap()
+        .unwrap();
+    db.retire_trunk_merge_intent(&first.id, "cancelled").unwrap();
+
+    // Episode 2: requeued on the same commit and evicted for failing tests.
+    // A fresh check run means a fresh `completedAt`.
+    assert!(
+        adopt_unattributed_trunk_queue_episode(
+            &db,
+            &candidate,
+            &evicted_probe_at(EVICTED_HEAD, Some(completed_secs_ago(120)))
+        ),
+        "a second queue episode on the same commit must be adopted, not declined",
+    );
+
+    let second = db
+        .get_active_trunk_merge_intent(&candidate.work_item_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(second.id, first.id);
+    assert_eq!(second.adopted_at_head_sha.as_deref(), Some(EVICTED_HEAD));
+    assert_eq!(count_intents(&db, &candidate.work_item_id), 2);
+}
+
+/// The recency bound. A failed Trunk check sits on a head until that head
+/// moves, so an evicted-then-abandoned PR carries the eviction indefinitely.
+/// Adopting it would mint a `ci-fix` revision for an episode a human walked
+/// away from and — because an adopted intent carries the same authority as a
+/// merge-verb one — eventually re-enqueue and merge the PR.
+#[test]
+fn declines_an_episode_older_than_the_adoption_window() {
+    let db = test_db();
+    let candidate = seed(&db, "flunge-abandoned", Some("trunk_queue"));
+    let stale = completed_secs_ago(MAX_ADOPTABLE_EPISODE_AGE.as_secs() as i64 + 60);
+
+    assert!(!adopt_unattributed_trunk_queue_episode(
+        &db,
+        &candidate,
+        &evicted_probe_at(EVICTED_HEAD, Some(stale))
+    ));
+    assert_eq!(count_intents(&db, &candidate.work_item_id), 0);
+}
+
+/// …while an episode just inside the window is still live work and is
+/// adopted normally. The bound exists to stop backfilling history, not to
+/// drop evictions the poller would otherwise have caught.
+#[test]
+fn adopts_an_episode_just_inside_the_adoption_window() {
+    let db = test_db();
+    let candidate = seed(&db, "flunge-fresh", Some("trunk_queue"));
+    let fresh = completed_secs_ago(MAX_ADOPTABLE_EPISODE_AGE.as_secs() as i64 - 300);
+
+    assert!(adopt_unattributed_trunk_queue_episode(
+        &db,
+        &candidate,
+        &evicted_probe_at(EVICTED_HEAD, Some(fresh))
+    ));
+    assert_eq!(count_intents(&db, &candidate.work_item_id), 1);
+}
+
+/// A leaf with no usable `completedAt` cannot be aged, so the bound does not
+/// apply — declining on a missing datum would throw away a live eviction —
+/// but adoption must still be exactly-once, which the NULL-safe existence
+/// probe delivers.
+#[test]
+fn adopts_once_when_the_leaf_reports_no_completed_at() {
+    let db = test_db();
+    let candidate = seed(&db, "flunge-nodate", Some("trunk_queue"));
+
+    assert!(adopt_unattributed_trunk_queue_episode(
+        &db,
+        &candidate,
+        &evicted_probe_at(EVICTED_HEAD, None)
+    ));
+    let adopted = db
+        .get_active_trunk_merge_intent(&candidate.work_item_id)
+        .unwrap()
+        .unwrap();
+    db.retire_trunk_merge_intent(&adopted.id, "cancelled").unwrap();
+
+    for _ in 0..3 {
+        assert!(!adopt_unattributed_trunk_queue_episode(
+            &db,
+            &candidate,
+            &evicted_probe_at(EVICTED_HEAD, None)
+        ));
+    }
+    assert_eq!(count_intents(&db, &candidate.work_item_id), 1);
+}
+
+#[test]
+fn episode_age_is_measured_from_the_checks_completed_at() {
+    // 2026-07-28T09:14:02Z
+    const COMPLETED_EPOCH: i64 = 1785230042;
+    let completed = chrono::DateTime::from_timestamp(COMPLETED_EPOCH, 0)
+        .unwrap()
+        .to_rfc3339();
+
+    assert_eq!(
+        super::episode_age_secs(Some(&completed), COMPLETED_EPOCH + 3_600),
+        Some(3_600),
+    );
+    // A non-UTC offset is the same instant, not an hour of extra age.
+    assert_eq!(
+        super::episode_age_secs(Some("2026-07-28T02:14:02-07:00"), COMPLETED_EPOCH + 60),
+        Some(60),
+    );
+    // Trunk's clock marginally ahead of ours is a fresh episode, not a stale
+    // one — a negative age must never read as "older than the window".
+    assert_eq!(super::episode_age_secs(Some(&completed), COMPLETED_EPOCH - 5), Some(-5),);
+    // Nothing to bound against: absent, empty, or unparseable.
+    assert_eq!(super::episode_age_secs(None, COMPLETED_EPOCH), None);
+    assert_eq!(super::episode_age_secs(Some("not a timestamp"), COMPLETED_EPOCH), None);
 }
 
 /// The other half of head-sha keying: it is episode-scoped, not permanent.

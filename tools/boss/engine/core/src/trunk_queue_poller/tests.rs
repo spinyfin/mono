@@ -890,6 +890,13 @@ async fn an_eviction_boss_did_not_initiate_is_adopted_and_remediated() {
             name: "Trunk Merge Queue (main)".to_owned(),
             conclusion: "FAILURE".to_owned(),
             details_url: "https://app.trunk.io/flunge/merge-queue/c1478ade-ef63-4ba9-86de-b45801e5fb5e/1156".to_owned(),
+            // Inside the adoption window: an eviction this poller is about
+            // to resolve is by definition a live episode, not a backfill.
+            completed_at: Some(
+                chrono::DateTime::from_timestamp(boss_engine_utils::epoch_time::now_epoch_secs() - 120, 0)
+                    .unwrap()
+                    .to_rfc3339(),
+            ),
         })
         .build();
     assert!(
