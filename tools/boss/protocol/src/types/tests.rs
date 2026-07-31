@@ -2029,7 +2029,7 @@ fn selected_product_state_roundtrips_under_its_status_tag() {
                 product_id: "prod_1".into(),
                 name: "Flunge".into(),
                 slug: "flunge".into(),
-                reported_at: 1_747_000_000,
+                reported_at: "2025-05-11T22:26:40Z".into(),
             },
             "selected",
         ),
@@ -2060,7 +2060,7 @@ fn selected_product_result_flattens_status_alongside_the_event_tag() {
             product_id: "prod_1".into(),
             name: "Flunge".into(),
             slug: "flunge".into(),
-            reported_at: 1_747_000_000,
+            reported_at: "2025-05-11T22:26:40Z".into(),
         },
     };
     let value = serde_json::to_value(&event).unwrap();
@@ -2086,7 +2086,7 @@ fn selected_product_state_reports_a_reason_for_every_unavailable_case() {
             product_id: "prod_1".into(),
             name: "Flunge".into(),
             slug: "flunge".into(),
-            reported_at: 1,
+            reported_at: "1970-01-01T00:00:01Z".into(),
         }
         .unavailable_reason()
         .is_none()

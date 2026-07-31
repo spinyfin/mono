@@ -68,7 +68,7 @@ mod tests {
             product_id: "prod_abc".into(),
             name: "Flunge".into(),
             slug: "flunge".into(),
-            reported_at: 1_700_000_000,
+            reported_at: "2023-11-14T22:13:20Z".into(),
         }
     }
 

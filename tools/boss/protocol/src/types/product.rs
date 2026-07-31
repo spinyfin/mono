@@ -254,8 +254,12 @@ pub enum SelectedProductState {
         product_id: String,
         name: String,
         slug: String,
-        /// Epoch seconds at which the app last reported this selection.
-        reported_at: i64,
+        /// When the app last reported this selection, as an ISO-8601 UTC
+        /// timestamp (`YYYY-MM-DDTHH:MM:SSZ`) — the same shape every
+        /// other `*_at` field in this protocol carries, so a script
+        /// consuming `bossctl selected-product --json` parses it with
+        /// whatever it already uses for Boss timestamps.
+        reported_at: String,
     },
     /// No macOS app session is registered — the Boss UI is not running
     /// (or has not finished connecting), so there is no chooser to read.

@@ -36,7 +36,7 @@ extension EngineClient {
     /// selected.
     ///
     /// This exists so `bossctl selected-product` has something to read.
-    /// Short IDs (`T42`) are scoped per product, and until this report
+    /// Short IDs (`T<n>`) are scoped per product, and until this report
     /// existed the engine had no idea which product was on screen, so a
     /// coordinator resolving a short ID had to guess — and a wrong guess
     /// resolves *successfully*, to the wrong work item.

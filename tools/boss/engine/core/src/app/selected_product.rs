@@ -42,16 +42,9 @@ pub(super) struct SelectedProductReport {
     /// The reported product id. `None` means the app explicitly reported
     /// "nothing is selected" — distinct from never having reported.
     product_id: Option<String>,
-    /// Epoch seconds at which the report arrived.
-    reported_at: i64,
-}
-
-/// Epoch seconds, saturating at 0 for a clock set before 1970.
-fn now_epoch_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    /// ISO-8601 UTC timestamp at which the report arrived, formatted
+    /// once here so the wire type never has to.
+    reported_at: String,
 }
 
 impl ServerState {
@@ -70,7 +63,9 @@ impl ServerState {
         *self.selected_product.lock().unwrap() = Some(SelectedProductReport {
             session_id: session_id.to_owned(),
             product_id,
-            reported_at: now_epoch_seconds(),
+            reported_at: boss_engine_utils::iso8601::format_epoch_iso8601(
+                boss_engine_utils::epoch_time::now_epoch_secs(),
+            ),
         });
         true
     }

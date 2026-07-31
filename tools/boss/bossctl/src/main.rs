@@ -261,7 +261,7 @@ enum Command {
         action: comments::CommentsAction,
     },
     /// Print the product the Boss UI's product chooser is currently set
-    /// to — the product a short ID (`T42`) should be resolved against,
+    /// to — the product a short ID (`T<n>`) should be resolved against,
     /// and the value to pass to `boss --product`.
     ///
     /// Read-only in both directions: it does not change the selection and
