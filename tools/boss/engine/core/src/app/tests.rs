@@ -192,6 +192,7 @@ mod context;
 mod dispatch_pause;
 mod driver_start_signal;
 mod engine_health_report;
+mod metadata_persistence;
 mod open_document;
 mod pr_status;
 mod probe_delivery;

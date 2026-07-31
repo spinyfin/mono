@@ -6,6 +6,7 @@
 use super::*;
 
 use boss_engine_utils::iso8601::{format_epoch_iso8601, format_paused_since_phrase};
+use sha2::{Digest, Sha256};
 
 /// Build the per-product effort-audit report. Handles the product
 /// lookup, window filter, and chore-corpus / event-log fan-in so
@@ -75,6 +76,34 @@ pub(crate) const METADATA_KEY_DISPATCH_PAUSE_REASON: &str = "dispatch_paused_rea
 /// so this exists solely to give restart-time restoration something
 /// non-empty to carry forward instead of panicking on missing history.
 pub(super) const LEGACY_PAUSE_REASON_FALLBACK: &str = "reason not recorded (pause predates reason tracking)";
+
+/// Fallback reason substituted for a persisted pause reason that matches
+/// [`RETIRED_FABRICATED_PAUSE_REASON_SHA256`] — i.e. a reason that was
+/// never actually authored by an operator, just synthesized client-side
+/// by a since-removed `bossctl` default. Distinct from
+/// [`LEGACY_PAUSE_REASON_FALLBACK`] (which covers a pause from before the
+/// reason field existed at all) so the two "no real reason" cases stay
+/// separately diagnosable if it ever matters.
+pub(super) const FABRICATED_PAUSE_REASON_FALLBACK: &str =
+    "reason not recorded (was synthesized by a since-removed bossctl default, not authored by an operator)";
+
+/// SHA-256 of the placeholder reason `bossctl dispatch pause` / `bossctl
+/// automation pause` / `bossctl pause` used to fabricate client-side
+/// before `--reason` became required. Compared as a digest rather than
+/// the literal retired phrase so that phrase does not reappear anywhere
+/// in the source tree. A persisted reason matching this digest was never
+/// actually authored by an operator; restoring it renders as
+/// [`FABRICATED_PAUSE_REASON_FALLBACK`] instead of echoing fabricated
+/// text back as though a human had typed it.
+const RETIRED_FABRICATED_PAUSE_REASON_SHA256: &str = "5831d61684650c2cf085321be0e0640cb1495be5567a3d167047a2f102c3d2c9";
+
+/// `true` when `reason` (already trimmed by the caller) is byte-for-byte
+/// the retired client-side default described at
+/// [`RETIRED_FABRICATED_PAUSE_REASON_SHA256`].
+fn is_retired_fabricated_pause_reason(reason: &str) -> bool {
+    let digest = Sha256::digest(reason.as_bytes());
+    format!("{digest:x}") == RETIRED_FABRICATED_PAUSE_REASON_SHA256
+}
 
 /// Metadata key for the interactive-pool concurrency cap (`bossctl dispatch
 /// concurrency --set N`). Stores the decimal `usize` limit; absent or
@@ -439,7 +468,11 @@ pub(super) fn load_automation_paused_state(work_db: &WorkDb) -> (bool, u64, Opti
 /// Shared helper for the dispatch/automation reason-restore rule: `None`
 /// when not paused; otherwise the persisted reason, or
 /// [`LEGACY_PAUSE_REASON_FALLBACK`] when a pause is active but no reason
-/// was persisted for it.
+/// was persisted for it, or [`FABRICATED_PAUSE_REASON_FALLBACK`] when the
+/// persisted reason is byte-for-byte the retired `bossctl` client-side
+/// default — that value was never actually authored by an operator, so it
+/// must not be echoed back as though it were. Never back-filled into
+/// `state.db`: this substitution happens only at read time.
 fn load_persisted_pause_reason(work_db: &WorkDb, key: &str, paused: bool) -> Option<String> {
     if !paused {
         return None;
@@ -448,8 +481,14 @@ fn load_persisted_pause_reason(work_db: &WorkDb, key: &str, paused: bool) -> Opt
         .get_metadata(key)
         .ok()
         .flatten()
-        .filter(|v| !v.trim().is_empty());
-    Some(stored.unwrap_or_else(|| LEGACY_PAUSE_REASON_FALLBACK.to_owned()))
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    let reason = match stored {
+        None => LEGACY_PAUSE_REASON_FALLBACK.to_owned(),
+        Some(v) if is_retired_fabricated_pause_reason(&v) => FABRICATED_PAUSE_REASON_FALLBACK.to_owned(),
+        Some(v) => v,
+    };
+    Some(reason)
 }
 
 /// Read the persisted interactive-pool concurrency cap from the metadata KV.
