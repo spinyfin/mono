@@ -2611,26 +2611,99 @@ pub(crate) fn migrate_backfill_cancelled_moot_revision_tombstones(conn: &Connect
 }
 
 /// Create `execution_driver_decisions`: one row per `work_executions` row,
-/// recording which driver Codex-percentage routing chose for it and why
-/// (`explicit` | `percentage` | `default`) — see `work::codex_routing`.
+/// recording which driver traffic allocation chose for it and why
+/// (`explicit` | `allocation` | `default`) — see `work::driver_allocation`.
 /// A dedicated side table rather than columns on `work_executions` itself:
 /// the decision is written once, read by two narrow lookups keyed on
 /// `execution_id`, and joins cleanly for after-the-fact analysis ("how much
-/// went to Codex", "did Codex rows fail more") without touching the
-/// `work_executions` SELECT column list every other query in this crate
+/// went to each driver", "did one driver's rows fail more") without touching
+/// the `work_executions` SELECT column list every other query in this crate
 /// repeats verbatim.
+///
+/// `split_at_decision` holds the JSON-encoded `DriverTrafficSplit` the row
+/// was placed against. A database created while the superseded single-Codex-
+/// percentage scheme was live instead has a nullable
+/// `percentage_at_decision INTEGER` column, left in place and unread: its
+/// rows carry `reason = 'percentage'`, which
+/// `work::driver_allocation::get_execution_driver_decision_conn` still
+/// recognises, and their recorded `driver` still routes.
 pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS execution_driver_decisions (
-             execution_id           TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
-             work_item_id           TEXT NOT NULL,
-             driver                 TEXT,
-             reason                 TEXT NOT NULL,
-             percentage_at_decision INTEGER,
-             created_at             TEXT NOT NULL
+             execution_id      TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
+             work_item_id      TEXT NOT NULL,
+             driver            TEXT,
+             reason            TEXT NOT NULL,
+             split_at_decision TEXT,
+             created_at        TEXT NOT NULL
          );
          CREATE INDEX IF NOT EXISTS execution_driver_decisions_work_item_idx
              ON execution_driver_decisions(work_item_id);",
+    )?;
+    if !table_has_column(conn, "execution_driver_decisions", "split_at_decision")? {
+        conn.execute(
+            "ALTER TABLE execution_driver_decisions ADD COLUMN split_at_decision TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// Fold a persisted single-Codex-percentage value into the equivalent
+/// three-way `DriverTrafficSplit`, once.
+///
+/// The superseded scheme stored one integer under `codex_dispatch_percentage`
+/// and sent `bucket < percentage` to Codex. `work::driver_allocation` lays
+/// `codex` out over exactly that low end of the bucket line, so
+/// `{grok: 0, claude: 100 - p, codex: p}` allocates identically — an operator
+/// who had turned the experiment up keeps their routing across the upgrade
+/// instead of silently snapping back to all-`claude`.
+///
+/// The legacy key is removed afterwards so there is exactly one source of
+/// truth. Guarded on the new key being absent and self-idempotent: once
+/// either the fold has run or an operator has set a split directly, this is
+/// a no-op forever.
+pub(crate) fn migrate_driver_traffic_split_from_codex_percentage(conn: &Connection) -> Result<()> {
+    let already_set: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'driver_traffic_split'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if already_set.is_some() {
+        return Ok(());
+    }
+    let legacy: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = ?1",
+            params![METADATA_KEY_CODEX_DISPATCH_PERCENTAGE],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(codex) = legacy
+        .as_deref()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .map(|v| v.min(100) as u8)
+    else {
+        // Absent, or a hand-edited value that is not a number at all —
+        // nothing meaningful to carry forward. Leave the default split in
+        // place rather than inventing an allocation from garbage.
+        conn.execute(
+            "DELETE FROM metadata WHERE key = ?1",
+            params![METADATA_KEY_CODEX_DISPATCH_PERCENTAGE],
+        )?;
+        return Ok(());
+    };
+    let split = DriverTrafficSplit::new(0, 100 - codex, codex);
+    conn.execute(
+        "INSERT INTO metadata (key, value) VALUES ('driver_traffic_split', ?1)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![serde_json::to_string(&split)?],
+    )?;
+    conn.execute(
+        "DELETE FROM metadata WHERE key = ?1",
+        params![METADATA_KEY_CODEX_DISPATCH_PERCENTAGE],
     )?;
     Ok(())
 }

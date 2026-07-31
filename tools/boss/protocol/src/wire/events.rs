@@ -1100,11 +1100,11 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clamped_from: Option<usize>,
     },
-    /// Response to [`FrontendRequest::SetCodexDispatchPercentage`] and
-    /// [`FrontendRequest::GetCodexDispatchPercentage`]. `percentage` is the
-    /// current effective value (always `0..=100`).
-    CodexDispatchPercentageResult {
-        percentage: u8,
+    /// Response to [`FrontendRequest::SetDriverTrafficSplit`] and
+    /// [`FrontendRequest::GetDriverTrafficSplit`]. `split` is the current
+    /// effective allocation; its three shares always sum to exactly 100.
+    DriverTrafficSplitResult {
+        split: DriverTrafficSplit,
     },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state

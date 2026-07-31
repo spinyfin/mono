@@ -702,9 +702,14 @@ impl WorkDb {
         // doc comment.
         migrate_backfill_cancelled_moot_revision_tombstones(conn)?;
         // `execution_driver_decisions`: one row per execution recording the
-        // Codex-percentage routing decision (driver + reason). New table
-        // only, independent of every migration above.
+        // driver traffic allocation decision (driver + reason + the split it
+        // was decided under). New table plus one additive column, independent
+        // of every migration above.
         migrate_execution_driver_decisions_table(conn)?;
+        // Fold a superseded `codex_dispatch_percentage` value into the
+        // equivalent three-way split and drop the legacy key. Data-only,
+        // self-idempotent — see the function doc comment.
+        migrate_driver_traffic_split_from_codex_percentage(conn)?;
         // `pr_review_verdicts`: durable per-pass review-verdict ledger, written
         // atomically with `record_worker_pr_completion` so a `pr_review` pass
         // can never reach `completed` without a verdict row. Additive,

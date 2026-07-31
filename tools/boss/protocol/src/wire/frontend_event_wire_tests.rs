@@ -1831,9 +1831,11 @@ fn tag_cases() -> Vec<TagCase> {
             expected_tag: "dispatch_concurrency_result",
         },
         TagCase {
-            label: "CodexDispatchPercentageResult",
-            event: FrontendEvent::CodexDispatchPercentageResult { percentage: 25 },
-            expected_tag: "codex_dispatch_percentage_result",
+            label: "DriverTrafficSplitResult",
+            event: FrontendEvent::DriverTrafficSplitResult {
+                split: DriverTrafficSplit::new(10, 60, 30),
+            },
+            expected_tag: "driver_traffic_split_result",
         },
     ]
 }
@@ -1981,7 +1983,7 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::MetricsResetDone { .. }
         | FrontendEvent::PrReconcilersKicked { .. }
         | FrontendEvent::DispatchConcurrencyResult { .. }
-        | FrontendEvent::CodexDispatchPercentageResult { .. }
+        | FrontendEvent::DriverTrafficSplitResult { .. }
         | FrontendEvent::DispatchStateResult { .. }
         | FrontendEvent::ExternalTrackerSyncStarted { .. }
         | FrontendEvent::CiRemediationsList { .. }
@@ -2074,6 +2076,20 @@ fn hello_pins_session_id_field() {
     .unwrap();
     assert_eq!(v["type"], "hello");
     assert_eq!(v["session_id"], "sess_1");
+}
+
+/// The macOS app hand-decodes the nested split object, so its three share
+/// keys are wire contract, not internals.
+#[test]
+fn driver_traffic_split_result_pins_nested_share_field_names() {
+    let v = serde_json::to_value(FrontendEvent::DriverTrafficSplitResult {
+        split: DriverTrafficSplit::new(10, 60, 30),
+    })
+    .unwrap();
+    assert_eq!(v["type"], "driver_traffic_split_result");
+    assert_eq!(v["split"]["grok"], 10);
+    assert_eq!(v["split"]["claude"], 60);
+    assert_eq!(v["split"]["codex"], 30);
 }
 
 #[test]

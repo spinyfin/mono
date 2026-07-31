@@ -592,9 +592,18 @@ final class EngineClient: @unchecked Sendable {
                 let rawIssues = report["issues"] as? [[String: Any]] ?? []
                 let issues = rawIssues.compactMap(parseEngineHealthIssue)
                 emit(.engineHealthResult(apiKeyPresent: apiKeyPresent, issues: issues))
-            case "codex_dispatch_percentage_result":
-                let percentage = (payload["percentage"] as? NSNumber)?.intValue ?? 0
-                emit(.codexDispatchPercentageResult(percentage: percentage))
+            case "driver_traffic_split_result":
+                let raw = payload["split"] as? [String: Any] ?? [:]
+                // A share the engine did not send would make the decoded
+                // split fail its sum-to-100 invariant, so fall back to the
+                // engine default wholesale rather than to a partly-decoded
+                // split the UI would then treat as real.
+                let decoded = DriverTrafficSplit(
+                    grok: (raw["grok"] as? NSNumber)?.intValue ?? 0,
+                    claude: (raw["claude"] as? NSNumber)?.intValue ?? 0,
+                    codex: (raw["codex"] as? NSNumber)?.intValue ?? 0
+                )
+                emit(.driverTrafficSplitResult(split: decoded.isValid ? decoded : .engineDefault))
             case "trunk_status":
                 let configured = (payload["configured"] as? NSNumber)?.boolValue ?? false
                 let source = payload["source"] as? String

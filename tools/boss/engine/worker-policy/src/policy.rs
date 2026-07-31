@@ -347,7 +347,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::DebugLiveStatusPipeline
         | FrontendRequest::ExecutionTranscript { .. }
         | FrontendRequest::FocusWorkerPane { .. }
-        | FrontendRequest::GetCodexDispatchPercentage
+        | FrontendRequest::GetDriverTrafficSplit
         | FrontendRequest::GetDispatchConcurrency
         | FrontendRequest::GetDispatchState
         | FrontendRequest::GetEngineHealth
@@ -374,7 +374,7 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::RetirePane { .. }
         | FrontendRequest::RevealWorkItem { .. }
         | FrontendRequest::SendInputToWorker { .. }
-        | FrontendRequest::SetCodexDispatchPercentage { .. }
+        | FrontendRequest::SetDriverTrafficSplit { .. }
         | FrontendRequest::SetDispatchConcurrency { .. }
         | FrontendRequest::SetDispatchPaused { .. }
         | FrontendRequest::SetFeatureFlag { .. }
