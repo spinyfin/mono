@@ -2475,7 +2475,6 @@ fn design_directive_requires_the_scope_tag() {
     );
     assert!(directive.contains("rather than silently omitting them"), "{directive}");
 }
-
 /// The breakdown block must carry proportionality calibration, not just
 /// split rules: a named cost for over-splitting to balance the scheduler
 /// rejection named for under-splitting, anchor bands relating entry count
@@ -2512,4 +2511,27 @@ fn design_directive_calibrates_breakdown_size_to_problem_size() {
         "{directive}"
     );
     assert!(directive.contains("rather than fewer"), "{directive}");
+}
+
+/// The design-discipline block (distilled from the codex-driver-execution-shape
+/// postmortem into generalisable lessons) must appear in both design-family
+/// directives, not be duplicated as separate text in each.
+#[test]
+fn design_discipline_block_present_in_both_design_directives() {
+    let design = compose_design_directive(None);
+    assert!(design.contains("Name the contested property up front"), "{design}");
+    assert!(
+        design.contains("codex-driver-execution-shape-postmortem-2026-07-29.md"),
+        "{design}"
+    );
+
+    let postmortem = compose_design_postmortem_directive(None, "/tmp/followups.json");
+    assert!(
+        postmortem.contains("Name the contested property up front"),
+        "{postmortem}"
+    );
+    assert!(
+        postmortem.contains("codex-driver-execution-shape-postmortem-2026-07-29.md"),
+        "{postmortem}"
+    );
 }

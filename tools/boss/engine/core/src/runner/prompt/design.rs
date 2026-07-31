@@ -24,6 +24,26 @@ pub(super) fn doc_structure_conventions_block() -> String {
     out
 }
 
+/// Design-discipline guidance distilled from a process postmortem
+/// (`tools/boss/docs/investigations/codex-driver-execution-shape-postmortem-2026-07-29.md`)
+/// into lessons general enough to apply to any project, not just the one
+/// that prompted them. Shared by both design-family directives: an
+/// undocumented decision, an invariant pitched at the wrong level, or an
+/// unfalsifiable rejection costs the same whether the doc is being
+/// authored fresh or reconciled against what shipped.
+pub(super) fn design_discipline_block() -> String {
+    let mut out = String::new();
+    out.push_str("- **Design discipline** (see `tools/boss/docs/investigations/codex-driver-execution-shape-postmortem-2026-07-29.md` for the full reasoning behind each point):\n");
+    out.push_str("  - **Name the contested property up front.** If this project's central bet is a property a reviewer could reasonably disagree with, put that property in the title or opening sentence — not bury it as an implementation detail nobody is ever asked about.\n");
+    out.push_str("  - **Silence is not neutral.** If you can't find a recorded reason for an existing decision, don't assume a reason once existed and was lost — the stronger and more common reading is that the decision was never made at all. Treat that as a finding, not something to paper over.\n");
+    out.push_str("  - **State invariants at the level of the property that is load-bearing, not the container that usually carries it.** If an implementation could satisfy the letter of a constraint while breaking everything downstream of it, the constraint is written at the wrong level. When you record two things as equivalent, name the dimension the equivalence holds on — an equivalence noted on one dimension gets read as holding on all of them.\n");
+    out.push_str("  - **Every rejection must be checkable, and must survive contact with existing practice.** A pejorative label is not an argument. If you reject an approach that something else in this project (or a comparable one) already does in production, name that precedent and say why the reasoning doesn't apply to it — a rejection that would also disqualify what's already shipped isn't a rejection. Also check that each requirement used to reject an alternative is a real requirement, not an artifact of the option you'd already picked.\n");
+    out.push_str("  - **Decide whether a study is choosing between options or validating one, and say so before you run it.** A study that can only return \"the chosen approach works\" or \"it's broken\" will never surface that a different approach is better, however carefully it's run. Evidence gathered to verify a claim can't later stand in for a comparison it was never asked to make, and a hedge like \"fine, if that option were chosen\" is marking an unmade decision — escalate the decision instead of filing the hedge as a result.\n");
+    out.push_str("  - **A gate at the end of a phase has no authority over the phase it belongs to** — it can only block what comes after. And a hand-built reproduction of a real system is structurally unable to find integration bugs, because it's built from the same beliefs that produced the code; only the genuine end-to-end path finds those.\n");
+    out.push_str("  - **Don't let documents or tests harden drift into fact.** When a premise changes, make the change and everything downstream of it visible in the same diff — quietly folding an amendment in before anyone sees the contradiction just hides it. A test that pins a since-superseded requirement turns drift into a defended invariant, so sweep the tests that pin a premise in the same change that changes the premise. Separate a doc's durable reasoning from its perishable status/gaps/tasks so the latter can be refreshed without disturbing the former.\n");
+    out
+}
+
 /// Directive block for the synthetic `kind = 'design'` task that the
 /// engine auto-creates with every project. Without this block the
 /// `project_design` worker only sees the generic "draft or update a
@@ -66,6 +86,7 @@ pub(super) fn compose_design_directive(parent_project: Option<&Project>) -> Stri
     out.push_str("  - **Chosen approach** — the design itself, with enough detail that a follow-up implementation task can be filed against it.\n");
     out.push_str("  - **Risks / open questions** — anything the author wants a human reviewer to land on before implementation starts.\n");
     out.push_str("  - **Proposed implementation task breakdown** — this section is **required** and must be the final section of the doc. It is the machine-findable handoff to scheduling (see below).\n");
+    out.push_str(&design_discipline_block());
     out.push_str("- the **Proposed implementation task breakdown** section must:\n");
     out.push_str("  - use exactly that heading (`## Proposed implementation task breakdown`) so a downstream parser can locate it reliably.\n");
     out.push_str("  - list PR-sized tasks in dependency order, where each entry contains:\n");
@@ -125,6 +146,7 @@ pub(super) fn compose_design_postmortem_directive(
         out.push_str(&path_line);
     }
     out.push_str(&doc_structure_conventions_block());
+    out.push_str(&design_discipline_block());
     out.push_str("- review each merged PR listed in the details above (`gh pr view`/`gh pr diff`) alongside the current doc, and update the doc to reflect **as-built reality**:\n");
     out.push_str("  - decisions that diverged from what the doc originally said, and why (as best you can tell from the PR/commit history).\n");
     out.push_str("  - scope that was added or dropped relative to the doc's plan.\n");
