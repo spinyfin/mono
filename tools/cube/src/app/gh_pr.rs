@@ -1,15 +1,26 @@
 //! Shared REST-backed GitHub PR lookups.
 //!
 //! `gh pr view` and `gh pr list` are implemented over GitHub's GraphQL API,
-//! which draws from a quota entirely separate from REST. Every hot path in
-//! `cube` that resolves a PR's head branch or lifecycle state (`workspace
-//! goto`, `workspace rebase`, `pr push`, GC's closed-PR sweep) does so
-//! through `gh api` against the REST `pulls` endpoints instead, so a fleet of
-//! workers exhausting the GraphQL budget never blocks these lookups — the
-//! separate, far-less-contended REST (`core`) quota serves them.
+//! which draws from a quota entirely separate from REST. Every single-PR hot
+//! path in `cube` that resolves a PR's head branch or lifecycle state
+//! (`workspace goto`, `workspace rebase`, `pr push`) does so through `gh api`
+//! against the REST `pulls` endpoints instead, so a fleet of workers
+//! exhausting the GraphQL budget never blocks these lookups — the separate,
+//! far-less-contended REST (`core`) quota serves them.
+//!
+//! The one exception is [`fetch_pr_states_batch`], used by GC's closed-PR
+//! bookmark sweep: that caller walks *every* `pr/<n>` bookmark a reused
+//! workspace has accumulated, not a single PR, and REST's `pulls/{n}`
+//! endpoint has no batch form — one bookmark meant one full serial round
+//! trip, unbounded by any timeout, which was observed to hang `cube
+//! workspace release` for 4-6+ minutes on a single stuck call. GraphQL's
+//! aliasing lets the whole sweep go out as one round trip instead, the same
+//! technique the merge-poller reconciler uses for its own batched probe
+//! (`tools/boss/engine/core/src/merge_poller/probe.rs`).
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
@@ -28,6 +39,69 @@ pub(super) fn fetch_pr_json(runner: &dyn CommandRunner, cwd: &Path, owner_repo: 
         .run(&RealCommandRunner::invocation(cwd, "gh", &["api", &api_path]))
         .map_err(|e| enrich_rate_limit_error(runner, cwd, e))?;
     Ok(serde_json::from_str(&json)?)
+}
+
+/// Fetch the `state` (`"OPEN"` / `"CLOSED"` / `"MERGED"`) of every PR in
+/// `pr_numbers`, all assumed to belong to `owner_repo`, in a single `gh api
+/// graphql` round trip via aliased `pullRequest(...)` blocks — instead of one
+/// REST call per PR. See the module doc for why this one lookup goes through
+/// GraphQL when everything else here deliberately doesn't.
+///
+/// Returns an empty map for an empty `pr_numbers` without spawning a
+/// subprocess. A PR number absent from the returned map means GraphQL's node
+/// for it came back null (force-deleted/transferred) — the caller decides
+/// how to treat that, same as a REST 404 would.
+///
+/// Bounded by `timeout` so a hung or rate-limited GitHub cannot block the
+/// caller indefinitely; the timeout (or any other transport failure) is
+/// returned as `Err`, never silently swallowed into an empty result, so a
+/// caller can tell "genuinely nothing closed" apart from "the lookup never
+/// completed".
+pub(super) fn fetch_pr_states_batch(
+    runner: &dyn CommandRunner,
+    cwd: &Path,
+    owner_repo: &str,
+    pr_numbers: &[u64],
+    timeout: Duration,
+) -> Result<HashMap<u64, String>> {
+    let mut out = HashMap::new();
+    if pr_numbers.is_empty() {
+        return Ok(out);
+    }
+    let (owner, repo) = owner_repo
+        .split_once('/')
+        .ok_or_else(|| CubeError::InvalidArgument(format!("`{owner_repo}` is not an `owner/repo` slug")))?;
+
+    let mut query = format!(r#"{{ repository(owner: "{owner}", name: "{repo}") {{"#);
+    for (idx, number) in pr_numbers.iter().enumerate() {
+        query.push_str(&format!(" pr{idx}: pullRequest(number: {number}) {{ state }}"));
+    }
+    query.push_str(" } }");
+
+    let json = runner
+        .run_with_timeout(
+            &RealCommandRunner::invocation(cwd, "gh", &["api", "graphql", "-f", &format!("query={query}")]),
+            timeout,
+        )
+        .map_err(|e| enrich_rate_limit_error(runner, cwd, e))?;
+    let body: Value = serde_json::from_str(&json)?;
+
+    if let Some(errors) = body.get("errors").and_then(Value::as_array)
+        && !errors.is_empty()
+    {
+        return Err(CubeError::InvalidArgument(format!(
+            "batched PR-state graphql query for {owner_repo} returned errors: {errors:?}"
+        )));
+    }
+
+    let repo_node = &body["data"]["repository"];
+    for (idx, number) in pr_numbers.iter().enumerate() {
+        let alias = format!("pr{idx}");
+        if let Some(state) = repo_node.get(alias).and_then(|n| n["state"].as_str()) {
+            out.insert(*number, state.to_string());
+        }
+    }
+    Ok(out)
 }
 
 /// Extract `head.ref` from a PR's REST JSON.

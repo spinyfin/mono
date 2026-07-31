@@ -212,8 +212,13 @@ fn gc_forgets_closed_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &["api", "repos/spinyfin/mono/pulls/42"],
-            r#"{"state":"closed","merged":false}"#,
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 42) { state } } }",
+            ],
+            r#"{"data":{"repository":{"pr0":{"state":"CLOSED"}}}}"#,
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/42"], ""),
     ]);
@@ -288,8 +293,13 @@ fn gc_forgets_merged_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &["api", "repos/spinyfin/mono/pulls/99"],
-            r#"{"state":"closed","merged":true}"#,
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 99) { state } } }",
+            ],
+            r#"{"data":{"repository":{"pr0":{"state":"MERGED"}}}}"#,
         ),
         ExpectedCommand::ok(workspace_path.clone(), "jj", &["bookmark", "forget", "pr/99"], ""),
     ]);
@@ -365,10 +375,110 @@ fn gc_retains_open_pr_bookmark() {
         ExpectedCommand::ok(
             workspace_path.clone(),
             "gh",
-            &["api", "repos/spinyfin/mono/pulls/7"],
-            r#"{"state":"open","merged":false}"#,
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 7) { state } } }",
+            ],
+            r#"{"data":{"repository":{"pr0":{"state":"OPEN"}}}}"#,
         ),
         // No bookmark forget — pr/7 is still open.
+    ]);
+    run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
+        Some(&database_path),
+        &release_runner,
+    )
+    .expect("release");
+    release_runner.assert_exhausted();
+}
+
+/// The actual regression this fix addresses: a workspace reused across many
+/// leases can accumulate several stale `pr/*` bookmarks, and the sweep must
+/// resolve all of them in one `gh api graphql` round trip, not one `gh api`
+/// call per bookmark. `FakeRunner` is a strict FIFO of exact-match
+/// invocations, so if the production code regressed to a per-bookmark REST
+/// walk, this test would panic on "unexpected command invocation" (a second
+/// `gh` call) rather than silently pass.
+#[test]
+fn gc_batches_pr_state_lookup_across_multiple_bookmarks() {
+    let (tempdir, database_path) = with_database_path();
+    let workspace_root = tempdir.path().join("workspaces");
+    let workspace_path = workspace_root.join("mono-agent-001");
+    std::fs::create_dir_all(workspace_path.join(".jj")).expect("workspace dir");
+
+    seed_mono_repo(&workspace_root, &database_path);
+
+    let lease_runner = lease_runner_for(&workspace_path, "abc1234");
+    let lease_result = run_with_dependencies(
+        Cli::parse_from(["cube", "workspace", "lease", "mono", "--task", "pr gc batch"]),
+        Some(&database_path),
+        &lease_runner,
+    )
+    .expect("lease");
+    lease_runner.assert_exhausted();
+    let lease_id = lease_result.payload["workspace"]["lease_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Three stale bookmarks, far apart in PR number the way a long-lived
+    // reused workspace accumulates them: one closed, one merged, one still
+    // open. All three are resolved by exactly one `gh api graphql` call.
+    let release_runner = FakeRunner::new(vec![
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["git", "fetch"], ""),
+        release_guard_reusable_command(&workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "origin\tgit@github.com:spinyfin/mono.git\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["bookmark", "set", "main", "-r", "main@origin", "--allow-backwards"],
+            "",
+        ),
+        ExpectedCommand::ok(workspace_path.clone(), "jj", &["new", "main@origin"], ""),
+        gc_noop_command(&workspace_path),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["git", "remote", "list"],
+            "github\tgit@github.com:spinyfin/mono.git\norigin\t/local/mirror\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &[
+                "log",
+                "-r",
+                "bookmarks(glob:\"pr/*\")",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ],
+            "pr/1579\npr/2201\npr/2332\n",
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "gh",
+            &[
+                "api",
+                "graphql",
+                "-f",
+                "query={ repository(owner: \"spinyfin\", name: \"mono\") { pr0: pullRequest(number: 1579) { state } pr1: pullRequest(number: 2201) { state } pr2: pullRequest(number: 2332) { state } } }",
+            ],
+            r#"{"data":{"repository":{"pr0":{"state":"CLOSED"},"pr1":{"state":"OPEN"},"pr2":{"state":"MERGED"}}}}"#,
+        ),
+        ExpectedCommand::ok(
+            workspace_path.clone(),
+            "jj",
+            &["bookmark", "forget", "pr/1579", "pr/2332"],
+            "",
+        ),
     ]);
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "release", "--lease", &lease_id]),
