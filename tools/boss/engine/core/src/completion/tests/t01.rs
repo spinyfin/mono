@@ -2518,3 +2518,53 @@ async fn no_op_marker_is_refused_when_a_command_was_left_unobserved() {
         "the unobserved command must file its own attention item; got {items:?}",
     );
 }
+
+#[tokio::test]
+async fn no_op_marker_is_accepted_on_a_later_clean_turn_after_an_earlier_unobserved_command() {
+    // A long-lived, multi-turn Codex session fires a Stop at every turn
+    // boundary, not once at process exit. A command abandoned on an early
+    // turn must refuse the no-op claim it actually undermines (the Stop
+    // immediately following it), but must NOT permanently refuse every
+    // later, unrelated NO_CHANGES_NEEDED claim for the rest of the run —
+    // that was the multi-turn-session bug in the single accumulate-forever
+    // tracking this test locks the fix for.
+    let workspace = tempdir().unwrap();
+    let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
+    write_assistant_transcript(
+        &db,
+        workspace.path(),
+        &execution_id,
+        "## Summary\nRan the test suite and it passed; nothing else to change.\n\nNO_CHANGES_NEEDED\n",
+    );
+    let detector = StubPrDetector::ok(None);
+
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    handler
+        .staged_unobserved_commands
+        .record(&execution_id, "bazel test //tools/boss/...");
+
+    // Turn N: the abandoned command correctly refuses this Stop's no-op claim.
+    let first = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(first, StopOutcome::AwaitingInput),
+        "turn N's no-op claim must be refused by the command it abandoned; got {first:?}",
+    );
+    assert_eq!(
+        probes.snapshot(),
+        [(execution_id.clone(), PROBE_NO_PR.to_owned())],
+        "turn N's refusal must still get the normal produce-a-PR nudge",
+    );
+
+    // Turn N+1: no new command went unobserved. The same claim must now be
+    // trusted — the gate must not still be latched from turn N.
+    let second = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(&second, StopOutcome::NoChangesNeeded { work_item_id } if work_item_id == &chore_id),
+        "a clean later turn must not inherit an earlier turn's unobserved-command refusal forever; \
+         got {second:?}",
+    );
+    match db.get_work_item(&chore_id).unwrap() {
+        WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done, "the later clean no-op must close the task"),
+        other => panic!("expected chore, got {other:?}"),
+    }
+}

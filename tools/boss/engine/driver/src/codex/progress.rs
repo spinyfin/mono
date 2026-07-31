@@ -30,7 +30,53 @@ use super::guard_chain::{self, ArmedChainStatus};
 use super::guard_trace;
 use crate::{ProgressIdentityStore, ProgressSessionNormalizer, TranscriptSessionNormalizer};
 
-const MAX_TRACKED_ROLLOUT_CALLS: usize = 256;
+/// Bound on concurrently-pending (started, not yet completed) rollout tool
+/// calls tracked by [`CodexRolloutProgressSession`] (`self.calls`,
+/// [`CodexRolloutProgressSession::remember_call`] /
+/// [`CodexRolloutProgressSession::take_call`]).
+///
+/// This one genuinely is a **per-turn** bound, unlike
+/// [`MAX_TRACKED_TRANSCRIPT_TOOL_CALLS`] below: `self.calls` is fully
+/// drained (and cleared — see the `self.calls.clear()` at the end of
+/// [`CodexRolloutProgressSession::drain_abandoned_command_notifications`])
+/// immediately before every `Stop`, i.e. at every turn boundary, so its
+/// occupancy resets to zero on every turn regardless of how long the
+/// surrounding Codex session runs. 256 concurrently-outstanding tool calls
+/// within a single turn (before any of them complete) is already a
+/// pathological turn, so the original one-turn sizing holds for a session of
+/// any length — what changed under a long-lived multi-turn session is not
+/// this bound, only that eviction here used to be silent. It no longer is:
+/// evicting a call here means Boss loses the ability to ever report it as
+/// abandoned (`take_call` can no longer find it, and it is dropped from
+/// `call_order` without a `Notification`), which is strictly worse than the
+/// unobserved-command notification this whole module exists to emit — so
+/// eviction is now logged at `error!` in [`CodexRolloutProgressSession::remember_call`].
+const MAX_TRACKED_ROLLOUT_CALLS_PER_TURN: usize = 256;
+
+/// Bound on rollout tool calls tracked by [`CodexTranscriptSession`]
+/// (`self.tool_calls`, [`CodexTranscriptSession::remember_exec`] /
+/// [`CodexTranscriptSession::take_exec`]) — the transcript-rendering
+/// correlator the live-status loop (`live_status_loop.rs::run_slot_loop`)
+/// constructs **once per worker slot and keeps for the life of the run**,
+/// feeding it every tail entry across every turn. Unlike
+/// [`MAX_TRACKED_ROLLOUT_CALLS_PER_TURN`] there is no per-turn drain here: a
+/// resolved call is removed by `take_exec` as soon as its output arrives, so
+/// occupancy only grows from calls that are *abandoned* (never observed
+/// completing) — the same condition
+/// `codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION` (50 distinct
+/// commands) bounds on the engine side, but with no structural cap here: a
+/// long multi-turn session can in principle abandon calls turn after turn
+/// with nothing draining this map between them. Sized generously above that
+/// 50-per-session ceiling (each entry is a small `RolloutToolCall` — a tool
+/// name plus its JSON input — so the worst case is a few MB, not a
+/// correctness concern) to make eviction a true tail event rather than
+/// something an ordinary long session runs into. Where it must still exist —
+/// no cap is infinite — eviction is loud: logged at `error!` in
+/// [`CodexTranscriptSession::remember_exec`], because it silently orphans a
+/// call's eventual output (rendered as "omitting unmatched tool output body"
+/// even though the command genuinely completed and Boss simply stopped
+/// remembering it started).
+const MAX_TRACKED_TRANSCRIPT_TOOL_CALLS: usize = 4096;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(super) struct RolloutToolCall {
@@ -241,11 +287,19 @@ impl CodexRolloutProgressSession {
             existing.insert(call);
             return;
         }
-        while self.calls.len() >= MAX_TRACKED_ROLLOUT_CALLS {
+        while self.calls.len() >= MAX_TRACKED_ROLLOUT_CALLS_PER_TURN {
             let Some(oldest) = self.call_order.pop_front() else {
                 break;
             };
             self.calls.remove(&oldest);
+            tracing::error!(
+                run_id = ?self.run_id,
+                evicted_call_id = oldest,
+                cap = MAX_TRACKED_ROLLOUT_CALLS_PER_TURN,
+                "codex rollout: evicted a pending tool call before its completion was observed — this \
+                 turn has more than MAX_TRACKED_ROLLOUT_CALLS_PER_TURN concurrently-outstanding calls; \
+                 the evicted call can no longer be reported as abandoned",
+            );
         }
         self.calls.insert(call_id.clone(), call);
         self.call_order.push_back(call_id);
@@ -759,11 +813,19 @@ impl CodexTranscriptSession {
             existing.insert(call);
             return;
         }
-        while self.tool_calls.len() >= MAX_TRACKED_ROLLOUT_CALLS {
+        while self.tool_calls.len() >= MAX_TRACKED_TRANSCRIPT_TOOL_CALLS {
             let Some(oldest) = self.exec_order.pop_front() else {
                 break;
             };
             self.tool_calls.remove(&oldest);
+            tracing::error!(
+                evicted_call_id = oldest,
+                cap = MAX_TRACKED_TRANSCRIPT_TOOL_CALLS,
+                "codex rollout: transcript tool-call correlator evicted a still-pending call — this \
+                 session has accumulated more than MAX_TRACKED_TRANSCRIPT_TOOL_CALLS abandoned/unresolved \
+                 tool calls; the evicted call's eventual output (if any ever arrives) will render as \
+                 unmatched",
+            );
         }
         self.tool_calls.insert(call_id.to_owned(), call);
         self.exec_order.push_back(call_id.to_owned());

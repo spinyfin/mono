@@ -630,8 +630,8 @@ impl WorkerCompletionHandler {
                  Command:\n\n```\n{command}\n```\n\n\
                  Boss cannot confirm this command's outcome (exit code, output). Any claim in this \
                  run that depends on it — tests passing, a build succeeding, `NO_CHANGES_NEEDED` — \
-                 is treated as unconfirmed: the sanctioned no-op completion is refused for this \
-                 execution as a result, so the worker still gets the normal produce-a-PR nudge.",
+                 is treated as unconfirmed: the next `NO_CHANGES_NEEDED` claim after this abandonment \
+                 is refused and the worker gets the normal produce-a-PR nudge instead.",
                 execution_id = execution.id,
                 work_item_id = execution.work_item_id,
             );
@@ -646,6 +646,55 @@ impl WorkerCompletionHandler {
                     "codex_unobserved_command: failed to file attention item (non-fatal)",
                 );
             }
+        }
+        self.detect_and_file_unobserved_command_overflow(execution).await;
+    }
+
+    /// File the one-time "audit trail overflowed" attention for `execution`
+    /// once [`crate::codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION`]
+    /// has been exceeded — the operator-visible signal that Boss can no
+    /// longer name every distinct command this execution has abandoned
+    /// (`crate::codex_unobserved_command::UnobservedCommandTracker::overflowed`
+    /// is sticky, so a matching sticky attention is the right shape here; the
+    /// per-execution attention-list check below is what keeps this filed
+    /// exactly once despite `overflowed` staying `true` on every later Stop).
+    async fn detect_and_file_unobserved_command_overflow(&self, execution: &crate::work::WorkExecution) {
+        if !self.staged_unobserved_commands.overflowed(&execution.id) {
+            return;
+        }
+        let kind = crate::codex_unobserved_command::UNOBSERVED_COMMAND_OVERFLOW_ATTENTION_KIND;
+        let already_filed = self
+            .work_db
+            .list_attention_items(&execution.id)
+            .map(|items| items.iter().any(|i| i.kind == kind))
+            .unwrap_or(false);
+        if already_filed {
+            return;
+        }
+
+        let body = format!(
+            "Codex abandoned more than \
+             {max} distinct commands (`item.started` with no `item.completed`) in this run — the \
+             audit trail stopped recording further ones by name.\n\n\
+             - execution: `{execution_id}`\n\
+             - work item: `{work_item_id}`\n\n\
+             This does not weaken the `NO_CHANGES_NEEDED` refusal gate, which does not depend on \
+             this trail — but it does mean the list of abandoned commands surfaced as attention \
+             items on this run is incomplete. Treat this run's completion claims with extra \
+             scrutiny.",
+            max = crate::codex_unobserved_command::MAX_COMMANDS_PER_EXECUTION,
+            execution_id = execution.id,
+            work_item_id = execution.work_item_id,
+        );
+        if let Err(err) = self
+            .file_execution_attention(execution, kind, "Codex abandoned-command audit trail overflowed", body)
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "codex_unobserved_command: failed to file overflow attention item (non-fatal)",
+            );
         }
     }
 

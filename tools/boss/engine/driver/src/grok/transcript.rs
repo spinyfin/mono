@@ -48,11 +48,21 @@ use crate::TranscriptSessionNormalizer;
 
 use super::progress::TOOL_NAME_MAP;
 
-/// Defensive bound on in-flight tool calls tracked per tail, matching
-/// Codex's own cap (`codex/progress.rs::MAX_TRACKED_ROLLOUT_CALLS`) — not a
-/// measured Grok-specific limit, just the same "don't grow unbounded on a
-/// tail that never sees a matching update" guard.
-const MAX_TRACKED_GROK_CALLS: usize = 256;
+/// Bound on in-flight tool calls tracked by [`GrokTranscriptSession`] — the
+/// transcript-rendering correlator the live-status loop
+/// (`live_status_loop.rs::run_slot_loop`) constructs **once per worker slot
+/// and keeps for the life of the run**, feeding it every tail entry across
+/// every turn, exactly like `codex/progress.rs::CodexTranscriptSession`. A
+/// resolved call is removed by [`GrokTranscriptSession::take`] as soon as its
+/// `tool_call_update` arrives, so occupancy only grows from calls that are
+/// abandoned (never observed completing) — a long multi-turn Grok session can
+/// in principle abandon calls turn after turn with nothing draining this map
+/// between them. Sized to match Codex's own transcript-correlator cap
+/// (`codex/progress.rs::MAX_TRACKED_TRANSCRIPT_TOOL_CALLS`) for the same
+/// reason: make eviction a true tail event rather than something an ordinary
+/// long session runs into. Where it must still exist — no cap is infinite —
+/// eviction is loud: logged at `error!` in [`GrokTranscriptSession::remember`].
+const MAX_TRACKED_GROK_CALLS: usize = 4096;
 
 /// Grok's own tool nomenclature -> Claude-canonical name, reusing the
 /// vocabulary `grok/progress.rs` already established for the hook dialect
@@ -187,6 +197,12 @@ impl GrokTranscriptSession {
                 break;
             };
             self.pending.remove(&oldest);
+            tracing::error!(
+                cap = MAX_TRACKED_GROK_CALLS,
+                "grok updates.jsonl: evicting oldest in-flight tool_call — session has accumulated more than \
+                 MAX_TRACKED_GROK_CALLS abandoned/unresolved calls; the evicted call's eventual tool_call_update \
+                 will be dropped as unmatched"
+            );
         }
         self.pending.insert(call_id.clone(), call);
         self.order.push_back(call_id);

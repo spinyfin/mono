@@ -35,9 +35,9 @@ pub fn init_all(registry: &Registry) {
     crate::merge_poller::init(registry);
     // External tracker reconciler pass counters.
     crate::external_tracker::reconcile::register_metrics(registry);
-    // Layer 4 / T10: speculative conflict-prediction sweep counters.
+    // Speculative conflict-prediction sweep counters.
     crate::speculative_conflict::init(registry);
-    // Layer 4 / T11: stacked-PR auto-structuring offer counters.
+    // Stacked-PR auto-structuring offer counters.
     crate::stacked_pr_structuring::init(registry);
     // Queue-level dispatch telemetry: per-pool depth/oldest-wait gauges,
     // dispatch-completed counter, drain-pass-duration gauge.
@@ -158,14 +158,14 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        // Layer 4 / T10: speculative conflict-prediction sweep counters.
+        // Speculative conflict-prediction sweep counters.
         for expected in ["speculative_conflict.predicted", "speculative_conflict.clean"] {
             assert!(
                 names.contains(&expected.to_owned()),
                 "init_all must register {expected}"
             );
         }
-        // Layer 4 / T11: stacked-PR auto-structuring offer counter.
+        // Stacked-PR auto-structuring offer counter.
         assert!(
             names.contains(&"stacked_pr_structuring.offered".to_owned()),
             "init_all must register stacked_pr_structuring.offered"
@@ -224,11 +224,13 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        // Codex unobserved-command detection counter.
-        assert!(
-            names.contains(&"codex.unobserved_command".to_owned()),
-            "init_all must register codex.unobserved_command"
-        );
+        // Codex unobserved-command detection counters.
+        for expected in ["codex.unobserved_command", "codex.unobserved_command_overflow"] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         // Codex PreToolUse guard observation counters.
         for expected in ["codex.guard_trace.reported", "codex.guard_trace.silent"] {
             assert!(
@@ -238,12 +240,12 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            86,
+            87,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 14 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \
-             5 github_api + 1 codex_unobserved_command + 2 codex_guard_trace counters"
+             5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();
