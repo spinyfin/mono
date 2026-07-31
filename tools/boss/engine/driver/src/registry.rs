@@ -161,6 +161,35 @@ impl DriverRegistry {
             .ok_or_else(|| UnknownDriverSlug(slug.to_owned()))
     }
 
+    /// The subset of `candidates` that can actually run a work item of
+    /// `kind`, in the order `candidates` gave them.
+    ///
+    /// Eligibility is not a list this crate maintains — it is
+    /// [`CapabilityResolver::check_dispatch`], the same gate
+    /// `runner::worker_spawn` runs immediately before a pane spawns, which
+    /// resolves the kind's [`crate::KindRequirements`] against each driver's
+    /// declared [`crate::CapabilitySet`]. Asking it here is what lets a
+    /// scheduling decision made well before dispatch (traffic allocation)
+    /// agree with the gate by construction instead of by a parallel copy of
+    /// the rules that can drift from it.
+    ///
+    /// A slug this registry does not recognise is **not** eligible: an
+    /// unknown driver fails closed, exactly as [`Self::require`] does.
+    pub fn eligible_drivers_for_kind(
+        &self,
+        kind: &boss_protocol::TaskKind,
+        candidates: &[&'static str],
+    ) -> Vec<&'static str> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|slug| {
+                self.resolver(slug)
+                    .is_some_and(|resolver| resolver.check_dispatch(kind).is_ok())
+            })
+            .collect()
+    }
+
     /// Build a [`CapabilityResolver`] for the named driver.
     ///
     /// Returns `None` when `slug` is not registered.  An unrecognised slug
@@ -375,6 +404,84 @@ mod tests {
         );
     }
 
+    /// Eligibility must agree with the dispatch gate for every registered
+    /// driver and every task kind — asserted against `check_dispatch` itself
+    /// rather than a hand-written expectation, so this stays true when a
+    /// `KindRequirements` change lands or a driver's `CapabilitySet` moves.
+    #[test]
+    fn eligible_drivers_for_kind_agrees_with_the_dispatch_gate() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let candidates: Vec<&'static str> = {
+            let mut slugs: Vec<&'static str> = reg.slugs().collect();
+            slugs.sort_unstable();
+            slugs
+        };
+        for kind in TaskKind::ALL {
+            let eligible = reg.eligible_drivers_for_kind(kind, &candidates);
+            for slug in &candidates {
+                let gate_ok = reg.resolver(slug).unwrap().check_dispatch(kind).is_ok();
+                assert_eq!(
+                    eligible.contains(slug),
+                    gate_ok,
+                    "{slug} eligibility for {kind:?} must match the dispatch gate",
+                );
+            }
+        }
+    }
+
+    /// An unregistered slug is refused, not assumed eligible: allocation
+    /// must never hand a row to a driver this binary cannot even resolve.
+    #[test]
+    fn eligible_drivers_for_kind_fails_closed_on_an_unknown_slug() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        assert_eq!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, &["copilot", "claude"]),
+            vec!["claude"],
+        );
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, &["copilot"]).is_empty(),
+            "an unknown slug must not be reported eligible",
+        );
+    }
+
+    /// A driver that lacks a capability a kind marks required-strict is
+    /// excluded — the mechanism the document-producing kinds rely on. Uses a
+    /// stub with a deliberately thin `CapabilitySet` so the case is covered
+    /// even while all three built-in drivers happen to clear every gate.
+    #[test]
+    fn eligible_drivers_for_kind_excludes_a_driver_the_kind_refuses() {
+        use boss_protocol::TaskKind;
+
+        let mut descriptor = stub_descriptor();
+        descriptor.name = "thin";
+        // Everything a `Chore` needs (no Refuse-on-absence capability
+        // missing), but no StructuredOutput / ToolUseInterception — which
+        // `Design` marks required-strict.
+        let thin: Arc<dyn AgentDriver> = Arc::new(StubDriver::new(
+            descriptor,
+            CapabilitySet::new([
+                Capability::Spawn,
+                Capability::WorkspaceProvisioning,
+                Capability::PermissionPolicy,
+                Capability::PromptComposition,
+            ]),
+        ));
+        let reg = DriverRegistry::default().with_driver("thin", thin);
+
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, &["thin"])
+                .contains(&"thin"),
+            "a chore has no required-strict escalations, so the thin driver clears it",
+        );
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Design, &["thin"]).is_empty(),
+            "Design require-stricts StructuredOutput + ToolUseInterception, which the thin driver lacks",
+        );
+    }
     #[test]
     fn slugs_enumerates_every_registered_driver() {
         let reg = DriverRegistry::default();

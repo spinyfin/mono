@@ -1546,6 +1546,29 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
     }
 }
 
+/// `true` when EVERY execution of `kind` runs on a pool whose driver is
+/// pinned by [`pool_dispatch_policy_for_worker_id`], rather than on the
+/// driver its work item resolves to.
+///
+/// The companion of that function for callers that have a kind but no worker
+/// id yet — chiefly [`crate::work::driver_allocation`], which decides a
+/// row's driver when its execution row is created, long before a pool slot
+/// is claimed. Traffic allocation must decline these executions for exactly
+/// the reason it declines a row with an explicit `--driver`: their driver is
+/// already decided elsewhere, so an allocation would be a decision record
+/// that does not describe where the worker actually ran.
+///
+/// `pr_review` (review pool) and `automation_triage` (automation pool) are
+/// the two kinds that are *always* pool-bound by kind alone. The automation
+/// pool additionally takes ordinary implementation executions whose work
+/// item came from an automation
+/// (`ClaudeCoordinator::execution_targets_automation_pool`); that half
+/// cannot be decided from the kind and is checked against
+/// `tasks.source_automation_id` at the allocation site.
+pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
+    matches!(kind, ExecutionKind::PrReview | ExecutionKind::AutomationTriage)
+}
+
 /// Derive the canonical worker-id string for a pane slot id.
 /// Inverse of [`slot_id_from_worker_id`]: regular-pool slots
 /// (1..=MAX_WORKER_POOL_SIZE) produce `"worker-{N}"`; automation-pool

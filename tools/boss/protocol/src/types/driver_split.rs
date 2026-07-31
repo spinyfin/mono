@@ -157,6 +157,162 @@ impl DriverTrafficSplit {
             _ => None,
         }
     }
+
+    /// This split renormalised onto `eligible` — the subset of drivers that
+    /// may legally take a given work item — as `(driver, share)` pairs in
+    /// bucket-line order, still summing to exactly 100.
+    ///
+    /// The caller decides what "eligible" means; this type only knows how to
+    /// respect it. (In Boss that decision is the dispatch capability gate:
+    /// `boss_engine_driver::DriverRegistry::eligible_drivers_for_kind`.)
+    ///
+    /// **The rule: proportional, by cumulative flooring.** Each eligible
+    /// driver keeps its configured share *relative to the other eligible
+    /// ones* — the operator's proportions are preserved as far as they can
+    /// be inside the subset, so restricting `20/50/30` to `{codex, claude}`
+    /// yields `29/71`, not `50/50` and not `20/50` with 30 points stranded.
+    /// The arithmetic is integer-only: the boundary after the *i*th eligible
+    /// driver is `floor(cumulative_i * 100 / eligible_total)`, and each
+    /// driver's share is the difference between consecutive boundaries. That
+    /// gives four properties this must have:
+    ///
+    /// - **Exact partition.** Consecutive differences of a monotone sequence
+    ///   ending at exactly 100 leave no gap and no overlap, so every bucket
+    ///   in `[0, 100)` still lands on exactly one driver — no rounding
+    ///   fudge, no leftover point handed to an arbitrary driver.
+    /// - **Zero stays zero.** A 0 share contributes nothing to the running
+    ///   total, so its two boundaries coincide and its interval is empty.
+    ///   Renormalisation can never resurrect a driver the operator switched
+    ///   off, which is the whole reason it is not "spread the shortfall
+    ///   evenly".
+    /// - **Bounded distortion.** Cumulative flooring gives each driver either
+    ///   the floor or the ceiling of its exact proportional share, never
+    ///   further off; the sub-point residue lands on whichever eligible
+    ///   driver the flooring happens to favour, deterministically.
+    /// - **Determinism.** A pure function of `self` and `eligible`: same
+    ///   split, same eligible set, same answer, every time — which is what
+    ///   lets [`Self::driver_for_bucket_among`] keep the "same row always
+    ///   lands on the same driver" guarantee.
+    ///
+    /// Unrecognised slugs in `eligible` are ignored (this split covers
+    /// exactly three drivers); duplicates are collapsed, and the order of
+    /// `eligible` does not matter — the result is always in
+    /// [`Self::DRIVERS_IN_BUCKET_ORDER`].
+    ///
+    /// Errors rather than repairing when the restriction leaves nothing to
+    /// allocate: see [`EligibleAllocationError`].
+    pub fn renormalised_over(&self, eligible: &[&str]) -> Result<Vec<(&'static str, u8)>, EligibleAllocationError> {
+        let boundaries = self.boundaries_over(eligible)?;
+        let mut shares = Vec::with_capacity(boundaries.len());
+        let mut prev = 0u8;
+        for (driver, end) in boundaries {
+            shares.push((driver, end - prev));
+            prev = end;
+        }
+        Ok(shares)
+    }
+
+    /// Which eligible driver owns `bucket` once this split is renormalised
+    /// over `eligible` (see [`Self::renormalised_over`] for the rule).
+    ///
+    /// This is the allocation primitive: `bucket` is a stable hash of a work
+    /// item's id in `[0, 100)`, and the answer is the driver that item goes
+    /// to. It is a strict generalisation of [`Self::driver_for_bucket`] —
+    /// with every driver eligible the two agree bucket-for-bucket, because
+    /// the eligible total is then 100 and every boundary is already integral.
+    ///
+    /// A driver **outside** `eligible` can never be returned. That is the
+    /// hard invariant: allocating a row to a driver that cannot satisfy its
+    /// kind's contract strands the row, so the restriction is applied to the
+    /// bucket line itself rather than checked afterwards.
+    pub fn driver_for_bucket_among(
+        &self,
+        bucket: u8,
+        eligible: &[&str],
+    ) -> Result<&'static str, EligibleAllocationError> {
+        for (driver, end) in self.boundaries_over(eligible)? {
+            if bucket < end {
+                return Ok(driver);
+            }
+        }
+        // Unreachable: `boundaries_over` ends at exactly 100 and `bucket` is
+        // in `[0, 100)`. Expressed as an error rather than a panic or a
+        // silent default so a future change to the boundary arithmetic that
+        // broke the partition would surface as a loud dispatch failure.
+        Err(EligibleAllocationError::BucketOutOfRange { bucket })
+    }
+
+    /// Half-open interval ends (exclusive) for each eligible driver, in
+    /// bucket-line order, ending at exactly 100. The single implementation
+    /// [`Self::renormalised_over`] and [`Self::driver_for_bucket_among`]
+    /// share, so the shares an operator can inspect and the driver a row
+    /// actually gets can never be computed two different ways.
+    fn boundaries_over(&self, eligible: &[&str]) -> Result<Vec<(&'static str, u8)>, EligibleAllocationError> {
+        let kept: Vec<(&'static str, u8)> = Self::DRIVERS_IN_BUCKET_ORDER
+            .into_iter()
+            .filter(|driver| eligible.contains(driver))
+            .map(|driver| {
+                let share = self
+                    .share_for(driver)
+                    .expect("DRIVERS_IN_BUCKET_ORDER names exactly the drivers share_for covers");
+                (driver, share)
+            })
+            .collect();
+        if kept.is_empty() {
+            return Err(EligibleAllocationError::NoEligibleDriver);
+        }
+        let total: u32 = kept.iter().map(|(_, share)| u32::from(*share)).sum();
+        if total == 0 {
+            return Err(EligibleAllocationError::EveryEligibleDriverAtZero {
+                eligible: kept.iter().map(|(driver, _)| *driver).collect(),
+                split: *self,
+            });
+        }
+        let mut cumulative = 0u32;
+        Ok(kept
+            .into_iter()
+            .map(|(driver, share)| {
+                cumulative += u32::from(share);
+                // `cumulative <= total`, so this is in `[0, 100]`, and the
+                // last entry is exactly 100.
+                (driver, (cumulative * 100 / total) as u8)
+            })
+            .collect())
+    }
+}
+
+/// Why a [`DriverTrafficSplit`] could not allocate a work item restricted to
+/// a set of eligible drivers.
+///
+/// Both real variants are deliberately errors rather than a fallback to the
+/// engine default driver. Allocation exists to route work to a driver that
+/// can actually run it; when nothing eligible has any share, quietly routing
+/// to the default would either strand the row on a driver its kind refuses
+/// or silently overrule an operator who set that driver's share to 0. Zero
+/// means zero, so the honest outcome is a loud failure the operator can fix
+/// by changing the split (or by declaring the driver eligible for the kind).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum EligibleAllocationError {
+    #[error(
+        "no driver is eligible for this work item: the eligible set is empty (or names only drivers \
+         the traffic split does not cover), so there is nothing to allocate to"
+    )]
+    NoEligibleDriver,
+    #[error(
+        "every driver eligible for this work item holds a 0 share ({}): the split is \
+         grok={}, claude={}, codex={} — raise one of the eligible drivers' shares, or make an \
+         already-funded driver eligible for this kind",
+        .eligible.join(", "),
+        .split.grok,
+        .split.claude,
+        .split.codex,
+    )]
+    EveryEligibleDriverAtZero {
+        eligible: Vec<&'static str>,
+        split: DriverTrafficSplit,
+    },
+    #[error("bucket {bucket} is outside the [0, 100) bucket line")]
+    BucketOutOfRange { bucket: u8 },
 }
 
 #[cfg(test)]
@@ -291,6 +447,220 @@ mod tests {
                     "percentage {percentage}, bucket {bucket}"
                 );
             }
+        }
+    }
+
+    /// With every driver eligible, restricting changes nothing: the
+    /// renormalised line is the configured line, bucket for bucket. Proves
+    /// `driver_for_bucket_among` is a strict generalisation rather than a
+    /// second, subtly different allocator.
+    #[test]
+    fn full_eligibility_reproduces_the_unrestricted_line_exactly() {
+        let all = DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER;
+        for split in [
+            DriverTrafficSplit::new(0, 100, 0),
+            DriverTrafficSplit::new(10, 60, 30),
+            DriverTrafficSplit::new(33, 33, 34),
+            DriverTrafficSplit::new(1, 98, 1),
+            DriverTrafficSplit::new(0, 0, 100),
+        ] {
+            for bucket in 0..100u8 {
+                assert_eq!(
+                    split.driver_for_bucket_among(bucket, &all).unwrap(),
+                    split.driver_for_bucket(bucket),
+                    "{split:?} bucket {bucket}",
+                );
+            }
+            assert_eq!(
+                split.renormalised_over(&all).unwrap(),
+                vec![
+                    (DRIVER_SLUG_CODEX, split.codex),
+                    (DRIVER_SLUG_CLAUDE, split.claude),
+                    (DRIVER_SLUG_GROK, split.grok),
+                ],
+            );
+        }
+    }
+
+    /// The operator's proportions survive the restriction: dropping a driver
+    /// redistributes its share between the survivors *in proportion to what
+    /// they already had*, not evenly.
+    #[test]
+    fn renormalising_preserves_the_configured_proportions() {
+        let split = DriverTrafficSplit::new(30, 50, 20);
+        // {codex, claude} keep 20:50 → 28.57 : 71.43 → 28/72 by cumulative
+        // flooring (codex's boundary floors to 28, claude takes the rest).
+        assert_eq!(
+            split
+                .renormalised_over(&[DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX])
+                .unwrap(),
+            vec![(DRIVER_SLUG_CODEX, 28), (DRIVER_SLUG_CLAUDE, 72)],
+        );
+        // Halves stay halves: 50:50 out of {claude, grok} at 50:30 is 62/38.
+        assert_eq!(
+            split
+                .renormalised_over(&[DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK])
+                .unwrap(),
+            vec![(DRIVER_SLUG_CLAUDE, 62), (DRIVER_SLUG_GROK, 38)],
+        );
+        // A single eligible driver takes everything it is allowed to take.
+        assert_eq!(
+            split.renormalised_over(&[DRIVER_SLUG_GROK]).unwrap(),
+            vec![(DRIVER_SLUG_GROK, 100)],
+        );
+    }
+
+    /// The renormalised line is still an exact partition of `[0, 100)`: the
+    /// per-driver bucket counts equal the renormalised shares, which sum to
+    /// 100. No gap, no overlap, no bucket unaccounted for.
+    #[test]
+    fn renormalised_buckets_partition_exactly() {
+        let subsets: [&[&str]; 6] = [
+            &[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE],
+            &[DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK],
+            &[DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK],
+            &[DRIVER_SLUG_CODEX],
+            &[DRIVER_SLUG_CLAUDE],
+            &[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_GROK],
+        ];
+        for split in [
+            DriverTrafficSplit::new(33, 33, 34),
+            DriverTrafficSplit::new(10, 60, 30),
+            DriverTrafficSplit::new(1, 98, 1),
+            DriverTrafficSplit::new(0, 50, 50),
+        ] {
+            for eligible in subsets {
+                let Ok(shares) = split.renormalised_over(eligible) else {
+                    continue; // covered by the every-eligible-driver-at-zero test
+                };
+                assert_eq!(
+                    shares.iter().map(|(_, s)| u16::from(*s)).sum::<u16>(),
+                    100,
+                    "{split:?} over {eligible:?}",
+                );
+                for (driver, share) in shares {
+                    let count = (0..100u8)
+                        .filter(|b| split.driver_for_bucket_among(*b, eligible).unwrap() == driver)
+                        .count();
+                    assert_eq!(
+                        count,
+                        usize::from(share),
+                        "{split:?} over {eligible:?}, driver {driver}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The hard invariant: a driver outside the eligible set is never
+    /// returned, for any split and any bucket.
+    #[test]
+    fn an_ineligible_driver_is_never_allocated() {
+        let subsets: [&[&str]; 3] = [
+            &[DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE],
+            &[DRIVER_SLUG_CLAUDE],
+            &[DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK],
+        ];
+        for split in [
+            DriverTrafficSplit::new(0, 100, 0),
+            DriverTrafficSplit::new(80, 10, 10),
+            DriverTrafficSplit::new(33, 33, 34),
+            DriverTrafficSplit::new(100, 0, 0),
+        ] {
+            for eligible in subsets {
+                for bucket in 0..100u8 {
+                    match split.driver_for_bucket_among(bucket, eligible) {
+                        Ok(driver) => assert!(
+                            eligible.contains(&driver),
+                            "{split:?} allocated ineligible {driver} (eligible {eligible:?}) at bucket {bucket}",
+                        ),
+                        // Only ever the all-eligible-at-zero case; never a
+                        // silent fallback to an ineligible driver.
+                        Err(err) => assert!(
+                            matches!(err, EligibleAllocationError::EveryEligibleDriverAtZero { .. }),
+                            "unexpected {err:?}",
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Zero survives renormalisation: an eligible driver at 0 stays at 0
+    /// rather than being handed a slice of the ineligible driver's share.
+    #[test]
+    fn a_zero_share_stays_zero_after_renormalising() {
+        let split = DriverTrafficSplit::new(0, 40, 60);
+        let eligible = [DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK];
+        assert_eq!(
+            split.renormalised_over(&eligible).unwrap(),
+            vec![(DRIVER_SLUG_CODEX, 100), (DRIVER_SLUG_GROK, 0)],
+        );
+        for bucket in 0..100u8 {
+            assert_eq!(
+                split.driver_for_bucket_among(bucket, &eligible).unwrap(),
+                DRIVER_SLUG_CODEX
+            );
+        }
+    }
+
+    /// An empty eligible set — or one naming only drivers this split does
+    /// not cover — is an error, never a fallback.
+    #[test]
+    fn an_empty_eligible_set_is_an_error() {
+        let split = DriverTrafficSplit::new(10, 60, 30);
+        assert_eq!(
+            split.renormalised_over(&[]).unwrap_err(),
+            EligibleAllocationError::NoEligibleDriver,
+        );
+        assert_eq!(
+            split.driver_for_bucket_among(0, &["copilot"]).unwrap_err(),
+            EligibleAllocationError::NoEligibleDriver,
+        );
+    }
+
+    /// Every eligible driver at 0 is an error too: the operator said "send
+    /// nothing there", and allocation honours that rather than overruling it
+    /// with a default. The message names both the eligible set and the split
+    /// so the operator can see which of the two to change.
+    #[test]
+    fn every_eligible_driver_at_zero_is_an_error_naming_both_sides() {
+        let split = DriverTrafficSplit::new(0, 100, 0);
+        let err = split
+            .driver_for_bucket_among(7, &[DRIVER_SLUG_GROK, DRIVER_SLUG_CODEX])
+            .unwrap_err();
+        assert_eq!(
+            err,
+            EligibleAllocationError::EveryEligibleDriverAtZero {
+                eligible: vec![DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK],
+                split,
+            },
+        );
+        let text = err.to_string();
+        assert!(text.contains("codex, grok"), "{text}");
+        assert!(text.contains("claude=100"), "{text}");
+    }
+
+    /// The eligible set is a set: order and duplicates do not change the
+    /// answer, so two call sites that compute it differently cannot disagree.
+    #[test]
+    fn eligible_set_order_and_duplicates_do_not_matter() {
+        let split = DriverTrafficSplit::new(20, 50, 30);
+        let canonical: Vec<_> = (0..100u8)
+            .map(|b| {
+                split
+                    .driver_for_bucket_among(b, &[DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK])
+                    .unwrap()
+            })
+            .collect();
+        for eligible in [
+            vec![DRIVER_SLUG_GROK, DRIVER_SLUG_CODEX],
+            vec![DRIVER_SLUG_GROK, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK],
+        ] {
+            let got: Vec<_> = (0..100u8)
+                .map(|b| split.driver_for_bucket_among(b, &eligible).unwrap())
+                .collect();
+            assert_eq!(got, canonical, "{eligible:?}");
         }
     }
 

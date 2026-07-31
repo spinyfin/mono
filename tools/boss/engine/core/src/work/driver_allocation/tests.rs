@@ -7,7 +7,26 @@
 
 use super::*;
 use crate::test_support::{create_ready_chore_execution, create_test_chore, create_test_product, open_db};
-use boss_protocol::{DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, WorkItemPatch};
+use boss_protocol::{
+    CreateExecutionInput, DRIVER_SLUG_CLAUDE, DRIVER_SLUG_CODEX, DRIVER_SLUG_GROK, ExecutionStatus, WorkItemPatch,
+};
+
+/// Rewrite a work item's `kind` in place.
+///
+/// Allocation reads `tasks.kind` to ask the capability gate what a row of
+/// that kind needs, so covering every [`TaskKind`] means having a row of
+/// every kind. Writing the column directly (rather than reaching for a
+/// per-kind constructor, several of which need a parent/project/doc pointer
+/// this test does not care about) keeps the sweep exhaustive over
+/// `TaskKind::ALL` — a new variant is covered the day it is added.
+fn set_task_kind(db: &WorkDb, work_item_id: &str, kind: &TaskKind) {
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET kind = ?1 WHERE id = ?2",
+        params![kind.as_str(), work_item_id],
+    )
+    .unwrap();
+}
 
 /// Every driver an eligible row was allocated to across `count` fresh chores.
 fn allocated_drivers(db: &WorkDb, product_id: &str, count: usize) -> Vec<Option<String>> {
@@ -95,19 +114,216 @@ fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
     }
 }
 
+/// Eligibility is the dispatch capability gate, not a list this module
+/// keeps. Asserted against `check_dispatch` itself for every kind, so a
+/// `KindRequirements` or `CapabilitySet` change moves both together or
+/// fails here.
 #[test]
-fn is_allocation_eligible_whitelists_implementation_kinds_only() {
-    assert!(is_allocation_eligible(ExecutionKind::TaskImplementation));
-    assert!(is_allocation_eligible(ExecutionKind::ChoreImplementation));
-    assert!(is_allocation_eligible(ExecutionKind::RevisionImplementation));
-    assert!(!is_allocation_eligible(ExecutionKind::ProductDesign));
-    assert!(!is_allocation_eligible(ExecutionKind::ProjectDesign));
-    assert!(!is_allocation_eligible(ExecutionKind::InvestigationImplementation));
-    assert!(!is_allocation_eligible(ExecutionKind::PrReview));
-    assert!(!is_allocation_eligible(ExecutionKind::AutomationTriage));
-    assert!(!is_allocation_eligible(ExecutionKind::CiRemediation));
-    assert!(!is_allocation_eligible(ExecutionKind::ConflictResolution));
-    assert!(!is_allocation_eligible(ExecutionKind::AnswerAgent));
+fn eligibility_is_exactly_what_the_dispatch_gate_says() {
+    let registry = crate::driver::DriverRegistry::default();
+    for kind in TaskKind::ALL {
+        let eligible = eligible_drivers_for(kind);
+        for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
+            let gate_ok = registry.resolver(driver).unwrap().check_dispatch(kind).is_ok();
+            assert_eq!(
+                eligible.contains(&driver),
+                gate_ok,
+                "{driver} eligibility for {kind} must be the gate's answer, not a local rule",
+            );
+        }
+    }
+}
+
+/// The hard invariant, end to end and across every work-item kind: whatever
+/// driver a row is allocated to, the dispatch capability gate accepts that
+/// `(kind, driver)` pair — so allocation can never strand a row on a driver
+/// that refuses it at spawn.
+///
+/// This is also the widening this change is about: `design`,
+/// `investigation`, `design_postmortem` and friends are allocated now,
+/// where the previous hardcoded slice left them on the default driver.
+#[test]
+fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
+    let registry = crate::driver::DriverRegistry::default();
+    for split in [
+        DriverTrafficSplit::new(0, 100, 0),
+        DriverTrafficSplit::new(33, 33, 34),
+        DriverTrafficSplit::new(10, 60, 30),
+        DriverTrafficSplit::new(0, 0, 100),
+    ] {
+        let (_dir, db) = open_db();
+        db.set_driver_traffic_split(split).unwrap();
+        let product = create_test_product(&db);
+        for kind in TaskKind::ALL {
+            for i in 0..12 {
+                let chore = create_test_chore(&db, &product.id, format!("{kind} row {i}"));
+                set_task_kind(&db, &chore.id, kind);
+                let execution = create_ready_chore_execution(&db, &chore.id);
+                let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+                assert_eq!(decision.reason, REASON_ALLOCATION, "{kind} row must be allocated");
+                let driver = decision.driver.expect("an allocated row always names a driver");
+                registry
+                    .resolver(&driver)
+                    .expect("allocation must only ever name a registered driver")
+                    .check_dispatch(kind)
+                    .unwrap_or_else(|e| {
+                        panic!("allocated {driver} for {kind} under {split:?}, but the gate refuses it: {e}")
+                    });
+            }
+        }
+    }
+}
+
+/// Reasoning mode no longer decides the driver. It still decides the model
+/// (`ModelMenu::model_for_reasoning`), which is a per-driver menu lookup at
+/// spawn — but an `investigation`-reasoning row, and a legacy row with no
+/// reasoning at all, are allocated exactly like a `standard` one.
+#[test]
+fn reasoning_does_not_gate_allocation() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    let product = create_test_product(&db);
+
+    let investigation_shaped = create_test_chore(&db, &product.id, "investigation-reasoning chore");
+    db.update_work_item(
+        &investigation_shaped.id,
+        WorkItemPatch {
+            reasoning: Some("investigation".to_owned()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let legacy = create_test_chore(&db, &product.id, "legacy chore with no reasoning");
+    let conn = db.connect().unwrap();
+    conn.execute("UPDATE tasks SET reasoning = NULL WHERE id = ?1", params![&legacy.id])
+        .unwrap();
+    drop(conn);
+
+    for chore in [&investigation_shaped, &legacy] {
+        let execution = create_ready_chore_execution(&db, &chore.id);
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(decision.reason, REASON_ALLOCATION, "{} must be allocated", chore.name);
+        assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+    }
+}
+
+/// A PR review dispatches on the review pool's pinned driver, not on the
+/// row's — so allocation declines it rather than recording a driver the
+/// reviewer never ran on. Deliberate: the pool pin is what keeps who
+/// authored a change from deciding who reviews it
+/// (`coordinator::pool_dispatch_policy_for_worker_id`).
+#[test]
+fn pr_review_executions_are_not_allocated() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "reviewed chore");
+    let review = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore.id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .build(),
+        )
+        .unwrap();
+
+    let decision = db.get_execution_driver_decision(&review.id).unwrap().unwrap();
+    assert_eq!(decision.driver, None);
+    assert_eq!(decision.reason, REASON_DEFAULT);
+
+    // The implementation execution for the same row still allocates — it is
+    // the review that is pool-pinned, not the work item.
+    let implementation = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&implementation.id).unwrap().unwrap();
+    assert_eq!(decision.reason, REASON_ALLOCATION);
+    assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+}
+
+/// Work that came from an automation runs on the automation pool, which
+/// pins the same driver the review pool does
+/// (`ClaudeCoordinator::execution_targets_automation_pool`). Allocation
+/// declines it for the same reason it declines a review.
+#[test]
+fn automation_sourced_rows_are_not_allocated() {
+    let (_dir, db) = open_db();
+    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, &product.id, "automation-sourced chore");
+    let automation = db
+        .create_automation(boss_protocol::CreateAutomationInput {
+            product_id: product.id.clone(),
+            name: "Fix clippy".to_owned(),
+            repo_remote_url: None,
+            trigger: boss_protocol::AutomationTrigger::Schedule {
+                cron: "0 14 * * 1-5".to_owned(),
+                timezone: "America/Los_Angeles".to_owned(),
+            },
+            standing_instruction: "Fix any new clippy warnings.".to_owned(),
+            open_task_limit: 1,
+            catch_up_window_secs: None,
+            enabled: true,
+            created_via: None,
+        })
+        .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE tasks SET source_automation_id = ?1 WHERE id = ?2",
+        params![&automation.id, &chore.id],
+    )
+    .unwrap();
+    drop(conn);
+
+    let execution = create_ready_chore_execution(&db, &chore.id);
+    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+    assert_eq!(decision.driver, None);
+    assert_eq!(decision.reason, REASON_DEFAULT);
+}
+
+/// A restricted eligible set holding no share at all is a loud failure, not
+/// a quiet fallback to the engine default: zero means zero, and the default
+/// driver may be exactly the one the kind refuses. Exercised through
+/// `allocate_among` because no real work item can produce a restricted set
+/// today — all three built-in drivers clear every kind's gate.
+#[test]
+fn allocation_fails_loudly_when_no_eligible_driver_holds_a_share() {
+    let split = DriverTrafficSplit::new(0, 100, 0);
+    let err = allocate_among(split, "task_zero", &TaskKind::Design, &[DRIVER_SLUG_GROK]).unwrap_err();
+    let text = err.to_string();
+    assert!(text.contains("task_zero"), "{text}");
+    assert!(text.contains("design"), "{text}");
+    assert!(text.contains("0 share"), "{text}");
+    assert!(
+        !text.contains(DRIVER_SLUG_CLAUDE) || text.contains("claude=100"),
+        "the error must not read as a fallback to claude: {text}",
+    );
+}
+
+/// An empty eligible set is an error too, never the engine default.
+#[test]
+fn allocation_fails_loudly_when_nothing_is_eligible() {
+    let err = allocate_among(DriverTrafficSplit::default(), "task_none", &TaskKind::Chore, &[]).unwrap_err();
+    assert!(err.to_string().contains("no driver is eligible"), "{err}");
+}
+
+/// Restricting to a subset keeps allocation inside that subset for every
+/// bucket, and keeps it deterministic — the same row, split and eligible
+/// set always give the same answer.
+#[test]
+fn allocation_stays_inside_a_restricted_eligible_set() {
+    let split = DriverTrafficSplit::new(20, 50, 30);
+    let eligible = [DRIVER_SLUG_CODEX, DRIVER_SLUG_CLAUDE];
+    for i in 0..200 {
+        let id = format!("task_{i}");
+        let driver = allocate_among(split, &id, &TaskKind::Investigation, &eligible).unwrap();
+        assert!(eligible.contains(&driver), "{id} allocated to ineligible {driver}");
+        assert_eq!(
+            driver,
+            allocate_among(split, &id, &TaskKind::Investigation, &eligible).unwrap(),
+            "allocation must be deterministic for {id}",
+        );
+    }
 }
 
 /// End-to-end: a driver at 0 receives literally zero eligible rows, across a
@@ -211,28 +427,6 @@ fn product_default_driver_overrides_allocation() {
     let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
     assert_eq!(decision.driver.as_deref(), Some("copilot"));
     assert_eq!(decision.reason, REASON_EXPLICIT);
-}
-
-/// A row whose reasoning is not `standard` (e.g. `investigation`) is never
-/// eligible, whatever the split says.
-#[test]
-fn non_standard_reasoning_is_ineligible() {
-    let (_dir, db) = open_db();
-    db.set_driver_traffic_split(DriverTrafficSplit::new(0, 0, 100)).unwrap();
-    let product = create_test_product(&db);
-    let chore = create_test_chore(&db, &product.id, "investigation-shaped chore");
-    db.update_work_item(
-        &chore.id,
-        WorkItemPatch {
-            reasoning: Some("investigation".to_owned()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let execution = create_ready_chore_execution(&db, &chore.id);
-    let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
-    assert_eq!(decision.driver, None);
-    assert_eq!(decision.reason, REASON_DEFAULT);
 }
 
 /// Same work item id → same decision, deterministically, across repeated
