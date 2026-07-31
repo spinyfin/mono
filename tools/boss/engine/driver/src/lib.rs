@@ -415,11 +415,10 @@ impl CapabilitySet {
 /// [`DriverDescriptor`]. Each driver supplies its own table; `resolve_spawn_config`
 /// resolves model/effort precedence against the selected driver's menu
 /// (design §1.4 / §Mix-and-match).
-/// The `bon::Builder` derive is here for the repo's builder convention (a
-/// struct with more than five named fields must carry it, so an additive field
-/// doesn't churn every construction site). Every current construction is a
-/// struct literal inside a `static DriverDescriptor`, which a builder call
-/// cannot be — the derive is what future non-static callers use.
+///
+/// Carries `#[derive(bon::Builder)]` per the repo's builder convention for
+/// structs with more than five named fields, so an additive field doesn't
+/// force every construction site to change.
 #[derive(Debug, Clone, Copy, bon::Builder)]
 pub struct ModelMenu {
     /// Engine-default model slug for this driver (resolve-spawn precedence step 5:

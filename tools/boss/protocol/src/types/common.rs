@@ -104,9 +104,10 @@ impl std::str::FromStr for EffortLevel {
 /// investigate-and-fix chore is to inflate its effort level, which lies about
 /// the size and distorts scheduling, timeouts, and effort-based reporting.
 ///
-/// The operator's policy, which this enum encodes: *"sonnet is best for well
-/// articulated coding tasks (these should be the bulk of what boss does, but
-/// when some investigation is required, opus is usually better)."*
+/// Sonnet is the right tier for well-articulated coding work; Opus is worth
+/// paying for when the worker has to diagnose or design before it edits. This
+/// enum names that distinction so the model choice is a property of the row
+/// rather than a side effect of its size.
 ///
 /// Stored as TEXT in SQLite (no `CHECK` constraint), validated in code by
 /// [`ReasoningMode::from_str`]. A `NULL` column is **not** this enum's
