@@ -770,6 +770,13 @@ impl WorkDb {
         // root. Additive and independent of every other table.
         // Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
         migrate_work_attachments_table(conn)?;
+        // `work_executions.run_done_declared_at` / `run_done_outcome` /
+        // `run_undeclared_at`: the durable record of whether a run's worker
+        // declared itself finished (`boss propose done`), and of the
+        // backstop having ended a run that never did. Additive columns on
+        // an existing table; independent of every migration above.
+        // Design: tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md
+        migrate_work_executions_run_done_columns(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
