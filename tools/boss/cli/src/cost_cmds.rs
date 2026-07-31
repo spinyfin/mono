@@ -219,14 +219,21 @@ fn format_tokens(n: i64) -> String {
 }
 
 fn print_measurement_summary(m: &CostMeasurement) {
-    println!("  Total tokens: {}", format_tokens(m.total_tokens));
-    println!(
-        "    input={} output={} cache_write={} cache_read={}",
-        format_tokens(m.input_tokens),
-        format_tokens(m.output_tokens),
-        format_tokens(m.cache_creation_tokens),
-        format_tokens(m.cache_read_tokens),
-    );
+    if m.runs_measured == 0 && m.runs_unmeasured > 0 {
+        println!(
+            "  Total tokens: unknown — none of the {} run(s) here have recorded token data",
+            m.runs_total
+        );
+    } else {
+        println!("  Total tokens: {}", format_tokens(m.total_tokens));
+        println!(
+            "    input={} output={} cache_write={} cache_read={}",
+            format_tokens(m.input_tokens),
+            format_tokens(m.output_tokens),
+            format_tokens(m.cache_creation_tokens),
+            format_tokens(m.cache_read_tokens),
+        );
+    }
     println!(
         "  Runs: {} measured, {} unmeasured (no token data recorded), {} recorded zero",
         m.runs_measured, m.runs_unmeasured, m.runs_zero,
@@ -298,9 +305,12 @@ fn print_task_cost_report(report: &TaskCostReport, tz: &DisplayTz) {
     print_table(table);
 }
 
-fn print_cost_buckets(title: &str, buckets: &[CostBucket]) {
+fn print_cost_buckets(title: &str, buckets: &[CostBucket], caveat: Option<&str>) {
     println!();
     println!("{title}:");
+    if let Some(caveat) = caveat {
+        println!("  NOTE: {caveat}");
+    }
     if buckets.is_empty() {
         println!("  (no runs)");
         return;
@@ -333,15 +343,34 @@ fn print_window_cost_report(report: &WindowCostReport, tz: &DisplayTz) {
              are a FLOOR on the window's real spend, not a complete total.",
             format_epoch(report.capture_start_epoch_s, tz),
         );
+    } else if report.overall.runs_unmeasured > 0 {
+        println!();
+        println!(
+            "  WARNING: {} run(s) in this window have no recorded tokens and are excluded from every \
+             total below — these figures are a FLOOR on the window's real spend, not a complete total.",
+            report.overall.runs_unmeasured,
+        );
     }
     println!();
     print_measurement_summary(&report.overall);
     print_pricing_gaps(&report.pricing_gaps);
 
-    print_cost_buckets("BY EXECUTION KIND", &report.by_kind);
-    print_cost_buckets("BY MODEL", &report.by_model);
-    print_cost_buckets("BY REASONING MODE", &report.by_reasoning);
-    print_cost_buckets("BY EFFORT LEVEL", &report.by_effort_level);
+    print_cost_buckets("BY EXECUTION KIND", &report.by_kind, None);
+    print_cost_buckets("BY MODEL", &report.by_model, None);
+    print_cost_buckets(
+        "BY REASONING MODE",
+        &report.by_reasoning,
+        Some(
+            "these labels reflect each work item's current setting, not necessarily the setting in force when a run executed.",
+        ),
+    );
+    print_cost_buckets(
+        "BY EFFORT LEVEL",
+        &report.by_effort_level,
+        Some(
+            "these labels reflect each work item's current setting, not necessarily the setting in force when a run executed.",
+        ),
+    );
 }
 
 fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
@@ -366,7 +395,12 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
         return;
     }
     println!();
-    let mut table = new_dynamic_table(vec!["WORK ITEM", "KIND", "MODEL", "TOKENS", "STARTED", "STATUS"]);
+    let include_usd = report.rows.iter().any(|row| row.estimated_usd.is_some());
+    let mut headers = vec!["WORK ITEM", "KIND", "MODEL", "TOKENS", "STARTED", "STATUS"];
+    if include_usd {
+        headers.push("USD (EST)");
+    }
+    let mut table = new_dynamic_table(headers);
     for row in &report.rows {
         let label = boss_protocol::short_id_label(row.short_id).unwrap_or_else(|| row.work_item_id.clone());
         let identity = format!("{label}: {}", row.name);
@@ -374,21 +408,76 @@ fn print_top_cost_report(report: &TopCostReport, tz: &DisplayTz) {
             .started_at_epoch_s
             .map(|e| format_epoch(e, tz))
             .unwrap_or_else(|| "—".to_owned());
-        table.add_row(vec![
-            identity.as_str(),
-            row.kind.as_str(),
-            row.model.as_deref().unwrap_or("—"),
-            &format_tokens(row.total_tokens),
-            started.as_str(),
-            row.status.as_str(),
-        ]);
+        let mut cells = vec![
+            identity,
+            row.kind.clone(),
+            row.model.clone().unwrap_or_else(|| "—".to_owned()),
+            format_tokens(row.total_tokens),
+            started,
+            row.status.clone(),
+        ];
+        let usd = row
+            .estimated_usd
+            .map(|value| format!("${value:.2}"))
+            .unwrap_or_else(|| "—".to_owned());
+        if include_usd {
+            cells.push(usd);
+        }
+        table.add_row(cells);
     }
     print_table(table);
+    if include_usd {
+        println!("  USD figures: (ESTIMATE, not billing truth)");
+    }
     if report.truncated {
         println!();
         println!(
             "  (truncated to the top {} — more measured runs exist in this window)",
             report.limit
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_epoch_bound_accepts_relative_durations_case_insensitively() {
+        let now = 2_000_000_000;
+        assert_eq!(parse_epoch_bound("7d", now).unwrap(), now - 7 * 86_400);
+        assert_eq!(parse_epoch_bound("2W", now).unwrap(), now - 2 * 604_800);
+        assert_eq!(parse_epoch_bound("24H", now).unwrap(), now - 24 * 3_600);
+    }
+
+    #[test]
+    fn parse_epoch_bound_accepts_rfc3339() {
+        assert_eq!(parse_epoch_bound("2026-07-01T00:00:00Z", 0).unwrap(), 1_782_864_000);
+    }
+
+    #[test]
+    fn parse_epoch_bound_rejects_unparseable_input() {
+        let err = parse_epoch_bound("yesterday-ish", 0).unwrap_err();
+        assert!(err.to_string().contains("could not parse"));
+    }
+
+    #[test]
+    fn resolve_window_rejects_empty_or_reversed_ranges() {
+        let err = resolve_window("0h", Some("0h")).unwrap_err();
+        assert!(err.to_string().contains("--until must be after --since"));
+    }
+
+    #[test]
+    fn display_helpers_format_offsets_epochs_and_tokens() {
+        assert_eq!(offset_suffix(-19_800), "-05:30");
+        assert_eq!(offset_suffix(0), "+00:00");
+        let tz = DisplayTz {
+            offset_s: -3_600,
+            label: "test".to_owned(),
+        };
+        assert_eq!(format_epoch(0, &tz), "1969-12-31T23:00:00-01:00");
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(1_000_000), "1,000,000");
+        assert_eq!(format_tokens(-1234), "-1,234");
     }
 }

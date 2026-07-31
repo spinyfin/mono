@@ -930,8 +930,7 @@ pub enum FrontendRequest {
 
     GetWorkTree {
         product_id: String,
-        /// App-side per-product population-fetch sequence number (T2101
-        /// R1). Purely a correlation id: the macOS app mints a 1-based
+        /// App-side per-product population-fetch sequence number. Purely a correlation id: the macOS app mints a 1-based
         /// per-product `fetch_seq` for every `GetWorkTree` it issues and
         /// stamps it on its `population-timing-*.jsonl` lines. Propagating
         /// it here lets the engine stamp the same value on its

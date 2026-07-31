@@ -44,7 +44,8 @@ pub struct CostMeasurement {
     pub estimated_usd_partial: bool,
     pub input_tokens: i64,
     pub output_tokens: i64,
-    /// Runs whose tokens were recorded and summed to a non-zero total.
+    /// Runs with recorded token columns — includes `runs_zero`, whose
+    /// recorded tokens are all exactly zero.
     pub runs_measured: u32,
     pub runs_total: u32,
     /// Runs with NULL token columns — cost unknown, excluded from
@@ -67,9 +68,11 @@ pub struct CostMeasurement {
 /// execution kind, model, reasoning mode, or effort level).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CostBucket {
-    /// Grouping key as recorded on the row, e.g. `"chore_implementation"`
-    /// (kind), a model slug, `"standard"` (reasoning), `"medium"`
-    /// (effort level), or `"(none)"` when the underlying column was NULL.
+    /// Grouping key for this slice, e.g. `"chore_implementation"` (kind),
+    /// a model slug, `"standard"` (reasoning), `"medium"` (effort level),
+    /// or `"(none)"` when the underlying column was NULL. Reasoning and
+    /// effort labels reflect the work item's current setting because their
+    /// historical per-run values are not recorded.
     pub label: String,
     pub measurement: CostMeasurement,
 }

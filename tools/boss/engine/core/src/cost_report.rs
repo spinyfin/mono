@@ -85,11 +85,13 @@ impl TokenTotals {
 
 /// Running total for one grouping bucket. Folds [`CostRunRecord`]s one at
 /// a time so every report can build every bucket in a single pass.
-#[derive(Default)]
+#[derive(Default, bon::Builder)]
+#[builder(on(String, into))]
 struct Accumulator {
     counts: RunCounts,
     tokens: TokenTotals,
     agent_active_ms: i64,
+    priced_runs: u32,
     priced_usd: f64,
     partial: bool,
 }
@@ -119,6 +121,7 @@ impl Accumulator {
         if want_usd {
             match record.model.as_deref().and_then(cost_pricing::price_for_model) {
                 Some(price) => {
+                    self.priced_runs += 1;
                     self.priced_usd += cost_pricing::estimate_usd(
                         price,
                         input_tokens,
@@ -148,7 +151,7 @@ impl Accumulator {
             .runs_unmeasured(self.counts.unmeasured)
             .runs_zero(self.counts.zero)
             .total_tokens(self.tokens.sum())
-            .maybe_estimated_usd(want_usd.then_some(self.priced_usd))
+            .maybe_estimated_usd((want_usd && self.priced_runs > 0).then_some(self.priced_usd))
             .build()
     }
 }
@@ -536,5 +539,15 @@ mod tests {
         assert!(report.overall.estimated_usd.is_none());
         assert!(!report.overall.estimated_usd_partial);
         assert!(report.pricing_gaps.is_empty());
+    }
+
+    #[test]
+    fn usd_estimate_is_absent_when_no_runs_have_a_price() {
+        let mut unpriced = measured(record("run_1", "exec_1"), 1_000_000, 0, 0, 0);
+        unpriced.model = Some("gpt-5-codex".to_owned());
+        let report = build_task_cost_report("task_1", None, "t", &[unpriced], true, 0);
+        assert!(report.overall.estimated_usd.is_none());
+        assert!(report.overall.estimated_usd_partial);
+        assert_eq!(report.pricing_gaps, vec!["gpt-5-codex".to_owned()]);
     }
 }
