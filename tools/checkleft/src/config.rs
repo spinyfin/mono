@@ -230,14 +230,15 @@ impl ResolvedChecks {
         &self.global_exclude_patterns
     }
 
-    /// Build the effective [`PathScope`] for a specific check instance: the
-    /// single place that answers "is this file in this check's scope". The
-    /// positive side is `check`'s own `applies_to` patterns; the negative side
-    /// is the union of:
+    /// Strictly build the effective [`PathScope`] for config-time validation
+    /// of a specific check instance. The positive side is `check`'s own
+    /// `applies_to` patterns; the negative side is the union of:
     /// 1. the accumulated global exclude patterns for this directory
     /// 2. the per-check exclude patterns on `check`
     ///
-    /// Returns an error if any pattern is invalid globset syntax.
+    /// Returns an error if any pattern is invalid globset syntax. Run
+    /// scheduling uses its own lenient construction so malformed patterns can
+    /// be reported without preventing other checks from running.
     pub fn effective_matcher_for(&self, check: &CheckConfig) -> Result<PathScope> {
         let all: Vec<String> = self
             .global_exclude_patterns
