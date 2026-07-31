@@ -1,13 +1,21 @@
 //! Static validation for scoping glob patterns declared via the `applies_to`
 //! (include) and `exclude` framework keys.
 //!
-//! A glob pattern can be **structurally empty** — incapable of matching any
-//! path in any changeset, in any repo — decidable from the pattern text
-//! alone, with no repo access and no false positives. That is a distinct,
-//! narrower claim than "matches nothing in this repo" (not statically
-//! decidable; a `--all` warning at most, never an error) or "matches nothing
-//! in this changeset" (the ordinary, silent, correct outcome of a diff run).
-//! Only the structurally-empty case is validated here.
+//! A glob pattern that selects zero files falls into one of three situations,
+//! referred to elsewhere in this crate (tests, comments) by these letters:
+//!
+//! - **(a) structurally empty**: incapable of matching any path in any
+//!   changeset, in any repo — decidable from the pattern text alone, with no
+//!   repo access and no false positives. This is the only situation this
+//!   module validates.
+//! - **(b) matchable, but matches nothing in this repo**: e.g. a typo'd
+//!   directory or wrong case. Not statically decidable without a repo scan,
+//!   so it is never an error here — at most a `--all` warning elsewhere.
+//! - **(c) matching nothing in this changeset**: the ordinary, silent,
+//!   correct outcome of a diff run that simply didn't touch a matching file.
+//!
+//! Situation (a) is a distinct, narrower claim than (b) or (c). Only (a) is
+//! validated here.
 //!
 //! Three shapes are decidable with zero false positives:
 //! - a leading `./`: changeset paths never carry a `./` prefix, so a pattern

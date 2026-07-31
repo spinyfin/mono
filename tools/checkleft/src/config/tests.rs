@@ -2096,3 +2096,104 @@ exclude = ["./testdata/**"]
         "check with invalid exclude should be absent"
     );
 }
+
+#[test]
+fn global_exclude_one_bad_pattern_does_not_discard_the_others() {
+    // A single structurally-empty pattern in a multi-entry `exclude` list must
+    // not discard the file's other, valid global excludes — only the offending
+    // entry is rejected (with a diagnostic), the rest still apply.
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+exclude = ["vendor/**", "./third_party/**", "generated/**"]
+
+[[checks]]
+id = "file-size"
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("./third_party/**") && d.message.contains("exclude[1]")),
+        "expected diagnostic naming the offending pattern and its index; got {diagnostics:?}"
+    );
+    assert_eq!(
+        checks.global_exclude_patterns(),
+        &["vendor/**".to_owned(), "generated/**".to_owned()],
+        "the other, valid patterns must still apply despite the one bad entry"
+    );
+}
+
+#[test]
+fn legacy_exclude_files_structurally_empty_pattern_produces_diagnostic() {
+    // The legacy `config.exclude_files`/`config.exclude_globs` alias position is a
+    // live, documented backwards-compatible exclude position — it must be validated
+    // the same way as the framework-level `exclude` key, not silently accept a
+    // structurally-empty pattern.
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "format/oxc"
+
+[checks.config]
+exclude_files = ["vendor/"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/file.ts")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("vendor/") && d.message.contains("exclude_files")),
+        "expected diagnostic naming the pattern and legacy key; got {diagnostics:?}"
+    );
+    assert!(
+        checks.get("format/oxc").is_none(),
+        "check with an invalid legacy exclude should be absent"
+    );
+}
+
+#[test]
+fn per_repo_applies_to_override_structurally_empty_pattern_produces_diagnostic_at_resolution() {
+    // The per-repo `config.applies_to` override position is what authors actually
+    // type into CHECKS.yaml. It must produce a `ConfigDiagnostic` at config
+    // resolution time (not only at check-execution time via `override_applies_to`),
+    // so it's visible to `list_configured_checks` and any run that never schedules
+    // this check (e.g. an empty changeset).
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "file-size"
+
+[checks.config]
+applies_to = ["./src/**/*.rs"]
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("src/lib.rs")).expect("resolve");
+
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("./src/**/*.rs") && d.message.contains("applies_to[0]")),
+        "expected a config-resolution-time diagnostic naming the pattern and position; got {diagnostics:?}"
+    );
+}

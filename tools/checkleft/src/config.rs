@@ -431,10 +431,14 @@ impl ConfigResolver {
             }
         }
 
-        // Union this file's global excludes into the accumulated set.
-        match parse_global_exclude_patterns(&checks_file.exclude, &check_config_dir, &config_relative_path) {
-            Ok(patterns) => resolved.global_exclude_patterns.extend(patterns),
-            Err(diagnostic) => resolved.push_diagnostic(diagnostic),
+        // Union this file's global excludes into the accumulated set. A structurally-empty
+        // pattern is reported as a diagnostic but does not discard this file's other,
+        // valid global excludes.
+        let (global_excludes, global_exclude_diagnostics) =
+            parse_global_exclude_patterns(&checks_file.exclude, &check_config_dir, &config_relative_path);
+        resolved.global_exclude_patterns.extend(global_excludes);
+        for diagnostic in global_exclude_diagnostics {
+            resolved.push_diagnostic(diagnostic);
         }
 
         for check in checks_file.checks {
@@ -539,6 +543,31 @@ impl ConfigResolver {
                     ),
                 ));
                 continue;
+            }
+            // Validate a per-check `config.applies_to` override the same way the
+            // top-level `exclude` list and per-check `exclude` list are validated: a
+            // structurally-empty pattern here is otherwise only caught at check-execution
+            // time by `override_applies_to` (declarative executor), which means a
+            // config-only invocation (`list_configured_checks`) or a run that never
+            // schedules this check (e.g. an empty changeset) never sees the problem.
+            // Surface it here as well so it's visible at config-resolution time too;
+            // `override_applies_to` remains as defence in depth for externally-supplied
+            // config that bypasses this resolver.
+            if let Some(toml::Value::Array(applies_to)) = check.config.get("applies_to") {
+                for (i, entry) in applies_to.iter().enumerate() {
+                    if let Some(s) = entry.as_str()
+                        && let Some(reason) = crate::glob_scope::structurally_empty_reason(s, false)
+                    {
+                        resolved.push_diagnostic(config_check_diagnostic(
+                            configured_id.clone(),
+                            config_relative_path.clone(),
+                            format!(
+                                "`applies_to[{i}]` config override pattern `{s}` can never \
+                                 match any changeset path: {reason}"
+                            ),
+                        ));
+                    }
+                }
             }
             // A `scope = changeset` check resolves once at repo root with an empty
             // changed-file set by construction (see `Runner::schedule_changeset_scope_runs`),
@@ -696,10 +725,17 @@ fn normalize_exclude_patterns(patterns: &[String], config_dir: &Path) -> Vec<Str
 ///
 /// This preserves backward compatibility with the existing convention of placing
 /// exclusion config inside the check's `config:` blob rather than at the
-/// framework-level `exclude:` key.
-fn extract_legacy_config_excludes(config: &toml::Value, config_dir: &Path) -> Vec<String> {
+/// framework-level `exclude:` key. A structurally-empty pattern here is rejected
+/// with a diagnostic exactly as it would be at the framework-level `exclude:` key
+/// — this legacy position is a live, documented alias, not a lesser-validated one.
+fn extract_legacy_config_excludes(
+    check_id: &str,
+    config: &toml::Value,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
     let Some(table) = config.as_table() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let prefix = if config_dir.as_os_str().is_empty() {
         None
@@ -709,8 +745,23 @@ fn extract_legacy_config_excludes(config: &toml::Value, config_dir: &Path) -> Ve
     let mut patterns = Vec::new();
     for key in ["exclude_files", "exclude_globs"] {
         if let Some(toml::Value::Array(globs)) = table.get(key) {
-            for v in globs {
+            for (i, v) in globs.iter().enumerate() {
                 if let Some(s) = v.as_str() {
+                    if let Some(reason) = crate::glob_scope::structurally_empty_reason(s, true) {
+                        return Err(config_file_diagnostic(
+                            check_id.to_owned(),
+                            source_path.to_path_buf(),
+                            format!(
+                                "check `{check_id}` `config.{key}[{i}]` pattern `{s}` can never \
+                                 match any changeset path: {reason}"
+                            ),
+                            None,
+                            None,
+                            Some(format!(
+                                "Fix or remove this pattern from this check's `config.{key}` list."
+                            )),
+                        ));
+                    }
                     patterns.push(match &prefix {
                         Some(p) => format!("{p}/{s}"),
                         None => s.to_owned(),
@@ -719,32 +770,42 @@ fn extract_legacy_config_excludes(config: &toml::Value, config_dir: &Path) -> Ve
             }
         }
     }
-    patterns
+    Ok(patterns)
 }
 
 /// Parse and validate global exclude patterns from a parsed `CHECKS` file, returning
-/// them normalized to repo-root-relative coords. Returns a diagnostic on error.
+/// them normalized to repo-root-relative coords alongside any diagnostics.
+///
+/// A structurally-empty pattern produces a diagnostic but does NOT discard the rest
+/// of the list — the other, valid patterns are still returned and still apply. Only
+/// an empty `exclude` key itself (no patterns at all) is a hard, no-patterns-returned
+/// error, since there is nothing valid to salvage in that case.
 fn parse_global_exclude_patterns(
     raw_exclude: &Option<Vec<String>>,
     config_dir: &Path,
     source_path: &Path,
-) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+) -> (Vec<String>, Vec<ConfigDiagnostic>) {
     let Some(patterns) = raw_exclude else {
-        return Ok(Vec::new());
+        return (Vec::new(), Vec::new());
     };
     if patterns.is_empty() {
-        return Err(config_file_diagnostic(
-            CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
-            source_path.to_path_buf(),
-            "top-level `exclude` must not be an empty list; omit the key to declare no global excludes".to_owned(),
-            None,
-            None,
-            Some("Add at least one glob pattern, or remove the `exclude` key entirely.".to_owned()),
-        ));
+        return (
+            Vec::new(),
+            vec![config_file_diagnostic(
+                CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
+                source_path.to_path_buf(),
+                "top-level `exclude` must not be an empty list; omit the key to declare no global excludes".to_owned(),
+                None,
+                None,
+                Some("Add at least one glob pattern, or remove the `exclude` key entirely.".to_owned()),
+            )],
+        );
     }
+    let mut valid = Vec::with_capacity(patterns.len());
+    let mut diagnostics = Vec::new();
     for (i, pattern) in patterns.iter().enumerate() {
         if let Some(reason) = crate::glob_scope::structurally_empty_reason(pattern, true) {
-            return Err(config_file_diagnostic(
+            diagnostics.push(config_file_diagnostic(
                 CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
                 source_path.to_path_buf(),
                 format!(
@@ -755,11 +816,13 @@ fn parse_global_exclude_patterns(
                 None,
                 Some("Fix or remove this pattern from the top-level `exclude` list.".to_owned()),
             ));
+        } else {
+            valid.push(pattern.clone());
         }
     }
-    let normalized = normalize_exclude_patterns(patterns, config_dir);
+    let normalized = normalize_exclude_patterns(&valid, config_dir);
     if let Err(err) = ExclusionMatcher::new(&normalized) {
-        return Err(config_file_diagnostic(
+        diagnostics.push(config_file_diagnostic(
             CHECKS_CONFIG_DIAGNOSTIC_ID.to_owned(),
             source_path.to_path_buf(),
             format!("invalid glob pattern in top-level `exclude`: {err}"),
@@ -767,8 +830,9 @@ fn parse_global_exclude_patterns(
             None,
             Some("Fix the invalid glob pattern in the `exclude` list.".to_owned()),
         ));
+        return (Vec::new(), diagnostics);
     }
-    Ok(normalized)
+    (normalized, diagnostics)
 }
 
 /// Parse and validate per-check exclude patterns from a parsed check entry, returning
@@ -817,7 +881,7 @@ fn parse_per_check_exclude_patterns(
         .as_deref()
         .map(|p| normalize_exclude_patterns(p, config_dir))
         .unwrap_or_default();
-    let legacy_patterns = extract_legacy_config_excludes(config, config_dir);
+    let legacy_patterns = extract_legacy_config_excludes(check_id, config, config_dir, source_path)?;
     let all = [framework_patterns, legacy_patterns].concat();
     if let Err(err) = ExclusionMatcher::new(&all) {
         return Err(config_file_diagnostic(
@@ -1470,7 +1534,10 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 );
             }
             let mut all = patterns.clone();
-            all.extend(extract_legacy_config_excludes(&check.config, Path::new("")));
+            all.extend(
+                extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
+                    .map_err(|diag| anyhow::anyhow!(diag.message))?,
+            );
             if let Err(err) = ExclusionMatcher::new(&all) {
                 bail!(
                     "invalid glob pattern in `exclude` for check `{configured_id}` in {}: {err}",
@@ -1479,7 +1546,8 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             }
             all
         } else {
-            let patterns = extract_legacy_config_excludes(&check.config, Path::new(""));
+            let patterns = extract_legacy_config_excludes(&configured_id, &check.config, Path::new(""), Path::new(""))
+                .map_err(|diag| anyhow::anyhow!(diag.message))?;
             if let Err(err) = ExclusionMatcher::new(&patterns) {
                 bail!(
                     "invalid glob pattern in legacy `config.exclude_files`/`config.exclude_globs` \
