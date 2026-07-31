@@ -244,12 +244,7 @@ pub trait ExternalCheckExecutor: Send + Sync {
     /// The default returns the full changeset size, which is correct for component
     /// checks (they receive the entire changeset). Declarative checks override this
     /// to apply their `applies_to` glob filter.
-    fn eligible_file_count(
-        &self,
-        _package: &ExternalCheckPackage,
-        changeset: &ChangeSet,
-        _config: &toml::Value,
-    ) -> usize {
+    fn eligible_file_count(&self, _package: &ExternalCheckPackage, changeset: &ChangeSet) -> usize {
         changeset.changed_files.len()
     }
 
@@ -658,12 +653,7 @@ impl ExternalCheckExecutor for DefaultExternalCheckExecutor {
         }
     }
 
-    fn eligible_file_count(
-        &self,
-        package: &ExternalCheckPackage,
-        changeset: &ChangeSet,
-        _config: &toml::Value,
-    ) -> usize {
+    fn eligible_file_count(&self, package: &ExternalCheckPackage, changeset: &ChangeSet) -> usize {
         match &package.implementation {
             ExternalCheckPackageImplementation::Declarative(d) => {
                 super::declarative::eligible_file_count(&self.root, d, changeset)

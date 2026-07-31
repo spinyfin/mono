@@ -1144,12 +1144,7 @@ impl ExternalCheckExecutor for DeclarativeEligibleCountExecutor {
         })
     }
 
-    fn eligible_file_count(
-        &self,
-        package: &ExternalCheckPackage,
-        changeset: &ChangeSet,
-        _config: &toml::Value,
-    ) -> usize {
+    fn eligible_file_count(&self, package: &ExternalCheckPackage, changeset: &ChangeSet) -> usize {
         match &package.implementation {
             ExternalCheckPackageImplementation::Declarative(d) => {
                 crate::external::declarative::eligible_file_count(&self.root, d, changeset)

@@ -2,8 +2,7 @@
 //! decides both "is this file a target of this check" and "is this file
 //! excluded from this check".
 //!
-//! [`PathScope`] generalises the exclude-only matcher that predated it into
-//! one value carrying an optional positive globset alongside the existing
+//! [`PathScope`] carries an optional positive globset alongside an optional
 //! negative one. It is the single enforcement point applied at every
 //! selection site — built-in, component, and declarative — plus the
 //! finding-stage backstop, so there is exactly one place that answers "does
@@ -25,9 +24,8 @@ use crate::input::ChangeSet;
 ///   exclude patterns.
 ///
 /// `include: None` means universal (every path is in scope); `exclude: None`
-/// means nothing is excluded. A [`Default`] instance is universal-include,
-/// empty-exclude — the same no-op behavior the predecessor `PathScope`
-/// had for excludes alone.
+/// means nothing is excluded. A [`Default`] instance is universal-include and
+/// empty-exclude — a no-op that keeps every path.
 #[derive(Debug, Clone, Default)]
 pub struct PathScope {
     include: Option<GlobSet>,
@@ -66,6 +64,24 @@ impl PathScope {
     /// site used exclusively before the include side existed.
     pub fn exclude_only(patterns: &[String]) -> Result<Self> {
         Self::new(&[], patterns)
+    }
+
+    /// Build a scope leniently: each side is compiled independently, so an
+    /// invalid pattern on one side falls back to a no-op for that side only
+    /// (universal include, or empty exclude) instead of discarding a valid
+    /// pattern on the other side. Returns the scope plus one warning message
+    /// per side that failed to compile, for the caller to log.
+    pub fn new_lenient(include_patterns: &[String], exclude_patterns: &[String]) -> (Self, Vec<String>) {
+        let mut warnings = Vec::new();
+        let include = build_globset(include_patterns, "applies_to").unwrap_or_else(|err| {
+            warnings.push(err.to_string());
+            None
+        });
+        let exclude = build_globset(exclude_patterns, "exclude").unwrap_or_else(|err| {
+            warnings.push(err.to_string());
+            None
+        });
+        (Self { include, exclude }, warnings)
     }
 
     /// Returns `true` if the repo-root-relative `path` is within this scope's
@@ -323,5 +339,50 @@ mod tests {
     fn empty_include_slice_is_universal() {
         let m = PathScope::new(&[], &[]).unwrap();
         assert!(m.is_included(Path::new("anything/at/all.ext")));
+    }
+
+    #[test]
+    fn new_lenient_keeps_valid_exclude_when_include_is_invalid() {
+        let (m, warnings) = PathScope::new_lenient(&["[invalid".to_owned()], &["vendor/**".to_owned()]);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for the bad include side"
+        );
+        assert!(
+            m.is_included(Path::new("anything/at/all.ext")),
+            "invalid include falls back to universal"
+        );
+        assert!(
+            m.is_excluded(Path::new("vendor/dep/lib.rs")),
+            "valid exclude side must survive"
+        );
+    }
+
+    #[test]
+    fn new_lenient_keeps_valid_include_when_exclude_is_invalid() {
+        let (m, warnings) = PathScope::new_lenient(&["src/**".to_owned()], &["[invalid".to_owned()]);
+        assert_eq!(
+            warnings.len(),
+            1,
+            "expected exactly one warning for the bad exclude side"
+        );
+        assert!(
+            m.is_included(Path::new("src/lib.rs")),
+            "valid include side must survive"
+        );
+        assert!(!m.is_included(Path::new("docs/readme.md")));
+        assert!(
+            !m.is_excluded(Path::new("anything.rs")),
+            "invalid exclude falls back to empty-exclude"
+        );
+    }
+
+    #[test]
+    fn new_lenient_with_valid_patterns_produces_no_warnings() {
+        let (m, warnings) = PathScope::new_lenient(&["src/**".to_owned()], &["**/generated/**".to_owned()]);
+        assert!(warnings.is_empty());
+        assert!(m.is_in_scope(Path::new("src/keep.rs")));
+        assert!(!m.is_in_scope(Path::new("src/generated/out.rs")));
     }
 }

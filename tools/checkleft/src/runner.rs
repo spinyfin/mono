@@ -98,8 +98,9 @@ type DiagnosticGroupKey = (String, PathBuf, Option<u32>, Option<u32>, String, St
 /// Build the [`RunGroupKey`] for `check` under `policy` and the given effective
 /// applies_to and exclude patterns (global ∪ per-check, already normalized to
 /// repo-root-relative coords by the caller). Both join into one scope
-/// fingerprint so two files with a different effective *or* exclude set never
-/// share a run — each run then carries one consistent [`PathScope`].
+/// fingerprint, so two files whose effective `applies_to` or exclude set
+/// differs never share a run — each run then carries one consistent
+/// [`PathScope`].
 fn run_group_key(
     check: &CheckConfig,
     policy: &EffectiveCheckPolicy,
@@ -368,11 +369,9 @@ impl Runner {
                     let path_scope = run.path_scope;
                     // Seed the progress count from the scope-filtered view so it matches
                     // what the executor will actually process.
-                    let file_count = self.external_executor.eligible_file_count(
-                        &package,
-                        &path_scope.filter_changeset(&run_changeset),
-                        &run_config,
-                    );
+                    let file_count = self
+                        .external_executor
+                        .eligible_file_count(&package, &path_scope.filter_changeset(&run_changeset));
                     info!(
                         check_id = %configured_check_id,
                         package_id = %package.id,

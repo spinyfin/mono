@@ -508,6 +508,134 @@ id = "capture"
     );
 }
 
+/// A built-in Rust check narrowed by a check-entry `applies_to` only ever sees
+/// files matching that positive glob — the single new capability this PR adds.
+#[tokio::test]
+async fn builtin_check_is_narrowed_by_applies_to() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "capture"
+applies_to = ["backend/**"]
+"#,
+    )
+    .expect("write config");
+
+    let seen_files = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(CapturingCheck {
+            id: "capture".to_owned(),
+            seen_files: Arc::clone(&seen_files),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    runner
+        .run_changeset(&ChangeSet::new(vec![
+            ChangedFile {
+                path: PathBuf::from("backend/src/a.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("frontend/src/b.ts"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]))
+        .await
+        .expect("run checks");
+
+    let files = seen_files.lock().expect("lock files").clone();
+    assert_eq!(
+        files,
+        vec!["backend/src/a.rs".to_owned()],
+        "the check must only see files matching its applies_to scope"
+    );
+}
+
+/// Two files that resolve to the same check id but with different effective
+/// `applies_to` sets (a subdirectory `CHECKS` file narrows the check further)
+/// must schedule as two separate runs, each carrying its own consistent
+/// `PathScope` — the run-group key must fold in the effective `applies_to`
+/// set, not just the exclude set.
+#[tokio::test]
+async fn files_with_different_effective_applies_to_schedule_as_separate_runs() {
+    let temp = tempdir().expect("create temp dir");
+    fs::create_dir_all(temp.path().join("backend/src")).expect("create dirs");
+    fs::create_dir_all(temp.path().join("frontend/src")).expect("create dirs");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "capture"
+"#,
+    )
+    .expect("write root config");
+    fs::write(
+        temp.path().join("backend/CHECKS.toml"),
+        r#"
+[[checks]]
+id = "capture"
+applies_to = ["**"]
+"#,
+    )
+    .expect("write backend config");
+
+    let seen_files = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = CheckRegistry::new();
+    registry
+        .register(CapturingCheck {
+            id: "capture".to_owned(),
+            seen_files: Arc::clone(&seen_files),
+        })
+        .expect("register check");
+
+    let runner = Runner::new(
+        Arc::new(registry),
+        Arc::new(ConfigResolver::new(temp.path()).expect("resolver")),
+        Arc::new(LocalSourceTree::new(temp.path()).expect("tree")),
+    );
+
+    let results = runner
+        .run_changeset(&ChangeSet::new(vec![
+            ChangedFile {
+                path: PathBuf::from("backend/src/a.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+            ChangedFile {
+                path: PathBuf::from("frontend/src/b.rs"),
+                kind: ChangeKind::Modified,
+                old_path: None,
+            },
+        ]))
+        .await
+        .expect("run checks");
+
+    assert_eq!(
+        results.len(),
+        2,
+        "different effective applies_to sets must produce separate scheduled runs"
+    );
+    let mut files = seen_files.lock().expect("lock files").clone();
+    files.sort();
+    assert_eq!(
+        files,
+        vec!["backend/src/a.rs".to_owned(), "frontend/src/b.rs".to_owned()],
+        "each run must still see the file matching its own scope"
+    );
+}
+
 /// Task 5: the finding-location backstop drops any finding whose path is excluded,
 /// uniformly — even for a check that ignores the filtered changeset and derives the
 /// path itself. The excluded path is still present in the run's full changeset (so
@@ -608,6 +736,62 @@ fn drop_excluded_findings_keeps_locationless_and_drops_excluded() {
 
     let messages: Vec<&str> = result.findings.iter().map(|f| f.message.as_str()).collect();
     assert_eq!(messages, vec!["on a normal path", "check-level error, no location"]);
+}
+
+/// Symmetric proof for the include side: the backstop also drops a finding
+/// located outside the positive `applies_to` scope, while still keeping
+/// location-less findings.
+#[test]
+fn drop_excluded_findings_drops_finding_outside_applies_to_scope() {
+    let scope = crate::path_scope::PathScope::new(&["src/**".to_owned()], &[]).expect("scope");
+    let mut result = CheckResult {
+        check_id: "demo".to_owned(),
+        findings: vec![
+            Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "outside applies_to scope".to_owned(),
+                location: Some(Location {
+                    path: PathBuf::from("docs/readme.md"),
+                    line: None,
+                    column: None,
+                }),
+                surface: None,
+                remediations: vec![],
+                suggested_fix: None,
+            },
+            Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "inside applies_to scope".to_owned(),
+                location: Some(Location {
+                    path: PathBuf::from("src/lib.rs"),
+                    line: None,
+                    column: None,
+                }),
+                surface: None,
+                remediations: vec![],
+                suggested_fix: None,
+            },
+            Finding {
+                fixable: false,
+                severity: Severity::Error,
+                message: "check-level error, no location".to_owned(),
+                location: None,
+                surface: None,
+                remediations: vec![],
+                suggested_fix: None,
+            },
+        ],
+    };
+
+    super::drop_excluded_findings(&mut result, &scope);
+
+    let messages: Vec<&str> = result.findings.iter().map(|f| f.message.as_str()).collect();
+    assert_eq!(
+        messages,
+        vec!["inside applies_to scope", "check-level error, no location"]
+    );
 }
 
 #[tokio::test]

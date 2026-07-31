@@ -230,9 +230,10 @@ impl ResolvedChecks {
         &self.global_exclude_patterns
     }
 
-    /// Build the effective exclude-only [`PathScope`] for a specific check
-    /// instance (no positive/`applies_to` side — see [`CheckConfig::applies_to_patterns`]
-    /// for that). The effective exclude set is the union of:
+    /// Build the effective [`PathScope`] for a specific check instance: the
+    /// single place that answers "is this file in this check's scope". The
+    /// positive side is `check`'s own `applies_to` patterns; the negative side
+    /// is the union of:
     /// 1. the accumulated global exclude patterns for this directory
     /// 2. the per-check exclude patterns on `check`
     ///
@@ -244,7 +245,7 @@ impl ResolvedChecks {
             .chain(check.exclude_patterns.iter())
             .cloned()
             .collect();
-        PathScope::exclude_only(&all)
+        PathScope::new(&check.applies_to_patterns, &all)
     }
 
     fn upsert(&mut self, check: CheckConfig) {
@@ -525,7 +526,12 @@ impl ConfigResolver {
                 &check_config_dir,
                 &config_relative_path,
             ) {
-                Ok(patterns) => patterns,
+                Ok((patterns, deprecation_warning)) => {
+                    if let Some(diagnostic) = deprecation_warning {
+                        resolved.push_diagnostic(diagnostic);
+                    }
+                    patterns
+                }
                 Err(diagnostic) => {
                     resolved.push_diagnostic(diagnostic);
                     continue;
@@ -941,22 +947,70 @@ fn parse_per_check_exclude_patterns(
 
 /// Extract the legacy per-check `applies_to` override from the check's `config`
 /// blob (`config.applies_to`), normalized to repo-root-relative using
-/// `config_dir`. Returns an empty `Vec` when the key is absent or not a list of
-/// strings.
+/// `config_dir`. Returns `Ok(None)` when the key is absent — the legacy
+/// position was not used at all, so no deprecation warning is due. Returns
+/// `Ok(Some(patterns))` when the key is present and valid. Returns `Err` on a
+/// malformed value: a scalar, an empty list, an empty-string entry, or a
+/// non-string entry — mirroring the validation `resolve::override_applies_to`
+/// performed before this rewiring.
 ///
 /// This is the same legacy-position convention `extract_legacy_config_excludes`
 /// implements for `exclude`: decision 3 of the unify-include-side design treats
 /// the sibling-of-`config:` position and this in-`config` position as the same
 /// one coordinate, so both normalize through [`normalize_check_entry_patterns`].
-fn extract_legacy_config_applies_to(config: &toml::Value, config_dir: &Path) -> Vec<String> {
+fn extract_legacy_config_applies_to(
+    check_id: &str,
+    config: &toml::Value,
+    config_dir: &Path,
+    source_path: &Path,
+) -> std::result::Result<Option<Vec<String>>, ConfigDiagnostic> {
     let Some(table) = config.as_table() else {
-        return Vec::new();
+        return Ok(None);
     };
-    let Some(toml::Value::Array(globs)) = table.get("applies_to") else {
-        return Vec::new();
+    let Some(value) = table.get("applies_to") else {
+        return Ok(None);
     };
-    let raw: Vec<String> = globs.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect();
-    normalize_check_entry_patterns(&raw, config_dir)
+    let malformed = |message: String| {
+        config_file_diagnostic(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            message,
+            None,
+            None,
+            Some("Fix `config.applies_to` for this check entry, or remove the key.".to_owned()),
+        )
+    };
+    let array = match value.as_array() {
+        Some(arr) => arr,
+        None => {
+            return Err(malformed(format!(
+                "`config.applies_to` for check `{check_id}` must be a list of glob strings, not a scalar"
+            )));
+        }
+    };
+    if array.is_empty() {
+        return Err(malformed(format!(
+            "`config.applies_to` for check `{check_id}` must not be an empty list; \
+             use `enabled: false` to disable the check instead"
+        )));
+    }
+    let mut raw = Vec::with_capacity(array.len());
+    for (i, entry) in array.iter().enumerate() {
+        match entry.as_str() {
+            Some(s) if !s.trim().is_empty() => raw.push(s.to_owned()),
+            Some(_) => {
+                return Err(malformed(format!(
+                    "`config.applies_to[{i}]` for check `{check_id}` must not be an empty string"
+                )));
+            }
+            None => {
+                return Err(malformed(format!(
+                    "`config.applies_to[{i}]` for check `{check_id}` must be a string"
+                )));
+            }
+        }
+    }
+    Ok(Some(normalize_check_entry_patterns(&raw, config_dir)))
 }
 
 /// Parse and validate per-check `applies_to` patterns from a parsed check entry,
@@ -972,14 +1026,22 @@ fn extract_legacy_config_applies_to(config: &toml::Value, config_dir: &Path) -> 
 /// definition scope (decision 2) rather than replacing it — composition is
 /// applied by the caller, not here. An empty (but present) list is rejected,
 /// same as `exclude`'s precedent: "use `enabled: false` to disable the check
-/// instead".
+/// instead". A malformed legacy `config.applies_to` value (scalar, empty list,
+/// or a non-string/empty-string entry) is rejected the same way, restoring the
+/// validation `resolve::override_applies_to` performed before this rewiring.
+///
+/// On success, also returns an optional `Warning`-severity deprecation
+/// [`ConfigDiagnostic`] when the legacy `config.applies_to` position was used
+/// at all (present and valid) — the design's "accept both, emit a
+/// `ConfigDiagnostic` at `warning`" requirement. The caller should push it
+/// alongside the returned patterns without skipping the check.
 fn parse_per_check_applies_to_patterns(
     check_id: &str,
     raw_applies_to: &Option<Vec<String>>,
     config: &toml::Value,
     config_dir: &Path,
     source_path: &Path,
-) -> std::result::Result<Vec<String>, ConfigDiagnostic> {
+) -> std::result::Result<(Vec<String>, Option<ConfigDiagnostic>), ConfigDiagnostic> {
     if matches!(raw_applies_to, Some(p) if p.is_empty()) {
         return Err(config_file_diagnostic(
             check_id.to_owned(),
@@ -997,8 +1059,26 @@ fn parse_per_check_applies_to_patterns(
         .as_deref()
         .map(|p| normalize_check_entry_patterns(p, config_dir))
         .unwrap_or_default();
-    let legacy_patterns = extract_legacy_config_applies_to(config, config_dir);
-    Ok([framework_patterns, legacy_patterns].concat())
+    let legacy_patterns = extract_legacy_config_applies_to(check_id, config, config_dir, source_path)?;
+    let deprecation_warning = legacy_patterns.is_some().then(|| {
+        config_file_diagnostic_with_severity(
+            check_id.to_owned(),
+            source_path.to_path_buf(),
+            format!(
+                "check `{check_id}` sets `applies_to` via the legacy `config.applies_to` position; \
+                 prefer the top-level `applies_to` key on the check entry instead"
+            ),
+            None,
+            None,
+            Some(
+                "Move the glob list from `config.applies_to` to a sibling `applies_to` key on this check entry."
+                    .to_owned(),
+            ),
+            Severity::Warning,
+        )
+    });
+    let patterns = [framework_patterns, legacy_patterns.unwrap_or_default()].concat();
+    Ok((patterns, deprecation_warning))
 }
 
 fn parse_checks_file(path: &Path, relative_path: &Path) -> std::result::Result<ParsedChecksFile, ConfigDiagnostic> {
@@ -1661,6 +1741,10 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
             }
             patterns
         };
+        let legacy_applies_to =
+            extract_legacy_config_applies_to(&configured_id, &check.config, Path::new(""), Path::new(""))
+                .map_err(|diagnostic| anyhow::anyhow!(diagnostic.message))?
+                .unwrap_or_default();
         let applies_to_patterns = if let Some(patterns) = &check.applies_to {
             if patterns.is_empty() {
                 bail!(
@@ -1670,10 +1754,10 @@ fn apply_external_checks_file(resolved: &mut ResolvedChecks, external_checks_fil
                 );
             }
             let mut all = patterns.clone();
-            all.extend(extract_legacy_config_applies_to(&check.config, Path::new("")));
+            all.extend(legacy_applies_to);
             all
         } else {
-            extract_legacy_config_applies_to(&check.config, Path::new(""))
+            legacy_applies_to
         };
         let scope = match check.scope.as_deref() {
             Some(raw) => parse_check_scope(raw).with_context(|| {
