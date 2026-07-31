@@ -311,6 +311,62 @@ fn effort_escalation() -> crate::EffortEscalation {
         .build()
 }
 
+fn cost_measurement() -> crate::CostMeasurement {
+    crate::CostMeasurement::builder()
+        .agent_active_ms(0)
+        .cache_creation_tokens(0)
+        .cache_read_tokens(0)
+        .estimated_usd_partial(false)
+        .input_tokens(100)
+        .output_tokens(50)
+        .runs_measured(1)
+        .runs_total(1)
+        .runs_unmeasured(0)
+        .runs_zero(0)
+        .total_tokens(150)
+        .build()
+}
+
+fn task_cost_report() -> crate::TaskCostReport {
+    crate::TaskCostReport::builder()
+        .work_item_id("task_1")
+        .by_execution(vec![])
+        .generated_at_epoch_s(1_747_000_000)
+        .name("Fix cursor flicker")
+        .overall(cost_measurement())
+        .pricing_gaps(vec![])
+        .build()
+}
+
+fn window_cost_report() -> crate::WindowCostReport {
+    crate::WindowCostReport::builder()
+        .by_effort_level(vec![])
+        .by_kind(vec![])
+        .by_model(vec![])
+        .by_reasoning(vec![])
+        .capture_start_epoch_s(1_785_144_180)
+        .generated_at_epoch_s(1_747_000_000)
+        .overall(cost_measurement())
+        .pricing_gaps(vec![])
+        .since_epoch_s(1_746_000_000)
+        .spans_capture_boundary(false)
+        .until_epoch_s(1_747_000_000)
+        .build()
+}
+
+fn top_cost_report() -> crate::TopCostReport {
+    crate::TopCostReport::builder()
+        .rows(vec![])
+        .excluded_unmeasured_count(0)
+        .generated_at_epoch_s(1_747_000_000)
+        .limit(10)
+        .pricing_gaps(vec![])
+        .since_epoch_s(1_746_000_000)
+        .truncated(false)
+        .until_epoch_s(1_747_000_000)
+        .build()
+}
+
 /// Every `FrontendEvent` variant paired with the exact `"type"` tag it
 /// must serialize under. Ordered to match the declaration order in
 /// [`events.rs`](super::events) so a reviewer can diff the two side by
@@ -1196,6 +1252,28 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "effort_escalation_recorded",
         },
+        // --- Cost reporting ---
+        TagCase {
+            label: "WorkItemCostReport",
+            event: FrontendEvent::WorkItemCostReport {
+                report: task_cost_report(),
+            },
+            expected_tag: "work_item_cost_report",
+        },
+        TagCase {
+            label: "CostWindowReport",
+            event: FrontendEvent::CostWindowReport {
+                report: window_cost_report(),
+            },
+            expected_tag: "cost_window_report",
+        },
+        TagCase {
+            label: "TopCostConsumers",
+            event: FrontendEvent::TopCostConsumers {
+                report: top_cost_report(),
+            },
+            expected_tag: "top_cost_consumers",
+        },
         // --- Planner / project lifecycle ---
         TagCase {
             label: "PlannerRunsList",
@@ -1861,6 +1939,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::CiNeverStartsAlert { .. }
         | FrontendEvent::EffortAuditReport { .. }
         | FrontendEvent::EffortEscalationRecorded { .. }
+        | FrontendEvent::WorkItemCostReport { .. }
+        | FrontendEvent::CostWindowReport { .. }
+        | FrontendEvent::TopCostConsumers { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

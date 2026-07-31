@@ -449,6 +449,12 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         | FrontendRequest::GetCiRemediation { .. }
         | FrontendRequest::GetConflictHotspots { .. }
         | FrontendRequest::GetConflictResolution { .. }
+        // Cost reporting (design: token-spend CLI surface). An operator/
+        // coordinator diagnostic akin to `AuditProductEffort` above, not
+        // something a task worker needs about its own or other work items.
+        | FrontendRequest::GetCostWindowReport { .. }
+        | FrontendRequest::GetTopCostConsumers { .. }
+        | FrontendRequest::GetWorkItemCostReport { .. }
         | FrontendRequest::GitHubAuthCancel
         | FrontendRequest::GitHubAuthDisconnect
         | FrontendRequest::GitHubAuthStart

@@ -66,6 +66,7 @@ rust_binary(
         "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/editorial",
+        "//tools/boss/engine/utils",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(normal = True),
@@ -84,6 +85,7 @@ rust_test(
         "//tools/boss/build-info",
         "//tools/boss/client",
         "//tools/boss/engine/editorial",
+        "//tools/boss/engine/utils",
         "//tools/boss/github",
         "//tools/boss/protocol",
     ] + all_crate_deps(

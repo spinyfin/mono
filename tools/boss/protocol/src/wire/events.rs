@@ -836,6 +836,18 @@ pub enum FrontendEvent {
     EffortEscalationRecorded {
         event: crate::EffortEscalation,
     },
+    /// Response to [`FrontendRequest::GetWorkItemCostReport`].
+    WorkItemCostReport {
+        report: crate::TaskCostReport,
+    },
+    /// Response to [`FrontendRequest::GetCostWindowReport`].
+    CostWindowReport {
+        report: crate::WindowCostReport,
+    },
+    /// Response to [`FrontendRequest::GetTopCostConsumers`].
+    TopCostConsumers {
+        report: crate::TopCostReport,
+    },
     /// Response to [`FrontendRequest::ListPlannerRuns`]: every
     /// `planner_runs` audit row for the project, newest first.
     PlannerRunsList {

@@ -10,16 +10,17 @@ pub(crate) use boss_client::{
 pub(crate) use boss_protocol::{
     AddDependencyInput, AnswerAgentRun, Attention, AttentionGroup, Automation, AutomationDedupSuppression,
     AutomationPatch, AutomationRun, AutomationTrigger, CREATED_VIA_CLI, CiBudgetSnapshot, CiRemediation, CommentAnchor,
-    ConflictHotspotReport, ConflictResolution, CreateAttentionInput, CreateAutomationInput, CreateChoreInput,
-    CreateCommentInput, CreateDecisionInput, CreateInvestigationInput, CreateManyChoresInput, CreateManyTasksInput,
-    CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateTaskInput, Decision, DependencyDirection,
-    DependencyEdge, DependencyFilter, EditorialAction, EditorialRules, EffortAuditReport, EffortLevel,
-    EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent, FrontendRequest, GitHubAuthStateDto,
-    LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput, PlannerRun, PrWorkItemMatch, Product,
-    Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput, ResolveProjectDesignDocOutput,
-    ResolvedDesignDocKind, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, Task, TaskRuntime, UnpopulatePreservedTask, WorkAttentionItem, WorkComment, WorkExecution,
-    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
+    ConflictHotspotReport, ConflictResolution, CostBucket, CostMeasurement, CreateAttentionInput,
+    CreateAutomationInput, CreateChoreInput, CreateCommentInput, CreateDecisionInput, CreateInvestigationInput,
+    CreateManyChoresInput, CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput,
+    CreateTaskInput, Decision, DependencyDirection, DependencyEdge, DependencyFilter, EditorialAction, EditorialRules,
+    EffortAuditReport, EffortLevel, EngineAttemptListEntry, ExecutionKind, FollowupMemberOverride, FrontendEvent,
+    FrontendRequest, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput, OrgAuthState, PlannerOutput,
+    PlannerRun, PrWorkItemMatch, Product, Project, ProjectDesignDocState, ReasoningMode, RemoveDependencyInput,
+    ResolveProjectDesignDocOutput, ResolvedDesignDocKind, SetProductEditorialRulesInput,
+    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskCostReport,
+    TaskRuntime, TopCostReport, UnpopulatePreservedTask, WindowCostReport, WorkAttentionItem, WorkComment,
+    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch,
 };
 pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
@@ -94,6 +95,7 @@ macro_rules! rpc_call {
 mod automation_cmds;
 mod commands;
 mod comment_commands;
+mod cost_cmds;
 mod data;
 mod decision_commands;
 mod engine_cmds;
@@ -299,6 +301,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Editorial { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_editorial_command(command, &ctx).await
+        }
+        Commands::Cost { command } => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            cost_cmds::run_cost_command(command, &ctx).await
         }
     }
 }

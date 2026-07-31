@@ -435,6 +435,7 @@ mod codex_routing;
 mod comment_thread_entries;
 mod comments;
 mod conflict_res;
+mod cost_report_db;
 mod create_entities;
 mod decisions;
 mod dep_helpers;
