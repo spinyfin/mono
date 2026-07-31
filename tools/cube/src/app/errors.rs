@@ -52,6 +52,8 @@ pub enum CubeError {
     WorkspaceDirRead { path: PathBuf, source: io::Error },
     #[error("failed to remove workspace directory `{path}`: {source}")]
     WorkspaceDirRemove { path: PathBuf, source: io::Error },
+    #[error("failed to remove bazel output base `{path}`: {source}")]
+    BazelOutputBaseRemove { path: PathBuf, source: io::Error },
     #[error("failed to create repo source directory `{path}`: {source}")]
     RepoSourceDirCreate { path: PathBuf, source: io::Error },
     #[error("failed to open state database at `{path}`: {source}")]
@@ -203,6 +205,7 @@ impl CubeError {
             | Self::WorkspaceDirCreate { .. }
             | Self::WorkspaceDirRead { .. }
             | Self::WorkspaceDirRemove { .. }
+            | Self::BazelOutputBaseRemove { .. }
             | Self::RepoSourceDirCreate { .. }
             | Self::StateDbIo { .. }
             | Self::AuditLogIo { .. }

@@ -1,10 +1,24 @@
-use super::support::{ExpectedCommand, FakeRunner, seed_mono_repo, with_database_path};
+use super::support::{ExpectedCommand, FakeRunner, mono_source_path, seed_mono_repo, with_database_path};
 use clap::Parser;
 
 use crate::cli::Cli;
 
 use crate::app::dispatch::run_with_dependencies;
 use crate::app::errors::CubeError;
+
+/// The `bazel info output_base` probe an `--expunge` removal issues to
+/// discover the shared `_bazel_<user>` root, run in the repo's canonical
+/// source checkout (`seed_mono_repo` always registers one). The fake output
+/// base does not need to exist on disk — these tests' workspaces never
+/// populated a real one, so cleanup resolves to a harmless `NothingToRemove`.
+fn expunge_runner(workspace_root: &std::path::Path) -> FakeRunner {
+    FakeRunner::new(vec![ExpectedCommand::ok(
+        mono_source_path(workspace_root),
+        "bazel",
+        &["info", "output_base"],
+        "/fake-bazel-cache/_bazel_testuser/deadbeefdeadbeefdeadbeefdeadbeef",
+    )])
+}
 
 #[test]
 fn workspace_remove_deletes_synced_free_row() {
@@ -335,7 +349,7 @@ fn workspace_remove_expunge_deletes_row_and_directory() {
     let result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
         Some(&database_path),
-        &FakeRunner::default(),
+        &expunge_runner(&workspace_root),
     )
     .expect("expunge remove");
 
@@ -385,7 +399,7 @@ fn workspace_remove_expunge_tolerates_missing_directory() {
     let result = run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
         Some(&database_path),
-        &FakeRunner::default(),
+        &expunge_runner(&workspace_root),
     )
     .expect("expunge tolerates missing dir");
 
@@ -468,7 +482,7 @@ fn workspace_remove_expunge_makes_removal_durable_against_lease_resync() {
     run_with_dependencies(
         Cli::parse_from(["cube", "workspace", "remove", "mono-agent-007", "--expunge"]),
         Some(&database_path),
-        &FakeRunner::default(),
+        &expunge_runner(&workspace_root),
     )
     .expect("expunge remove");
 

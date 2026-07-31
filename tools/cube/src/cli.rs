@@ -448,6 +448,34 @@ pub enum WorkspaceCommand {
         #[arg(long)]
         expunge: bool,
     },
+    /// Remove bazel output-base directories that no longer belong to any
+    /// registered workspace.
+    ///
+    /// Every cube workspace gets its own bazel output base, keyed by a hash
+    /// of its path, under `<output_user_root>/_bazel_<user>/`. Destroying a
+    /// workspace normally cleans up its own output base as part of teardown
+    /// (`cube workspace remove --expunge`, and the automatic pool trim); this
+    /// command instead sweeps the *whole* shared root for bases with no
+    /// corresponding registered workspace — the backlog from before that
+    /// cleanup existed, or from a crash, kill, or interrupted teardown since.
+    ///
+    /// Discovers the shared root by probing a real `bazel info output_base`
+    /// in a configured repo's canonical source checkout, so it works
+    /// wherever `output_user_root` is actually configured on this host
+    /// rather than assuming a hardcoded default. Never removes a base whose
+    /// hash matches a currently-registered workspace — membership is
+    /// re-checked immediately before each individual removal, not just once
+    /// up front, so a workspace minted while the sweep is running is safe.
+    ///
+    /// Each base can take 20-30s to remove (bazel marks its output trees
+    /// read-only, so every directory has to be made writable before it can
+    /// be unlinked) — a sweep over many orphans is not fast. Failures are
+    /// always reported, never silently skipped.
+    ReclaimBazelBases {
+        /// List what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1079,6 +1107,28 @@ mod tests {
     fn workspace_remove_requires_workspace_id() {
         let result = Cli::try_parse_from(["cube", "workspace", "remove"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn workspace_reclaim_bazel_bases_parses_default() {
+        let cli = Cli::parse_from(["cube", "workspace", "reclaim-bazel-bases"]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::ReclaimBazelBases { dry_run },
+            } => assert!(!dry_run),
+            _ => panic!("expected workspace reclaim-bazel-bases command"),
+        }
+    }
+
+    #[test]
+    fn workspace_reclaim_bazel_bases_accepts_dry_run() {
+        let cli = Cli::parse_from(["cube", "workspace", "reclaim-bazel-bases", "--dry-run"]);
+        match cli.command {
+            Command::Workspace {
+                command: WorkspaceCommand::ReclaimBazelBases { dry_run },
+            } => assert!(dry_run),
+            _ => panic!("expected workspace reclaim-bazel-bases command"),
+        }
     }
 
     #[test]
