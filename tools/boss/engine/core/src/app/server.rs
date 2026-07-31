@@ -829,6 +829,7 @@ pub async fn serve_with_merge_probe(
                     &server_state.work_db,
                     &execution.id,
                     execution.workspace_path.as_deref().map(std::path::Path::new),
+                    crate::driver_teardown::TeardownReason::AppCrashReconcile,
                 )
                 .await;
                 // Snapshot any uncommitted in-flight work to a durable

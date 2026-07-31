@@ -16,9 +16,136 @@
 //! precedence used at spawn time ([`WorkDb::get_execution_driver_slug`]).
 
 use std::path::Path;
+use std::time::Instant;
 
 use crate::driver::DriverRegistry;
 use crate::work::WorkDb;
+
+/// Which termination path invoked [`teardown_driver_workspace`], and why.
+///
+/// Both the entry and completion traces carry this, so "who tore this
+/// execution down?" is answerable from the teardown line itself rather than
+/// inferred from whichever sweep happened to log next to it. The 2026-07-31
+/// silent-spawn-abort investigation is the motivating case: `driver workspace
+/// teardown: entered` was the LAST line a run ever emitted, and nothing in it
+/// distinguished the coordinator's spawn-failure arm from a mid-spawn cancel
+/// or from any of the ~12 sweeps that also reach this function.
+///
+/// Every variant maps to exactly one call site family. Adding a call site
+/// means adding a variant — a call site that cannot name itself is a call
+/// site nobody can attribute later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownReason {
+    /// `coordinator::run_execution` — `ExecutionRunner::run_execution`
+    /// returned `Err` before any pane existed.
+    SpawnFailed,
+    /// `coordinator::run_execution` — the run was cancelled while its spawn
+    /// was still in flight; the runner already reaped the just-spawned pane.
+    CancelledDuringSpawn,
+    /// `coordinator::record_run_completion` — the run reached a wait state
+    /// that releases the workspace.
+    RunCompleted,
+    /// `completion::finish_worker_teardown`; the payload is that function's
+    /// own `path` label (`"no_op"`, `"pr_review"`, `"idle_park"`, …), so the
+    /// completion family stays distinguishable from the sweeps without
+    /// flattening which completion path it was.
+    Completion(&'static str),
+    /// `completion::force_release` — `bossctl agents stop`, cascade cancel,
+    /// and every other explicit operator-driven teardown.
+    ForceRelease,
+    /// `ServerState::reap_run` — an operator reaped this run by hand.
+    ManualReap,
+    /// Engine-startup app-crash reconciliation.
+    AppCrashReconcile,
+    /// `host_reconcile` — the run's host went offline (disabled, drained, or
+    /// removed from the registry).
+    HostDrainReconcile,
+    /// `terminal_work_sweep` — a live pane outlived its terminal work item.
+    TerminalWorkReconcile,
+    /// `dead_pid_sweep` — the worker's tracked pid is gone.
+    DeadPidReconcile,
+    /// `execution_liveness` — the pane died or never attached
+    /// (dead-pane / lost-workspace reconcile).
+    PaneLivenessReconcile,
+    /// `transient_recovery` — the sweep orphaned the run before resuming it.
+    TransientRecoveryReap,
+    /// `cube_lease_heartbeat` — the lease failed to refresh often enough to
+    /// auto-reap the execution.
+    CubeLeaseAutoReap,
+    /// `remote_lease_reconcile` — a remote worker process was provably gone.
+    RemoteLeaseReconcile,
+    /// `stale_worker_sweep` — the worker is alive but wedged past threshold.
+    StaleWorkerReconcile,
+    /// `spawn_ack_sweep` — no pid and no hook event ever arrived.
+    SpawnAckTimeout,
+}
+
+impl TeardownReason {
+    /// Stable snake_case family label for the `reason` trace field. Pair with
+    /// [`Self::detail`], which carries the completion path for
+    /// [`Self::Completion`] and is empty for every other variant — keeping
+    /// the two apart is what stops a completion path label (a free-form
+    /// string) from colliding with a reason name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnFailed => "spawn_failed",
+            Self::CancelledDuringSpawn => "cancelled_during_spawn",
+            Self::RunCompleted => "run_completed",
+            Self::Completion(_) => "completion",
+            Self::ForceRelease => "force_release",
+            Self::ManualReap => "manual_reap",
+            Self::AppCrashReconcile => "app_crash_reconcile",
+            Self::HostDrainReconcile => "host_drain_reconcile",
+            Self::TerminalWorkReconcile => "terminal_work_reconcile",
+            Self::DeadPidReconcile => "dead_pid_reconcile",
+            Self::PaneLivenessReconcile => "pane_liveness_reconcile",
+            Self::TransientRecoveryReap => "transient_recovery_reap",
+            Self::CubeLeaseAutoReap => "cube_lease_auto_reap",
+            Self::RemoteLeaseReconcile => "remote_lease_reconcile",
+            Self::StaleWorkerReconcile => "stale_worker_reconcile",
+            Self::SpawnAckTimeout => "spawn_ack_timeout",
+        }
+    }
+
+    /// Sub-label for the `reason_detail` trace field: the completion path for
+    /// [`Self::Completion`], empty otherwise.
+    pub fn detail(self) -> &'static str {
+        match self {
+            Self::Completion(path) => path,
+            _ => "",
+        }
+    }
+}
+
+/// How a teardown pass ended, for the completion trace's `outcome` field.
+/// Every early return in [`resolve_and_teardown`] maps to one of these, so
+/// the completion line always says why a teardown that logged `entered` did
+/// or did not reach the driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownOutcome {
+    /// The resolved driver's `teardown_workspace` ran and returned `Ok`.
+    Ok,
+    /// The driver ran and returned an error (already logged in detail).
+    DriverError,
+    /// No `tasks` row / unknown execution — nothing to resolve.
+    NoDriverSlug,
+    /// The slug lookup itself failed.
+    DriverSlugLookupFailed,
+    /// The slug resolved but names no registered driver.
+    UnknownDriver,
+}
+
+impl TeardownOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::DriverError => "driver_error",
+            Self::NoDriverSlug => "no_driver_slug",
+            Self::DriverSlugLookupFailed => "driver_slug_lookup_failed",
+            Self::UnknownDriver => "unknown_driver",
+        }
+    }
+}
 
 /// Tear down driver-owned, out-of-workspace state for a terminated
 /// execution. Never fails the caller: a teardown error is logged and
@@ -32,7 +159,22 @@ use crate::work::WorkDb;
 /// by a racing teardown — callers must still call this unconditionally
 /// in that case, since a driver may key its out-of-workspace state by
 /// the recorded runtime state alone (e.g. a per-worker `CODEX_HOME`).
-pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, workspace_path: Option<&Path>) {
+///
+/// `reason` names the calling termination path; see [`TeardownReason`].
+///
+/// Emits a matched pair of traces — `entered` and `completed` — around every
+/// path through the body, including the early returns. The pairing is the
+/// point: with only an entry line, a teardown still running is
+/// indistinguishable from one that finished, which is exactly what made the
+/// 2026-07-31 abort read as "the engine stopped here" when it had in fact
+/// finished this function in single-digit milliseconds and gone on to block
+/// in the caller's `cube workspace release`.
+pub async fn teardown_driver_workspace(
+    work_db: &WorkDb,
+    execution_id: &str,
+    workspace_path: Option<&Path>,
+    reason: TeardownReason,
+) {
     #[cfg(test)]
     test_hooks::record_call();
 
@@ -43,10 +185,33 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
     // function itself is never reached).
     tracing::info!(
         execution_id,
+        reason = reason.as_str(),
+        reason_detail = reason.detail(),
         workspace_path = ?workspace_path.map(Path::display),
         "driver workspace teardown: entered",
     );
 
+    let started = Instant::now();
+    let (outcome, driver_slug) = resolve_and_teardown(work_db, execution_id, workspace_path).await;
+    tracing::info!(
+        execution_id,
+        reason = reason.as_str(),
+        reason_detail = reason.detail(),
+        driver = driver_slug.as_deref().unwrap_or(""),
+        outcome = outcome.as_str(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "driver workspace teardown: completed",
+    );
+}
+
+/// Body of [`teardown_driver_workspace`], split out so the completion trace
+/// covers every return path without a `defer`-style guard. Returns the
+/// outcome and, once resolved, the driver slug the pass ran against.
+async fn resolve_and_teardown(
+    work_db: &WorkDb,
+    execution_id: &str,
+    workspace_path: Option<&Path>,
+) -> (TeardownOutcome, Option<String>) {
     // Provider-session identity is engine-owned lifecycle state, independent
     // of whether the driver had filesystem runtime state to clean up. Clear it
     // before any early return below so every normal termination path prunes
@@ -94,7 +259,7 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
                      could be resolved; skipping teardown rather than inventing a home"
                 );
             }
-            return;
+            return (TeardownOutcome::NoDriverSlug, None);
         }
         Err(err) => {
             tracing::warn!(
@@ -102,7 +267,7 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
                 error = %format!("{err:#}"),
                 "driver workspace teardown: failed to resolve driver slug (non-fatal)",
             );
-            return;
+            return (TeardownOutcome::DriverSlugLookupFailed, None);
         }
     };
 
@@ -115,7 +280,7 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
                 driver = %driver_slug,
                 "driver workspace teardown: unknown driver slug; skipping"
             );
-            return;
+            return (TeardownOutcome::UnknownDriver, Some(driver_slug));
         }
     };
 
@@ -131,7 +296,9 @@ pub async fn teardown_driver_workspace(work_db: &WorkDb, execution_id: &str, wor
             error = %format!("{err:#}"),
             "driver workspace teardown failed (non-fatal)",
         );
+        return (TeardownOutcome::DriverError, Some(driver_slug));
     }
+    (TeardownOutcome::Ok, Some(driver_slug))
 }
 
 /// Test-only call counter for [`teardown_driver_workspace`] — the entry
@@ -176,7 +343,7 @@ mod tests {
         let execution = create_ready_chore_execution(&db, &chore.id);
         let dir = tempfile::tempdir().unwrap();
         // No-op driver, no panic, nothing propagated — just confirm it runs.
-        teardown_driver_workspace(&db, &execution.id, Some(dir.path())).await;
+        teardown_driver_workspace(&db, &execution.id, Some(dir.path()), TeardownReason::RunCompleted).await;
     }
 
     #[tokio::test]
@@ -189,7 +356,7 @@ mod tests {
         let product = create_test_product(&db);
         let chore = create_test_chore(&db, &product.id, "test chore");
         let execution = create_ready_chore_execution(&db, &chore.id);
-        teardown_driver_workspace(&db, &execution.id, None).await;
+        teardown_driver_workspace(&db, &execution.id, None, TeardownReason::RunCompleted).await;
     }
 
     #[tokio::test]
@@ -216,7 +383,7 @@ mod tests {
                 .unwrap()
         );
 
-        teardown_driver_workspace(&db, &execution.id, None).await;
+        teardown_driver_workspace(&db, &execution.id, None, TeardownReason::RunCompleted).await;
 
         assert!(
             !db.claim_run_progress_session_identity(&execution.id, "thread-a")
@@ -246,11 +413,75 @@ mod tests {
         assert_eq!(loaded.as_ref().map(|s| s.as_value()), Some(state.as_value()));
 
         // Teardown must not panic or fail the caller even with state present.
-        teardown_driver_workspace(&db, &execution.id, None).await;
+        teardown_driver_workspace(&db, &execution.id, None, TeardownReason::RunCompleted).await;
 
         // State survives teardown (idempotent; retention may still need it).
         let still = db.get_driver_runtime_state(&execution.id).unwrap();
         assert_eq!(still.as_ref().map(|s| s.as_value()), Some(state.as_value()));
+    }
+
+    #[tokio::test]
+    async fn teardown_traces_name_their_caller_and_pair_entry_with_completion() {
+        // Both halves of the 2026-07-31 instrumentation gap in one assertion:
+        // `entered` must say WHO called it (a bare `entered` line was the last
+        // thing a silently-aborted dispatch ever emitted, and nothing in it
+        // distinguished the coordinator's spawn-failure arm from any of the
+        // ~12 sweeps), and it must be followed by a `completed` line carrying
+        // a duration — without which an in-flight teardown is
+        // indistinguishable from one that finished milliseconds ago.
+        let buffer = crate::test_support::log_capture::install();
+        let starting_offset = buffer.lock().len();
+
+        let (_dir, db) = open_db();
+        let product = create_test_product(&db);
+        let chore = create_test_chore(&db, &product.id, "test chore");
+        let execution = create_ready_chore_execution(&db, &chore.id);
+
+        teardown_driver_workspace(&db, &execution.id, None, TeardownReason::SpawnFailed).await;
+
+        let captured = String::from_utf8_lossy(&buffer.lock()[starting_offset..]).to_string();
+        let our_lines: Vec<&str> = captured.lines().filter(|line| line.contains(&execution.id)).collect();
+
+        let entered = our_lines
+            .iter()
+            .position(|line| line.contains("driver workspace teardown: entered"))
+            .unwrap_or_else(|| panic!("no `entered` line for {}; got {our_lines:#?}", execution.id));
+        assert!(
+            our_lines[entered].contains("reason=\"spawn_failed\""),
+            "the entry line must name its caller; got:\n{}",
+            our_lines[entered],
+        );
+
+        let completed = our_lines
+            .iter()
+            .position(|line| line.contains("driver workspace teardown: completed"))
+            .unwrap_or_else(|| panic!("no `completed` line for {}; got {our_lines:#?}", execution.id));
+        assert!(
+            completed > entered,
+            "`completed` must follow `entered`; got {our_lines:#?}",
+        );
+        assert!(
+            our_lines[completed].contains("reason=\"spawn_failed\"") && our_lines[completed].contains("elapsed_ms="),
+            "the completion line must carry the reason and a duration; got:\n{}",
+            our_lines[completed],
+        );
+        assert!(
+            our_lines[completed].contains("outcome=\"ok\""),
+            "a teardown that reached the driver cleanly reports outcome=ok; got:\n{}",
+            our_lines[completed],
+        );
+    }
+
+    #[test]
+    fn teardown_reason_labels_are_stable_and_completion_keeps_its_path() {
+        // The labels are what an operator greps for; pin the family/detail
+        // split so a completion path label can never be mistaken for a reason.
+        assert_eq!(TeardownReason::SpawnFailed.as_str(), "spawn_failed");
+        assert_eq!(TeardownReason::SpawnFailed.detail(), "");
+        assert_eq!(TeardownReason::CancelledDuringSpawn.as_str(), "cancelled_during_spawn");
+        assert_eq!(TeardownReason::RunCompleted.as_str(), "run_completed");
+        assert_eq!(TeardownReason::Completion("pr_review").as_str(), "completion");
+        assert_eq!(TeardownReason::Completion("pr_review").detail(), "pr_review");
     }
 
     #[test]

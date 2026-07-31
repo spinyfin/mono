@@ -209,6 +209,258 @@ async fn pane_spawn_failure_raises_attention_item_and_dispatch_event() {
     }
 }
 
+/// Poll `recording` until an event for `execution_id` matches `predicate`,
+/// returning it. Used by the spawn-abort tests below, which have to assert on
+/// what is visible at a specific instant *while the cube release is still
+/// parked* — a `wait_for_execution_status` would sail past that window,
+/// because the whole point of the fix is that the failure is reported long
+/// before the row is terminalized.
+async fn wait_for_dispatch_event(
+    recording: &crate::dispatch_events::RecordingDispatchEventSink,
+    execution_id: &str,
+    predicate: impl Fn(&crate::dispatch_events::DispatchEvent) -> bool,
+    what: &str,
+) -> crate::dispatch_events::DispatchEvent {
+    for _ in 0..200 {
+        let events = recording.events_for(execution_id).await;
+        if let Some(found) = events.iter().find(|event| predicate(event)) {
+            return found.clone();
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "no {what} event for {execution_id}; got {:#?}",
+        recording.events_for(execution_id).await
+    );
+}
+
+/// Poll until `cube` has entered `release_workspace` for `lease_id`. The fake
+/// records the call before parking on its gate, so this returning means the
+/// release is in flight and being held open.
+async fn wait_for_release_entered(cube: &FakeCubeClient, lease_id: &str) {
+    for _ in 0..200 {
+        if cube.release_calls.lock().await.iter().any(|id| id == lease_id) {
+            return;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("cube release for `{lease_id}` was never entered");
+}
+
+/// Slice the shared log buffer from `offset` down to the lines mentioning
+/// `needle` (an execution id), so a test's assertions are not polluted by the
+/// other tests sharing the process-wide subscriber.
+fn captured_lines_for(buffer: &crate::test_support::log_capture::SharedBuffer, offset: usize, needle: &str) -> String {
+    String::from_utf8_lossy(&buffer.lock()[offset..])
+        .lines()
+        .filter(|line| line.contains(needle))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The 2026-07-31 silent-abort regression, first half: when the spawn aborts
+/// before any pane exists, the abort must be reported — in the log AND in the
+/// dispatch stream — *before* the arm goes anywhere near the unbounded
+/// `cube workspace release`.
+///
+/// The incident shape: a dispatch reached `run_started`, entered driver
+/// teardown ~99 ms later, and then went silent for minutes because the only
+/// rendering of the spawn error lived past a `cube workspace release` that was
+/// taking 4-6 minutes. `bossctl dispatch diagnose` showed a timeline that
+/// simply stopped at `run_started`, and no failure event existed to explain
+/// why. The release being slow is a separately-filed problem and is
+/// deliberately NOT what this test fixes: the gate here holds it open forever
+/// on purpose, and the assertions all fire while it is still held.
+#[tokio::test]
+async fn spawn_abort_is_reported_before_the_cube_release_completes() {
+    let buffer = log_capture::install();
+    let starting_offset = buffer.lock().len();
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let cube = Arc::new(FakeCubeClient {
+        release_gate: Some(gate.clone()),
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+
+    // Structured signal: a terminal `spawn_failed` stage carrying the full
+    // error chain. `is_terminal_event` treats any `outcome=error` as terminal,
+    // so `dispatch diagnose` now ends on a stage instead of trailing off.
+    let event = wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "spawn_failed" && event.outcome == "error",
+        "spawn_failed",
+    )
+    .await;
+    assert!(
+        event
+            .error_message
+            .as_deref()
+            .is_some_and(|msg| msg.contains("worker prompt failed")),
+        "spawn_failed must carry the spawn error; got {:?}",
+        event.error_message,
+    );
+    assert!(
+        event.details["run_id"].is_string(),
+        "spawn_failed must carry the run_id; got {:?}",
+        event.details,
+    );
+
+    // The release is held open, so nothing downstream of it has run: the row
+    // is still `running` with its lease bound. That is precisely the state the
+    // incident sat in for minutes — the difference is that the failure is now
+    // already on record.
+    wait_for_release_entered(cube.as_ref(), "lease-1").await;
+    let mid_flight = db.get_execution(&execution_id).unwrap();
+    assert_eq!(
+        mid_flight.status,
+        ExecutionStatus::Running,
+        "the row must still be mid-teardown when the abort is already reported — \
+         otherwise this test is asserting nothing about ordering",
+    );
+
+    // Unstructured signal: the ERROR log naming the failing spawn, emitted at
+    // the abort point rather than after the release.
+    let our_lines = captured_lines_for(&buffer, starting_offset, &execution_id);
+    assert!(
+        our_lines.lines().any(|line| line.contains("ERROR")
+            && line.contains("spawn aborted")
+            && line.contains("worker prompt failed")),
+        "expected an ERROR log naming the spawn error at the abort point; got:\n{our_lines}",
+    );
+
+    // Let the release finish; the pre-existing tail (attention item,
+    // `pane_spawned: error`) is unchanged.
+    gate.notify_one();
+    wait_for_execution_status(db.as_ref(), &execution_id, ExecutionStatus::Failed).await;
+    let stages: Vec<String> = recording
+        .events_for(&execution_id)
+        .await
+        .into_iter()
+        .map(|event| event.stage)
+        .collect();
+    assert!(
+        stages.contains(&"pane_spawned".to_owned()),
+        "the existing pane_spawned:error event must still follow; got {stages:?}",
+    );
+}
+
+/// The 2026-07-31 silent-abort regression, second half: the cancel race that
+/// destroyed the evidence entirely.
+///
+/// Field sequence, reproduced here exactly: the spawn aborts, the arm blocks
+/// in `cube workspace release`, an operator/cascade cancel lands during that
+/// window, and `finish_execution_run` then rejects the terminalizing write
+/// with "cannot finish a run from status `cancelled`". Every rendering of the
+/// spawn error used to live in that write's success branch, so this path
+/// produced a run whose abort cause reached no log and no event anywhere.
+#[tokio::test]
+async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
+    let buffer = log_capture::install();
+    let starting_offset = buffer.lock().len();
+
+    let dir = tempdir().unwrap();
+    let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id.clone(), "Cleanup");
+    db.reconcile_product_executions(&product.id).unwrap();
+
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let cube = Arc::new(FakeCubeClient {
+        release_gate: Some(gate.clone()),
+        ..FakeCubeClient::default()
+    });
+    let runner = Arc::new(FakeExecutionRunner {
+        fail: true,
+        ..FakeExecutionRunner::default()
+    });
+    let recording = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let coordinator = Arc::new(
+        ExecutionCoordinator::new(db.clone(), WorkerPool::new(1), cube.clone(), runner.clone())
+            .with_dispatch_events(recording.clone()),
+    );
+    let execution_id = db.list_executions(Some(&chore.id)).unwrap()[0].id.clone();
+    coordinator.kick();
+
+    wait_for_dispatch_event(
+        &recording,
+        &execution_id,
+        |event| event.stage == "spawn_failed" && event.outcome == "error",
+        "spawn_failed",
+    )
+    .await;
+    wait_for_release_entered(cube.as_ref(), "lease-1").await;
+
+    // The cancel lands mid-release, exactly as it did in the field.
+    db.cancel_execution(&execution_id).unwrap();
+    gate.notify_one();
+
+    // `finish_execution_run` now rejects. The double-fault line must still
+    // name the spawn error — it is the only tracing record of it left on this
+    // path, because the `execution run failed` line lives in the branch that
+    // never runs here.
+    for _ in 0..200 {
+        let lines = captured_lines_for(&buffer, starting_offset, &execution_id);
+        if lines.lines().any(|line| {
+            line.contains("failed to record execution run failure") && line.contains("worker prompt failed")
+        }) {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    let our_lines = captured_lines_for(&buffer, starting_offset, &execution_id);
+    assert!(
+        our_lines
+            .lines()
+            .any(|line| line.contains("failed to record execution run failure")),
+        "expected the double-fault log line; got:\n{our_lines}",
+    );
+    assert!(
+        our_lines.lines().any(|line| {
+            line.contains("failed to record execution run failure") && line.contains("worker prompt failed")
+        }),
+        "the double-fault line must carry the original spawn error; got:\n{our_lines}",
+    );
+
+    // And the dispatch timeline still terminates on a stage. The
+    // `pane_spawned: error` event is unreachable on this path (it is emitted
+    // inside the rejected write's success branch) — `spawn_failed` is what
+    // keeps `dispatch diagnose` from showing a timeline that just ends.
+    let events = recording.events_for(&execution_id).await;
+    let stages: Vec<&str> = events.iter().map(|event| event.stage.as_str()).collect();
+    assert!(
+        stages.contains(&"spawn_failed"),
+        "spawn_failed must be present even when the terminalizing write is rejected; got {stages:?}",
+    );
+    assert!(
+        !stages.contains(&"pane_spawned"),
+        "this path must not reach pane_spawned — if it does, the test is no longer \
+         exercising the double fault; got {stages:?}",
+    );
+    assert_eq!(
+        events.last().map(|event| event.stage.as_str()),
+        Some("spawn_failed"),
+        "spawn_failed must be the terminal stage of the timeline; got {stages:?}",
+    );
+}
+
 /// Slow-ack provisional-spawn regression (outcome 3): a slow `SpawnWorkerPane` ack that
 /// nonetheless spawned the pane must NOT be treated as a spawn
 /// failure. The real `PaneSpawnRunner` now converts the ack timeout

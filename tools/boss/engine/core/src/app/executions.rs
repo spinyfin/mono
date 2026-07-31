@@ -872,6 +872,7 @@ pub(super) async fn handle_reap_run(ctx: Dispatch, req: FrontendRequest) {
                     &server_state.work_db,
                     &execution.id,
                     execution.workspace_path.as_deref().map(std::path::Path::new),
+                    crate::driver_teardown::TeardownReason::ManualReap,
                 )
                 .await;
                 // The execution row is now terminal, but marking it so

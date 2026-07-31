@@ -614,7 +614,20 @@ impl ExecutionRunner for PaneSpawnRunner {
                 followup_proposals_seam_enabled,
             },
         )
-        .await?;
+        .await
+        // Every other fallible step below already names itself in its error
+        // context; this one did not, so a composition failure surfaced to the
+        // coordinator as a bare inner error with no indication that the SPAWN
+        // is what aborted. That matters now that the coordinator logs this
+        // error the instant the abort happens (`spawn aborted: …` /
+        // `spawn_failed`): the chain it prints is the only account of which
+        // step failed.
+        .with_context(|| {
+            format!(
+                "composing the worker prompt and spawn config for execution {}",
+                execution.id
+            )
+        })?;
 
         // Resolve the driver once via the registry on the slug
         // `compose_worker_spawn` already validated. Every subsequent trait
@@ -623,7 +636,13 @@ impl ExecutionRunner for PaneSpawnRunner {
         // driver type. A second registered driver therefore actually runs.
         let driver = crate::driver::DriverRegistry::default()
             .require(&spawn_config.driver)
-            .map_err(|err| anyhow!("spawn: {err}"))?;
+            .map_err(|err| {
+                anyhow!(
+                    "spawn: resolving driver {:?} for execution {}: {err}",
+                    spawn_config.driver,
+                    execution.id,
+                )
+            })?;
 
         // Write the initial prompt (and gitignore + pre-trust) via the driver's
         // WorkspaceProvisioning capability. The driver's config_dir and

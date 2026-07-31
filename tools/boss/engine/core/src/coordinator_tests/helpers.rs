@@ -97,6 +97,13 @@ pub(super) struct FakeCubeClient {
     /// reporting a workspace still leased to a dead worker so the
     /// stale-lease reclaim path (issue #962) can be exercised.
     pub(super) list_workspaces_response: Mutex<Vec<CubeWorkspaceStatus>>,
+    /// When set, `release_workspace` records its call and then parks on this
+    /// gate until the test notifies it. Models the field condition behind the
+    /// 2026-07-31 silent-abort incident: a `cube workspace release` that ran
+    /// for minutes, holding the spawn-failure arm of `run_execution` open
+    /// long enough for a cancel to land in the middle of it. A gate rather
+    /// than a sleep so the window is deterministic instead of timing-tuned.
+    pub(super) release_gate: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl FakeCubeClient {
@@ -219,7 +226,12 @@ crate::stub_cube_client! { FakeCubeClient {
     }
 
     async fn release_workspace(&self, lease_id: &str) -> Result<()> {
+        // Record BEFORE parking on the gate, so a test can observe that the
+        // release was entered and still hold it open.
         self.release_calls.lock().await.push(lease_id.to_owned());
+        if let Some(gate) = self.release_gate.as_ref() {
+            gate.notified().await;
+        }
         Ok(())
     }
 

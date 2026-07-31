@@ -71,6 +71,7 @@ impl WorkerCompletionHandler {
             &self.work_db,
             execution_id,
             cleared.workspace_path.as_deref().map(std::path::Path::new),
+            crate::driver_teardown::TeardownReason::ForceRelease,
         )
         .await;
         if let Err(err) = self.cube_client.release_workspace(&lease_id).await {

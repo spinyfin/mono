@@ -145,6 +145,33 @@ pub enum Stage {
     /// `failed` and released the lease without surfacing anything
     /// to the user.
     PaneSpawned,
+    /// The dispatch aborted between `run_started` and any pane existing:
+    /// `ExecutionRunner::run_execution` returned `Err` — a prompt-composition
+    /// failure, a driver provision/permission-config failure, an
+    /// undeliverable `SpawnWorkerPane` RPC, anything upstream of the app
+    /// actually being asked for a pane.
+    ///
+    /// Emitted the INSTANT the abort is observed, ahead of driver teardown
+    /// and ahead of the (unbounded) `cube workspace release` that follows —
+    /// which is the entire reason it exists separately from
+    /// [`Stage::PaneSpawned`] with `outcome=error`. That event is emitted
+    /// only inside the success branch of `finish_execution_run`, minutes
+    /// later, so the 2026-07-31 incident — a spawn that aborted ~99 ms after
+    /// `run_started`, blocked ~5 minutes in the cube release, and was
+    /// cancelled in the meantime so `finish_execution_run` rejected the
+    /// terminalizing write — produced a per-execution timeline that simply
+    /// STOPPED at `run_started`, with the spawn error discarded unlogged.
+    /// This stage is the terminal marker that survives that double-fault:
+    /// `error_message` carries the full `{err:#}` chain, and `details`
+    /// carries `run_id` and `slot_id`.
+    ///
+    /// A healthy dispatch never emits it — `pane_spawned` is still the
+    /// success terminal, and `pane_spawned/error` still follows this one when
+    /// the tail of the abort path completes normally (it carries what only
+    /// becomes knowable later: `released_workspace` and the `slot_busy`
+    /// occupant). Readers keying off `pane_spawned` — `bossctl doctor`'s
+    /// SIG-B/SIG-F/SIG-H signatures — are unaffected.
+    SpawnFailed,
     /// A non-terminal stage exceeded its per-stage stalled-threshold
     /// without progressing to the next stage. Fires periodically
     /// from the engine's stage-stalled detector; surfaces via
@@ -597,6 +624,7 @@ impl Stage {
             Stage::CubeChangeCreated => "cube_change_created",
             Stage::RunStarted => "run_started",
             Stage::PaneSpawned => "pane_spawned",
+            Stage::SpawnFailed => "spawn_failed",
             Stage::StageStalled => "stage_stalled",
             Stage::OrphanActiveRedispatch => "orphan_active_redispatch",
             Stage::PrReviewDeadRecovery => "pr_review_dead_recovery",
@@ -1353,6 +1381,7 @@ mod tests {
         assert_eq!(Stage::CubeChangeCreated.as_str(), "cube_change_created");
         assert_eq!(Stage::RunStarted.as_str(), "run_started");
         assert_eq!(Stage::PaneSpawned.as_str(), "pane_spawned");
+        assert_eq!(Stage::SpawnFailed.as_str(), "spawn_failed");
         assert_eq!(Stage::StageStalled.as_str(), "stage_stalled");
         assert_eq!(Stage::OrphanActiveRedispatch.as_str(), "orphan_active_redispatch");
         assert_eq!(Stage::PrReviewDeadRecovery.as_str(), "pr_review_dead_recovery");

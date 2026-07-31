@@ -516,6 +516,7 @@ pub async fn run_one_pass(
             work_db,
             &candidate.run_id,
             candidate.workspace_path.as_deref().map(std::path::Path::new),
+            crate::driver_teardown::TeardownReason::TerminalWorkReconcile,
         )
         .await;
 

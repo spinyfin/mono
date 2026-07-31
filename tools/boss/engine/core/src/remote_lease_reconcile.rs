@@ -265,6 +265,7 @@ async fn reap_dead_remote_execution(
                 work_db,
                 &execution.id,
                 execution.workspace_path.as_deref().map(std::path::Path::new),
+                crate::driver_teardown::TeardownReason::RemoteLeaseReconcile,
             )
             .await;
         }
