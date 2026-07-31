@@ -467,13 +467,13 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
     // row-level, DB-driven recovery still fires — so pin it rather than
     // assume it.
     //
-    // Two independent guarantees, in the order they take effect:
-    //
-    // 1. `run_execution`'s own tail releases the pool claim unconditionally
-    //    on this path (`hold_slot_busy` is only ever set in the sibling `Ok`
-    //    branch, which the rejected write never reaches), and the cube lease
-    //    was already handed back before the write was attempted.
-    // 2. `pool_claim_sweep` is the backstop if (1) ever regresses.
+    // `run_execution`'s own tail releases the pool claim unconditionally on
+    // this path (`hold_slot_busy` is only ever set in the sibling `Ok`
+    // branch, which the rejected write never reaches), and the cube lease was
+    // already handed back before the write was attempted. `pool_claim_sweep`
+    // is the backstop if that ever regresses, but it is not what these
+    // assertions pin: a regression surfaces here, directly, as a claim that
+    // never clears.
     let pool = coordinator.worker_pool();
     for _ in 0..200 {
         if pool.claimed_execution_ids().await.is_empty() {
@@ -496,25 +496,6 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
         execution.status.is_terminal(),
         "the row must be terminal from the cancel that rejected the write, not left running; got {:?}",
         execution.status,
-    );
-
-    // And the backstop reconciler agrees there is nothing stranded: a pass
-    // over this post-double-fault state finds no leaked claim to free. If the
-    // tail's release ever regresses, `released` here becomes non-zero and
-    // this reconciler — not the (now silent) dispatch stream — is what
-    // recovers the slot.
-    let live_states = crate::live_worker_state::LiveWorkerStateRegistry::new();
-    let sweep_sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
-    let outcome =
-        crate::pool_claim_sweep::run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sweep_sink.as_ref())
-            .await;
-    assert_eq!(
-        outcome.released, 0,
-        "no claim may be left for the sweep to reclaim — the abort path frees its own slot",
-    );
-    assert_eq!(
-        outcome.non_terminal_skipped, 0,
-        "a non-terminal skip here would mean a claim is pinned to a row nothing will terminalize",
     );
 }
 
@@ -774,6 +755,9 @@ async fn pane_spawn_failure_for_pr_review_does_not_demote_work_item() {
 /// on the next free slot" behavior a plain pool-exhaustion wait gets.
 #[tokio::test]
 async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot() {
+    let buffer = log_capture::install();
+    let starting_offset = buffer.lock().len();
+
     let dir = tempdir().unwrap();
     let db = Arc::new(WorkDb::open(dir.path().join("boss.db")).unwrap());
     let product = create_test_product(&db);
@@ -833,6 +817,32 @@ async fn slot_busy_pane_spawn_failure_requeues_without_demoting_and_holds_slot()
         "the slot-busy slot must be held (not freed) so the next dispatch pass doesn't \
              immediately re-select and repeat the rejection — pool_claim_sweep reclaims it later",
     );
+
+    // The abort is still reported at the spawn-abort point (that is what
+    // makes a genuine abort attributable), but a `SlotBusy` rejection is an
+    // engine/app desync that self-heals via the requeue asserted above — it
+    // must not be logged at ERROR, or the genuine aborts get buried. The
+    // `slot_busy` field is what keeps the two classes filterable regardless
+    // of level.
+    let our_lines = captured_lines_for(&buffer, starting_offset, &first_execution_id);
+    let abort_lines: Vec<&str> = our_lines
+        .lines()
+        .filter(|line| line.contains("spawn aborted"))
+        .collect();
+    assert!(
+        !abort_lines.is_empty(),
+        "a slot-busy abort must still be reported at the abort point; got:\n{our_lines}",
+    );
+    for line in &abort_lines {
+        assert!(
+            line.contains("WARN") && !line.contains("ERROR"),
+            "a slot-busy abort must be demoted to WARN, not logged at ERROR; got:\n{line}",
+        );
+        assert!(
+            line.contains("slot_busy=true"),
+            "the abort line must carry `slot_busy=true` so the two classes stay filterable; got:\n{line}",
+        );
+    }
 }
 
 /// Sibling of the above for the `automation_triage` execution kind,
