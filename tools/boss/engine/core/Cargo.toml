@@ -9,6 +9,7 @@ boss-build-info = { path = "../../build-info" }
 boss-build-provenance = { path = "../../build-provenance" }
 boss-ci-log-reader = { path = "../ci-log-reader" }
 boss-claude-client = { path = "../../claude_client" }
+boss-codex-auth = { path = "../../codex_auth" }
 boss-comment-anchor = { path = "../../comment_anchor" }
 boss-engine-comment-classifier = { path = "../comment-classifier" }
 boss-gh-telemetry = { path = "../../gh_telemetry" }

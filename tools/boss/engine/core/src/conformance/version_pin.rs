@@ -27,6 +27,7 @@ use crate::conformance::fixtures::{
     CODEX_STDOUT_SESSION_JSONL, PINNED_CODEX_CLI_VERSION, PINNED_CODEX_ITEM_ID_BASE, assert_codex_spawn_contract,
     codex_shaped_driver, decode_jsonl,
 };
+use crate::conformance::{require_codex_cli, require_grok_cli, which};
 use crate::driver::grok::PINNED_GROK_VERSION;
 use crate::driver::{AgentDriver, GrokDriver};
 
@@ -40,23 +41,6 @@ fn parse_codex_version(stdout: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Truthy-env-var parsing shared by every driver's "require the live CLI"
-/// gate (`BOSS_REQUIRE_CODEX_CLI`, `BOSS_REQUIRE_GROK_CLI`, …), so a future
-/// third driver's pin does not add yet another copy of the same parsing.
-fn require_cli(var: &str) -> bool {
-    match std::env::var(var) {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
-}
-
-fn require_codex_cli() -> bool {
-    require_cli("BOSS_REQUIRE_CODEX_CLI")
 }
 
 #[test]
@@ -239,14 +223,7 @@ fn generated_config_toml_loads_under_strict_config_on_pinned_codex() {
     use std::time::{Duration, Instant};
 
     let require = require_codex_cli();
-    let codex_bin = match Command::new("which").arg("codex").output() {
-        Ok(o) if o.status.success() => {
-            let path = String::from_utf8_lossy(&o.stdout).trim().to_owned();
-            if path.is_empty() { None } else { Some(path) }
-        }
-        _ => None,
-    };
-    let Some(codex_bin) = codex_bin else {
+    let Some(codex_bin) = which("codex") else {
         if require {
             panic!("BOSS_REQUIRE_CODEX_CLI is set but codex is not on PATH");
         }
@@ -422,10 +399,6 @@ fn error_item_as_operational_warning_is_not_silently_a_turn_failure() {
 // SKU must fail this pin loudly, not get silently absorbed as a stale
 // default (`GROK_DESCRIPTOR`'s model menu, `model_menu.rs`, still hard-codes
 // the single `grok-4.5` SKU).
-
-fn require_grok_cli() -> bool {
-    require_cli("BOSS_REQUIRE_GROK_CLI")
-}
 
 /// Probe grok availability with a flag guaranteed to be present (`--help`).
 /// Soft-skip (return `false`, meaning "test body should return early") when

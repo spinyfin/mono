@@ -418,6 +418,7 @@ dependencies = [
  "boss-ci-log-reader",
  "boss-claude-client",
  "boss-client",
+ "boss-codex-auth",
  "boss-comment-anchor",
  "boss-conflict-diagnosis",
  "boss-deterministic-resolvers",
