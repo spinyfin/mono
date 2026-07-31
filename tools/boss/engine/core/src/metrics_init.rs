@@ -35,9 +35,9 @@ pub fn init_all(registry: &Registry) {
     crate::merge_poller::init(registry);
     // External tracker reconciler pass counters.
     crate::external_tracker::reconcile::register_metrics(registry);
-    // Layer 4 / T10: speculative conflict-prediction sweep counters.
+    // Speculative conflict-prediction sweep counters.
     crate::speculative_conflict::init(registry);
-    // Layer 4 / T11: stacked-PR auto-structuring offer counters.
+    // Stacked-PR auto-structuring offer counters.
     crate::stacked_pr_structuring::init(registry);
     // Queue-level dispatch telemetry: per-pool depth/oldest-wait gauges,
     // dispatch-completed counter, drain-pass-duration gauge.
@@ -158,14 +158,14 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
-        // Layer 4 / T10: speculative conflict-prediction sweep counters.
+        // Speculative conflict-prediction sweep counters.
         for expected in ["speculative_conflict.predicted", "speculative_conflict.clean"] {
             assert!(
                 names.contains(&expected.to_owned()),
                 "init_all must register {expected}"
             );
         }
-        // Layer 4 / T11: stacked-PR auto-structuring offer counter.
+        // Stacked-PR auto-structuring offer counter.
         assert!(
             names.contains(&"stacked_pr_structuring.offered".to_owned()),
             "init_all must register stacked_pr_structuring.offered"

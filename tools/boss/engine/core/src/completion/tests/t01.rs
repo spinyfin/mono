@@ -2527,7 +2527,7 @@ async fn no_op_marker_is_accepted_on_a_later_clean_turn_after_an_earlier_unobser
     // immediately following it), but must NOT permanently refuse every
     // later, unrelated NO_CHANGES_NEEDED claim for the rest of the run —
     // that was the multi-turn-session bug in the single accumulate-forever
-    // `has_any` this test locks the fix for.
+    // tracking this test locks the fix for.
     let workspace = tempdir().unwrap();
     let (_dir, db, _product_id, chore_id, execution_id) = fixture(workspace.path());
     write_assistant_transcript(

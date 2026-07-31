@@ -1111,7 +1111,7 @@ must not be asked to open one",
                     // claim and fall through to the normal produce-a-PR
                     // nudge rather than closing the task as done.
                     //
-                    // `consume_unresolved` (not `list`/`has_any`) is the
+                    // `consume_unresolved` (not `list`) is the
                     // right read here: it answers "has a command gone
                     // unobserved since the last time this gate fired?", not
                     // "has this run ever left a command unobserved?" — see
