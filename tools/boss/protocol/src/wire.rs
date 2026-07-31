@@ -743,6 +743,18 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
+    /// Cost recorded in `[since_epoch_s, until_epoch_s)`, broken down
+    /// by execution kind, model, reasoning mode, and effort level.
+    /// Read-only; backs `boss cost window`. `estimate_usd` requests
+    /// the optional pricing-table USD estimate alongside the token
+    /// totals. Replies with [`FrontendEvent::CostWindowReport`].
+    GetCostWindowReport {
+        since_epoch_s: i64,
+        until_epoch_s: i64,
+        #[serde(default)]
+        estimate_usd: bool,
+    },
+
     /// Fetch a product decision by canonical id. Replies with
     /// [`FrontendEvent::DecisionResult`] or [`FrontendEvent::WorkError`].
     GetDecision {
@@ -860,6 +872,18 @@ pub enum FrontendRequest {
         work_item_id: String,
     },
 
+    /// The highest-token-cost runs recorded in `[since_epoch_s,
+    /// until_epoch_s)`, ranked descending by total tokens. Read-only;
+    /// backs `boss cost top`. Replies with
+    /// [`FrontendEvent::TopCostConsumers`].
+    GetTopCostConsumers {
+        since_epoch_s: i64,
+        until_epoch_s: i64,
+        limit: u32,
+        #[serde(default)]
+        estimate_usd: bool,
+    },
+
     /// Worker → engine, read-only: the sanitized one-call context bundle —
     /// own task + project + product, sibling tasks in the project (each
     /// with dependency edges), edges touching the caller's own task, open
@@ -893,10 +917,20 @@ pub enum FrontendRequest {
         short_id: i64,
     },
 
+    /// Cost for one work item, aggregated across every execution and
+    /// run it has ever had. Read-only; backs `boss cost task`.
+    /// `estimate_usd` requests the optional pricing-table USD estimate
+    /// alongside the token totals. Replies with
+    /// [`FrontendEvent::WorkItemCostReport`].
+    GetWorkItemCostReport {
+        work_item_id: String,
+        #[serde(default)]
+        estimate_usd: bool,
+    },
+
     GetWorkTree {
         product_id: String,
-        /// App-side per-product population-fetch sequence number (T2101
-        /// R1). Purely a correlation id: the macOS app mints a 1-based
+        /// App-side per-product population-fetch sequence number. Purely a correlation id: the macOS app mints a 1-based
         /// per-product `fetch_seq` for every `GetWorkTree` it issues and
         /// stamps it on its `population-timing-*.jsonl` lines. Propagating
         /// it here lets the engine stamp the same value on its

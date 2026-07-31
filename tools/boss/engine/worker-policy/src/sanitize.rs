@@ -215,6 +215,9 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::CiNeverStartsAlert { .. }
         | FrontendEvent::EffortAuditReport { .. }
         | FrontendEvent::EffortEscalationRecorded { .. }
+        | FrontendEvent::WorkItemCostReport { .. }
+        | FrontendEvent::CostWindowReport { .. }
+        | FrontendEvent::TopCostConsumers { .. }
         | FrontendEvent::PlannerRunsList { .. }
         | FrontendEvent::PlanProjectResult { .. }
         | FrontendEvent::ReleaseProjectResult { .. }

@@ -246,6 +246,7 @@ dependencies = [
  "boss-client",
  "boss-editorial",
  "boss-engine",
+ "boss-engine-utils",
  "boss-github",
  "boss-protocol",
  "clap",

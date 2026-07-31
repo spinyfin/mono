@@ -33,6 +33,8 @@ pub mod conflict_remediation;
 pub mod conflict_stop_gate;
 pub mod conflict_watch;
 pub mod coordinator;
+pub mod cost_pricing;
+pub mod cost_report;
 pub mod cube_commands;
 pub mod cube_lease_heartbeat;
 pub mod database_backup;

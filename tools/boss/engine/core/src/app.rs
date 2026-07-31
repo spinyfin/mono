@@ -62,6 +62,7 @@ mod ci_remediation;
 mod comments;
 mod conflict_resolution;
 mod context;
+mod cost;
 mod decisions;
 mod dependencies;
 mod design_docs;
@@ -2153,6 +2154,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetConflictResolution { .. } => {
                 conflict_resolution::handle_get_conflict_resolution(ctx, r).await
             }
+            r @ FrontendRequest::GetCostWindowReport { .. } => cost::handle_get_cost_window_report(ctx, r).await,
             r @ FrontendRequest::GetDecision { .. } => decisions::handle_get_decision(ctx, r).await,
             r @ FrontendRequest::GetDispatchConcurrency => engine_meta::handle_get_dispatch_concurrency(ctx, r).await,
             r @ FrontendRequest::GetDispatchState => engine_meta::handle_get_dispatch_state(ctx, r).await,
@@ -2166,11 +2168,13 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::GetRun { .. } => executions::handle_get_run(ctx, r).await,
             r @ FrontendRequest::GetSettings => engine_meta::handle_get_settings(ctx, r).await,
             r @ FrontendRequest::GetTaskRuntime { .. } => executions::handle_get_task_runtime(ctx, r).await,
+            r @ FrontendRequest::GetTopCostConsumers { .. } => cost::handle_get_top_cost_consumers(ctx, r).await,
             r @ FrontendRequest::GetWorkerContext { .. } => context::handle_get_worker_context(ctx, r).await,
             r @ FrontendRequest::GetWorkItem { .. } => work_items::handle_get_work_item(ctx, r).await,
             r @ FrontendRequest::GetWorkItemByShortId { .. } => {
                 work_items::handle_get_work_item_by_short_id(ctx, r).await
             }
+            r @ FrontendRequest::GetWorkItemCostReport { .. } => cost::handle_get_work_item_cost_report(ctx, r).await,
             r @ FrontendRequest::GetWorkTree { .. } => work_items::handle_get_work_tree(ctx, r).await,
             r @ FrontendRequest::GitHubAuthCancel => github_auth::handle_git_hub_auth_cancel(ctx, r).await,
             r @ FrontendRequest::GitHubAuthDisconnect => github_auth::handle_git_hub_auth_disconnect(ctx, r).await,
