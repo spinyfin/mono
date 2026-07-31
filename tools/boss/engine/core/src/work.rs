@@ -466,6 +466,7 @@ mod products_design;
 mod proposal_apply;
 mod proposals;
 mod query_ensure;
+mod review_verdicts;
 mod revise_doc;
 mod revision_helpers;
 mod schema_init;
@@ -557,5 +558,10 @@ pub use pr_state::StaticPrStateChecker;
 pub use pr_state::classify_pr_merge_state;
 pub use proposals::SubmitWorkerProposalInput;
 pub use proposals::SubmitWorkerProposalOutcome;
+pub use review_verdicts::{
+    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN, REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+    REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD, REVIEW_GATE_OUTCOME_GAVE_UP,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED, ReviewVerdict, ReviewVerdictInput,
+};
 pub use revision_helpers::normalize_priority;
 pub use trunk_merge_intents::{ActiveTrunkMergeIntent, TrunkMergeIntent, TrunkMergeIntentInsertInput};

@@ -240,17 +240,18 @@ impl WorkerCompletionHandler {
         let teardown = self.begin_teardown(execution_id);
 
         let record_started = std::time::Instant::now();
-        let completion = match self
-            .work_db
-            .record_worker_pr_completion(execution_id, &pr_url, None, effective_target)
-        {
-            Ok(Some(completion)) => completion,
-            Ok(None) => return StopOutcome::AlreadyTerminal,
-            Err(err) => {
-                tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
-                return StopOutcome::DbError;
-            }
-        };
+        let completion =
+            match self
+                .work_db
+                .record_worker_pr_completion(execution_id, &pr_url, None, effective_target, None)
+            {
+                Ok(Some(completion)) => completion,
+                Ok(None) => return StopOutcome::AlreadyTerminal,
+                Err(err) => {
+                    tracing::error!(execution_id, source, ?err, "pr completion: failed to record");
+                    return StopOutcome::DbError;
+                }
+            };
         tracing::info!(
             execution_id,
             source,

@@ -705,6 +705,15 @@ impl WorkDb {
         // Codex-percentage routing decision (driver + reason). New table
         // only, independent of every migration above.
         migrate_execution_driver_decisions_table(conn)?;
+        // `pr_review_verdicts`: durable per-pass review-verdict ledger, written
+        // atomically with `record_worker_pr_completion` so a `pr_review` pass
+        // can never reach `completed` without a verdict row. Additive,
+        // independent of every other table.
+        migrate_pr_review_verdicts_table(conn)?;
+        // One-time backfill: auto-resolve `pr_review_died_without_findings`
+        // attentions already followed by a later completed review pass —
+        // data-only, no schema change; self-idempotent.
+        migrate_backfill_resolve_stale_dead_review_attentions(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -843,6 +852,18 @@ mod tests {
         assert!(
             worker_proposals_exists,
             "expected worker_proposals table from migrate_worker_proposals_table"
+        );
+
+        let pr_review_verdicts_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'pr_review_verdicts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            pr_review_verdicts_exists,
+            "expected pr_review_verdicts table from migrate_pr_review_verdicts_table"
         );
 
         let run_cost_columns: i64 = conn

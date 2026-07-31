@@ -2591,3 +2591,83 @@ pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Res
     )?;
     Ok(())
 }
+
+/// One-time backfill: auto-resolve any still-`open`
+/// `pr_review_died_without_findings` attention item (see
+/// `crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND`) whose work
+/// item already has a LATER `pr_review` execution that reached `completed`.
+///
+/// Before the live resolve path landed (`finalize_pr_review_pass` now calls
+/// `resolve_external_tracker_attention` on every completed pass), these
+/// attentions were never cleared automatically — an operator had to dismiss
+/// each one by hand even after the very re-fired review the attention itself
+/// announced had long since finished. A retained trace snapshot found 2051
+/// open items, 1696 of them already followed by a completed review pass on
+/// the same work item — this sweeps that backlog once; the live path
+/// (`resolve_external_tracker_attention` in `finalize_pr_review_pass`) keeps
+/// it from recurring going forward.
+///
+/// Self-idempotent (no schema change to gate on): the query only ever
+/// matches still-open items of this kind, so once the backlog is cleared,
+/// subsequent runs on every engine startup find nothing and are a cheap
+/// no-op — mirrors [`migrate_backfill_cancelled_moot_revision_tombstones`].
+pub(crate) fn migrate_backfill_resolve_stale_dead_review_attentions(conn: &Connection) -> Result<()> {
+    let now = now_string();
+    conn.execute(
+        "UPDATE work_attention_items
+         SET status = 'resolved', resolved_at = ?1
+         WHERE kind = 'pr_review_died_without_findings'
+           AND status = 'open'
+           AND work_item_id IS NOT NULL
+           AND EXISTS (
+               SELECT 1 FROM work_executions we
+               WHERE we.work_item_id = work_attention_items.work_item_id
+                 AND we.kind = 'pr_review'
+                 AND we.status = 'completed'
+                 AND we.finished_at IS NOT NULL
+                 AND we.finished_at >= work_attention_items.created_at
+           )",
+        params![now],
+    )?;
+    Ok(())
+}
+
+/// Create the `pr_review_verdicts` table: a durable per-pass record of what
+/// a `pr_review` reviewer execution actually found, written atomically with
+/// [`crate::work::WorkDb::record_worker_pr_completion`] so a completed pass
+/// can never exist without a verdict row (or vice versa).
+///
+/// Before this table, `work_executions.status = 'completed'` was the only
+/// signal available for a finished review pass, and it is written
+/// identically whether the pass found nothing, found something and minted a
+/// revision, gave up after repeated unproductive nudges, or had its findings
+/// silently discarded by the duplicate-head guard or a failed
+/// `create_revision` call — a clean review was indistinguishable from a
+/// destroyed one. Additive, independent of every other table.
+///
+/// `execution_id` is intentionally NOT unique: `record_worker_pr_completion`
+/// only ever inserts once per execution in practice (the whole point of
+/// pairing the insert with that call), but the schema does not need to
+/// enforce it — a stray duplicate write would just be an extra historical
+/// row, not a correctness hazard for `latest_review_verdict`'s
+/// most-recent-by-`created_at` read.
+pub(crate) fn migrate_pr_review_verdicts_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pr_review_verdicts (
+             id                  TEXT PRIMARY KEY,
+             execution_id        TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+             work_item_id        TEXT NOT NULL,
+             head_sha            TEXT,
+             findings_count      INTEGER NOT NULL DEFAULT 0,
+             revision_warranted  INTEGER NOT NULL DEFAULT 0,
+             gate_outcome        TEXT NOT NULL,
+             revision_task_id    TEXT,
+             created_at          TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS pr_review_verdicts_execution_idx
+             ON pr_review_verdicts(execution_id);
+         CREATE INDEX IF NOT EXISTS pr_review_verdicts_work_item_idx
+             ON pr_review_verdicts(work_item_id, created_at);",
+    )?;
+    Ok(())
+}

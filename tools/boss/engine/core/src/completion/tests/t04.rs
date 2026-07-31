@@ -372,6 +372,23 @@ async fn pr_review_pass_clean_advances_to_in_review_without_revision() {
         Some("sha_reviewed_abc123"),
         "last_reviewed_sha must be recorded from the ReviewResult head_sha",
     );
+
+    // A durable verdict must record this as a genuine clean pass, not an
+    // absence of a verdict — Boss must be able to tell "reviewed, clean"
+    // apart from "never reviewed" or "review died".
+    let verdict = db
+        .review_verdict_for_execution(&pr_review_exec_id)
+        .unwrap()
+        .expect("a completed pr_review pass must record a verdict");
+    assert_eq!(verdict.work_item_id, chore_id);
+    assert_eq!(verdict.gate_outcome, crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN);
+    assert!(!verdict.revision_warranted);
+    assert_eq!(
+        verdict.findings_count, 1,
+        "the clean fixture still carries one low-signal finding"
+    );
+    assert_eq!(verdict.head_sha.as_deref(), Some("sha_reviewed_abc123"));
+    assert!(verdict.revision_task_id.is_none());
 }
 
 /// The `ReviewResult` fallback used to resolve the *reviewed row's* driver
@@ -524,6 +541,27 @@ async fn pr_review_pass_high_finding_creates_revision_with_correct_metadata() {
         TaskStatus::InReview,
         "producing task must advance to in_review after reviewer pass",
     );
+
+    // Verdict must record the findings AND the revision it produced —
+    // `revision_task_id` is amended onto the row after `create_revision`
+    // succeeds (it cannot be known inside the same transaction as
+    // `record_worker_pr_completion`, which is what makes the parent
+    // revisable in the first place).
+    let verdict = db
+        .review_verdict_for_execution(&pr_review_exec_id)
+        .unwrap()
+        .expect("a completed pr_review pass must record a verdict");
+    assert_eq!(
+        verdict.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS
+    );
+    assert!(verdict.revision_warranted);
+    assert_eq!(verdict.findings_count, 1);
+    assert_eq!(
+        verdict.revision_task_id.as_deref(),
+        Some(revision_task_id.as_str()),
+        "verdict must be amended with the revision it produced",
+    );
 }
 
 /// A `ReviewResult` with a `regression` category finding must trigger the
@@ -658,6 +696,222 @@ async fn duplicate_pr_review_passes_on_same_head_mint_only_one_revision() {
         "the duplicate pass must not double-increment review_cycle"
     );
     assert_eq!(last_sha.as_deref(), Some("sha_reviewed_abc123"));
+
+    // The dropped duplicate pass must still record a verdict — its findings
+    // were computed (findings_count = 1) and then discarded by the
+    // duplicate-head guard, which must not read identically to a clean pass.
+    let verdict_b = db
+        .review_verdict_for_execution(&pr_review_exec_b.id)
+        .unwrap()
+        .expect("the dropped duplicate pass must still record a verdict");
+    assert_eq!(
+        verdict_b.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD,
+        "a pass whose findings were computed then dropped as a duplicate must not \
+         read as completed_clean",
+    );
+    assert_eq!(verdict_b.findings_count, 1);
+    assert!(
+        verdict_b.revision_warranted,
+        "revision_warranted is the severity gate's own (pre-dedup) answer — it stays true \
+         even though the duplicate-head guard suppressed the revision; gate_outcome is what \
+         records the suppression"
+    );
+    assert!(verdict_b.revision_task_id.is_none());
+}
+
+/// A second pass on an already-reviewed head that itself found nothing
+/// qualifying must record `completed_clean`, not `dropped_duplicate_head` —
+/// the duplicate-head guard only applies to findings that were actually
+/// computed and then suppressed. This exercises the
+/// `duplicate_head_review && !original_revision_warranted` branch of
+/// `gate_outcome` in `finalize_pr_review_pass`.
+#[tokio::test]
+async fn duplicate_head_review_with_no_findings_records_completed_clean() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json_a = high_finding_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_a, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json_a));
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome_a = handler.on_stop(&pr_review_exec_a).await;
+    assert!(
+        matches!(outcome_a, StopOutcome::ReviewPassRevisionCreated { .. }),
+        "first pass with a high finding must create a revision; got {outcome_a:?}",
+    );
+
+    // A second, independent pr_review execution for the same chore,
+    // reviewing the SAME head sha ("sha_reviewed_abc123") as pass A, but
+    // this time the reviewer found nothing worth a revision.
+    let json_b = clean_review_result_json(pr_url);
+    let pr_review_exec_b = db
+        .create_execution(
+            CreateExecutionInput::builder()
+                .work_item_id(chore_id.clone())
+                .kind(ExecutionKind::PrReview)
+                .status(ExecutionStatus::Ready)
+                .repo_remote_url("git@github.com:spinyfin/mono.git")
+                .build(),
+        )
+        .unwrap();
+    let (pr_review_exec_b, run_b) = db
+        .start_execution_run(
+            &pr_review_exec_b.id,
+            "review-worker-2",
+            "mono",
+            "lease-review-2",
+            "mono-agent-review-002",
+            workspace.path().to_str().unwrap(),
+        )
+        .unwrap();
+    let _ = db
+        .finish_execution_run(
+            FinishExecutionRunInput::builder()
+                .execution_id(&pr_review_exec_b.id)
+                .run_id(&run_b.id)
+                .execution_status(ExecutionStatus::Running)
+                .run_status("completed")
+                .result_summary("reviewer spawned")
+                .build(),
+        )
+        .unwrap();
+    let transcript_path = workspace
+        .path()
+        .join(format!("transcript-{}.jsonl", pr_review_exec_b.id));
+    std::fs::write(&transcript_path, make_review_transcript_jsonl(&json_b).as_bytes()).unwrap();
+    db.set_run_transcript_path_if_unset(&pr_review_exec_b.id, transcript_path.to_str().unwrap())
+        .unwrap();
+
+    let outcome_b = handler.on_stop(&pr_review_exec_b.id).await;
+    assert!(
+        matches!(outcome_b, StopOutcome::ReviewPassCompleted { .. }),
+        "a clean duplicate-head pass must not mint a revision; got {outcome_b:?}",
+    );
+
+    let verdict_b = db
+        .review_verdict_for_execution(&pr_review_exec_b.id)
+        .unwrap()
+        .expect("the clean duplicate-head pass must still record a verdict");
+    assert_eq!(
+        verdict_b.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+        "a duplicate-head pass whose own findings never qualified must read as a genuine \
+         clean pass, not as a dropped-duplicate (nothing was suppressed — there was nothing \
+         to suppress)",
+    );
+    assert!(
+        !verdict_b.revision_warranted,
+        "this pass's own severity gate never warranted a revision",
+    );
+    assert!(verdict_b.revision_task_id.is_none());
+}
+
+/// When `create_revision` fails after the completion transaction already
+/// recorded a `completed_with_findings` verdict — the parent PR was merged
+/// or closed between the review and now — the destroyed findings must be
+/// recorded, not silently dropped. This is the first of the two "destroy
+/// paths" the durable review-verdict mechanism exists to catch.
+#[tokio::test]
+async fn pr_review_pass_revision_creation_failure_amends_verdict() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json = high_finding_review_result_json(pr_url);
+    let (_dir, db, product_id, chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json));
+
+    // The parent is revisable per cached DB state (status starts `active`,
+    // not `done`) but the live probe reports the PR already merged — the
+    // exact race `create_revision`'s live check exists to catch.
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(Arc::new(FakePrStateChecker::always(PrOpenState::Merged)));
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+        "a failed create_revision must fall through to ReviewPassCompleted \
+         (no revision), not surface as an error; got {outcome:?}",
+    );
+
+    // No revision was actually created.
+    let revisions = db.list_revisions(&product_id, None, false, Some(&chore_id)).unwrap();
+    assert!(
+        revisions.is_empty(),
+        "create_revision failed; no revision row should exist, got {revisions:?}",
+    );
+
+    let verdict = db
+        .review_verdict_for_execution(&pr_review_exec_id)
+        .unwrap()
+        .expect("the pass must still record a verdict even though create_revision failed");
+    assert_eq!(
+        verdict.gate_outcome,
+        crate::work::REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
+        "the verdict must be amended off completed_with_findings once create_revision \
+         is known to have failed, not left claiming a revision that doesn't exist",
+    );
+    assert!(
+        verdict.revision_warranted,
+        "revision_warranted reflects what the severity gate found, independent of \
+         whether create_revision later succeeded",
+    );
+    assert_eq!(verdict.findings_count, 1);
+    assert!(
+        verdict.revision_task_id.is_none(),
+        "no revision was created, so revision_task_id must stay unset",
+    );
+}
+
+/// A `pr_review_died_without_findings` attention filed for an earlier dead
+/// review (see `crate::pr_review_recovery`) must auto-resolve once a fresh
+/// pass completes for the same work item — an operator should not have to
+/// manually dismiss a note whose premise ("the review died") is now stale.
+#[tokio::test]
+async fn pr_review_pass_completion_resolves_stale_dead_review_attention() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json = clean_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json));
+
+    // Simulate an earlier dead review having filed the recovery attention
+    // on this same work item (see `pr_review_recovery::file_dead_review_attention`).
+    let attn_id = db
+        .create_attention_item(boss_protocol::CreateAttentionItemInput {
+            execution_id: None,
+            work_item_id: Some(chore_id.clone()),
+            kind: crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND.to_owned(),
+            status: None,
+            title: "Automated review died without findings — auto-refired".to_owned(),
+            body_markdown: "stale".to_owned(),
+            resolved_at: None,
+        })
+        .unwrap()
+        .id;
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::ReviewPassCompleted { .. }),
+        "expected a normal clean completion; got {outcome:?}",
+    );
+
+    let attentions = db.list_attention_items_for_work_item(&chore_id).unwrap();
+    let resolved = attentions
+        .iter()
+        .find(|a| a.id == attn_id)
+        .expect("the attention item must still exist");
+    assert_eq!(
+        resolved.status, "resolved",
+        "a later completed review pass must auto-resolve the stale dead-review attention",
+    );
 }
 
 /// When no ReviewResult is readable (no artifact AND no parseable
@@ -767,6 +1021,17 @@ async fn pr_review_pass_no_result_advances_with_attention_after_breaker_trips() 
         attentions.iter().any(|i| i.kind == REVIEW_RESULT_GIVEUP_ATTENTION_KIND),
         "a review-result-missing attention must be filed; got {attentions:?}",
     );
+
+    // The verdict must record that the engine gave up, not that the review
+    // was clean — no `ReviewResult` was ever produced for this pass.
+    let verdict = db
+        .review_verdict_for_execution(&pr_review_exec_id)
+        .unwrap()
+        .expect("a give-up completion must still record a verdict");
+    assert_eq!(verdict.gate_outcome, crate::work::REVIEW_GATE_OUTCOME_GAVE_UP);
+    assert_eq!(verdict.findings_count, 0);
+    assert!(!verdict.revision_warranted);
+    assert!(verdict.head_sha.is_none());
 }
 
 /// The PRIMARY channel: a `ReviewResult` written to the engine-owned

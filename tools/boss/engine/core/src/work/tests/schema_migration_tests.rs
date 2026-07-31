@@ -637,3 +637,94 @@ fn migrate_backfill_cancelled_moot_revision_tombstones_sweeps_stuck_row_after_me
     drop(conn2);
     let _ = std::fs::remove_file(path);
 }
+
+/// `migrate_backfill_resolve_stale_dead_review_attentions` must resolve an
+/// open `pr_review_died_without_findings` attention once its work item has a
+/// LATER completed `pr_review` execution on record, and must leave alone an
+/// attention with no such later pass — re-opening the DB triggers the
+/// one-time sweep.
+#[test]
+fn migrate_backfill_resolve_stale_dead_review_attentions_resolves_only_when_later_review_completed() {
+    // disk_db_path required: the test re-opens the DB to trigger the migration.
+    let (_dir, path) = disk_db_path("migration-backfill-dead-review-attentions");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Backfill", Some("git@example.com:backfill.git"));
+    let chore_healed = create_test_chore(&db, product.id.clone(), "healed by a later review");
+    let chore_stuck = create_test_chore(&db, product.id.clone(), "still genuinely stale");
+
+    let conn = db.connect().unwrap();
+
+    // Attention filed at t=1000 for both work items.
+    let attn_healed_id = next_id("attn");
+    conn.execute(
+        "INSERT INTO work_attention_items
+            (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+         VALUES (?1, NULL, ?2, 'pr_review_died_without_findings', 'open', 'died', 'stale', '1000', NULL)",
+        params![attn_healed_id, chore_healed.id],
+    )
+    .unwrap();
+    let attn_stuck_id = next_id("attn");
+    conn.execute(
+        "INSERT INTO work_attention_items
+            (id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at)
+         VALUES (?1, NULL, ?2, 'pr_review_died_without_findings', 'open', 'died', 'stale', '1000', NULL)",
+        params![attn_stuck_id, chore_stuck.id],
+    )
+    .unwrap();
+
+    // Only `chore_healed` has a LATER completed pr_review execution
+    // (finished_at = 2000, after the attention's created_at = 1000).
+    let healed_exec_id = next_id("exec");
+    conn.execute(
+        "INSERT INTO work_executions
+            (id, work_item_id, kind, status, repo_remote_url, priority, created_at, finished_at)
+         VALUES (?1, ?2, 'pr_review', 'completed', 'https://github.com/test/repo', 0, '1500', '2000')",
+        params![healed_exec_id, chore_healed.id],
+    )
+    .unwrap();
+    // `chore_stuck` only has an EARLIER dead execution (the one the
+    // attention itself describes) — no later completed pass.
+    let dead_exec_id = next_id("exec");
+    conn.execute(
+        "INSERT INTO work_executions
+            (id, work_item_id, kind, status, repo_remote_url, priority, created_at, finished_at)
+         VALUES (?1, ?2, 'pr_review', 'orphaned', 'https://github.com/test/repo', 0, '900', '950')",
+        params![dead_exec_id, chore_stuck.id],
+    )
+    .unwrap();
+
+    drop(conn);
+    drop(db);
+
+    // Re-open the DB to trigger the migration.
+    let db2 = WorkDb::open(path.clone()).unwrap();
+    let conn2 = db2.connect().unwrap();
+
+    let (healed_status, healed_resolved_at): (String, Option<String>) = conn2
+        .query_row(
+            "SELECT status, resolved_at FROM work_attention_items WHERE id = ?1",
+            [&attn_healed_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        healed_status, "resolved",
+        "an attention with a later completed review pass must be auto-resolved"
+    );
+    assert!(healed_resolved_at.is_some());
+
+    let stuck_status: String = conn2
+        .query_row(
+            "SELECT status FROM work_attention_items WHERE id = ?1",
+            [&attn_stuck_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        stuck_status, "open",
+        "an attention with no later completed review pass must be left open"
+    );
+
+    drop(conn2);
+    let _ = std::fs::remove_file(path);
+}
