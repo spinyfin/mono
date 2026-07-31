@@ -2274,7 +2274,7 @@ impl WorkDb {
 
     /// Stamp `at` (ISO-8601 UTC) as the moment this execution's current run
     /// delivered a turn boundary — the durable "the worker produced a terminal
-    /// result" record read by [`crate::worker_process_exit`].
+    /// result" record.
     ///
     /// Last-write-wins on purpose: for a driver that serves several turns from
     /// one process the newest boundary is the interesting one, and for a
@@ -2301,10 +2301,9 @@ impl WorkDb {
     /// The turn boundary this execution's current run delivered, if any.
     ///
     /// `None` means no terminal result has ever been observed for the process
-    /// currently attached to the run — which is exactly the case where a
-    /// one-turn-per-process worker's exit must still be treated as a death.
-    /// Keyed on the same row [`Self::record_run_turn_boundary_for_execution`]
-    /// writes, so a prior run's boundary can never vouch for a later process.
+    /// currently attached to the run. Keyed on the same row
+    /// [`Self::record_run_turn_boundary_for_execution`] writes, so a prior
+    /// run's boundary can never vouch for a later process.
     pub fn latest_run_turn_boundary_for_execution(&self, execution_id: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         let Some(run_id) = resolve_run_id_for_execution_hooks(&conn, execution_id)? else {
@@ -2861,9 +2860,7 @@ mod event_bus_tests {
             .expect_err("no ExecutionTerminal should be published when cancel_execution errors");
     }
 
-    /// A run that has not delivered a turn boundary reads back as `None` —
-    /// the state [`crate::worker_process_exit`] treats as "no evidence", and
-    /// therefore as a death when the worker's process is gone.
+    /// A run that has not delivered a turn boundary reads back as `None`.
     #[test]
     fn turn_boundary_is_absent_until_one_is_recorded() {
         let (_dir, db) = open_db();

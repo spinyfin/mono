@@ -162,7 +162,6 @@ pub use boss_engine_utility_model as utility_model;
 pub mod work;
 pub mod work_dependencies;
 pub mod worker_escalation;
-pub mod worker_process_exit;
 pub mod worker_readoption;
 pub mod worker_registry;
 pub mod worker_sandbox_audit;

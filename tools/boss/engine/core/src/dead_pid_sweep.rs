@@ -108,21 +108,21 @@
 //! period and PID probe, since the app's report is a direct observation
 //! rather than a speculative one.
 //!
-//! ## One-turn-per-process drivers
+//! ## Every vanished process is a death
 //!
-//! Every path here first asks [`crate::worker_process_exit`] whether the
-//! vanished process is a *death* at all. It is, for every driver whose
-//! process is contracted to outlive its turns. No driver in the registry
-//! currently declares otherwise: `codex exec`, whose CLI served one turn
-//! and then exited by design, was the one exception, and retired in favor
-//! of the persistent interactive TUI (see
-//! `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`). Reading a
-//! one-shot exit as a crash once reaped a cleanly finished Codex run 160 ms
-//! after it succeeded and redispatched the same chore ~20 times; see that
-//! module for the full diagnosis and for why the fix is causal rather than
-//! a grace window. This machinery is retained for a future one-shot driver
-//! rather than deleted — a one-shot worker that exited *without* delivering
-//! a turn boundary would still be reaped here, exactly as before.
+//! Every registered driver's process is contracted to outlive its turns, so
+//! a vanished process always means a dead worker here. That was not always
+//! true: `codex exec` served one turn per process and exited by design, and
+//! reading that exit as a crash once reaped a cleanly finished Codex run 160
+//! ms after it succeeded and redispatched the same chore ~20 times. Codex
+//! was moved to a persistent interactive TUI to close that gap (see
+//! `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`), and the
+//! classification/drain machinery that distinguished a one-shot driver's
+//! expected exit from a death was removed along with the last driver that
+//! needed it — [`crate::driver::DriverRegistry`] now refuses to register a
+//! driver that declares `WorkerProcessLifetime::OneTurnPerProcess` at all. A
+//! future one-shot driver must rebuild that machinery, not rely on anything
+//! left here.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -133,7 +133,6 @@ use crate::coordinator::{ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::{LiveWorkerStateRegistry, iso8601_utc};
 use crate::work::WorkDb;
-use crate::worker_process_exit::ProgressDrain;
 
 /// Grace period after `started_at` (epoch seconds) during which we
 /// skip PID probing. Guards against racing a fresh dispatch whose pane
@@ -225,16 +224,11 @@ pub struct DeadPidSweepOutcome {
     /// this guard a live worker mid-tool-call would be falsely reaped when
     /// its registered shell pid was a transient or reused identity.
     pub live_corroborated_skipped: usize,
-    /// Slots whose worker process is genuinely gone but whose driver serves
-    /// one turn per process and had already delivered its turn boundary —
-    /// the exit was the process's normal end of life, so the slot was
-    /// released without orphaning the execution.
-    pub expected_turn_exits: usize,
 }
 
 impl crate::sweep_loop::SweepOutcome for DeadPidSweepOutcome {
     fn has_activity(&self) -> bool {
-        self.reaped > 0 || self.expected_turn_exits > 0
+        self.reaped > 0
     }
 
     fn log(&self) {
@@ -242,7 +236,6 @@ impl crate::sweep_loop::SweepOutcome for DeadPidSweepOutcome {
             reaped = self.reaped,
             alive_skipped = self.alive_skipped,
             live_corroborated_skipped = self.live_corroborated_skipped,
-            expected_turn_exits = self.expected_turn_exits,
             grace_skipped = self.grace_skipped,
             "dead-pid sweep: pass complete",
         );
@@ -257,7 +250,6 @@ pub fn spawn_loop(
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
-    progress_drain: Arc<dyn ProgressDrain>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     crate::sweep_loop::spawn_sweep_loop(interval, move || {
@@ -265,14 +257,12 @@ pub fn spawn_loop(
         let live_states = Arc::clone(&live_states);
         let coordinator = Arc::clone(&coordinator);
         let dispatch_events = Arc::clone(&dispatch_events);
-        let progress_drain = Arc::clone(&progress_drain);
         async move {
             run_one_pass(
                 work_db.as_ref(),
                 live_states.as_ref(),
                 coordinator.clone(),
                 dispatch_events.as_ref(),
-                Some(progress_drain.as_ref()),
                 DeadPidSweepMode::PeriodicSpeculative,
             )
             .await
@@ -316,7 +306,6 @@ pub async fn reconcile_orphans_on_reattach(
     live_states: Arc<LiveWorkerStateRegistry>,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: Arc<dyn DispatchEventSink>,
-    progress_drain: Arc<dyn ProgressDrain>,
     prior_app_pid: libc::pid_t,
     new_app_pid: libc::pid_t,
 ) -> DeadPidSweepOutcome {
@@ -330,7 +319,6 @@ pub async fn reconcile_orphans_on_reattach(
         live_states.as_ref(),
         coordinator,
         dispatch_events.as_ref(),
-        Some(progress_drain.as_ref()),
         DeadPidSweepMode::AppReattach,
     )
     .await;
@@ -357,19 +345,11 @@ pub async fn reconcile_orphans_on_reattach(
 /// pid verdict is corroborated against recent in-execution event activity
 /// before reaping, and whether each reap files a durable pane-death
 /// attention item. See [`DeadPidSweepMode`].
-///
-/// `progress_drain` lets a confirmed-dead process's progress stream be read
-/// to its end before the reap verdict is taken, so a one-turn-per-process
-/// worker's terminal envelope is never left unread in a file nobody will
-/// write to again. `None` (tests, callers with no ingress to reach) falls
-/// through to the durable turn-boundary record — which for a run that never
-/// delivered one still means "reap".
 pub async fn run_one_pass(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
-    progress_drain: Option<&dyn ProgressDrain>,
     mode: DeadPidSweepMode,
 ) -> DeadPidSweepOutcome {
     let file_pane_death_attention = mode.file_pane_death_attention();
@@ -472,82 +452,35 @@ pub async fn run_one_pass(
             continue;
         }
 
-        // The process is gone — but "gone" is only a *death* for a driver
-        // whose process was supposed to outlive its turns. Ask before
-        // reaping; a one-turn-per-process worker that already delivered its
-        // turn boundary exited on purpose. The classifier may drain progress
-        // first, and that drain can terminalize the execution via completion
-        // detection — so both arms below re-read before acting on a stale
-        // pre-drain snapshot (shared with [`reap_reported_pane_death`]).
-        match crate::worker_process_exit::classify_worker_process_exit(work_db, progress_drain, execution_id).await {
-            crate::worker_process_exit::ProcessExitVerdict::ExpectedTurnExit { turn_boundary_at } => {
-                let execution = reread_execution_after_drain(
-                    work_db,
-                    execution_id,
-                    execution,
-                    "dead-pid sweep: failed to re-read execution after drain; using pre-drain snapshot",
-                );
-                finalize_expected_turn_exit(
-                    work_db,
-                    live_states,
-                    coordinator.clone(),
-                    dispatch_events,
-                    &state,
-                    &execution,
-                    ExpectedExitRecord {
-                        turn_boundary_at: &turn_boundary_at,
-                        source: "dead-pid-sweep",
-                    },
-                )
-                .await;
-                outcome.expected_turn_exits += 1;
-                continue;
-            }
-            crate::worker_process_exit::ProcessExitVerdict::Death => {
-                // Drain may have finalized the run (e.g. completion raced in
-                // while envelopes were published). Skip the reap if so —
-                // otherwise a stale non-terminal snapshot is overwritten with
-                // `orphaned`.
-                let Some(execution) = execution_after_drain_if_not_terminal(
-                    work_db,
-                    execution_id,
-                    execution,
-                    "dead-pid sweep: failed to re-read execution before reap; using pre-drain snapshot",
-                ) else {
-                    continue;
-                };
-
-                // No corroborating activity: the worker is presumed genuinely
-                // dead. Capture what the probe and live-state actually observed so
-                // the reap is explainable from the run's record and the dispatch
-                // tail (the operator's "a transcript must never just stop with no
-                // reason" ask).
-                let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
-                let reason = format!(
-                    "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
-                     no live-event corroboration within {DEAD_PID_CORROBORATION_SECS}s — process presumed dead",
-                    state.shell_pid,
-                    observation.activity_summary(),
-                );
-                let reaped = reap_dead_execution(
-                    work_db,
-                    live_states,
-                    coordinator.clone(),
-                    dispatch_events,
-                    &state,
-                    &execution,
-                    ReapOptions {
-                        reason: &reason,
-                        now_epoch_secs,
-                        file_pane_death_attention,
-                        probe_observation: Some(&observation),
-                    },
-                )
-                .await;
-                if reaped {
-                    outcome.reaped += 1;
-                }
-            }
+        // The process is gone with no corroborating activity: the worker is
+        // presumed genuinely dead. Capture what the probe and live-state
+        // actually observed so the reap is explainable from the run's record
+        // and the dispatch tail — so a reaped run's transcript never just
+        // stops with no indication of why.
+        let observation = LivenessProbeObservation::from_dead_probe(&state, now_epoch_secs);
+        let reason = format!(
+            "dead-pid-reconcile: shell PID {} not found (kill(pid,0)=ESRCH); {}; \
+             no live-event corroboration within {DEAD_PID_CORROBORATION_SECS}s — process presumed dead",
+            state.shell_pid,
+            observation.activity_summary(),
+        );
+        let reaped = reap_dead_execution(
+            work_db,
+            live_states,
+            coordinator.clone(),
+            dispatch_events,
+            &state,
+            &execution,
+            ReapOptions {
+                reason: &reason,
+                now_epoch_secs,
+                file_pane_death_attention,
+                probe_observation: Some(&observation),
+            },
+        )
+        .await;
+        if reaped {
+            outcome.reaped += 1;
         }
     }
 
@@ -617,23 +550,11 @@ fn corroborating_liveness(state: &LiveWorkerState, started_epoch: i64, now_epoch
 /// relaunch can kill many panes at once and an operator needs a durable
 /// record. A single reported pane death is comparatively rare and
 /// already surfaced via the `dead_pid_reconcile` dispatch event.
-///
-/// **The app's report is authoritative about the pane, not about the run.**
-/// `onChildExited` fires whenever the pane's foreground process exits —
-/// which for a one-turn-per-process driver (the retired `codex exec` shape)
-/// was what *success* looked like, terminating by design at the end of its
-/// one turn. So the report is classified through
-/// [`crate::worker_process_exit`] before anything is reaped: this is the exact
-/// call that orphaned a cleanly finished Codex run 160 ms after `task_complete`
-/// and left its completion handler with nothing to finalize. `progress_drain`
-/// is what makes that classification race-free — the process exiting is what
-/// made its rollout file final, so the file is read to end before the verdict.
 pub async fn reap_reported_pane_death(
     work_db: &WorkDb,
     live_states: &LiveWorkerStateRegistry,
     coordinator: Arc<ExecutionCoordinator>,
     dispatch_events: &dyn DispatchEventSink,
-    progress_drain: Option<&dyn ProgressDrain>,
     run_id: &str,
     detail: &str,
 ) -> bool {
@@ -665,242 +586,29 @@ pub async fn reap_reported_pane_death(
 
     let now_epoch_secs: i64 = boss_engine_utils::epoch_time::now_epoch_secs();
 
-    // Is this pane death a worker death, or a one-shot process finishing? The
-    // classifier drains the run's now-final progress stream before answering,
-    // so a `turn.completed` the tailer had not reached yet is delivered — and
-    // has already run completion detection — by the time it returns.
-    match crate::worker_process_exit::classify_worker_process_exit(work_db, progress_drain, run_id).await {
-        crate::worker_process_exit::ProcessExitVerdict::ExpectedTurnExit { turn_boundary_at } => {
-            // Re-read: the drain above may have terminalized the execution
-            // through the completion handler (PR found → in_review), which is
-            // the outcome the reap used to destroy.
-            let execution = reread_execution_after_drain(
-                work_db,
-                run_id,
-                execution,
-                "worker_pane_died: failed to re-read execution after drain; using pre-drain snapshot",
-            );
-            finalize_expected_turn_exit(
-                work_db,
-                live_states,
-                coordinator,
-                dispatch_events,
-                &state,
-                &execution,
-                ExpectedExitRecord {
-                    turn_boundary_at: &turn_boundary_at,
-                    source: "app-reported-pane-exit",
-                },
-            )
-            .await;
-            false
-        }
-        crate::worker_process_exit::ProcessExitVerdict::Death => {
-            // The drain can also have finalized the run on the *death* path (a
-            // worker that crashed after its turn boundary was already consumed).
-            // Re-check before orphaning so a terminal execution is never
-            // overwritten — shared with [`run_one_pass`].
-            let Some(execution) = execution_after_drain_if_not_terminal(
-                work_db,
-                run_id,
-                execution,
-                "worker_pane_died: failed to re-read execution before reap; using pre-drain snapshot",
-            ) else {
-                return false;
-            };
-
-            let reason = format!("worker-pane-died: {detail}");
-            reap_dead_execution(
-                work_db,
-                live_states,
-                coordinator,
-                dispatch_events,
-                &state,
-                &execution,
-                ReapOptions {
-                    reason: &reason,
-                    now_epoch_secs,
-                    file_pane_death_attention: false,
-                    probe_observation: None,
-                },
-            )
-            .await
-        }
-    }
-}
-
-/// Re-read `execution_id` after [`crate::worker_process_exit::classify_worker_process_exit`]
-/// may have drained progress. Used by every path that acts on a post-classify
-/// snapshot so a completion handler that ran mid-drain cannot be overwritten
-/// by a stale pre-drain row. Falls back to `fallback` only when the lookup
-/// itself fails.
-fn reread_execution_after_drain(
-    work_db: &WorkDb,
-    execution_id: &str,
-    fallback: WorkExecution,
-    warn_msg: &str,
-) -> WorkExecution {
-    crate::sweep_loop::lookup_execution_or_warn(work_db, execution_id, warn_msg).unwrap_or(fallback)
-}
-
-/// Like [`reread_execution_after_drain`], but returns `None` when the refreshed
-/// execution is already terminal — the caller must skip the reap rather than
-/// overwrite a real outcome with `orphaned`. Shared by [`run_one_pass`] and
-/// [`reap_reported_pane_death`] so the two Death arms cannot drift.
-fn execution_after_drain_if_not_terminal(
-    work_db: &WorkDb,
-    execution_id: &str,
-    fallback: WorkExecution,
-    warn_msg: &str,
-) -> Option<WorkExecution> {
-    match crate::sweep_loop::lookup_execution_or_warn(work_db, execution_id, warn_msg) {
-        Some(refreshed) if refreshed.status.is_terminal() => None,
-        Some(refreshed) => Some(refreshed),
-        None => Some(fallback),
-    }
-}
-
-/// What was observed about an expected one-shot exit — the evidence that
-/// earned the exemption and which path spotted it. Bundled for the same reason
-/// [`ReapOptions`] is: it keeps [`finalize_expected_turn_exit`]'s argument
-/// count under the `clippy::too_many_arguments` threshold.
-struct ExpectedExitRecord<'a> {
-    /// The turn boundary the driver delivered before exiting, as recorded on
-    /// the run.
-    turn_boundary_at: &'a str,
-    /// Which path observed the exit (`"app-reported-pane-exit"`,
-    /// `"dead-pid-sweep"`), surfaced on the dispatch event so an operator can
-    /// tell an immediate report from a periodic pass.
-    source: &'a str,
-}
-
-/// Finalize a worker process that exited **as designed**: a
-/// [`crate::driver::WorkerProcessLifetime::OneTurnPerProcess`] driver
-/// delivered its turn boundary and then terminated.
-///
-/// This performs the reap's *slot hygiene* and none of its *crash semantics*.
-/// Specifically it does NOT:
-///
-/// - mark the execution `orphaned` — the completion handler already decided
-///   this run's fate on the turn boundary (a PR moved it to review; no PR
-///   parked it `waiting_human`), and overwriting that with a crash status is
-///   what fed the redispatch loop;
-/// - append an `[engine-reconcile]` audit line claiming a dead worker;
-/// - capture a recovery patch — nothing was interrupted;
-/// - tear down driver-owned state — a run the completion handler left live
-///   still owns its per-run driver home, and the path that terminalizes it
-///   owns that teardown.
-///
-/// It DOES drop the live-state entry and release the pool slot, because the
-/// pane really is gone: leaving either claimed would strand a worker slot on a
-/// process that no longer exists. Releasing is safe against redispatch — the
-/// orphan sweep excludes `waiting_human` executions explicitly (they are a
-/// legitimate live state whose worker may have released its slot), and
-/// `rescan_active_dispatch` only re-queues work whose latest execution is
-/// terminal or missing.
-async fn finalize_expected_turn_exit(
-    work_db: &WorkDb,
-    live_states: &LiveWorkerStateRegistry,
-    coordinator: Arc<ExecutionCoordinator>,
-    dispatch_events: &dyn DispatchEventSink,
-    state: &LiveWorkerState,
-    execution: &WorkExecution,
-    exit: ExpectedExitRecord<'_>,
-) {
-    let ExpectedExitRecord {
-        turn_boundary_at,
-        source,
-    } = exit;
-    let execution_id = &state.run_id;
-    tracing::info!(
-        execution_id,
-        work_item_id = %execution.work_item_id,
-        pid = state.shell_pid,
-        slot_id = state.slot_id,
-        execution_status = %execution.status,
-        turn_boundary_at,
-        source,
-        "one-shot worker exit: process finished its turn and exited as designed; \
-         releasing the slot WITHOUT orphaning the execution",
-    );
-
-    live_states.release_slot(state.slot_id);
-    let worker_id = worker_id_for_slot(state.slot_id);
-    coordinator.release_worker_and_kick(&worker_id, None).await;
-
-    dispatch_events
-        .emit(
-            DispatchEvent::new(Stage::OneShotWorkerExit, Outcome::Ok, execution_id)
-                .with_work_item(&execution.work_item_id)
-                .with_details(serde_json::json!({
-                    "slot_id": state.slot_id,
-                    "shell_pid": state.shell_pid,
-                    "turn_boundary_at": turn_boundary_at,
-                    "execution_status": execution.status.as_str(),
-                    "source": source,
-                })),
-        )
-        .await;
-
-    // A run the completion handler could not finish is now unreachable: its
-    // process is gone, so Boss cannot probe it, ask it to escalate, or nudge
-    // it toward a PR (resuming a one-shot driver is a separate capability it
-    // does not have yet). That is a human's call, so say so durably instead of
-    // leaving a live-looking row nobody is driving.
-    if !execution.status.is_terminal() {
-        file_unreachable_one_shot_attention(
-            work_db,
-            &execution.work_item_id,
-            execution_id,
-            execution.status.as_str(),
-        );
-    }
-}
-
-/// `work_attention_items.kind` filed when a one-turn-per-process worker exits
-/// cleanly but its execution is still live — the run finished its turn without
-/// reaching a terminal outcome, and nothing can talk to it any more.
-///
-/// Scoped to the work item and deduped on `open` status (see
-/// [`crate::work::WorkDb::upsert_work_item_attention`]) so repeated one-shot
-/// runs on the same chore surface one actionable item, not a pile.
-pub const ONE_SHOT_UNREACHABLE_ATTENTION_KIND: &str = "one_shot_worker_unreachable";
-
-fn file_unreachable_one_shot_attention(
-    work_db: &WorkDb,
-    work_item_id: &str,
-    execution_id: &str,
-    execution_status: &str,
-) {
-    let title = "One-shot worker finished its turn without a terminal outcome".to_owned();
-    let body = format!(
-        "Execution `{execution_id}` ran on a driver that serves one turn per process. It \
-         delivered its turn boundary and exited normally — it was **not** orphaned, and the work \
-         item has **not** been redispatched.\n\n\
-         Its completion handler left the execution `{execution_status}` rather than finishing it, \
-         which for an implementation run usually means no PR was produced. Because the worker \
-         process is gone, Boss cannot probe it, ask it to escalate, or nudge it toward a PR the \
-         way it can with a long-lived worker, so this needs a human decision: re-run the work \
-         item, or close it out.\n\n\
-         This item won't be re-filed for this work item while it stays open."
-    );
-    if let Err(err) =
-        work_db.upsert_work_item_attention(work_item_id, ONE_SHOT_UNREACHABLE_ATTENTION_KIND, &title, &body)
-    {
-        tracing::warn!(
-            work_item_id,
-            execution_id,
-            ?err,
-            "one-shot worker exit: failed to file unreachable-worker attention item (non-fatal)",
-        );
-    }
+    let reason = format!("worker-pane-died: {detail}");
+    reap_dead_execution(
+        work_db,
+        live_states,
+        coordinator,
+        dispatch_events,
+        &state,
+        &execution,
+        ReapOptions {
+            reason: &reason,
+            now_epoch_secs,
+            file_pane_death_attention: false,
+            probe_observation: None,
+        },
+    )
+    .await
 }
 
 /// What the liveness probe and live-state observed at the moment a
 /// periodic-sweep reap was decided. Recorded on the reap's `tracing` log
 /// and `dead_pid_reconcile` dispatch-event details so a future death is
-/// explainable from the run's record — the operator's explicit ask that a
-/// reaped run's transcript never "just stops" with no indication of why.
+/// explainable from the run's record — a reaped run's transcript must
+/// never "just stop" with no indication of why.
 /// Only produced on the speculative periodic path; the app-reported
 /// pane-death reap has no probe to describe.
 struct LivenessProbeObservation {
@@ -1186,18 +894,6 @@ mod tests {
     use crate::test_support::*;
     use crate::work::{ExecutionStatus, WorkDb};
 
-    /// An ingress with nothing to make final.
-    ///
-    /// These tests run against the engine-default (Claude) driver, whose
-    /// process is `Persistent`, so the classifier never reaches the drain at
-    /// all — the seam itself is covered in [`crate::worker_process_exit`].
-    struct NoDrain;
-
-    #[async_trait::async_trait]
-    impl ProgressDrain for NoDrain {
-        async fn drain_progress_for_exited_worker(&self, _run_id: &str) {}
-    }
-
     /// Register a slot in the live-state registry with the given PID and
     /// an optional work-item binding. Activity is left as `Spawning`
     /// (non-terminal, so the sweep considers it).
@@ -1310,7 +1006,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1355,7 +1050,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1392,7 +1086,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1431,7 +1124,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1470,7 +1162,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1514,7 +1205,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1591,7 +1281,6 @@ mod tests {
             live_states.clone(),
             coordinator.clone(),
             sink.clone() as Arc<dyn DispatchEventSink>,
-            Arc::new(NoDrain) as Arc<dyn ProgressDrain>,
             // Prior (dead) app pid and the relaunched app pid; values are
             // only used for logging so any distinct pair is fine.
             1111,
@@ -1654,7 +1343,6 @@ mod tests {
             live_states.clone(),
             coordinator.clone(),
             sink.clone() as Arc<dyn DispatchEventSink>,
-            Arc::new(NoDrain) as Arc<dyn ProgressDrain>,
             1111,
             2222,
         )
@@ -1671,7 +1359,6 @@ mod tests {
             live_states.clone(),
             coordinator.clone(),
             sink.clone() as Arc<dyn DispatchEventSink>,
-            Arc::new(NoDrain) as Arc<dyn ProgressDrain>,
             2222,
             3333,
         )
@@ -1716,7 +1403,6 @@ mod tests {
             live_states.clone(),
             coordinator.clone(),
             sink.clone() as Arc<dyn DispatchEventSink>,
-            Arc::new(NoDrain) as Arc<dyn ProgressDrain>,
             1111,
             2222,
         )
@@ -1765,7 +1451,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             &execution_id,
             "surface failed to attach",
         )
@@ -1799,7 +1484,6 @@ mod tests {
             &live_states,
             coordinator,
             sink.as_ref(),
-            None,
             "run-does-not-exist",
             "surface failed to attach",
         )
@@ -1838,7 +1522,6 @@ mod tests {
             &live_states,
             coordinator,
             sink.as_ref(),
-            None,
             &execution_id,
             "surface failed to attach",
         )
@@ -1870,7 +1553,6 @@ mod tests {
             &live_states,
             coordinator,
             sink.as_ref(),
-            None,
             &execution_id,
             "surface failed to attach",
         )
@@ -1912,7 +1594,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -1974,7 +1655,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -2017,7 +1697,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -2031,8 +1710,8 @@ mod tests {
 
         // The reap event carries what the liveness probe observed (probe
         // type, result, and the live-state activity snapshot) so a future
-        // death is explainable from the dispatch tail — the operator's ask
-        // that a reaped run never "just stops" with no indication of why.
+        // death is explainable from the dispatch tail — a reaped run must
+        // never "just stop" with no indication of why.
         let events = sink.events().await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].stage, "dead_pid_reconcile");
@@ -2076,7 +1755,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
@@ -2119,7 +1797,6 @@ mod tests {
             live_states.clone(),
             coordinator.clone(),
             sink.clone() as Arc<dyn DispatchEventSink>,
-            Arc::new(NoDrain) as Arc<dyn ProgressDrain>,
             1111,
             2222,
         )
@@ -2339,7 +2016,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             &execution_id,
             "app reported the worker pane died (child process exited)",
         )
@@ -2359,19 +2035,14 @@ mod tests {
         let events = sink.events().await;
         assert_eq!(events.len(), 1, "expected one dispatch event, got: {events:?}");
         assert_eq!(events[0].stage, Stage::DeadPidReconcile.as_str());
-        assert_ne!(
-            events[0].stage,
-            Stage::OneShotWorkerExit.as_str(),
-            "no registered driver declares OneTurnPerProcess any more",
-        );
     }
 
-    /// The exemption is bought with evidence, not with a driver name. A Codex
-    /// worker that died mid-turn delivered no boundary, so it is reaped
-    /// exactly as any other dead worker — otherwise a genuinely crashed pane
-    /// would hold its slot forever.
+    /// A dead pid is a dead pane regardless of driver. A Codex worker that
+    /// died mid-turn delivered no boundary, so it is reaped exactly as any
+    /// other dead worker — otherwise a genuinely crashed pane would hold
+    /// its slot forever.
     #[tokio::test]
-    async fn one_shot_exit_without_a_turn_boundary_is_still_reaped() {
+    async fn an_exit_without_a_turn_boundary_is_still_reaped() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         let db = Arc::new(db);
@@ -2387,13 +2058,12 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             &execution_id,
             "app reported the worker pane died (surface failed to attach)",
         )
         .await;
 
-        assert!(reaped, "a one-shot worker that never finished a turn is a death");
+        assert!(reaped, "a worker that never finished a turn is still a death");
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
@@ -2426,27 +2096,24 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             DeadPidSweepMode::PeriodicSpeculative,
         )
         .await;
 
         assert_eq!(outcome.reaped, 1);
-        assert_eq!(outcome.expected_turn_exits, 0);
         assert_eq!(
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned,
         );
     }
 
-    /// The `ONE_SHOT_UNREACHABLE_ATTENTION_KIND` filing is gated on
-    /// [`crate::worker_process_exit::ProcessExitVerdict::ExpectedTurnExit`],
-    /// which no registered driver can produce any more now that Codex is
-    /// `Persistent` — so a reaped Codex pane files neither that item nor a
-    /// [`PANE_DEATH_ATTENTION_KIND`] one (per [`reap_reported_pane_death`]'s
-    /// own contract, which reserves that kind for the reattach reconciler).
+    /// [`reap_reported_pane_death`]'s own contract (see its doc) is that it
+    /// never files a [`PANE_DEATH_ATTENTION_KIND`] item — that kind is
+    /// reserved for [`reconcile_orphans_on_reattach`], where a single app
+    /// relaunch can kill many panes at once and an operator needs a durable
+    /// record. A single reported pane death does not get one.
     #[tokio::test]
-    async fn a_reaped_persistent_codex_worker_files_no_one_shot_attention_item() {
+    async fn reap_reported_pane_death_files_no_attention_item() {
         let (_dir, db) = open_db();
         let (work_item_id, execution_id) = create_codex_run(&db);
         db.record_run_turn_boundary_for_execution(&execution_id, "2026-07-28T00:16:58Z")
@@ -2463,17 +2130,12 @@ mod tests {
             &live_states,
             coordinator.clone(),
             Arc::new(RecordingDispatchEventSink::new()).as_ref(),
-            None,
             &execution_id,
             "child process exited",
         )
         .await;
 
         let items = db.list_attention_items_for_work_item(&work_item_id).unwrap();
-        assert!(
-            !items.iter().any(|i| i.kind == ONE_SHOT_UNREACHABLE_ATTENTION_KIND),
-            "no driver can produce ExpectedTurnExit any more: {items:?}",
-        );
         assert!(
             !items.iter().any(|i| i.kind == PANE_DEATH_ATTENTION_KIND),
             "reap_reported_pane_death never files this kind: {items:?}",
@@ -2482,8 +2144,8 @@ mod tests {
 
     /// Claude's process is contracted to outlive its turns, so a recorded turn
     /// boundary says nothing about whether it is alive. Its pane dying is still
-    /// a reap — the sweeps must behave exactly as they did before the one-shot
-    /// exemption existed.
+    /// a reap — a dead durable pid is a dead pane and the turn-boundary record
+    /// is not consulted.
     #[tokio::test]
     async fn a_persistent_driver_pane_death_is_still_reaped_after_a_turn_boundary() {
         let (_dir, db) = open_db();
@@ -2507,7 +2169,6 @@ mod tests {
             &live_states,
             coordinator.clone(),
             sink.as_ref(),
-            None,
             &execution_id,
             "app reported the worker pane died",
         )
@@ -2518,71 +2179,5 @@ mod tests {
             db.get_execution(&execution_id).unwrap().status,
             ExecutionStatus::Orphaned
         );
-    }
-
-    /// The drain-vs-completion race [`execution_after_drain_if_not_terminal`]
-    /// closes only ever arises for a driver whose exit classification pays
-    /// for a drain at all — gated on
-    /// [`crate::worker_process_exit::one_turn_per_process`], which no driver
-    /// in the registry satisfies now that Codex is `Persistent`. A supplied
-    /// drain is therefore never invoked for a Codex pane death; confirmed by
-    /// [`codex_clean_exit_is_now_reaped_like_a_persistent_driver`] and its
-    /// `worker_process_exit` counterpart, which assert the drain's call
-    /// count directly. The race itself is currently unreachable through any
-    /// registered driver and so has no live regression test here.
-    #[tokio::test]
-    async fn periodic_sweep_reaps_a_dead_codex_pane_without_invoking_the_supplied_drain() {
-        let (_dir, db) = open_db();
-        let (work_item_id, execution_id) = create_codex_run(&db);
-        let drain = RecordingDrain::default();
-        let db = Arc::new(db);
-
-        let live_states = Arc::new(LiveWorkerStateRegistry::new());
-        register_slot_with_binding(&live_states, 1, &execution_id, dead_pid(), &work_item_id);
-        let coordinator = make_coordinator(db.clone(), 1);
-        coordinator.worker_pool().claim_worker(&execution_id, None).await;
-
-        let sink = Arc::new(RecordingDispatchEventSink::new());
-        let outcome = run_one_pass(
-            db.as_ref(),
-            &live_states,
-            coordinator.clone(),
-            sink.as_ref(),
-            Some(&drain),
-            DeadPidSweepMode::PeriodicSpeculative,
-        )
-        .await;
-
-        assert_eq!(
-            drain.calls(),
-            0,
-            "a persistent driver's exit must not pay for the drain"
-        );
-        assert_eq!(outcome.reaped, 1);
-        assert_eq!(outcome.expected_turn_exits, 0);
-        assert_eq!(
-            db.get_execution(&execution_id).unwrap().status,
-            ExecutionStatus::Orphaned,
-        );
-    }
-
-    /// Records how many times the drain was invoked, without side effects —
-    /// used to pin that a persistent driver's exit never pays for a drain.
-    #[derive(Default)]
-    struct RecordingDrain {
-        calls: std::sync::atomic::AtomicUsize,
-    }
-
-    impl RecordingDrain {
-        fn calls(&self) -> usize {
-            self.calls.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl ProgressDrain for RecordingDrain {
-        async fn drain_progress_for_exited_worker(&self, _run_id: &str) {
-            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 }

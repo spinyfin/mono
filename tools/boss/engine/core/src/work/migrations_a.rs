@@ -429,11 +429,10 @@ pub(crate) fn migrate_work_runs_progress_session_id(conn: &Connection) -> Result
 /// therefore a fresh (NULL) boundary, so a prior process's turn can never
 /// vouch for a later process that crashed before delivering one.
 ///
-/// Read by [`crate::worker_process_exit`] when a one-turn-per-process driver's
-/// worker exits, to tell an expected end-of-life apart from a death. It must
-/// survive an engine restart — [`crate::dead_pane_sweep`] is restart-robust by
-/// design and probes a durable pid, so an in-memory record would leave that
-/// sweep orphaning cleanly-finished one-shot runs after any restart.
+/// Historically read to tell a one-turn-per-process driver's expected
+/// end-of-life apart from a death; no registered driver declares that
+/// lifetime any more and the classifier that read this column was removed
+/// along with it (see `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`).
 pub(crate) fn migrate_work_runs_turn_boundary_at(conn: &Connection) -> Result<()> {
     if !table_has_column(conn, "work_runs", "turn_boundary_at")? {
         conn.execute("ALTER TABLE work_runs ADD COLUMN turn_boundary_at TEXT", [])?;

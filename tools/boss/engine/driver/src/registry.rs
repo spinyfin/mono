@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::{
     AgentDriver, CapabilityResolver, ClaudeDriver, CodexDriver, GrokDriver, ProgressIngress, ProgressObservationConfig,
+    WorkerProcessLifetime,
 };
 
 /// A driver slug the current binary's [`DriverRegistry`] does not recognise.
@@ -51,6 +52,7 @@ impl Default for DriverRegistry {
         drivers.insert("grok", Arc::new(GrokDriver::default()));
         for (slug, driver) in &drivers {
             refuse_stdout_jsonl_ingress(slug, driver.as_ref());
+            refuse_one_turn_per_process(slug, driver.as_ref());
         }
         Self { drivers }
     }
@@ -88,6 +90,33 @@ fn refuse_stdout_jsonl_ingress(slug: &str, driver: &dyn AgentDriver) {
         "driver '{slug}' declared ProgressIngress::StdoutJsonl at registration; the engine-spawned \
          stdout-JSONL topology was intentionally discontinued and production ingress activation does \
          not wire it up — see tools/boss/docs/designs/codex-as-a-first-class-agent-driver.md"
+    );
+}
+
+/// Registration-time guard for [`WorkerProcessLifetime::OneTurnPerProcess`]:
+/// the classification/drain machinery that let the engine's process-liveness
+/// reapers tell a one-turn-per-process driver's expected exit apart from a
+/// death was removed once Codex (the last driver that declared it) moved to
+/// a persistent interactive session — see
+/// `docs/investigations/codex-tui-pivot-pricing-2026-07-30.md`. A driver that
+/// declares this variant today would silently get the *old*, wrong
+/// treatment back (every exit read as a death, mid-turn or not) with nothing
+/// to catch the contradiction, which is exactly the misclassification that
+/// machinery existed to prevent. Panicking here at registration turns a
+/// driver author's untested assumption into a loud startup failure instead
+/// of a redispatch storm discovered in production.
+///
+/// Deliberately probes only the three built-in slugs constructed above, not
+/// [`DriverRegistry::with_driver`] generally, mirroring
+/// [`refuse_stdout_jsonl_ingress`].
+fn refuse_one_turn_per_process(slug: &str, driver: &dyn AgentDriver) {
+    assert!(
+        driver.worker_process_lifetime() != WorkerProcessLifetime::OneTurnPerProcess,
+        "driver '{slug}' declared WorkerProcessLifetime::OneTurnPerProcess at registration; the \
+         classification/drain machinery that distinguished a one-shot driver's expected exit from \
+         a death was removed once no driver needed it any more — rebuild that machinery before a \
+         driver can declare this lifetime — see \
+         tools/boss/docs/investigations/codex-tui-pivot-pricing-2026-07-30.md"
     );
 }
 
@@ -345,5 +374,30 @@ mod tests {
         let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]));
         let reg = DriverRegistry::default().with_driver("stub", Arc::new(driver));
         assert_eq!(reg.require("stub").unwrap().descriptor().name, "stub");
+    }
+
+    /// A driver that declares `OneTurnPerProcess` is refused rather than
+    /// silently getting the pre-classification-machinery treatment back —
+    /// see `refuse_one_turn_per_process`'s doc for why.
+    #[test]
+    fn refuse_one_turn_per_process_panics_on_a_one_shot_declaration() {
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]))
+            .with_worker_process_lifetime(WorkerProcessLifetime::OneTurnPerProcess);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            refuse_one_turn_per_process("stub", &driver);
+        }));
+        assert!(
+            result.is_err(),
+            "registering a OneTurnPerProcess-declaring driver must panic",
+        );
+    }
+
+    /// The same guard must not fire for a driver that declares the default
+    /// (`Persistent`) lifetime — every built-in driver, and the common case
+    /// for a new one.
+    #[test]
+    fn refuse_one_turn_per_process_allows_persistent() {
+        let driver = StubDriver::new(stub_descriptor(), CapabilitySet::new([Capability::Spawn]));
+        refuse_one_turn_per_process("stub", &driver);
     }
 }

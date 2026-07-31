@@ -96,14 +96,12 @@ pub(super) async fn handle_register_app_session(ctx: Dispatch, req: FrontendRequ
             let live_worker_states = server_state.live_worker_states.clone();
             let execution_coordinator = server_state.execution_coordinator.clone();
             let dispatch_events = server_state.dispatch_events.clone();
-            let progress_drain = server_state.clone() as Arc<dyn crate::worker_process_exit::ProgressDrain>;
             tokio::spawn(async move {
                 crate::dead_pid_sweep::reconcile_orphans_on_reattach(
                     work_db,
                     live_worker_states,
                     execution_coordinator,
                     dispatch_events,
-                    progress_drain,
                     prior,
                     observed,
                 )
@@ -317,10 +315,10 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
 /// **Spawned detached**, for the reason `handle_register_app_session`'s
 /// re-attach reconcile is: the macOS app holds ONE frontend connection for its
 /// whole lifetime and this loop dispatches its requests serially, so anything
-/// awaited here delays every subsequent app RPC. Resolving a pane death now
-/// includes draining the run's progress stream (see
-/// [`crate::worker_process_exit`]) — bounded, but not instantaneous — and the
-/// app is not waiting on the answer.
+/// awaited here delays every subsequent app RPC. Resolving a pane death does
+/// real work (driver-owned state teardown, a recovery-patch capture, DB
+/// writes) — bounded, but not instantaneous — and the app is not waiting on
+/// the answer.
 pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state, peer_pid, ..
@@ -342,7 +340,6 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
             server_state.live_worker_states.as_ref(),
             server_state.execution_coordinator.clone(),
             server_state.dispatch_events.as_ref(),
-            Some(server_state.as_ref() as &dyn crate::worker_process_exit::ProgressDrain),
             &run_id,
             "app reported the worker pane died (surface failed to attach or child process exited)",
         )

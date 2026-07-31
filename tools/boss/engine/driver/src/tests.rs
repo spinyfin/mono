@@ -45,8 +45,6 @@ fn hook_wiring_destination_defaults_to_worker_settings_file() {
 fn worker_process_lifetime_defaults_to_persistent() {
     let stub = test_support::StubDriver::new(test_support::stub_descriptor(), CapabilitySet::new([]));
     assert_eq!(stub.worker_process_lifetime(), WorkerProcessLifetime::Persistent);
-    assert!(!WorkerProcessLifetime::Persistent.exits_after_each_turn());
-    assert!(WorkerProcessLifetime::OneTurnPerProcess.exits_after_each_turn());
 }
 
 #[test]

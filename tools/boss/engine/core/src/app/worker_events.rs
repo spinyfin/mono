@@ -135,11 +135,9 @@ pub(super) async fn dispatch_worker_event_fanout(
     // so they are delivered on the *same* Stop that
     // triggered them rather than stalling until the
     // next Stop (which never comes for an idle worker).
-    // Durably record the boundary BEFORE anything reacts to it. This is the
-    // evidence `worker_process_exit` reads to tell a one-turn-per-process
-    // worker's expected exit from a death, so it must survive a completion
-    // handler that errors, an engine restart, and the pane going away
-    // milliseconds later — which for `codex exec` it always does.
+    // Durably record the boundary BEFORE anything reacts to it, so it
+    // survives a completion handler that errors, an engine restart, or the
+    // pane going away milliseconds later.
     record_turn_boundary_on_stop(server_state, incoming);
     dispatch_probe_reply_on_stop(server_state, incoming).await;
     dispatch_completion_on_stop(server_state, incoming).await;
@@ -153,10 +151,7 @@ pub(super) async fn dispatch_worker_event_fanout(
 /// the driver-resolved signal — not on the `Stop` variant, so a driver whose
 /// turn ends some other way records it too.
 ///
-/// Best-effort by design: a failed write only ever costs the *exemption* (the
-/// exit is then read as a death and reaped, which is the pre-existing
-/// behaviour), never the reverse. That asymmetry is deliberate — the record is
-/// permission to skip a reap, so its absence must fail safe.
+/// Best-effort by design: a failed write is logged and otherwise ignored.
 pub(super) fn record_turn_boundary_on_stop(
     server_state: &Arc<ServerState>,
     incoming: &crate::events_socket::IncomingHookEvent,
