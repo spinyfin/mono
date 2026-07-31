@@ -134,6 +134,28 @@ impl IntegrityReport {
         self.lost_lines().any(|line| line.overlaps_window(from, to))
     }
 
+    /// True when every damaged line sits in a rotated `current.jsonl.<secs>`
+    /// segment rather than the live `current.jsonl` the current writer
+    /// appends to.
+    ///
+    /// This is the boundary between "the writer that produced this stream
+    /// today could have produced this damage" and "this predates whatever
+    /// writer is running now". A rotated segment stopped receiving appends
+    /// the moment it was rotated out — nothing currently running can still be
+    /// writing to it — so damage confined to rotated segments is settled
+    /// history no matter which writer version is live today. This is
+    /// deliberately NOT a timestamp comparison against the writer-fix date
+    /// (see [`crate::stream_integrity`] docs / the PR that added this): a
+    /// hardcoded cutoff would need updating by hand and would silently misfire
+    /// against clock skew or a state root copied from elsewhere, while segment
+    /// identity is read off the filesystem layout itself and never goes stale.
+    /// An empty report is not "confined to rotated segments" — there is no
+    /// damage to confine anywhere, so callers must check [`Self::is_intact`]
+    /// first.
+    pub fn all_damage_in_rotated_segments(&self) -> bool {
+        !self.damage.is_empty() && self.damage.iter().all(|line| !is_live_path(&line.path))
+    }
+
     /// One line of provenance for a damaged line, for a marker or footer.
     fn describe(line: &DamagedLine) -> String {
         let where_ = format!(
@@ -186,6 +208,19 @@ impl IntegrityReport {
                 "!! Records are missing from the timeline below. The ABSENCE of an event"
             );
             let _ = writeln!(out, "!! in this report is NOT evidence that it never happened.");
+        } else if self.all_damage_in_rotated_segments() {
+            let _ = writeln!(
+                out,
+                "!! Every dispatch record was recovered, so the timeline below is complete —"
+            );
+            let _ = writeln!(
+                out,
+                "!! the interleaving is confined to rotated segment(s), i.e. history the current"
+            );
+            let _ = writeln!(
+                out,
+                "!! writer stopped appending to a while ago. Nothing here implicates the live writer."
+            );
         } else {
             let _ = writeln!(
                 out,
@@ -193,7 +228,7 @@ impl IntegrityReport {
             );
             let _ = writeln!(
                 out,
-                "!! but the stream interleaved, which means the writer needs attention."
+                "!! but the stream interleaved in the LIVE segment, which means the writer needs attention."
             );
         }
         let _ = writeln!(
@@ -278,9 +313,19 @@ impl IntegrityReport {
             "recovered_records": self.recovered_records(),
             "lines_with_lost_records": self.lost_lines().count(),
             "exit_code": if incomplete { EXIT_UNRECOVERED_RECORDS } else { 0 },
+            "all_damage_in_rotated_segments": self.all_damage_in_rotated_segments(),
             "lines": self.damage,
         })
     }
+}
+
+/// True when `path`'s file name is exactly the live dispatch stream filename
+/// (`current.jsonl`), as opposed to a rotated `current.jsonl.<unix_seconds>`
+/// segment. See [`IntegrityReport::all_damage_in_rotated_segments`].
+fn is_live_path(path: &std::path::Path) -> bool {
+    path.file_name()
+        .map(|name| name == boss_log_files::DISPATCH_EVENTS_LIVE_FILENAME)
+        .unwrap_or(false)
 }
 
 /// A damage marker to interleave into a rendered timeline, and where it goes.
@@ -346,8 +391,30 @@ mod tests {
     use std::path::PathBuf;
 
     fn damaged(line_number: u64, shape: DamageShape, prev: Option<u128>, next: Option<u128>) -> DamagedLine {
+        damaged_at("/state/dispatch-events/current.jsonl", line_number, shape, prev, next)
+    }
+
+    /// Like [`damaged`], but in a rotated segment rather than the live file —
+    /// for exercising [`IntegrityReport::all_damage_in_rotated_segments`].
+    fn damaged_rotated(line_number: u64, shape: DamageShape, prev: Option<u128>, next: Option<u128>) -> DamagedLine {
+        damaged_at(
+            "/state/dispatch-events/current.jsonl.1753747200",
+            line_number,
+            shape,
+            prev,
+            next,
+        )
+    }
+
+    fn damaged_at(
+        path: &str,
+        line_number: u64,
+        shape: DamageShape,
+        prev: Option<u128>,
+        next: Option<u128>,
+    ) -> DamagedLine {
         DamagedLine {
-            path: PathBuf::from("/state/dispatch-events/current.jsonl"),
+            path: PathBuf::from(path),
             line_number,
             byte_len: 418,
             recovered: if shape == DamageShape::Unrecoverable { 0 } else { 2 },
@@ -427,5 +494,60 @@ mod tests {
         let text = IntegrityReport::describe(&damaged(266198, DamageShape::Unrecoverable, None, None));
         assert!(text.contains("current.jsonl:266198"), "{text}");
         assert!(text.contains("UNRECOVERABLE"), "{text}");
+    }
+
+    #[test]
+    fn damage_confined_to_rotated_segments_does_not_implicate_the_writer() {
+        let report = IntegrityReport::new(vec![
+            damaged_rotated(1, DamageShape::Concatenated, Some(10), Some(20)),
+            damaged_rotated(2, DamageShape::Concatenated, Some(30), Some(40)),
+        ]);
+        assert!(report.all_damage_in_rotated_segments());
+        let banner = report.render_banner();
+        assert!(
+            banner.contains("rotated segment"),
+            "banner should name rotated segments as the source: {banner}"
+        );
+        assert!(
+            !banner.contains("writer needs attention"),
+            "confirmed-historical damage must not blame the live writer: {banner}"
+        );
+        assert_eq!(report.to_json()["all_damage_in_rotated_segments"], json!(true));
+    }
+
+    #[test]
+    fn damage_in_the_live_segment_still_implicates_the_writer() {
+        let report = IntegrityReport::new(vec![damaged(1, DamageShape::Concatenated, Some(10), Some(20))]);
+        assert!(!report.all_damage_in_rotated_segments());
+        let banner = report.render_banner();
+        assert!(
+            banner.contains("writer needs attention"),
+            "live-segment damage is a genuine live-writer signal: {banner}"
+        );
+        assert_eq!(report.to_json()["all_damage_in_rotated_segments"], json!(false));
+    }
+
+    #[test]
+    fn one_live_line_among_rotated_damage_still_implicates_the_writer() {
+        let report = IntegrityReport::new(vec![
+            damaged_rotated(1, DamageShape::Concatenated, Some(10), Some(20)),
+            damaged(2, DamageShape::Concatenated, Some(30), Some(40)),
+        ]);
+        assert!(
+            !report.all_damage_in_rotated_segments(),
+            "even one live-segment line means the boundary is not confirmed-historical"
+        );
+        let banner = report.render_banner();
+        assert!(banner.contains("writer needs attention"), "{banner}");
+    }
+
+    #[test]
+    fn an_intact_report_is_not_confined_to_rotated_segments() {
+        let report = IntegrityReport::new(vec![]);
+        assert!(report.is_intact());
+        assert!(
+            !report.all_damage_in_rotated_segments(),
+            "no damage anywhere is not the same claim as 'all damage is historical'"
+        );
     }
 }
