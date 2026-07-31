@@ -29,20 +29,6 @@
 //! subagent) still eventually surfaces to the normal nudge/park flow
 //! rather than being trusted forever.
 
-/// Bound on how many process-tree levels [`count_live_descendants`] walks
-/// below the probed pid. Mirrors [`crate::worker_registry::ANCESTOR_WALK_DEPTH`]'s
-/// choice of a small, generous-enough constant rather than an unbounded
-/// walk — a worker's own descendant tree (shell → claude → subagent(s)) is
-/// only ever a couple of levels deep in practice; this just guards against
-/// a pathological tree turning a "cheap" sweep-time check into a long scan.
-const DESCENDANT_WALK_DEPTH: usize = 8;
-
-/// Hard cap on how many pids a single probe visits across the whole walk.
-/// A real worker's descendant count is in the single digits; this bound
-/// only ever protects against a runaway process tree (fork bomb, buggy
-/// tool loop) making the probe itself expensive.
-const MAX_VISITED_PIDS: usize = 512;
-
 /// Default horizon a continuously-reported live-descendant sighting is
 /// trusted for, measured from the first reported sighting, before
 /// [`crate::completion::WorkerCompletionHandler::nudge_or_park`] stops
@@ -72,8 +58,21 @@ pub fn count_live_descendants(pid: libc::pid_t) -> usize {
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{DESCENDANT_WALK_DEPTH, MAX_VISITED_PIDS};
     use std::os::raw::c_void;
+
+    /// Bound on how many process-tree levels [`count_live_descendants`] walks
+    /// below the probed pid. Mirrors [`crate::worker_registry::ANCESTOR_WALK_DEPTH`]'s
+    /// choice of a small, generous-enough constant rather than an unbounded
+    /// walk — a worker's own descendant tree (shell → claude → subagent(s)) is
+    /// only ever a couple of levels deep in practice; this just guards against
+    /// a pathological tree turning a "cheap" sweep-time check into a long scan.
+    const DESCENDANT_WALK_DEPTH: usize = 8;
+
+    /// Hard cap on how many pids a single probe visits across the whole walk.
+    /// A real worker's descendant count is in the single digits; this bound
+    /// only ever protects against a runaway process tree (fork bomb, buggy
+    /// tool loop) making the probe itself expensive.
+    const MAX_VISITED_PIDS: usize = 512;
 
     unsafe extern "C" {
         fn proc_listchildpids(ppid: libc::pid_t, buffer: *mut c_void, buffersize: libc::c_int) -> libc::c_int;
