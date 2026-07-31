@@ -45,6 +45,7 @@ impl WorkerCompletionHandler {
             background_activity_probe: Arc::new(crate::background_children::NoopBackgroundActivityProbe),
             background_children_tracker: Arc::new(BackgroundNudgeTracker::new(Arc::new(BuildWaitTracker::new()))),
             background_children_horizon_secs: crate::background_children::DEFAULT_BACKGROUND_CHILDREN_HORIZON_SECS,
+            run_done_silence_tracker: Arc::new(BuildWaitTracker::new()),
             hold_registry: Arc::new(crate::hold_registry::HoldRegistry::new()),
             teardown_registry: Arc::new(crate::teardown_registry::TeardownRegistry::new()),
             max_review_cycles: crate::config::DEFAULT_MAX_REVIEW_CYCLES,
@@ -147,6 +148,15 @@ impl WorkerCompletionHandler {
     /// nudge/park flow deterministically; production uses the default.
     pub fn with_background_children_horizon_secs(mut self, horizon_secs: i64) -> Self {
         self.background_children_horizon_secs = horizon_secs;
+        self
+    }
+
+    /// Wire an externally-owned run-done silence tracker into this
+    /// handler. Tests use it to drive [`crate::run_done_backstop::decide`]
+    /// deterministically — seed it with a past `first_seen_epoch` to reach
+    /// the ask without waiting out a real horizon.
+    pub fn with_run_done_silence_tracker(mut self, tracker: Arc<BuildWaitTracker>) -> Self {
+        self.run_done_silence_tracker = tracker;
         self
     }
 

@@ -652,6 +652,12 @@ impl ExecutionRunner for PaneSpawnRunner {
         // follow-ups seam migration must move together.
         let followup_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
             && self.feature_flags.is_enabled("followup_proposals_seam");
+        // Mirrors `worker_signal_proposals_seam_enabled` above. This one is
+        // the seam where the two halves moving together matters most: gating
+        // the engine's completion path on a declaration the worker was never
+        // taught to make would hold every run to the run-done backstop.
+        let run_done_proposals_seam_enabled = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam");
         let ComposedWorkerSpawn {
             prompt_text,
             spawn_config,
@@ -662,13 +668,14 @@ impl ExecutionRunner for PaneSpawnRunner {
             work_item,
             workspace_path,
             cube_change_id,
-            WorkerSpawnOpts {
-                editorial_enabled,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled,
-                deferred_scope_proposals_seam_enabled,
-                followup_proposals_seam_enabled,
-            },
+            WorkerSpawnOpts::builder()
+                .editorial_enabled(editorial_enabled)
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
+                .deferred_scope_proposals_seam_enabled(deferred_scope_proposals_seam_enabled)
+                .followup_proposals_seam_enabled(followup_proposals_seam_enabled)
+                .run_done_proposals_seam_enabled(run_done_proposals_seam_enabled)
+                .build(),
         )
         .await
         // Every other fallible step below already names itself in its error

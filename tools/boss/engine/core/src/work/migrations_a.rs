@@ -98,6 +98,36 @@ pub(crate) fn migrate_work_executions_metadata_fix_columns(conn: &Connection) ->
     Ok(())
 }
 
+/// `run_done_declared_at` / `run_done_outcome` / `run_undeclared_at`: the
+/// durable record of whether this run's worker ever declared itself finished,
+/// and — when it did not and the engine ended the run anyway — that the ending
+/// was the backstop's, not the worker's.
+///
+/// `run_done_declared_at` + `run_done_outcome` are stamped by the
+/// `run_done` proposal applier
+/// ([`crate::work::proposal_apply`]) at submission time, so "the worker
+/// declared" is a durable fact on the execution row rather than something
+/// re-derived by scanning the proposal ledger on every read. `run_undeclared_at`
+/// is stamped by the backstop
+/// ([`crate::run_done_backstop`]) when it gives up waiting for a declaration
+/// that never came. The three columns together are what makes a
+/// declared completion distinguishable from a backstopped one in stored
+/// state: a declared run has the first two set and the third NULL, a
+/// backstopped run the reverse. All NULL on pre-migration rows and on any
+/// run still in flight. Idempotent.
+pub(crate) fn migrate_work_executions_run_done_columns(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "run_done_declared_at")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN run_done_declared_at TEXT", [])?;
+    }
+    if !work_executions_has_column(conn, "run_done_outcome")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN run_done_outcome TEXT", [])?;
+    }
+    if !work_executions_has_column(conn, "run_undeclared_at")? {
+        conn.execute("ALTER TABLE work_executions ADD COLUMN run_undeclared_at TEXT", [])?;
+    }
+    Ok(())
+}
+
 /// `pr_title_before`: the bound PR's title captured at the same moment as
 /// `pr_body_before` (execution start). Backs `boss pr body`, which returns
 /// both title and body so a worker doing read-modify-write on the

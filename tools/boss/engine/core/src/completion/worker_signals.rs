@@ -724,21 +724,81 @@ impl WorkerCompletionHandler {
         ))
     }
 
-    /// Whether the worker emitted the sanctioned [`NO_CHANGES_NEEDED`
-    /// marker](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) in its final
-    /// assistant prose — its unambiguous signal that the assigned work is
-    /// already done and there is genuinely nothing to commit/push/open a PR
-    /// for. Reads the run transcript (reusing the triage-marker reader) and
-    /// scans it for an own-line emission of the marker.
+    /// Whether the worker declared that its run had nothing to produce —
+    /// the "verified already done, nothing to commit/push/open a PR for"
+    /// claim that closes a task without a PR.
+    ///
+    /// Read proposals-first when `run_done_proposals_seam` is on: a
+    /// `run_done` proposal carrying
+    /// [`boss_protocol::RunDoneOutcome::NoChangesNeeded`] is the declaration
+    /// channel for this claim, and it is what makes the declaration cover
+    /// the execution kinds that never open a PR — the ones whose completion
+    /// the engine could otherwise only infer. When no such declaration
+    /// exists, the legacy [`NO_CHANGES_NEEDED`
+    /// marker](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER) scan still
+    /// runs exactly as before, and every time it carries the claim
+    /// `worker_proposals.fallback_hit.run_done` increments and a WARN logs
+    /// — this seam's exit criterion for eventually deleting the scan. With
+    /// the flag off the marker scan runs unconditionally and nothing is
+    /// counted.
+    ///
+    /// A `run_done` declaration with any *other* outcome is deliberately
+    /// not treated as a no-op claim, and does not suppress the marker
+    /// scan either: `delivered` and `blocked` say the opposite thing, and a
+    /// worker that declared one of those while also emitting the marker has
+    /// contradicted itself — in which case the marker (the narrower, more
+    /// specific claim) is still what this answers on, and the caller's own
+    /// evidence checks decide what to do with it.
     ///
     /// Returns `false` on any read failure or when no transcript is recorded
-    /// — absence of the marker must never be guessed at: a worker that
-    /// stopped without the explicit signal is treated as "gave up / not done"
-    /// and falls through to the normal produce-a-PR nudge.
+    /// — absence of the signal must never be guessed at: a worker that
+    /// stopped without it is treated as "gave up / not done" and falls
+    /// through to the normal produce-a-PR nudge.
     pub(super) async fn worker_signalled_no_op(&self, execution_id: &str) -> bool {
-        match self.read_final_triage_message(execution_id).await.into_message() {
+        let proposals_first = self.feature_flags.is_enabled("worker_proposals")
+            && self.feature_flags.is_enabled("run_done_proposals_seam");
+        if proposals_first {
+            match self.work_db.execution_run_done_outcome(execution_id) {
+                Ok(Some(boss_protocol::RunDoneOutcome::NoChangesNeeded)) => return true,
+                Ok(_) => {}
+                Err(err) => {
+                    // Fails open onto the legacy scan, like every other
+                    // proposals-first read here: a storage error must not
+                    // silently discard a real no-op claim.
+                    tracing::warn!(
+                        execution_id,
+                        ?err,
+                        seam = "run_done_proposals_seam",
+                        "failed to read the run_done declaration; falling back to the \
+                         NO_CHANGES_NEEDED marker scan for this claim",
+                    );
+                }
+            }
+        }
+        let signalled = match self.read_final_triage_message(execution_id).await.into_message() {
             Some(text) => crate::no_op_signal::transcript_signals_no_op(&text),
             None => false,
+        };
+        if proposals_first && signalled {
+            // Count once per Stop that the marker actually carried the
+            // claim. Unlike the marker-based seams above there is no
+            // "already filed" state to dedup against — this function is a
+            // pure predicate — so a long multi-turn run whose transcript
+            // keeps the marker can increment on several Stops. That
+            // over-counts rather than under-counts, which is the safe
+            // direction for a counter whose job is to say "the fallback is
+            // not quiet yet".
+            self.record_proposal_fallback_hit(
+                &match self.work_db.get_execution(execution_id) {
+                    Ok(execution) => execution,
+                    Err(_) => return signalled,
+                },
+                &RUN_DONE_FALLBACK_HIT,
+                "run_done_proposals_seam",
+                "run_done",
+                crate::no_op_signal::NO_CHANGES_NEEDED_MARKER,
+            );
         }
+        signalled
     }
 }

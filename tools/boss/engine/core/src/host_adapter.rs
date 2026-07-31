@@ -767,13 +767,23 @@ impl HostAdapter for SshHostAdapter {
             // counters' declaration in `completion.rs` before using them as
             // an exit criterion. Wire feature flags into the remote path
             // alongside the cross-host config work (PR3/PR4).
-            WorkerSpawnOpts {
-                editorial_enabled: false,
-                max_embed_diff_lines: self.cfg.work.max_review_embed_diff_lines,
-                worker_signal_proposals_seam_enabled: false,
-                deferred_scope_proposals_seam_enabled: false,
-                followup_proposals_seam_enabled: false,
-            },
+            //
+            // `run_done_proposals_seam` is the one seam where this hardcode
+            // is not merely a lost optimisation. The others degrade to "the
+            // legacy marker still works, and gets counted"; that one gates
+            // the engine's completion path on a verb the remote worker is
+            // never taught, so every remote run whose bound PR looks healthy
+            // would be held by `run_done_backstop` — held, asked, and
+            // eventually parked rather than finalized. Visible and
+            // recoverable rather than silent, but not the intended
+            // behaviour. Remote SSH execution has never worked end to end
+            // (see the design's remote-worker risk note), so no live run is
+            // affected today; wiring feature flags into the remote path
+            // MUST land before remote bring-up if that seam is on.
+            // Every seam flag is left at its builder default (`false`).
+            WorkerSpawnOpts::builder()
+                .max_embed_diff_lines(self.cfg.work.max_review_embed_diff_lines)
+                .build(),
         )
         .await?;
         // `compose_execution_prompt` decides the Bazel pre-push gate by
