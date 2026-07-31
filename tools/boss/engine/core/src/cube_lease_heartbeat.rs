@@ -1083,6 +1083,7 @@ async fn reap_and_release_lease(
         ctx.work_db,
         &execution.id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
+        crate::driver_teardown::TeardownReason::CubeLeaseAutoReap,
     )
     .await;
 

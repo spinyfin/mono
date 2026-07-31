@@ -258,6 +258,7 @@ pub async fn finalize_gone_execution(
                 work_db,
                 &execution.id,
                 execution.workspace_path.as_deref().map(Path::new),
+                crate::driver_teardown::TeardownReason::PaneLivenessReconcile,
             )
             .await;
         }

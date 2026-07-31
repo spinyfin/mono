@@ -79,13 +79,16 @@ impl WorkerCompletionHandler {
     /// `"pr_recheck"`, `"no_op"`, …) so a stall is attributable to a
     /// specific stage of a specific path instead of being inferred from
     /// the gap between two unrelated log lines — which is exactly how the
-    /// 388 s stall had to be measured.
+    /// 388 s stall had to be measured. It is `&'static str` because it is
+    /// also forwarded verbatim as
+    /// [`crate::driver_teardown::TeardownReason::Completion`]'s payload; every
+    /// caller already passes a literal (or a `&'static str` `source`).
     pub(super) async fn finish_worker_teardown(
         &self,
         execution_id: &str,
         lease_id: Option<&str>,
         workspace_path: Option<&Path>,
-        path: &str,
+        path: &'static str,
         guard: TeardownGuard,
     ) {
         let started = Instant::now();
@@ -95,7 +98,13 @@ impl WorkerCompletionHandler {
         let pane_ms = pane_started.elapsed().as_millis();
 
         let driver_started = Instant::now();
-        crate::driver_teardown::teardown_driver_workspace(&self.work_db, execution_id, workspace_path).await;
+        crate::driver_teardown::teardown_driver_workspace(
+            &self.work_db,
+            execution_id,
+            workspace_path,
+            crate::driver_teardown::TeardownReason::Completion(path),
+        )
+        .await;
         let driver_ms = driver_started.elapsed().as_millis();
 
         let cube_started = Instant::now();

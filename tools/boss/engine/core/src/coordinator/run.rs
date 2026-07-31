@@ -103,6 +103,7 @@ impl ExecutionCoordinator {
                             &self.work_db,
                             &execution.id,
                             cleared.workspace_path.as_deref().map(std::path::Path::new),
+                            crate::driver_teardown::TeardownReason::CancelledDuringSpawn,
                         )
                         .await;
                         match adapter.release_workspace(&cleared.lease_id).await {
@@ -245,6 +246,77 @@ impl ExecutionCoordinator {
                     .await;
             }
             Err(err) => {
+                // FIRST, before anything that can block or fail: say what
+                // went wrong, in the log and in the dispatch stream.
+                //
+                // Everything below this point — driver teardown, the cube
+                // release, `finish_execution_run` — is either slow (the cube
+                // release can run for minutes) or fallible (a cancel landing
+                // mid-release makes `finish_execution_run` reject the
+                // terminalizing write and take its `execution run failed` log
+                // line with it). Emitting here is what guarantees the abort
+                // reaches the log and the dispatch stream no matter what the
+                // tail does.
+                //
+                // `err` here is already a full anyhow chain naming the failing
+                // spawn step (prompt composition, driver provision, permission
+                // config, the initial-input script, or the `SpawnWorkerPane`
+                // send).
+                let err_detail = format!("{err:#}");
+                let slot_id = slot_id_from_worker_id(&worker_id);
+                // A `SlotBusy` rejection is a benign, self-healing engine/app
+                // desync (see the longer note at the `is_slot_busy` binding
+                // below), and it is common enough that logging it at ERROR
+                // would bury the genuine aborts this line exists to surface.
+                // Report it, but at WARN, and tag every abort with
+                // `slot_busy` so the two classes stay filterable either way.
+                let slot_busy = slot_busy_occupant(&err).is_some();
+                let abort_message = "spawn aborted: ExecutionRunner::run_execution returned an \
+                                     error before any pane existed; tearing down and releasing \
+                                     the workspace";
+                if slot_busy {
+                    tracing::warn!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        run_id = %run.id,
+                        worker_id = %worker_id,
+                        slot_id,
+                        slot_busy,
+                        cube_lease_id = %lease.lease_id,
+                        cube_workspace_id = %lease.workspace_id,
+                        error = %err_detail,
+                        "{abort_message}",
+                    );
+                } else {
+                    tracing::error!(
+                        execution_id = %execution.id,
+                        work_item_id = %execution.work_item_id,
+                        run_id = %run.id,
+                        worker_id = %worker_id,
+                        slot_id,
+                        slot_busy,
+                        cube_lease_id = %lease.lease_id,
+                        cube_workspace_id = %lease.workspace_id,
+                        error = %err_detail,
+                        "{abort_message}",
+                    );
+                }
+                self.dispatch_events
+                    .emit(
+                        DispatchEvent::new(Stage::SpawnFailed, DispatchOutcome::Error, &execution.id)
+                            .with_work_item(&execution.work_item_id)
+                            .with_worker(&worker_id)
+                            .with_cube_lease(&lease.lease_id)
+                            .with_cube_workspace(&lease.workspace_id)
+                            .with_error(&err)
+                            .with_details(serde_json::json!({
+                                "run_id": run.id,
+                                "slot_id": slot_id,
+                                "page": slot_id.and_then(worker_page_label),
+                            })),
+                    )
+                    .await;
+
                 // Pane-spawn-failure termination path: the run is
                 // unconditionally terminal from here (marked `failed`
                 // below regardless of whether the cube release below
@@ -258,6 +330,7 @@ impl ExecutionCoordinator {
                     &self.work_db,
                     &execution.id,
                     Some(&lease.workspace_path),
+                    crate::driver_teardown::TeardownReason::SpawnFailed,
                 )
                 .await;
                 let released = match adapter.release_workspace(&lease.lease_id).await {
@@ -287,7 +360,7 @@ impl ExecutionCoordinator {
                 // (rather than freed) so the very next dispatch pass
                 // doesn't just re-select the same bad slot and repeat the
                 // rejection — see the tail of this function.
-                let is_slot_busy = slot_busy_occupant(&err).is_some();
+                let is_slot_busy = slot_busy;
 
                 // Historical silent-release path: a pane-spawn
                 // failure (libghostty IPC drop, slot busy, prompt
@@ -298,7 +371,6 @@ impl ExecutionCoordinator {
                 // turns up in the kanban "Attention" lane and via
                 // `ListAttentionItems`. The structured event below
                 // gives tooling a parallel signal.
-                let err_detail = format!("{err:#}");
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
@@ -352,8 +424,8 @@ impl ExecutionCoordinator {
                         let mut error_details = serde_json::json!({
                             "run_id": run.id,
                             "released_workspace": released,
-                            "slot_id": slot_id_from_worker_id(&worker_id),
-                            "page": slot_id_from_worker_id(&worker_id).and_then(worker_page_label),
+                            "slot_id": slot_id,
+                            "page": slot_id.and_then(worker_page_label),
                         });
                         // A `SlotBusy` spawn rejection means the engine and
                         // the app disagree about slot occupancy — the
@@ -365,7 +437,7 @@ impl ExecutionCoordinator {
                         // husk pane by hand.
                         if let Some(occupying_run_id) = slot_busy_occupant(&err) {
                             error_details["slot_busy"] = serde_json::json!({
-                                "slot_id": slot_id_from_worker_id(&worker_id),
+                                "slot_id": slot_id,
                                 "occupying_run_id": occupying_run_id,
                             });
                         }
@@ -532,11 +604,27 @@ impl ExecutionCoordinator {
                         }
                     }
                     Err(record_err) => {
+                        // Double fault: the spawn failed AND the terminalizing
+                        // write was rejected (in the field: the row had been
+                        // cancelled during the minutes this arm spent in the
+                        // cube release, so `finish_execution_run` refused with
+                        // "cannot finish a run from status `cancelled`").
+                        //
+                        // Carry the original spawn error on this line too.
+                        // Without it, this arm was the one path where the
+                        // abort cause reached no log at all — the
+                        // `execution run failed` line that renders it lives in
+                        // the sibling `Ok` branch and never runs here. The
+                        // `spawn_failed` dispatch event emitted at the top of
+                        // this arm is the structured counterpart, and is
+                        // likewise unaffected by this failure.
                         tracing::error!(
                             ?record_err,
                             execution_id = %execution.id,
                             run_id = %run.id,
                             worker_id = %worker_id,
+                            spawn_error = %err_detail,
+                            released_workspace = released,
                             "failed to record execution run failure"
                         );
                     }
@@ -808,6 +896,7 @@ impl ExecutionCoordinator {
                 &self.work_db,
                 &execution.id,
                 Some(&lease.workspace_path),
+                crate::driver_teardown::TeardownReason::RunCompleted,
             )
             .await;
         }

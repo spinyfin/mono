@@ -569,6 +569,7 @@ pub(crate) async fn reap_never_started_spawn(
         ctx.work_db,
         execution_id,
         execution.workspace_path.as_deref().map(std::path::Path::new),
+        crate::driver_teardown::TeardownReason::SpawnAckTimeout,
     )
     .await;
 
