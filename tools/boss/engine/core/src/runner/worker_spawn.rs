@@ -372,15 +372,11 @@ pub(crate) async fn compose_worker_spawn(
     // into "no product": a genuine read failure must be loud, never
     // rendered as an empty preamble/guidance block.
     let product = work_db.get_product(work_item.product_id())?;
-    // `default_model` / `default_driver` / `editorial_rules` stay scoped to
-    // Task/Chore executions only — the same scope they had before this
-    // widened lookup. Those three drive dispatch decisions (which model,
-    // which driver, which PR-surface rules) for an ordinary work-item
-    // execution, and widening them to Product-/Project-scoped executions
-    // (e.g. `ProductDesign`) would silently change what model/driver a
-    // product-level run dispatches to — a behavior change this chore does
-    // not intend. Only `dispatch_preamble` and `design_guidance` are meant
-    // to reach every execution kind on the product.
+    // `default_model` / `default_driver` / `editorial_rules` apply only to
+    // Task/Chore executions. They determine the model, driver, and
+    // PR-surface rules for ordinary work-item executions; Product-/
+    // Project-scoped runs must not inherit them. Only `dispatch_preamble`
+    // and `design_guidance` reach every execution kind on the product.
     let is_task_or_chore = matches!(work_item, WorkItem::Task(_) | WorkItem::Chore(_));
     let product_editorial_rules = if is_task_or_chore {
         product.as_ref().and_then(|p| p.editorial_rules.clone())
@@ -1143,14 +1139,9 @@ mod compose_worker_spawn_tests {
         );
     }
 
-    /// A `Product`-scoped execution (e.g. `product_design`) picks up the
-    /// product's `dispatch_preamble` (widened to every execution kind), but
-    /// must NOT pick up `default_model` / `default_driver` /
-    /// `editorial_rules` — those stay scoped to Task/Chore executions only,
-    /// exactly as they were before `WorkItem::product_id()` replaced the
-    /// Task/Chore-only match in product derivation. A product-level run
-    /// dispatching on a different model/driver than before this widening
-    /// would be a silent, unstated behavior change.
+    /// A `Product`-scoped execution picks up the product's
+    /// `dispatch_preamble` but not its `default_model` / `default_driver` /
+    /// `editorial_rules`, which stay scoped to Task/Chore executions.
     #[tokio::test]
     async fn product_scoped_execution_gets_preamble_but_not_default_model_or_driver() {
         let workspace = TempDir::new().unwrap();
