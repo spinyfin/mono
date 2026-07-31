@@ -133,6 +133,16 @@ struct WorkBoardCardItem: View {
         let onMergeWhenReady: (() -> Void)? = snapshot.showsMergeWhenReady
             ? { model.mergeWhenReady(for: task) }
             : nil
+        let onRevealAIReviewFindings: (() -> Void)? = snapshot.aiReviewFindingsRevisionId.map { revisionID in
+            {
+                switch model.revealWorkCard(revisionID, productID: task.productID) {
+                case .revealed, .deferred:
+                    break
+                case .unreachable(let reason):
+                    model.workErrorMessage = "Couldn't reveal the review findings for \(task.name): \(reason)"
+                }
+            }
+        }
         let onOpenDesignDoc: (() -> Void)? = {
             guard snapshot.showsDesignDocAffordance else { return nil }
             if (task.kind == "design" || task.kind == "design_postmortem"),
@@ -183,6 +193,7 @@ struct WorkBoardCardItem: View {
                     },
                     onOpenTerminal: onOpenTerminal,
                     onMergeWhenReady: onMergeWhenReady,
+                    onRevealAIReviewFindings: onRevealAIReviewFindings,
                     onAcceptDeferredScope: { id in model.acceptDeferredScopeAttention(id: id) },
                     onCreateTaskFromDeferredScope: { id in
                         model.createTaskFromDeferredScopeAttention(attentionID: id)
@@ -370,6 +381,11 @@ struct WorkBoardCardView: View, @MainActor Equatable {
     /// Invoked after the user confirms "Merge When Ready". `nil` hides
     /// the button (also gated by `snapshot.showsMergeWhenReady`).
     var onMergeWhenReady: (() -> Void)? = nil
+    /// Invoked when the user taps the `reviewed_with_findings` AI-review
+    /// badge — reveals the follow-up revision carrying the review
+    /// comments. Only called when `snapshot.aiReviewFindingsRevisionId`
+    /// is non-nil.
+    var onRevealAIReviewFindings: (() -> Void)? = nil
     /// Invoked with an attention item id when the popup's "Accept" button
     /// is tapped.
     var onAcceptDeferredScope: ((String) -> Void)? = nil
@@ -410,6 +426,7 @@ struct WorkBoardCardView: View, @MainActor Equatable {
                 onDepBadgeHover: onDepBadgeHover,
                 onOpenTerminal: onOpenTerminal,
                 onMergeWhenReady: onMergeWhenReady,
+                onRevealAIReviewFindings: onRevealAIReviewFindings,
                 onAcceptDeferredScope: onAcceptDeferredScope,
                 onCreateTaskFromDeferredScope: onCreateTaskFromDeferredScope
             )

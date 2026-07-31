@@ -22,6 +22,21 @@ pub const REVIEW_GATE_OUTCOME_DROPPED_DUPLICATE_HEAD: &str = "dropped_duplicate_
 /// write via [`WorkDb::mark_review_verdict_revision_creation_failed`].
 pub const REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED: &str = "revision_creation_failed";
 
+/// Gate outcomes that represent a real completed judgement about a pass —
+/// the only ones the AI-review badge (`attach_ai_review_state`) will ever
+/// render as `"reviewed_with_findings"` / `"reviewed_all_clear"`.
+/// `gave_up` and `dropped_duplicate_head` are deliberately excluded: neither
+/// is positive evidence of anything (a give-up never produced a result; a
+/// dropped-duplicate pass reviewed a head an EARLIER, still-informative row
+/// already covers), so a badge resolver must skip past them and keep
+/// looking rather than surface either as if it were a completed verdict.
+/// See [`WorkDb::latest_informative_review_verdicts`].
+const INFORMATIVE_GATE_OUTCOMES: [&str; 3] = [
+    REVIEW_GATE_OUTCOME_COMPLETED_WITH_FINDINGS,
+    REVIEW_GATE_OUTCOME_COMPLETED_CLEAN,
+    REVIEW_GATE_OUTCOME_REVISION_CREATION_FAILED,
+];
+
 /// What [`crate::completion::WorkerCompletionHandler::finalize_pr_review_pass`]
 /// knows about a completed reviewer pass at the moment it calls
 /// [`WorkDb::record_worker_pr_completion`]. Written into `pr_review_verdicts`
@@ -201,4 +216,57 @@ impl WorkDb {
         .optional()
         .map_err(Into::into)
     }
+}
+
+/// Batched form of [`WorkDb::latest_review_verdict`], restricted to
+/// [`INFORMATIVE_GATE_OUTCOMES`], for every id in `work_item_ids` at once.
+/// Used by the AI-review badge resolver (`attach_ai_review_state`) so
+/// rendering a board of cards issues one query rather than one per row; a
+/// free function (rather than a `WorkDb` method) so that resolver — which
+/// runs inside `get_work_tree`'s already-open connection — can call it
+/// directly instead of opening a second one.
+///
+/// An id missing from the returned map has no informative verdict —
+/// callers MUST treat that as "not reviewed yet" (no badge), never infer a
+/// clean result from the absence.
+pub(crate) fn query_latest_informative_review_verdicts(
+    conn: &Connection,
+    work_item_ids: &[String],
+) -> Result<std::collections::HashMap<String, ReviewVerdict>> {
+    if work_item_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let id_placeholders = work_item_ids
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let outcome_placeholders = INFORMATIVE_GATE_OUTCOMES
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", work_item_ids.len() + i + 1))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id, execution_id, work_item_id, head_sha, findings_count,
+                revision_warranted, gate_outcome, revision_task_id, created_at
+         FROM pr_review_verdicts
+         WHERE work_item_id IN ({id_placeholders})
+           AND gate_outcome IN ({outcome_placeholders})
+         ORDER BY created_at ASC, id ASC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut params: Vec<&dyn rusqlite::ToSql> = work_item_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    params.extend(INFORMATIVE_GATE_OUTCOMES.iter().map(|o| o as &dyn rusqlite::ToSql));
+    let mut result = std::collections::HashMap::new();
+    for row in stmt.query_map(params.as_slice(), map_review_verdict)? {
+        let verdict = row?;
+        // Ascending order means a later row for the same work item
+        // overwrites an earlier one, leaving the most recent informative
+        // verdict per id — same "most recent wins" contract as
+        // `latest_review_verdict`.
+        result.insert(verdict.work_item_id.clone(), verdict);
+    }
+    Ok(result)
 }

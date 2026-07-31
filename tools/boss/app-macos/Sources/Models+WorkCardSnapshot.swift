@@ -167,7 +167,8 @@ struct WorkCardSnapshot: Equatable {
     let showsDeferredBadge: Bool
     let showsHumanDrivenBadge: Bool
     let showsProjectBadge: Bool
-    let showsAIReviewingBadge: Bool
+    let aiReviewState: String?
+    let aiReviewFindingsRevisionId: String?
     let showsResolvingConflictsBadge: Bool
     let showsResolvingCIBadge: Bool
     /// Precomputed `WorkBlockedBadge.badgeText` (nil collapses the chip).
@@ -377,7 +378,8 @@ struct WorkCardSnapshot: Equatable {
             showsDeferredBadge: task.deferred,
             showsHumanDrivenBadge: task.humanDriven,
             showsProjectBadge: projectNameNonEmpty,
-            showsAIReviewingBadge: task.aiReviewing && task.status == "active",
+            aiReviewState: task.aiReviewState,
+            aiReviewFindingsRevisionId: task.aiReviewFindingsRevisionId,
             showsResolvingConflictsBadge: showsResolvingConflicts,
             showsResolvingCIBadge: showsResolvingCI,
             blockedBadgeText: showsBlockedBadge ? blockedBadgeText : nil,

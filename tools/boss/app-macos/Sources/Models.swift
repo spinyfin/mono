@@ -177,6 +177,20 @@ struct WorkTask: Identifiable, Hashable {
     /// intentional. Mirrors `Task.ai_reviewing` on the wire; `false` when
     /// absent (older engines / tasks not undergoing an AI review pass).
     var aiReviewing: Bool = false
+    /// Resolved AI-review badge state: one of `"reviewing"`,
+    /// `"reviewed_with_findings"`, `"reviewed_all_clear"`, or
+    /// `"review_not_required"`. `nil` means "not reviewed yet" — render no
+    /// badge — and must never be treated as a clean result. Mirrors
+    /// `Task.ai_review_state` on the wire; engine-computed from the durable
+    /// `pr_review_verdicts` ledger, never from execution status.
+    var aiReviewState: String? = nil
+    /// The revision task that carries the review comments for
+    /// `aiReviewState == "reviewed_with_findings"`, when one was
+    /// successfully created. `nil` for every other state, and also `nil`
+    /// for `"reviewed_with_findings"` itself when revision creation failed
+    /// — there is nothing to reveal in that case. Mirrors
+    /// `Task.ai_review_findings_revision_id` on the wire.
+    var aiReviewFindingsRevisionId: String? = nil
     /// `true` when this is a Review-lane card waiting on the operator and
     /// nothing else: an open PR with no blocked pill, no `in revision`
     /// badge, all required CI checks green, and no merge conflict with the
