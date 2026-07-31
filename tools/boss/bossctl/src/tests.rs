@@ -238,12 +238,12 @@ fn format_dispatch_set_line_matches_existing_dispatch_pause_text() {
         paused: true,
         paused_since_epoch_s: Some(123),
         reviews_exempt: true,
-        reason: Some("the operator asked me to".to_string()),
+        reason: Some("investigating a spike in failed dispatch attempts".to_string()),
     };
     assert_eq!(
         pause::format_dispatch_set_line(&paused),
         "dispatch paused (since epoch 123) — PR reviews are exempt and keep dispatching — \
-         reason: the operator asked me to"
+         reason: investigating a spike in failed dispatch attempts"
     );
 
     let resumed = pause::DispatchPauseState {
@@ -275,12 +275,13 @@ fn format_automation_set_line_matches_existing_automation_pause_text() {
     let paused = pause::AutomationPauseState {
         paused: true,
         paused_since_epoch_s: Some(456),
-        reason: Some("the operator asked me to".to_string()),
+        reason: Some("investigating a spike in failed dispatch attempts".to_string()),
     };
     assert_eq!(
         pause::format_automation_set_line(&paused),
-        "automation paused (since epoch 456) — reason: the operator asked me to — new triage passes \
-         and automation-pool spawns are held; already-running automation workers finish normally"
+        "automation paused (since epoch 456) — reason: investigating a spike in failed dispatch \
+         attempts — new triage passes and automation-pool spawns are held; already-running \
+         automation workers finish normally"
     );
 
     let resumed = pause::AutomationPauseState {
@@ -335,12 +336,65 @@ fn points_per_hour_handles_zero_spend_over_a_real_span() {
     assert_eq!(points_per_hour(0, 3_600_000), Some(0.0));
 }
 
+// ── pause reason requirement ─────────────────────────────────────────────
+//
+// `--reason` must never be fabricated on a human's behalf: an operator, an
+// agent, and a script pausing all record the same string under the old
+// default, which destroys the one distinction the field exists to capture.
+// `dispatch pause`/`automation pause` enforce this declaratively via clap
+// (their `--reason` is a required `String`, not `Option<String>`); the
+// unified `bossctl pause` enforces it in `require_pause_reason` since its
+// clap field must stay optional for `bossctl pause state`.
+
 #[test]
-fn operator_pause_reason_falls_back_to_the_client_side_default_when_omitted() {
-    assert_eq!(pause::operator_pause_reason(None), pause::DEFAULT_OPERATOR_PAUSE_REASON);
+fn require_pause_reason_rejects_a_missing_reason() {
+    assert!(pause::require_pause_reason(None).is_err());
 }
 
 #[test]
-fn operator_pause_reason_passes_through_an_explicit_reason() {
-    assert_eq!(pause::operator_pause_reason(Some("disk full".to_owned())), "disk full");
+fn require_pause_reason_passes_through_an_explicit_reason() {
+    assert_eq!(
+        pause::require_pause_reason(Some("disk full".to_owned())).unwrap(),
+        "disk full"
+    );
+}
+
+#[test]
+fn dispatch_pause_fails_to_parse_without_reason() {
+    let result = Cli::try_parse_from(["bossctl", "dispatch", "pause"]);
+    assert!(
+        result.is_err(),
+        "omitting --reason must fail clap parsing, not silently pause with a fabricated reason"
+    );
+}
+
+#[test]
+fn dispatch_pause_parses_an_explicit_reason() {
+    let cli = Cli::try_parse_from(["bossctl", "dispatch", "pause", "--reason", "disk full"]).unwrap();
+    match cli.command {
+        Command::Dispatch {
+            action: DispatchAction::Pause { reason },
+        } => assert_eq!(reason, "disk full"),
+        other => panic!("expected DispatchAction::Pause, got {other:?}"),
+    }
+}
+
+#[test]
+fn automation_pause_fails_to_parse_without_reason() {
+    let result = Cli::try_parse_from(["bossctl", "automation", "pause"]);
+    assert!(
+        result.is_err(),
+        "omitting --reason must fail clap parsing, not silently pause with a fabricated reason"
+    );
+}
+
+#[test]
+fn automation_pause_parses_an_explicit_reason() {
+    let cli = Cli::try_parse_from(["bossctl", "automation", "pause", "--reason", "disk full"]).unwrap();
+    match cli.command {
+        Command::Automation {
+            action: AutomationAction::Pause { reason },
+        } => assert_eq!(reason, "disk full"),
+        other => panic!("expected AutomationAction::Pause, got {other:?}"),
+    }
 }

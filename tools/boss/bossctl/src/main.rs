@@ -152,9 +152,9 @@ enum Command {
         systems: Vec<PauseArg>,
         /// Why these systems are being paused. Applied identically to
         /// every system this call pauses — one reason per invocation, not
-        /// per system. Defaults to "the operator asked me to" when
-        /// omitted. Ignored (and need not be supplied) when the only
-        /// argument is `state`.
+        /// per system. Required to actually pause (fails with a
+        /// non-zero exit if omitted); not needed when the only argument
+        /// is `state`, since that verb only prints status.
         #[arg(long)]
         reason: Option<String>,
     },
@@ -438,10 +438,12 @@ enum DispatchAction {
     /// (the scope operators usually want), use `bossctl pause` (defaults
     /// to every system) or `bossctl pause dispatch automation`.
     Pause {
-        /// Why dispatch is being paused. Defaults to "the operator asked
-        /// me to" when omitted.
+        /// Why dispatch is being paused. Required — a pause with no
+        /// stated reason is worse than no reason field at all, since a
+        /// reader downstream cannot tell a fabricated value from a real
+        /// one.
         #[arg(long)]
-        reason: Option<String>,
+        reason: String,
     },
     /// Resume global dispatch. The engine immediately drains any executions
     /// that queued while paused and resumes normal dispatch. Idempotent —
@@ -526,10 +528,10 @@ enum AutomationAction {
     /// use `bossctl pause` (defaults to every system) or `bossctl pause
     /// dispatch automation`.
     Pause {
-        /// Why automation is being paused. Defaults to "the operator
-        /// asked me to" when omitted.
+        /// Why automation is being paused. Required — see `dispatch
+        /// pause`'s `--reason` doc for why omitting it is not allowed.
         #[arg(long)]
-        reason: Option<String>,
+        reason: String,
     },
     /// Resume automation-originated activity. The engine immediately
     /// drains any automation-pool executions that queued while paused and
@@ -1285,8 +1287,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 }
                 pause::unified_state(&cli.socket_path, cli.json).await
             } else {
+                let reason = pause::require_pause_reason(reason)?;
                 let targets = pause::pause_arg_targets(&systems);
-                let reason = pause::operator_pause_reason(reason);
                 pause::set_paused_for_systems(&cli.socket_path, cli.json, &targets, Some(reason)).await
             }
         }
@@ -1301,10 +1303,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::State => pause::unified_state(&cli.socket_path, cli.json).await,
         Command::Dispatch {
             action: DispatchAction::Pause { reason },
-        } => {
-            let reason = pause::operator_pause_reason(reason);
-            pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await
-        }
+        } => pause::dispatch_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
         Command::Dispatch {
             action: DispatchAction::Resume,
         } => pause::dispatch_set_paused(&cli.socket_path, cli.json, None).await,
@@ -1325,10 +1324,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         } => dispatch_concurrency(&cli.socket_path, cli.json, set).await,
         Command::Automation {
             action: AutomationAction::Pause { reason },
-        } => {
-            let reason = pause::operator_pause_reason(reason);
-            pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await
-        }
+        } => pause::automation_set_paused(&cli.socket_path, cli.json, Some(reason)).await,
         Command::Automation {
             action: AutomationAction::Resume,
         } => pause::automation_set_paused(&cli.socket_path, cli.json, None).await,

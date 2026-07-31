@@ -1883,10 +1883,10 @@ pub enum FrontendRequest {
     /// a missing or empty reason with [`FrontendEvent::WorkError`] rather
     /// than falling back to a default, so automation can never be paused
     /// anonymously. Ignored when `paused = false`; resuming always clears
-    /// any previously-stored reason. `bossctl automation pause` defaults
-    /// `--reason` to "the operator asked me to" for a human caller who
-    /// omits it — that default is applied client-side, never by the
-    /// engine.
+    /// any previously-stored reason. `bossctl automation pause` also
+    /// requires `--reason` client-side (clap rejects the invocation
+    /// outright when it is omitted) — no default is synthesized at
+    /// either layer.
     ///
     /// Independent of [`FrontendRequest::SetDispatchPaused`]: a dispatch
     /// pause already holds automation-pool *spawns* (automation rows are
@@ -1968,11 +1968,11 @@ pub enum FrontendRequest {
     /// [`crate::PauseReason`] enforces at the engine layer). Ignored when
     /// `paused = false`; resuming always clears any previously-stored
     /// reason, so a later pause never inherits a stale one. `bossctl
-    /// dispatch pause` defaults `--reason` to "the operator asked me to"
-    /// for a human caller who omits it — programmatic pausers (e.g. the
+    /// dispatch pause` also requires `--reason` client-side (clap rejects
+    /// the invocation outright when it is omitted) — no default is
+    /// synthesized at either layer. Programmatic pausers (e.g. the
     /// spawn-capability circuit breaker) always supply their own specific
-    /// reason instead; that default is applied client-side, never by the
-    /// engine.
+    /// reason.
     ///
     /// Independent of [`FrontendRequest::SetAutomationPaused`]: this pause
     /// already holds automation-pool executions from claiming a slot (they

@@ -604,7 +604,7 @@ mod pause_reason_tests {
 
     #[test]
     fn trims_and_accepts_a_real_reason() {
-        let reason = PauseReason::new("  the operator asked me to  ").unwrap();
-        assert_eq!(reason.as_str(), "the operator asked me to");
+        let reason = PauseReason::new("  investigating a spike in failed dispatch attempts  ").unwrap();
+        assert_eq!(reason.as_str(), "investigating a spike in failed dispatch attempts");
     }
 }

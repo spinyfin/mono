@@ -12,17 +12,17 @@ use boss_protocol::{FrontendEvent, FrontendRequest};
 
 use super::{PauseArg, PauseSystem, connect, resolve_state_root};
 
-/// Client-side default applied to `--reason` on a human pause verb
-/// (`bossctl pause`, `bossctl dispatch pause`, `bossctl automation pause`)
-/// when the operator omits it. Never sent as an engine-side fallback: the
-/// engine rejects a pause request with no reason at all — see
-/// [`FrontendRequest::SetDispatchPaused`].
-pub(super) const DEFAULT_OPERATOR_PAUSE_REASON: &str = "the operator asked me to";
-
-/// Fills in [`DEFAULT_OPERATOR_PAUSE_REASON`] when the operator omits
-/// `--reason` on a human pause verb; otherwise returns what they passed.
-pub(super) fn operator_pause_reason(reason: Option<String>) -> String {
-    reason.unwrap_or_else(|| DEFAULT_OPERATOR_PAUSE_REASON.to_owned())
+/// Require an operator-supplied `--reason` before `bossctl pause`
+/// actually pauses anything. `Command::Pause::reason` stays
+/// `Option<String>` in the clap struct (so `bossctl pause state`, which
+/// only prints status, doesn't need one), but every path that pauses a
+/// system genuinely requires a reason — this is where that requirement
+/// is enforced, with a clear non-zero-exit error naming the missing
+/// flag rather than a fabricated stand-in. `dispatch pause` and
+/// `automation pause` enforce the same requirement declaratively via
+/// clap instead, since their `--reason` is unconditionally required.
+pub(super) fn require_pause_reason(reason: Option<String>) -> Result<String> {
+    reason.ok_or_else(|| anyhow::anyhow!("--reason is required to pause (why are these systems being paused?)"))
 }
 
 /// Current dispatch-pause state as returned by
