@@ -23,7 +23,9 @@
 //! 2. appends one JSON line per invocation to
 //!    `$CODEX_HOME/`[`GUARD_TRACE_FILENAME`] — guard name, tool name,
 //!    decision, reason head,
-//! 3. re-emits the guard's own decision verbatim, and
+//! 3. **translates** that decision into the vocabulary Codex accepts — the
+//!    guards are written in Claude Code's dialect, which Codex refuses, and a
+//!    refused response is fail-open (see [`super::decision`]), and
 //! 4. **fails closed**: a guard that crashes, exceeds
 //!    `BOSS_GUARD_TIMEOUT_SECONDS`, exits non-zero or prints something that is
 //!    not a decision becomes a `block` with a loud reason, recorded as
@@ -105,8 +107,12 @@ pub fn guard_trace_path(codex_home: &Path) -> PathBuf {
 pub(super) const GUARD_TRACE_SHIM_SCRIPT: &str = r#"#!/usr/bin/env python3
 """Boss guard-trace shim for Codex PreToolUse hooks.
 
-Runs one Boss guard, records what it decided, and re-emits that decision. A
-guard that crashes, exits non-zero, or prints something that is not a decision
+Runs one Boss guard, records what it decided, and re-emits that decision *in
+Codex's own vocabulary*. Boss's guards speak Claude Code's hook dialect, which
+Codex refuses outright -- and a refused response is fail-open, so an untranslated
+`block` is a disarmed guard, not merely a noisy one. See `emit_decision`.
+
+A guard that crashes, exits non-zero, or prints something that is not a decision
 becomes a hard `block`: Codex treats a broken hook as approval, so the shim is
 what turns a broken guard into a loud refusal instead of a silent hole.
 
@@ -156,6 +162,37 @@ GUARD_ERROR = (
     "cannot answer is treated as a refusal, never as approval. Detail: {detail}"
 )
 
+# Substituted when a guard blocks without saying why. Codex rejects a block
+# whose reason is missing or empty, and a rejected response runs the tool call
+# anyway -- so an unexplained refusal would silently become an approval.
+BLOCK_WITHOUT_REASON = (
+    "Blocked by a Boss guard, which did not record a reason. Treat this as a "
+    "refusal and do not retry the call"
+)
+
+
+def emit_decision(decision, reason):
+    """Write one decision in Codex's PreToolUse dialect.
+
+    Codex's PreToolUse is deny-only. It has no affirmative allow token at all:
+    `decision:approve`, `decision:allow` and `permissionDecision:allow` are each
+    rejected, and a rejected response is fail-open -- Codex logs the hook as
+    failed and runs the call regardless. So the allow path here writes *nothing*,
+    which is the only thing Codex accepts as "proceed".
+
+    That also rules out re-emitting the guard's stdout verbatim. Claude's extra
+    fields are not merely ignored by Codex; `suppressOutput`, `stopReason` and
+    `continue:false` are named rejections, so passing them through converts a
+    decision into a hook failure.
+
+    A block must carry a non-empty reason for the same reason.
+    """
+    if decision in BLOCK_DECISIONS:
+        text = reason if isinstance(reason, str) else ""
+        if not text.strip():
+            text = BLOCK_WITHOUT_REASON
+        sys.stdout.write(json.dumps({"decision": "block", "reason": text}))
+
 
 def record(payload_text, decision, reason, exit_code, detail):
     """Append one line to the trace. Never raises: tracing must not break a hook."""
@@ -201,18 +238,21 @@ def classify(stdout):
     if not isinstance(parsed, dict):
         return None, "guard output was not a JSON object"
     decision = parsed.get("decision")
+    reason = parsed.get("reason")
     if not isinstance(decision, str):
         hook_output = parsed.get("hookSpecificOutput")
         if isinstance(hook_output, dict):
             decision = hook_output.get("permissionDecision")
+            # In this dialect the explanation travels under its own key. Without
+            # this the reason would be dropped and the block re-emitted with the
+            # generic fallback, losing what the guard actually objected to.
+            if not isinstance(reason, str):
+                reason = hook_output.get("permissionDecisionReason")
     if not isinstance(decision, str):
         return None, "guard output carried no decision field"
     lowered = decision.lower()
     if lowered in APPROVE_DECISIONS or lowered in BLOCK_DECISIONS:
-        reason = parsed.get("reason")
-        if not isinstance(reason, str):
-            reason = ""
-        return lowered, reason
+        return lowered, reason if isinstance(reason, str) else ""
     return None, "guard decision %r is not approve/block" % decision
 
 
@@ -222,7 +262,7 @@ def main():
         detail = "shim invoked with no guard path"
         message = GUARD_ERROR.format(guard="(unknown)", detail=detail)
         record("", "guard_error", message, None, detail)
-        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        emit_decision("block", message)
         return 0
 
     guard = sys.argv[1]
@@ -238,7 +278,7 @@ def main():
             detail = "guard bytes do not match the attested content hash (%s)" % digest
             message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
             record(payload_text, "guard_error", message, None, detail)
-            sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+            emit_decision("block", message)
             return 0
 
     command = [sys.executable, guard] if guard.endswith(".py") else [guard]
@@ -257,7 +297,7 @@ def main():
         detail = "guard timed out after %gs and was killed" % budget
         message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
         record(payload_text, "guard_error", message, None, detail)
-        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        emit_decision("block", message)
         return 0
     except Exception as error:
         stdout, stderr, code = "", str(error), None
@@ -269,13 +309,11 @@ def main():
             detail = "%s; stderr: %s" % (detail, stderr.strip()[:200])
         message = GUARD_ERROR.format(guard=os.path.basename(guard), detail=detail)
         record(payload_text, "guard_error", message, code, detail)
-        sys.stdout.write(json.dumps({"decision": "block", "reason": message}))
+        emit_decision("block", message)
         return 0
 
     record(payload_text, decision, reason_or_detail, code, None)
-    # Re-emit the guard's own output byte-for-byte: it may carry fields beyond
-    # `decision`/`reason` that Codex understands.
-    print(stdout, end="")
+    emit_decision(decision, reason_or_detail)
     return 0
 
 
@@ -326,7 +364,7 @@ pub(super) fn wrapper_body(
          guarded. A guard chain that cannot prove its own integrity is treated as a \
          refusal, never as approval. Report this to the operator."
     );
-    let decision = serde_json::json!({"decision": "block", "reason": message}).to_string();
+    let decision = super::decision::block_response(&message);
     let record = serde_json::json!({
         "guard": guard_name,
         "decision": "guard_error",
@@ -535,6 +573,7 @@ pub(super) fn render_summary(summary: &GuardTraceSummary) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::decision::{self, Verdict};
     use std::io::Write as _;
 
     /// `sha256:<hex>` of a file, mirroring what the driver bakes into the
@@ -557,8 +596,12 @@ mod tests {
     }
 
     /// Materialise the shim plus a stub guard, run it, and return
-    /// (stdout decision, trace lines).
-    fn run_shim(tag: &str, guard_body: &str, payload: &str) -> (serde_json::Value, Vec<serde_json::Value>) {
+    /// (what Codex would do with the shim's stdout, trace lines).
+    ///
+    /// The verdict — rather than the raw bytes — is what these tests assert on:
+    /// the question is never "what did Boss print?" but "does the agent accept
+    /// it?". Asserting on the literal is what let the `approve` bug ship.
+    fn run_shim(tag: &str, guard_body: &str, payload: &str) -> (Verdict, Vec<serde_json::Value>) {
         run_shim_with_env(tag, guard_body, payload, &[])
     }
 
@@ -568,7 +611,7 @@ mod tests {
         guard_body: &str,
         payload: &str,
         extra_env: &[(&str, &str)],
-    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+    ) -> (Verdict, Vec<serde_json::Value>) {
         let dir = temp_dir(tag);
         let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
         std::fs::write(&shim, GUARD_TRACE_SHIM_SCRIPT).unwrap();
@@ -596,31 +639,44 @@ mod tests {
         drop(child.stdin.take());
         let out = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
-            panic!(
-                "shim produced invalid JSON: {err}\nstdout={stdout}\nstderr={}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        });
+        let verdict = decision::verdict(&stdout);
+        assert!(
+            !matches!(verdict, Verdict::Rejected(_)),
+            "the shim emitted something Codex refuses ({verdict:?}), which fails open and runs \
+             the tool call anyway\nstdout={stdout:?}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let lines = std::fs::read_to_string(&trace)
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
             .collect();
-        (decision, lines)
+        (verdict, lines)
+    }
+
+    /// The reason text of a [`Verdict::Block`], or a panic naming what came
+    /// back instead.
+    fn block_reason(verdict: &Verdict) -> &str {
+        match verdict {
+            Verdict::Block(reason) => reason,
+            other => panic!("expected a block Codex accepts, got {other:?}"),
+        }
     }
 
     const PAYLOAD: &str = r#"{"tool_name":"Bash","session_id":"sess-1","tool_input":{"command":"echo hi"}}"#;
 
     #[test]
-    fn approval_is_passed_through_and_recorded() {
-        let (decision, lines) = run_shim(
+    fn a_claude_dialect_approval_becomes_the_silence_codex_accepts() {
+        // The shipped bug: the guards emit Claude's `approve`, the shim used to
+        // re-emit it verbatim, and Codex refused it on every single tool call.
+        // Codex has no allow token, so an accepted approval is an empty stdout.
+        let (verdict, lines) = run_shim(
             "approve",
             "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
             PAYLOAD,
         );
-        assert_eq!(decision["decision"], "approve");
+        assert_eq!(verdict, Verdict::Allow);
         assert_eq!(lines.len(), 1, "one invocation must be recorded");
         assert_eq!(lines[0]["decision"], "approve");
         assert_eq!(lines[0]["tool"], "Bash");
@@ -630,13 +686,12 @@ mod tests {
 
     #[test]
     fn block_reason_is_preserved_verbatim() {
-        let (decision, lines) = run_shim(
+        let (verdict, lines) = run_shim(
             "block",
             "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'block','reason':'nope'}))\n",
             PAYLOAD,
         );
-        assert_eq!(decision["decision"], "block");
-        assert_eq!(decision["reason"], "nope");
+        assert_eq!(block_reason(&verdict), "nope");
         assert_eq!(lines[0]["decision"], "block");
         assert_eq!(lines[0]["reason"], "nope");
     }
@@ -645,26 +700,25 @@ mod tests {
     fn crashing_guard_becomes_a_block_not_an_approval() {
         // The whole point: Codex treats a broken hook as approval. The shim
         // must convert that into a refusal and say so.
-        let (decision, lines) = run_shim("crash", "import sys\nsys.stdin.read()\nraise SystemExit(3)\n", PAYLOAD);
-        assert_eq!(decision["decision"], "block");
+        let (verdict, lines) = run_shim("crash", "import sys\nsys.stdin.read()\nraise SystemExit(3)\n", PAYLOAD);
         assert!(
-            decision["reason"].as_str().unwrap().contains("fail-closed"),
-            "reason must be explicit about failing closed: {decision}"
+            block_reason(&verdict).contains("fail-closed"),
+            "reason must be explicit about failing closed: {verdict:?}"
         );
         assert_eq!(lines[0]["decision"], "guard_error");
     }
 
     #[test]
     fn guard_printing_garbage_becomes_a_block() {
-        let (decision, lines) = run_shim("garbage", "import sys\nsys.stdin.read()\nprint('not json')\n", PAYLOAD);
-        assert_eq!(decision["decision"], "block");
+        let (verdict, lines) = run_shim("garbage", "import sys\nsys.stdin.read()\nprint('not json')\n", PAYLOAD);
+        assert!(matches!(verdict, Verdict::Block(_)), "{verdict:?}");
         assert_eq!(lines[0]["decision"], "guard_error");
     }
 
     #[test]
     fn silent_guard_becomes_a_block() {
-        let (decision, lines) = run_shim("silent", "import sys\nsys.stdin.read()\n", PAYLOAD);
-        assert_eq!(decision["decision"], "block");
+        let (verdict, lines) = run_shim("silent", "import sys\nsys.stdin.read()\n", PAYLOAD);
+        assert!(matches!(verdict, Verdict::Block(_)), "{verdict:?}");
         assert_eq!(lines[0]["decision"], "guard_error");
     }
 
@@ -673,14 +727,13 @@ mod tests {
         // A guard that never answers is the same silent fail-open as one that
         // crashes: Codex's own hook timeout would treat it as absent. The shim
         // has to be what decides, on its own budget.
-        let (decision, lines) = run_shim_with_env(
+        let (verdict, lines) = run_shim_with_env(
             "timeout",
             "import sys,time\nsys.stdin.read()\ntime.sleep(30)\n",
             PAYLOAD,
             &[("BOSS_GUARD_TIMEOUT_SECONDS", "1")],
         );
-        assert_eq!(decision["decision"], "block");
-        let reason = decision["reason"].as_str().unwrap();
+        let reason = block_reason(&verdict);
         assert!(reason.contains("timed out"), "reason must name the timeout: {reason}");
         assert_eq!(lines[0]["decision"], "guard_error");
         assert!(
@@ -693,24 +746,96 @@ mod tests {
     #[test]
     fn an_unparseable_timeout_override_falls_back_to_the_default_budget() {
         // A malformed override must not disable the budget or wedge the guard.
-        let (decision, _) = run_shim_with_env(
+        let (verdict, _) = run_shim_with_env(
             "timeout-bad-env",
             "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'approve'}))\n",
             PAYLOAD,
             &[("BOSS_GUARD_TIMEOUT_SECONDS", "not-a-number")],
         );
-        assert_eq!(decision["decision"], "approve");
+        assert_eq!(verdict, Verdict::Allow);
     }
 
     #[test]
-    fn hook_specific_output_dialect_is_understood() {
-        let (decision, lines) = run_shim(
+    fn hook_specific_output_dialect_is_translated_and_keeps_its_reason() {
+        // `decision:deny` is *not* a synonym for `block` to Codex -- it is a
+        // rejection, so passing this dialect through unchanged would fail open.
+        // The reason lives under its own key in this dialect and must survive.
+        let (verdict, lines) = run_shim(
             "dialect",
-            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'hookSpecificOutput':{'permissionDecision':'deny'}}))\n",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'hookSpecificOutput':{'permissionDecision':'deny','permissionDecisionReason':'not allowed here'}}))\n",
             PAYLOAD,
         );
-        assert_eq!(decision["hookSpecificOutput"]["permissionDecision"], "deny");
-        assert_eq!(lines[0]["decision"], "deny");
+        assert_eq!(block_reason(&verdict), "not allowed here");
+        assert_eq!(lines[0]["decision"], "deny", "the trace keeps the guard's own word");
+    }
+
+    /// The regression test for the shipped bug, stated as the property that was
+    /// never checked: whatever a Boss guard says, Codex must *accept* what the
+    /// shim emits on its behalf. Every dialect below is one a guard in this repo
+    /// can produce — the Claude-native `approve`/`block` the shared path and
+    /// checkleft guards emit, and the `hookSpecificOutput` forms.
+    ///
+    /// Before the translation, the first four rows all made Codex log
+    /// `PreToolUse hook returned unsupported …` and run the tool call anyway.
+    #[test]
+    fn every_dialect_a_boss_guard_emits_is_one_codex_accepts() {
+        let cases: &[(&str, &str, bool)] = &[
+            ("approve", r#"{'decision':'approve'}"#, false),
+            ("allow", r#"{'decision':'allow'}"#, false),
+            (
+                "perm-allow",
+                r#"{'hookSpecificOutput':{'hookEventName':'PreToolUse','permissionDecision':'allow'}}"#,
+                false,
+            ),
+            ("deny-word", r#"{'decision':'deny','reason':'no'}"#, true),
+            ("block", r#"{'decision':'block','reason':'no'}"#, true),
+            (
+                "perm-deny",
+                r#"{'hookSpecificOutput':{'permissionDecision':'deny','permissionDecisionReason':'no'}}"#,
+                true,
+            ),
+        ];
+        for (tag, emitted, expect_block) in cases {
+            let body = format!("import json,sys\nsys.stdin.read()\nprint(json.dumps({emitted}))\n");
+            // run_shim already fails the test if Codex would reject the output.
+            let (verdict, _) = run_shim(&format!("dialect-{tag}"), &body, PAYLOAD);
+            if *expect_block {
+                assert!(
+                    matches!(verdict, Verdict::Block(_)),
+                    "{tag}: a refusing guard must still refuse after translation, got {verdict:?}"
+                );
+            } else {
+                assert_eq!(
+                    verdict,
+                    Verdict::Allow,
+                    "{tag}: an approving guard must let the call run"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_guard_that_blocks_without_saying_why_still_blocks() {
+        // Codex rejects a reasonless block, and a rejected response runs the
+        // call — so passing the guard's silence through would quietly disarm it.
+        // The shim substitutes a reason rather than emitting one Codex discards.
+        //
+        // Asserting equality with the Rust constant, not merely non-emptiness,
+        // is what binds the shim's `BLOCK_WITHOUT_REASON` to
+        // `decision::BLOCK_WITHOUT_REASON`: the two copies live in different
+        // languages, and without this a worker would see different refusal text
+        // depending on which layer produced the block.
+        let (verdict, lines) = run_shim(
+            "block-no-reason",
+            "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'block'}))\n",
+            PAYLOAD,
+        );
+        assert_eq!(
+            block_reason(&verdict),
+            decision::BLOCK_WITHOUT_REASON,
+            "the shim's substituted reason must match the Rust-side constant"
+        );
+        assert_eq!(lines[0]["decision"], "block");
     }
 
     #[test]
@@ -746,11 +871,10 @@ mod tests {
         child.stdin.as_mut().unwrap().write_all(PAYLOAD.as_bytes()).unwrap();
         drop(child.stdin.take());
         let out = child.wait_with_output().unwrap();
-        let decision: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
-        assert_eq!(decision["decision"], "block");
+        let verdict = decision::verdict(&String::from_utf8_lossy(&out.stdout));
         assert!(
-            decision["reason"].as_str().unwrap().contains("content hash"),
-            "reason must name the content-hash mismatch: {decision}"
+            block_reason(&verdict).contains("content hash"),
+            "reason must name the content-hash mismatch: {verdict:?}"
         );
         let recorded = std::fs::read_to_string(&trace).unwrap();
         assert!(recorded.contains("guard_error"), "{recorded}");
@@ -900,7 +1024,7 @@ mod tests {
     ///
     /// `shim_body` of `None` removes the shim entirely, so its digest cannot be
     /// computed at all.
-    fn run_wrapper(tag: &str, shim_body: Option<&str>) -> (serde_json::Value, Vec<serde_json::Value>) {
+    fn run_wrapper(tag: &str, shim_body: Option<&str>) -> (Verdict, Vec<serde_json::Value>) {
         let dir = temp_dir(tag);
         let shim = dir.join(GUARD_TRACE_SHIM_FILENAME);
         // Hash the *real* shim, then materialise whatever body the test wants:
@@ -945,25 +1069,25 @@ mod tests {
         drop(child.stdin.take());
         let out = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|err| {
-            panic!(
-                "wrapper produced invalid JSON: {err}\nstdout={stdout}\nstderr={}",
-                String::from_utf8_lossy(&out.stderr)
-            )
-        });
+        let verdict = decision::verdict(&stdout);
+        assert!(
+            !matches!(verdict, Verdict::Rejected(_)),
+            "the wrapper emitted something Codex refuses ({verdict:?}), which fails open\nstdout={stdout:?}\nstderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let lines = std::fs::read_to_string(&trace)
             .unwrap_or_default()
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| serde_json::from_str(line).expect("trace line must be JSON"))
             .collect();
-        (decision, lines)
+        (verdict, lines)
     }
 
     #[test]
     fn the_wrapper_runs_the_guard_when_the_shim_matches_its_hash() {
-        let (decision, lines) = run_wrapper("wrapper-ok", Some(GUARD_TRACE_SHIM_SCRIPT));
-        assert_eq!(decision["decision"], "approve");
+        let (verdict, lines) = run_wrapper("wrapper-ok", Some(GUARD_TRACE_SHIM_SCRIPT));
+        assert_eq!(verdict, Verdict::Allow);
         assert_eq!(lines.len(), 1, "the shim must still have recorded the invocation");
         assert_eq!(lines[0]["decision"], "approve");
     }
@@ -975,12 +1099,11 @@ mod tests {
         // bytes. Swapping it for a blanket approve would disarm every guard
         // with both hashes still valid, so the wrapper -- which *is* bound --
         // verifies the shim before exec'ing it.
-        let (decision, lines) = run_wrapper(
+        let (verdict, lines) = run_wrapper(
             "wrapper-tampered",
             Some("import sys\nsys.stdin.read()\nprint('{\"decision\":\"approve\"}')\n"),
         );
-        assert_eq!(decision["decision"], "block");
-        let reason = decision["reason"].as_str().unwrap();
+        let reason = block_reason(&verdict);
         assert!(
             reason.contains("shim") && reason.contains("content hash"),
             "reason must name the shim hash mismatch: {reason}"
@@ -994,7 +1117,7 @@ mod tests {
     fn a_missing_shim_blocks_too() {
         // A shim whose digest cannot be computed is an unverified shim, and the
         // wrapper must not fall through to running it.
-        let (decision, _) = run_wrapper("wrapper-missing-shim", None);
-        assert_eq!(decision["decision"], "block");
+        let (verdict, _) = run_wrapper("wrapper-missing-shim", None);
+        assert!(matches!(verdict, Verdict::Block(_)), "{verdict:?}");
     }
 }

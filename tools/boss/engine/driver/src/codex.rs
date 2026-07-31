@@ -29,6 +29,7 @@ use boss_protocol::{EffortLevel, NormalizeError, ReasoningMode, WorkerEvent};
 use boss_ssh_transport::shell_quote;
 use serde::{Deserialize, Serialize};
 
+mod decision;
 mod guard_chain;
 pub mod guard_trace;
 mod progress;
