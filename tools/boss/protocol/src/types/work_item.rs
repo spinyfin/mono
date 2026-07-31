@@ -181,6 +181,12 @@ pub struct WorkItemPatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_preamble: Option<String>,
 
+    /// Product-level design guidance, injected only into the design-family
+    /// prompt directive. Only honoured on product-targeted updates. `None` →
+    /// leave unchanged. `Some("")` → clear. See [`Product::design_guidance`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_guidance: Option<String>,
+
     /// Product-level investigation-task ("docs") repo override. Only
     /// honoured on product-targeted updates; ignored when patching a
     /// task / chore / project. `None` → leave unchanged. `Some("")` →

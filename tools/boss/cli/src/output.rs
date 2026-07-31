@@ -367,6 +367,9 @@ pub(crate) fn print_product_details(title: &str, product: &Product) {
     if let Some(preamble) = product.dispatch_preamble.as_deref() {
         println!("Dispatch preamble: {preamble}");
     }
+    if let Some(guidance) = product.design_guidance.as_deref() {
+        println!("Design guidance: {guidance}");
+    }
     if let Some(rules) = product.editorial_rules.as_ref() {
         println!("Editorial rules:");
         let branch_str = match &rules.branch_naming {

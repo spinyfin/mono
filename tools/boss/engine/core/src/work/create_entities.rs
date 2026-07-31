@@ -77,7 +77,7 @@ impl WorkDb {
     pub fn list_products(&self) -> Result<Vec<Product>> {
         let conn = self.connect()?;
         let mut stmt = conn.prepare(
-            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix, editorial_rules, default_driver, merge_mechanism
+            "SELECT id, name, slug, description, repo_remote_url, status, created_at, updated_at, default_model, dispatch_preamble, external_tracker_kind, external_tracker_config, design_repo, docs_repo, worker_branch_prefix, editorial_rules, default_driver, merge_mechanism, design_guidance
              FROM products
              ORDER BY name COLLATE NOCASE ASC",
         )?;

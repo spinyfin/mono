@@ -122,6 +122,7 @@ impl WorkDb {
                 default_driver TEXT,
                 ci_attempt_budget INTEGER NOT NULL DEFAULT 3,
                 dispatch_preamble TEXT,
+                design_guidance TEXT,
                 external_tracker_kind TEXT,
                 external_tracker_config TEXT,
                 design_repo TEXT,
@@ -755,6 +756,11 @@ impl WorkDb {
         // otherwise reject any still-corrupt row.
         migrate_repair_invalid_project_status(conn)?;
         migrate_projects_tasks_status_check(conn)?;
+        // `products.design_guidance`: kind-scoped design-directive guidance,
+        // distinct from `dispatch_preamble` (every kind) and
+        // `editorial_rules.instructions` (GitHub-visible surfaces only) — see
+        // `migrate_products_design_guidance`'s doc comment.
+        migrate_products_design_guidance(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

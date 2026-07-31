@@ -1927,6 +1927,13 @@ pub(crate) struct ProductUpdateArgs {
     #[arg(long)]
     pub(crate) dispatch_preamble: Option<String>,
 
+    /// Markdown guidance injected into the `[product-design-guidance]…[/product-design-guidance]`
+    /// block of the design-task prompt directive only — unlike
+    /// `--dispatch-preamble`, it never reaches other execution kinds on this
+    /// product. Pass `""` to clear an existing value.
+    #[arg(long = "design-guidance")]
+    pub(crate) design_guidance: Option<String>,
+
     /// Set or clear the leading prefix for worker branch names. Pass a
     /// prefix to set it (e.g. `bduff/`), `""` to clear (→ engine
     /// default `boss/`), or omit to leave unchanged. A trailing `/` is

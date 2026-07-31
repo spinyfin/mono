@@ -139,6 +139,19 @@ pub struct Product {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_preamble: Option<String>,
 
+    /// Optional markdown guidance injected into the `[product-design-guidance]`
+    /// block of the `kind = 'design'` / `kind = 'design_postmortem'` prompt
+    /// directive only — unlike [`Self::dispatch_preamble`], it never reaches
+    /// any other execution kind on this product. `None` / empty → today's
+    /// behaviour (no injection). Intended for per-product design-doc
+    /// conventions (house style, required sections, prior-art pointers) that
+    /// only a design worker needs to see. See
+    /// `editorial-controls-for-agent-authored-prs-and-github-comments.md` R11
+    /// for why this is a separate, kind-scoped surface rather than folded
+    /// into `dispatch_preamble` or `editorial_rules`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design_guidance: Option<String>,
+
     /// Optional repo where `kind = 'investigation'` task deliverables
     /// (markdown docs) are filed. When set, investigation workers open
     /// PRs against this repo instead of the user-level fallback

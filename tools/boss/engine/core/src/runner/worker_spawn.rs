@@ -363,43 +363,40 @@ pub(crate) async fn compose_worker_spawn(
         None
     };
     // Fetch the product before composing the prompt so we can pass
-    // editorial_rules and the PR template set into compose_execution_prompt.
-    let (
-        product_editorial_rules,
-        row_effort,
-        row_model_override,
-        product_default_model,
-        product_dispatch_preamble,
-        row_driver,
-        product_default_driver,
-        allocated_driver,
-        row_reasoning,
-    ) = match work_item {
-        WorkItem::Task(task) | WorkItem::Chore(task) => {
-            let product = work_db.get_product(&task.product_id).ok().flatten();
-            let editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
-            let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
-            let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
-            let dispatch_preamble = product.and_then(|p| p.dispatch_preamble).filter(|s| !s.is_empty());
-            let allocated_driver = work_db
-                .get_execution_driver_decision(&execution.id)
-                .ok()
-                .flatten()
-                .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
-                .and_then(|decision| decision.driver);
-            (
-                editorial_rules,
-                task.effort_level,
-                task.model_override.clone(),
-                product_default_model,
-                dispatch_preamble,
-                task.driver.clone(),
-                product_default_driver,
-                allocated_driver,
-                task.reasoning,
-            )
-        }
-        _ => (None, None, None, None, None, None, None, None, None),
+    // editorial_rules, dispatch_preamble, and design_guidance into
+    // compose_execution_prompt. Derived via `WorkItem::product_id()` — which
+    // covers every variant, not just Task/Chore — so a `ProductDesign`
+    // execution (whose work item IS the product) resolves its own product
+    // row instead of silently losing it to a `_ => None` fallthrough. A DB
+    // error reading the row propagates via `?` rather than being swallowed
+    // into "no product": a genuine read failure must be loud, never
+    // rendered as an empty preamble/guidance block.
+    let product = work_db.get_product(work_item.product_id())?;
+    let product_editorial_rules = product.as_ref().and_then(|p| p.editorial_rules.clone());
+    let product_default_model = product.as_ref().and_then(|p| p.default_model.clone());
+    let product_default_driver = product.as_ref().and_then(|p| p.default_driver.clone());
+    let allocated_driver = work_db
+        .get_execution_driver_decision(&execution.id)
+        .ok()
+        .flatten()
+        .filter(|decision| matches!(decision.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+        .and_then(|decision| decision.driver);
+    let product_dispatch_preamble = product
+        .as_ref()
+        .and_then(|p| p.dispatch_preamble.clone())
+        .filter(|s| !s.is_empty());
+    let product_design_guidance = product
+        .as_ref()
+        .and_then(|p| p.design_guidance.clone())
+        .filter(|s| !s.is_empty());
+    let (row_effort, row_model_override, row_driver, row_reasoning) = match work_item {
+        WorkItem::Task(task) | WorkItem::Chore(task) => (
+            task.effort_level,
+            task.model_override.clone(),
+            task.driver.clone(),
+            task.reasoning,
+        ),
+        _ => (None, None, None, None),
     };
     // Load the PR template for editorial-rules prompt injection.
     let pr_template_product_id = match work_item {
@@ -487,6 +484,7 @@ pub(crate) async fn compose_worker_spawn(
                         .maybe_conflict_attempt(conflict_attempt.as_ref())
                         .maybe_ci_attempt(ci_attempt.as_ref())
                         .maybe_editorial_rules(product_editorial_rules.as_ref())
+                        .maybe_design_guidance(product_design_guidance.as_deref())
                         .pr_template_set(&pr_template_set)
                         .editorial_enabled(editorial_enabled)
                         .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
@@ -520,6 +518,7 @@ pub(crate) async fn compose_worker_spawn(
                     .maybe_conflict_attempt(conflict_attempt.as_ref())
                     .maybe_ci_attempt(ci_attempt.as_ref())
                     .maybe_editorial_rules(product_editorial_rules.as_ref())
+                    .maybe_design_guidance(product_design_guidance.as_deref())
                     .pr_template_set(&pr_template_set)
                     .editorial_enabled(editorial_enabled)
                     .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)
@@ -641,6 +640,7 @@ pub(crate) async fn compose_worker_spawn(
                 .maybe_conflict_attempt(conflict_attempt.as_ref())
                 .maybe_ci_attempt(ci_attempt.as_ref())
                 .maybe_editorial_rules(product_editorial_rules.as_ref())
+                .maybe_design_guidance(product_design_guidance.as_deref())
                 .pr_template_set(&pr_template_set)
                 .editorial_enabled(editorial_enabled)
                 .worker_signal_proposals_seam_enabled(worker_signal_proposals_seam_enabled)

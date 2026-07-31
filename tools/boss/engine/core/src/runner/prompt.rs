@@ -28,6 +28,14 @@ pub(super) struct ExecutionPromptParams<'a> {
     conflict_attempt: Option<&'a ConflictResolution>,
     ci_attempt: Option<&'a CiRemediation>,
     editorial_rules: Option<&'a EditorialRules>,
+    /// `products.design_guidance` — markdown injected into the
+    /// `[product-design-guidance]` block of the design-family directive
+    /// only (`compose_design_directive` / `compose_design_postmortem_directive`).
+    /// `None` / empty → no block, today's behaviour. Distinct from
+    /// `editorial_rules` (GitHub-visible-surface rules, every kind) and
+    /// `dispatch_preamble` (every kind, rendered outside this builder
+    /// entirely — see `worker_spawn.rs`).
+    design_guidance: Option<&'a str>,
     pr_template_set: &'a crate::pr_template::PrTemplateSet,
     #[builder(default)]
     editorial_enabled: bool,
@@ -300,6 +308,7 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
         conflict_attempt,
         ci_attempt,
         editorial_rules,
+        design_guidance,
         pr_template_set,
         editorial_enabled,
         worker_signal_proposals_seam_enabled,
@@ -458,9 +467,10 @@ pub(super) fn compose_execution_prompt(params: ExecutionPromptParams<'_>) -> Str
                         &execution.id,
                         StructuredOutputKind::PostmortemFollowups,
                     ),
+                    design_guidance,
                 ));
             } else {
-                prompt.push_str(&compose_design_directive(parent_project));
+                prompt.push_str(&compose_design_directive(parent_project, design_guidance));
             }
         }
         ExecutionKind::InvestigationImplementation => {
