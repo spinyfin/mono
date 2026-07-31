@@ -63,6 +63,12 @@ extension ChatViewModel {
             isAppSessionRegistered = true
             maybeRegisterBossSession()
             engine.sendRegisterCapabilities(capabilityIds: CapabilityRegistry.shared.all)
+            // The engine drops the recorded selection on every app-session
+            // registration (it belongs to the app session that reported it),
+            // so re-report the current one here. Without this, `bossctl
+            // selected-product` would answer `no_selection` after every
+            // reconnect until the operator happened to switch products.
+            reportSelectedProductToEngine()
         case .bossSessionRegistered:
             break
         case .engineRequest(let requestId, let request):

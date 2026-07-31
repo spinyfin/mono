@@ -2020,3 +2020,88 @@ fn reasoning_default_is_derived_from_kind_then_effort_and_is_standard_otherwise(
         }
     }
 }
+
+#[test]
+fn selected_product_state_roundtrips_under_its_status_tag() {
+    let cases = [
+        (
+            SelectedProductState::Selected {
+                product_id: "prod_1".into(),
+                name: "Flunge".into(),
+                slug: "flunge".into(),
+                reported_at: 1_747_000_000,
+            },
+            "selected",
+        ),
+        (SelectedProductState::AppNotConnected, "app_not_connected"),
+        (SelectedProductState::NoSelection, "no_selection"),
+        (
+            SelectedProductState::ProductUnknown {
+                product_id: "prod_gone".into(),
+            },
+            "product_unknown",
+        ),
+    ];
+    for (state, expected_tag) in cases {
+        let value = serde_json::to_value(&state).unwrap();
+        assert_eq!(value["status"], expected_tag, "unexpected tag for {state:?}: {value}");
+        let back: SelectedProductState = serde_json::from_value(value).unwrap();
+        assert_eq!(back, state);
+    }
+}
+
+/// The state travels flattened inside `FrontendEvent::SelectedProductResult`,
+/// so `type` and `status` must coexist at the top level — that is what lets a
+/// caller branch on the unavailable case without unwrapping a nested object.
+#[test]
+fn selected_product_result_flattens_status_alongside_the_event_tag() {
+    let event = crate::FrontendEvent::SelectedProductResult {
+        state: SelectedProductState::Selected {
+            product_id: "prod_1".into(),
+            name: "Flunge".into(),
+            slug: "flunge".into(),
+            reported_at: 1_747_000_000,
+        },
+    };
+    let value = serde_json::to_value(&event).unwrap();
+    assert_eq!(value["type"], "selected_product_result");
+    assert_eq!(value["status"], "selected");
+    assert_eq!(value["product_id"], "prod_1");
+    assert_eq!(value["slug"], "flunge");
+
+    let back: crate::FrontendEvent = serde_json::from_value(value).unwrap();
+    let crate::FrontendEvent::SelectedProductResult { state } = back else {
+        panic!("expected SelectedProductResult");
+    };
+    assert_eq!(state.product_id(), Some("prod_1"));
+}
+
+/// Only `Selected` is an answer. Every other case must expose a reason —
+/// silence there is what would let a caller treat "I don't know" as "no
+/// problem" and resolve a short id against a guessed product.
+#[test]
+fn selected_product_state_reports_a_reason_for_every_unavailable_case() {
+    assert!(
+        SelectedProductState::Selected {
+            product_id: "prod_1".into(),
+            name: "Flunge".into(),
+            slug: "flunge".into(),
+            reported_at: 1,
+        }
+        .unavailable_reason()
+        .is_none()
+    );
+    for state in [
+        SelectedProductState::AppNotConnected,
+        SelectedProductState::NoSelection,
+        SelectedProductState::ProductUnknown {
+            product_id: "prod_gone".into(),
+        },
+    ] {
+        assert!(
+            state.unavailable_reason().is_some(),
+            "{state:?} must explain why there is no answer",
+        );
+        assert_eq!(state.product_id(), None, "{state:?} must not offer a product id");
+    }
+}

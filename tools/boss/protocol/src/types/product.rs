@@ -229,3 +229,76 @@ pub struct SetProductExternalTrackerInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 }
+
+/// What the engine knows about the Boss UI's product chooser — the
+/// answer `bossctl selected-product` prints, and the reason it cannot
+/// answer when it cannot.
+///
+/// Short ids (`T<n>`) are scoped per product, so a caller that resolves
+/// one against the wrong product gets a real row for the wrong work
+/// item: a confident, wrong answer. This state therefore never falls
+/// back to "the only product" or "the first product" — every
+/// non-[`Selected`](Self::Selected) case is an explicit, distinguishable
+/// refusal the caller is expected to surface rather than paper over.
+///
+/// The engine is the system of record: the macOS app reports its
+/// chooser state via [`crate::FrontendRequest::ReportSelectedProduct`]
+/// and the engine holds it for the lifetime of that app session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SelectedProductState {
+    /// The app is connected and its chooser is set to this product.
+    /// `product_id` is the canonical typed id (`prod_…`); `slug` and
+    /// `name` are the other two forms `boss --product` accepts.
+    Selected {
+        product_id: String,
+        name: String,
+        slug: String,
+        /// Epoch seconds at which the app last reported this selection.
+        reported_at: i64,
+    },
+    /// No macOS app session is registered — the Boss UI is not running
+    /// (or has not finished connecting), so there is no chooser to read.
+    AppNotConnected,
+    /// The app is connected but has not reported a selection: either it
+    /// predates this RPC, or its chooser is genuinely empty (no product
+    /// on screen).
+    NoSelection,
+    /// The app reported a product the engine can no longer resolve —
+    /// deleted or archived out from under the selection.
+    ProductUnknown { product_id: String },
+}
+
+impl SelectedProductState {
+    /// The selected product's canonical id, or `None` for every
+    /// unavailable case.
+    pub fn product_id(&self) -> Option<&str> {
+        match self {
+            Self::Selected { product_id, .. } => Some(product_id),
+            _ => None,
+        }
+    }
+
+    /// An operator-facing explanation of why there is no answer, or
+    /// `None` when there is one. Phrased as the next thing to do, since
+    /// every caller of this RPC is about to fail loudly with it.
+    pub fn unavailable_reason(&self) -> Option<String> {
+        match self {
+            Self::Selected { .. } => None,
+            Self::AppNotConnected => Some(
+                "the Boss app is not connected to the engine, so it has no product chooser to read; \
+                 launch Boss (or wait for it to reconnect) and try again"
+                    .to_owned(),
+            ),
+            Self::NoSelection => Some(
+                "the Boss app is connected but has not reported a selected product; \
+                 pick a product in the app's chooser (or relaunch an app build that reports it)"
+                    .to_owned(),
+            ),
+            Self::ProductUnknown { product_id } => Some(format!(
+                "the Boss app reports product {product_id} is selected, but the engine has no such product; \
+                 it was probably deleted — pick another product in the app"
+            )),
+        }
+    }
+}

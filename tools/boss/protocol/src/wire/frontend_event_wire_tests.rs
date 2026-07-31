@@ -1355,6 +1355,18 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "setting_set",
         },
+        TagCase {
+            label: "SelectedProductResult",
+            event: FrontendEvent::SelectedProductResult {
+                state: crate::SelectedProductState::AppNotConnected,
+            },
+            expected_tag: "selected_product_result",
+        },
+        TagCase {
+            label: "SelectedProductReported",
+            event: FrontendEvent::SelectedProductReported { accepted: true },
+            expected_tag: "selected_product_reported",
+        },
         // --- Hosts ---
         TagCase {
             label: "HostsList",
@@ -1932,7 +1944,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::DecisionsList { .. }
         | FrontendEvent::DecisionUpdated { .. }
         | FrontendEvent::ProbeRefused { .. }
-        | FrontendEvent::ProbeStatusResult { .. } => {}
+        | FrontendEvent::ProbeStatusResult { .. }
+        | FrontendEvent::SelectedProductResult { .. }
+        | FrontendEvent::SelectedProductReported { .. } => {}
     }
 }
 

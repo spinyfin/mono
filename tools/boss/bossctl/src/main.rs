@@ -30,6 +30,7 @@ mod logs;
 mod pause;
 mod probe;
 mod review;
+mod selected_product;
 mod stream_integrity;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
@@ -259,6 +260,25 @@ enum Command {
         #[command(subcommand)]
         action: comments::CommentsAction,
     },
+    /// Print the product the Boss UI's product chooser is currently set
+    /// to — the product a short ID (`T42`) should be resolved against,
+    /// and the value to pass to `boss --product`.
+    ///
+    /// Read-only in both directions: it does not change the selection and
+    /// cannot be used to drive the UI. It also never guesses. When the
+    /// answer is unavailable this exits non-zero and says which case it
+    /// hit — the app is not connected, nothing is selected, or the
+    /// selected product no longer exists — instead of falling back to a
+    /// default or first product. That fallback is the bug this verb
+    /// exists to remove: short IDs are scoped per product, so resolving
+    /// one against the wrong product succeeds and returns a real row for
+    /// the wrong work item.
+    ///
+    /// `--json` emits `{"status": ...}` — `selected` (with `product_id`,
+    /// `name`, `slug`, `reported_at`), `app_not_connected`,
+    /// `no_selection`, or `product_unknown` — so a caller can branch on
+    /// the case rather than parse a message.
+    SelectedProduct,
     /// Scroll the kanban in the macOS app to a work item's card and
     /// play a short transient highlight. Accepts a short id (`T607`)
     /// or a canonical id. Returns an error when the app is not
@@ -1445,6 +1465,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Comments {
             action: comments::CommentsAction::Runs { comment_id, state_root },
         } => comments::comments_runs(cli.json, state_root, &comment_id),
+        Command::SelectedProduct => selected_product::selected_product(&cli.socket_path, cli.json).await,
         Command::Reveal { id } => agents::reveal_work_item(&cli.socket_path, cli.json, id).await,
         Command::Open { path } => agents::open_document(&cli.socket_path, cli.json, path).await,
         Command::Logs {

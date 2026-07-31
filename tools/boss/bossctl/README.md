@@ -37,6 +37,20 @@ work-item id (`T42`, `P7`). Names and slot ids resolve only against live
 slots so a typo cannot silently match a closed run; bare run ids may
 fall through to the persisted historical `WorkRun` record.
 
+`selected-product` answers the question that reference resolution
+cannot answer on its own: **which product is the operator looking at?**
+Short IDs are scoped per product, so resolving one against the wrong
+product does not fail — it returns a real row, with a real status and a
+real PR, for the wrong work item. The macOS app reports its product
+chooser to the engine (`report_selected_product`, accepted only from the
+registered app session) and the engine is the system of record; this
+verb reads it back. It never falls back to a default or first product:
+when there is no answer it exits non-zero with the specific case
+(`app_not_connected`, `no_selection`, `product_unknown`), because a
+guess here is worse than a refusal. The selection is in-memory and
+session-scoped, so it dies with the app that reported it rather than
+outliving the UI it describes.
+
 The `agents` family steers individual workers — listing live slots,
 showing status, focusing or stopping a pane, sending user-typed text,
 interrupting a turn, launching or reaping an execution, and dumping the

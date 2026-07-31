@@ -196,6 +196,7 @@ mod open_document;
 mod pr_status;
 mod probe_delivery;
 mod proposals;
+mod selected_product;
 mod session_sink_queue;
 mod t02;
 mod t03;

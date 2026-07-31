@@ -18,9 +18,9 @@ use crate::types::{
     EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
     PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project,
     ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SetProductEditorialRulesInput,
-    SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput, Task, TaskRuntime,
-    TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
+    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
+    Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
     WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
     WorkerTierDenial,
 };
@@ -841,6 +841,22 @@ pub enum FrontendRequest {
     GetRun {
         id: String,
     },
+
+    /// Which product the Boss UI's product chooser is currently set to,
+    /// as last reported by the registered app session
+    /// ([`FrontendRequest::ReportSelectedProduct`]). Replies with
+    /// [`FrontendEvent::SelectedProductResult`] carrying a
+    /// [`SelectedProductState`].
+    ///
+    /// Read-only in both directions: it neither changes the selection
+    /// nor asks the app anything, so it cannot be used to drive the UI.
+    /// It also never guesses — when the app is not connected, has not
+    /// reported, or reported a product that no longer exists, the reply
+    /// says exactly which of those happened rather than falling back to
+    /// a default or first product. That distinction is the whole point:
+    /// short ids are per-product, so a wrong-product answer resolves
+    /// *successfully* to the wrong work item.
+    GetSelectedProduct,
 
     /// Snapshot of every registered per-installation setting and its
     /// current value. Used by the macOS Settings window to render the
@@ -1733,6 +1749,28 @@ pub enum FrontendRequest {
     ReorderProjectTasks {
         project_id: String,
         task_ids: Vec<String>,
+    },
+
+    /// App reports which product its chooser is now set to, so the
+    /// engine — not the app, and not a coordinator-side cache — is the
+    /// system of record for the current selection. `product_id` is
+    /// `None` when nothing is selected (the app cleared its chooser,
+    /// e.g. after the selected product was archived).
+    ///
+    /// Sent on every selection change and once on (re)connect, so a
+    /// restarted engine relearns the selection from the app rather than
+    /// persisting it. The engine holds it in memory for the lifetime of
+    /// the reporting app session and drops it when that session goes
+    /// away — a stale selection from a dead app would be exactly the
+    /// confident-but-wrong answer [`Self::GetSelectedProduct`] exists to
+    /// prevent.
+    ///
+    /// Only the registered app session may call this: it is a report of
+    /// UI state, not a way to set it. A report from any other session is
+    /// rejected, so no CLI can steer the chooser through this path.
+    ReportSelectedProduct {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        product_id: Option<String>,
     },
 
     /// App reports that a worker pane's shell never came up — the
