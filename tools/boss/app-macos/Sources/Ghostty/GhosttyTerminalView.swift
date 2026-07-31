@@ -274,14 +274,13 @@ final class GhosttyTerminalHostView: NSView {
     ///
     /// This string is the operator-facing explanation: it is what the engine
     /// writes as the execution's orphan reason and what surfaces on the
-    /// dispatch event. It previously always claimed "likely no active
-    /// display" whatever the machine's real display state was, which made a
-    /// failure with a display present — an entirely different, non-transient
-    /// bug class (env pollution, a rejected working directory, a libghostty
-    /// version mismatch) — indistinguishable in the record from the benign
-    /// post-sleep case. The two branches here are the whole point: they are
-    /// the difference between "wait for the display to come back" and "this
-    /// will fail again on the next attempt and needs a human".
+    /// dispatch event. A failure with a display present is an entirely
+    /// different, non-transient bug class (env pollution, a rejected working
+    /// directory, a libghostty version mismatch) and must never be recorded
+    /// as the benign post-sleep case. The two branches here are the whole
+    /// point: they are the difference between "wait for the display to come
+    /// back" and "this will fail again on the next attempt and needs a
+    /// human".
     ///
     /// No active display is the known-recoverable #800 condition: libghostty's
     /// renderer calls `CVDisplayLinkCreateWithCGDisplays`, which rejects a

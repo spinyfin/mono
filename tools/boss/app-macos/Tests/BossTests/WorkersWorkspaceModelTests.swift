@@ -266,11 +266,11 @@ final class WorkersWorkspaceModelSpawnTests: XCTestCase {
 
     func testSurfaceFailureReasonNamesTheDisplayStateActuallyObserved() {
         // The reason string is the operator-facing explanation the engine
-        // stores as the orphan reason. It previously always claimed
-        // "likely no active display" regardless of the real display state,
-        // which made the recoverable #800 condition and a genuine
-        // non-transient rejection (env pollution, bad cwd, version
-        // mismatch) indistinguishable in the record.
+        // stores as the orphan reason. A reason that names display
+        // availability whatever the real display state is makes the
+        // recoverable #800 condition and a genuine non-transient rejection
+        // (env pollution, bad cwd, version mismatch) indistinguishable in
+        // the record, so each branch must name what it actually observed.
         let noDisplay = GhosttyTerminalHostView.surfaceFailureReason(hasActiveDisplay: false)
         XCTAssertTrue(
             noDisplay.contains("no active display"),

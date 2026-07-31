@@ -374,10 +374,23 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
     tokio::spawn(async move { resolve_reported_pane_death(&server_state, &run_id, reason).await });
 }
 
-/// What the app tells us it saw when it reports a pane death. Deliberately
-/// one string shared by both reap paths so the record says the same thing
-/// however the report is classified.
-const PANE_DIED_DETAIL: &str = "app reported the worker pane died (surface failed to attach or child process exited)";
+/// What the app tells us it saw when it reports a pane death: the pane's
+/// child process exited. The app raises this only from `onChildExited`; a
+/// surface that never attached hosted no child to exit and is reported as a
+/// spawn NACK instead, so that cause is deliberately absent here.
+///
+/// A bare observation, with no "the app reported" prefix and no cause
+/// disjunction: both reap narratives already say who reported it, and a
+/// detail that restates its own prefix is what made the durable reason read
+/// "app reported the worker pane died … : app reported the worker pane died".
+/// Deliberately one string shared by both reap paths so the record says the
+/// same thing however the report is classified.
+///
+/// Note this is a constant, not a diagnosis: the app's display-state-aware
+/// `surfaceFailureReason` text (app-side) reaches the record only via the NACK path.
+/// A failure that arrives on the pane-death channel — an older app build, or
+/// a genuine child exit — carries this generic string instead.
+const PANE_DIED_DETAIL: &str = "the pane's child process exited";
 
 /// Classify and resolve one app-reported pane death — the body of
 /// [`handle_worker_pane_died`], split out so the routing decision is

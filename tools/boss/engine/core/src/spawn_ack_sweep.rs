@@ -554,13 +554,13 @@ fn reap_narrative(cause: &ReapCause<'_>, execution_id: &str) -> (String, String,
         ),
         ReapCause::PaneDiedBeforeStart { detail } => (
             format!(
-                "pane-death-before-start: app reported the worker pane died before it ever produced a \
-                 shell pid or a hook event, so no worker process ever existed: {detail}"
+                "pane-death-before-start: the app reported that {detail}, but no shell pid and no hook \
+                 event was ever observed, so no worker process ever existed"
             ),
             format!(
                 "app reported worker-pane death before start (exec {execution_id}): {detail}; no shell \
-                 or hook event was ever observed, so the pane never came up; chore reset to todo for \
-                 redispatch."
+                 pid or hook event was ever observed, so the pane never came up; chore reset to todo \
+                 for redispatch."
             ),
             Stage::PaneDeathBeforeStart,
         ),
@@ -734,7 +734,8 @@ pub(crate) async fn reap_never_started_spawn(
     // cannot catch; when enough DISTINCT items fail in the window the breaker
     // pauses dispatch and raises one loud attention item.
     //
-    // All three causes feed it, driver-start timeouts included: a driver
+    // All four causes feed it, driver-start timeouts and app-reported pane
+    // deaths before start included: a driver
     // binary that cannot exec on this host fails the same way for every work
     // item routed to it, so it belongs in the aggregate. Pass 2's own
     // per-execution attention item above is additional to this, not a
