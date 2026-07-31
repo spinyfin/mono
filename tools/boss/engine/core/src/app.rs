@@ -55,6 +55,7 @@ use tokio::time::{Duration, timeout};
 
 mod agent_launch_guard;
 mod app_session;
+pub(crate) mod attachments;
 mod attentions;
 mod automations;
 mod broadcasts;
@@ -806,6 +807,20 @@ struct ServerState {
     /// counter state isolated per `ServerState` instance and
     /// makes unit tests cheap.
     metrics: Arc<crate::metrics::Registry>,
+    /// Content-addressed store for reviewer-visible screenshot evidence,
+    /// rooted at `<state_root>/attachments`. Under the state root rather
+    /// than a workspace because a cube workspace is released and recycled
+    /// while the evidence has to outlive the run that produced it.
+    attachment_store: boss_engine_attachments::AttachmentStore,
+    /// Port the evidence HTTP surface actually bound, set by
+    /// [`crate::attachment_server`] once the listener is up.
+    ///
+    /// A `OnceLock` rather than a config value on purpose: a URL is minted
+    /// only after a successful bind, so a second engine (a `--socket-path`
+    /// test fixture, say) that loses the race for the port never hands a
+    /// worker a link served by a *different* engine's gallery.
+    #[builder(default)]
+    evidence_port: Arc<std::sync::OnceLock<u16>>,
     /// Registry of external-tracker backends. Holds the `GitHubTracker`
     /// at startup; future backends (Jira, Linear) are registered the
     /// same way. Shared between the periodic spawn loop and the
@@ -857,6 +872,21 @@ struct ServerState {
 }
 
 impl ServerState {
+    /// The origin evidence links are minted against, e.g.
+    /// `http://127.0.0.1:8419`.
+    ///
+    /// `None` until the evidence surface has actually bound, and forever if
+    /// it never does. Callers must propagate the `None` rather than
+    /// substituting a default port: handing a worker a URL that nothing is
+    /// listening on would put a dead link in a PR body, which is worse than
+    /// telling it plainly that there is no link to paste.
+    fn evidence_base_url(&self) -> Option<String> {
+        self.evidence_port
+            .get()
+            .copied()
+            .map(boss_engine_attachments::http::base_url)
+    }
+
     /// Construct `ServerState` with optional `MergeProbe`, Trunk
     /// token-store, and Trunk client overrides. Production (via
     /// [`server::serve`]) passes `None` for all three and gets the real
@@ -1186,6 +1216,9 @@ impl ServerState {
         // Dispatch-event JSONL stream lands next to state.db /
         // events.sock under the same `state_root` resolved above.
         let dispatch_event_root: PathBuf = state_root.clone();
+        // The evidence blob store lands under the same root, next to
+        // `state.db`, so an install's data is one directory.
+        let attachment_state_root: PathBuf = state_root.clone();
         let dispatch_events: Arc<dyn crate::dispatch_events::DispatchEventSink> =
             Arc::new(crate::dispatch_events::JsonlFileSink::new(dispatch_event_root.clone()));
         let dispatch_events_for_state = dispatch_events.clone();
@@ -1279,6 +1312,9 @@ impl ServerState {
                 .dispatch_events(dispatch_events_for_state)
                 .dispatch_event_root(dispatch_event_root_for_state)
                 .topic_broker(topic_broker)
+                .attachment_store(boss_engine_attachments::AttachmentStore::under_state_root(
+                    &attachment_state_root,
+                ))
                 .worker_registry(WorkerRegistry::new())
                 .live_worker_states(live_worker_states)
                 .hold_registry(hold_registry_for_state)
@@ -2245,6 +2281,7 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::ListProducts => products::handle_list_products(ctx, r).await,
             r @ FrontendRequest::ListProjects { .. } => projects::handle_list_projects(ctx, r).await,
+            r @ FrontendRequest::ListAttachments { .. } => attachments::handle_list_attachments(ctx, r).await,
             r @ FrontendRequest::ListProposals { .. } => proposals::handle_list_proposals(ctx, r).await,
             r @ FrontendRequest::ListRuns { .. } => executions::handle_list_runs(ctx, r).await,
             r @ FrontendRequest::ListTasks { .. } => work_items::handle_list_tasks(ctx, r).await,
@@ -2344,6 +2381,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::Shutdown { .. } => sessions::handle_shutdown(ctx, r).await,
             r @ FrontendRequest::SpawnCapabilityRestored => sessions::handle_spawn_capability_restored(ctx, r).await,
             r @ FrontendRequest::StopRun { .. } => executions::handle_stop_run(ctx, r).await,
+            r @ FrontendRequest::SubmitAttachment { .. } => attachments::handle_submit_attachment(ctx, r).await,
             r @ FrontendRequest::SubmitProposal { .. } => proposals::handle_submit_proposal(ctx, r).await,
             r @ FrontendRequest::Subscribe { .. } => subscriptions::handle_subscribe(ctx, r).await,
             r @ FrontendRequest::SupersedeDecision { .. } => decisions::handle_supersede_decision(ctx, r).await,

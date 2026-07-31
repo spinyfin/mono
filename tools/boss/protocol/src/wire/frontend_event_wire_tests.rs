@@ -20,9 +20,9 @@ use super::*;
 // Enum discriminants and inputs used only by these fixtures are not part of
 // the `wire` module's import set — bring them in explicitly from the crate root.
 use crate::{
-    AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree, EffortLevel,
-    ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError, TaskKind,
-    TaskStatus, WorkerTierDenialReason,
+    AttachmentMediaType, AutomationTrigger, Decision, DecisionKind, DecisionStatus, DesignDocEntry, DesignDocTree,
+    EffortLevel, ExecutionKind, ExecutionStatus, ListHostedPanesInput, ProjectDesignDocState, ProposalFieldError,
+    TaskKind, TaskStatus, WorkerTierDenialReason,
 };
 
 /// One representative event paired with the exact `"type"` tag it must
@@ -74,6 +74,22 @@ fn worker_proposal() -> WorkerProposal {
         .kind(ProposalKind::Blocked)
         .payload_json(r#"{"reason":"stuck"}"#)
         .work_item_id("task_1")
+        .build()
+}
+
+fn work_attachment() -> WorkAttachment {
+    WorkAttachment::builder()
+        .id("atc_1")
+        .execution_id("exec_1")
+        .work_item_id("task_1")
+        .caption("after the fix")
+        .content_digest("aa00")
+        .created_at("1747000000")
+        .media_type(AttachmentMediaType::Png)
+        .pixel_width(800)
+        .pixel_height(600)
+        .size_bytes(4096)
+        .source_name("after.png")
         .build()
 }
 
@@ -1344,6 +1360,25 @@ fn tag_cases() -> Vec<TagCase> {
             },
             expected_tag: "proposals_list",
         },
+        // --- Screenshot evidence attachments ---
+        TagCase {
+            label: "AttachmentStored",
+            event: FrontendEvent::AttachmentStored {
+                attachment: work_attachment(),
+                already_stored: false,
+                evidence_base_url: Some("http://127.0.0.1:8419".into()),
+            },
+            expected_tag: "attachment_stored",
+        },
+        TagCase {
+            label: "AttachmentsList",
+            event: FrontendEvent::AttachmentsList {
+                work_item_id: "task_1".into(),
+                attachments: vec![work_attachment()],
+                evidence_base_url: None,
+            },
+            expected_tag: "attachments_list",
+        },
         TagCase {
             label: "WorkerContextResult",
             event: FrontendEvent::WorkerContextResult {
@@ -2030,7 +2065,9 @@ fn every_variant_is_pinned(e: &FrontendEvent) {
         | FrontendEvent::ProbeRefused { .. }
         | FrontendEvent::ProbeStatusResult { .. }
         | FrontendEvent::SelectedProductResult { .. }
-        | FrontendEvent::SelectedProductReported { .. } => {}
+        | FrontendEvent::SelectedProductReported { .. }
+        | FrontendEvent::AttachmentStored { .. }
+        | FrontendEvent::AttachmentsList { .. } => {}
     }
 }
 

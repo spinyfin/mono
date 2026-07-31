@@ -125,6 +125,30 @@ and bare binary launches remain blocked. The hard gate in
 Do not commit capture PNGs to the branch. Read the image back and state in
 the PR body what you verified and what you could not.
 
+### Showing the capture to a reviewer
+
+Not committing a capture used to mean deleting it, which left reviewers of UI
+changes with a prose description of an image nobody could look at. Attach it
+instead:
+
+```sh
+boss attach /tmp/shot.png --caption "toolbar badge, after the fix"
+```
+
+The engine copies the bytes into a content-addressed store under its state
+root — outside the cube workspace, which is released and recycled — and prints
+a loopback gallery URL (`http://127.0.0.1:8419/w/<work-item-id>`). Put that URL
+in the PR body under an `## Evidence` heading; GitHub linkifies `http` URLs, so
+the reviewer clicks straight through from the PR and the engine on their
+machine serves the image. Inline `![](…)` embedding does not work — GitHub
+proxies image sources through camo, which cannot reach anyone's loopback.
+
+Retention is bounded (90 days, with a 1 GiB backstop; see
+`BOSS_ATTACHMENT_RETENTION_DAYS`) and a reclaimed link explains itself rather
+than 404ing. `bossctl attachments list` shows what is stored;
+`bossctl attachments sweep` reclaims on demand. Set `BOSS_ATTACHMENT_PORT=0` to
+disable the surface — attachments are still stored, but no link is minted.
+
 ## Overrides
 
 - `BOSS_SOCKET_PATH`: unix socket path (default `/tmp/boss-engine.sock`)

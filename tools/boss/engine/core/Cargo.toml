@@ -33,6 +33,7 @@ boss-engine-board-gesture = { path = "../board-gesture" }
 boss-engine-design-docs = { path = "../design-docs" }
 boss-engine-codex-rollout-retention = { path = "../codex-rollout-retention" }
 boss-engine-driver = { path = "../driver" }
+boss-engine-attachments = { path = "../attachments" }
 boss-engine-grok-home-retention = { path = "../grok-home-retention" }
 boss-engine-effort = { path = "../effort" }
 boss-feature-flags = { path = "../feature-flags" }

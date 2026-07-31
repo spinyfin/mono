@@ -211,6 +211,19 @@ pub fn worker_verb_decision(request: &FrontendRequest) -> WorkerVerbDecision {
         // worker still cannot reach another run's work item through them.
         FrontendRequest::ListProposals { .. } | FrontendRequest::SubmitProposal { .. } => Allow,
 
+        // ── Allowed: screenshot evidence ─────────────────────────────────
+        //
+        // `boss attach` / `boss attach --list`. Same tier for the same
+        // reason as the proposal verbs: mediated worker submissions, both
+        // re-deriving the caller's execution from the socket peer
+        // independently of this gate. `SubmitAttachment` is a *write*, but
+        // it writes only the worker's own evidence — it edits no taxonomy
+        // row and needs no human judgment, which is why it is not a
+        // proposal kind. Its confinement (the path must resolve inside the
+        // peer-resolved execution's own workspace) is enforced in the
+        // handler, not here, because this match is pure.
+        FrontendRequest::ListAttachments { .. } | FrontendRequest::SubmitAttachment { .. } => Allow,
+
         // ── Allowed: the caller's own PR state ───────────────────────────
         //
         // `GetPrStatus` / `GetPrBody` are attributed identically to

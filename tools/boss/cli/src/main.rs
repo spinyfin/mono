@@ -26,6 +26,7 @@ pub(crate) use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 pub(crate) use comfy_table::{Cell, ContentArrangement, Table};
 pub(crate) use serde::Serialize;
 
+mod attach;
 mod buildkite_release;
 mod context;
 mod pr;
@@ -274,6 +275,10 @@ pub(crate) async fn run_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Attention { command } => {
             let ctx = RunContext::from_flags(&cli.global)?;
             run_attention_command(command, &ctx).await
+        }
+        Commands::Attach(args) => {
+            let ctx = RunContext::from_flags(&cli.global)?;
+            attach::run_attach_command(args, &ctx).await
         }
         Commands::Propose(args) => {
             let ctx = RunContext::from_flags(&cli.global)?;

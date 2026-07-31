@@ -906,11 +906,19 @@ pub enum FrontendEvent {
         proposal: WorkerProposal,
         already_submitted: bool,
     },
-    /// Failure reply to [`FrontendRequest::SubmitProposal`] or
-    /// [`FrontendRequest::ListProposals`]. Sent instead of the generic
+    /// Failure reply to any mediated worker submission —
+    /// [`FrontendRequest::SubmitProposal`],
+    /// [`FrontendRequest::ListProposals`],
+    /// [`FrontendRequest::SubmitAttachment`], or
+    /// [`FrontendRequest::ListAttachments`]. Sent instead of the generic
     /// [`FrontendEvent::WorkError`] so the caller can branch on
     /// `error.code` and, for a validation failure, point at the offending
     /// fields by name rather than re-printing prose.
+    ///
+    /// Shared across proposals and attachments deliberately: the refusal
+    /// vocabulary is the same one (the attribution codes are literally
+    /// identical, since both verbs resolve the caller from the socket peer),
+    /// and a worker that has learned to read one has learned to read both.
     ProposalRejected {
         error: ProposalSubmissionError,
     },
@@ -934,6 +942,37 @@ pub enum FrontendEvent {
     ProposalsList {
         work_item_id: String,
         proposals: Vec<WorkerProposal>,
+    },
+    /// Success reply to [`FrontendRequest::SubmitAttachment`]: the bytes are
+    /// in the engine's content-addressed store and the row is durable.
+    ///
+    /// `already_stored` distinguishes "this call ingested the image" from "an
+    /// identical image was already stored for this execution and this call
+    /// was a no-op". Both are successes — content-addressed replay safety is
+    /// the point.
+    ///
+    /// `evidence_base_url` is the origin the evidence HTTP surface is served
+    /// on (`http://127.0.0.1:<port>`). `None` means the surface is disabled
+    /// or failed to bind, which is exactly when a caller must **not** invent
+    /// a URL — the image is stored and inspectable via `bossctl attachments`,
+    /// but there is no link to paste into a PR body and saying otherwise
+    /// would hand the reviewer a dead link.
+    AttachmentStored {
+        attachment: WorkAttachment,
+        already_stored: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_base_url: Option<String>,
+    },
+    /// Response to [`FrontendRequest::ListAttachments`]: every attachment
+    /// filed against `work_item_id` across all its executions, newest first,
+    /// including reclaimed tombstones (so a stale PR link has an explanation
+    /// rather than a mystery). `evidence_base_url` carries the same meaning
+    /// as on [`Self::AttachmentStored`].
+    AttachmentsList {
+        work_item_id: String,
+        attachments: Vec<WorkAttachment>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence_base_url: Option<String>,
     },
     /// Reply for [`FrontendRequest::GetWorkerContext`]: the sanitized
     /// one-call bundle for the caller's own work item, resolved from its

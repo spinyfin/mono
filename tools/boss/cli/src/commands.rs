@@ -144,6 +144,22 @@ pub(crate) enum Commands {
     ///
     /// See `tools/boss/docs/designs/worker-proposal-api-replace-fragile-worker-to-engine-seams.md`.
     Propose(propose::ProposeArgs),
+    /// Attach a screenshot as review evidence a human can look at.
+    ///
+    /// Committing capture PNGs to the branch is forbidden — and rots, since
+    /// merging deletes the branch the images lived on. This is the
+    /// alternative: the engine stores the image outside your (ephemeral)
+    /// cube workspace and serves it from a loopback gallery. The command
+    /// prints the gallery URL; put it in the PR body under an `## Evidence`
+    /// heading and the reviewer can click it straight from GitHub.
+    ///
+    /// Validation is synchronous and typed — a path outside your workspace,
+    /// a file that is not really a PNG/JPEG, an oversize render, or a
+    /// per-run cap all come back immediately so you can fix and retry in
+    /// the same run.
+    ///
+    /// See `tools/boss/docs/designs/worker-screenshot-evidence-attachments.md`.
+    Attach(attach::AttachArgs),
     /// Print the sanitized one-call context bundle for this worker
     /// session: your own task + project + product, sibling tasks in the
     /// project (with dependency edges), edges touching your own task,

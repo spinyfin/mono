@@ -50,6 +50,9 @@ pub fn init_all(registry: &Registry) {
     crate::app::proposals::register_metrics(registry);
     // Worker-proposal API: proposal_channel_error detection counter.
     crate::proposal_channel_error::register_metrics(registry);
+    // Screenshot-evidence attachments: SubmitAttachment ingest, replay, and
+    // refusal counters.
+    crate::app::attachments::register_metrics(registry);
     // Codex unobserved-command detection counter (item.started with no
     // item.completed before the turn boundary).
     crate::codex_unobserved_command::register_metrics(registry);
@@ -211,6 +214,18 @@ mod tests {
                 "init_all must register {expected}"
             );
         }
+        // Screenshot-evidence attachments.
+        for expected in [
+            "work_attachments.stored",
+            "work_attachments.replayed",
+            "work_attachments.validation_failed",
+            "work_attachments.rate_limited",
+        ] {
+            assert!(
+                names.contains(&expected.to_owned()),
+                "init_all must register {expected}"
+            );
+        }
         // GitHub API usage telemetry: the static totals. The per-caller
         // breakdown is registered dynamically on first use.
         for expected in [
@@ -241,12 +256,13 @@ mod tests {
         }
         assert_eq!(
             names.len(),
-            88,
+            92,
             "expected 6 pr_url_capture + 4 worker_proposals fallback_hit + 3 cube_workspace_lease + \
              10 dispatcher + 15 merge_poller + 18 external_tracker + 2 speculative_conflict + \
              1 stacked_pr_structuring + 1 dispatch_metrics + 9 trunk_queue_poller + \
              9 worker_proposals submit + 1 worker_proposals channel_error + \
-             5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace counters"
+             5 github_api + 2 codex_unobserved_command + 2 codex_guard_trace + \
+             4 work_attachments counters"
         );
         // Phase 3: dep_unblock gauge, plus the queue-level dispatch gauges.
         let gauge_names: Vec<_> = registry.gauge_snapshots().into_iter().map(|s| s.name).collect();

@@ -2842,3 +2842,54 @@ pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> 
     }
     Ok(())
 }
+
+/// Create `work_attachments`: the metadata ledger for reviewer-visible image
+/// evidence. Bytes live outside the row, content-addressed under the engine
+/// state root (`boss_engine_attachments::store`) — a screenshot is not
+/// something to put in SQLite, and keeping it out means retention can reclaim
+/// bytes while leaving the row as a tombstone.
+///
+/// `UNIQUE (execution_id, content_digest)` is the replay key: resubmitting
+/// the same image inside one run returns the existing row instead of
+/// duplicating it, so no caller-supplied idempotency key is needed — the
+/// bytes already are one. The constraint is deliberately scoped to the
+/// execution, not global: two runs that render an identical view each get
+/// their own row (the reviewer wants to know *which run* produced what),
+/// while content addressing still stores the blob once.
+///
+/// `reclaimed_at` is why the row outlives its blob. A gallery link in a
+/// merged PR body then answers "reclaimed by retention on <date>" rather
+/// than a bare 404 that reads like a bug. Tombstones are removed with their
+/// execution by the `ON DELETE CASCADE`, the same way `worker_proposals` and
+/// `work_runs` rows are.
+///
+/// Purely additive (`CREATE TABLE IF NOT EXISTS`) and independent of every
+/// other table except that reference.
+///
+/// Design: tools/boss/docs/designs/worker-screenshot-evidence-attachments.md
+pub(crate) fn migrate_work_attachments_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS work_attachments (
+             id             TEXT PRIMARY KEY,
+             execution_id   TEXT NOT NULL REFERENCES work_executions(id) ON DELETE CASCADE,
+             work_item_id   TEXT NOT NULL,
+             caption        TEXT NOT NULL DEFAULT '',
+             content_digest TEXT NOT NULL,
+             media_type     TEXT NOT NULL,
+             pixel_width    INTEGER NOT NULL,
+             pixel_height   INTEGER NOT NULL,
+             size_bytes     INTEGER NOT NULL,
+             source_name    TEXT NOT NULL,
+             created_at     TEXT NOT NULL,
+             reclaimed_at   TEXT,
+             UNIQUE (execution_id, content_digest)
+         );
+
+         CREATE INDEX IF NOT EXISTS work_attachments_work_item_idx
+             ON work_attachments(work_item_id, created_at);
+
+         CREATE INDEX IF NOT EXISTS work_attachments_digest_idx
+             ON work_attachments(content_digest);",
+    )?;
+    Ok(())
+}

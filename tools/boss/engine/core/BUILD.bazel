@@ -61,6 +61,7 @@ rust_library(
         "//tools/boss/claude_client",
         "//tools/boss/codex_auth",
         "//tools/boss/comment_anchor",
+        "//tools/boss/engine/attachments",
         "//tools/boss/engine/automation-dedup",
         "//tools/boss/engine/automation-schedule",
         "//tools/boss/engine/board-gesture",
