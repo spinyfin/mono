@@ -32,6 +32,7 @@ fn queue_probe_mints_unique_probe_ids() {
 #[test]
 fn reserving_a_probe_claims_the_runs_only_delivery_slot() {
     let (server_state, _dir) = test_server_state();
+    server_state.worker_registry.register_run_slot("run-y", 1);
     let first = server_state.queue_probe("run-y".into(), "first".into(), false);
     let second = server_state.queue_probe("run-y".into(), "second".into(), false);
 
