@@ -2811,20 +2811,6 @@ pub(crate) fn migrate_backfill_resolve_stale_dead_review_attentions(conn: &Conne
 /// enforce it — a stray duplicate write would just be an extra historical
 /// row, not a correctness hazard for `latest_review_verdict`'s
 /// most-recent-by-`created_at` read.
-/// Add `products.design_guidance` — an optional markdown block injected
-/// into the `[product-design-guidance]` section of the `kind = 'design'` /
-/// `kind = 'design_postmortem'` prompt directive only. `NULL` / empty → no
-/// injection (existing behaviour). Distinct from `dispatch_preamble` (every
-/// execution kind on the product) and `editorial_rules.instructions`
-/// (GitHub-visible-surface rules) — see
-/// `editorial-controls-for-agent-authored-prs-and-github-comments.md` R11.
-pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> {
-    if !table_has_column(conn, "products", "design_guidance")? {
-        conn.execute("ALTER TABLE products ADD COLUMN design_guidance TEXT", [])?;
-    }
-    Ok(())
-}
-
 pub(crate) fn migrate_pr_review_verdicts_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS pr_review_verdicts (
@@ -2843,5 +2829,19 @@ pub(crate) fn migrate_pr_review_verdicts_table(conn: &Connection) -> Result<()> 
          CREATE INDEX IF NOT EXISTS pr_review_verdicts_work_item_idx
              ON pr_review_verdicts(work_item_id, created_at);",
     )?;
+    Ok(())
+}
+
+/// Add `products.design_guidance` — an optional markdown block injected
+/// into the `[product-design-guidance]` section of the `kind = 'design'` /
+/// `kind = 'design_postmortem'` prompt directive only. `NULL` / empty → no
+/// injection (existing behaviour). Distinct from `dispatch_preamble` (every
+/// execution kind on the product) and `editorial_rules.instructions`
+/// (GitHub-visible-surface rules) — see
+/// `editorial-controls-for-agent-authored-prs-and-github-comments.md` R11.
+pub(crate) fn migrate_products_design_guidance(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "products", "design_guidance")? {
+        conn.execute("ALTER TABLE products ADD COLUMN design_guidance TEXT", [])?;
+    }
     Ok(())
 }
