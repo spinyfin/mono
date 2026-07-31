@@ -76,6 +76,50 @@ impl WorkerCompletionHandler {
         StopOutcome::NoChangesNeeded { work_item_id }
     }
 
+    /// File the human-visible record that a `revision_implementation`
+    /// closed on the sanctioned `NO_CHANGES_NEEDED` marker without ever
+    /// moving the bound PR — i.e. the worker declared the review finding
+    /// it was dispatched for needs no code change.
+    ///
+    /// Always filed, never conditional: this terminal is the one path on
+    /// which a revision completes successfully with the finding
+    /// unaddressed, so the human who asked for it has to be able to see
+    /// that it was declined rather than fixed. Best-effort — a filing
+    /// failure is logged and swallowed, exactly like the other attention
+    /// helpers here; it must never block the completion itself.
+    pub(super) async fn file_revision_no_op_attention(
+        &self,
+        execution: &crate::work::WorkExecution,
+        bound_pr_url: &str,
+    ) {
+        let body = format!(
+            "This revision worker pushed no commits — the bound PR's head SHA is unchanged from \
+             the snapshot taken when the run started — and ended by emitting the sanctioned \
+             `NO_CHANGES_NEEDED` marker, its explicit claim that the review finding needs no code \
+             change.\n\n\
+             The revision has been closed as a declared no-op: no PR was opened, nothing was \
+             pushed, and the bound PR ({bound_pr_url}) is untouched. **The finding that produced \
+             this revision was therefore never addressed.** Read the worker's final message to \
+             judge whether declining it was right; re-dispatch the revision if it was not.\n\n\
+             The execution's cube lease and worker slot have been released."
+        );
+        if let Err(err) = self
+            .file_execution_attention(
+                execution,
+                REVISION_NO_OP_ATTENTION_KIND,
+                "Revision closed without addressing its finding",
+                body,
+            )
+            .await
+        {
+            tracing::warn!(
+                execution_id = %execution.id,
+                ?err,
+                "revision no-op: failed to file attention item; closing without a UI surface",
+            );
+        }
+    }
+
     /// Finalize an execution whose driver reported its own terminal turn
     /// boundary as an unrecoverable error (see
     /// [`StopOutcome::DriverTerminalError`]). The worker process that

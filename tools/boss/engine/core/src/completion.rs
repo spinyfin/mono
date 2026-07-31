@@ -1399,6 +1399,79 @@ enum ShaDeltaGateOutcome {
     Inapplicable,
 }
 
+/// What a Stop boundary knows about whether *this run* moved the bound
+/// PR, carried into [`WorkerCompletionHandler::try_finalize_satisfied_deliverable_on_stop`]
+/// so the finalize decision can depend on it.
+///
+/// This type exists because the satisfied-deliverable gate used to read
+/// the bound PR's live health as proof the run had delivered, while the
+/// SHA-delta gate that ran moments earlier already held the answer and
+/// spent it only on a nudge fingerprint. Threading the finding in makes
+/// it load-bearing on the finalize decision rather than merely on
+/// whether a reviewer pass runs.
+///
+/// There is deliberately no `Contributed` variant: a run the SHA-delta
+/// gate proved *did* move the head finalizes upstream via
+/// `finalize_pr_transition(.., "stop_sha_delta")` and never reaches this
+/// gate at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContributionEvidence {
+    /// [`ShaDeltaGateOutcome::NoContribution`]: the bound PR's head was
+    /// fetched and compared against this execution's `pr_head_before`
+    /// snapshot, and they are equal. This run did not move the PR —
+    /// positive proof of non-contribution, not an absence of evidence.
+    ProvenAbsent,
+    /// [`ShaDeltaGateOutcome::Inapplicable`]: no baseline was ever
+    /// captured, or the head fetch failed. The run may or may not have
+    /// contributed; SHA comparison cannot say.
+    Indeterminate,
+}
+
+/// Whether "the bound PR is open, mergeable and CI-clean" is on its own
+/// enough to call this run's deliverable satisfied at a Stop boundary
+/// where the head did not move.
+///
+/// **For every kind except `revision_implementation`: yes.** A primary
+/// implementation's deliverable *is* a healthy PR for its work item, and
+/// a PR bound to that item can only exist because some run of it pushed
+/// one. Reading the PR's health as "delivered" states something true.
+///
+/// **For a `revision_implementation`: only when the evidence does not
+/// contradict it.** A revision is dispatched *into* an open, mergeable,
+/// CI-clean parent PR — that is the definition of the state a reviewer
+/// pass hands it, and it holds at t=0 before the worker has read its
+/// prompt. The predicate is therefore trivially true from the instant
+/// the run starts and cannot distinguish "the revision landed its fix"
+/// from "the revision has not started". A revision's deliverable is a
+/// *change* to a PR that was already healthy, so when the SHA-delta gate
+/// has proven the head did not move
+/// ([`ContributionEvidence::ProvenAbsent`]) the PR's health is evidence
+/// of nothing and must not finalize the run as delivered. That is the
+/// defect this predicate closes: a revision on
+/// `spinyfin/mono#2589` was terminalized as delivered 78 s in, having
+/// produced no commit and no push, 1.7 s after the engine logged that it
+/// had contributed nothing.
+///
+/// [`ContributionEvidence::Indeterminate`] still qualifies: "we could not
+/// measure" is not the same claim as "we measured, and it did not move",
+/// and refusing it would re-open the stuck-revision dead end where a
+/// revision whose dispatch-time snapshot failed can never be finalized by
+/// any Stop, forever. The caller logs that finalize loudly — see
+/// `try_finalize_satisfied_deliverable_on_stop`.
+///
+/// Note this governs ONLY the health-alone arm. The gate's other
+/// satisfying states — the PR is merged, or GitHub has accepted it into
+/// the merge queue, or a merge-conflict revision's conflict has cleared —
+/// are unaffected, because each is either a genuine delta from the
+/// dispatch state or proof the deliverable has passed out of the
+/// worker's hands, where nudging it to push would be actively wrong.
+fn health_alone_satisfies_deliverable(kind: &ExecutionKind, contribution: ContributionEvidence) -> bool {
+    match kind {
+        ExecutionKind::RevisionImplementation => contribution != ContributionEvidence::ProvenAbsent,
+        _ => true,
+    }
+}
+
 /// Attention-item `kind` filed when the auto-nudge circuit breaker
 /// parks an execution. Distinct kind so the coordinator/UI can surface
 /// "worker parked: nudge loop bounded" separately from other attention
@@ -1420,6 +1493,19 @@ pub const REVIEW_RESULT_GIVEUP_ATTENTION_KIND: &str = "review_result_missing";
 /// itself failed the run" apart from the nudge-breaker and give-up cases
 /// above, which both imply the worker ran to some kind of conclusion.
 pub const DRIVER_TERMINAL_ERROR_ATTENTION_KIND: &str = "driver_terminal_error";
+
+/// Attention-item kind filed when a `revision_implementation` worker ends
+/// on the sanctioned [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
+/// marker: it pushed nothing, and declared explicitly that the review
+/// finding it was dispatched for needs no code change.
+///
+/// Distinct kind, and always filed, because that terminal closes a
+/// revision without the finding ever being addressed. Unlike a primary
+/// implementation's no-op — where "the work was already on `main`" is
+/// self-evidently complete — a revision exists because a reviewer pass
+/// asked for something, so a worker declining it is a judgement a human
+/// should see rather than a silent close.
+pub const REVISION_NO_OP_ATTENTION_KIND: &str = "revision_no_changes_needed";
 
 /// Probe text dispatched when a worker stops without producing any PR
 /// for its branch. Phrased so a worker that already finished the work
@@ -1665,6 +1751,14 @@ pub enum StopOutcome {
     /// the `NoContribution` branch of `on_stop_inner`. The execution
     /// is finalised and the worker reaped without nudging, preventing
     /// the "nothing left to do" zombie loop.
+    ///
+    /// For a `revision_implementation` the health-alone arm of that gate
+    /// additionally requires that the SHA-delta gate has NOT proven the
+    /// run contributed nothing — see [`health_alone_satisfies_deliverable`].
+    /// A revision is dispatched into an already-healthy PR, so without
+    /// that requirement this outcome fires on the first Stop of every
+    /// revision whose parent PR happens to be open and CI-clean, which is
+    /// the normal case.
     DeliverableSatisfied { pr_url: String },
     /// A CI-remediation worker classified the failure as flaky/infra and
     /// re-triggered the failing job (`boss engine ci mark-retriggered`),
