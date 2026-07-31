@@ -506,6 +506,21 @@ fn forget_registration(workspace_root: &Path, source: &Path, workspace_id: &str)
     )
 }
 
+/// The `bazel info output_base` probe `remove_workspace_from_disk` issues,
+/// lazily and once per repo pass, to discover the shared `_bazel_<user>`
+/// root — run in the repo's canonical `source` checkout. The output base
+/// this fakes up does not need to exist on disk: the workspace being
+/// removed in these tests never actually populated one, so the resulting
+/// cleanup is a harmless `NothingToRemove`.
+fn bazel_root_probe(source: &Path) -> ExpectedCommand {
+    ExpectedCommand::ok(
+        source.to_path_buf(),
+        "bazel",
+        &["info", "output_base"],
+        "/fake-bazel-cache/_bazel_testuser/deadbeefdeadbeefdeadbeefdeadbeef",
+    )
+}
+
 #[test]
 fn a_staged_workspace_cannot_be_rediscovered_and_re_registered() {
     // The window the staging rename exists to close. Dropping the registry row
@@ -604,6 +619,9 @@ fn trim_removes_the_most_idle_surplus_down_to_the_mark() {
     let ws2 = workspace_root.join("mono-agent-002");
     let mut script = trim_probe_reusable(&ws1);
     script.push(forget_registration(&workspace_root, &source, "mono-agent-001"));
+    // Discovered once, lazily, on the first removal's bazel-output-base
+    // cleanup, then reused (not re-probed) for the second.
+    script.push(bazel_root_probe(&source));
     script.extend(trim_probe_reusable(&ws2));
     script.push(forget_registration(&workspace_root, &source, "mono-agent-002"));
     let runner = FakeRunner::new(script);
@@ -779,6 +797,7 @@ fn a_row_whose_directory_is_already_gone_does_not_inflate_the_surplus() {
     let ws2 = workspace_root.join("mono-agent-002");
     let mut script = trim_probe_reusable(&ws2);
     script.push(forget_registration(&workspace_root, &source, "mono-agent-002"));
+    script.push(bazel_root_probe(&source));
     let runner = FakeRunner::new(script);
 
     let report = trim_free_workspaces_to_mark(&runner, &store, Some(&database_path), NOW, None);

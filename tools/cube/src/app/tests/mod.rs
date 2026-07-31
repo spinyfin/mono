@@ -1,5 +1,6 @@
 //! Unit tests for `crate::app`, split to mirror the production module layout.
 
+mod bazel_output_base_tests;
 mod change_tests;
 mod checkleft_tests;
 mod dispatch_tests;
@@ -16,6 +17,7 @@ mod pr_tests;
 mod push_tests;
 mod quarantine_tests;
 mod rebase_tests;
+mod reclaim_bazel_bases_tests;
 mod reclaim_tests;
 mod reconcile_tests;
 mod release_tests;

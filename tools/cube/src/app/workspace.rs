@@ -16,6 +16,10 @@ use crate::setup::StepStatus;
 use crate::store::{EffectiveState, Store, WorkspaceListFilter};
 use crate::{audit, config};
 
+use crate::app::bazel_output_base::{
+    BazelUserRootCache, CleanupOutcome, cleanup_output_base_for_workspace, discover_bazel_user_root,
+    sweep_orphaned_output_bases,
+};
 use crate::app::display::{
     effective_state_display, format_age, format_retention_summary, format_workspace_list, human_workspace_detail,
     retention_summary,
@@ -1781,6 +1785,43 @@ pub(super) fn run_workspace(
                         });
                     }
                 }
+
+                // Probe the repo's canonical source checkout — a stable,
+                // always-present bazel workspace cube never tears down —
+                // rather than the workspace just removed.
+                let probe_candidates = store
+                    .get_repo(&record.repo)
+                    .ok()
+                    .flatten()
+                    .and_then(|repo_record| repo_record.source)
+                    .into_iter()
+                    .collect();
+                let bazel_root_cache = BazelUserRootCache::new(runner, probe_candidates);
+                match cleanup_output_base_for_workspace(&bazel_root_cache, &record.workspace_path) {
+                    CleanupOutcome::Removed(path) => {
+                        audit!(
+                            database_path,
+                            "workspace.bazel_output_base_removed",
+                            repo = record.repo,
+                            workspace_id = record.workspace_id,
+                            path = path.display().to_string(),
+                        );
+                    }
+                    CleanupOutcome::NothingToRemove | CleanupOutcome::RootUnknown => {}
+                    CleanupOutcome::Failed(e) => {
+                        eprintln!(
+                            "warning: failed to remove bazel output base for {}: {e}",
+                            record.workspace_id
+                        );
+                        audit!(
+                            database_path,
+                            "workspace.bazel_output_base_remove_failed",
+                            repo = record.repo,
+                            workspace_id = record.workspace_id,
+                            error = e.to_string(),
+                        );
+                    }
+                }
             }
 
             if let Err(e) = cleanup_workspace_logs(&record.workspace_id) {
@@ -1825,6 +1866,66 @@ pub(super) fn run_workspace(
                     "expunged": expunge,
                 }),
             )
+        }
+        WorkspaceCommand::ReclaimBazelBases { dry_run } => {
+            // Probe every configured repo's canonical source checkout in
+            // turn until one answers — any of them will do, since
+            // `output_user_root` is a single host+user-wide value, not
+            // per-repo.
+            let probe_candidates: Vec<PathBuf> = store
+                .list_repos()?
+                .into_iter()
+                .filter_map(|repo_record| repo_record.source)
+                .collect();
+            let Some(bazel_user_root) = discover_bazel_user_root(runner, &probe_candidates, None) else {
+                return Err(CubeError::InvalidArgument(
+                    "could not discover the shared bazel root: no configured repo has a canonical source \
+                     checkout bazel could be probed from, or every probe failed (see stderr)"
+                        .to_string(),
+                ));
+            };
+
+            let report = sweep_orphaned_output_bases(&store, &bazel_user_root, dry_run);
+
+            for failure in &report.failed {
+                eprintln!(
+                    "warning: failed to remove bazel output base {}: {}",
+                    failure.path.display(),
+                    failure.error.as_deref().unwrap_or("unknown error"),
+                );
+            }
+            audit!(
+                database_path,
+                "workspace.bazel_output_base_sweep",
+                bazel_user_root = bazel_user_root.display().to_string(),
+                dry_run = dry_run,
+                candidates_examined = report.candidates_examined,
+                removed = report.removed.len(),
+                failed = report.failed.len(),
+                skipped_now_live = report.skipped_now_live,
+            );
+
+            let message = if dry_run {
+                format!(
+                    "Dry run: {} of {} bazel output base(s) under {} would be reclaimed ({} still live, {} \
+                     failed to inspect).",
+                    report.removed.len(),
+                    report.candidates_examined,
+                    bazel_user_root.display(),
+                    report.skipped_now_live,
+                    report.failed.len(),
+                )
+            } else {
+                format!(
+                    "Reclaimed {} of {} bazel output base(s) under {} ({} still live, {} failed).",
+                    report.removed.len(),
+                    report.candidates_examined,
+                    bazel_user_root.display(),
+                    report.skipped_now_live,
+                    report.failed.len(),
+                )
+            };
+            RunResult::new(message, report)
         }
         WorkspaceCommand::Reconcile {
             repo,

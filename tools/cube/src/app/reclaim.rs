@@ -5,11 +5,20 @@
 //!
 //! The pool grew to 520 mono workspaces and ~191 GB, but the ratio is what
 //! decides the fix. A pristine workspace is ~600 MB — the shared jj object
-//! store means 41 mono workspaces are not 41 clones, and bazel's outputs are
-//! symlinks into one shared cache — while the uncleaned Cargo `target/` trees
-//! inside just 13 of 51 workspaces came to 67.1 GiB, **82% of the entire
-//! workspaces tree**. The disk is not in the checkouts. It is in the build
-//! output.
+//! store means 41 mono workspaces are not 41 clones, and `bazel-out` /
+//! `bazel-bin` inside a workspace are symlinks, not real trees — while the
+//! uncleaned Cargo `target/` trees inside just 13 of 51 workspaces came to
+//! 67.1 GiB, **82% of the entire workspaces tree**. The disk is not in the
+//! checkouts. It is in the build output.
+//!
+//! Those symlinks point *out* of the workspace, at bazel's own output base,
+//! and — unlike the `disk_cache`/`repository_cache` — that base is **not**
+//! shared across workspaces: bazel keys it by a hash of the workspace's own
+//! path, so every workspace gets a private output tree under
+//! `<output_user_root>/_bazel_<user>/<hash>`. That tree survives a workspace
+//! directory's removal unless something removes it too — see
+//! [`crate::app::bazel_output_base`] for the cleanup this module calls into
+//! from [`remove_workspace_from_disk`].
 //!
 //! And the warm checkout is the entire value of the pool: reprovisioning one
 //! costs a `jj workspace add` plus setup, which is exactly what leasing is
@@ -68,6 +77,7 @@ use crate::metadata::{RepoRecord, WorkspaceRecord, WorkspaceState};
 use crate::store::{Store, WorkspaceListFilter};
 use crate::{audit, config};
 
+use crate::app::bazel_output_base::{BazelUserRootCache, CleanupOutcome, cleanup_output_base_for_workspace};
 use crate::app::disk::{DiskSpace, human_bytes};
 use crate::app::errors::Result;
 use crate::app::health::probe_workspace_reuse;
@@ -190,11 +200,14 @@ fn artifact_dir_is_tracked(
 /// tracking anything inside it.
 ///
 /// The symlink gate is the one that matters most here. Bazel puts `bazel-out`,
-/// `bazel-bin` and friends in every workspace as symlinks into a single shared
-/// output base under `~/Library/Caches/bazel/`. They occupy no meaningful
-/// space in the workspace tree, so there is nothing to gain by removing them —
-/// and following one would delete through it into the output base every other
-/// workspace on the machine shares.
+/// `bazel-bin` and friends in every workspace as symlinks into that
+/// workspace's own private output base (see
+/// [`crate::app::bazel_output_base`] — it is per-workspace, not shared).
+/// They occupy no meaningful space in the workspace tree, so there is
+/// nothing to gain by removing them here — following one with a naive
+/// recursive delete would walk through it into the real output base
+/// instead. Reclaiming the output base itself happens separately, once the
+/// whole workspace (not just its `target/`) is being removed.
 fn compact_workspace(
     runner: &dyn CommandRunner,
     workspace_path: &Path,
@@ -403,6 +416,14 @@ fn trim_one_repo(
     deadline: Option<Instant>,
 ) -> ReclaimReport {
     let repo = repo_record.repo.as_str();
+    // Lazy: discovered on first use (inside `remove_workspace_from_disk`), so
+    // a repo pass that ends up removing nothing pays for no `bazel info`
+    // probe, and a pass that removes many pays for exactly one, reused for
+    // the whole repo. Probes the repo's own canonical source checkout — a
+    // stable, always-present bazel workspace that cube itself never tears
+    // down — rather than another cube-managed workspace (which could be
+    // mid-removal itself in the same pass).
+    let bazel_root_cache = BazelUserRootCache::new(runner, repo_record.source.clone().into_iter().collect());
     let mark = pool.max_free_workspaces(repo);
     let free = free_workspaces(store, repo);
     let mut report = ReclaimReport::default();
@@ -575,7 +596,14 @@ fn trim_one_repo(
             mark,
             free_on_disk,
         };
-        match remove_workspace_from_disk(database_path, repo_record, record, &staged_path, context) {
+        match remove_workspace_from_disk(
+            database_path,
+            repo_record,
+            record,
+            &staged_path,
+            context,
+            &bazel_root_cache,
+        ) {
             Ok(freed) => {
                 report.workspaces_removed += 1;
                 report.available_delta_bytes = report.available_delta_bytes.saturating_add(freed);
@@ -730,6 +758,7 @@ fn remove_workspace_from_disk(
     record: &WorkspaceRecord,
     staged_path: &Path,
     context: TrimContext,
+    bazel_root_cache: &BazelUserRootCache<'_>,
 ) -> Result<u64> {
     let before = DiskSpace::probe(&repo_record.workspace_root).ok();
     fs::remove_dir_all(staged_path).map_err(|source| crate::app::errors::CubeError::WorkspaceDirRemove {
@@ -746,6 +775,35 @@ fn remove_workspace_from_disk(
             "warning: failed to clean up workspace logs for {}: {e}",
             record.workspace_id
         );
+    }
+
+    // `record.workspace_path` is the workspace's original (pre-staging-
+    // rename) path — the one bazel actually hashed to derive its output
+    // base — not `staged_path`.
+    match cleanup_output_base_for_workspace(bazel_root_cache, &record.workspace_path) {
+        CleanupOutcome::Removed(path) => {
+            audit!(
+                database_path,
+                "workspace.bazel_output_base_removed",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                path = path.display().to_string(),
+            );
+        }
+        CleanupOutcome::NothingToRemove | CleanupOutcome::RootUnknown => {}
+        CleanupOutcome::Failed(e) => {
+            eprintln!(
+                "warning: pool trim: failed to remove bazel output base for {}: {e}",
+                record.workspace_id
+            );
+            audit!(
+                database_path,
+                "workspace.bazel_output_base_remove_failed",
+                repo = record.repo,
+                workspace_id = record.workspace_id,
+                error = e.to_string(),
+            );
+        }
     }
 
     eprintln!(

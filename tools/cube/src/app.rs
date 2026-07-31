@@ -5,6 +5,7 @@
 //! All logic lives in the submodules, grouped by the area of the CLI they
 //! serve.
 
+mod bazel_output_base;
 mod change;
 mod checkleft_gate;
 mod disk;
