@@ -1831,10 +1831,11 @@ pub enum FrontendRequest {
     /// `environmental` is the load-bearing field: `true` means the app
     /// **measured** a host condition that makes surface creation impossible
     /// for *any* work item (no active display — see
-    /// `SpawnCapability.evaluate()` app-side), so the failure says nothing
+    /// `SpawnCapability.verdict(for:)` app-side), so the failure says nothing
     /// about the work item and the execution must be returned to the queue
     /// re-dispatchable rather than terminalized. `false` (the default, and
-    /// what every pre-#2579 app sends) keeps the historical behaviour: the
+    /// what any app predating the `environmental` field sends) keeps the
+    /// historical behaviour: the
     /// execution is marked `orphaned` and the failure counts against the
     /// work item's churn budget. Defaulting to `false` is deliberate — a
     /// cause the app cannot positively identify as environmental must still

@@ -1305,15 +1305,6 @@ pub async fn serve_with_merge_probe(
         Duration::from_secs(60),
     );
 
-    // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
-    // that never reported a shell pid AND never received a single hook
-    // event — proof no worker process ever came up at all, distinct from
-    // `mark_stalled_spawns` (which only ever promotes a slot that DOES
-    // have a pid, i.e. a real process blocked on the interactive
-    // directory-trust prompt). This is the fix for the 2026-07-03/04
-    // false-live incident, where such a slot instead sat at
-    // `activity=waiting_for_input, shell_pid=0` forever and had to be
-    // noticed and manually reaped. Runs every 60s and fires on boot.
     // Let every dispatch pause/resume — whatever its origin — push a fresh
     // health snapshot to connected frontends. Registered here because it is
     // the first point at which `ServerState` exists as an `Arc`; stored
@@ -1323,6 +1314,22 @@ pub async fn serve_with_merge_probe(
         &(server_state.clone() as Arc<dyn crate::coordinator::EngineHealthNotifier>),
     ));
 
+    // Give the coordinator the spawn-health tracker so a pre-flight spawn
+    // rejection can resolve an in-flight recovery probe immediately rather
+    // than leaving it to the 120s stall backstop.
+    server_state
+        .execution_coordinator
+        .set_spawn_health(server_state.spawn_health.clone());
+
+    // Periodic spawn-ack sweep: detects worker slots stuck in `Spawning`
+    // that never reported a shell pid AND never received a single hook
+    // event — proof no worker process ever came up at all, distinct from
+    // `mark_stalled_spawns` (which only ever promotes a slot that DOES
+    // have a pid, i.e. a real process blocked on the interactive
+    // directory-trust prompt). This is the fix for the 2026-07-03/04
+    // false-live incident, where such a slot instead sat at
+    // `activity=waiting_for_input, shell_pid=0` forever and had to be
+    // noticed and manually reaped. Runs every 60s and fires on boot.
     let _spawn_ack_sweep_handle = crate::spawn_ack_sweep::spawn_loop(
         server_state.work_db.clone(),
         server_state.live_worker_states.clone(),

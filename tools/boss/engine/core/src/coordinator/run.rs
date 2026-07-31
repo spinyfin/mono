@@ -24,6 +24,15 @@ impl ExecutionCoordinator {
     ///
     /// The workspace lease has already been released by the caller, which is
     /// why the requeue clears the lease columns.
+    ///
+    /// It does resolve the half-open recovery probe, though. A rejection at
+    /// the app's pre-flight never reaches `spawn_ack_sweep`'s reap (this
+    /// method handles the synchronous error itself), so if the rejected
+    /// spawn was the canary admitted through a Breaker pause, nothing else
+    /// would clear it until the 120s stall backstop — flattening the probe
+    /// backoff and logging a bogus "went stale" warning for a probe that
+    /// resolved promptly. `record_probe_failure` no-ops for any other
+    /// execution id, so it is safe to call unconditionally.
     async fn handle_host_environment_spawn_rejection(
         &self,
         execution: &WorkExecution,
@@ -31,6 +40,10 @@ impl ExecutionCoordinator {
         lease: &CubeWorkspaceLease,
         host_reason: &str,
     ) {
+        let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
+        if let Some(spawn_health) = self.spawn_health() {
+            spawn_health.record_probe_failure(&execution.id, now_epoch_secs);
+        }
         match self
             .work_db
             .requeue_execution_after_environmental_failure(&execution.id, host_reason)
@@ -71,7 +84,7 @@ impl ExecutionCoordinator {
             &execution.id,
             &execution.work_item_id,
             host_reason,
-            boss_engine_utils::epoch_time::now_epoch_secs(),
+            now_epoch_secs,
         )
         .await;
     }
