@@ -1137,10 +1137,16 @@ fn parse_transcript_tail_events(
             let normalizer =
                 driver_slug.and_then(|slug| boss_engine::driver::DriverRegistry::default().require(slug).ok());
             match normalizer {
-                Some(driver) => Ok(boss_engine::driver_transcript::parse_transcript_with_driver(
-                    Some(driver.as_ref()),
-                    joined,
-                )),
+                Some(driver) => {
+                    let events =
+                        boss_engine::driver_transcript::parse_transcript_with_driver(Some(driver.as_ref()), joined);
+                    let has_content = joined.lines().any(|line| !line.trim().is_empty());
+                    if events.is_empty() && has_content {
+                        Err(anyhow::anyhow!("{err}")).with_context(|| format!("rendering transcript {transcript_path}"))
+                    } else {
+                        Ok(events)
+                    }
+                }
                 None => {
                     Err(anyhow::anyhow!("{err}")).with_context(|| format!("rendering transcript {transcript_path}"))
                 }
@@ -1797,11 +1803,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_transcript_tail_events_errors_when_driver_resolves_but_cannot_normalize_content() {
+        // A resolvable driver slug that still can't make sense of the tail
+        // content (e.g. a Grok tail window landing entirely on a
+        // `session_update` variant `parse_acp_envelope` maps to `Unknown`,
+        // or any other non-empty content the driver silently drops) must
+        // not swallow the original schema error into an empty transcript —
+        // the doc comment on `parse_transcript_tail_events` promises the
+        // opposite, and this is the exact "renders nothing" symptom this
+        // module set out to fix.
+        let jsonl = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
+            r#""sessionUpdate":"totally_unknown_variant","foo":"bar"}}}"#,
+        );
+        assert!(
+            boss_engine::transcript_markdown::parse_transcript_checked(jsonl).is_err(),
+            "raw ACP content must not match the Claude/Codex schema directly"
+        );
+        let err = parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl")
+            .expect_err("a resolvable driver that normalizes to nothing must still surface the schema error");
+        assert!(err.to_string().contains("rendering transcript"), "got: {err}");
+    }
+
+    #[test]
     fn parse_transcript_tail_events_errors_when_no_driver_can_normalize_unknown_content() {
         let jsonl = r#"{"totally":"unrecognised"}"#;
         let err = parse_transcript_tail_events(jsonl, None, "/tmp/t.jsonl")
             .expect_err("unrecognised content with no driver to fall back on must still error");
         assert!(err.to_string().contains("rendering transcript"));
+    }
+
+    #[test]
+    fn parse_transcript_tail_events_grok_joins_tool_call_and_surfaces_hook_events() {
+        // A `tool_call` / `tool_call_update` pair only joins into one
+        // `ToolUse` (no spurious filler for the update line) because
+        // `parse_transcript_with_driver` builds a stateful
+        // `GrokTranscriptSession` for the whole tail — an isolated
+        // per-line normalize (a regression back to
+        // `normalize_transcript_entry`) would instead see the update in
+        // isolation, fail the `toolCallId` correlation, and emit an
+        // extra `{"type":"system"}` filler event with no subtype. A
+        // `hook_execution` record must also surface as a system event,
+        // per the brief's requirement that hook events render alongside
+        // assistant text and tool calls/results.
+        let jsonl = concat!(
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
+            r#""sessionUpdate":"tool_call","toolCallId":"call-1","title":"run_terminal_command","rawInput":{"command":"echo hi"}}}}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
+            r#""sessionUpdate":"tool_call_update","toolCallId":"call-1","rawOutput":{"exit_code":0,"output":"hi"}}}}"#,
+            "\n",
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"#,
+            r#""sessionUpdate":"hook_execution","event_name":"Stop"}}}"#,
+        );
+        let events =
+            parse_transcript_tail_events(jsonl, Some("grok"), "/tmp/t.jsonl").expect("grok driver must normalize");
+
+        let tool_uses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TranscriptEventKind::ToolUse { name, input } => Some((name.as_str(), input)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_uses.len(),
+            1,
+            "expected exactly one joined tool call; got {events:?}"
+        );
+        assert_eq!(tool_uses[0].0, "Bash");
+        assert_eq!(tool_uses[0].1, &serde_json::json!({"command": "echo hi"}));
+
+        let system_events: Vec<_> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                TranscriptEventKind::System { subtype, .. } => Some(subtype.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system_events,
+            vec![Some("hook_execution".to_owned())],
+            "the tool_call_update must join silently (no unmatched filler) and the hook \
+             execution must be the only system event; got {events:?}",
+        );
+
+        let render_opts = boss_engine::transcript_markdown::RenderOpts {
+            hide_tools: true,
+            ..Default::default()
+        };
+        let segments = boss_engine::transcript_markdown::events_to_segments(&events, &render_opts);
+        assert!(
+            segments
+                .iter()
+                .all(|segment| segment.role != boss_engine::transcript_markdown::SegmentRole::Tool),
+            "--no-tools must drop the Grok tool segment exactly as it does for Claude; got {segments:?}",
+        );
     }
 
     #[test]

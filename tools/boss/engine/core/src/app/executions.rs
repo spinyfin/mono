@@ -989,22 +989,26 @@ pub(super) async fn handle_tail_run_transcript(ctx: Dispatch, req: FrontendReque
                 match read_result {
                     Ok((lines_out, truncated)) => {
                         // `run_id` may be either namespace (see the host
-                        // resolution above); try it as an `exec_*` id first,
-                        // then fall back through the `work_runs` row's own
-                        // `execution_id` for a `run_*` id. The client needs
-                        // this to normalize `lines` through the producing
-                        // driver's own dialect before rendering — see the
-                        // `driver` field's doc comment on `RunTranscriptTail`.
-                        let driver_slug =
+                        // resolution above). A `run_*` id can never resolve
+                        // as an execution id, so trying it first against
+                        // `resolve_execution_driver_slug` always misses and
+                        // logs a misleading "no driver slug resolves for
+                        // this execution" before falling back — check the
+                        // `run_*` shape first (mirroring the host
+                        // resolution's own namespace-aware order above) and
+                        // only try the id directly as an `exec_*` id
+                        // otherwise. The client needs this to normalize
+                        // `lines` through the producing driver's own dialect
+                        // before rendering — see the `driver` field's doc
+                        // comment on `RunTranscriptTail`.
+                        let driver_slug = if let Ok(run) = server_state.work_db.get_run(&run_id) {
+                            crate::driver_transcript::resolve_execution_driver_slug(
+                                &server_state.work_db,
+                                &run.execution_id,
+                            )
+                        } else {
                             crate::driver_transcript::resolve_execution_driver_slug(&server_state.work_db, &run_id)
-                                .or_else(|| {
-                                    server_state.work_db.get_run(&run_id).ok().and_then(|run| {
-                                        crate::driver_transcript::resolve_execution_driver_slug(
-                                            &server_state.work_db,
-                                            &run.execution_id,
-                                        )
-                                    })
-                                });
+                        };
                         send_response(
                             &sink,
                             &request_id,
