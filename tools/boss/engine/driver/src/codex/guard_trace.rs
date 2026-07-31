@@ -180,10 +180,10 @@ def emit_decision(decision, reason):
     failed and runs the call regardless. So the allow path here writes *nothing*,
     which is the only thing Codex accepts as "proceed".
 
-    That also rules out re-emitting the guard's stdout verbatim, which is what
-    this shim used to do. Claude's extra fields are not merely ignored by Codex;
-    `suppressOutput`, `stopReason` and `continue:false` are named rejections, so
-    passing them through converts a decision into a hook failure.
+    That also rules out re-emitting the guard's stdout verbatim. Claude's extra
+    fields are not merely ignored by Codex; `suppressOutput`, `stopReason` and
+    `continue:false` are named rejections, so passing them through converts a
+    decision into a hook failure.
 
     A block must carry a non-empty reason for the same reason.
     """
@@ -819,14 +819,21 @@ mod tests {
         // Codex rejects a reasonless block, and a rejected response runs the
         // call — so passing the guard's silence through would quietly disarm it.
         // The shim substitutes a reason rather than emitting one Codex discards.
+        //
+        // Asserting equality with the Rust constant, not merely non-emptiness,
+        // is what binds the shim's `BLOCK_WITHOUT_REASON` to
+        // `decision::BLOCK_WITHOUT_REASON`: the two copies live in different
+        // languages, and without this a worker would see different refusal text
+        // depending on which layer produced the block.
         let (verdict, lines) = run_shim(
             "block-no-reason",
             "import json,sys\nsys.stdin.read()\nprint(json.dumps({'decision':'block'}))\n",
             PAYLOAD,
         );
-        assert!(
-            !block_reason(&verdict).trim().is_empty(),
-            "a block must carry a reason or Codex discards it: {verdict:?}"
+        assert_eq!(
+            block_reason(&verdict),
+            decision::BLOCK_WITHOUT_REASON,
+            "the shim's substituted reason must match the Rust-side constant"
         );
         assert_eq!(lines[0]["decision"], "block");
     }

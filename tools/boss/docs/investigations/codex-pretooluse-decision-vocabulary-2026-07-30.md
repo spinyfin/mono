@@ -47,7 +47,9 @@ Three findings beyond the reported bug:
 
 1. **`deny` is not a synonym for `block` on the `decision` key.** `{"decision":"deny"}` is rejected, while `permissionDecision:deny` is accepted. The shim's `classify()` treated `deny` as a valid block and re-emitted it verbatim, so a guard using that spelling would have failed open. No shipping guard used it; the translation now covers it regardless.
 2. **A reasonless block is a disarmed guard**, per the verdict above.
-3. **`continue: true` is accepted**, though only `continue:false` appears in the binary's rejection list — so the list is not a complete description of the key's handling.
+3. **`continue: true` is accepted**, though only `continue:false` appears in the binary's rejection list — so the list is not a complete description of the key's handling. `continue:false` itself was not exercised live; the model in `decision.rs` rejects it on the binary string alone, and says so.
+
+`updatedInput` is deliberately absent from both the matrix and the model. The binary's string is `PreToolUse hook returned updatedInput without permissionDecision:allow`, which establishes only that it is refused _without_ an allow that is itself refused — not that a bare `updatedInput` is unsupported. Nobody has measured it, so nothing here claims to know.
 
 The rejection strings are present verbatim in the shipping binary and cover more than `PreToolUse` alone:
 
@@ -57,6 +59,7 @@ PreToolUse hook returned unsupported permissionDecision:allow
 PreToolUse hook returned unsupported permissionDecision:ask
 PreToolUse hook returned unsupported stopReason
 PreToolUse hook returned unsupported suppressOutput
+PreToolUse hook returned unsupported continue:false
 PreToolUse hook returned reason without decision
 PreToolUse hook returned permissionDecision:deny without a non-empty permissionDecisionReason
 ```

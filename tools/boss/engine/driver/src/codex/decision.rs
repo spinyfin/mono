@@ -2,24 +2,29 @@
 //!
 //! # Why this module exists
 //!
-//! Boss's guard scripts are written in Claude Code's hook dialect, and the
-//! Codex shim used to re-emit their stdout byte-for-byte. Codex rejects that
-//! dialect: every tool call by a Codex worker produced one
-//! `PreToolUse hook returned unsupported decision:approve` per armed guard.
+//! Boss's guard scripts are written in Claude Code's hook dialect, which Codex
+//! rejects, so [`super::guard_trace`]'s shim translates their stdout rather
+//! than re-emitting it. An untranslated `{"decision":"approve"}` produces one
+//! `PreToolUse hook returned unsupported decision:approve` per armed guard, on
+//! every tool call.
 //!
 //! The rejection is **fail-open**. Codex logs the hook as failed and runs the
 //! tool call anyway, so a rejected response is indistinguishable from an
 //! approval — which is why a `block` that Codex rejects is a silently inert
 //! guard, not merely noise.
 //!
-//! Two drivers now translate rather than pass through ([`super::guard_trace`]
-//! for Codex, `driver::grok::hooks` for Grok). A third driver should reach for
-//! this module rather than inheriting Claude's vocabulary by default: the
-//! contract lives here as executable data, so a test can ask "would the target
-//! agent accept what we just emitted?" instead of restating an expectation by
-//! hand. Restating it by hand is precisely how the `approve` bug shipped — the
-//! existing tests verified that guards *fire*, never that Codex *accepts* what
-//! they emit.
+//! # Scope: this describes codex-cli, and nothing else
+//!
+//! The vocabulary below is `codex-cli`'s `PreToolUse` dialect specifically, and
+//! this module is deliberately private to [`super`]. It is not a shared
+//! cross-driver contract, and a new driver must **not** reuse it: the sibling
+//! Grok driver's `driver::grok::hooks::translate_decision` speaks a genuinely
+//! different dialect, and a third agent's is unknown until someone measures it.
+//! What is reusable is the *shape* — measure the target agent's accepted
+//! responses, encode them as executable data next to that driver, and have the
+//! driver's tests ask "would this agent accept what we just emitted?". Tests
+//! must assert that the target agent accepts what a guard emits, not that a
+//! guard fires; only the former catches a dialect mismatch.
 //!
 //! # The contract, as measured
 //!
@@ -43,12 +48,16 @@
 //! | `{"hookSpecificOutput":{…,"permissionDecision":"allow"}}`            | rejected  | proceeds  |
 //! | `{"suppressOutput": true}`                                           | rejected  | proceeds  |
 //!
+//! One row is not from that matrix: `{"continue": false}` is refused, per the
+//! binary's own validation string `PreToolUse hook returned unsupported
+//! continue:false`. Only `continue:true` was exercised live, and it is accepted
+//! — so `continue` is rejected on its false value alone.
+//!
 //! Two consequences drive the shim's translation:
 //!
 //! 1. **There is no affirmative allow token.** `approve`, `allow` and
 //!    `permissionDecision:allow` are all refused, so the only way to say "let
-//!    this through" is to say nothing. This was an open question when the work
-//!    started — it is a measurement, not an inference.
+//!    this through" is to say nothing.
 //! 2. **A block's reason is load-bearing.** `{"decision":"block"}` and an empty
 //!    reason are both rejected, and rejection means the call runs. A guard that
 //!    blocks tersely would be silently disarmed, so the shim substitutes a
@@ -57,8 +66,11 @@
 /// Substituted when a refusal arrives with no reason attached.
 ///
 /// Mirrors `BLOCK_WITHOUT_REASON` in the shim; both exist because a reasonless
-/// block is rejected, and a rejected block runs the call.
-const BLOCK_WITHOUT_REASON: &str =
+/// block is rejected, and a rejected block runs the call. The two copies are
+/// held together by `guard_trace`'s
+/// `a_guard_that_blocks_without_saying_why_still_blocks`, which runs the real
+/// shim and asserts the substituted text equals this constant.
+pub(super) const BLOCK_WITHOUT_REASON: &str =
     "Blocked by a Boss guard, which did not record a reason. Treat this as a refusal and do not retry the call";
 
 /// Render a refusal in the one shape Codex accepts.
@@ -93,12 +105,16 @@ pub(super) enum Verdict {
     Rejected(String),
 }
 
-/// Top-level keys Codex names in its own `PreToolUse` rejection messages.
+/// Top-level keys Codex refuses outright, whatever their value.
 ///
-/// `continue` is absent deliberately: only `continue:false` is refused, and
-/// `{"continue": true}` measured as accepted.
+/// `continue` is not one of them — it is refused on its `false` value alone,
+/// which [`verdict`] handles separately. `updatedInput` is absent too: the
+/// binary's string is `PreToolUse hook returned updatedInput without
+/// permissionDecision:allow`, which says it is refused *without* an allow that
+/// is itself refused — not that the key is unsupported on its own. Nobody has
+/// measured a bare `updatedInput`, so this table does not claim to know.
 #[cfg(test)]
-const UNSUPPORTED_KEYS: &[&str] = &["stopReason", "suppressOutput", "updatedInput"];
+const UNSUPPORTED_KEYS: &[&str] = &["stopReason", "suppressOutput"];
 
 /// Decide what Codex would do with `stdout` from a `PreToolUse` guard.
 ///
@@ -123,6 +139,12 @@ pub(super) fn verdict(stdout: &str) -> Verdict {
         if object.contains_key(*key) {
             return Verdict::Rejected(format!("unsupported {key}"));
         }
+    }
+
+    // `continue` is refused on its false value only; `continue:true` measured
+    // as accepted.
+    if object.get("continue") == Some(&serde_json::Value::Bool(false)) {
+        return Verdict::Rejected("unsupported continue:false".to_owned());
     }
 
     // `hookSpecificOutput` dialect, checked first: it carries its decision and
@@ -180,6 +202,7 @@ mod tests {
         "PreToolUse hook returned unsupported permissionDecision:ask",
         "PreToolUse hook returned unsupported stopReason",
         "PreToolUse hook returned unsupported suppressOutput",
+        "PreToolUse hook returned unsupported continue:false",
         "PreToolUse hook returned reason without decision",
         "PreToolUse hook returned permissionDecision:deny without a non-empty permissionDecisionReason",
     ];
@@ -249,7 +272,7 @@ mod tests {
         for emitted in [
             r#"{"suppressOutput":true}"#,
             r#"{"stopReason":"x"}"#,
-            r#"{"updatedInput":{"command":"ls"}}"#,
+            r#"{"continue":false}"#,
             r#"{"reason":"orphaned"}"#,
         ] {
             assert!(
@@ -257,7 +280,8 @@ mod tests {
                 "{emitted} must be rejected"
             );
         }
-        // `continue: true` measured as accepted; only `continue: false` is not.
+        // `continue` is refused on its false value alone: `true` measured as
+        // accepted, so the key itself is not unsupported.
         assert_eq!(verdict(r#"{"continue":true}"#), Verdict::Allow);
     }
 
@@ -273,33 +297,58 @@ mod tests {
     /// this module. Cross-check it against the binary's own strings when one
     /// is reachable.
     ///
-    /// Skipped, loudly, when no `codex` is installed: this is a conformance
-    /// check against a local tool, not a unit test of Boss's own logic, and
-    /// the rest of this module covers the logic without it.
+    /// `codex` is not on the sandboxed `PATH` a `bazel test` runs under, so
+    /// this check does not fire there. Point [`CODEX_BINARY_ENV`] at a codex
+    /// binary to run it — set-but-unreadable is a failure, not a skip, so a
+    /// typo'd path cannot look like a pass. When it is unset, the test says so
+    /// on stdout (which bazel does surface, unlike stderr, under
+    /// `--test_output=all`) and the rest of this module still covers the logic.
     #[test]
     fn the_model_matches_the_shipping_binarys_own_rejection_list() {
-        let Some(binary) = locate_codex() else {
-            eprintln!("skipping: no `codex` binary on PATH to check the contract against");
+        let Some(binary) = codex_binary() else {
+            println!(
+                "skipped: no codex binary to check the contract against. Run it with \
+                 `bazel test //tools/boss/engine/driver:driver_test \
+                 --test_env={CODEX_BINARY_ENV}=$(command -v codex) --test_output=all`."
+            );
             return;
         };
-        let bytes = std::fs::read(&binary).expect("codex binary must be readable");
-        let haystack = String::from_utf8_lossy(&bytes);
-        let mut missing: Vec<&str> = Vec::new();
-        for needle in BINARY_REJECTION_STRINGS {
-            if !haystack.contains(needle) {
-                missing.push(needle);
+        let explicit = std::env::var_os(CODEX_BINARY_ENV).is_some_and(|value| !value.is_empty());
+        let bytes = match std::fs::read(&binary) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                assert!(
+                    !explicit,
+                    "{CODEX_BINARY_ENV} points at {} which cannot be read: {error}",
+                    binary.display()
+                );
+                println!("skipped: codex at {} is unreadable: {error}", binary.display());
+                return;
             }
-        }
+        };
+        // Search the bytes directly: the binary is tens of megabytes and a
+        // lossy `String` copy of it buys nothing for an ASCII needle.
+        let missing: Vec<&str> = BINARY_REJECTION_STRINGS
+            .iter()
+            .copied()
+            .filter(|needle| !bytes.windows(needle.len()).any(|window| window == needle.as_bytes()))
+            .collect();
         assert!(
             missing.is_empty(),
-            "the installed codex ({}) no longer carries {missing:?} — the contract in this module \
+            "the codex at {} no longer carries {missing:?} — the contract in this module \
              was measured against a different CLI and must be re-measured before it is trusted",
             binary.display()
         );
     }
 
-    /// First `codex` on `PATH`, if any.
-    fn locate_codex() -> Option<std::path::PathBuf> {
+    /// Names a codex binary to run the conformance check against.
+    const CODEX_BINARY_ENV: &str = "BOSS_CODEX_BINARY";
+
+    /// The codex binary to check, from [`CODEX_BINARY_ENV`] or `PATH`.
+    fn codex_binary() -> Option<std::path::PathBuf> {
+        if let Some(explicit) = std::env::var_os(CODEX_BINARY_ENV).filter(|value| !value.is_empty()) {
+            return Some(std::path::PathBuf::from(explicit));
+        }
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
             .map(|dir| dir.join("codex"))
