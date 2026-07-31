@@ -527,11 +527,17 @@ impl SpawnHealthTracker {
 /// [`resume_dispatch_after_breaker_recovery`] auto-resumes it when the app
 /// reports capability restored or a canary reports a real shell pid, and it
 /// does not exempt `pr_review` (a review pane needs a surface exactly like a
-/// worker pane does). An operator pause is never overridden.
+/// worker pane does).
 ///
-/// Idempotent: a no-op when dispatch is already paused non-exempt, so a
-/// second rejected spawn during the same outage does not re-pause or file a
-/// duplicate attention item.
+/// An operator pause is never overridden: this is a no-op whenever dispatch
+/// is *already* paused, whatever the origin. Over a Breaker pause that is
+/// plain idempotence — a second rejected spawn during the same outage must
+/// not re-pause or file a duplicate attention item. Over an Operator pause
+/// it is a hard invariant: overwriting one would erase the operator's reason
+/// and hand their deliberate pause to
+/// [`resume_dispatch_after_breaker_recovery`], which would auto-resume it as
+/// soon as a display came back. Dispatch is held either way, which is all
+/// this function was trying to achieve.
 pub async fn hold_dispatch_for_host_environment(
     work_db: &WorkDb,
     coordinator: &ExecutionCoordinator,
@@ -541,10 +547,20 @@ pub async fn hold_dispatch_for_host_environment(
     host_reason: &str,
     now_epoch_secs: i64,
 ) {
-    if coordinator.is_dispatch_paused() && !coordinator.dispatch_pause_exempts_reviews() {
+    if let Some(origin) = coordinator.dispatch_pause_origin() {
+        // Dispatch is already held, so the hold has nothing left to add:
+        // re-pausing would only rewrite the reason and re-file a duplicate
+        // attention item. Critically, this must be an origin check and not
+        // `!dispatch_pause_exempts_reviews()`: an operator pause exempts
+        // reviews, so the inverted form fell through here and overwrote the
+        // operator's pause with a Breaker one — destroying the record of who
+        // paused and why, and making the pause auto-resumable by
+        // `resume_dispatch_after_breaker_recovery` the moment a display came
+        // back. An operator pause is never overridden.
         tracing::debug!(
             execution_id,
-            "host-environment hold: dispatch already paused (non-exempt); skipping duplicate hold",
+            origin = origin.as_metadata_str(),
+            "host-environment hold: dispatch already paused; skipping duplicate hold",
         );
         return;
     }
@@ -1323,6 +1339,114 @@ mod tests {
         .await;
         assert!(!resumed, "an operator pause must survive display recovery");
         assert!(coordinator.is_dispatch_paused());
+    }
+
+    /// The hold itself must leave an operator pause completely untouched.
+    ///
+    /// The sibling test above only exercises the *resume* side, so it could
+    /// never catch the real hazard: the hold's idempotence guard was
+    /// originally phrased as `paused && !exempts_reviews`, and an operator
+    /// pause exempts reviews — so the guard did not fire, and the hold
+    /// re-paused with `DispatchPauseOrigin::Breaker`. That erased the
+    /// operator's reason, started holding reviews they never asked to hold,
+    /// and — worst — made their deliberate pause auto-resumable by
+    /// `resume_dispatch_after_breaker_recovery`. This path is live: reviews
+    /// keep dispatching through an operator pause, so a review spawn hitting
+    /// the app's pre-flight lands exactly here.
+    #[tokio::test]
+    async fn host_environment_hold_never_overwrites_an_operator_pause() {
+        let (_dir, db) = open_db();
+        let product_id = create_product(&db);
+        let work_item_id = create_active_chore(&db, &product_id, "test chore");
+        let execution_id = create_old_execution(&db, &work_item_id);
+        let db = Arc::new(db);
+        let coordinator = make_coordinator(db.clone(), 1);
+        coordinator.pause_dispatch(
+            900,
+            DispatchPauseOrigin::Operator,
+            PauseReason::new("operator pause: reviewing a bad merge").unwrap(),
+        );
+        let sink = RecordingDispatchEventSink::new();
+
+        hold_dispatch_for_host_environment(
+            &db,
+            &coordinator,
+            &sink,
+            &execution_id,
+            &work_item_id,
+            "no active display",
+            1000,
+        )
+        .await;
+
+        assert_eq!(
+            coordinator.dispatch_pause_origin(),
+            Some(DispatchPauseOrigin::Operator),
+            "the operator's pause must keep its origin — a Breaker origin would auto-resume it",
+        );
+        assert!(
+            coordinator.dispatch_pause_exempts_reviews(),
+            "the operator did not ask for reviews to be held",
+        );
+        assert_eq!(
+            coordinator.dispatch_paused_reason().as_deref(),
+            Some("operator pause: reviewing a bad merge"),
+            "the record of who paused and why must survive",
+        );
+        assert_eq!(
+            coordinator.dispatch_paused_since_epoch_s(),
+            Some(900),
+            "the pause's start time is part of that record",
+        );
+        assert!(
+            db.list_attention_items(&execution_id)
+                .unwrap()
+                .iter()
+                .all(|a| a.kind != HOST_ENVIRONMENT_ATTENTION_KIND),
+            "dispatch is already held, so the hold has nothing to tell the operator",
+        );
+        assert!(
+            sink.events().await.iter().all(|e| e.stage != "dispatch_paused"),
+            "no pause transition happened, so none may be recorded",
+        );
+
+        // And the operator's pause is still theirs to clear: display
+        // recovery must not resume it.
+        let resumed = resume_dispatch_after_breaker_recovery(
+            &db,
+            &coordinator,
+            &sink,
+            Some(&execution_id),
+            "display is active again",
+        )
+        .await;
+        assert!(!resumed, "an operator pause must survive display recovery");
+        assert!(coordinator.is_dispatch_paused());
+    }
+
+    /// A pre-flight rejection is handled synchronously by the coordinator
+    /// and never reaches `spawn_ack_sweep`'s reap, so it has to resolve the
+    /// half-open probe itself. Without that the canary stays `in_flight`
+    /// until the 120s stall backstop, pinning probes to a flat 120s cadence
+    /// and logging "went stale" for a probe that resolved immediately.
+    #[test]
+    fn rejected_probe_resolves_immediately_and_backs_off() {
+        let tracker = SpawnHealthTracker::with_config(3, 300);
+        assert!(tracker.try_admit_probe(1000), "precondition: a probe is due");
+        tracker.mark_probe_dispatched("exec-canary", 1000);
+        assert!(!tracker.try_admit_probe(1001), "one probe in flight at a time");
+
+        // What the coordinator does on a pre-flight rejection.
+        tracker.record_probe_failure("exec-canary", 1001);
+
+        assert!(
+            !tracker.try_admit_probe(1001),
+            "the probe resolved as a failure, so backoff applies rather than an immediate retry",
+        );
+        assert!(
+            tracker.try_admit_probe(1001 + SPAWN_HEALTH_PROBE_STALL_DEADLINE_SECS),
+            "and the next attempt is due well before the 120s stall backstop would have fired",
+        );
     }
 
     #[test]

@@ -2195,6 +2195,22 @@ pub struct ExecutionCoordinator {
     /// cycle and leak both for the process lifetime.
     #[builder(default = std::sync::Mutex::new(None))]
     health_notifier: std::sync::Mutex<Option<std::sync::Weak<dyn EngineHealthNotifier>>>,
+    /// Spawn-health tracker, so a spawn the app refuses synchronously at its
+    /// pre-flight can resolve an in-flight half-open recovery probe on the
+    /// spot (see [`crate::spawn_health::SpawnHealthTracker::record_probe_failure`]).
+    ///
+    /// Every other probe outcome reaches the tracker through
+    /// `spawn_ack_sweep`, which owns its own handle. A pre-flight rejection
+    /// never reaches the sweep — the coordinator handles the error itself —
+    /// so without this the canary would sit `in_flight` until the 120s stall
+    /// backstop, pinning recovery probes to a flat 120s cadence instead of
+    /// the intended exponential backoff and logging a "went stale" warning
+    /// for a probe that in fact resolved immediately.
+    ///
+    /// `None` in tests that construct a bare coordinator; production
+    /// installs it via [`Self::set_spawn_health`] from `app::server::serve`.
+    #[builder(default = std::sync::Mutex::new(None))]
+    spawn_health: std::sync::Mutex<Option<Arc<crate::spawn_health::SpawnHealthTracker>>>,
 }
 
 /// Notified when engine-health-affecting state changes so connected
