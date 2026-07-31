@@ -353,132 +353,52 @@ Changes: `boss-release.sh` shrinks from 416 lines to roughly 90 — secrets, stu
 
 ## Proposed implementation task breakdown
 
-Tasks at the same depth that may run in parallel are noted. File-overlap warnings are called out where two otherwise-independent tasks would edit the same file.
+Six entries. Tasks that may run in parallel are noted, and file-overlap warnings are called out where two otherwise-independent tasks would edit the same file. The breakdown is deliberately coarse: work a single worker would do in one sitting — the same crate, the same shell script, the same doc — is one task rather than several, because splitting it would only force each PR to forward-port the last for no gain in reviewability.
 
-### 1. Fix the self-contradictory musl/version claims in checkleft's release doc
+### 1. Create the `//tools/release` crate: config, version resolution, and the release-state decisions
 
-Correct `tools/checkleft/docs/buildkite-release-setup.md:177`, which still says the musl target is built with `cargo --target` and that all checkleft binaries are byte-identical regardless of version — both contradicted by §7 of the same document and by `checkleft-release.sh:557` and `tools/checkleft/BUILD.bazel:59-61`. Documentation only; no code.
+Add `tools/release/` as a new workspace crate with its Bazel `rust_binary` and `rust_test` targets, minimal visibility, and a `Cargo.toml` registered in the root workspace members. It implements four layers, all of which are pure logic over injected inputs and land together because each is a few hundred lines that only the next one consumes. **Config:** the typed `ReleaseConfig` struct — flat TOML, closed enums, no inheritance. **Version resolution:** `compute_next_version` for both the `alpha-counter` and `patch-counter` schemes, including `patch-counter`'s literal-major-minor form for Boss. **Release-state queries:** the GitHub release-listing layer over `gh api repos/.../releases --paginate` (REST, deliberately not GraphQL), the published-vs-draft split that `resolve_last_release` needs, and the `git ls-remote --tags` cross-check that fails closed when the API list under-reports the true maximum tag — porting `boss-release.sh:32-62,214-250`, the hardening the other two products lack. **The skip decision:** `should_skip` (never re-release a commit already at the head of the latest published tag; on scheduled triggers, skip unless a `change_paths` entry was touched since that tag) and appoint's `assert_allowed_trigger` (refuse anything that is not a schedule or a manual `ui`/`api` build). Unit-tested over fixture manifests, fixture tag lists, and captured fixture JSON through an injectable runner; no network, no real subprocess, and no product wired to it yet.
 
-- Effort hint: `trivial`
-- Dependencies: none — may start immediately, in parallel with everything below.
+- Effort hint: `large`
+- Dependencies: none — may start immediately.
 - Scope: in-scope
 
-### 2. Create the `//tools/release` crate with config parsing and version resolution
+### 2. Implement the CLI: `prepare`, `tag`, `upload`, and `publish`
 
-Add `tools/release/` as a new workspace crate with its Bazel `rust_binary` and `rust_test` targets, minimal visibility, and a `Cargo.toml` registered in the root workspace members. Implements the typed `ReleaseConfig` struct (flat TOML, closed enums, no inheritance) and `compute_next_version` for both the `alpha-counter` and `patch-counter` schemes, including `patch-counter`'s literal-major-minor form for Boss. Unit-tested over fixture manifests and fixture tag lists; no network, no subprocess. No product is wired to it yet.
+Build the four subcommands on top of task 1. They are one task, not four, because they share the crate's CLI entry point: split apart, whichever landed second would have to forward-port the others' subcommand registration rather than replace it, and a reviewer would read them together anyway. `prepare`: fetch tags, resolve, decide skip-or-proceed, compute the version, re-fetch and collision-guard, create and push the tag, generate notes, create the release as a draft, and record the tag in Buildkite meta-data (gated on `BUILDKITE_JOB_ID`, per appoint) — including leaked-tag cleanup on failure and checkleft's manual-trigger-gated resume-existing-draft path. Notes come from `//tools/changelog:git_changelog_lib` as a library dependency — a one-line visibility widen on that target — with `github-generated` as the fallback variant. `tag`: read the tag back for later build steps. `upload`: parse `--asset <name>=<path>`, copy each file to a staging dir under its release asset name, compute and write the `<name>.sha256` sidecar in `sha256sum -c` format, and upload the staging dir with `gh release upload --clobber` over three attempts at 15/30/45 s backoff, porting `checkleft-release.sh:217-238` verbatim in behaviour. `publish`: list the release's remote assets, assert every `required_assets` entry and its sidecar are present, re-download each required asset plus any present optional asset, re-hash it against its sidecar, then `gh release edit --draft=false`, leaving the draft and its assets in place on any failure for inspection; ports `checkleft-release.sh:619-683`.
 
-- Effort hint: `medium`
-- Dependencies: none — may start immediately, in parallel with task 1.
+- Effort hint: `large`
+- Dependencies: task 1.
 - Scope: in-scope
 
-### 3. Implement release-state queries: listing, last-release resolution, and the degraded-list cross-check
+### 3. Migrate checkleft, publish the tool as a consumable prebuilt, and rewrite checkleft's release doc
 
-Implement the GitHub release-listing layer over `gh api repos/.../releases --paginate` (REST, deliberately not GraphQL), the published-vs-draft split that `resolve_last_release` needs, and the `git ls-remote --tags` cross-check that fails closed when the API list under-reports the true maximum tag. Ports `boss-release.sh:32-62,214-250` — the hardening the other two products lack. Unit-tested against captured fixture JSON through an injectable runner.
+Add `tools/checkleft/release.toml` and rewrite `.buildkite/steps/checkleft-release.sh` to three build-only phases plus `release prepare` / `release upload` / `release publish` calls, deleting every duplicated helper in the same PR. Asset names, tag scheme, musl's release-blocking status and version guard, the cargo-cross darwin fallback, and both pipeline YAMLs are unchanged. This is the tool's first real exercise, and the pipeline shape it settles on is immediately reused for the tool's own release path: `//tools/release` publishes `release-<triple>` assets with `.sha256` sidecars under `release-v*` tags, built from source inside mono so no bootstrap dependency exists and gated on the crate's `rust_test` suite — this is what external repos will pin. Then rewrite `tools/checkleft/docs/buildkite-release-setup.md` to describe the shared tool, the per-product `release.toml`, the recovery paths, and the self-release bootstrap answer. That rewrite is also the fix for the doc's self-contradictory claim at `buildkite-release-setup.md:177` that the musl target is built with `cargo --target` and that all checkleft binaries are byte-identical regardless of version — both contradicted by §7 of the same document, `checkleft-release.sh:557`, and `tools/checkleft/BUILD.bazel:59-61`. Spot-fixing that line ahead of the rewrite would be work thrown away.
 
-- Effort hint: `medium`
+- Effort hint: `large`
 - Dependencies: task 2.
 - Scope: in-scope
 
-### 4. Implement the skip decision: idempotency guard, change detection, and trigger guard
+### 4. Migrate Boss's release record to the shared tool and rewrite its release doc
 
-Implement `should_skip` (never re-release a commit already at the head of the latest published tag; on scheduled triggers, skip unless a `change_paths` entry was touched since that tag) and appoint's `assert_allowed_trigger` (refuse anything that is not a schedule or a manual `ui`/`api` build). Pure decision logic over injected inputs, fully unit-tested.
+Add `tools/boss/release.toml` and rewrite `.buildkite/steps/boss-release.sh` to keep only the secret loading, GhosttyKit stub, `bazel build -c opt --define=...`, and `.zip` `cquery` discovery, delegating everything else to the tool. Boss gains draft-then-publish and a `Boss-1.0.N.zip.sha256` sidecar. The asset name `Boss-1.0.N.zip` and the `boss-v1.0.N` tag scheme are unchanged, so the auto-update design's resolution logic is unaffected. Rewrite `tools/boss/docs/buildkite-release-setup.md` in the same PR, for the same reasons and to the same shape as checkleft's in task 3.
 
-- Effort hint: `small`
+- Effort hint: `medium`
+- Dependencies: task 2. **May run in parallel with tasks 3 and 5** — it touches only `boss-release.sh`, `tools/boss/`, and Boss's own doc, none of which those tasks edit.
+- Scope: in-scope
+
+### 5. Migrate appoint to the shared tool
+
+A PR in `brianduff/appoint`, not mono. Add a `release` entry to `multitool.lock.json` pinned to the prebuilt from task 3, add `release.toml` at the repo root, and reduce `.buildkite/steps/release.sh` to two build phases plus three tool calls, deleting the rest. Switches appoint's release notes from `--generate-notes` to `changelog`-generated path-scoped notes. This stays its own task rather than merging into task 3 or 4: it is a different repository, so it cannot share a PR with any mono work, and it is hard-blocked on the prebuilt existing.
+
+- Effort hint: `medium`
 - Dependencies: task 3.
 - Scope: in-scope
 
-### 5. Implement `release upload`: asset staging, `.sha256` sidecars, and retrying upload
+### 6. Deferred follow-ons: `gh`-runner extraction, version-scheme convergence, optional-asset retirement, and Boss.app signing
 
-Implement the `upload` subcommand: parse `--asset <name>=<path>`, copy each file to a staging dir under its release asset name, compute and write the `<name>.sha256` sidecar in `sha256sum -c` format, and upload the staging dir with `gh release upload --clobber` over three attempts at 15/30/45 s backoff. Ports `checkleft-release.sh:217-238` verbatim in behaviour.
+Four post-v1 items, independent of each other and each gated on a human decision rather than on engineering readiness. **(a) Extract a product-neutral `gh` runner:** move the generic parts of `tools/boss/github/src/gh_runner.rs` into a lower-level crate both `boss_github` and `//tools/release` can depend on, removing the duplicated subprocess wrapper this design knowingly introduces; requires untangling the tokio and `boss_gh_telemetry` coupling and re-pointing `boss_github`'s call sites. **(b) Converge checkleft's version scheme onto `patch-counter`:** move checkleft from `X.Y.Z-alpha.N` to plain `X.Y.Z` and retire the `alpha-counter` enum variant, leaving one scheme in the tool; requires re-pinning every external consumer (`brianduff/appoint`, `brianduff/checkleft-sandbox`) and updating docs that name `checkleft-v*-alpha.*` tags. **(c) Drop the optional-asset tier:** retire `checkleft-x86_64-apple-darwin`, deleting `build_cross_cargo`, the last `cargo` invocation in any release path, and the entire required/optional asset distinction from the tool; requires first establishing whether anything actually fetches that asset. **(d) Bring Boss.app signing and notarisation into the release pipeline:** wire `tools/boss/installer/release.sh`'s codesign / notarytool / stapler / `.pkg` path into CI so releases ship a signed, notarised artifact; requires provisioning Developer ID and Apple notary credentials into Buildkite.
 
-- Effort hint: `small`
-- Dependencies: task 2. **May run in parallel with tasks 3 and 4** — different modules, no shared logic. It does share the crate's CLI entry point with them, so whichever lands second must forward-port the other's subcommand registration preservingly rather than replacing it.
-- Scope: in-scope
-
-### 6. Implement `release publish`: expected-asset verification and the draft flip
-
-Implement the `publish` subcommand: list the release's remote assets, assert every `required_assets` entry and its sidecar are present, re-download each required asset plus any present optional asset, re-hash it and compare against its sidecar, then `gh release edit --draft=false`. Any failure leaves the draft and its assets in place for inspection. Ports `checkleft-release.sh:619-683`.
-
-- Effort hint: `small`
-- Dependencies: task 5 (shares the sidecar-format and asset-naming helpers).
-- Scope: in-scope
-
-### 7. Implement `release prepare` and `release tag`: tagging, notes, draft creation, and resume
-
-Wire tasks 3–4 into the `prepare` subcommand: fetch tags, resolve, decide skip-or-proceed, compute the version, re-fetch and collision-guard, create and push the tag, generate notes, create the release as a draft, and record the tag in Buildkite meta-data (gated on `BUILDKITE_JOB_ID`, per appoint). Includes the leaked-tag cleanup on failure and checkleft's manual-trigger-gated resume-existing-draft path. Adds the `tag` subcommand that build steps use to read the tag back. Notes come from `//tools/changelog:git_changelog_lib` as a library dependency — a one-line visibility widen on that target — with `github-generated` as the fallback variant.
-
-- Effort hint: `medium`
-- Dependencies: tasks 4 and 6.
-- Scope: in-scope
-
-### 8. Migrate checkleft's release pipeline to the shared tool
-
-Add `tools/checkleft/release.toml` and rewrite `.buildkite/steps/checkleft-release.sh` to three build-only phases plus `release prepare` / `release upload` / `release publish` calls, deleting every duplicated helper in the same PR. Asset names, tag scheme, musl's release-blocking status and version guard, the cargo-cross darwin fallback, and both pipeline YAMLs are unchanged. First real exercise of the tool.
-
-- Effort hint: `medium`
-- Dependencies: task 7.
-- Scope: in-scope
-
-### 9. Publish the release tool from mono as a consumable prebuilt
-
-Add a release path for `//tools/release` itself, producing `release-<triple>` assets with `.sha256` sidecars under `release-v*` tags, built from source inside mono so no bootstrap dependency exists. Gated on the crate's `rust_test` suite. This is what external repos will pin.
-
-- Effort hint: `small`
-- Dependencies: task 8 (reuses the migrated checkleft pipeline shape as the template).
-- Scope: in-scope
-
-### 10. Migrate appoint to the shared tool
-
-A PR in `brianduff/appoint`, not mono. Add a `release` entry to `multitool.lock.json` pinned to the release from task 9, add `release.toml` at the repo root, and reduce `.buildkite/steps/release.sh` to two build phases plus three tool calls, deleting the rest. Switches appoint's release notes from `--generate-notes` to `changelog`-generated path-scoped notes.
-
-- Effort hint: `medium`
-- Dependencies: task 9.
-- Scope: in-scope
-
-### 11. Migrate Boss's release record to the shared tool
-
-Add `tools/boss/release.toml` and rewrite `.buildkite/steps/boss-release.sh` to keep only the secret loading, GhosttyKit stub, `bazel build -c opt --define=...`, and `.zip` `cquery` discovery, delegating everything else to the tool. Boss gains draft-then-publish and a `Boss-1.0.N.zip.sha256` sidecar. The asset name `Boss-1.0.N.zip` and the `boss-v1.0.N` tag scheme are unchanged, so the auto-update design's resolution logic is unaffected.
-
-- Effort hint: `medium`
-- Dependencies: task 7. **May run in parallel with tasks 8–10** — it touches only `boss-release.sh` and `tools/boss/`, which none of those tasks edit.
-- Scope: in-scope
-
-### 12. Rewrite the two release-setup docs for the shared tool
-
-Rewrite `tools/checkleft/docs/buildkite-release-setup.md` and `tools/boss/docs/buildkite-release-setup.md` to describe the shared tool, the per-product `release.toml`, the recovery paths, and the self-release bootstrap answer. Supersedes task 1's spot fix.
-
-- Effort hint: `small`
-- Dependencies: tasks 8 and 11.
-- Scope: in-scope
-
-### 13. Extract a product-neutral `gh` runner crate
-
-Move the generic parts of `tools/boss/github/src/gh_runner.rs` into a lower-level crate both `boss_github` and `//tools/release` can depend on, removing the duplicated subprocess wrapper this design knowingly introduces. Requires untangling the tokio and `boss_gh_telemetry` coupling and re-pointing `boss_github`'s call sites.
-
-- Effort hint: `medium`
-- Dependencies: task 11.
-- Scope: deferred (future / not a v1 blocker) — the duplication is small and self-contained, and the extraction touches a live Boss crate; not worth blocking unification on.
-
-### 14. Converge checkleft's version scheme onto `patch-counter`
-
-Retire the `alpha-counter` enum variant by moving checkleft from `X.Y.Z-alpha.N` to plain `X.Y.Z`, leaving one scheme in the tool. Requires re-pinning every external consumer (`brianduff/appoint`, `brianduff/checkleft-sandbox`) and updating docs that name `checkleft-v*-alpha.*` tags.
-
-- Effort hint: `medium`
-- Dependencies: task 10.
-- Scope: deferred (future / not a v1 blocker) — consumer-visible with no benefit to unification itself; needs an explicit human decision first (see the attentions manifest).
-
-### 15. Drop the optional-asset tier by retiring checkleft's cargo-cross darwin asset
-
-Remove `checkleft-x86_64-apple-darwin`, deleting `build_cross_cargo`, the last `cargo` invocation in any release path, and the entire required/optional asset distinction from the tool. Requires first establishing whether anything actually fetches that asset.
-
-- Effort hint: `small`
-- Dependencies: task 8.
-- Scope: deferred (future / not a v1 blocker) — a simplification with an unknown consumer, not a prerequisite for unification.
-
-### 16. Bring Boss.app signing and notarisation into the release pipeline
-
-Wire `tools/boss/installer/release.sh`'s codesign / notarytool / stapler / `.pkg` path into CI so releases ship a signed, notarised artifact. Requires provisioning Developer ID and Apple notary credentials into Buildkite.
-
-- Effort hint: `large`
-- Dependencies: task 11.
-- Scope: deferred (future / not a v1 blocker) — explicitly out of scope for this design; it is artifact _building_, needs new credential paths the brief rules out without a separate decision, and is not part of the CI release path today.
+- Effort hint: `large` in aggregate — `medium` for (a) and (b), `small` for (c), `large` for (d).
+- Dependencies: (a) and (d) follow task 4; (b) follows task 5; (c) follows task 3.
+- Scope: deferred (future / not a v1 blocker) — none of the four is a prerequisite for unification. The runner duplication is small and self-contained and the extraction touches a live Boss crate; the scheme convergence is consumer-visible with no benefit to unification itself and needs an explicit human decision first (see the attentions manifest); the asset retirement is a simplification with an unknown consumer; and signing is explicitly out of scope for this design — it is artifact _building_, is not part of the CI release path today, and needs new credential paths the brief rules out without a separate decision.

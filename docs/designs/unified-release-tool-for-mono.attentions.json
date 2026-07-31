@@ -1,7 +1,7 @@
 [
   {
     "question_type": "yes_no",
-    "prompt": "Bring Boss's release record (version resolution, tag, notes, draft, upload, verify, publish) into the shared tool in v1? Saying yes gives Boss draft-then-publish and .sha256 sidecars it lacks today, and gives checkleft/appoint Boss's hardened REST + git-ls-remote version resolution they lack today. Saying no keeps v1 to checkleft + appoint only, and drops task 11.",
+    "prompt": "Bring Boss's release record (version resolution, tag, notes, draft, upload, verify, publish) into the shared tool in v1? Saying yes gives Boss draft-then-publish and .sha256 sidecars it lacks today, and gives checkleft/appoint Boss's hardened REST + git-ls-remote version resolution they lack today. Saying no keeps v1 to checkleft + appoint only, and drops the Boss migration task from the breakdown.",
     "anchor": "boss-app-in-or-out"
   },
   {
