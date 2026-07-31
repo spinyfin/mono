@@ -1662,29 +1662,15 @@ impl WorkDb {
                 bail!("attention item execution `{provided}` does not match finished execution `{execution_id}`",);
             }
 
-            let attention_id = next_id("attn");
-            let status = input.status.unwrap_or_else(|| "open".to_owned());
-            let resolved_at = normalize_optional_text(input.resolved_at);
-            tx.execute(
-                "INSERT INTO work_attention_items (
-                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-                 ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    attention_id,
-                    execution_id,
-                    input.kind,
-                    status,
-                    input.title,
-                    input.body_markdown,
-                    now,
-                    resolved_at,
-                ],
-            )?;
-
-            Some(
-                query_attention_item(&tx, &attention_id)?
-                    .with_context(|| format!("missing attention item after insert: {attention_id}"))?,
-            )
+            // Routed through `insert_attention_item_row` (rather than a
+            // bespoke raw INSERT) so this filer gets the same
+            // `warn_if_lifecycle_undeclared` coverage and `last_raised_at`
+            // stamping as every other path — see `work/attention_filing.rs`.
+            let resolved_input = CreateAttentionItemInput {
+                execution_id: Some(execution_id.to_owned()),
+                ..input
+            };
+            Some(crate::work::workitems::insert_attention_item_row(&tx, &resolved_input)?)
         } else {
             None
         };

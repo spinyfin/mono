@@ -74,9 +74,9 @@ const ATTENTION_WORK_ITEM: &str = "COALESCE(
 /// [`crate::work::reraise_open_work_item_attention`]), which is the right UI
 /// behaviour but freezes `created_at` at the *first* occurrence. Comparing
 /// evidence against that would clear a live signal with pre-occurrence proof:
-/// a pane dies at T1, the orphan sweep redispatches and a run starts at T2,
-/// the replacement pane dies too at T3 and no new row is written — and a
-/// sweep anchored on T1 accepts the T2 run start and resolves an attention
+/// the pane dies (t0); the orphan sweep redispatches and a run starts (t1);
+/// the replacement pane dies too (t2) and no new row is written — and a
+/// sweep anchored on t0 accepts the t1 run start and resolves an attention
 /// whose condition is true right now. The repeated die/redispatch/die cycle
 /// is exactly the case an operator most needs to keep seeing.
 ///

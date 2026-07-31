@@ -489,7 +489,11 @@ mod workitems;
 // reaches for the in-tx variant; every other caller uses the public,
 // tx-owning `WorkDb::create_attention`.
 pub(crate) use attention_filing::reraise_open_work_item_attention;
-pub use attention_filing::warn_if_lifecycle_undeclared;
+// pub(crate), not pub: no consumer outside boss-engine-core exists, and the
+// intra-doc links to it from the crate-public `attention_lifecycle` module
+// (rustdoc's `private_intra_doc_links` warns on those, not `broken_intra_doc_links`
+// on a pub(crate) target) are formatted as plain code rather than doc links.
+pub(crate) use attention_filing::warn_if_lifecycle_undeclared;
 pub use attention_reconcile::AttentionReconcileOutcome;
 use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;

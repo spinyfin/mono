@@ -171,11 +171,15 @@ impl WorkDb {
     /// with the same `kind` is already open. Idempotent: repeated reconciler
     /// ticks for the same failure do not pile up rows.
     ///
-    /// Also the filer behind [`Self::upsert_churn_guard_parked_attention`], so
+    /// Also the filer behind [`Self::file_churn_guard_parked_attention`], so
     /// the dedup branch goes through [`reraise_open_work_item_attention`]:
     /// `churn_guard_parked` is a [`ClearedBy::WorkResumed`] kind, and a guard
     /// that re-trips onto its own still-open row must not then be cleared by a
-    /// run that started before the current trip.
+    /// run that started before the current trip. That filer re-files on every
+    /// sweep pass with a refreshed failure count, so each pass advances
+    /// `last_raised_at` — intentionally: the guard stops re-filing only once
+    /// it redispatches, so the next run start still clears the row against
+    /// the most recent trip, not a stale earlier one.
     ///
     /// [`ClearedBy::WorkResumed`]: crate::attention_lifecycle::ClearedBy::WorkResumed
     pub fn upsert_external_tracker_attention(

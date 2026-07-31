@@ -13,12 +13,12 @@ Both are engine-owned state. The app renders them and does not interpret them: i
 
 Every attention kind declares which shape of evidence applies to it, in `tools/boss/engine/core/src/attention_lifecycle.rs`. The four shapes are:
 
-| `ClearedBy`                    | Evidence                                                                                                               | Applied by             |
-| ------------------------------ | ---------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| `WorkResumed`                  | A run for the same work item started at or after the signal was raised                                                 | the generic reconciler |
-| `ExecutionKindCompleted(kind)` | An execution of that kind for the same work item reached `completed` at or after the signal was raised                 | the generic reconciler |
-| `ProducerReconciles`           | The kind's own producer re-reads its condition every pass and resolves the item itself                                 | that producer          |
-| `HumanDecision`                | None is sufficient — the signal records something a later success does not undo, or is a gate a human is meant to open | a human                |
+| `ClearedBy`                    | Evidence                                                                                                                                                    | Applied by             |
+| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
+| `WorkResumed`                  | A run for the same work item started at or after the signal was raised                                                                                      | the generic reconciler |
+| `ExecutionKindCompleted(kind)` | An execution of that kind for the same work item (other than the one the attention was filed against) reached `completed` at or after the signal was raised | the generic reconciler |
+| `ProducerReconciles`           | The kind's own producer re-reads its condition every pass and resolves the item itself                                                                      | that producer          |
+| `HumanDecision`                | None is sufficient — the signal records something a later success does not undo, or is a gate a human is meant to open                                      | a human                |
 
 `ProducerReconciles` and `HumanDecision` are declarations that no generic rule applies, **and why**. They are not blanks. Each entry in the table carries a `rationale` string, and a unit test refuses an entry whose rationale is too short to be a real one — the point is that a future reader can tell a deliberate "human only" from a forgotten one.
 
@@ -29,6 +29,8 @@ Every automatic rule requires the evidence to **postdate the signal**. A run tha
 That is what keeps a genuinely-broken item loud. If dispatch keeps failing, nothing ever starts, no evidence ever accrues, and the banner and the attentions stay exactly where they are — indefinitely, with no expiry. The goal is that a card reflects the item's _current_ state, not that failures become invisible.
 
 Nothing is deleted, either. Resolution stamps `status = 'resolved'` and `resolved_at`; the row stays queryable, and the underlying failure remains in the dispatch-event log and the execution's own history.
+
+A signal can be re-raised onto an already-open row instead of getting a fresh one — the dedup contract every filer implements is one open row per (scope, kind). When that happens, `last_raised_at` is stamped forward to the re-raise time while `created_at` keeps recording when the row was first opened, so the boundary check above compares evidence against `COALESCE(last_raised_at, created_at)`, not bare `created_at`. Otherwise evidence from between the original raise and the re-raise would look postdating when it is really stale. For `ExecutionKindCompleted`, the completing execution must also not be the one the attention was filed against — an execution cannot supply the evidence that clears a signal about itself.
 
 ## Where it runs
 
@@ -45,8 +47,8 @@ This is the actual defect being guarded against. Raising a signal always went th
 
 ## Debugging a signal that will not clear
 
-1. Find the kind: `SELECT id, kind, status, created_at, resolved_at FROM work_attention_items WHERE work_item_id = '<id>' OR execution_id IN (SELECT id FROM work_executions WHERE work_item_id = '<id>')`.
+1. Find the kind: `SELECT id, kind, status, created_at, last_raised_at, resolved_at FROM work_attention_items WHERE work_item_id = '<id>' OR execution_id IN (SELECT id FROM work_executions WHERE work_item_id = '<id>')`.
 2. Look the kind up in `ATTENTION_LIFECYCLES`. If it is `HumanDecision` or `ProducerReconciles`, the reconciler is deliberately not touching it — read the entry's `rationale` for why.
-3. If it is automatic, check the evidence. For `WorkResumed`, the item needs a `work_runs` row whose `started_at` is at or after the attention's `created_at`. For `ExecutionKindCompleted`, an execution of that kind with `status = 'completed'` and a `finished_at` at or after it. No such row means the condition genuinely has not been superseded, and the signal is correct to still be showing.
+3. If it is automatic, check the evidence against `COALESCE(last_raised_at, created_at)`, not bare `created_at` — a re-raised row moves the reference point forward to the last re-raise, and comparing against the original `created_at` will find stale evidence that looks postdating but is not. For `WorkResumed`, the item needs a `work_runs` row whose `started_at` is at or after that value. For `ExecutionKindCompleted`, an execution of that kind with `status = 'completed'` and a `finished_at` at or after it, whose `id` is not the attention's own `execution_id` — an execution never clears an attention filed against itself. No such row means the condition genuinely has not been superseded, and the signal is correct to still be showing.
 
 All timestamp columns in this schema are epoch-seconds-as-text, so `CAST(… AS INTEGER)` comparisons are exact rather than lexicographic.

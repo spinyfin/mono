@@ -6,8 +6,9 @@
 //!
 //! 1. **A kind with no declared lifecycle is surfaced.**
 //!    [`warn_if_lifecycle_undeclared`] runs on every filing path — the
-//!    work-item upsert, the execution-scoped `create_attention_item`, and
-//!    the bespoke raw-INSERT helpers for `repo_unresolved` /
+//!    work-item upsert, the execution-scoped `create_attention_item` /
+//!    `insert_attention_item_row` (which `finish_execution_run` also routes
+//!    through), and the bespoke raw-INSERT helpers for `repo_unresolved` /
 //!    `revision_archived`. The original defect was that raising went through
 //!    shared plumbing while lowering was left to each producer to remember;
 //!    a guard wired into only one of the filers would reproduce it in
@@ -57,10 +58,10 @@ pub fn warn_if_lifecycle_undeclared(kind: &str) {
 /// `created_at` records the *first* occurrence forever, and the reconciler's
 /// "evidence must postdate the signal" rule would then accept evidence that
 /// predates the current occurrence. Concretely for `pane_death_reconcile`:
-/// pane dies at T1, the orphan sweep redispatches and a run starts at T2,
-/// that pane dies too at T3, no new row is written — and a sweep comparing
-/// against T1 finds the T2 run start and resolves a signal whose condition
-/// is true right now.
+/// the pane dies (t0); the orphan sweep redispatches and a run starts (t1);
+/// the replacement pane dies too (t2), no new row is written — and a sweep
+/// anchored on t0 accepts the t1 run start and resolves a signal whose
+/// condition is true right now.
 ///
 /// Stamping a separate `last_raised_at` (rather than mutating `created_at`)
 /// keeps the "open since" fact the surfaces already show intact, while
@@ -132,7 +133,7 @@ impl WorkDb {
     /// of a bare "is one already open?" read is what keeps the reconciler's
     /// evidence rule honest for a breaker that trips repeatedly on the same
     /// execution. See [`reraise_open_execution_attention`].
-    pub fn reraise_open_execution_attention(&self, execution_id: &str, kind: &str) -> Result<Option<String>> {
+    pub(crate) fn reraise_open_execution_attention(&self, execution_id: &str, kind: &str) -> Result<Option<String>> {
         let conn = self.connect()?;
         reraise_open_execution_attention(&conn, execution_id, kind)
     }

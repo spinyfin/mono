@@ -1981,6 +1981,8 @@ mod execution;
 mod run;
 mod scheduler;
 
+pub use run::PANE_SPAWN_FAILED_ATTENTION_KIND;
+
 /// Copy a [`crate::cube_commands::CubeCliError`]'s structured exit code +
 /// stderr into a dispatch-event `details` object when the failure was a
 /// non-zero cube CLI exit (the anaplian failure-mode A: cube granted the

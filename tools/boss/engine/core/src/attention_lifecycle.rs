@@ -141,7 +141,7 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 /// Every `work_attention_items.kind` the engine writes, with its clearing
 /// rule. Adding a kind without adding it here means the generic reconciler
 /// cannot see it, so filing runs a guard:
-/// [`crate::work::warn_if_lifecycle_undeclared`] logs a warning for an
+/// `crate::work::warn_if_lifecycle_undeclared` logs a warning for an
 /// unregistered kind and is called from *every* filing path — the
 /// work-item upsert, the execution-scoped `create_attention_item` /
 /// `insert_attention_item_row`, and the two bespoke raw-INSERT helpers.
@@ -204,6 +204,13 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         "Asserts the provider itself failed a run. A later run start is the provider working again \
          for this item. Distinct from `worker_recovery_*` below, which are dispatch *gates* whose \
          resolution is the operator's re-enable gesture, not an observation.",
+    ),
+    entry(
+        crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
+        ClearedBy::WorkResumed,
+        "Asserts the worker pane for a run never came up. A later run starting for the same item is \
+         direct evidence the pane-spawn problem is no longer blocking it — the same reasoning as \
+         `driver_terminal_error`, one stage earlier in the run's lifecycle.",
     ),
     // ── Cleared by a later completed pass of the same kind ──────────────
     entry(
@@ -495,7 +502,7 @@ mod tests {
     ///
     /// Its honest limit: `declared` is hand-maintained, so a brand-new kind
     /// constant added to *neither* this list nor the registry still passes.
-    /// That gap is what [`crate::work::warn_if_lifecycle_undeclared`] covers
+    /// That gap is what `crate::work::warn_if_lifecycle_undeclared` covers
     /// at runtime — it fires on the actual filing call, which no amount of
     /// list curation can be forgotten out of.
     #[test]
@@ -513,6 +520,7 @@ mod tests {
             crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
             crate::completion::DRIVER_TERMINAL_ERROR_ATTENTION_KIND,
             crate::completion::REVISION_NO_OP_ATTENTION_KIND,
+            crate::coordinator::PANE_SPAWN_FAILED_ATTENTION_KIND,
             crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
             crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
             crate::worker_escalation::WORKER_BLOCKED_ATTENTION_KIND,
