@@ -7,7 +7,10 @@ use tempfile::tempdir;
 use crate::external::ExternalCheckImplementationRef;
 use crate::output::Severity;
 
-use super::{CheckScope, ConfigResolver, StaleExclusionMode};
+use super::{
+    CheckScope, ConfigResolver, StaleExclusionMode, diagnose_unknown_check_fields, levenshtein_distance,
+    suggest_check_field_correction, unknown_check_field_severity,
+};
 
 mod yaml;
 
@@ -1624,4 +1627,154 @@ exclude_files = ["testdata/**"]
 
     let check = checks.get("format/oxc").expect("check exists");
     assert_eq!(check.exclude_patterns, vec!["testdata/**".to_owned()]);
+}
+
+#[test]
+fn misspelled_exclude_key_produces_diagnostic_with_correction() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nexcludes = [\"testdata/**\"]\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.iter().any(|d| d.message.contains("excludes")
+            && d.message.contains("did you mean `exclude`?")
+            && d.check_id == "rust/giant-structs"),
+        "expected a `did you mean exclude` diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn policy_field_written_as_sibling_produces_misplacement_diagnostic() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nseverity = \"warning\"\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("severity") && d.message.contains("belongs inside `policy:`")),
+        "expected a misplacement diagnostic for `severity`, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn unrelated_unknown_key_produces_generic_diagnostic_listing_known_fields() {
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nfrobnicate = true\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|d| d.message.contains("frobnicate") && d.message.contains("expected one of")),
+        "expected a generic unknown-field diagnostic, got {diagnostics:?}"
+    );
+}
+
+#[test]
+fn unknown_check_entry_key_is_currently_warning_and_does_not_block_loading() {
+    // Documents today's point in the deprecation window (see
+    // `unknown_check_field_severity`): during the grace period, a stray key is
+    // diagnosed but the check still loads with its recognised fields applied.
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        "[[checks]]\nid = \"rust/giant-structs\"\nexcludes = [\"testdata/**\"]\n",
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    assert_eq!(unknown_check_field_severity(), Severity::Warning);
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(diagnostics.iter().all(|d| d.severity == Severity::Warning));
+    assert!(
+        checks.get("rust/giant-structs").is_some(),
+        "check should still load during the warning-only grace period"
+    );
+}
+
+#[test]
+fn unknown_check_field_diagnostics_are_tagged_with_the_requested_severity() {
+    // The apply-time `Error` branch (post-grace-period) skips loading the check —
+    // exercised structurally by every other `push_diagnostic(...); continue;` config
+    // error in this file (e.g. `invalid_scope_produces_diagnostic`). This test pins
+    // the severity-tagging half of that contract directly, since the crate can't
+    // fake being a different released version from within a test.
+    let mut unknown_fields = BTreeMap::new();
+    unknown_fields.insert("excludes".to_owned(), toml::Value::Array(vec![]));
+    let diagnostics = diagnose_unknown_check_fields(
+        "rust/giant-structs",
+        &unknown_fields,
+        Path::new("CHECKS.toml"),
+        Severity::Error,
+    );
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].severity, Severity::Error);
+}
+
+#[test]
+fn suggest_check_field_correction_covers_misspelling_misplacement_and_unrelated_keys() {
+    assert_eq!(
+        suggest_check_field_correction("excludes").as_deref(),
+        Some("did you mean `exclude`?")
+    );
+    assert_eq!(
+        suggest_check_field_correction("severity").as_deref(),
+        Some("`severity` belongs inside `policy:`, not as a sibling of it")
+    );
+    assert_eq!(suggest_check_field_correction("frobnicate"), None);
+}
+
+#[test]
+fn levenshtein_distance_matches_known_values() {
+    assert_eq!(levenshtein_distance("exclude", "exclude"), 0);
+    assert_eq!(levenshtein_distance("excludes", "exclude"), 1);
+    assert_eq!(levenshtein_distance("scop", "scope"), 1);
+    assert_eq!(levenshtein_distance("frobnicate", "exclude"), 9);
+}
+
+#[test]
+fn unknown_key_inside_config_block_is_not_flagged() {
+    // `config:` is guest configuration passed through verbatim to the check
+    // implementation — its keys are never checked against the check-entry schema.
+    let temp = tempdir().expect("create temp dir");
+    fs::write(
+        temp.path().join("CHECKS.toml"),
+        r#"
+[[checks]]
+id = "rust/giant-structs"
+
+[checks.config]
+excludes = ["testdata/**"]
+whatever_the_check_wants = 1
+"#,
+    )
+    .expect("write config");
+
+    let resolver = ConfigResolver::new(temp.path()).expect("create resolver");
+    let checks = resolver.resolve_for_file(Path::new("a.rs")).expect("resolve checks");
+    let diagnostics: Vec<_> = checks.diagnostics().collect();
+    assert!(
+        diagnostics.is_empty(),
+        "keys inside `config:` must not be checked against the check-entry schema, got {diagnostics:?}"
+    );
 }

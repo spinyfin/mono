@@ -1407,7 +1407,7 @@ fn config_diagnostic_result(diagnostic: &ConfigDiagnostic) -> CheckResult {
         check_id: diagnostic.check_id.clone(),
         findings: vec![Finding {
             fixable: false,
-            severity: Severity::Error,
+            severity: diagnostic.severity,
             message: diagnostic.message.clone(),
             location: Some(diagnostic.location.clone()),
             surface: None,

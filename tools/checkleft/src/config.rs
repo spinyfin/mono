@@ -249,6 +249,12 @@ pub struct ConfigDiagnostic {
     pub message: String,
     pub location: Location,
     pub remediation: Option<String>,
+    /// Nearly all config diagnostics are hard errors (malformed CHECKS file, invalid
+    /// field value) and skip loading the offending check. The exception is an unknown
+    /// check-entry key during its deprecation window — see
+    /// `unknown_check_field_severity` — which is diagnosed at `Warning` so the check
+    /// still loads while the repo has time to fix it.
+    pub severity: Severity,
 }
 
 #[derive(Debug)]
@@ -413,6 +419,20 @@ impl ConfigResolver {
 
         for check in checks_file.checks {
             let configured_id = check.id;
+            if !check.unknown_fields.is_empty() {
+                let severity = unknown_check_field_severity();
+                for diagnostic in diagnose_unknown_check_fields(
+                    &configured_id,
+                    &check.unknown_fields,
+                    &config_relative_path,
+                    severity,
+                ) {
+                    resolved.push_diagnostic(diagnostic);
+                }
+                if severity == Severity::Error {
+                    continue;
+                }
+            }
             // check_name is the definition name (check: field, defaulting to id).
             let check_name = check.check.as_deref().unwrap_or(&configured_id).to_owned();
             let implementation = if check.enabled {
@@ -584,6 +604,14 @@ struct ParsedCheckConfig {
     /// `files` (default) or `changeset`. See [`CheckScope`].
     #[serde(default)]
     scope: Option<String>,
+    /// Any keys on this check entry that checkleft does not recognise, captured via
+    /// `#[serde(flatten)]` rather than left to a bare `deny_unknown_fields` failure.
+    /// Flattening lets us keep parsing the rest of this entry (and the rest of the
+    /// file) and turn each stray key into a diagnostic that names the check id and
+    /// suggests a correction, instead of aborting the whole CHECKS file on the first
+    /// typo. See `diagnose_unknown_check_fields`.
+    #[serde(flatten)]
+    unknown_fields: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1034,12 +1062,142 @@ fn config_file_diagnostic(
     column: Option<u32>,
     remediation: Option<String>,
 ) -> ConfigDiagnostic {
+    config_file_diagnostic_with_severity(check_id, path, message, line, column, remediation, Severity::Error)
+}
+
+fn config_file_diagnostic_with_severity(
+    check_id: String,
+    path: PathBuf,
+    message: String,
+    line: Option<u32>,
+    column: Option<u32>,
+    remediation: Option<String>,
+    severity: Severity,
+) -> ConfigDiagnostic {
     ConfigDiagnostic {
         check_id,
         message,
         location: Location { path, line, column },
         remediation,
+        severity,
     }
+}
+
+/// Released `checkleft` version as of which unknown check-entry keys are diagnosed
+/// at `Warning` severity rather than `Error` (see `ParsedCheckConfig::unknown_fields`).
+/// Any released version other than this one — i.e. the very next version the release
+/// pipeline cuts, whatever it turns out to be (`Cargo.toml` is the source of truth,
+/// see `docs/buildkite-release-setup.md`) — escalates to `Error` automatically. This
+/// gives the deprecation window real teeth without depending on a human remembering
+/// to flip a flag once the grace period has elapsed.
+const UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION: &str = "0.1.0-alpha.8";
+
+/// "Not yet released" marker: `.bazelrc`'s default for `--define CHECKLEFT_VERSION`,
+/// reported by every local/CI Bazel build that isn't the release pipeline itself.
+/// Treated the same as [`UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION`] so ordinary
+/// development builds stay in the grace period until an actual release ships past it.
+const CHECKLEFT_DEV_BUILD_VERSION: &str = "0.0.0-dev";
+
+fn unknown_check_field_severity() -> Severity {
+    // `CHECKLEFT_BUILD_VERSION` carries the release pipeline's `--define
+    // CHECKLEFT_VERSION` (see BUILD.bazel); a plain `cargo build`/crates.io consumer
+    // has no such rustc_env, so fall back to Cargo.toml's own version, same as the
+    // `--version` flag does in main.rs.
+    let effective_version = option_env!("CHECKLEFT_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    if effective_version == UNKNOWN_CHECK_FIELD_WARN_AS_OF_VERSION || effective_version == CHECKLEFT_DEV_BUILD_VERSION {
+        Severity::Warning
+    } else {
+        Severity::Error
+    }
+}
+
+/// Canonical field names on a check entry (`ParsedCheckConfig`), used to suggest a
+/// correction for a misspelled key.
+const KNOWN_CHECK_ENTRY_FIELDS: &[&str] = &[
+    "id",
+    "check",
+    "implementation",
+    "enabled",
+    "policy",
+    "config",
+    "exclude",
+    "scope",
+];
+
+/// Field names that only exist nested under `policy:`. One of these found as a
+/// sibling of `policy:` — i.e. directly on the check entry — is a misplacement,
+/// not a misspelling, and gets a more specific diagnostic than "unknown field".
+const POLICY_ONLY_FIELD_NAMES: &[&str] = &[
+    "severity",
+    "allow_bypass",
+    "bypass_name",
+    "stale_exclusion_severity",
+    "changed_lines_only",
+];
+
+/// Diagnose the unknown keys captured in `ParsedCheckConfig::unknown_fields`, naming
+/// the offending key, the check id, and the CHECKS file, and suggesting a correction
+/// when the key is a recognisable misspelling (edit distance <= 2 from a known field)
+/// or misplacement (a `policy:`-only field written as a sibling of `policy:`).
+fn diagnose_unknown_check_fields(
+    check_id: &str,
+    unknown_fields: &BTreeMap<String, toml::Value>,
+    source_path: &Path,
+    severity: Severity,
+) -> Vec<ConfigDiagnostic> {
+    unknown_fields
+        .keys()
+        .map(|key| {
+            let message = match suggest_check_field_correction(key) {
+                Some(suggestion) => format!("unknown key `{key}` on check `{check_id}` — {suggestion}"),
+                None => format!(
+                    "unknown key `{key}` on check `{check_id}`; expected one of: {}",
+                    KNOWN_CHECK_ENTRY_FIELDS.join(", ")
+                ),
+            };
+            config_file_diagnostic_with_severity(
+                check_id.to_owned(),
+                source_path.to_path_buf(),
+                message,
+                None,
+                None,
+                Some("Fix or remove this key in the CHECKS file.".to_owned()),
+                severity,
+            )
+        })
+        .collect()
+}
+
+/// Suggest a correction for an unrecognised check-entry key, or `None` if it isn't a
+/// recognisable misspelling or misplacement of a real field.
+fn suggest_check_field_correction(key: &str) -> Option<String> {
+    if POLICY_ONLY_FIELD_NAMES.contains(&key) {
+        return Some(format!("`{key}` belongs inside `policy:`, not as a sibling of it"));
+    }
+    KNOWN_CHECK_ENTRY_FIELDS
+        .iter()
+        .map(|candidate| (*candidate, levenshtein_distance(key, candidate)))
+        .filter(|(_, distance)| *distance <= 2)
+        .min_by_key(|(_, distance)| *distance)
+        .map(|(candidate, _)| format!("did you mean `{candidate}`?"))
+}
+
+/// Classic Levenshtein edit distance, used only to suggest corrections for a
+/// misspelled check-entry key; not performance-sensitive (short strings, small sets).
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut curr = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        curr[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            curr[j] = (prev[j] + 1).min(curr[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut curr);
+    }
+    prev[b.len()]
 }
 
 fn offset_to_line_column(contents: &str, offset: usize) -> (u32, u32) {
@@ -1500,6 +1658,7 @@ fn resolve_checks_file_path(dir: &Path) -> Result<Option<PathBuf>, ConfigDiagnos
                 column: None,
             },
             remediation: Some("Remove one of the two config files so checkleft knows which one to load.".to_owned()),
+            severity: Severity::Error,
         });
     }
 
