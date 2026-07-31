@@ -215,7 +215,7 @@ Field-by-field against what Boss's shared parsing expects:
 | `source: "startup"`                        | ✔            | `source: "new"`                                | **No** — but degrades safely, see below            |
 | `reason`, `lastAssistantMessage` on `Stop` | `reason`     | `reason: "end_turn"`, `lastAssistantMessage`   | Key transfers, casing differs on the second        |
 
-Every hook also gets `GROK_HOME`, `GROK_AGENT=1`, `GROK_HOOK_EVENT` (snake), `GROK_HOOK_NAME`, `GROK_SESSION_ID`, `GROK_WORKSPACE_ROOT` — **and `CLAUDE_PROJECT_DIR`**, set even for native Grok hooks. That last one is a footgun in shared scripts and is called out in [Claude-Code interop](#claude-code-interop--a-coexistence-hazard).
+Grok's hook runner injects five reserved variables into every hook: `GROK_HOOK_EVENT` (snake), `GROK_HOOK_NAME`, `GROK_SESSION_ID`, `GROK_WORKSPACE_ROOT`, and **`CLAUDE_PROJECT_DIR`**. The last is set even for native Grok hooks, so it is a footgun in shared scripts and is called out in [Claude-Code interop](#claude-code-interop--a-coexistence-hazard). The earlier spike's `env | grep GROK` output also listed `GROK_HOME` and `GROK_AGENT=1`, but those were inherited by its harness: `GROK_HOME` came from the launched process and `GROK_AGENT` from the persistent tool shell. Neither is runner-injected and neither establishes hook identity.
 
 **Three consequences, in descending severity.**
 
@@ -342,7 +342,7 @@ Grok's Claude compatibility is **on by default** and is broader than the spike m
 2. **Hooks.** Shared project `.claude/settings.json` hooks run under Grok after folder trust; global `~/.claude` hooks are always trusted when compat hooks are enabled. In a workspace that has run both drivers, this means double-firing `boss-event` forwarders or unexpected denies. **Mitigated** by `[compat.claude] hooks = false` (verified in the spike: the canary did not run).
 3. **Permissions.** `~/.claude/settings.local.json` loads as a permission source, and `/Library/Application Support/ClaudeCode/managed-settings.json` is probed for managed settings. **Not mitigated** by any `[compat.claude]` key tested (D-1).
 
-Plus the ambient one: **`CLAUDE_PROJECT_DIR` is exported to native Grok hooks.** Any shared script that branches on that variable's presence will mis-identify a Grok worker as a Claude worker. Boss's adapter must key on `GROK_AGENT=1` / `GROK_HOOK_EVENT`, never on `CLAUDE_PROJECT_DIR`.
+Plus the ambient one: **`CLAUDE_PROJECT_DIR` is exported to native Grok hooks.** Any shared script that branches on that variable's presence will mis-identify a Grok worker as a Claude worker. Boss's adapter must key on the runner-injected `GROK_HOOK_EVENT`, `GROK_HOOK_NAME`, `GROK_SESSION_ID`, and `GROK_WORKSPACE_ROOT`, never on `CLAUDE_PROJECT_DIR`.
 
 **Posture:** always Boss-owned `GROK_HOME`, always the full `[compat.claude]` and `[compat.cursor]` disable block, never point Grok at the user's live `~/.grok`, and assert the resulting posture with `grok inspect --json` before the first turn.
 

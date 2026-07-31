@@ -1,0 +1,7 @@
+{
+  "CLAUDE_PROJECT_DIR": "/private/tmp/boss-grok-hook-env/ws",
+  "GROK_HOOK_EVENT": "session_start",
+  "GROK_HOOK_NAME": "global/probe:session_start[0].hooks[0]",
+  "GROK_SESSION_ID": "019fb672-9043-70b2-a4fc-521b1e70d588",
+  "GROK_WORKSPACE_ROOT": "/private/tmp/boss-grok-hook-env/ws"
+}

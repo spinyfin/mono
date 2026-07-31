@@ -247,7 +247,7 @@ fn write_executable(path: &Path, body: &str) -> anyhow::Result<()> {
 ///
 /// Fails **closed** (emits `{"decision":"deny", ...}` and logs to stderr)
 /// whenever it cannot positively canonicalise the invocation or the guard's
-/// output: wrong/absent `GROK_AGENT` identity, a stdin payload that is not a
+/// output: wrong/absent Grok hook identity, a stdin payload that is not a
 /// JSON object, a guard exit that produces no parseable decision. Passing an
 /// unrecognised payload through unmodified — or defaulting to allow — is
 /// exactly the silent guardrail-loss failure mode this adapter exists to
@@ -278,7 +278,7 @@ the guard on stdin, and translates the guard's block/approve decision into
 Grok's deny/allow vocabulary.
 
 Fails CLOSED (deny) -- never approve -- whenever it cannot positively
-canonicalise the invocation: wrong/absent GROK_AGENT identity, a payload
+canonicalise the invocation: wrong/absent Grok hook identity, a payload
 that is not a JSON object, or a guard result it cannot parse as a known
 decision. A silently-approved unrecognised invocation is exactly the
 guardrail-loss failure mode this adapter exists to prevent.
@@ -396,12 +396,18 @@ def main():
     guard_command = sys.argv[1]
 
     # Identity: this adapter must run only under a genuine Grok hook
-    # invocation. Key on GROK_AGENT / GROK_HOOK_EVENT -- never on
-    # CLAUDE_PROJECT_DIR, which Grok exports even for its own native hooks
-    # and would misidentify this invocation as a Claude session.
-    if os.environ.get("GROK_AGENT") != "1" or not os.environ.get("GROK_HOOK_EVENT"):
+    # invocation. Grok's hook runner injects these four values. Never key on
+    # CLAUDE_PROJECT_DIR: Grok also exports that for its own native hooks.
+    hook_identity = (
+        os.environ.get("GROK_HOOK_EVENT"),
+        os.environ.get("GROK_HOOK_NAME"),
+        os.environ.get("GROK_SESSION_ID"),
+        os.environ.get("GROK_WORKSPACE_ROOT"),
+    )
+    if not all(hook_identity):
         fail_closed(
-            "GROK_AGENT=1 / GROK_HOOK_EVENT not present in the hook environment; "
+            "GROK_HOOK_EVENT / GROK_HOOK_NAME / GROK_SESSION_ID / "
+            "GROK_WORKSPACE_ROOT not present in the hook environment; "
             "refusing to run an interception guard outside a recognised Grok hook invocation"
         )
 
@@ -578,14 +584,28 @@ mod tests {
         adapter_path: &Path,
         guard_command: &str,
         grok_payload: &serde_json::Value,
-        agent_env: bool,
+        real_hook_env: bool,
     ) -> (i32, String, String) {
         let mut cmd = std::process::Command::new("python3");
         cmd.arg(adapter_path).arg(guard_command);
-        if agent_env {
-            cmd.env("GROK_AGENT", "1").env("GROK_HOOK_EVENT", "pre_tool_use");
-        } else {
-            cmd.env_remove("GROK_AGENT").env_remove("GROK_HOOK_EVENT");
+        for key in [
+            "GROK_HOOK_EVENT",
+            "GROK_HOOK_NAME",
+            "GROK_SESSION_ID",
+            "GROK_WORKSPACE_ROOT",
+            "CLAUDE_PROJECT_DIR",
+            "GROK_AGENT",
+        ] {
+            cmd.env_remove(key);
+        }
+        if real_hook_env {
+            // This fixture was recorded from the installed Grok 0.2.114 hook
+            // runner. Loading it keeps this acceptance path tied to the
+            // runner's contract rather than manufacturing one in the test.
+            let hook_env: std::collections::BTreeMap<String, String> =
+                serde_json::from_str(include_str!("testdata/grok-hook-env-0.2.114.json"))
+                    .expect("real Grok hook environment fixture must be valid JSON");
+            cmd.envs(hook_env);
         }
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
@@ -778,10 +798,10 @@ mod tests {
         );
     }
 
-    /// Fail-closed: missing `GROK_AGENT`/`GROK_HOOK_EVENT` must deny, never
+    /// Fail-closed: missing runner-injected Grok hook identity must deny, never
     /// silently approve or pass the payload through unmodified.
     #[test]
-    fn adapter_fails_closed_without_grok_agent_identity() {
+    fn adapter_fails_closed_without_grok_hook_identity() {
         if !python3_available() {
             eprintln!("python3 not available; skipping adapter acceptance test");
             return;
@@ -800,7 +820,7 @@ mod tests {
         let decision: serde_json::Value = serde_json::from_str(&stdout).expect(&stdout);
         assert_eq!(
             decision["decision"], "deny",
-            "missing GROK_AGENT identity must fail closed: {stdout}"
+            "missing Grok hook identity must fail closed: {stdout}"
         );
     }
 
@@ -817,8 +837,10 @@ mod tests {
         let mut cmd = std::process::Command::new("python3");
         cmd.arg(&adapter_path)
             .arg(PR_REDIRECT_GUARD_COMMAND)
-            .env("GROK_AGENT", "1")
             .env("GROK_HOOK_EVENT", "pre_tool_use")
+            .env("GROK_HOOK_NAME", "global/boss-provision:pre_tool_use[0].hooks[0]")
+            .env("GROK_SESSION_ID", "test-session")
+            .env("GROK_WORKSPACE_ROOT", "/tmp/ws")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
