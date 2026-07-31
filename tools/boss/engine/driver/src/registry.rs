@@ -234,11 +234,14 @@ mod tests {
                 || !plan.provided.contains(&Capability::ToolProvisioning),
             "ToolProvisioning must be absent/degraded for Codex: {plan:?}"
         );
-        // Design tasks still require-strict ToolUseInterception + StructuredOutput;
-        // Codex provides both, so Design must also clear the gate.
-        resolver
-            .check_dispatch(&TaskKind::Design)
-            .expect("Codex provides ToolUseInterception + StructuredOutput for Design");
+        // Design/Investigation/DesignPostmortem all require-strict
+        // ToolUseInterception + StructuredOutput (Codex-eligibility Phase 2);
+        // Codex provides both, so every document-producing kind clears the gate.
+        for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+            resolver
+                .check_dispatch(&kind)
+                .unwrap_or_else(|e| panic!("Codex provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
+        }
     }
 
     /// Acceptance: `--driver grok` resolves in the registry and the
@@ -271,11 +274,14 @@ mod tests {
                 || !plan.provided.contains(&Capability::ToolProvisioning),
             "ToolProvisioning must be absent/degraded for Grok: {plan:?}"
         );
-        // Design tasks still require-strict ToolUseInterception + StructuredOutput;
-        // Grok provides both, so Design must also clear the gate.
-        resolver
-            .check_dispatch(&TaskKind::Design)
-            .expect("Grok provides ToolUseInterception + StructuredOutput for Design");
+        // Design/Investigation/DesignPostmortem all require-strict
+        // ToolUseInterception + StructuredOutput (Codex-eligibility Phase 2);
+        // Grok provides both, so every document-producing kind clears the gate.
+        for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+            resolver
+                .check_dispatch(&kind)
+                .unwrap_or_else(|e| panic!("Grok provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
+        }
     }
 
     #[test]

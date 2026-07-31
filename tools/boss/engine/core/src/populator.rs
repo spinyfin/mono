@@ -1379,6 +1379,72 @@ mod tests {
         assert_eq!(publisher.work_items_created_len().await, Some(2));
     }
 
+    /// Codex-eligibility Phase 2 acceptance criterion (agent-driver design
+    /// doc, "Which work-item kinds are Codex-eligible"): a Codex-authored
+    /// design doc's `Proposed implementation task breakdown` must parse and
+    /// materialise follow-up tasks through the exact same path a
+    /// Claude-authored doc goes through. Nothing in this pipeline branches on
+    /// which driver wrote the doc — `fetch_doc` reads raw markdown off the
+    /// repo and `plan` hands it to the driver-agnostic utility-model
+    /// Planner — so this exercises `Populator::run` against doc content and a
+    /// breakdown shaped like Codex's own output, seeded into a project with
+    /// no pre-existing implementation rows. (The populator's pre-seed
+    /// refusal would otherwise skip the run and read as a driver failure
+    /// rather than the dedup guard it actually is — see `refuses_pre_seeded_project`.)
+    #[tokio::test]
+    async fn codex_authored_design_doc_task_breakdown_materialises_followups() {
+        let db = open();
+        let (product_id, project_id, design_id) = seed(&db);
+        // Confirm the fixture actually starts clean per the populator's own
+        // pre-seed guard (`is_pre_seed_kind`) — a stale fixture here would
+        // silently turn this into a `SkippedPreSeeded` run instead of `Staged`.
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 0);
+
+        let codex_authored_doc = "# Codex driver follow-on: load balancing\n\n\
+            ## Proposed implementation task breakdown\n\n\
+            ### T-01 Per-driver capacity accounting\n\nAttach an in-flight counter at the dispatch gate.\n\n\
+            ### T-02 Per-provider rate-limit state\n\nRecord Codex's per-turn `usage` fields. Depends on T-01.\n";
+        let output = plan_output(
+            vec![
+                ptask("capacity", "Per-driver capacity accounting"),
+                ptask("rate-limit", "Per-provider rate-limit state"),
+            ],
+            vec![ProposedEdge {
+                dependent: "rate-limit".to_owned(),
+                prerequisite: "capacity".to_owned(),
+            }],
+            Confidence::High,
+            true,
+        );
+        let steps = steps_with(
+            DocFetchOutcomeKind::Content(codex_authored_doc.to_owned()),
+            PlannerOutcomeKind::Success(output),
+        );
+
+        let publisher = RecordingPublisher::default();
+        let outcome = Populator::run(
+            &db,
+            &steps,
+            &ctx(&product_id, &project_id, &design_id),
+            DEFAULT_MAX_TASKS,
+            &publisher,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            PopulateOutcome::Staged {
+                created: 2,
+                edges: 1,
+                skipped: 0,
+                low_confidence: false,
+            },
+            "a Codex-authored doc's task breakdown must materialise exactly like a Claude-authored one"
+        );
+        assert_eq!(project_task_count(&db, &product_id, &project_id), 2);
+        assert_eq!(publisher.work_items_created_len().await, Some(2));
+    }
+
     #[tokio::test]
     async fn low_confidence_still_stages_and_flags() {
         let db = open();

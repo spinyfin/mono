@@ -47,19 +47,26 @@ fn worker_process_lifetime_defaults_to_persistent() {
     assert_eq!(stub.worker_process_lifetime(), WorkerProcessLifetime::Persistent);
 }
 
+/// All three document-producing / design-family kinds (`Design`,
+/// `Investigation`, `DesignPostmortem` — Codex-eligibility Phase 2) escalate
+/// the same pair to required-strict, not just `Design`.
 #[test]
 fn required_strict_capabilities_refuse_absent_driver() {
-    let reqs = KindRequirements::for_kind(TaskKind::Design);
-    let no_caps = CapabilitySet::new([]);
+    for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
+        let reqs = KindRequirements::for_kind(kind.clone());
+        let no_caps = CapabilitySet::new([]);
 
-    assert_eq!(
-        reqs.resolve_absence_disposition(Capability::StructuredOutput, &no_caps),
-        Some(AbsenceDisposition::Refuse),
-    );
-    assert_eq!(
-        reqs.resolve_absence_disposition(Capability::ToolUseInterception, &no_caps),
-        Some(AbsenceDisposition::Refuse),
-    );
+        assert_eq!(
+            reqs.resolve_absence_disposition(Capability::StructuredOutput, &no_caps),
+            Some(AbsenceDisposition::Refuse),
+            "{kind:?} should refuse absent StructuredOutput",
+        );
+        assert_eq!(
+            reqs.resolve_absence_disposition(Capability::ToolUseInterception, &no_caps),
+            Some(AbsenceDisposition::Refuse),
+            "{kind:?} should refuse absent ToolUseInterception",
+        );
+    }
 }
 
 #[test]
@@ -97,11 +104,13 @@ fn absence_override_takes_precedence_over_default() {
     );
 }
 
+/// The document-producing / design-family kinds (`Design`, `Investigation`,
+/// `DesignPostmortem`) are covered separately by
+/// `required_strict_capabilities_refuse_absent_driver` — they DO escalate.
 #[test]
 fn task_kind_has_no_strict_requirements_by_default() {
     for kind in [
         TaskKind::Chore,
-        TaskKind::Investigation,
         TaskKind::ProjectTask,
         TaskKind::Revision,
         TaskKind::Task,
