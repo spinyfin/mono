@@ -35,9 +35,10 @@ pub enum ProbeDeliveryExpectation {
     NextToolBoundary,
     /// The probe waits for the worker's next turn boundary (`Stop`). This is
     /// now the *last-resort* contract, reported only for a worker whose
-    /// driver does not read mid-turn stdin at all (`codex exec`): for such a
-    /// worker there is no earlier opportunity, and for one mid-way through a
-    /// long turn it can be a while, which is exactly why the CLI says so.
+    /// driver has not measured its mid-turn stdin behaviour and so holds the
+    /// `Rejects` trait default: for such a worker there is no earlier
+    /// opportunity, and for one mid-way through a long turn it can be a
+    /// while, which is exactly why the CLI says so.
     NextTurnBoundary,
 }
 
@@ -57,7 +58,7 @@ impl ProbeDeliveryExpectation {
             Self::Immediate => "written into the worker's pane now (parked, or buffered mid-turn by the agent)",
             Self::NextToolBoundary => "will be injected when the worker's next tool call returns",
             Self::NextTurnBoundary => {
-                "will be injected at the worker's next turn boundary (its driver takes no mid-turn input)"
+                "will be injected at the worker's next turn boundary (its driver's mid-turn input handling is undeclared)"
             }
         }
     }
