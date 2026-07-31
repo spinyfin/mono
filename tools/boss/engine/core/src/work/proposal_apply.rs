@@ -62,7 +62,7 @@ use boss_protocol::{
     Attention, AttentionGroup, AttentionProposalPayload, AutomationOutcomeProposalPayload, BlockedProposalPayload,
     CreateAttentionInput, CreateAttentionItemInput, DeferredScopeProposalPayload, EffortEscalationProposalPayload,
     FollowupTaskProposalPayload, PrCreatedProposalPayload, ProposalKind, ReviewBatchMemberStatus,
-    ReviewReportProposalPayload, ReviewVerdictProposalPayload,
+    ReviewReportProposalPayload, ReviewVerdictProposalPayload, RunDoneProposalPayload,
 };
 
 /// `work_attention_items.kind` for an `attention` proposal that did not
@@ -90,7 +90,8 @@ pub fn apply_policy(kind: ProposalKind) -> ProposalApplyPolicy {
         | ProposalKind::DeferredScope
         | ProposalKind::AutomationOutcome
         | ProposalKind::PrCreated
-        | ProposalKind::ReviewReport => ProposalApplyPolicy::AutoApply,
+        | ProposalKind::ReviewReport
+        | ProposalKind::RunDone => ProposalApplyPolicy::AutoApply,
         // Gated by design: task creation from a followup proposal always
         // requires the human batch-accept gesture
         // (`WorkDb::action_attention_group`). See
@@ -158,6 +159,7 @@ pub fn apply_in_transaction(
         ProposalKind::AutomationOutcome => apply_automation_outcome(tx, execution_id, payload_json, proposal_id),
         ProposalKind::PrCreated => apply_pr_created(tx, execution_id, payload_json),
         ProposalKind::ReviewReport => apply_review_report(tx, execution_id, payload_json, proposal_id),
+        ProposalKind::RunDone => apply_run_done(tx, execution_id, payload_json, proposal_id),
         ProposalKind::FollowupTask => anyhow::bail!(
             "no applier for `followup_task`; it stages via \
              stage_followup_task_in_transaction and remains Gated for human acceptance"
@@ -672,10 +674,90 @@ fn apply_pr_created(tx: &Transaction<'_>, execution_id: &str, payload_json: &str
     }))
 }
 
+/// `run_done` auto-applies by stamping the declaration onto the execution
+/// row: `run_done_declared_at` (when) and `run_done_outcome` (what the
+/// worker claims). That stamp — written in the submission transaction, like
+/// every other auto-apply kind — is what the completion path reads
+/// ([`WorkDb::execution_run_done_outcome`]), so a worker's declaration and
+/// the fact the engine gates on are the same commit.
+///
+/// Unlike `pr_created`, this applier makes **no judgment about whether the
+/// claim is true**, and deliberately so. The declaration is a *necessary*
+/// condition for the completion path's inference-only finalize arm, never a
+/// sufficient one: the evidence checks that ran before it (the SHA-delta
+/// gate, the bound PR's live state, the empty-diff / no-PR detector) all
+/// still run and still refuse. A worker that declares `delivered` having
+/// pushed nothing does not thereby close its task — it just stops being
+/// held in the "did this run even finish?" limbo the backstop exists for.
+/// Validating the claim here would put the same inference this design is
+/// replacing back in, one layer down.
+///
+/// This is the only kind that is applicable to **every** execution kind: it
+/// records nothing about a PR, a task, or an automation, so a reviewer, an
+/// answer agent, a conflict-resolution revision and a chore implementation
+/// all declare identically. That is the requirement the kinds table could
+/// not previously meet — `pr_created` covers only the runs that open a PR,
+/// and the kinds that terminate without creating anything are exactly the
+/// ones the engine could otherwise only guess about.
+///
+/// A worker may legitimately re-declare (it declared `blocked`, the blocker
+/// cleared, it went on to deliver), so a newly-applied declaration marks
+/// this execution's prior `run_done` proposals `superseded` — the same
+/// "one operative answer at a time" discipline
+/// [`apply_automation_outcome`] uses, for the same reason. The stamp is
+/// overwritten to match, so the row and the ledger never disagree about
+/// which declaration is current.
+fn apply_run_done(
+    tx: &Transaction<'_>,
+    execution_id: &str,
+    payload_json: &str,
+    proposal_id: &str,
+) -> Result<ApplyDecision> {
+    let payload: RunDoneProposalPayload =
+        serde_json::from_str(payload_json).context("run_done proposal payload_json did not deserialize")?;
+
+    let affected = tx.execute(
+        "UPDATE work_executions SET run_done_declared_at = ?2, run_done_outcome = ?3 WHERE id = ?1",
+        params![execution_id, now_string(), payload.outcome.as_str()],
+    )?;
+    if affected == 0 {
+        return Ok(ApplyDecision::Rejected(format!(
+            "execution {execution_id} no longer exists; a run cannot declare itself done after its \
+             row has been pruned"
+        )));
+    }
+
+    supersede_prior_run_done_declarations(tx, execution_id, proposal_id)?;
+
+    Ok(ApplyDecision::Applied(ApplyOutcome {
+        // The execution row is what the apply produced, and it is the row
+        // the completion gate reads — so it is the honest `applied_ref`.
+        applied_ref: Some(execution_id.to_owned()),
+        post_commit_audit_line: None,
+    }))
+}
+
+/// Mark this execution's prior `run_done` proposals `superseded`, per
+/// [`apply_run_done`]'s doc comment. `proposal_id` (the row about to be
+/// decided) is excluded; at the point this runs it has not been inserted
+/// yet, so the exclusion is defensive rather than load-bearing — the same
+/// shape as [`supersede_prior_automation_outcomes`].
+fn supersede_prior_run_done_declarations(tx: &Transaction<'_>, execution_id: &str, proposal_id: &str) -> Result<()> {
+    let now = now_string();
+    tx.execute(
+        "UPDATE worker_proposals
+         SET state = 'superseded', decided_by = 'policy', decided_at = ?2,
+             decision_reason = 'superseded by a newer run_done declaration (' || ?3 || ') for the same execution'
+         WHERE execution_id = ?1 AND kind = 'run_done' AND state IN ('proposed', 'applied') AND id <> ?3",
+        params![execution_id, now, proposal_id],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boss_protocol::ProposalState;
+    use boss_protocol::{ProposalState, RunDoneOutcome};
 
     #[test]
     fn a_rejected_automation_outcome_does_not_supersede_a_valid_predecessor() {
@@ -851,6 +933,116 @@ mod tests {
             ProposalApplyPolicy::AutoApply
         );
         assert_eq!(apply_policy(ProposalKind::PrCreated), ProposalApplyPolicy::AutoApply);
+        assert_eq!(apply_policy(ProposalKind::RunDone), ProposalApplyPolicy::AutoApply);
+    }
+
+    /// The whole point of the kind: a declaration stamps the execution row,
+    /// which is what the completion gate reads. Without this the gate can
+    /// never see a declaration and every run backstops.
+    #[test]
+    fn run_done_stamps_the_declaration_on_the_execution_row() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id, "Ship it");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+
+        assert_eq!(db.execution_run_done_outcome(&execution.id).unwrap(), None);
+
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::RunDone,
+                payload_json: r#"{"outcome":"delivered","summary":"opened the PR"}"#,
+                idempotency_key: "done-1",
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(outcome.proposal.applied_ref.as_deref(), Some(execution.id.as_str()));
+        assert_eq!(
+            db.execution_run_done_outcome(&execution.id).unwrap(),
+            Some(RunDoneOutcome::Delivered)
+        );
+    }
+
+    /// A worker that declared `blocked` and then went on to deliver must
+    /// end up with `delivered` as its operative declaration, and the
+    /// earlier one marked `superseded` rather than left as a second
+    /// simultaneously-applied answer.
+    #[test]
+    fn a_later_run_done_declaration_supersedes_the_earlier_one() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let chore = crate::test_support::create_test_chore(&db, product.id, "Ship it");
+        let execution = crate::test_support::create_ready_chore_execution(&db, chore.id.clone());
+
+        let first = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &chore.id,
+                kind: ProposalKind::RunDone,
+                payload_json: r#"{"outcome":"blocked","summary":"waiting on a decision"}"#,
+                idempotency_key: "done-blocked",
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.proposal.state, ProposalState::Applied);
+
+        db.submit_worker_proposal(SubmitWorkerProposalInput {
+            execution_id: &execution.id,
+            work_item_id: &chore.id,
+            kind: ProposalKind::RunDone,
+            payload_json: r#"{"outcome":"delivered","summary":"blocker cleared; opened the PR"}"#,
+            idempotency_key: "done-delivered",
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            db.execution_run_done_outcome(&execution.id).unwrap(),
+            Some(RunDoneOutcome::Delivered),
+            "the newest declaration must be the operative one"
+        );
+        let refetched_first = db
+            .list_worker_proposals_for_work_item(&chore.id, None, None)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == first.proposal.id)
+            .expect("the first declaration row must still exist");
+        assert_eq!(refetched_first.state, ProposalState::Superseded);
+    }
+
+    /// `run_done` is the one kind every execution kind can submit, including
+    /// the ones that never bind a PR or a task. `automation_triage` is the
+    /// sharpest case: its `work_item_id` is an automation, which is exactly
+    /// what makes `pr_created` reject — this must not.
+    #[test]
+    fn run_done_applies_from_an_execution_whose_work_item_is_not_a_task() {
+        let (_dir, db) = crate::test_support::open_db();
+        let product = crate::test_support::create_test_product(&db);
+        let automation = crate::test_support::seed_daily_automation(&db, &product.id);
+        let execution = db
+            .create_automation_triage_execution(&automation.id, "git@github.com:spinyfin/mono.git")
+            .unwrap();
+
+        let outcome = db
+            .submit_worker_proposal(SubmitWorkerProposalInput {
+                execution_id: &execution.id,
+                work_item_id: &automation.id,
+                kind: ProposalKind::RunDone,
+                payload_json: r#"{"outcome":"no_changes_needed","summary":"repo is clean"}"#,
+                idempotency_key: "done-triage",
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.proposal.state, ProposalState::Applied);
+        assert_eq!(
+            db.execution_run_done_outcome(&execution.id).unwrap(),
+            Some(RunDoneOutcome::NoChangesNeeded)
+        );
     }
 
     /// If a `Gated` kind is ever flipped to `AutoApply` in [`apply_policy`]

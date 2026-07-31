@@ -470,7 +470,11 @@ impl WorkDb {
     /// pause on the *live* run) is meaningless once the execution is over.
     /// `followup_task` is never touched — a pending followup proposal
     /// outlives its execution by design, sitting in the `followup` attention
-    /// group until the human batch-accept gesture decides it.
+    /// group until the human batch-accept gesture decides it. Neither is
+    /// `run_done`: a terminal declaration is *about* the execution reaching
+    /// its end, so expiring it when the execution goes terminal would erase
+    /// the record precisely when it becomes the answer to "did this run
+    /// finish, or did the backstop end it?".
     ///
     /// In today's policy both in-flight-only kinds auto-apply synchronously
     /// at submission ([`proposal_apply::apply_policy`]), so a `proposed` row
@@ -642,6 +646,7 @@ mod tests {
             ProposalKind::ReviewVerdict => {
                 format!(r#"{{"batch_id":"rvb_missing","verdict":{{"outcome":"approved_{i}"}}}}"#)
             }
+            ProposalKind::RunDone => format!(r#"{{"outcome":"delivered","summary":"S{i}"}}"#),
         }
     }
 
