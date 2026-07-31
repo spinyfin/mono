@@ -25,11 +25,11 @@ use crate::work::WorkDb;
 ///
 /// Both the entry and completion traces carry this, so "who tore this
 /// execution down?" is answerable from the teardown line itself rather than
-/// inferred from whichever sweep happened to log next to it. The 2026-07-31
-/// silent-spawn-abort investigation is the motivating case: `driver workspace
-/// teardown: entered` was the LAST line a run ever emitted, and nothing in it
-/// distinguished the coordinator's spawn-failure arm from a mid-spawn cancel
-/// or from any of the ~12 sweeps that also reach this function.
+/// inferred from whichever sweep happened to log next to it. That matters
+/// because ~12 distinct call sites reach this function and the teardown line
+/// is frequently the last thing an aborting run emits: without the reason,
+/// the coordinator's spawn-failure arm, a mid-spawn cancel, and any of the
+/// sweeps are indistinguishable in the log.
 ///
 /// Every variant maps to exactly one call site family. Adding a call site
 /// means adding a variant — a call site that cannot name itself is a call

@@ -459,6 +459,63 @@ async fn spawn_abort_survives_a_cancel_landing_during_the_cube_release() {
         Some("spawn_failed"),
         "spawn_failed must be the terminal stage of the timeline; got {stages:?}",
     );
+
+    // Emitting a TERMINAL `spawn_failed` this early is what takes this
+    // execution off the dispatch-stream detectors: `is_terminal_event` marks
+    // the timeline terminal, so `dispatch ghost-active` and the stage-stalled
+    // detector stop reporting it from here on. That is only safe if the
+    // row-level, DB-driven recovery still fires — so pin it rather than
+    // assume it.
+    //
+    // Two independent guarantees, in the order they take effect:
+    //
+    // 1. `run_execution`'s own tail releases the pool claim unconditionally
+    //    on this path (`hold_slot_busy` is only ever set in the sibling `Ok`
+    //    branch, which the rejected write never reaches), and the cube lease
+    //    was already handed back before the write was attempted.
+    // 2. `pool_claim_sweep` is the backstop if (1) ever regresses.
+    let pool = coordinator.worker_pool();
+    for _ in 0..200 {
+        if pool.claimed_execution_ids().await.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        pool.claimed_execution_ids().await.is_empty(),
+        "the pool claim must be released even though the terminalizing write was rejected — \
+         nothing on the dispatch stream is watching this execution any more",
+    );
+    let releases = cube.release_calls.lock().await.clone();
+    assert!(
+        releases.iter().any(|id| id == "lease-1"),
+        "the cube lease must still be handed back on the double-fault path; releases: {releases:?}",
+    );
+    let execution = db.get_execution(&execution_id).unwrap();
+    assert!(
+        execution.status.is_terminal(),
+        "the row must be terminal from the cancel that rejected the write, not left running; got {:?}",
+        execution.status,
+    );
+
+    // And the backstop reconciler agrees there is nothing stranded: a pass
+    // over this post-double-fault state finds no leaked claim to free. If the
+    // tail's release ever regresses, `released` here becomes non-zero and
+    // this reconciler — not the (now silent) dispatch stream — is what
+    // recovers the slot.
+    let live_states = crate::live_worker_state::LiveWorkerStateRegistry::new();
+    let sweep_sink = Arc::new(crate::dispatch_events::RecordingDispatchEventSink::new());
+    let outcome =
+        crate::pool_claim_sweep::run_one_pass(db.as_ref(), &live_states, coordinator.clone(), sweep_sink.as_ref())
+            .await;
+    assert_eq!(
+        outcome.released, 0,
+        "no claim may be left for the sweep to reclaim — the abort path frees its own slot",
+    );
+    assert_eq!(
+        outcome.non_terminal_skipped, 0,
+        "a non-terminal skip here would mean a claim is pinned to a row nothing will terminalize",
+    );
 }
 
 /// Slow-ack provisional-spawn regression (outcome 3): a slow `SpawnWorkerPane` ack that

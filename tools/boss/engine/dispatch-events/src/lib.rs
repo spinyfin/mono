@@ -155,15 +155,13 @@ pub enum Stage {
     /// and ahead of the (unbounded) `cube workspace release` that follows —
     /// which is the entire reason it exists separately from
     /// [`Stage::PaneSpawned`] with `outcome=error`. That event is emitted
-    /// only inside the success branch of `finish_execution_run`, minutes
-    /// later, so the 2026-07-31 incident — a spawn that aborted ~99 ms after
-    /// `run_started`, blocked ~5 minutes in the cube release, and was
-    /// cancelled in the meantime so `finish_execution_run` rejected the
-    /// terminalizing write — produced a per-execution timeline that simply
-    /// STOPPED at `run_started`, with the spawn error discarded unlogged.
-    /// This stage is the terminal marker that survives that double-fault:
-    /// `error_message` carries the full `{err:#}` chain, and `details`
-    /// carries `run_id` and `slot_id`.
+    /// only inside the success branch of `finish_execution_run`, which sits
+    /// behind an unbounded cube release and is skipped entirely if a cancel
+    /// lands first and rejects the terminalizing write. Without this stage,
+    /// that double-fault leaves a per-execution timeline that simply STOPS at
+    /// `run_started` with the spawn error discarded unlogged. This stage is
+    /// the terminal marker that survives it: `error_message` carries the full
+    /// `{err:#}` chain, and `details` carries `run_id` and `slot_id`.
     ///
     /// A healthy dispatch never emits it — `pane_spawned` is still the
     /// success terminal, and `pane_spawned/error` still follows this one when
