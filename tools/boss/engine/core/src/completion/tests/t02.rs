@@ -2581,16 +2581,6 @@ async fn build_wait_horizon_expiry_falls_back_to_normal_nudge() {
 // ended, but it is waiting, not stalled.
 // -----------------------------------------------------------
 
-/// Reports a fixed descendant count for every execution, regardless of
-/// id — enough to exercise `nudge_or_park`'s suppression branch without
-/// a real process tree.
-struct FixedDescendantProbe(usize);
-impl crate::background_children::BackgroundActivityProbe for FixedDescendantProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        self.0
-    }
-}
-
 #[tokio::test]
 async fn background_children_suppress_nudge_across_repeated_stops() {
     // Same shape as `build_wait_narration_suppresses_nudge_across_repeated_stops`:

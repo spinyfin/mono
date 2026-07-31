@@ -109,17 +109,6 @@ async fn on_stop_refuses_to_finalize_revision_that_contributed_nothing() {
     );
 }
 
-/// Reports a fixed live-descendant count for any execution — enough to
-/// drive `nudge_or_park`'s background-children suppression without a real
-/// process tree. (t02 has an identical private stub; the test modules
-/// don't share private items.)
-struct RevisionDescendantProbe(usize);
-impl crate::background_children::BackgroundActivityProbe for RevisionDescendantProbe {
-    fn live_descendant_count(&self, _execution_id: &str) -> usize {
-        self.0
-    }
-}
-
 #[tokio::test]
 async fn revision_that_contributed_nothing_is_left_alone_while_background_work_is_live() {
     // The second signal the incident ignored: the worker process was
@@ -153,7 +142,7 @@ async fn revision_that_contributed_nothing_is_left_alone_while_background_work_i
     let handler = handler
         .with_branch_verifier(verifier)
         .with_merge_probe(probe)
-        .with_background_activity_probe(Arc::new(RevisionDescendantProbe(1)));
+        .with_background_activity_probe(Arc::new(FixedDescendantProbe(1)));
 
     let outcome = handler.on_stop(&execution_id).await;
     assert!(
@@ -282,6 +271,122 @@ async fn revision_that_contributed_nothing_still_finalizes_when_bound_pr_is_merg
     );
     match db.get_work_item(&revision_id).unwrap() {
         WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::Done),
+        other => panic!("expected task, got {other:?}"),
+    }
+}
+
+// -----------------------------------------------------------
+// The satisfied-deliverable guard was restructured from
+// `(ci_clean || merge_conflict_revision || queued_for_merge)` to
+// `(merge_conflict_revision || queued_for_merge || (ci_clean &&
+// health_alone_satisfies))`. `health_alone_satisfies` is false for every
+// revision reaching this gate with `ProvenAbsent` evidence, so the
+// merge-conflict and merge-queue short-circuits are the only thing still
+// keeping those two arms alive for a no-push revision. Pin both directly
+// so a future edit that quietly drops a disjunct fails a test instead of
+// silently stranding a resolved-conflict or queued-for-merge revision.
+// -----------------------------------------------------------
+
+#[tokio::test]
+async fn merge_conflict_revision_with_proven_absent_still_finalizes_despite_dirty_ci() {
+    use crate::merge_poller::{OpenPrCiStatus, OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1980";
+    let head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let (_dir, db, _product_id, parent_chore_id, revision_id, execution_id, attempt_id) =
+        conflict_revision_fixture(workspace.path(), parent_pr_url, head);
+
+    // The conflict is already resolved from the engine's point of view —
+    // ledger retired and parent unblocked — so `try_retire_cleared_blocking_signal`
+    // finds no live attempt and falls through to the satisfied-deliverable
+    // gate, exactly like the merge-poller race this fixture models.
+    db.mark_conflict_resolution_succeeded(&attempt_id, None).unwrap();
+    db.clear_chore_blocked_merge_conflict_for_attempt(&parent_chore_id, parent_pr_url, &attempt_id)
+        .unwrap();
+
+    let detector = StubPrDetector::ok(None);
+    // SHA-delta gate: head unchanged since dispatch → ProvenAbsent.
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head.into())).await;
+    // Mergeable, but CI is NOT clean — this arm must not require it.
+    let probe: Arc<dyn MergeProbe> = Arc::new(FixedStateProbe(PrLifecycleState::Open(OpenPrStatus {
+        mergeability: OpenPrMergeability::Clean,
+        ci: OpenPrCiStatus::InFlight,
+    })));
+
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler.with_branch_verifier(verifier).with_merge_probe(probe);
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+        "a merge-conflict-provenance revision with ProvenAbsent evidence must still finalize on \
+         mergeability alone — the merge_conflict_revision disjunct must survive the guard \
+         restructure regardless of CI state; got {outcome:?}",
+    );
+    assert!(
+        probes.snapshot().is_empty(),
+        "no nudge must fire once the conflict-cleared arm accepts; got {:?}",
+        probes.snapshot(),
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
+        other => panic!("expected task, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn queued_for_merge_revision_with_proven_absent_still_finalizes_despite_dirty_ci() {
+    use crate::merge_poller::{OpenPrMergeability, OpenPrStatus, PrLifecycleState};
+
+    let workspace = tempdir().unwrap();
+    let parent_pr_url = "https://github.com/spinyfin/mono/pull/1981";
+    let head = "cccccccccccccccccccccccccccccccccccccccc";
+    let (_dir, db, _product_id, revision_id, execution_id) = revision_fixture(workspace.path(), parent_pr_url, head);
+
+    let detector = StubPrDetector::ok(None);
+    // SHA-delta gate: head unchanged since dispatch → ProvenAbsent.
+    let verifier = StubBranchVerifier::ok("boss/exec_parent");
+    verifier.set_head_oid(Ok(head.into())).await;
+
+    struct QueuedForMergeProbe;
+    #[async_trait::async_trait]
+    impl MergeProbe for QueuedForMergeProbe {
+        async fn probe(&self, url: &str) -> anyhow::Result<PrLifecycleProbe> {
+            Ok(PrLifecycleProbe::builder()
+                .url(url.to_owned())
+                .state(PrLifecycleState::Open(OpenPrStatus {
+                    mergeability: OpenPrMergeability::Clean,
+                    ci: OpenPrCiStatus::InFlight,
+                }))
+                .labels(Vec::new())
+                .review(crate::merge_poller::PrReviewState::Unknown)
+                .in_merge_queue(true)
+                .merge_queue_entry_state("AWAITING_CHECKS")
+                .build())
+        }
+    }
+
+    let TestHarness { handler, probes, .. } = TestHarness::new(db.clone(), detector);
+    let handler = handler
+        .with_branch_verifier(verifier)
+        .with_merge_probe(Arc::new(QueuedForMergeProbe));
+
+    let outcome = handler.on_stop(&execution_id).await;
+    assert!(
+        matches!(outcome, StopOutcome::DeliverableSatisfied { ref pr_url } if pr_url == parent_pr_url),
+        "a revision with ProvenAbsent evidence whose PR is already accepted into the merge queue \
+         (entry state not UNMERGEABLE) must still finalize — the queued_for_merge disjunct must \
+         survive the guard restructure regardless of CI state; got {outcome:?}",
+    );
+    assert!(
+        probes.snapshot().is_empty(),
+        "no nudge must fire once the merge-queue arm accepts; got {:?}",
+        probes.snapshot(),
+    );
+    match db.get_work_item(&revision_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => assert_eq!(t.status, TaskStatus::InReview),
         other => panic!("expected task, got {other:?}"),
     }
 }

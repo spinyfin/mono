@@ -94,9 +94,10 @@ impl WorkerCompletionHandler {
     ) {
         let body = format!(
             "This revision worker pushed no commits — the bound PR's head SHA is unchanged from \
-             the snapshot taken when the run started — and ended by emitting the sanctioned \
-             `NO_CHANGES_NEEDED` marker, its explicit claim that the review finding needs no code \
-             change.\n\n\
+             the last known baseline (the dispatch-time snapshot, or a later baseline absorbed \
+             when a concurrently-active parent worker's push was observed) — and ended by emitting \
+             the sanctioned `NO_CHANGES_NEEDED` marker, its explicit claim that the review finding \
+             needs no code change.\n\n\
              The revision has been closed as a declared no-op: no PR was opened, nothing was \
              pushed, and the bound PR ({bound_pr_url}) is untouched. **The finding that produced \
              this revision was therefore never addressed.** Read the worker's final message to \

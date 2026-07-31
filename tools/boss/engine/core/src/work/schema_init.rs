@@ -57,7 +57,7 @@ impl WorkDb {
         crate::host_registry::ensure_local_host(conn)?;
         crate::host_registry::refresh_local_host_auto_capabilities(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -714,8 +714,17 @@ impl WorkDb {
         // attentions already followed by a later completed review pass —
         // data-only, no schema change; self-idempotent.
         migrate_backfill_resolve_stale_dead_review_attentions(conn)?;
+        // `work_executions.pr_head_baseline_absorbed`: set when on_stop_inner's
+        // parent-push suppression path rewrites `pr_head_before` mid-run (a
+        // head movement attributed to the concurrently-active parent worker,
+        // not this revision). Once set, the SHA-delta gate's "head unchanged"
+        // finding means "unchanged since the last absorbed baseline", not
+        // "unchanged since the run started" — the ProvenAbsent evidence this
+        // flag gates on must not be trusted the same way a never-absorbed
+        // baseline is (mono#2606 revision).
+        migrate_work_executions_pr_head_baseline_absorbed(conn)?;
         conn.execute(
-            "INSERT INTO metadata (key, value) VALUES ('schema_version', '30')
+            "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             [],
         )?;
@@ -806,7 +815,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, "30");
+        assert_eq!(schema_version, "31");
 
         let boothby_passes_exists: bool = conn
             .query_row(

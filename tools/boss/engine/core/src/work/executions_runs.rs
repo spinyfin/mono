@@ -1214,6 +1214,39 @@ impl WorkDb {
         Ok(head)
     }
 
+    /// Stamp `pr_head_baseline_absorbed` for `execution_id`, recording that
+    /// `on_stop_inner`'s parent-push suppression path has rewritten
+    /// `pr_head_before` to a head movement it attributed to the
+    /// concurrently-active parent worker rather than to this revision's own
+    /// push. Never cleared for the life of the execution — once the
+    /// baseline has been absorbed once, every later SHA-delta comparison is
+    /// against that rewritten value, not the dispatch-time head, for good.
+    pub fn mark_execution_pr_head_baseline_absorbed(&self, execution_id: &str) -> Result<()> {
+        let conn = self.connect()?;
+        conn.execute(
+            "UPDATE work_executions SET pr_head_baseline_absorbed = 1 WHERE id = ?1",
+            params![execution_id],
+        )?;
+        Ok(())
+    }
+
+    /// Whether `pr_head_before` has ever been rewritten by the parent-push
+    /// suppression path for `execution_id` — see
+    /// [`Self::mark_execution_pr_head_baseline_absorbed`]. `false` for any
+    /// execution that has never gone through that path (including
+    /// pre-migration rows, which default to 0).
+    pub fn execution_pr_head_baseline_absorbed(&self, execution_id: &str) -> Result<bool> {
+        let conn = self.connect()?;
+        let absorbed: Option<i64> = conn
+            .query_row(
+                "SELECT pr_head_baseline_absorbed FROM work_executions WHERE id = ?1",
+                params![execution_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(absorbed.unwrap_or(0) != 0)
+    }
+
     /// Snapshot the bound PR's description/body captured at run start.
     /// Baseline for the metadata-only CI-fix finalize gate (issue #1252):
     /// `on_stop` diffs the live body against this to detect an

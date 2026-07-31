@@ -1131,6 +1131,18 @@ impl MergeProbe for FixedStateProbe {
     }
 }
 
+/// Reports a fixed live-descendant count for every execution, regardless
+/// of id — enough to exercise `nudge_or_park`'s background-children
+/// suppression branch without a real process tree. Shared by t02 (the
+/// suppression tests themselves) and t08 (the satisfied-deliverable gate's
+/// "still working" arm).
+struct FixedDescendantProbe(usize);
+impl crate::background_children::BackgroundActivityProbe for FixedDescendantProbe {
+    fn live_descendant_count(&self, _execution_id: &str) -> usize {
+        self.0
+    }
+}
+
 /// Build a conflict-resolution revision fixture. The parent chore is
 /// `blocked: merge_conflict`. A `conflict_resolutions` row is inserted
 /// in `running` state (simulating an active attempt). A revision task is
