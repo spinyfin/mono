@@ -391,7 +391,7 @@ Every create path seeds a concrete value, so the signal is visible on the row (`
 - `effort_level = max` → `investigation`. `max` is documented above as the human-only escape hatch for "Claude's maximum reasoning depth regardless of what the scope markers suggest" — its meaning was always about capability rather than size, so honouring it here preserves what `--effort max` has always bought.
 - Everything else → `standard`. This is deliberately the common case.
 
-Revisions inherit the chain root's value. Only an explicit write changes an existing row; there is no backfill, and re-dispatch reads the current value exactly as it already does for `effort_level`.
+Operator-filed revisions (`boss task create-revision` with no `--reasoning`) inherit the chain root's value. Revisions the engine mints for PR-review findings, merge-conflict resolution, and CI failures pin `standard` at create time — they hand the worker a described diff, not a diagnosis, so the chain root's mode is not evidence about their shape. Every other engine-side revision-creation path (`CommentsReviseDoc`, answered question groups) still inherits: those fire from a human acting against a design/investigation-owned doc, and the deliverable is design thinking, so the chain root's mode remains real evidence there. Only an explicit write changes an existing row; there is no backfill, and re-dispatch reads the current value exactly as it already does for `effort_level`.
 
 ### Surfaces
 

@@ -885,6 +885,13 @@ fn action_question_group(
             .description(brief.clone())
             .name(name.clone())
             .created_via(CREATED_VIA_ATTENTION)
+            // Deliberately left on the inherit side (unlike the
+            // PR-review/CI/conflict producers, which pin `standard`): this
+            // fires from an operator-answered question group against a
+            // design-doc source task, and the deliverable is design
+            // thinking, not a described diff. The chain root's reasoning
+            // mode is real evidence about the shape of this work, so it
+            // should inherit rather than pin `standard`.
             .build();
         match assert_parent_revisable_and_insert(pending, conn, input, pr_checker) {
             Ok(revision) => {

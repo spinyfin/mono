@@ -36,7 +36,7 @@
 use boss_protocol::TaskKind;
 use boss_protocol::{
     CREATED_VIA_CI_FIX_PREFIX, CreateAttentionItemInput, CreateRevisionInput, ExecutionKind, ExecutionStatus,
-    FrontendEvent,
+    FrontendEvent, ReasoningMode,
 };
 use serde::Serialize;
 
@@ -728,6 +728,10 @@ async fn maybe_spawn_ci_revision(
             .parent_task_id(candidate.work_item_id.clone())
             .description(description)
             .created_via(created_via)
+            // The failed check and its log excerpt are attached; there is
+            // nothing to diagnose. Pin `standard` rather than inheriting the
+            // chain root's mode.
+            .reasoning(ReasoningMode::Standard)
             .build(),
         pr_checker,
     ) {

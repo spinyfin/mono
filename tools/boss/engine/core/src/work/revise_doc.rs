@@ -77,6 +77,15 @@ impl WorkDb {
                         // (AlreadyInFlight), so the recent-duplicate guard
                         // must not preempt it here.
                         .force_duplicate(true)
+                        // Deliberately left on the inherit side (unlike the
+                        // PR-review/CI/conflict producers, which pin
+                        // `standard`): this fires from a human clicking
+                        // "address these doc comments" against a
+                        // design/investigation-owned doc, and the
+                        // deliverable is design thinking on that doc, not a
+                        // described diff. The chain root's reasoning mode
+                        // is real evidence about the shape of this work, so
+                        // it should inherit rather than pin `standard`.
                         .build(),
                     pr_checker,
                 ) {

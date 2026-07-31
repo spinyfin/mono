@@ -1148,6 +1148,34 @@ fn create_revision_inherits_product_and_project_from_root() {
 }
 
 #[test]
+fn create_revision_without_explicit_reasoning_still_inherits_from_root() {
+    // Operator-filed revisions (`boss task create-revision`, no explicit
+    // `--reasoning`) must keep inheriting the chain root's `reasoning`
+    // unchanged — only the engine's own automatic producers (conflict_watch,
+    // ci_watch, pr_review finalize) pin `standard` for their own shape.
+    let db = WorkDb::open(temp_db_path("revision-inherit-reasoning")).unwrap();
+    let product_id = make_revision_product(&db, "inherit-reasoning");
+    let pr_url = "https://github.com/spinyfin/mono/pull/201";
+    let parent_id = make_in_review_chore(&db, &product_id, pr_url);
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET reasoning = 'investigation' WHERE id = ?1",
+            rusqlite::params![parent_id],
+        )
+        .unwrap();
+
+    let checker = FakePrStateChecker::always(PrOpenState::Open);
+    let revision = db.create_revision(revision_input(&parent_id), &checker).unwrap();
+
+    assert_eq!(
+        revision.reasoning,
+        Some(boss_protocol::ReasoningMode::Investigation),
+        "an operator-filed revision with no explicit reasoning must inherit the chain root's"
+    );
+}
+
+#[test]
 fn create_revision_inherits_repo_remote_url_from_root() {
     // Issue #840: under a multi-repo product (product.repo_remote_url is
     // NULL) the chain root carries its own per-task repo override. The

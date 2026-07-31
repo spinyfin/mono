@@ -67,6 +67,54 @@ async fn detection_spawns_revision_and_stamps_attempt() {
 }
 
 #[tokio::test]
+async fn spawned_revision_pins_standard_reasoning_regardless_of_chain_root() {
+    // Engine-minted CI-fix revisions must classify by their own shape (the
+    // failing check + log excerpt is attached — nothing to diagnose) rather
+    // than inheriting the chain root's `reasoning`. Give the chain root
+    // `investigation` and confirm the spawned revision still comes back
+    // `standard`.
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("boss.db");
+    let db = WorkDb::open(db_path.clone()).unwrap();
+    let pr = "https://github.com/foo/bar/pull/103";
+    let (product, chore) = make_in_review(&db, "C-rev-reasoning", pr);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET reasoning = 'investigation' WHERE id = ?1", [&chore])
+        .unwrap();
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    let flipped = on_ci_failure_detected(
+        &db,
+        pub_.as_ref(),
+        &fix_checker(),
+        &candidate(&product, &chore, pr),
+        &probe(pr, "head-1"),
+        &one_failure(),
+    )
+    .await;
+    assert!(flipped);
+
+    let attempt = db
+        .active_ci_remediation_for_work_item(&chore)
+        .unwrap()
+        .expect("a pending attempt row must exist");
+    let rev_id = attempt
+        .revision_task_id
+        .clone()
+        .expect("revision_task_id must be stamped");
+    let revision = match db.get_work_item(&rev_id).unwrap() {
+        WorkItem::Task(t) => t,
+        other => panic!("expected revision task, got {other:?}"),
+    };
+    assert_eq!(
+        revision.reasoning,
+        Some(boss_protocol::ReasoningMode::Standard),
+        "ci-fix revision must not inherit the investigation-shaped chain root"
+    );
+}
+
+#[tokio::test]
 async fn detection_idempotent_does_not_double_spawn_revision() {
     // Re-firing on the same head sha reuses the existing attempt (whose
     // revision_task_id is already set) and spawns no second revision.
