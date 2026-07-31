@@ -300,9 +300,9 @@ mod tests {
     /// `codex` is not on the sandboxed `PATH` a `bazel test` runs under, so
     /// this check does not fire there. Point [`CODEX_BINARY_ENV`] at a codex
     /// binary to run it — set-but-unreadable is a failure, not a skip, so a
-    /// typo'd path cannot look like a pass. When it is unset, the test says so
-    /// on stdout (which bazel does surface, unlike stderr, under
-    /// `--test_output=all`) and the rest of this module still covers the logic.
+    /// typo'd path cannot look like a pass. When it is unset, the test prints a
+    /// skip line, visible under `--test_output=all`, and the rest of this
+    /// module still covers the logic.
     #[test]
     fn the_model_matches_the_shipping_binarys_own_rejection_list() {
         let Some(binary) = codex_binary() else {
