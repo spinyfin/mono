@@ -99,23 +99,22 @@ pub(crate) fn attention_target_from_input(
     }
 }
 
-/// Emit a sticky `repo_unresolved` attention item against
-/// `work_item_id`, unless one is already open. Idempotent: repeated
-/// reconcile passes against the same work item don't pile up rows.
-/// Caller supplies the kind label (`task`, `chore`, `project`) so
-/// the message names the right CLI verb.
+/// Emit a sticky [`REPO_UNRESOLVED_ATTENTION_KIND`] attention item against
+/// `work_item_id`, unless one is already open (in which case the open row's
+/// re-raise is stamped). Idempotent: repeated reconcile passes against the
+/// same work item don't pile up rows. Caller supplies the kind label
+/// (`task`, `chore`, `project`) so the message names the right CLI verb.
+///
+/// Binds the registry constant rather than re-spelling the kind string:
+/// `repo_unresolved` is a `ClearedBy::WorkResumed` kind, so a producer-side
+/// typo would silently take it out of reconciliation — the exact class of
+/// un-lowerable signal [`crate::attention_lifecycle`] exists to prevent.
+///
+/// [`REPO_UNRESOLVED_ATTENTION_KIND`]: crate::attention_lifecycle::REPO_UNRESOLVED_ATTENTION_KIND
 pub(crate) fn record_repo_unresolved_attention(conn: &Connection, work_item_id: &str, kind_label: &str) -> Result<()> {
-    let already_open: i64 = conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM work_attention_items
-             WHERE work_item_id = ?1
-               AND kind = 'repo_unresolved'
-               AND status = 'open'
-         )",
-        [work_item_id],
-        |row| row.get(0),
-    )?;
-    if already_open != 0 {
+    let kind = crate::attention_lifecycle::REPO_UNRESOLVED_ATTENTION_KIND;
+    warn_if_lifecycle_undeclared(kind);
+    if reraise_open_work_item_attention(conn, work_item_id, kind)?.is_some() {
         return Ok(());
     }
     let id = next_id("attn");
@@ -124,9 +123,10 @@ pub(crate) fn record_repo_unresolved_attention(conn: &Connection, work_item_id: 
     let body = repo_unresolved_attention_body(work_item_id, kind_label);
     conn.execute(
         "INSERT INTO work_attention_items (
-            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-         ) VALUES (?1, NULL, ?2, 'repo_unresolved', 'open', ?3, ?4, ?5, NULL)",
-        params![id, work_item_id, title, body, now],
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+            last_raised_at
+         ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+        params![id, work_item_id, kind, title, body, now],
     )?;
     Ok(())
 }

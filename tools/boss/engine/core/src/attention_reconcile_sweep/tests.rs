@@ -35,7 +35,7 @@ fn open_attention_for_work_item(db: &WorkDb, work_item_id: &str, kind: &str, cre
 /// are filed this way (the completion handlers), and a reconciler that only
 /// understood the work-item scope would leak every one of them.
 fn open_attention_for_execution(db: &WorkDb, execution_id: &str, kind: &str, created_at: i64) -> String {
-    let id = format!("attn_test_exec_{kind}_{created_at}");
+    let id = format!("attn_test_exec_{kind}_{created_at}_{execution_id}");
     let conn = db.connect().unwrap();
     conn.execute(
         "INSERT INTO work_attention_items
@@ -86,6 +86,64 @@ fn start_run_at(db: &WorkDb, work_item_id: &str, started_at: i64) -> String {
         .unwrap();
     force_run_started_at(db, &execution.id, started_at);
     execution.id
+}
+
+/// Create an execution of `kind` for `work_item_id` and leave it un-finished,
+/// so a test can decide later whether it is the attention's own execution or
+/// a fresh one.
+fn ready_execution(db: &WorkDb, work_item_id: &str, kind: ExecutionKind) -> String {
+    db.create_execution(
+        CreateExecutionInput::builder()
+            .work_item_id(work_item_id.to_owned())
+            .kind(kind)
+            .status(ExecutionStatus::Ready)
+            .build(),
+    )
+    .unwrap()
+    .id
+}
+
+/// Flip an existing execution to `completed` with an explicit `finished_at`.
+fn force_execution_completed_at(db: &WorkDb, execution_id: &str, finished_at: i64) {
+    let conn = db.connect().unwrap();
+    let updated = conn
+        .execute(
+            "UPDATE work_executions SET status = 'completed', finished_at = ?2 WHERE id = ?1",
+            rusqlite::params![execution_id, finished_at.to_string()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1, "expected an execution row for {execution_id}");
+}
+
+/// Pin `tasks.updated_at`, the column `list_orphan_active_candidates` ages
+/// items off. Non-async so the connection guard never spans an `.await`.
+fn force_task_updated_at(db: &WorkDb, work_item_id: &str, epoch_secs: i64) {
+    let conn = db.connect().unwrap();
+    let updated = conn
+        .execute(
+            "UPDATE tasks SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![work_item_id, epoch_secs.to_string()],
+        )
+        .unwrap();
+    assert_eq!(updated, 1, "expected a task row for {work_item_id}");
+}
+
+fn task_updated_at(db: &WorkDb, work_item_id: &str) -> String {
+    let conn = db.connect().unwrap();
+    conn.query_row("SELECT updated_at FROM tasks WHERE id = ?1", [work_item_id], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+fn last_raised_at(db: &WorkDb, attention_id: &str) -> Option<String> {
+    let conn = db.connect().unwrap();
+    conn.query_row(
+        "SELECT last_raised_at FROM work_attention_items WHERE id = ?1",
+        [attention_id],
+        |row| row.get(0),
+    )
+    .unwrap()
 }
 
 fn completed_execution_at(db: &WorkDb, work_item_id: &str, kind: ExecutionKind, finished_at: i64) -> String {
@@ -368,6 +426,168 @@ async fn a_condition_that_re_trips_after_resolution_shows_again() {
     let second = open_attention_for_work_item(&db, &chore.id, crate::work::CHURN_GUARD_PARKED_ATTENTION_KIND, 9000);
     assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
     assert_eq!(attention_status(&db, &second).0, "open");
+}
+
+/// The harder half of the re-trip contract: a condition that trips *again*
+/// while its first row is still `open` must not be cleared by evidence from
+/// before the current occurrence.
+///
+/// Every filer dedups onto the open row rather than inserting a second one —
+/// `file_pane_death_attention_item` documents this explicitly ("It won't be
+/// re-filed for this chore while it stays open, even if further relaunches
+/// kill subsequent panes") — so `created_at` stays pinned to the first trip
+/// forever. The sequence below is the real one: pane dies, the orphan sweep
+/// redispatches and a run starts, that pane dies too. Anchored on
+/// `created_at` the sweep would accept the intervening run start and resolve
+/// a signal whose condition is live; anchored on `last_raised_at` it does
+/// not.
+#[tokio::test]
+async fn a_condition_that_re_trips_onto_its_still_open_row_is_not_cleared_by_the_earlier_run() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Pane keeps dying");
+
+    // First trip, then the redispatch's run start — the evidence that would
+    // legitimately clear it if nothing else had happened.
+    let attention =
+        open_attention_for_work_item(&db, &chore.id, crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND, 1000);
+    start_run_at(&db, &chore.id, 1500);
+
+    // The replacement pane dies too. The filer dedups onto the open row and
+    // returns its id — no second row — but stamps the re-raise.
+    let reraised = db
+        .upsert_work_item_attention(
+            &chore.id,
+            crate::dead_pid_sweep::PANE_DEATH_ATTENTION_KIND,
+            "App relaunch killed a worker pane",
+            "body",
+        )
+        .unwrap();
+    assert_eq!(
+        reraised, attention,
+        "the re-raise must dedup onto the open row, not insert a second"
+    );
+    let stamped: i64 = last_raised_at(&db, &attention)
+        .expect("a re-raise must stamp last_raised_at")
+        .parse()
+        .unwrap();
+    assert!(
+        stamped > 1500,
+        "the stamp must postdate the run start it must not be cleared by"
+    );
+
+    let outcome = run_one_pass(&db).await;
+    assert_eq!(outcome.attentions_resolved, 0);
+    assert_eq!(
+        attention_status(&db, &attention).0,
+        "open",
+        "the run that started before the latest trip is not evidence about it",
+    );
+}
+
+/// An attention filed *about* an execution is never cleared by that same
+/// execution completing.
+///
+/// The producers on this path file from inside the pass they are describing
+/// and then mark that execution `completed` a moment later, so without the
+/// self-exclusion the offending execution supplies its own clearing evidence
+/// and the signal self-resolves on the very first sweep. A genuinely later
+/// pass of the same kind still clears it.
+#[tokio::test]
+async fn an_execution_scoped_signal_is_not_cleared_by_its_own_execution_completing() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Reviewer died");
+
+    let reviewer = ready_execution(&db, &chore.id, ExecutionKind::PrReview);
+    let attention = open_attention_for_execution(
+        &db,
+        &reviewer,
+        crate::pr_review_recovery::PR_REVIEW_DIED_ATTENTION_KIND,
+        1000,
+    );
+
+    force_execution_completed_at(&db, &reviewer, 2000);
+    let outcome = run_one_pass(&db).await;
+    assert_eq!(outcome.attentions_resolved, 0);
+    assert_eq!(
+        attention_status(&db, &attention).0,
+        "open",
+        "the execution the signal is about cannot be its own clearing evidence",
+    );
+
+    // A different, later pr_review pass is.
+    completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 3000);
+    let outcome = run_one_pass(&db).await;
+    assert_eq!(outcome.attentions_resolved, 1);
+    assert_eq!(attention_status(&db, &attention).0, "resolved");
+}
+
+/// `review_result_missing` records that a PR advanced to Review with **no**
+/// automated review at all. It is filed inside `finalize_pr_review_pass`,
+/// which then falls through to `record_worker_pr_completion` and stamps that
+/// same `pr_review` execution `completed` in the same or the next second.
+///
+/// Declaring it `ExecutionKindCompleted(PrReview)` therefore guaranteed the
+/// signal self-resolved within one sweep of being raised, every time —
+/// silently deleting the "review this by hand" prompt it exists to show. It
+/// is `HumanDecision` for the same reason `revision_no_changes_needed` is:
+/// the PR already advanced unreviewed, and no later pass undoes that.
+#[tokio::test]
+async fn review_result_missing_survives_its_own_review_pass_completing() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Advanced unreviewed");
+
+    assert_eq!(
+        lifecycle_for(crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND)
+            .unwrap()
+            .cleared_by,
+        ClearedBy::HumanDecision,
+    );
+
+    let reviewer = ready_execution(&db, &chore.id, ExecutionKind::PrReview);
+    let attention = open_attention_for_execution(
+        &db,
+        &reviewer,
+        crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
+        1000,
+    );
+
+    // The producer ordering: the same execution completes right after filing.
+    force_execution_completed_at(&db, &reviewer, 1000);
+    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(attention_status(&db, &attention).0, "open");
+
+    // Nor does any amount of later successful activity lower it.
+    completed_execution_at(&db, &chore.id, ExecutionKind::PrReview, 9000);
+    start_run_at(&db, &chore.id, 9500);
+    assert_eq!(run_one_pass(&db).await.attentions_resolved, 0);
+    assert_eq!(attention_status(&db, &attention).0, "open");
+}
+
+/// The sweep's banner clear must leave `tasks.updated_at` exactly where the
+/// inline clear leaves it — untouched. `list_orphan_active_candidates` gates
+/// on `CAST(t.updated_at AS INTEGER) < cutoff`, so a bump here would push the
+/// item's orphan-active detection out by a full `min_age_secs` window, and
+/// would do it only on the sweep path.
+#[tokio::test]
+async fn clearing_a_banner_does_not_reset_the_orphan_active_age_clock() {
+    let (_dir, db) = open_db();
+    let product = create_test_product(&db);
+    let chore = create_test_chore(&db, product.id, "Age clock");
+
+    start_run_at(&db, &chore.id, 2000);
+    force_dispatch_failure(&db, &chore.id, "cube_workspace_lease_failed", "lease refused", 1000);
+    force_task_updated_at(&db, &chore.id, 1000);
+
+    assert_eq!(run_one_pass(&db).await.dispatch_banners_cleared, 1);
+
+    assert_eq!(
+        task_updated_at(&db, &chore.id),
+        "1000",
+        "clearing a stale banner is bookkeeping about a finished failure, not a state change",
+    );
 }
 
 #[tokio::test]

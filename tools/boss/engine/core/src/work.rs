@@ -429,6 +429,7 @@ impl Clone for WorkDb {
 
 // ---- module tree (see PR description for the split rationale) ----
 mod answer_agent_runs;
+mod attention_filing;
 mod attention_reconcile;
 mod attentions;
 mod audit_misc;
@@ -487,6 +488,8 @@ mod workitems;
 // attention item inside its own transaction (`WorkDb::create_automation_task`)
 // reaches for the in-tx variant; every other caller uses the public,
 // tx-owning `WorkDb::create_attention`.
+pub(crate) use attention_filing::reraise_open_work_item_attention;
+pub use attention_filing::warn_if_lifecycle_undeclared;
 pub use attention_reconcile::AttentionReconcileOutcome;
 use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;

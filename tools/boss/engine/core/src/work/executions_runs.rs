@@ -17,28 +17,6 @@ pub struct CancelExecutionOpts {
     pub queued_only: bool,
 }
 
-/// Emit a trace warning when an attention `kind` has no entry in
-/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`].
-///
-/// The original defect was structural, not local: raising a signal went
-/// through shared, well-tested plumbing while lowering it was left to each
-/// producer to remember, so kinds added later simply never got a resolution
-/// path and could be raised but never lowered. The registry is the fix; this
-/// is its enforcement at the filing boundary. Deliberately a warning rather
-/// than an error — refusing to file would trade an un-clearable signal for a
-/// missing one, which is strictly worse — and deliberately not a `panic!`,
-/// since callers file attentions on best-effort paths that must not abort.
-fn warn_if_lifecycle_undeclared(kind: &str) {
-    if crate::attention_lifecycle::lifecycle_for(kind).is_none() {
-        tracing::warn!(
-            attention_kind = kind,
-            "attention filed with no declared lifecycle — add an entry to \
-             crate::attention_lifecycle::ATTENTION_LIFECYCLES saying what lowers it (ClearedBy::HumanDecision \
-             is a valid answer; leaving it undeclared means it can never be lowered automatically)",
-        );
-    }
-}
-
 impl WorkDb {
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status
@@ -551,6 +529,11 @@ impl WorkDb {
     /// raise but has not declared a way to lower is the defect
     /// [`crate::attention_lifecycle`] exists to prevent, so an unregistered
     /// kind is surfaced in the trace rather than passing silently.
+    ///
+    /// Deduping onto the open row stamps its `last_raised_at`
+    /// ([`reraise_open_work_item_attention`]) so a condition that trips
+    /// again while the row is still open is not resolved by evidence from
+    /// before the current occurrence.
     pub fn upsert_work_item_attention(
         &self,
         work_item_id: &str,
@@ -562,25 +545,16 @@ impl WorkDb {
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
-        let existing: Option<String> = tx
-            .query_row(
-                "SELECT id FROM work_attention_items
-                 WHERE work_item_id = ?1 AND kind = ?2 AND status = 'open'
-                 ORDER BY created_at ASC, id ASC
-                 LIMIT 1",
-                params![work_item_id, kind],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let id = match existing {
+        let id = match reraise_open_work_item_attention(&tx, work_item_id, kind)? {
             Some(id) => id,
             None => {
                 let id = next_id("attn");
                 let now = now_string();
                 tx.execute(
                     "INSERT INTO work_attention_items (
-                        id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-                     ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
+                        id, execution_id, work_item_id, kind, status, title, body_markdown, created_at,
+                        resolved_at, last_raised_at
+                     ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
                     params![id, work_item_id, kind, title, body_markdown, now],
                 )?;
                 id

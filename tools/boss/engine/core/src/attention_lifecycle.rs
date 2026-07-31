@@ -140,8 +140,11 @@ const fn entry(kind: &'static str, cleared_by: ClearedBy, rationale: &'static st
 
 /// Every `work_attention_items.kind` the engine writes, with its clearing
 /// rule. Adding a kind without adding it here means the generic reconciler
-/// cannot see it — [`crate::work::WorkDb::upsert_work_item_attention`] logs
-/// a warning when handed an unregistered kind, and
+/// cannot see it, so filing runs a guard:
+/// [`crate::work::warn_if_lifecycle_undeclared`] logs a warning for an
+/// unregistered kind and is called from *every* filing path — the
+/// work-item upsert, the execution-scoped `create_attention_item` /
+/// `insert_attention_item_row`, and the two bespoke raw-INSERT helpers.
 /// `every_registered_kind_is_declared_once` below pins the table itself.
 pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
     // ── Cleared by work resuming ────────────────────────────────────────
@@ -210,13 +213,6 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
          inline on every completed pass; this is the backstop for passes finalized while a prior \
          engine process was running, and the shape the rest of the table is modelled on.",
     ),
-    entry(
-        crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
-        ClearedBy::ExecutionKindCompleted(ExecutionKind::PrReview),
-        "Asserts the PR advanced with no readable review result. A later `pr_review` reaching \
-         `completed` means the PR did get reviewed after all — the gap the item records is closed. \
-         Resolution keeps the record: the row stays queryable with its `resolved_at`.",
-    ),
     // ── The producer owns resolution ────────────────────────────────────
     entry(
         crate::worker_escalation::WORKER_ESCALATION_ATTENTION_KIND,
@@ -269,6 +265,17 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
         ClearedBy::HumanDecision,
         "It is a gate, not a report: the item is held in `blocked:deletion_signoff` until a human \
          signs off. Auto-resolving would release the hold the item exists to hold.",
+    ),
+    entry(
+        crate::completion::REVIEW_RESULT_GIVEUP_ATTENTION_KIND,
+        ClearedBy::HumanDecision,
+        "Records that a PR advanced to Review with NO automated review — a fact a later pass does \
+         not undo, same reasoning as `revision_no_changes_needed`. It cannot be \
+         `ExecutionKindCompleted(PrReview)`: `finalize_pr_review_pass` files this item and then \
+         falls straight through to `record_worker_pr_completion`, which stamps that very \
+         `pr_review` execution `completed` in the same (or next) second — so the offending \
+         execution would supply its own clearing evidence and the signal would self-resolve on the \
+         first sweep, every time.",
     ),
     entry(
         crate::completion::REVISION_NO_OP_ATTENTION_KIND,
@@ -404,12 +411,16 @@ pub const ATTENTION_LIFECYCLES: &[AttentionLifecycle] = &[
 ];
 
 /// `work_attention_items.kind` for the sticky item raised when a work item
-/// has no repo resolution — written as a literal by
-/// `record_repo_unresolved_attention`, named here so the registry does not
-/// depend on a `pub(crate)` symbol.
+/// has no repo resolution. Defined here rather than next to its producer so
+/// the registry above does not have to depend on a `pub(crate)` symbol;
+/// `record_repo_unresolved_attention` binds *this* constant rather than
+/// re-spelling the string, so there is exactly one definition of the value
+/// the reconciler matches on.
 pub const REPO_UNRESOLVED_ATTENTION_KIND: &str = "repo_unresolved";
 /// `work_attention_items.kind` for the item recording an engine
-/// auto-archival of a moot revision (`record_revision_archived_attention`).
+/// auto-archival of a moot revision. Bound by
+/// `record_revision_archived_attention`; see
+/// [`REPO_UNRESOLVED_ATTENTION_KIND`] for why it lives here.
 pub const REVISION_ARCHIVED_ATTENTION_KIND: &str = "revision_archived";
 /// Attention-group kind for proposed followup work awaiting the operator's
 /// batch-accept gesture.
@@ -417,7 +428,9 @@ pub const FOLLOWUP_ATTENTION_KIND: &str = "followup";
 /// Attention-group kind for a question posed to the operator.
 pub const QUESTION_ATTENTION_KIND: &str = "question";
 /// Product-scoped external-tracker fetch failures, resolved by the
-/// reconcile loop on the next successful fetch.
+/// reconcile loop on the next successful fetch. The reconcile loop
+/// (`external_tracker::reconcile::logic`) both raises and resolves against
+/// these constants — the kind string is defined once, here.
 pub const EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND: &str = "external_tracker_auth_failed";
 /// See [`EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND`].
 pub const EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND: &str = "external_tracker_token_revoked";
@@ -477,8 +490,14 @@ mod tests {
 
     /// Names every attention-kind constant the crate defines. A kind added
     /// without a lifecycle entry fails here; a kind renamed or deleted fails
-    /// to compile. This is the mechanism that stops the original defect —
-    /// "kinds added later simply never got one" — from recurring.
+    /// to compile; and the `assert_eq!` on lengths catches an entry added to
+    /// the registry but not named here (or vice versa).
+    ///
+    /// Its honest limit: `declared` is hand-maintained, so a brand-new kind
+    /// constant added to *neither* this list nor the registry still passes.
+    /// That gap is what [`crate::work::warn_if_lifecycle_undeclared`] covers
+    /// at runtime — it fires on the actual filing call, which no amount of
+    /// list curation can be forgotten out of.
     #[test]
     fn every_attention_kind_constant_in_the_crate_is_registered() {
         let declared: &[&str] = &[
