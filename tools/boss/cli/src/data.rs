@@ -1593,19 +1593,20 @@ pub(crate) async fn run_task_executions(
             // Oldest first — matches bossctl work executions and is what
             // "history" means for a coordinator scrolling for a prior run.
             executions.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+            let execution_runs = list_execution_runs(client, &executions).await?;
             print_entity(
                 ctx,
                 &serde_json::json!({
                     "work_item_id": work_item_id,
-                    "executions": executions,
+                    "executions": execution_runs,
                 }),
                 || {
-                    if executions.is_empty() {
+                    if execution_runs.is_empty() {
                         println!("no executions for {work_item_id}");
                         return;
                     }
-                    for exec in &executions {
-                        print_execution_history_row(exec);
+                    for detail in &execution_runs {
+                        print_execution_history_row(&detail.execution, &detail.runs);
                     }
                 },
             )
@@ -1617,7 +1618,7 @@ pub(crate) async fn run_task_executions(
     }
 }
 
-fn print_execution_history_row(exec: &WorkExecution) {
+fn print_execution_history_row(exec: &WorkExecution, runs: &[WorkRun]) {
     let workspace = exec.cube_workspace_id.as_deref().unwrap_or("-");
     let started = exec.started_at.as_deref().unwrap_or("-");
     let finished = exec.finished_at.as_deref().unwrap_or("-");
@@ -1628,6 +1629,7 @@ fn print_execution_history_row(exec: &WorkExecution) {
     if let Some(pr_url) = &exec.pr_url {
         println!("  pr_url: {pr_url}");
     }
+    print_run_summaries(runs, "  ");
 }
 
 /// Like [`list_executions_for_item`] but also pulls in every revision task's
@@ -1750,30 +1752,48 @@ pub(crate) struct ExecutionRuns {
     runs: Vec<WorkRun>,
 }
 
-/// Fetch the run history for every execution shown by a leaf work-item detail.
-/// `ListRuns` is deliberately used here instead of a lossy execution-level
-/// projection: an execution can have multiple runs and each owns its own
-/// terminal `result_summary`.
+/// Fetch the run history for terminal executions shown by a work-item detail.
+/// Only a terminal execution has a durable completion outcome to display, so
+/// avoiding live rows keeps detail views from making an RPC round trip per
+/// in-progress execution. A worker may only read runs for its own execution;
+/// sibling refusals intentionally yield an empty nested history instead of
+/// making the whole detail command fail.
 pub(crate) async fn list_execution_runs(
     client: &mut BossClient,
     executions: &[WorkExecution],
 ) -> Result<Vec<ExecutionRuns>, CliError> {
     let mut details = Vec::with_capacity(executions.len());
     for execution in executions {
-        let runs = rpc_call!(
-            client,
-            FrontendRequest::ListRuns {
-                execution_id: execution.id.clone(),
-            },
-            "execution runs",
-            FrontendEvent::RunsList { runs, .. } => runs
-        )?;
+        let runs = if execution.status.is_terminal() {
+            let event = client
+                .send_request(&FrontendRequest::ListRuns {
+                    execution_id: execution.id.clone(),
+                })
+                .await
+                .map_err(CliError::internal)?;
+            runs_from_list_event(event)?
+        } else {
+            Vec::new()
+        };
         details.push(ExecutionRuns {
             execution: execution.clone(),
             runs,
         });
     }
     Ok(details)
+}
+
+fn runs_from_list_event(event: FrontendEvent) -> Result<Vec<WorkRun>, CliError> {
+    match event {
+        FrontendEvent::RunsList { runs, .. } => Ok(runs),
+        // ListExecutions remains visible to workers so they can inspect the
+        // work item, but its sibling rows are outside the caller's run scope.
+        FrontendEvent::WorkerTierDenied { .. } => Ok(Vec::new()),
+        FrontendEvent::WorkError { message } | FrontendEvent::Error { message, .. } => {
+            Err(CliError::application(message))
+        }
+        other => Err(unexpected_event("execution runs", &other)),
+    }
 }
 
 pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
@@ -1794,13 +1814,57 @@ pub(crate) fn print_executions_section(executions: &[ExecutionRuns]) {
             print!(" pr={pr}");
         }
         println!();
-        for run in &detail.runs {
-            print!("    run {} [{}]", run.id, run.status);
-            if let Some(summary) = &run.result_summary {
-                print!(" result={summary}");
-            }
-            println!();
+        print_run_summaries(&detail.runs, "    ");
+    }
+}
+
+fn print_run_summaries(runs: &[WorkRun], indent: &str) {
+    for run in runs {
+        println!("{indent}run {} [{}]", run.id, run.status);
+        if let Some(summary) = &run.result_summary {
+            let continuation_indent = format!("{indent}  ");
+            println!(
+                "{continuation_indent}result: {}",
+                summary.replace('\n', &format!("\n{continuation_indent}")),
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_run_tests {
+    use super::*;
+    use boss_protocol::{WorkerTierDenial, WorkerTierDenialReason};
+
+    #[test]
+    fn worker_scope_elides_a_sibling_execution_without_hiding_own_runs() {
+        let own_execution_id = "exec_own";
+        let sibling_execution_id = "exec_sibling";
+        let own_runs = runs_from_list_event(FrontendEvent::RunsList {
+            execution_id: own_execution_id.to_owned(),
+            runs: vec![
+                WorkRun::builder()
+                    .id("run_own")
+                    .agent_id("agent")
+                    .execution_id(own_execution_id)
+                    .created_at("1000")
+                    .status("completed")
+                    .result_summary("finished")
+                    .build(),
+            ],
+        })
+        .expect("own execution runs should be visible");
+        let sibling_runs = runs_from_list_event(FrontendEvent::WorkerTierDenied {
+            denial: WorkerTierDenial::closed("ListRuns", WorkerTierDenialReason::RuntimeIsolation),
+        })
+        .expect("a sibling execution denial should not fail the detail view");
+
+        assert_eq!(own_runs.len(), 1, "the caller's execution keeps its run history");
+        assert!(
+            sibling_runs.is_empty(),
+            "a second execution on the same work item has its history elided when worker-scoped",
+        );
+        assert_ne!(own_execution_id, sibling_execution_id);
     }
 }
 

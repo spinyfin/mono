@@ -294,17 +294,16 @@ async fn chore_show_json_includes_run_result_summary() -> Result<()> {
             .build(),
     )?;
     let reason = "Worker verified the assigned work was already done (empty diff — no changes needed); closed as a no-op without a PR.";
-    db.create_run(CreateRunInput {
-        execution_id: execution.id.clone(),
-        agent_id: "test-agent".to_owned(),
-        artifacts_path: None,
-        error_text: None,
-        finished_at: Some("1000".to_owned()),
-        result_summary: Some(reason.to_owned()),
-        started_at: Some("999".to_owned()),
-        status: Some("completed".to_owned()),
-        transcript_path: None,
-    })?;
+    db.create_run(
+        CreateRunInput::builder()
+            .execution_id(execution.id.clone())
+            .agent_id("test-agent")
+            .finished_at("1000")
+            .result_summary(reason)
+            .started_at("999")
+            .status("completed")
+            .build(),
+    )?;
 
     let value = run_boss(engine.socket_str(), &["chore", "show", &chore.id])?;
     assert_eq!(value["executions"][0]["id"].as_str(), Some(execution.id.as_str()));
