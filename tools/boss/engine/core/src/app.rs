@@ -2154,9 +2154,7 @@ async fn handle_frontend_connection(
             }
             r @ FrontendRequest::GetAutomationState => engine_meta::handle_get_automation_state(ctx, r).await,
             r @ FrontendRequest::GetCiBudget { .. } => ci_remediation::handle_get_ci_budget(ctx, r).await,
-            r @ FrontendRequest::GetCodexDispatchPercentage => {
-                engine_meta::handle_get_codex_dispatch_percentage(ctx, r).await
-            }
+            r @ FrontendRequest::GetDriverTrafficSplit => engine_meta::handle_get_driver_traffic_split(ctx, r).await,
             r @ FrontendRequest::GetCiRemediation { .. } => ci_remediation::handle_get_ci_remediation(ctx, r).await,
             r @ FrontendRequest::GetConflictHotspots { .. } => {
                 conflict_resolution::handle_get_conflict_hotspots(ctx, r).await
@@ -2303,8 +2301,8 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::SendInputToWorker { .. } => panes::handle_send_input_to_worker(ctx, r).await,
             r @ FrontendRequest::SetAutomationPaused { .. } => engine_meta::handle_set_automation_paused(ctx, r).await,
             r @ FrontendRequest::SetCiBudget { .. } => ci_remediation::handle_set_ci_budget(ctx, r).await,
-            r @ FrontendRequest::SetCodexDispatchPercentage { .. } => {
-                engine_meta::handle_set_codex_dispatch_percentage(ctx, r).await
+            r @ FrontendRequest::SetDriverTrafficSplit { .. } => {
+                engine_meta::handle_set_driver_traffic_split(ctx, r).await
             }
             r @ FrontendRequest::SetDispatchConcurrency { .. } => {
                 engine_meta::handle_set_dispatch_concurrency(ctx, r).await

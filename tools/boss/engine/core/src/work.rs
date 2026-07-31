@@ -174,16 +174,17 @@ pub use boss_protocol::{
     CreateDecisionInput, CreateExecutionInput, CreateManyChoresInput, CreateManyTasksInput, CreateProductInput,
     CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput, Decision, DecisionKind, DecisionStatus,
     DeferredScopeAttention, DependencyDirection, DependencyEdge, DependencyFilter, DocOwner, DocOwnerPrLifecycle,
-    EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind, ExecutionReconcileResult,
-    ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION, INTENT_REVISION,
-    LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch, Product, Project,
-    ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY, RESOLVED_WITH_ORPHAN,
-    ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment,
-    ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome, SetProjectDesignDocInput,
-    SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE, THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE,
-    THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind, TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment,
-    WorkExecution, WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef,
-    WorkItemPatch, WorkRun, WorkTree, is_known_created_via,
+    DriverTrafficSplit, EditorialAction, EditorialRules, EffortLevel, EngineAttemptListEntry, ExecutionKind,
+    ExecutionReconcileResult, ExecutionStatus, FinishExecutionRunInput, FollowupMemberOverride, INTENT_QUESTION,
+    INTENT_REVISION, LAST_STATUS_ACTOR_BOOTHBY, LAST_STATUS_ACTOR_HUMAN, ListDependenciesInput, PrWorkItemMatch,
+    Product, Project, ProjectDesignDocState, ProjectStatus, RESOLVED_WITH_EXACT, RESOLVED_WITH_FUZZY,
+    RESOLVED_WITH_ORPHAN, ReasoningMode, RemoveDependencyInput, RequestExecutionInput, ResolveProjectDesignDocOutput,
+    ResolvedComment, ResolvedDesignDoc, ResolvedDesignDocKind, ReviseDocInput, ReviseDocOutcome,
+    SetProjectDesignDocInput, SetTaskDocPointerInput, StatusActor, THREAD_ENTRY_AUTHOR_ENGINE,
+    THREAD_ENTRY_KIND_ANSWER, THREAD_ENTRY_KIND_NUDGE, THREAD_ENTRY_KIND_OPERATOR_FOLLOWUP, Task, TaskKind,
+    TaskRuntime, TaskStatus, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
+    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemExternalRef, WorkItemPatch, WorkRun, WorkTree,
+    is_known_created_via,
 };
 
 /// Outcome of `WorkDb::record_pre_start_failure`. The coordinator uses
@@ -431,7 +432,6 @@ mod automations;
 mod blocking;
 mod boothby;
 mod chain_helpers;
-mod codex_routing;
 mod comment_thread_entries;
 mod comments;
 mod conflict_res;
@@ -443,6 +443,7 @@ mod design_postmortem;
 mod dispatch;
 mod dispatch_class;
 mod dispatch_helpers;
+mod driver_allocation;
 mod driver_lookup;
 mod editorial;
 mod exec_status_helpers;
@@ -484,11 +485,11 @@ mod workitems;
 use attentions::create_attention_in_tx;
 pub(crate) use audit_misc::*;
 pub(crate) use chain_helpers::*;
-pub(crate) use codex_routing::*;
 pub(crate) use dep_helpers::*;
 pub(crate) use design_postmortem::TriggerTaskSnapshot;
 pub(crate) use dispatch_class::DispatchClass;
 pub(crate) use dispatch_helpers::*;
+pub(crate) use driver_allocation::*;
 pub(crate) use exec_status_helpers::*;
 pub(crate) use exec_tail::content_checksum;
 pub(crate) use insert_helpers::*;

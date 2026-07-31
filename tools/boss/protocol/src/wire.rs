@@ -14,15 +14,15 @@ use crate::types::{
     ConflictResolution, CreateAttentionInput, CreateAttentionItemInput, CreateAutomationInput, CreateChoreInput,
     CreateCommentInput, CreateDecisionInput, CreateExecutionInput, CreateInvestigationInput, CreateManyChoresInput,
     CreateManyTasksInput, CreateProductInput, CreateProjectInput, CreateRevisionInput, CreateRunInput, CreateTaskInput,
-    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, EditorialAction,
-    EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput, ListDependenciesInput,
-    PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState, Product, Project,
-    ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput, RequestExecutionInput,
-    ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome, SelectedProductState,
-    SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput, SetTaskDocPointerInput,
-    Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution, WorkItem, WorkItemDependency,
-    WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun, WorkerContextBundle, WorkerProposal,
-    WorkerTierDenial,
+    Decision, DeferredScopeAttention, DependencyFilter, DesignDocContent, DesignDocTreeState, DriverTrafficSplit,
+    EditorialAction, EngineAttemptListEntry, FollowupMemberOverride, GitHubAuthStateDto, LinkExternalRefInput,
+    ListDependenciesInput, PrBodyView, PrStatusView, PrWorkItemMatch, ProbeDeliveryExpectation, ProbeDeliveryState,
+    Product, Project, ProposalKind, ProposalState, ProposalSubmissionError, RemoveDependencyInput,
+    RequestExecutionInput, ResolveProjectDesignDocOutput, ResolvedComment, ReviseDocInput, ReviseDocOutcome,
+    SelectedProductState, SetProductEditorialRulesInput, SetProductExternalTrackerInput, SetProjectDesignDocInput,
+    SetTaskDocPointerInput, Task, TaskRuntime, TranscriptSegment, WorkAttentionItem, WorkComment, WorkExecution,
+    WorkItem, WorkItemDependency, WorkItemDependencyDetail, WorkItemDependencyView, WorkItemPatch, WorkRun,
+    WorkerContextBundle, WorkerProposal, WorkerTierDenial,
 };
 
 /// Outcome of the live `getQueue` smoke check `boss engine trunk status`
@@ -719,12 +719,6 @@ pub enum FrontendRequest {
         attempt_id: String,
     },
 
-    /// Query the current Codex dispatch percentage (what share of eligible
-    /// `standard`-reasoning implementation work routes to the `codex`
-    /// driver instead of its normal default) without changing it. Replies
-    /// with [`FrontendEvent::CodexDispatchPercentageResult`].
-    GetCodexDispatchPercentage,
-
     /// Read-only: aggregate `conflict_diagnosis` for one product into a
     /// hotspot report (`boss engine conflicts hotspots`, Layer 0 / T5):
     /// per-file frequency, per-file-pair co-conflict frequency, per-class
@@ -768,6 +762,12 @@ pub enum FrontendRequest {
     /// Query the current dispatch-pause state without changing it.
     /// Replies with [`FrontendEvent::DispatchStateResult`].
     GetDispatchState,
+
+    /// Query the current driver traffic split (the three-way `grok` /
+    /// `claude` / `codex` allocation of eligible `standard`-reasoning
+    /// implementation work) without changing it. Replies with
+    /// [`FrontendEvent::DriverTrafficSplitResult`].
+    GetDriverTrafficSplit,
 
     /// One-shot snapshot of the engine's user-visible configuration
     /// health — currently a single ANTHROPIC_API_KEY presence bit plus
@@ -1985,24 +1985,6 @@ pub enum FrontendRequest {
         budget: Option<i64>,
     },
 
-    /// Set the Codex dispatch percentage: what share of eligible
-    /// `standard`-reasoning implementation work (`task_implementation`,
-    /// `chore_implementation`, `revision_implementation`) routes to the
-    /// `codex` driver instead of its normal default. `percentage` is
-    /// clamped server-side to `0..=100`; `0` sends literally nothing to
-    /// Codex. Persisted to `state.db` so it survives an engine restart.
-    /// Applies to executions created from this point on only — an
-    /// execution already dispatched keeps whatever driver it was recorded
-    /// with at creation time; nothing live is reassigned. Assignment
-    /// within the eligible slice is a deterministic hash of the work
-    /// item's own id against the threshold, not a per-attempt coin flip,
-    /// so the same row always lands on the same driver. An explicit
-    /// `--driver` on a row always wins over this percentage. Replies with
-    /// [`FrontendEvent::CodexDispatchPercentageResult`].
-    SetCodexDispatchPercentage {
-        percentage: u8,
-    },
-
     /// Set the interactive-pool ("Bridge Crew" + "Lower Decks") concurrency
     /// cap that `drain_ready_queue` enforces separately from the underlying
     /// 16-slot main worker pool (see `MAX_CONCURRENT_INTERACTIVE_WORKERS`).
@@ -2058,6 +2040,34 @@ pub enum FrontendRequest {
         paused: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+
+    /// Set the driver traffic split: how eligible `standard`-reasoning
+    /// implementation work (`task_implementation`, `chore_implementation`,
+    /// `revision_implementation`) is allocated three ways between the
+    /// `grok`, `claude`, and `codex` drivers.
+    ///
+    /// The three shares must sum to exactly 100. A split that does not is
+    /// **rejected** with [`FrontendEvent::WorkError`] — never clamped,
+    /// redistributed, or normalised into something valid-looking. Any one
+    /// or any two shares may be `0`, and a share of `0` sends that driver
+    /// literally nothing.
+    ///
+    /// Persisted to `state.db` as a single value, so an edit is one atomic
+    /// write no concurrent dispatch can observe half-applied, and it
+    /// survives an engine restart. Applies to executions created from this
+    /// point on only — an execution already dispatched keeps whatever
+    /// driver it was recorded with at creation time; nothing live is
+    /// reassigned. Assignment within the eligible slice is a deterministic
+    /// hash of the work item's own id against the split's boundaries, not a
+    /// per-attempt coin flip, so the same row under the same split always
+    /// lands on the same driver. Changing the split moves the boundaries
+    /// and therefore reallocates some not-yet-dispatched rows, which is
+    /// intended. An explicit `--driver` on a row, or a product's
+    /// `default_driver`, always wins over the split. Replies with
+    /// [`FrontendEvent::DriverTrafficSplitResult`].
+    SetDriverTrafficSplit {
+        split: DriverTrafficSplit,
     },
 
     /// Toggle one feature flag on or off. The engine updates the

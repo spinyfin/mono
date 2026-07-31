@@ -61,23 +61,30 @@ extension EngineClient {
         sendLine(["type": "get_settings"])
     }
 
-    /// Ask the engine for the current Codex dispatch percentage — what
-    /// share of eligible, `standard`-reasoning implementation work routes
-    /// to the `codex` driver instead of its normal default. Replies with
-    /// `codex_dispatch_percentage_result`.
-    func sendGetCodexDispatchPercentage() {
-        sendLine(["type": "get_codex_dispatch_percentage"])
+    /// Ask the engine for the current driver traffic split — how eligible,
+    /// `standard`-reasoning implementation work is allocated between the
+    /// `grok`, `claude`, and `codex` drivers. Replies with
+    /// `driver_traffic_split_result`.
+    func sendGetDriverTrafficSplit() {
+        sendLine(["type": "get_driver_traffic_split"])
     }
 
-    /// Set the Codex dispatch percentage (clamped server-side to
-    /// `0...100`; `0` sends nothing to Codex). Persisted to `state.db`
-    /// and applies to executions created from this point on only —
-    /// nothing already dispatched is disturbed. Replies with
-    /// `codex_dispatch_percentage_result`.
-    func sendSetCodexDispatchPercentage(percentage: Int) {
+    /// Set the driver traffic split. The three shares must sum to exactly
+    /// 100; the engine rejects anything else with a `work_error` rather
+    /// than repairing it, so callers must send a split built by
+    /// `DriverTrafficSplit.adjusting(_:to:)`, which preserves that
+    /// invariant by construction. Persisted to `state.db` and applies to
+    /// executions created from this point on only — nothing already
+    /// dispatched is disturbed. Replies with
+    /// `driver_traffic_split_result`.
+    func sendSetDriverTrafficSplit(_ split: DriverTrafficSplit) {
         sendLine([
-            "type": "set_codex_dispatch_percentage",
-            "percentage": percentage,
+            "type": "set_driver_traffic_split",
+            "split": [
+                "grok": split.grok,
+                "claude": split.claude,
+                "codex": split.codex,
+            ],
         ])
     }
 

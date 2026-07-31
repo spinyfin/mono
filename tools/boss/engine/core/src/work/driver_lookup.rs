@@ -36,18 +36,6 @@ impl WorkDb {
         // (non-reentrant) connection lock.
         let binding = {
             let conn = self.connect()?;
-            // Codex-percentage routing decision (recorded once, at
-            // `insert_execution` time — see `work::codex_routing`) wins
-            // over the ordinary `tasks.driver` → `products.default_driver`
-            // precedence below when it names a driver. When the decision
-            // recorded no override (ineligible row, or a percentage roll
-            // that landed on "stay default"), fall through unchanged — this
-            // keeps every pre-existing execution (rows created before this
-            // feature landed, which have no decision row at all) resolving
-            // exactly as before.
-            if let Some(driver) = get_execution_driver_decision_conn(&conn, execution_id)?.and_then(|d| d.driver) {
-                return Ok(Some(driver));
-            }
             let row: Option<(Option<String>, Option<String>)> = conn
                 .query_row(
                     "SELECT t.driver, p.default_driver
@@ -60,6 +48,38 @@ impl WorkDb {
                 )
                 .optional()?;
             if let Some((task_driver, product_default_driver)) = row {
+                // Precedence: a LIVE explicit pin (`tasks.driver`, then
+                // `products.default_driver`) → the recorded traffic-allocation
+                // decision → the ordinary default resolution.
+                //
+                // The pins are read fresh rather than taken from the recorded
+                // decision on purpose. An operator can pin a driver on a row
+                // after its execution row already exists but before it
+                // dispatches, and that must still win — "an explicit driver on
+                // the row always wins" is about the row, not about the instant
+                // the execution was created. Only the *allocation* is frozen at
+                // insert time (see `work::driver_allocation`), which is what
+                // keeps a row from flipping driver between attempts of one
+                // dispatch and keeps a split change off already-dispatched work.
+                let pinned = task_driver
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| product_default_driver.as_deref().filter(|s| !s.trim().is_empty()));
+                if let Some(pinned) = pinned {
+                    return Ok(Some(pinned.to_owned()));
+                }
+                // Only an `allocation` decision routes. An `explicit` one is an
+                // audit record of a pin that the branch above reads live, so
+                // honouring it here would resurrect a pin the operator removed.
+                if let Some(allocated) = get_execution_driver_decision_conn(&conn, execution_id)?
+                    .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+                    .and_then(|d| d.driver)
+                {
+                    return Ok(Some(allocated));
+                }
+                // No pin and no allocation (an ineligible row, or an execution
+                // created before this feature landed and so carrying no
+                // decision row at all) — resolves exactly as it always did.
                 return Ok(Some(boss_engine_effort::resolve_driver(
                     task_driver.as_deref(),
                     product_default_driver.as_deref(),

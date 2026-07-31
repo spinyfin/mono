@@ -497,51 +497,63 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
     );
 }
 
-pub(super) async fn handle_get_codex_dispatch_percentage(ctx: Dispatch, req: FrontendRequest) {
+pub(super) async fn handle_get_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
         sink,
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::GetCodexDispatchPercentage = req else {
+    let FrontendRequest::GetDriverTrafficSplit = req else {
         unreachable!()
     };
-    match work_db.get_codex_dispatch_percentage() {
-        Ok(percentage) => send_response(
-            &sink,
-            &request_id,
-            FrontendEvent::CodexDispatchPercentageResult { percentage },
-        ),
+    match work_db.get_driver_traffic_split() {
+        Ok(split) => send_response(&sink, &request_id, FrontendEvent::DriverTrafficSplitResult { split }),
         Err(err) => send_work_error(&sink, &request_id, err),
     }
 }
 
-pub(super) async fn handle_set_codex_dispatch_percentage(ctx: Dispatch, req: FrontendRequest) {
+pub(super) async fn handle_set_driver_traffic_split(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         work_db,
         sink,
         request_id,
         ..
     } = ctx;
-    let FrontendRequest::SetCodexDispatchPercentage { percentage } = req else {
+    let FrontendRequest::SetDriverTrafficSplit { split } = req else {
         unreachable!()
     };
-    // `set_codex_dispatch_percentage` clamps to 0..=100 and persists to
-    // `state.db` itself — see its doc comment. Nothing in-memory to
-    // update: every dispatch reads the metadata KV fresh at
-    // `insert_execution` time, so this takes effect on the very next
-    // execution created, without disturbing anything already dispatched.
-    match work_db.set_codex_dispatch_percentage(percentage) {
+    // `set_driver_traffic_split` validates (shares must sum to exactly 100)
+    // and persists to `state.db` itself — see its doc comment. A split that
+    // does not validate is rejected here as a `WorkError`, never repaired
+    // into something valid-looking. Nothing in-memory to update: every
+    // dispatch reads the metadata KV fresh at `insert_execution` time, so an
+    // accepted split takes effect on the very next execution created,
+    // without disturbing anything already dispatched.
+    match work_db.set_driver_traffic_split(split) {
         Ok(applied) => {
-            tracing::info!(requested = percentage, applied, "codex_dispatch_percentage: updated");
+            tracing::info!(
+                grok = applied.grok,
+                claude = applied.claude,
+                codex = applied.codex,
+                "driver_traffic_split: updated",
+            );
             send_response(
                 &sink,
                 &request_id,
-                FrontendEvent::CodexDispatchPercentageResult { percentage: applied },
+                FrontendEvent::DriverTrafficSplitResult { split: applied },
             );
         }
-        Err(err) => send_work_error(&sink, &request_id, err),
+        Err(err) => {
+            tracing::warn!(
+                grok = split.grok,
+                claude = split.claude,
+                codex = split.codex,
+                %err,
+                "driver_traffic_split: rejected",
+            );
+            send_work_error(&sink, &request_id, err);
+        }
     }
 }
 

@@ -10,7 +10,7 @@ use boss_gh_telemetry::{callers, scope as gh_scope};
 use crate::coordinator::{PoolDispatchPolicy, pool_dispatch_policy_for_worker_id};
 use crate::effort::{SpawnConfig, SpawnResolutionInput, resolve_spawn_config_in};
 use crate::structured_output::StructuredOutputKind;
-use crate::work::{WorkDb, WorkExecution, WorkItem};
+use crate::work::{REASON_ALLOCATION, REASON_LEGACY_PERCENTAGE, WorkDb, WorkExecution, WorkItem};
 use boss_protocol::ExecutionKind;
 
 use super::prompt::{
@@ -364,20 +364,25 @@ pub(crate) async fn compose_worker_spawn(
                 task.model_override.clone(),
                 product_default_model,
                 dispatch_preamble,
-                // Codex-percentage routing decision (recorded once at
-                // `insert_execution` time) wins when it names a driver —
-                // this is how a percentage-assigned row actually reaches
-                // Codex rather than the recorded decision being purely
-                // decorative. Falls back to the row's own `driver` column
-                // for executions predating this feature (no decision row
-                // recorded yet), preserving prior behavior exactly.
-                work_db
-                    .get_execution_driver_decision(&execution.id)
-                    .ok()
-                    .flatten()
-                    .and_then(|d| d.driver)
-                    .or_else(|| task.driver.clone()),
-                product_default_driver,
+                task.driver.clone(),
+                // `resolve_spawn_config` applies `row driver → this → engine
+                // default`, so slotting the recorded traffic-allocation
+                // decision in behind the product default gives the same
+                // precedence `work::driver_lookup` resolves with: a live
+                // explicit pin at either level wins, and only a row that
+                // pinned nothing reaches its allocation. Executions predating
+                // this feature carry no decision row and resolve exactly as
+                // before. `explicit` decisions are skipped deliberately —
+                // they record a pin that is read live just above, so
+                // honouring them here would resurrect a removed pin.
+                product_default_driver.or_else(|| {
+                    work_db
+                        .get_execution_driver_decision(&execution.id)
+                        .ok()
+                        .flatten()
+                        .filter(|d| matches!(d.reason, REASON_ALLOCATION | REASON_LEGACY_PERCENTAGE))
+                        .and_then(|d| d.driver)
+                }),
                 task.reasoning,
             )
         }

@@ -280,12 +280,12 @@ final class ChatViewModel: ObservableObject {
     /// so the banner doesn't flash on a transient reconnect.
     @Published var engineAnthropicApiKeyPresent: Bool = true
 
-    /// Current Codex dispatch percentage (0...100): the share of eligible,
-    /// `standard`-reasoning implementation work routed to the `codex`
-    /// driver instead of its normal default. Sourced from
-    /// `codex_dispatch_percentage_result`, fetched on Settings-pane
-    /// appear and refreshed after every `setCodexDispatchPercentage` call.
-    @Published var codexDispatchPercentage: Int = 0
+    /// Current driver traffic split: how eligible, `standard`-reasoning
+    /// implementation work is allocated between the `grok`, `claude`, and
+    /// `codex` drivers. Sourced from `driver_traffic_split_result`, fetched
+    /// on Settings-pane appear and confirmed after every
+    /// `setDriverTrafficShare` call.
+    @Published var driverTrafficSplit: DriverTrafficSplit = .engineDefault
 
     /// Whether a Trunk org API token is currently configured (env override
     /// or Keychain), sourced from `trunk_status` — on Settings-pane appear,
@@ -674,21 +674,28 @@ final class ChatViewModel: ObservableObject {
         engine.sendGetEngineHealth()
     }
 
-    /// Ask the engine for the current Codex dispatch percentage. Called by
-    /// the Settings window on appear so the control reflects the persisted
+    /// Ask the engine for the current driver traffic split. Called by the
+    /// Settings window on appear so the control reflects the persisted
     /// value rather than whatever it last happened to show.
-    func refreshCodexDispatchPercentage() {
-        engine.sendGetCodexDispatchPercentage()
+    func refreshDriverTrafficSplit() {
+        engine.sendGetDriverTrafficSplit()
     }
 
-    /// Set the Codex dispatch percentage. The engine echoes back the
-    /// clamped, applied value via `codex_dispatch_percentage_result`,
-    /// which updates `codexDispatchPercentage` — this call does not
-    /// optimistically patch local state first, since the server-side
-    /// clamp to `0...100` means the applied value can differ from what
-    /// was requested.
-    func setCodexDispatchPercentage(_ percentage: Int) {
-        engine.sendSetCodexDispatchPercentage(percentage: percentage)
+    /// Move `driver`'s share to `value`, letting the other two absorb the
+    /// difference (see `DriverTrafficSplit.adjusting(_:to:)`), and send the
+    /// resulting split.
+    ///
+    /// Local state is patched optimistically here, unlike the settings
+    /// controls that let the engine clamp: the engine never repairs a split,
+    /// it either stores this exact one or rejects it, and `adjusting` cannot
+    /// produce a rejectable split. Patching first keeps the steppers
+    /// responsive across a round trip; the echoed
+    /// `driver_traffic_split_result` then confirms it.
+    func setDriverTrafficShare(_ driver: DriverSlug, to value: Int) {
+        let next = driverTrafficSplit.adjusting(driver, to: value)
+        guard next != driverTrafficSplit else { return }
+        driverTrafficSplit = next
+        engine.sendSetDriverTrafficSplit(next)
     }
 
     /// User-initiated resume from the `dispatch_paused` health-banner
