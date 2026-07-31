@@ -96,7 +96,7 @@ pub fn driver_or_default(driver: Option<&dyn AgentDriver>) -> &dyn AgentDriver {
 /// [`pool_override_driver_slug`]), else the reviewed row's own
 /// `tasks.driver` → `products.default_driver` → engine-default chain (via
 /// `WorkDb::get_execution_driver_slug`).
-fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
+pub(crate) fn resolve_execution_driver_slug(work_db: &WorkDb, execution_id: &str) -> Option<String> {
     if let Some(slug) = pool_override_driver_slug(work_db, execution_id) {
         return Some(slug);
     }
