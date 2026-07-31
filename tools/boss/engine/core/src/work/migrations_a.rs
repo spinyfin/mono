@@ -407,6 +407,24 @@ pub(crate) fn migrate_work_executions_driver_runtime_state(conn: &Connection) ->
     Ok(())
 }
 
+/// `pr_head_baseline_absorbed`: set (never cleared) the first time
+/// `on_stop_inner`'s parent-push suppression path rewrites `pr_head_before`
+/// mid-run — a head movement it attributed to the concurrently-active
+/// parent worker rather than to this revision's own push. Once set, a
+/// later Stop's "head unchanged" SHA-delta finding compares against that
+/// rewritten baseline, not against the head at dispatch time, so it can no
+/// longer be trusted as positive proof this run contributed nothing (see
+/// `ContributionEvidence::ProvenAbsent` in `completion.rs`). Idempotent.
+pub(crate) fn migrate_work_executions_pr_head_baseline_absorbed(conn: &Connection) -> Result<()> {
+    if !work_executions_has_column(conn, "pr_head_baseline_absorbed")? {
+        conn.execute(
+            "ALTER TABLE work_executions ADD COLUMN pr_head_baseline_absorbed INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Engine-owned, bounded provider-session identity for the latest worker run.
 ///
 /// This deliberately lives in SQLite rather than the provider's writable

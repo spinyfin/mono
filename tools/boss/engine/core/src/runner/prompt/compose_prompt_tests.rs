@@ -2016,6 +2016,35 @@ fn deferred_scope_directive_teaches_boss_propose_verb_when_seam_is_on_for_revisi
 }
 
 #[test]
+fn revision_no_op_directive_teaches_no_changes_needed_marker() {
+    // Before this directive existed, no revision prompt ever taught the
+    // NO_CHANGES_NEEDED marker: `no_op_completion_directive` is gated to
+    // `TaskImplementation | ChoreImplementation` with no existing PR, and a
+    // revision always has a bound parent PR — so `on_stop_inner`'s revision
+    // no-op terminal (`worker_signalled_no_op`) was unreachable in
+    // production. Assert the marker and its revision-specific framing (keyed
+    // on the dispatched finding, not on an empty `jj diff`) are present.
+    let work_item = revision_task_with_created_via(None, "operator");
+    let prompt = compose_execution_prompt(
+        ExecutionPromptParams::builder()
+            .execution(&revision_execution("https://github.com/org/repo/pull/77"))
+            .work_item(&work_item)
+            .workspace_path(std::path::Path::new("/tmp/workspace"))
+            .pr_template_set(&crate::pr_template::PrTemplateSet::default())
+            .build(),
+    );
+    assert!(
+        prompt.contains(crate::no_op_signal::NO_CHANGES_NEEDED_MARKER),
+        "revision prompt must name the NO_CHANGES_NEEDED marker:\n{prompt}",
+    );
+    assert!(
+        prompt.contains("If the finding needs no code change"),
+        "revision prompt must carry the revision-flavoured no-op directive, keyed on the \
+         dispatched finding rather than an empty diff:\n{prompt}",
+    );
+}
+
+#[test]
 fn escalation_protocol_directive_present_for_revision_implementation_seam_off() {
     // A RevisionImplementation prompt never received
     // `worker_escalation_protocol_directive` — only TaskImplementation /

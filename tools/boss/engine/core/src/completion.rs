@@ -1420,6 +1420,13 @@ enum ContributionEvidence {
     /// fetched and compared against this execution's `pr_head_before`
     /// snapshot, and they are equal. This run did not move the PR —
     /// positive proof of non-contribution, not an absence of evidence.
+    ///
+    /// Callers must only construct this when `pr_head_before` still holds
+    /// the head captured at dispatch time. If the parent-push suppression
+    /// path in `on_stop_inner` has ever rewritten it (see
+    /// `execution_pr_head_baseline_absorbed`), "unchanged" means "unchanged
+    /// since that absorbed baseline", which is a weaker claim — use
+    /// [`Self::Indeterminate`] instead.
     ProvenAbsent,
     /// [`ShaDeltaGateOutcome::Inapplicable`]: no baseline was ever
     /// captured, or the head fetch failed. The run may or may not have

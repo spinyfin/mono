@@ -730,6 +730,21 @@ impl WorkerCompletionHandler {
                              suppression; next turn may re-trigger spuriously",
                         );
                     }
+                    // Record that the baseline was rewritten, not just its
+                    // new value: a later Stop's "head unchanged" finding
+                    // against this absorbed baseline is a weaker claim than
+                    // "unchanged since dispatch" and must not be trusted as
+                    // `ContributionEvidence::ProvenAbsent` — see
+                    // `execution_pr_head_baseline_absorbed`'s doc comment.
+                    if let Err(err) = self.work_db.mark_execution_pr_head_baseline_absorbed(execution_id) {
+                        tracing::warn!(
+                            execution_id,
+                            ?err,
+                            "stop event: failed to stamp pr_head_baseline_absorbed after parent-push \
+                             suppression; a later Stop may wrongly treat the rewritten baseline as \
+                             proof of non-contribution",
+                        );
+                    }
                     // Fall through to the NoContribution arm's nudge logic.
                     // We reach the nudge_or_park below directly.
                     let _pr_url_for_nudge = pr_url;
@@ -857,6 +872,35 @@ impl WorkerCompletionHandler {
                 // boundary terminalizes the run as delivered. See
                 // `health_alone_satisfies_deliverable`.
                 //
+                // "Byte-identical to the snapshot taken when this run
+                // started" is only true when `pr_head_before` has never
+                // been rewritten. The parent-push suppression path earlier
+                // in this function absorbs a head movement it attributes to
+                // the concurrently-active parent worker by overwriting
+                // `pr_head_before` with the new head — so on a LATER Stop,
+                // "head unchanged" can mean "unchanged since that absorbed
+                // baseline", not "unchanged since dispatch". If this
+                // execution's baseline was ever absorbed, downgrade the
+                // finding to `Indeterminate`: "we could not measure" is the
+                // honest claim once the reference point is no longer the
+                // dispatch-time head, and refusing here would strand a
+                // revision whose own push evidence was missed and absorbed
+                // into the baseline, with no way to ever satisfy the gate
+                // (mono#2606 revision).
+                let contribution_evidence = match self.work_db.execution_pr_head_baseline_absorbed(execution_id) {
+                    Ok(true) => ContributionEvidence::Indeterminate,
+                    Ok(false) => ContributionEvidence::ProvenAbsent,
+                    Err(err) => {
+                        tracing::warn!(
+                            execution_id,
+                            ?err,
+                            "stop event: failed to read pr_head_baseline_absorbed; treating as \
+                             absorbed (Indeterminate) to avoid a false ProvenAbsent refusal",
+                        );
+                        ContributionEvidence::Indeterminate
+                    }
+                };
+                //
                 // IMPORTANT: this gate is intentionally placed only in
                 // on_stop, not in recheck_for_pr. The merge-poller sweep
                 // runs for waiting_human executions even when the worker
@@ -871,7 +915,7 @@ impl WorkerCompletionHandler {
                         execution_id,
                         &execution,
                         &pr_url,
-                        ContributionEvidence::ProvenAbsent,
+                        contribution_evidence,
                     )
                     .await
                 {

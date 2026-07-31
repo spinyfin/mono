@@ -1143,6 +1143,60 @@ fn no_op_completion_directive(seam_enabled: bool) -> String {
     out
 }
 
+/// Revision-flavoured counterpart to [`no_op_completion_directive`]. A
+/// `revision_implementation` worker is dispatched to address a specific
+/// review finding on an already-open PR, not to produce a fresh diff
+/// against `main` — so the primary-implementation directive's "if `jj diff`
+/// is empty because the work is already on `main`" framing does not apply
+/// here, and until this directive existed no revision prompt taught the
+/// [`NO_CHANGES_NEEDED`](crate::no_op_signal::NO_CHANGES_NEEDED_MARKER)
+/// marker at all: `on_stop_inner`'s revision no-op terminal
+/// (`worker_signalled_no_op`) was reachable in the engine but no worker was
+/// ever told the marker existed, so a revision that genuinely concluded the
+/// finding needed no code change had no honest way to say so — it could
+/// only decline and stop, which the Stop-boundary handler then read as "did
+/// not contribute" and nudged forever.
+///
+/// This directive keys the marker on the DISPATCHED FINDING, not on an
+/// empty `jj diff`: after actually investigating, if the finding this
+/// revision was dispatched for turns out to need no code change (e.g. it
+/// was already fixed by a sibling commit, or the finding was itself
+/// mistaken), emitting the marker is the sanctioned way to say so. Always
+/// appended for every revision, independent of conflict/CI-remediation
+/// framing, because the engine's `worker_signalled_no_op` check is itself
+/// unconditional on `revision_implementation` executions.
+fn revision_no_op_completion_directive(seam_enabled: bool) -> String {
+    let marker = crate::no_op_signal::NO_CHANGES_NEEDED_MARKER;
+    let blocked_pointer = if seam_enabled {
+        "call `boss propose blocked --reason \"...\"` instead"
+    } else {
+        "emit a `[blocked] reason=\"...\"` marker instead"
+    };
+    let mut out = String::new();
+    out.push_str("\n## If the finding needs no code change: signal a sanctioned no-op\n\n");
+    out.push_str(
+        "This revision was dispatched to address a specific review finding. If, after actually \
+         investigating it, you conclude the finding needs NO code change — it was already fixed \
+         by another commit, or the finding was itself mistaken — that is a legitimate outcome, but \
+         it must be stated explicitly, not just implied by stopping without a push.\n\n",
+    );
+    out.push_str(&format!(
+        "In that case, do NOT push an empty or cosmetic commit to manufacture a diff. Instead, \
+         explain in your final response exactly why the finding needs no change, then emit a line \
+         containing exactly `{marker}` as the final line of your response, and stop. The engine \
+         recognizes this marker (combined with no new commit on the parent PR) as a declared no-op: \
+         it closes this revision without a nudge loop, and files a human-visible record that the \
+         finding was declined rather than fixed, so a human can judge whether that was right.\n\n",
+    ));
+    out.push_str(&format!(
+        "Do NOT emit `{marker}` to abandon a finding you simply find hard, ambiguous, or are \
+         blocked on — if you are blocked, {blocked_pointer} (see \"If you are blocked or the work \
+         is bigger than estimated\" above). This marker is specifically for a finding you have \
+         determined, after investigation, requires no code change.\n",
+    ));
+    out
+}
+
 /// Post-PR CI-monitoring directive (issue #899). A worker that opens a
 /// PR and then sits in a `gh pr checks` poll-loop "until every check is
 /// green" never completes under CI models where some required checks are
@@ -1639,6 +1693,9 @@ fn compose_revision_directive(
         worker_signal_proposals_seam_enabled,
     ));
     out.push_str(&deferred_scope_directive(deferred_scope_proposals_seam_enabled));
+    out.push_str(&revision_no_op_completion_directive(
+        worker_signal_proposals_seam_enabled,
+    ));
     out.push_str(&format!(
         "\nAcceptance criterion: when you believe the work is done, the deliverable is the parent PR URL.\n\
          - Push your changes to the parent branch (see step 4 above). Do NOT open a new PR.\n\
