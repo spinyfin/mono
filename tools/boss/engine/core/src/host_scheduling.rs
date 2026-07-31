@@ -300,6 +300,41 @@ mod tests {
         assert!(set.contains("xcode=15"));
     }
 
+    /// What a zero-capability host is actually worth, both ways round.
+    ///
+    /// This is the behaviour that made the anaplian `caps=0` report so easy
+    /// to dismiss: with no requirements recorded anywhere — the normal state
+    /// today — the filter is a no-op and a host that reports nothing is
+    /// eligible for everything, which is exactly why anaplian was still
+    /// offered a dispatch despite discovering nothing about itself. The
+    /// second half is why that is not a stable place to be: a single
+    /// requirement anywhere on the product/project/chore makes the same host
+    /// categorically ineligible, and no amount of it working correctly would
+    /// change that. Only discovery can.
+    #[test]
+    fn a_zero_capability_host_is_eligible_for_everything_until_anything_is_required() {
+        let no_requirements = ChoreRequirements::default();
+        let slots = vec![slot("anaplian", 3, 0, &[])];
+        let (picked, report) = select_host(&no_requirements, &slots);
+        assert_eq!(picked.as_deref(), Some("anaplian"));
+        assert!(report[0].eligible);
+
+        let one_requirement = ChoreRequirements {
+            required_capabilities: ["os=macos".into()].into_iter().collect(),
+            pinned_host_id: None,
+        };
+        let (picked, report) = select_host(&one_requirement, &slots);
+        assert!(picked.is_none());
+        assert!(
+            report[0]
+                .reasons
+                .iter()
+                .any(|r| matches!(r, IneligibilityReason::MissingCapabilities(_))),
+            "a host that discovered nothing satisfies nothing, got {:?}",
+            report[0].reasons
+        );
+    }
+
     #[test]
     fn lexicographic_tiebreak_is_deterministic() {
         // No affinity, equal slots — should pick `aardvark` over `zebra`.

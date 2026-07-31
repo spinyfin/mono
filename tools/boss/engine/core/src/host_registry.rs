@@ -177,19 +177,7 @@ pub(crate) fn ensure_local_host(conn: &Connection) -> Result<()> {
 /// OS/arch changes surface immediately.
 pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<()> {
     let caps = discover_local_capabilities();
-
-    // Delete old auto caps for local, then bulk-insert fresh ones.
-    conn.execute(
-        "DELETE FROM host_capabilities WHERE host_id = 'local' AND source = 'auto'",
-        [],
-    )?;
-    for (capability, source) in &caps {
-        conn.execute(
-            "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
-             VALUES ('local', ?1, ?2)",
-            params![capability, source],
-        )?;
-    }
+    replace_auto_capabilities(conn, "local", &caps)?;
     tracing::debug!(
         count = caps.len(),
         "host_registry: refreshed local host auto capabilities",
@@ -197,11 +185,33 @@ pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<
     Ok(())
 }
 
+/// Replace every `auto`-sourced capability row for `host_id` with `caps`.
+/// User-tagged rows (`source = 'user'`) are left untouched, so an operator
+/// `--tag` always survives a re-probe.
+///
+/// Deliberately takes the host id rather than hard-coding `'local'`: the
+/// local-only spelling of this write is why a remote host could never hold
+/// an auto-discovered capability. See [`crate::host_capability_probe`].
+pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: &[String]) -> Result<()> {
+    conn.execute(
+        "DELETE FROM host_capabilities WHERE host_id = ?1 AND source = 'auto'",
+        params![host_id],
+    )?;
+    for capability in caps {
+        conn.execute(
+            "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
+             VALUES (?1, ?2, 'auto')",
+            params![host_id, capability],
+        )?;
+    }
+    Ok(())
+}
+
 // ── Local capability discovery ────────────────────────────────────────────────
 
-/// Probe the local host and return `(capability, source)` pairs. Every
-/// returned row has `source = "auto"`. Failures for individual probes
-/// are logged and skipped; the remainder still land.
+/// Probe the local host and return its capability tags. Every returned tag
+/// is stored with `source = "auto"`. Failures for individual probes are
+/// logged and skipped; the remainder still land.
 ///
 /// Cached process-wide: `uname` + `gh auth status` are stable for the
 /// life of an engine process (design: probe once at startup). Without
@@ -209,36 +219,31 @@ pub(crate) fn refresh_local_host_auto_capabilities(conn: &Connection) -> Result<
 /// the full probe — and `gh auth status` alone was ~0.7s against a real
 /// `gh` (network + keychain). That cost was paid once per unit test that
 /// opened a WorkDb, dominating suites that open many databases.
-fn discover_local_capabilities() -> Vec<(String, String)> {
-    static CACHED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+fn discover_local_capabilities() -> Vec<String> {
+    static CACHED: OnceLock<Vec<String>> = OnceLock::new();
     CACHED.get_or_init(discover_local_capabilities_uncached).clone()
 }
 
 /// Uncached probe body. See [`discover_local_capabilities`].
-fn discover_local_capabilities_uncached() -> Vec<(String, String)> {
-    let mut caps: Vec<(String, String)> = Vec::new();
+///
+/// The tag *spelling* comes from [`crate::host_capability_probe`], shared
+/// with the remote probe: capability matching is exact string equality, so
+/// a local and a remote macOS host must describe themselves identically or
+/// a requirement written against one silently excludes the other.
+fn discover_local_capabilities_uncached() -> Vec<String> {
+    use crate::host_capability_probe::{arch_capability, gh_authed_capability, os_capability};
+
+    let mut caps: Vec<String> = Vec::new();
 
     // OS family
     match run_one(&["uname", "-s"]) {
-        Some(raw) => {
-            let tag = match raw.to_lowercase().as_str() {
-                "darwin" => "os=macos".to_owned(),
-                other => format!("os={other}"),
-            };
-            caps.push((tag, "auto".to_owned()));
-        }
+        Some(raw) => caps.push(os_capability(&raw)),
         None => tracing::warn!("host_registry: uname -s failed; os= capability not set"),
     }
 
     // CPU architecture
     match run_one(&["uname", "-m"]) {
-        Some(raw) => {
-            let arch = match raw.to_lowercase().as_str() {
-                "aarch64" => "arm64".to_owned(),
-                other => other.to_owned(),
-            };
-            caps.push((format!("arch={arch}"), "auto".to_owned()));
-        }
+        Some(raw) => caps.push(arch_capability(&raw)),
         None => tracing::warn!("host_registry: uname -m failed; arch= capability not set"),
     }
 
@@ -252,7 +257,7 @@ fn discover_local_capabilities_uncached() -> Vec<(String, String)> {
     })
     .map(|out| out.status.success())
     .unwrap_or(false);
-    caps.push((format!("gh-authed={gh_authed}"), "auto".to_owned()));
+    caps.push(gh_authed_capability(gh_authed));
 
     caps
 }
@@ -481,6 +486,22 @@ impl WorkDb {
             })
         })?;
         collect_rows(rows)
+    }
+
+    /// Replace every `auto`-sourced capability on `host_id` with `caps`,
+    /// leaving user-tagged rows alone. This is how a remote host's
+    /// discovered capabilities ([`crate::host_capability_probe`]) reach the
+    /// registry, and it is idempotent — re-probing a host converges rather
+    /// than accumulating stale rows.
+    pub fn replace_auto_host_capabilities(&self, host_id: &str, caps: &[String]) -> Result<()> {
+        let conn = self.connect()?;
+        if conn.query_row("SELECT COUNT(*) FROM hosts WHERE id = ?1", params![host_id], |r| {
+            r.get::<_, i64>(0)
+        })? == 0
+        {
+            bail!("host '{}' not found", host_id);
+        }
+        replace_auto_capabilities(&conn, host_id, caps)
     }
 
     /// Add a user-tagged capability to a host. Overwrites the row if
@@ -1151,6 +1172,86 @@ mod tests {
                 ("user".to_owned(), "zzz".to_owned()),
             ]
         );
+    }
+
+    // ── replace_auto_host_capabilities ──────────────────────────────────────
+
+    /// `(source, capability)` pairs on a host, in `list_host_capabilities`
+    /// order.
+    fn cap_pairs(db: &WorkDb, host_id: &str) -> Vec<(String, String)> {
+        db.list_host_capabilities(host_id)
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.source, c.capability))
+            .collect()
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_writes_auto_rows_for_a_remote_host() {
+        // The gap behind the anaplian `caps=0` report: the only writer of
+        // `auto` rows hard-coded `host_id = 'local'`, so a remote host had
+        // no path to an auto-discovered capability at all.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned(), "arch=arm64".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![
+                ("auto".to_owned(), "arch=arm64".to_owned()),
+                ("auto".to_owned(), "os=macos".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_converges_rather_than_accumulating() {
+        // Re-probing a host whose `gh` credentials expired must leave one
+        // `gh-authed=` row, not both answers.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &[]).unwrap();
+        db.replace_auto_host_capabilities("zakalwe", &["gh-authed=true".to_owned()])
+            .unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["gh-authed=false".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("auto".to_owned(), "gh-authed=false".to_owned())]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_leaves_operator_tags_alone() {
+        // An operator `--tag` is a deliberate statement about the host and
+        // must survive any number of re-probes.
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["role=builder".to_owned()])
+            .unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![
+                ("auto".to_owned(), "os=macos".to_owned()),
+                ("user".to_owned(), "role=builder".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_rejects_an_unknown_host() {
+        // The `host_capabilities` FK would reject the insert anyway, but an
+        // empty `caps` slice performs no insert at all — without this check
+        // that call would silently succeed against a host that isn't there.
+        let db = open_db();
+        let err = db.replace_auto_host_capabilities("ghost", &[]).unwrap_err();
+        assert!(err.to_string().contains("host 'ghost' not found"), "got: {err}");
     }
 
     // ── set_execution_pinned_host / execution_pinned_host ───────────────────

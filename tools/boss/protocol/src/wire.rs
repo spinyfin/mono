@@ -201,12 +201,14 @@ pub enum FrontendRequest {
         input: AddDependencyInput,
     },
 
-    /// Register a new remote SSH host. The engine stores the row,
-    /// then eagerly pushes the `boss-remote-run` wrapper and runs
-    /// capability discovery — identical to `bossctl hosts add`. On
-    /// success replies with [`FrontendEvent::HostResult`]. On failure
-    /// replies with [`FrontendEvent::Error`] with a human-readable
-    /// message. The host row is created before the push; if the push
+    /// Register a new remote SSH host. The engine stores the row, then
+    /// pushes the `boss-remote-run` wrapper, verifies `cube` is invocable
+    /// over non-interactive SSH, and runs capability discovery against the
+    /// host — the same `host_provisioning` sequence `bossctl hosts add`
+    /// drives. Discovered capabilities are persisted with `source =
+    /// "auto"`. On success replies with [`FrontendEvent::HostResult`]. On
+    /// failure replies with [`FrontendEvent::Error`] with a human-readable
+    /// message. The host row is created before provisioning; if any step
     /// fails the host is left disabled (same policy as the CLI).
     AddHost {
         id: String,

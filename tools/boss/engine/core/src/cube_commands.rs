@@ -15,6 +15,7 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -96,6 +97,28 @@ impl std::error::Error for CubeCliError {}
 pub trait CubeJsonTransport: Send + Sync {
     /// Run `cube <args>` and return its parsed JSON stdout.
     async fn run_cube_json(&self, args: &[&str]) -> Result<serde_json::Value>;
+
+    /// Run `cube <args>` with an explicit wall-clock budget, for a
+    /// provisioning-class operation whose cost is dominated by work on the
+    /// machine cube runs on rather than by the call itself — `workspace
+    /// lease` and `repo ensure` (see [`crate::cube_op_budget`]).
+    ///
+    /// The default implementation ignores `budget` and is correct for any
+    /// transport that imposes no bound of its own: the local
+    /// `CommandCubeClient` runs cube as a child process with no internal
+    /// timeout, so the dispatcher's outer `tokio::time::timeout` is already
+    /// the only bound and adding a second one here would change nothing.
+    ///
+    /// A transport that *does* bound its own calls must override this, or
+    /// its bound silently overrides the caller's. The SSH adapter is the
+    /// one such transport, and not overriding it was the anaplian
+    /// first-lease incident: every remote cube call was clamped to the
+    /// generic 30s ssh command budget, so the 90s the dispatcher had
+    /// budgeted for a lease could never actually be spent.
+    async fn run_cube_json_within(&self, args: &[&str], budget: Duration) -> Result<serde_json::Value> {
+        let _ = budget;
+        self.run_cube_json(args).await
+    }
 }
 
 // --- Wire payload structs shared by both transports -------------------------
@@ -164,10 +187,20 @@ struct ListReposPayload {
 
 // --- Command helpers --------------------------------------------------------
 
+/// Ensure cube knows about `origin`, cloning it on the first call for a
+/// given machine.
+///
+/// Runs under [`crate::cube_op_budget::REPO_ENSURE`] rather than the
+/// transport's generic bound: the first ensure for a repo performs a
+/// `jj git clone`, which on a remote host that has never seen the repo is
+/// the single most expensive cube call the dispatcher makes.
 pub async fn ensure_repo<T: CubeJsonTransport + ?Sized>(transport: &T, origin: &str) -> Result<CubeRepoHandle> {
     let payload: RepoEnsurePayload = serde_json::from_value(
         transport
-            .run_cube_json(&crate::repo_slug::repo_ensure_args(origin))
+            .run_cube_json_within(
+                &crate::repo_slug::repo_ensure_args(origin),
+                crate::cube_op_budget::repo_ensure_transport_budget(),
+            )
             .await?,
     )
     .context("decoding `cube repo ensure` payload")?;
@@ -185,6 +218,12 @@ pub async fn ensure_repo<T: CubeJsonTransport + ?Sized>(transport: &T, origin: &
 /// returned [`CubeWorkspaceLease::dirty_verified`] is cube's verdict on
 /// whether the working copy really still held work; `Some(false)` is the
 /// signal to fall back to the engine's own recovery patch.
+///
+/// Runs under [`crate::cube_op_budget::LEASE`] rather than the transport's
+/// generic bound. A lease is not a quick remote command: cube stacks a
+/// health scan, a quarantine-reclaim scan and `jj workspace add` + setup
+/// steps behind it, which is exactly why the dispatcher's bound for it is
+/// 90s and not 30s.
 pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     transport: &T,
     repo_id: &str,
@@ -218,8 +257,12 @@ pub async fn lease_workspace<T: CubeJsonTransport + ?Sized>(
     for excluded in exclude_workspace_ids {
         args.extend_from_slice(&["--exclude", excluded]);
     }
-    let payload: LeasePayload = serde_json::from_value(transport.run_cube_json(&args).await?)
-        .context("decoding `cube workspace lease` payload")?;
+    let payload: LeasePayload = serde_json::from_value(
+        transport
+            .run_cube_json_within(&args, crate::cube_op_budget::lease_transport_budget())
+            .await?,
+    )
+    .context("decoding `cube workspace lease` payload")?;
     let lease_id = payload
         .workspace
         .lease_id
@@ -419,11 +462,18 @@ mod tests {
 
     // --- Command helpers: argv construction + decode ----------------------
 
-    /// A [`CubeJsonTransport`] that records the argv of its single expected
-    /// `run_cube_json` call and replays a canned JSON envelope. Tests assert
-    /// the recorded argv and the decoded handle — observable behavior only.
+    /// A [`CubeJsonTransport`] that records the argv (and the budget, if
+    /// any) of its single expected call and replays a canned JSON envelope.
+    /// Tests assert the recorded argv and the decoded handle — observable
+    /// behavior only.
+    ///
+    /// It deliberately does NOT override `run_cube_json_within`: leaving the
+    /// default in place is what lets `budget()` distinguish "the helper asked
+    /// for an explicit budget" from "the helper used the plain call", which
+    /// is the contract a bounded transport (the SSH adapter) depends on.
     struct RecordingTransport {
         recorded: Mutex<Option<Vec<String>>>,
+        budget: Mutex<Option<Duration>>,
         response: serde_json::Value,
     }
 
@@ -431,6 +481,7 @@ mod tests {
         fn new(response: serde_json::Value) -> Self {
             Self {
                 recorded: Mutex::new(None),
+                budget: Mutex::new(None),
                 response,
             }
         }
@@ -443,6 +494,12 @@ mod tests {
                 .clone()
                 .expect("run_cube_json was never called")
         }
+
+        /// The budget the helper requested, or `None` if it used the plain
+        /// unbudgeted call.
+        fn budget(&self) -> Option<Duration> {
+            *self.budget.lock().unwrap()
+        }
     }
 
     #[async_trait]
@@ -451,6 +508,66 @@ mod tests {
             *self.recorded.lock().unwrap() = Some(args.iter().map(|s| s.to_string()).collect());
             Ok(self.response.clone())
         }
+
+        async fn run_cube_json_within(&self, args: &[&str], budget: Duration) -> Result<serde_json::Value> {
+            *self.budget.lock().unwrap() = Some(budget);
+            self.run_cube_json(args).await
+        }
+    }
+
+    // --- Per-operation budgets -------------------------------------------
+
+    /// A remote lease must be run under the lease budget, not the
+    /// transport's generic fast-command bound. This is the anaplian
+    /// regression: with the plain call, a bounded transport clamps the lease
+    /// to 30s and the dispatcher's 90s allowance is unreachable.
+    #[tokio::test]
+    async fn lease_workspace_requests_the_lease_budget() {
+        let t = RecordingTransport::new(json!({
+            "workspace": { "lease_id": "lease-1", "workspace_id": "ws-1", "workspace_path": "/tmp/ws-1" }
+        }));
+        lease_workspace(&t, "repo-1", "do a thing", None, false, &[])
+            .await
+            .unwrap();
+        assert_eq!(t.budget(), Some(crate::cube_op_budget::lease_transport_budget()));
+    }
+
+    /// `repo ensure` performs the first-time clone, so it gets its own
+    /// budget for the same reason.
+    #[tokio::test]
+    async fn ensure_repo_requests_the_repo_ensure_budget() {
+        let t = RecordingTransport::new(json!({ "repo_id": "repo-123" }));
+        ensure_repo(&t, "bduff").await.unwrap();
+        assert_eq!(t.budget(), Some(crate::cube_op_budget::repo_ensure_transport_budget()));
+    }
+
+    /// The converse: cheap reads must keep the tight default so an
+    /// unreachable host still fails fast. Widening the budget everywhere
+    /// would be the lazy version of this fix.
+    #[tokio::test]
+    async fn cheap_reads_do_not_request_an_extended_budget() {
+        let t = RecordingTransport::new(json!({
+            "workspace": {
+                "workspace_id": "ws-1",
+                "workspace_path": "/tmp/ws-1",
+                "state": "leased",
+                "lease_id": "lease-1",
+                "holder": "agent-019",
+                "task": "chore",
+                "leased_at_epoch_s": 100,
+                "lease_expires_at_epoch_s": 200
+            }
+        }));
+        workspace_status(&t, Path::new("/tmp/ws-1")).await.unwrap();
+        assert_eq!(t.budget(), None);
+
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        heartbeat_lease(&t, "lease-1", None).await.unwrap();
+        assert_eq!(t.budget(), None);
+
+        let t = RecordingTransport::new(json!({ "ok": true }));
+        release_workspace(&t, "lease-1").await.unwrap();
+        assert_eq!(t.budget(), None);
     }
 
     #[tokio::test]
