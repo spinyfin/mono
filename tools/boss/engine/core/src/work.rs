@@ -448,6 +448,7 @@ mod driver_lookup;
 mod editorial;
 mod exec_status_helpers;
 mod exec_tail;
+mod execution_launch_config;
 mod execution_retention;
 mod executions_runs;
 mod github_api_usage_db;

@@ -18,39 +18,6 @@ pub struct CancelExecutionOpts {
 }
 
 impl WorkDb {
-    /// Persist the resolved worker launch configuration exactly once per
-    /// execution. This is deliberately stamped after the runner successfully
-    /// launches the worker, not inferred later from current routing/model
-    /// policy, so execution history remains an honest record of what ran.
-    pub fn record_execution_launch_config(
-        &self,
-        execution_id: &str,
-        driver: &str,
-        model: &str,
-        effort_level: Option<EffortLevel>,
-    ) -> Result<WorkExecution> {
-        let mut conn = self.connect()?;
-        let tx = conn.transaction()?;
-        let existing = query_execution(&tx, execution_id).require("execution", execution_id)?;
-        if existing.driver.is_some() || existing.model.is_some() {
-            tx.commit()?;
-            return Ok(existing);
-        }
-
-        tx.execute(
-            "UPDATE work_executions
-             SET driver = ?2,
-                 model = ?3,
-                 effort_level = ?4
-             WHERE id = ?1",
-            params![execution_id, driver, model, effort_level.map(|level| level.as_str())],
-        )?;
-        let updated = query_execution(&tx, execution_id)?
-            .with_context(|| format!("missing execution after launch-config update: {execution_id}"))?;
-        tx.commit()?;
-        Ok(updated)
-    }
-
     /// Mark an execution `cancelled` and stamp `finished_at`. Errors
     /// when the execution is unknown or already in a terminal status
     /// — callers shouldn't try to cancel a row that's already done.
@@ -2890,8 +2857,6 @@ mod event_bus_tests {
         assert_eq!(recorded.model.as_deref(), Some("gpt-5.5-codex"));
         assert_eq!(recorded.effort_level, Some(EffortLevel::Large));
 
-        // A second call cannot rewrite the historical tuple after policy or
-        // a task row changes; execution history reports what actually ran.
         let reloaded = db
             .record_execution_launch_config(&execution.id, "claude", "opus", Some(EffortLevel::Small))
             .unwrap();
