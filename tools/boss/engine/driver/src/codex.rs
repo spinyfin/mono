@@ -23,6 +23,7 @@ use boss_codex_auth::{
 use boss_engine_codex_hook_trust::{
     ArmRequest, CommandHookSpec, HookEvent, arm_and_attest, sha256_hex_prefixed, write_attestation_file,
 };
+use boss_engine_codex_rollout::flatten_tool_output_text;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
 use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, WorkerEvent};
@@ -34,6 +35,7 @@ mod guard_chain;
 pub mod guard_trace;
 mod pane_monitor;
 mod progress;
+mod rollout_calls;
 mod tool_surface_guard;
 
 use guard_trace::{GUARD_TRACE_SHIM_FILENAME, GUARD_TRACE_SHIM_SCRIPT, guard_trace_path, wrapper_body};
@@ -1212,20 +1214,6 @@ fn which_codex() -> Option<PathBuf> {
     }
 }
 
-fn rollout_output_text(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(rollout_output_text)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        serde_json::Value::Object(object) => object.get("text").map(rollout_output_text).unwrap_or_default(),
-        _ => String::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // CodexDriver
 // ---------------------------------------------------------------------------
@@ -1685,9 +1673,11 @@ impl AgentDriver for CodexDriver {
             // Rollout tool completion is
             // `response_item.payload.output`, observed as either a string
             // (`function_call_output`) or text-content array
-            // (`custom_tool_call_output`). Keep extraction here, rather than
-            // pretending the value is stdout's `aggregated_output`.
-            output_text: rollout_output_text(tool_response),
+            // (`custom_tool_call_output`) — flattened by the same shared
+            // helper cell classification uses, so capture and classification
+            // can never see two different texts for one value. Not pretended
+            // to be stdout's `aggregated_output`.
+            output_text: flatten_tool_output_text(tool_response),
             command,
         })
     }
