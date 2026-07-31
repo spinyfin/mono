@@ -1,0 +1,36 @@
+== polls-run1: 130 polls @ 0.5s  (busy=25, non-busy=105)
+literal                                hits       busy   non-busy  first   last
+>_ OpenAI Codex                    23/130     23/25       0/105        1     23
+/model to change                   25/130     25/25       0/105        1     25
+permissions:                        0/130      0/25       0/105        -      -
+esc to interrupt                   25/130     25/25       0/105        1     25
+Booting MCP server:                 0/130      0/25       0/105        -      -
+› (composer/user-line prefix)     130/130     25/25     105/105        1    130
+■ Conversation interrupted          0/130      0/25       0/105        -      -
+Working (                          25/130     25/25       0/105        1     25
+busy spans (contiguous == no flicker): [(1, 25)]
+
+== polls-run2: 400 polls @ 0.25s  (busy=112, non-busy=288)
+literal                                hits       busy   non-busy  first   last
+>_ OpenAI Codex                    61/400     57/112      4/288        1     61
+/model to change                   61/400     57/112      4/288        1     61
+permissions:                        0/400      0/112      0/288        -      -
+esc to interrupt                  112/400    112/112      0/288        5    116
+Booting MCP server:                 5/400      5/112      0/288        5      9
+› (composer/user-line prefix)     400/400    112/112    288/288        1    400
+■ Conversation interrupted          0/400      0/112      0/288        -      -
+Working (                         107/400    107/112      0/288       10    116
+busy spans (contiguous == no flicker): [(5, 116)]
+
+== polls-run3: 380 polls @ 0.25s  (busy=134, non-busy=246)
+literal                                hits       busy   non-busy  first   last
+>_ OpenAI Codex                   379/380    134/134    245/246        2    380
+/model to change                  379/380    134/134    245/246        2    380
+permissions:                        0/380      0/134      0/246        -      -
+esc to interrupt                  134/380    134/134      0/246        3    136
+Booting MCP server:                 3/380      3/134      0/246        3      5
+› (composer/user-line prefix)     379/380    134/134    245/246        2    380
+■ Conversation interrupted          0/380      0/134      0/246        -      -
+Working (                         131/380    131/134      0/246        6    136
+busy spans (contiguous == no flicker): [(3, 136)]
+
