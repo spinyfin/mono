@@ -301,16 +301,53 @@ pub(super) async fn handle_update_worker_shell_pid(ctx: Dispatch, req: FrontendR
     }
 }
 
-/// Handle the app reporting that a worker pane died — either its
-/// libghostty surface never attached (`ghostty_surface_new` returned
-/// NULL) or its child process exited with no app-side restart handler
-/// for it (only the Boss pane restarts itself).
+/// Handle the app reporting that a worker pane died — its child process
+/// exited with no app-side restart handler for it (only the Boss pane
+/// restarts itself).
 ///
-/// Resolves the backing execution immediately via
-/// [`crate::dead_pid_sweep::reap_reported_pane_death`] instead of
-/// waiting for the next periodic dead-PID sweep pass (up to 60s later)
-/// or an app restart. Fire-and-forget: the app does not wait for a
-/// response.
+/// The current app also reports a surface that never attached
+/// (`ghostty_surface_new` returned NULL) via `ReportWorkerSpawnFailed`
+/// instead, since such a pane never had a child to exit. The classification
+/// below does not assume that: an older app build, or any future caller that
+/// gets it wrong, is still routed correctly, and an engine that depends on
+/// the frontend classifying its own failures is an engine one app regression
+/// away from repeating the incident described below.
+///
+/// Resolves the backing execution immediately instead of waiting for the
+/// next periodic dead-PID sweep pass (up to 60s later) or an app restart.
+/// Fire-and-forget: the app does not wait for a response.
+///
+/// # A "death" before the pane ever came up is not a death
+///
+/// The report is classified before it is acted on, because the two things
+/// the app folds into this one message need different handling:
+///
+/// - **The pane died after running** — a shell pid was reported, or a hook
+///   event arrived, or the slot progressed past `Spawning`. A worker really
+///   did exist and really did go away. Reaped by
+///   [`crate::dead_pid_sweep::reap_reported_pane_death`], as before.
+/// - **The pane never came up** ([`crate::spawn_ack_sweep::slot_never_started`])
+///   — no pid, no hook event, still `Spawning`. Nothing was started, so
+///   nothing died: this is a never-started spawn and is reaped as one, via
+///   [`crate::spawn_ack_sweep::reap_never_started_spawn`].
+///
+/// The distinction is not cosmetic. The never-started path force-releases
+/// the cube workspace lease and — decisively — feeds the cross-work-item
+/// [`crate::spawn_health`] circuit breaker; the death path does neither.
+/// A display-less host fails every spawn identically, spread thinly across
+/// many work items, so the per-work-item churn guard cannot see it and only
+/// the aggregate breaker can. Routing those failures down the death path is
+/// what let the 2026-07 no-active-display incident burn 818 executions
+/// across 79 work items: the breaker that exists precisely to stop it was
+/// never fed a single failure, and the churn guard — which parks a row
+/// rather than naming a cause — was left as the only backstop.
+///
+/// It also settles a race the app cannot win from its side. A surface that
+/// fails to create can produce both this report and the diagnostic
+/// `ReportWorkerSpawnFailed` NACK; whichever arrives first releases the
+/// slot, and the second is then correctly dropped as stale. Classifying here
+/// means the outcome no longer depends on which one that was — both orders
+/// end in the same never-started reap.
 ///
 /// **Spawned detached**, for the reason `handle_register_app_session`'s
 /// re-attach reconcile is: the macOS app holds ONE frontend connection for its
@@ -334,20 +371,94 @@ pub(super) async fn handle_worker_pane_died(ctx: Dispatch, req: FrontendRequest)
         );
         return;
     }
-    tokio::spawn(async move {
+    tokio::spawn(async move { resolve_reported_pane_death(&server_state, &run_id, reason).await });
+}
+
+/// What the app tells us it saw when it reports a pane death. Deliberately
+/// one string shared by both reap paths so the record says the same thing
+/// however the report is classified.
+const PANE_DIED_DETAIL: &str = "app reported the worker pane died (surface failed to attach or child process exited)";
+
+/// Classify and resolve one app-reported pane death — the body of
+/// [`handle_worker_pane_died`], split out so the routing decision is
+/// directly awaitable in tests instead of racing a detached `tokio::spawn`.
+async fn resolve_reported_pane_death(
+    server_state: &Arc<ServerState>,
+    run_id: &str,
+    reason: boss_protocol::WorkerPaneDeathReason,
+) {
+    // Classify against the live slot, not the DB: proof of life lives in the
+    // registry. A run with no live slot at all has already been reaped or
+    // released, and `reap_reported_pane_death` handles that (and every other
+    // terminal race) with its own guards — so anything we cannot positively
+    // classify as never-started falls through to it unchanged.
+    let never_started = server_state
+        .live_worker_states
+        .snapshot()
+        .into_iter()
+        .find(|s| s.run_id == run_id)
+        .filter(crate::spawn_ack_sweep::slot_never_started);
+
+    let Some(state) = never_started else {
         let reaped = crate::dead_pid_sweep::reap_reported_pane_death(
             server_state.work_db.as_ref(),
             server_state.live_worker_states.as_ref(),
             server_state.execution_coordinator.clone(),
             server_state.dispatch_events.as_ref(),
-            &run_id,
+            run_id,
             reason,
         )
         .await;
         if reaped {
-            tracing::info!(run_id = %run_id, "worker_pane_died: execution reaped immediately");
+            tracing::info!(run_id, "worker_pane_died: execution reaped immediately");
         }
-    });
+        return;
+    };
+
+    let execution = match server_state.work_db.get_execution(run_id) {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(run_id, ?err, "worker_pane_died: failed to look up execution; ignoring");
+            return;
+        }
+    };
+    if execution.status.is_terminal() {
+        tracing::debug!(run_id, "worker_pane_died: execution already terminal; ignoring");
+        return;
+    }
+
+    tracing::warn!(
+        run_id,
+        slot_id = state.slot_id,
+        "app reported worker-pane death for a pane that never came up (no shell pid, no hook \
+         event, still spawning); reaping as a never-started spawn",
+    );
+    crate::spawn_ack_sweep::reap_never_started_spawn(
+        &spawn_reap_ctx(server_state),
+        &execution,
+        state.slot_id,
+        state.shell_pid,
+        crate::spawn_ack_sweep::ReapCause::PaneDiedBeforeStart {
+            detail: PANE_DIED_DETAIL,
+        },
+        boss_engine_utils::epoch_time::now_epoch_secs(),
+    )
+    .await;
+}
+
+/// Build the shared [`crate::spawn_ack_sweep::SpawnReapCtx`] every
+/// never-started reap needs from `server_state`. One helper so the two
+/// app-report handlers cannot drift into passing different collaborators for
+/// what is meant to be the identical teardown.
+fn spawn_reap_ctx(server_state: &Arc<ServerState>) -> crate::spawn_ack_sweep::SpawnReapCtx<'_> {
+    crate::spawn_ack_sweep::SpawnReapCtx::builder()
+        .work_db(server_state.work_db.as_ref())
+        .coordinator(server_state.execution_coordinator.clone())
+        .dispatch_events(server_state.dispatch_events.as_ref())
+        .reaper(server_state.as_ref())
+        .spawn_health(server_state.spawn_health.as_ref())
+        .cube_client(server_state.cube_client.as_ref())
+        .build()
 }
 
 /// App reports that it can once again host worker panes after a
@@ -423,8 +534,7 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
         );
         return;
     };
-    if state.shell_pid > 0 || state.last_event_at.is_some() || state.activity != boss_protocol::WorkerActivity::Spawning
-    {
+    if !crate::spawn_ack_sweep::slot_never_started(&state) {
         tracing::info!(
             run_id = %run_id,
             slot_id = state.slot_id,
@@ -462,16 +572,8 @@ pub(super) async fn handle_report_worker_spawn_failed(ctx: Dispatch, req: Fronte
     );
 
     let now_epoch_secs = boss_engine_utils::epoch_time::now_epoch_secs();
-    let reap_ctx = crate::spawn_ack_sweep::SpawnReapCtx::builder()
-        .work_db(server_state.work_db.as_ref())
-        .coordinator(server_state.execution_coordinator.clone())
-        .dispatch_events(server_state.dispatch_events.as_ref())
-        .reaper(server_state.as_ref())
-        .spawn_health(server_state.spawn_health.as_ref())
-        .cube_client(server_state.cube_client.as_ref())
-        .build();
     crate::spawn_ack_sweep::reap_never_started_spawn(
-        &reap_ctx,
+        &spawn_reap_ctx(&server_state),
         &execution,
         state.slot_id,
         state.shell_pid,
@@ -645,6 +747,104 @@ mod tests {
             )
             .unwrap()
             .id
+    }
+
+    /// A pane-death report for a slot that never showed proof of life is a
+    /// never-started spawn, not a death. It must be reaped through the
+    /// never-started path — which is the ONLY one that feeds the
+    /// cross-work-item spawn-capability breaker. A display-less host fails
+    /// every spawn identically across many work items, so no per-work-item
+    /// guard can ever see it; starving the breaker is what let the 2026-07
+    /// incident burn 818 executions across 79 work items.
+    #[tokio::test]
+    async fn pane_death_before_start_feeds_the_spawn_capability_breaker() {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        let work_item_id = server_state.work_db.get_execution(&execution_id).unwrap().work_item_id;
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+
+        resolve_reported_pane_death(
+            &server_state,
+            &execution_id,
+            boss_protocol::WorkerPaneDeathReason::SurfaceCreationFailed,
+        )
+        .await;
+
+        assert_eq!(
+            server_state.work_db.get_execution(&execution_id).unwrap().status,
+            boss_protocol::ExecutionStatus::Orphaned,
+            "a pane that never came up must still be reaped",
+        );
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        let evidence = server_state.spawn_health.evidence_in_window(now);
+        assert_eq!(
+            evidence.iter().map(|e| e.work_item_id.as_str()).collect::<Vec<_>>(),
+            vec![work_item_id.as_str()],
+            "the never-started reap must record spawn-health evidence; the death path does not, \
+             and that omission is the defect",
+        );
+    }
+
+    /// The durable explanation must name what actually happened. The death
+    /// path's audit line ("worker pane died") describes a worker that ran and
+    /// stopped — the opposite of the truth — leaving an operator reading the
+    /// work item with nothing to diagnose from. The `[engine-reconcile]` line
+    /// appended to the work item's description is checked here because it is
+    /// a durable surface that lands unconditionally; the `work_runs` orphan
+    /// reason is guarded separately and is covered by its own work item.
+    #[tokio::test]
+    async fn pane_death_before_start_records_a_never_started_audit_line() {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        let work_item_id = server_state.work_db.get_execution(&execution_id).unwrap().work_item_id;
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 0, None);
+
+        resolve_reported_pane_death(
+            &server_state,
+            &execution_id,
+            boss_protocol::WorkerPaneDeathReason::SurfaceCreationFailed,
+        )
+        .await;
+
+        let description = match server_state.work_db.get_work_item(&work_item_id).unwrap() {
+            boss_protocol::WorkItem::Task(t) | boss_protocol::WorkItem::Chore(t) => t.description,
+            other => panic!("expected a chore work item, got {other:?}"),
+        };
+        assert!(
+            description.contains("death before start"),
+            "the audit line must say the pane never came up; got: {description}",
+        );
+    }
+
+    /// The other side of the classification: a pane that reported a real
+    /// shell pid genuinely hosted a worker, so its death is a death and must
+    /// keep taking the pane-death path. Reaping it as a never-started spawn
+    /// would feed the breaker a failure that is not a spawn failure at all,
+    /// and could trip the fleet on three unrelated crashed workers.
+    #[tokio::test]
+    async fn pane_death_after_a_live_shell_stays_on_the_death_path() {
+        let (server_state, _dir) = test_server_state();
+        let execution_id = create_ready_execution(&server_state);
+        server_state
+            .live_worker_states
+            .register_spawn(1, &execution_id, "claude-opus-4-7", 4242, None);
+
+        resolve_reported_pane_death(
+            &server_state,
+            &execution_id,
+            boss_protocol::WorkerPaneDeathReason::ChildProcessExited,
+        )
+        .await;
+
+        let now = boss_engine_utils::epoch_time::now_epoch_secs();
+        assert!(
+            server_state.spawn_health.evidence_in_window(now).is_empty(),
+            "a pane that hosted a live shell is not a spawn failure and must not feed the breaker",
+        );
     }
 
     async fn call_nack(server_state: &Arc<ServerState>, run_id: &str) {

@@ -133,13 +133,41 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use boss_protocol::{CreateAttentionItemInput, WorkExecution, WorkerActivity};
+use boss_protocol::{CreateAttentionItemInput, LiveWorkerState, WorkExecution, WorkerActivity};
 
 use crate::coordinator::{CubeClient, ExecutionCoordinator, worker_id_for_slot};
 use crate::dispatch_events::{DispatchEvent, DispatchEventSink, Outcome, Stage};
 use crate::live_worker_state::LiveWorkerStateRegistry;
 use crate::spawn_health::{SpawnHealthTracker, maybe_admit_recovery_probe, trip_spawn_capability_circuit};
 use crate::work::WorkDb;
+
+/// Whether a live slot has shown **no proof of life whatsoever** — no shell
+/// pid was ever reported, no hook event ever arrived, and it is still
+/// advertising `Spawning`. Such a slot has an execution the engine believes
+/// is running with, in fact, no process behind it: nothing was ever started,
+/// so nothing can have died.
+///
+/// This is the classifier that decides which reap an app report earns. Both
+/// app-originated reports about a not-yet-live pane land on it:
+///
+/// - `ReportWorkerSpawnFailed` (the diagnostic NACK) uses it as a staleness
+///   guard — a slot that HAS shown proof of life must never be reaped by a
+///   late NACK, because the pane demonstrably came up.
+/// - `WorkerPaneDied` uses it to tell "the pane never came up" apart from
+///   "the pane died after running". Only the latter is a death; the former
+///   belongs on [`reap_never_started_spawn`], which feeds the cross-work-item
+///   [`crate::spawn_health`] breaker. The pane-death path does not feed it,
+///   and routing never-started spawns there is what let the 2026-07
+///   no-active-display incident churn 818 executions across 79 work items
+///   without the one aggregator that would have stopped it ever seeing a
+///   single failure.
+///
+/// Pure and free-standing so the classification is unit-testable without a
+/// live registry, and so both call sites are provably asking the same
+/// question rather than maintaining two copies of the predicate.
+pub(crate) fn slot_never_started(state: &LiveWorkerState) -> bool {
+    state.shell_pid <= 0 && state.last_event_at.is_none() && state.activity == WorkerActivity::Spawning
+}
 
 /// Kind string for the attention item raised when a spawn produced a
 /// pane but no driver. Stable — operator tooling pins it.
@@ -480,6 +508,11 @@ pub(crate) enum ReapCause<'a> {
     SpawnAckTimeout { grace_secs: i64 },
     /// The app proactively reported the spawn failed (fast-fail NACK).
     AppNack { reason: &'a str },
+    /// The app reported the worker pane died (`WorkerPaneDied`), but the
+    /// slot had never shown any proof of life — see [`slot_never_started`].
+    /// The pane never came up, so this is a never-started spawn wearing a
+    /// death report's clothing, and it is reaped as one.
+    PaneDiedBeforeStart { detail: &'a str },
     /// A pane came up — possibly with a live shell pid — but no
     /// driver-originated signal ever arrived, so the driver binary never
     /// executed. Unlike the two above, this one also raises a
@@ -491,30 +524,18 @@ pub(crate) enum ReapCause<'a> {
     },
 }
 
-/// Reap a `Spawning` slot that never produced a live shell: mark the execution
-/// orphaned, back up any uncommitted work, append an `[engine-reconcile]`
-/// audit line, tear down the (possibly ghost) app pane, release the pool slot,
-/// emit a dispatch event, and feed the spawn-capability circuit breaker —
-/// tripping it when too many DISTINCT work items fail in the window. Returns
-/// `true` when the execution was reaped, `false` when it was skipped (already
-/// terminal, or the orphan write failed).
+/// The operator-facing narrative for one never-started reap: the orphan
+/// reason recorded on the run, the `[engine-reconcile]` audit line appended
+/// to the work item's description, and the dispatch stage emitted.
 ///
-/// Shared by [`run_one_pass`] (the 60s timeout path) and
-/// [`crate::app::sessions::handle_report_worker_spawn_failed`] (the immediate
-/// NACK path) so both do exactly the same thing — the only difference is
-/// `cause`.
-pub(crate) async fn reap_never_started_spawn(
-    ctx: &SpawnReapCtx<'_>,
-    execution: &WorkExecution,
-    slot_id: u8,
-    shell_pid: i32,
-    cause: ReapCause<'_>,
-    now_epoch_secs: i64,
-) -> bool {
-    let execution_id = execution.id.as_str();
-    let work_item_id = execution.work_item_id.as_str();
-
-    let (orphan_reason, audit_note, stage) = match &cause {
+/// Pure and free-standing so each cause's story is unit-testable without a
+/// DB, a pool, or an app session. That matters most for the reason text: it
+/// is the only durable explanation an operator gets for why an execution
+/// vanished, and a cause whose reason describes the wrong event (a "death"
+/// for a pane that never came up) is indistinguishable from no explanation
+/// at all.
+fn reap_narrative(cause: &ReapCause<'_>, execution_id: &str) -> (String, String, Stage) {
+    match &cause {
         ReapCause::SpawnAckTimeout { grace_secs } => (
             format!(
                 "spawn-ack-timeout: no shell pid reported and no hook event received within {grace_secs}s of spawn; worker process never came up"
@@ -530,6 +551,18 @@ pub(crate) async fn reap_never_started_spawn(
                 "app reported worker-pane spawn failure (exec {execution_id}): {reason}; chore reset to todo for redispatch."
             ),
             Stage::SpawnNack,
+        ),
+        ReapCause::PaneDiedBeforeStart { detail } => (
+            format!(
+                "pane-death-before-start: app reported the worker pane died before it ever produced a \
+                 shell pid or a hook event, so no worker process ever existed: {detail}"
+            ),
+            format!(
+                "app reported worker-pane death before start (exec {execution_id}): {detail}; no shell \
+                 or hook event was ever observed, so the pane never came up; chore reset to todo for \
+                 redispatch."
+            ),
+            Stage::PaneDeathBeforeStart,
         ),
         ReapCause::DriverStartTimeout {
             grace_secs,
@@ -548,7 +581,35 @@ pub(crate) async fn reap_never_started_spawn(
             ),
             Stage::DriverStartTimeout,
         ),
-    };
+    }
+}
+
+/// Reap a `Spawning` slot that never produced a live shell: mark the execution
+/// orphaned, back up any uncommitted work, append an `[engine-reconcile]`
+/// audit line, tear down the (possibly ghost) app pane, release the pool slot,
+/// emit a dispatch event, and feed the spawn-capability circuit breaker —
+/// tripping it when too many DISTINCT work items fail in the window. Returns
+/// `true` when the execution was reaped, `false` when it was skipped (already
+/// terminal, or the orphan write failed).
+///
+/// Shared by [`run_one_pass`] (the 60s timeout path),
+/// [`crate::app::sessions::handle_report_worker_spawn_failed`] (the immediate
+/// NACK path), and [`crate::app::sessions::handle_worker_pane_died`] when the
+/// reported "death" turns out to be a pane that never came up at all
+/// ([`slot_never_started`]) — so all three do exactly the same thing, and in
+/// particular all three feed the breaker. The only difference is `cause`.
+pub(crate) async fn reap_never_started_spawn(
+    ctx: &SpawnReapCtx<'_>,
+    execution: &WorkExecution,
+    slot_id: u8,
+    shell_pid: i32,
+    cause: ReapCause<'_>,
+    now_epoch_secs: i64,
+) -> bool {
+    let execution_id = execution.id.as_str();
+    let work_item_id = execution.work_item_id.as_str();
+
+    let (orphan_reason, audit_note, stage) = reap_narrative(&cause, execution_id);
 
     if let Err(err) = ctx.work_db.mark_execution_orphaned(execution_id, &orphan_reason) {
         tracing::warn!(
@@ -645,6 +706,9 @@ pub(crate) async fn reap_never_started_spawn(
         }
         ReapCause::AppNack { reason } => {
             details["reason"] = serde_json::json!(reason);
+        }
+        ReapCause::PaneDiedBeforeStart { detail } => {
+            details["detail"] = serde_json::json!(detail);
         }
         ReapCause::DriverStartTimeout {
             grace_secs,
@@ -914,6 +978,72 @@ mod tests {
     }
 
     // ─── tests ───────────────────────────────────────────────────────────────
+
+    /// Every way a slot can prove it came up, and the one shape that proves
+    /// it did not. This predicate decides whether an app-reported pane death
+    /// is treated as a death or as a never-started spawn, and only the
+    /// latter feeds the spawn-capability breaker — so a false positive here
+    /// would let a genuinely crashed worker trip the fleet, and a false
+    /// negative reproduces the 2026-07 churn.
+    #[test]
+    fn slot_never_started_requires_the_total_absence_of_proof_of_life() {
+        let live_states = LiveWorkerStateRegistry::new();
+        register_slot_zero_pid(&live_states, 1, "exec-1", "wi-1");
+        let pristine = live_states.get(1).expect("slot 1");
+        assert!(
+            slot_never_started(&pristine),
+            "no pid, no hook event, still Spawning is the never-started shape",
+        );
+
+        let with_pid = LiveWorkerState {
+            shell_pid: 4242,
+            ..pristine.clone()
+        };
+        assert!(!slot_never_started(&with_pid), "a reported shell pid is proof of life");
+
+        let with_event = LiveWorkerState {
+            last_event_at: Some("2026-07-31T00:00:00Z".to_owned()),
+            ..pristine.clone()
+        };
+        assert!(!slot_never_started(&with_event), "a hook event is proof of life");
+
+        let progressed = LiveWorkerState {
+            activity: WorkerActivity::Working,
+            ..pristine.clone()
+        };
+        assert!(
+            !slot_never_started(&progressed),
+            "activity past Spawning is proof of life",
+        );
+    }
+
+    /// A never-started spawn reported to us as a pane death must not be
+    /// narrated as a death. The reason text is the only durable explanation
+    /// an operator gets, and "the worker pane died" for a pane that never
+    /// came up sent every reader of the 2026-07 incident looking for a
+    /// process that had never existed.
+    #[test]
+    fn pane_death_before_start_is_narrated_as_never_started() {
+        let (reason, audit, stage) = reap_narrative(
+            &ReapCause::PaneDiedBeforeStart {
+                detail: "surface failed to attach",
+            },
+            "exec-1",
+        );
+        assert_eq!(stage, Stage::PaneDeathBeforeStart);
+        assert!(
+            reason.starts_with("pane-death-before-start:"),
+            "reason must be greppable by cause; got: {reason}",
+        );
+        assert!(
+            reason.contains("no worker process ever existed"),
+            "reason must say no process existed, not that one died; got: {reason}",
+        );
+        assert!(
+            reason.contains("surface failed to attach") && audit.contains("surface failed to attach"),
+            "both surfaces must carry the app's observation verbatim",
+        );
+    }
 
     /// The core invariant: a `Spawning` slot with `shell_pid == 0` and no
     /// hook events, past the grace window, has its execution orphaned,

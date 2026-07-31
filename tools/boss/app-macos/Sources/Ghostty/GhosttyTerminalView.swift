@@ -231,21 +231,23 @@ final class GhosttyTerminalHostView: NSView {
         guard let surface = makeSurface() else {
             session.statusMessage = "Waiting for an active display…"
             installScreenObserverIfNeeded()
-            if Self.shouldReportSurfaceFailure(hasActiveDisplay: NSScreen.main != nil) {
-                session.onSurfaceFailed?()
-            }
-            // Tell the session the spawn failed so worker panes can NACK the
-            // engine (fail-fast instead of the 60s spawn-ack timeout) and log
-            // a durable diagnostic. Dedupe: the screen observer / window-move
-            // retries call this again, but one report per spawn is enough — the
-            // engine reaps on the first. The pane stays in its surface-less
-            // placeholder either way; if the display returns before the engine
-            // reaps, the retry still recreates the surface.
+            // Tell the session the SPAWN failed — never that the pane died.
+            // A surface that was never created hosted no pty and therefore no
+            // shell process, so there is no worker here to have died. Saying
+            // "died" routes the engine to its pane-death reap, which does not
+            // feed the cross-work-item spawn-capability breaker; saying
+            // "spawn failed" routes it to the never-started-spawn reap, which
+            // does. See `TerminalPaneSession.onSurfaceCreationFailed`.
+            //
+            // Dedupe: the screen observer / window-move retries call this
+            // again, but one report per spawn is enough — the engine reaps on
+            // the first. The pane stays in its surface-less placeholder either
+            // way; if the display returns before the engine reaps, the retry
+            // still recreates the surface.
             if !reportedSurfaceCreationFailure {
                 reportedSurfaceCreationFailure = true
                 session.onSurfaceCreationFailed?(
-                    "libghostty surface creation failed (ghostty_surface_new returned NULL — "
-                        + "likely no active display after sleep/wake)"
+                    Self.surfaceFailureReason(hasActiveDisplay: NSScreen.main != nil)
                 )
             }
             return
@@ -266,23 +268,35 @@ final class GhosttyTerminalHostView: NSView {
         reconcilePaneMonitor()
     }
 
-    /// Whether a NULL surface should be reported as a pane death (via
-    /// `session.onSurfaceFailed?()`) or treated as the recoverable #800
-    /// "no active display" condition that `installScreenObserverIfNeeded()`
-    /// is about to retry.
+    /// The reason string reported to the engine when `ghostty_surface_new`
+    /// returns NULL, **diagnosed from the display state actually observed**
+    /// rather than assumed.
     ///
-    /// A NULL surface with no active display is not a real failure — it is
-    /// the transient state `attemptSurfaceCreation`'s doc comment describes,
-    /// and reporting it as a death would have the engine reap a
-    /// live/not-yet-started execution (bypassing the dead-pid sweep's grace
-    /// period) and redispatch straight back into the same no-display wall,
-    /// producing a reap/redispatch loop for as long as the display stays
-    /// asleep. A NULL surface while a display *is* present has no such
-    /// recovery path and is a genuine, unrecoverable failure that must
-    /// still be reported. Free function (not gated on any instance state)
-    /// so it is unit-testable without a live surface/window.
-    static func shouldReportSurfaceFailure(hasActiveDisplay: Bool) -> Bool {
-        hasActiveDisplay
+    /// This string is the operator-facing explanation: it is what the engine
+    /// writes as the execution's orphan reason and what surfaces on the
+    /// dispatch event. It previously always claimed "likely no active
+    /// display" whatever the machine's real display state was, which made a
+    /// failure with a display present — an entirely different, non-transient
+    /// bug class (env pollution, a rejected working directory, a libghostty
+    /// version mismatch) — indistinguishable in the record from the benign
+    /// post-sleep case. The two branches here are the whole point: they are
+    /// the difference between "wait for the display to come back" and "this
+    /// will fail again on the next attempt and needs a human".
+    ///
+    /// No active display is the known-recoverable #800 condition: libghostty's
+    /// renderer calls `CVDisplayLinkCreateWithCGDisplays`, which rejects a
+    /// display count of 0, so a surface genuinely cannot be created headless.
+    /// `installScreenObserverIfNeeded()` retries when a display returns.
+    ///
+    /// Free function (not gated on any instance state) so it is unit-testable
+    /// without a live surface/window.
+    static func surfaceFailureReason(hasActiveDisplay: Bool) -> String {
+        let cause = hasActiveDisplay
+            ? "a display IS active, so display availability is not the cause — check the "
+                + "stderr diagnostic dump for the rejected precondition"
+            : "no active display (lid closed, monitors disconnected, or display asleep); "
+                + "libghostty cannot create a surface headless"
+        return "libghostty surface creation failed (ghostty_surface_new returned NULL — \(cause))"
     }
 
     /// Build the surface config from `launchSpec` and call

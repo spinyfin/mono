@@ -270,13 +270,6 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// when the child exits). Boss pane uses this to re-register the
     /// Boss trust root after a restart produces a new shell pid.
     var onSurfaceAttached: (() -> Void)?
-    /// Called on the main actor each time `ghostty_surface_new` returns
-    /// NULL for this session (no active display, or another rejected
-    /// precondition) — the pane never got a shell process at all. Worker
-    /// panes use this to report the death to the engine immediately
-    /// instead of waiting for the periodic dead-pid sweep; the Boss pane
-    /// leaves it nil (it has no engine-tracked execution to reap).
-    var onSurfaceFailed: (() -> Void)?
     /// Called on the main actor when this session's libghostty surface
     /// FAILS to create (`ghostty_surface_new` returned NULL — typically the
     /// post-sleep "no active display" condition, #800). Worker panes set
@@ -285,6 +278,17 @@ final class TerminalPaneSession: ObservableObject, Identifiable {
     /// out the 60s spawn-ack timeout, and logs a durable diagnostic. Fired
     /// at most once per session — the host view dedupes — and never for a
     /// surface that eventually succeeds. Boss pane leaves this nil.
+    ///
+    /// This is the ONLY channel for a surface that never came up. It is
+    /// deliberately not `onChildExited`: a pane with no surface hosted no
+    /// pty and so never had a child to exit, and reporting it as a pane
+    /// death sends the engine down its death-reap path, which does not feed
+    /// the cross-work-item spawn-capability breaker. A display-less host
+    /// fails every spawn the same way, spread thinly over many work items,
+    /// so the aggregate breaker is the only thing that can see it — a
+    /// per-work-item guard never will. Misclassifying here is what let the
+    /// 2026-07 no-active-display incident burn 818 executions across 79
+    /// work items with the breaker never fed once.
     var onSurfaceCreationFailed: ((_ reason: String) -> Void)?
 
 

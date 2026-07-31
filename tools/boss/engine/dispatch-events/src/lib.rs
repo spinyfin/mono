@@ -419,6 +419,28 @@ pub enum Stage {
     /// (see [`Stage::SpawnCapabilityUnhealthy`]). The `details` object carries
     /// the app-supplied `reason` and the `slot_id`.
     SpawnNack,
+    /// The app reported a worker pane died (`WorkerPaneDied`) for a slot that
+    /// had never shown any proof of life — no shell pid, no hook event, still
+    /// advertising `Spawning`. The pane did not *die*; it never came up, so
+    /// the execution is reaped through the never-started-spawn path (orphan →
+    /// driver teardown → pane teardown → slot release → cube lease release)
+    /// and feeds the same spawn-capability circuit breaker as
+    /// [`Stage::SpawnNack`] and [`Stage::SpawnAckTimeout`].
+    ///
+    /// Distinct from [`Stage::DeadPidReconcile`] / [`Stage::PaneDeathReconcile`],
+    /// which handle a pane that died *after* hosting a live worker. That
+    /// distinction is the 2026-07 no-active-display incident: a surface that
+    /// `ghostty_surface_new` refused to create was reported as a pane death,
+    /// so it took the death path — which does not feed the cross-work-item
+    /// breaker — and the diagnostic `ReportWorkerSpawnFailed` NACK that
+    /// followed found the slot already released and was dropped as stale.
+    /// 818 executions across 79 work items churned because no single work
+    /// item reached its own churn threshold and the one aggregator that
+    /// would have caught it was never fed.
+    ///
+    /// The `details` object carries `slot_id`, `shell_pid` (always `0`), and
+    /// the app-supplied `detail` describing what it observed.
+    PaneDeathBeforeStart,
     /// The app-spawn-capability circuit breaker tripped: too many worker-pane
     /// spawns failed across DIFFERENT work items within a short window
     /// (`ReportWorkerSpawnFailed` NACKs and/or `spawn_ack_timeout` reaps),
@@ -660,6 +682,7 @@ impl Stage {
             Stage::DriverStartTimeout => "driver_start_timeout",
             Stage::DispatchFailureRecoveryRedispatch => "dispatch_failure_recovery_redispatch",
             Stage::SpawnNack => "spawn_nack",
+            Stage::PaneDeathBeforeStart => "pane_death_before_start",
             Stage::SpawnCapabilityUnhealthy => "spawn_capability_unhealthy",
             Stage::SpawnCapabilityRecovered => "spawn_capability_recovered",
             Stage::HuskPaneReconcile => "husk_pane_reconcile",
@@ -1424,6 +1447,7 @@ mod tests {
             "dispatch_failure_recovery_redispatch"
         );
         assert_eq!(Stage::SpawnNack.as_str(), "spawn_nack");
+        assert_eq!(Stage::PaneDeathBeforeStart.as_str(), "pane_death_before_start");
         assert_eq!(Stage::SpawnCapabilityUnhealthy.as_str(), "spawn_capability_unhealthy");
         assert_eq!(Stage::SpawnCapabilityRecovered.as_str(), "spawn_capability_recovered");
         assert_eq!(Stage::HuskPaneReconcile.as_str(), "husk_pane_reconcile");
