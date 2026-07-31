@@ -122,6 +122,10 @@ enum EngineEvent {
     /// pane warning. Introduced after #699 where a missing API key
     /// silently broke summarization with no UI affordance.
     case engineHealthResult(apiKeyPresent: Bool, issues: [EngineHealthIssue])
+    /// Response to `get_codex_dispatch_percentage` / `set_codex_dispatch_percentage`
+    /// — the current effective percentage (0...100) of eligible, `standard`-
+    /// reasoning implementation work routed to the `codex` driver.
+    case codexDispatchPercentageResult(percentage: Int)
     /// Reply to `trunk_set_token` / `trunk_status` — whether a Trunk org
     /// API token is configured (env override or Keychain), and where it
     /// came from. Drives the Settings pane's Trunk token control and the

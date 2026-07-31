@@ -2566,3 +2566,28 @@ pub(crate) fn migrate_backfill_cancelled_moot_revision_tombstones(conn: &Connect
     }
     Ok(())
 }
+
+/// Create `execution_driver_decisions`: one row per `work_executions` row,
+/// recording which driver Codex-percentage routing chose for it and why
+/// (`explicit` | `percentage` | `default`) — see `work::codex_routing`.
+/// A dedicated side table rather than columns on `work_executions` itself:
+/// the decision is written once, read by two narrow lookups keyed on
+/// `execution_id`, and joins cleanly for after-the-fact analysis ("how much
+/// went to Codex", "did Codex rows fail more") without touching the
+/// `work_executions` SELECT column list every other query in this crate
+/// repeats verbatim.
+pub(crate) fn migrate_execution_driver_decisions_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS execution_driver_decisions (
+             execution_id           TEXT PRIMARY KEY REFERENCES work_executions(id) ON DELETE CASCADE,
+             work_item_id           TEXT NOT NULL,
+             driver                 TEXT,
+             reason                 TEXT NOT NULL,
+             percentage_at_decision INTEGER,
+             created_at             TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS execution_driver_decisions_work_item_idx
+             ON execution_driver_decisions(work_item_id);",
+    )?;
+    Ok(())
+}

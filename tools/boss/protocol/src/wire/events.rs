@@ -1063,6 +1063,12 @@ pub enum FrontendEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clamped_from: Option<usize>,
     },
+    /// Response to [`FrontendRequest::SetCodexDispatchPercentage`] and
+    /// [`FrontendRequest::GetCodexDispatchPercentage`]. `percentage` is the
+    /// current effective value (always `0..=100`).
+    CodexDispatchPercentageResult {
+        percentage: u8,
+    },
     /// Response to [`FrontendRequest::SetDispatchPaused`] and
     /// [`FrontendRequest::GetDispatchState`]. Carries the current pause state
     /// and, when paused, the epoch-seconds timestamp at which it was set.

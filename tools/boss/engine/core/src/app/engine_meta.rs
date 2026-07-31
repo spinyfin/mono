@@ -497,6 +497,54 @@ pub(super) async fn handle_set_dispatch_concurrency(ctx: Dispatch, req: Frontend
     );
 }
 
+pub(super) async fn handle_get_codex_dispatch_percentage(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::GetCodexDispatchPercentage = req else {
+        unreachable!()
+    };
+    match work_db.get_codex_dispatch_percentage() {
+        Ok(percentage) => send_response(
+            &sink,
+            &request_id,
+            FrontendEvent::CodexDispatchPercentageResult { percentage },
+        ),
+        Err(err) => send_work_error(&sink, &request_id, err),
+    }
+}
+
+pub(super) async fn handle_set_codex_dispatch_percentage(ctx: Dispatch, req: FrontendRequest) {
+    let Dispatch {
+        work_db,
+        sink,
+        request_id,
+        ..
+    } = ctx;
+    let FrontendRequest::SetCodexDispatchPercentage { percentage } = req else {
+        unreachable!()
+    };
+    // `set_codex_dispatch_percentage` clamps to 0..=100 and persists to
+    // `state.db` itself — see its doc comment. Nothing in-memory to
+    // update: every dispatch reads the metadata KV fresh at
+    // `insert_execution` time, so this takes effect on the very next
+    // execution created, without disturbing anything already dispatched.
+    match work_db.set_codex_dispatch_percentage(percentage) {
+        Ok(applied) => {
+            tracing::info!(requested = percentage, applied, "codex_dispatch_percentage: updated");
+            send_response(
+                &sink,
+                &request_id,
+                FrontendEvent::CodexDispatchPercentageResult { percentage: applied },
+            );
+        }
+        Err(err) => send_work_error(&sink, &request_id, err),
+    }
+}
+
 pub(super) async fn handle_set_dispatch_paused(ctx: Dispatch, req: FrontendRequest) {
     let Dispatch {
         server_state,

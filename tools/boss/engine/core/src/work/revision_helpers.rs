@@ -793,6 +793,16 @@ pub(crate) fn insert_execution(conn: &Connection, input: CreateExecutionInput) -
         ],
     )?;
 
+    // Decide (and durably record) which driver governs this execution —
+    // explicit row override, Codex-percentage roll, or no override at all
+    // — before returning. Every `insert_execution` call site funnels
+    // through here, so this is the single place a routing decision is
+    // made; the two real dispatch paths (`driver_lookup::get_execution_driver_slug`
+    // for the events socket, `runner::worker_spawn` for the actual spawn)
+    // both read the recorded decision back rather than re-deriving it.
+    let decision = decide_execution_driver(conn, &input.work_item_id, input.kind)?;
+    record_execution_driver_decision(conn, &id, &input.work_item_id, &decision, &now)?;
+
     query_execution(conn, &id)?.with_context(|| format!("missing execution after insert: {id}"))
 }
 

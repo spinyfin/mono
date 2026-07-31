@@ -47,6 +47,7 @@ struct SettingsView: View {
             // env var). Re-poll on appear so the pane shows the
             // current truth, not a snapshot from minutes ago.
             chatModel.refreshEngineHealth()
+            chatModel.refreshCodexDispatchPercentage()
         }
         .frame(minWidth: 560, minHeight: 400)
     }
@@ -146,6 +147,17 @@ private struct EngineConfigPane: View {
                 Text("Required Configuration")
             }
 
+            Section {
+                CodexDispatchPercentageRow()
+            } header: {
+                Text("Codex Dispatch")
+            } footer: {
+                Text("Share of ordinary, standard-reasoning implementation work (tasks, chores, revisions) that dispatches to the Codex driver instead of its normal default. Deterministic per work item — the same row always lands on the same driver. An explicit --driver on a row always wins over this percentage. Changing this only affects work dispatched after the change; nothing already running is reassigned.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             if !chatModel.engineHealthIssues.isEmpty {
                 Section {
                     ForEach(chatModel.engineHealthIssues) { issue in
@@ -228,6 +240,34 @@ private struct EngineConfigPane: View {
                 ?? error.localizedDescription
             apiKeyStatus = nil
         }
+    }
+}
+
+/// Stepper + numeric field for the Codex dispatch percentage, in the
+/// "Engine" Settings tab. Reads/writes `chatModel.codexDispatchPercentage`,
+/// which mirrors the engine's persisted `state.db` value (fetched on
+/// Settings appear via `refreshCodexDispatchPercentage`). The engine
+/// clamps to `0...100` and echoes back the applied value, so this binds
+/// straight to the model rather than keeping separate draft state.
+private struct CodexDispatchPercentageRow: View {
+    @EnvironmentObject private var chatModel: ChatViewModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Stepper(
+                value: Binding(
+                    get: { chatModel.codexDispatchPercentage },
+                    set: { chatModel.setCodexDispatchPercentage($0) }
+                ),
+                in: 0...100,
+                step: 5
+            ) {
+                Text("\(chatModel.codexDispatchPercentage)%")
+                    .font(.body.monospacedDigit())
+                    .frame(minWidth: 48, alignment: .leading)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 
