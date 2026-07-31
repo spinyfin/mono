@@ -135,8 +135,12 @@ impl IntegrityReport {
     }
 
     /// True when every damaged line sits in a rotated `current.jsonl.<secs>`
-    /// segment rather than the live `current.jsonl` the current writer
-    /// appends to.
+    /// segment — as opposed to the live `current.jsonl` the current writer
+    /// appends to, *or* any other path this report was never taught to
+    /// recognise as settled history (e.g. a per-execution mirror at
+    /// `executions/<id>/dispatch.jsonl`, which is read without segment
+    /// enumeration and so never rotates — see `is_rotated_segment_of`'s
+    /// doc for why an unrecognised path must default to "live").
     ///
     /// This is the boundary between "the writer that produced this stream
     /// today could have produced this damage" and "this predates whatever
@@ -144,8 +148,7 @@ impl IntegrityReport {
     /// the moment it was rotated out — nothing currently running can still be
     /// writing to it — so damage confined to rotated segments is settled
     /// history no matter which writer version is live today. This is
-    /// deliberately NOT a timestamp comparison against the writer-fix date
-    /// (see [`crate::stream_integrity`] docs / the PR that added this): a
+    /// deliberately NOT a timestamp comparison against the writer-fix date: a
     /// hardcoded cutoff would need updating by hand and would silently misfire
     /// against clock skew or a state root copied from elsewhere, while segment
     /// identity is read off the filesystem layout itself and never goes stale.
@@ -153,7 +156,7 @@ impl IntegrityReport {
     /// damage to confine anywhere, so callers must check [`Self::is_intact`]
     /// first.
     pub fn all_damage_in_rotated_segments(&self) -> bool {
-        !self.damage.is_empty() && self.damage.iter().all(|line| !is_live_path(&line.path))
+        !self.damage.is_empty() && self.damage.iter().all(|line| is_rotated_path(&line.path))
     }
 
     /// One line of provenance for a damaged line, for a marker or footer.
@@ -319,13 +322,18 @@ impl IntegrityReport {
     }
 }
 
-/// True when `path`'s file name is exactly the live dispatch stream filename
-/// (`current.jsonl`), as opposed to a rotated `current.jsonl.<unix_seconds>`
-/// segment. See [`IntegrityReport::all_damage_in_rotated_segments`].
-fn is_live_path(path: &std::path::Path) -> bool {
-    path.file_name()
-        .map(|name| name == boss_log_files::DISPATCH_EVENTS_LIVE_FILENAME)
-        .unwrap_or(false)
+/// True when `path`'s file name matches the rotated `current.jsonl.<unix_seconds>`
+/// segment scheme for the live dispatch stream filename (`current.jsonl`).
+///
+/// This is a *positive* predicate, not `!is_live`: a path this report has
+/// never seen before — a per-execution mirror at `executions/<id>/dispatch.jsonl`
+/// (which is read via `read_execution` with no segment enumeration, so it
+/// never rotates and is always the file its writer is actively appending to
+/// right now), or any other unrecognised shape — must fall through to "not
+/// rotated" rather than being classified as settled history by default. See
+/// [`IntegrityReport::all_damage_in_rotated_segments`].
+fn is_rotated_path(path: &std::path::Path) -> bool {
+    boss_log_files::is_rotated_segment_of(boss_log_files::DISPATCH_EVENTS_LIVE_FILENAME, path)
 }
 
 /// A damage marker to interleave into a rendered timeline, and where it goes.
@@ -537,6 +545,45 @@ mod tests {
             !report.all_damage_in_rotated_segments(),
             "even one live-segment line means the boundary is not confirmed-historical"
         );
+        let banner = report.render_banner();
+        assert!(banner.contains("writer needs attention"), "{banner}");
+    }
+
+    #[test]
+    fn damage_in_a_per_execution_mirror_still_implicates_the_writer() {
+        // Mirrors (`executions/<id>/dispatch.jsonl`) are read via `read_execution`
+        // with no segment enumeration, so they never rotate and are always the
+        // file their writer is actively appending to — this path is neither the
+        // live flat stream's exact filename nor a rotated segment of it, and
+        // must NOT be classified as settled history by default.
+        let report = IntegrityReport::new(vec![damaged_at(
+            "/state/executions/exec-abc/dispatch.jsonl",
+            1,
+            DamageShape::Concatenated,
+            Some(10),
+            Some(20),
+        )]);
+        assert!(
+            !report.all_damage_in_rotated_segments(),
+            "an unrecognised (non-rotated) path must be treated as live, not as settled history"
+        );
+        let banner = report.render_banner();
+        assert!(banner.contains("writer needs attention"), "{banner}");
+    }
+
+    #[test]
+    fn damage_with_a_non_numeric_suffix_is_not_treated_as_rotated() {
+        // `boss-log-files` deliberately excludes `current.jsonl.bak`-shaped
+        // siblings from segment enumeration; the same file must not count as
+        // rotated here either.
+        let report = IntegrityReport::new(vec![damaged_at(
+            "/state/dispatch-events/current.jsonl.bak",
+            1,
+            DamageShape::Concatenated,
+            Some(10),
+            Some(20),
+        )]);
+        assert!(!report.all_damage_in_rotated_segments());
         let banner = report.render_banner();
         assert!(banner.contains("writer needs attention"), "{banner}");
     }

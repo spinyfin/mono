@@ -103,23 +103,40 @@ fn enumerate_segments(base: &Path) -> Vec<PathBuf> {
     let Some(stem) = base.file_name().and_then(|n| n.to_str()) else {
         return vec![];
     };
-    let prefix = format!("{stem}.");
     let Ok(read_dir) = std::fs::read_dir(dir) else {
         return vec![];
     };
     read_dir
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| {
-                    let suffix = n.strip_prefix(prefix.as_str()).unwrap_or("");
-                    !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
-                })
-                .unwrap_or(false)
-        })
+        .filter(|p| is_rotated_segment_of(stem, p))
         .collect()
+}
+
+/// True when `path`'s file name matches the rotated-segment naming scheme for
+/// `base_filename`: `<base_filename>.<all-digits>` (e.g. `current.jsonl.1748694000`
+/// is a rotated segment of `current.jsonl`; `current.jsonl.bak` and
+/// `current.jsonl` itself are not). This is the same test [`enumerate_segments`]
+/// uses to find a base's rotated siblings on disk, exposed here so a caller that
+/// already has a single path in hand (rather than a directory to scan) can
+/// classify it without a filesystem read — e.g. `bossctl`'s stream-integrity
+/// report, which sees paths recorded in already-parsed damage records rather
+/// than files it enumerates itself.
+///
+/// This module is declared as "the only place that encodes that format" (see
+/// the module doc), so any caller that needs to decide "is this file settled
+/// rotated history, or something else (the live file, or an unrecognised
+/// mirror path)" must go through this predicate rather than re-deriving the
+/// naming scheme.
+pub fn is_rotated_segment_of(base_filename: &str, path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            let prefix = format!("{base_filename}.");
+            let suffix = n.strip_prefix(prefix.as_str()).unwrap_or("");
+            !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit())
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -220,6 +237,26 @@ mod tests {
         assert!(segs[0].to_string_lossy().ends_with(".1000"));
         assert!(segs[1].to_string_lossy().ends_with(".2000"));
         assert_eq!(&segs[2], &base);
+    }
+
+    #[test]
+    fn is_rotated_segment_of_matches_only_the_all_digit_suffix_form() {
+        assert!(is_rotated_segment_of(
+            "current.jsonl",
+            Path::new("/state/dispatch-events/current.jsonl.1753747200")
+        ));
+        assert!(!is_rotated_segment_of(
+            "current.jsonl",
+            Path::new("/state/dispatch-events/current.jsonl")
+        ));
+        assert!(!is_rotated_segment_of(
+            "current.jsonl",
+            Path::new("/state/dispatch-events/current.jsonl.bak")
+        ));
+        assert!(!is_rotated_segment_of(
+            "current.jsonl",
+            Path::new("/state/executions/exec-abc/dispatch.jsonl")
+        ));
     }
 
     #[test]

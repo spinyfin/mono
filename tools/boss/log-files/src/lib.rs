@@ -53,6 +53,6 @@ pub use query::{
 };
 pub use reader::{collect_tail_lines, read_file_lines, read_new_content, read_new_content_filtered};
 pub use segments::{
-    next_rotated_path, next_rotated_path_from, now_unix_secs, rotated_segment_path, rotated_segments,
-    segments_with_live,
+    is_rotated_segment_of, next_rotated_path, next_rotated_path_from, now_unix_secs, rotated_segment_path,
+    rotated_segments, segments_with_live,
 };
