@@ -109,6 +109,47 @@ async fn detection_idempotent_does_not_double_spawn_revision() {
 }
 
 #[tokio::test]
+async fn spawned_revision_pins_standard_reasoning_regardless_of_chain_root() {
+    // Engine-minted merge-conflict revisions must classify by their own
+    // shape (a rebase — a described diff) rather than inheriting the chain
+    // root's `reasoning`. Give the chain root `investigation` and confirm
+    // the spawned revision still comes back `standard`.
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/34";
+    let (product, chore) = make_in_review(&db, "C-rev-reasoning", pr);
+    db.connect()
+        .unwrap()
+        .execute("UPDATE tasks SET reasoning = 'investigation' WHERE id = ?1", [&chore])
+        .unwrap();
+    let pub_ = Arc::new(RecordingPublisher::default());
+
+    assert!(
+        on_conflict_detected(
+            &db,
+            pub_.as_ref(),
+            None,
+            &open_checker(),
+            &candidate(&product, &chore, pr),
+            &probe(pr, PrLifecycleState::Open(OpenPrStatus::conflict_only())),
+        )
+        .await
+    );
+
+    let attempt = db
+        .active_conflict_resolution_for_work_item(&chore)
+        .unwrap()
+        .expect("a pending attempt row must exist");
+    let rev_id = attempt.revision_task_id.clone().expect("revision must be stamped");
+    let revision = task(&db, &rev_id);
+    assert_eq!(
+        revision.reasoning,
+        Some(boss_protocol::ReasoningMode::Standard),
+        "merge-conflict revision must not inherit the investigation-shaped chain root"
+    );
+}
+
+#[tokio::test]
 async fn create_revision_failure_abandons_attempt() {
     // When the create-time gate refuses (parent PR no longer open, R4),
     // the producer marks the ledger row `abandoned` so it never strands

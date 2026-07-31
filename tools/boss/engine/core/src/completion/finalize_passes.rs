@@ -879,6 +879,11 @@ impl WorkerCompletionHandler {
                     .description(instructions)
                     .name(title)
                     .created_via(created_via)
+                    // The reviewer already diagnosed each finding and
+                    // enumerated the fix; the revision's job is to apply
+                    // them, not to investigate. Pin `standard` rather than
+                    // inheriting the chain root's mode.
+                    .reasoning(ReasoningMode::Standard)
                     .build(),
                 self.pr_state_checker.as_ref(),
             ) {

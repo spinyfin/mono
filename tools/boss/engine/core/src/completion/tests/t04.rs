@@ -526,6 +526,47 @@ async fn pr_review_pass_high_finding_creates_revision_with_correct_metadata() {
     );
 }
 
+/// Engine-minted PR-review-findings revisions must classify by their own
+/// shape (the reviewer already diagnosed and enumerated the findings)
+/// rather than inheriting the chain root's `reasoning`. Give the producing
+/// chore `investigation` and confirm the spawned revision still comes back
+/// `standard`.
+#[tokio::test]
+async fn pr_review_pass_revision_pins_standard_reasoning_regardless_of_chain_root() {
+    let workspace = tempdir().unwrap();
+    let pr_url = "https://github.com/spinyfin/mono/pull/88";
+    let json = high_finding_review_result_json(pr_url);
+    let (_dir, db, _product_id, chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(&json));
+    db.connect()
+        .unwrap()
+        .execute(
+            "UPDATE tasks SET reasoning = 'investigation' WHERE id = ?1",
+            [&chore_id],
+        )
+        .unwrap();
+
+    let handler = TestHarness::new(db.clone(), StubPrDetector::ok(None))
+        .handler
+        .with_pr_state_checker(open_pr_checker());
+
+    let outcome = handler.on_stop(&pr_review_exec_id).await;
+    let revision_task_id = match &outcome {
+        StopOutcome::ReviewPassRevisionCreated { revision_task_id, .. } => revision_task_id.clone(),
+        other => panic!("high finding must yield ReviewPassRevisionCreated; got {other:?}"),
+    };
+
+    let revision = match db.get_work_item(&revision_task_id).unwrap() {
+        WorkItem::Task(t) | WorkItem::Chore(t) => t,
+        other => panic!("revision is not a task/chore: {other:?}"),
+    };
+    assert_eq!(
+        revision.reasoning,
+        Some(boss_protocol::ReasoningMode::Standard),
+        "pr_review revision must not inherit the investigation-shaped chain root"
+    );
+}
+
 /// A `ReviewResult` with a `regression` category finding must trigger the
 /// engine's severity gate *regardless of severity level* (a live feature
 /// silently removed during a forward-port must be caught even if the

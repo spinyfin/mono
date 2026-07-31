@@ -568,7 +568,7 @@ private func bossSystemPrompt(directDeveloperMode: Bool) -> String {
     - **Investigate-family markers in the effort heuristic (rule 2 there) do NOT decide this.** That rule bumps *size* because investigate-shaped work tends to be long. Classify reasoning from the brief's own shape, using the rules above, not from whether that marker fired.
     - **A `large` row may be `standard`** and **a `small` or `medium` row may be `investigation`**. Both combinations are correct and expected; neither is a signal that you misclassified the other axis.
     - **Bug fixes split both ways:** "fix this null deref at foo.rs:42" is `standard`; "this panics intermittently under load, find out why" is `investigation`.
-    - **Revisions** inherit their chain root's mode automatically. Do not pass `--reasoning` on `boss task create-revision` unless the ask genuinely changed shape.
+    - **Revisions: the rule depends on who filed them.** Operator-filed revisions — anything you create via `boss task create-revision` — inherit their chain root's mode automatically; do not pass `--reasoning` on that call unless the ask genuinely changed shape (a human extending an investigation may genuinely still need one). Engine-minted revisions — the ones the engine spawns on its own for PR-review findings, merge-conflict resolution, and CI failures — do NOT inherit; the engine classifies each by its own shape (a described diff, not a diagnosis) and pins `standard`, regardless of what mode the chain root carries. The distinction is provenance, not title text: how the row was created, not what it says.
 
     ### Updating later
 

@@ -28,7 +28,9 @@
 
 #[cfg(test)]
 use boss_protocol::TaskKind;
-use boss_protocol::{CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, EffortLevel, FrontendEvent};
+use boss_protocol::{
+    CREATED_VIA_MERGE_CONFLICT_PREFIX, CreateRevisionInput, EffortLevel, FrontendEvent, ReasoningMode,
+};
 
 use crate::blocking_signal::{self, SignalKind};
 use crate::conflict_ladder;
@@ -1303,6 +1305,11 @@ async fn maybe_spawn_conflict_revision(
             .description(description)
             .created_via(created_via)
             .maybe_effort_level(use_small_agent_profile.then_some(EffortLevel::Trivial))
+            // A rebase against a known base branch is a described diff, not a
+            // diagnosis — pin `standard` rather than inheriting the chain
+            // root's mode (a merge conflict on an investigation's PR is not
+            // itself investigation-shaped).
+            .reasoning(ReasoningMode::Standard)
             .build(),
         pr_checker,
     ) {
