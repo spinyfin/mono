@@ -199,7 +199,7 @@ pub(crate) fn replace_auto_capabilities(conn: &Connection, host_id: &str, caps: 
     )?;
     for capability in caps {
         conn.execute(
-            "INSERT OR REPLACE INTO host_capabilities (host_id, capability, source)
+            "INSERT OR IGNORE INTO host_capabilities (host_id, capability, source)
              VALUES (?1, ?2, 'auto')",
             params![host_id, capability],
         )?;
@@ -1241,6 +1241,20 @@ mod tests {
                 ("auto".to_owned(), "os=macos".to_owned()),
                 ("user".to_owned(), "role=builder".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn replace_auto_host_capabilities_preserves_a_colliding_operator_tag() {
+        let db = open_db();
+        db.add_host("zakalwe", "user@z", 2, &["os=macos".to_owned()]).unwrap();
+
+        db.replace_auto_host_capabilities("zakalwe", &["os=macos".to_owned()])
+            .unwrap();
+
+        assert_eq!(
+            cap_pairs(&db, "zakalwe"),
+            vec![("user".to_owned(), "os=macos".to_owned())]
         );
     }
 

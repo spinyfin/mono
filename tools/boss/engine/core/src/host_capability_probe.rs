@@ -10,16 +10,6 @@
 //! shared by both probes so a local and a remote macOS host describe
 //! themselves identically.
 //!
-//! ## Why the remote probe exists
-//!
-//! Discovery used to be local-only: `host_registry::refresh_local_host_auto_capabilities`
-//! hard-coded `host_id = 'local'`, and the probe itself shelled out to
-//! local `uname` / `gh` subprocesses. Nothing ever wrote an `auto`-sourced
-//! capability row for a remote host, so a host registered with
-//! `bossctl hosts add` reported `caps=0` unless the operator hand-typed
-//! `--tag`s — even though both `bossctl hosts --help` and the `AddHost`
-//! RPC contract stated that registration runs capability discovery.
-//!
 //! That is not merely cosmetic. An empty capability set is indistinguishable
 //! from "this host satisfies nothing": today `work_capability_requirements`
 //! is usually empty, so the filter is a no-op and a zero-capability host is
@@ -29,8 +19,27 @@
 //! eligible again. Discovery has to actually run on the far end.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 
-use crate::ssh_transport::SshTransport;
+use crate::ssh_transport::{SshOutput, SshTransport};
+
+/// Minimal remote command surface used by capability discovery.
+#[async_trait]
+pub trait RemoteRunner: Send + Sync {
+    fn host_id(&self) -> &str;
+    async fn run(&self, argv: &[&str]) -> Result<SshOutput>;
+}
+
+#[async_trait]
+impl RemoteRunner for SshTransport {
+    fn host_id(&self) -> &str {
+        &self.host_id
+    }
+
+    async fn run(&self, argv: &[&str]) -> Result<SshOutput> {
+        SshTransport::run(self, argv).await
+    }
+}
 
 /// Normalize `uname -s` output into the `os=` capability tag.
 ///
@@ -85,13 +94,13 @@ pub fn gh_authed_capability(authed: bool) -> String {
 ///
 /// Nothing here defaults or fabricates a capability: an absent tag means
 /// the probe genuinely did not answer.
-pub async fn discover_remote_capabilities(transport: &SshTransport) -> Result<Vec<String>> {
+pub async fn discover_remote_capabilities(transport: &impl RemoteRunner) -> Result<Vec<String>> {
     let mut caps = Vec::new();
 
     match probe_line(transport, &["uname", "-s"]).await? {
         Some(raw) => caps.push(os_capability(&raw)),
         None => tracing::warn!(
-            host_id = %transport.host_id,
+            host_id = transport.host_id(),
             "host_capability_probe: remote `uname -s` gave no answer; os= capability not set"
         ),
     }
@@ -99,7 +108,7 @@ pub async fn discover_remote_capabilities(transport: &SshTransport) -> Result<Ve
     match probe_line(transport, &["uname", "-m"]).await? {
         Some(raw) => caps.push(arch_capability(&raw)),
         None => tracing::warn!(
-            host_id = %transport.host_id,
+            host_id = transport.host_id(),
             "host_capability_probe: remote `uname -m` gave no answer; arch= capability not set"
         ),
     }
@@ -110,7 +119,7 @@ pub async fn discover_remote_capabilities(transport: &SshTransport) -> Result<Ve
     let gh = transport
         .run(&["gh", "auth", "status"])
         .await
-        .with_context(|| format!("probing `gh auth status` on host {}", transport.host_id))?;
+        .with_context(|| format!("probing `gh auth status` on host {}", transport.host_id()))?;
     caps.push(gh_authed_capability(gh.success()));
 
     Ok(caps)
@@ -119,11 +128,11 @@ pub async fn discover_remote_capabilities(transport: &SshTransport) -> Result<Ve
 /// Run a probe that is expected to print one line, returning `None` when it
 /// exits non-zero or prints nothing. Transport errors propagate — see the
 /// failure policy on [`discover_remote_capabilities`].
-async fn probe_line(transport: &SshTransport, argv: &[&str]) -> Result<Option<String>> {
+async fn probe_line(transport: &impl RemoteRunner, argv: &[&str]) -> Result<Option<String>> {
     let out = transport
         .run(argv)
         .await
-        .with_context(|| format!("probing {argv:?} on host {}", transport.host_id))?;
+        .with_context(|| format!("probing {argv:?} on host {}", transport.host_id()))?;
     if !out.success() {
         return Ok(None);
     }
@@ -134,6 +143,39 @@ async fn probe_line(transport: &SshTransport, argv: &[&str]) -> Result<Option<St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    struct FakeRunner {
+        outputs: Mutex<VecDeque<Result<SshOutput>>>,
+    }
+
+    impl FakeRunner {
+        fn new(outputs: Vec<Result<SshOutput>>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl RemoteRunner for FakeRunner {
+        fn host_id(&self) -> &str {
+            "fake"
+        }
+
+        async fn run(&self, _argv: &[&str]) -> Result<SshOutput> {
+            self.outputs.lock().unwrap().pop_front().expect("unexpected command")
+        }
+    }
+
+    fn output(status: i32, stdout: &str) -> Result<SshOutput> {
+        Ok(SshOutput {
+            status,
+            stdout: stdout.to_owned(),
+            stderr: String::new(),
+        })
+    }
 
     #[test]
     fn darwin_is_spelled_macos() {
@@ -166,5 +208,30 @@ mod tests {
         // discovers it.
         assert_eq!(gh_authed_capability(true), "gh-authed=true");
         assert_eq!(gh_authed_capability(false), "gh-authed=false");
+    }
+
+    #[tokio::test]
+    async fn records_gh_auth_failure_as_false() {
+        let runner = FakeRunner::new(vec![output(0, "Darwin\n"), output(0, "arm64\n"), output(1, "")]);
+        assert_eq!(
+            discover_remote_capabilities(&runner).await.unwrap(),
+            vec!["os=macos", "arch=arm64", "gh-authed=false"]
+        );
+    }
+
+    #[tokio::test]
+    async fn skips_unusable_uname_answers_but_keeps_other_capabilities() {
+        let runner = FakeRunner::new(vec![output(1, ""), output(0, "x86_64\n"), output(0, "")]);
+        assert_eq!(
+            discover_remote_capabilities(&runner).await.unwrap(),
+            vec!["arch=x86_64", "gh-authed=true"]
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_error_fails_discovery() {
+        let runner = FakeRunner::new(vec![Err(anyhow::anyhow!("connection reset"))]);
+        let err = discover_remote_capabilities(&runner).await.unwrap_err();
+        assert!(err.to_string().contains("probing [\"uname\", \"-s\"] on host fake"));
     }
 }

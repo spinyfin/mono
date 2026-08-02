@@ -20,10 +20,6 @@ pub(crate) async fn hosts_add(
     let db = open_state_db(state_root)?;
     let host = db.add_host(&id, &ssh_target, pool_size, &tags)?;
 
-    // Phase 3: eagerly push the wrapper unless suppressed. A push
-    // failure leaves the host row in place but disabled with the
-    // failure cause persisted, matching the design's "host that can't
-    // accept the wrapper is a host that can't run jobs" stance.
     let push_outcome = if skip_wrapper_push {
         None
     } else {
@@ -107,10 +103,8 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
         }
         RemoteProvisionOutcome::Skipped { reason } => EagerPushOutcome::Skipped { reason },
         RemoteProvisionOutcome::Failed { kind, detail } => {
-            // Both writes, on every failure arm. Previously the
-            // wrapper-push arm disabled the host without recording *why*,
-            // so `hosts show` reported a disabled host with an empty
-            // `last_error` and nothing to act on.
+            // Every failure arm records both: a disabled host with an empty
+            // `last_error` gives the operator nothing to act on.
             let _ = db.set_host_enabled(host_id, false);
             let _ = db.set_host_last_error(host_id, Some(&detail));
             EagerPushOutcome::Failed {
@@ -119,6 +113,38 @@ async fn eager_push_wrapper(db: &WorkDb, host_id: &str, ssh_target: &str) -> Eag
             }
         }
     }
+}
+
+/// Re-run provisioning and discovery for an existing remote host.
+pub(crate) async fn hosts_probe(json: bool, state_root: Option<PathBuf>, id: String) -> Result<()> {
+    let db = open_state_db(state_root)?;
+    let host = db.get_host(&id)?.context("host not found")?;
+    let ssh_target = host
+        .ssh_target
+        .as_deref()
+        .context("the built-in local host does not need remote probing")?;
+
+    let outcome = eager_push_wrapper(&db, &id, ssh_target).await;
+    if matches!(outcome, EagerPushOutcome::Ok { .. }) {
+        db.set_host_enabled(&id, true)?;
+    }
+    let host = db.get_host(&id)?.context("host disappeared after probe")?;
+    let caps = db.list_host_capabilities(&id)?;
+    if json {
+        let mut obj = host_to_json(&host, &caps);
+        obj["wrapper_push"] = serde_json::to_value(&outcome).unwrap_or(serde_json::Value::Null);
+        println!("{obj}");
+    } else {
+        match &outcome {
+            EagerPushOutcome::Ok { capabilities, .. } => println!("probed host {id}: {}", capabilities.join(", ")),
+            EagerPushOutcome::Skipped { reason } => println!("probe skipped: {reason}"),
+            EagerPushOutcome::Failed { kind, detail } => {
+                println!("probe failed ({kind}) — host disabled. detail: {detail}")
+            }
+        }
+        print_host_detail(&host, &caps);
+    }
+    Ok(())
 }
 
 pub(crate) fn hosts_list(json: bool, state_root: Option<PathBuf>, only_enabled: bool) -> Result<()> {
