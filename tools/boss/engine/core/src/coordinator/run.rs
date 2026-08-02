@@ -3,6 +3,13 @@
 //! module split; see [`super`] for the struct and shared types.
 use super::*;
 
+/// Filed against a run when the worker pane never came up (libghostty IPC
+/// drop, slot busy, prompt composition error). See
+/// [`crate::attention_lifecycle::ATTENTION_LIFECYCLES`] for its clearing
+/// rule: `ClearedBy::WorkResumed`, since a later run starting for the item
+/// is direct evidence the pane-spawn problem is no longer blocking it.
+pub const PANE_SPAWN_FAILED_ATTENTION_KIND: &str = "pane_spawn_failed";
+
 impl ExecutionCoordinator {
     // `change` is `None` for `pr_review` executions that checked out the PR
     // head directly; `Some` for all other executions that created a jj change.
@@ -388,7 +395,7 @@ impl ExecutionCoordinator {
                 let attention = Some(CreateAttentionItemInput {
                     execution_id: Some(execution.id.clone()),
                     work_item_id: None,
-                    kind: "pane_spawn_failed".to_owned(),
+                    kind: PANE_SPAWN_FAILED_ATTENTION_KIND.to_owned(),
                     status: None,
                     title: "Worker pane failed to spawn".to_owned(),
                     body_markdown: format!(

@@ -358,6 +358,35 @@ pub(crate) fn migrate_work_attention_items_converted_task_id(conn: &Connection) 
     Ok(())
 }
 
+/// Add `work_attention_items.last_raised_at` — the timestamp of the most
+/// recent occurrence of the condition an open row describes.
+///
+/// Every filer deduplicates a re-raise onto the already-`open` row rather
+/// than inserting a second one (see
+/// [`crate::work::reraise_open_work_item_attention`]), so `created_at` records
+/// the *first* occurrence and never moves. That is fine for display but wrong
+/// as the reference point for
+/// [`crate::work::WorkDb::reconcile_stale_attention_signals`], whose whole
+/// rule is "the clearing evidence must postdate the signal": for a condition
+/// that re-trips (pane dies → orphan sweep redispatches → pane dies again)
+/// the redispatch's run start postdates the *first* trip and would resolve a
+/// signal that is live right now.
+///
+/// Backfilled to `created_at` so pre-existing rows keep exactly their old
+/// semantics, and left nullable so any writer that has not been taught the
+/// column degrades to `created_at` via the reconciler's `COALESCE` rather
+/// than to NULL-compares-false.
+pub(crate) fn migrate_work_attention_items_last_raised_at(conn: &Connection) -> Result<()> {
+    if !table_has_column(conn, "work_attention_items", "last_raised_at")? {
+        conn.execute("ALTER TABLE work_attention_items ADD COLUMN last_raised_at TEXT", [])?;
+    }
+    conn.execute(
+        "UPDATE work_attention_items SET last_raised_at = created_at WHERE last_raised_at IS NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 /// Add `tasks.effort_level` and `tasks.model_override` per the
 /// effort-and-model-estimation design (PR #370). Both columns are
 /// nullable TEXT; existing rows keep `NULL` across the upgrade so

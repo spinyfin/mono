@@ -12,6 +12,11 @@ use std::collections::{HashMap, HashSet};
 use boss_protocol::{CREATED_VIA_EXTERNAL_TRACKER_SYNC, CreateChoreInput};
 use tracing::{info, warn};
 
+use crate::attention_lifecycle::{
+    EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND, EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND,
+    EXTERNAL_TRACKER_REMOVED_UPSTREAM_ATTENTION_KIND, EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND,
+    EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND,
+};
 use crate::external_tracker::{
     CloseReason, ExternalTracker, TrackerContext, TrackerError, UpstreamItem, UpstreamPrAssociation, UpstreamRef,
     UpstreamStatus,
@@ -106,9 +111,9 @@ pub(super) async fn process_product(
             // Clear any stale fetch-failure attention items now that the
             // fetch has succeeded.
             for kind in &[
-                "external_tracker_auth_failed",
-                "external_tracker_token_revoked",
-                "external_tracker_transient_errors",
+                EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
+                EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND,
+                EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND,
             ] {
                 if let Err(e) = work_db.resolve_external_tracker_attention(product_id, kind) {
                     warn!(product_id, %kind, error = %e, "resolve_external_tracker_attention failed");
@@ -124,9 +129,12 @@ pub(super) async fn process_product(
                 "Boss received HTTP 401 from GitHub — the stored OAuth token has been revoked or expired: {msg}\n\n\
                  Please reconnect via Settings → Issue Sync → Connect to authorize a new token."
             );
-            if let Err(attn_err) =
-                work_db.upsert_external_tracker_attention(product_id, "external_tracker_token_revoked", &title, &body)
-            {
+            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
+                product_id,
+                EXTERNAL_TRACKER_TOKEN_REVOKED_ATTENTION_KIND,
+                &title,
+                &body,
+            ) {
                 warn!(product_id, error = %attn_err,
                     "upsert_external_tracker_attention (token_revoked) failed");
             }
@@ -141,9 +149,12 @@ pub(super) async fn process_product(
                  This may indicate an org approval or SSO authorization is needed. \
                  Check your GitHub org settings, or run `gh auth login` to refresh credentials."
             );
-            if let Err(attn_err) =
-                work_db.upsert_external_tracker_attention(product_id, "external_tracker_auth_failed", &title, &body)
-            {
+            if let Err(attn_err) = work_db.upsert_external_tracker_attention(
+                product_id,
+                EXTERNAL_TRACKER_AUTH_FAILED_ATTENTION_KIND,
+                &title,
+                &body,
+            ) {
                 warn!(product_id, error = %attn_err,
                     "upsert_external_tracker_attention (auth_failed) failed");
             }
@@ -160,7 +171,7 @@ pub(super) async fn process_product(
             );
             if let Err(attn_err) = work_db.upsert_external_tracker_attention(
                 product_id,
-                "external_tracker_transient_errors",
+                EXTERNAL_TRACKER_TRANSIENT_ERRORS_ATTENTION_KIND,
                 &title,
                 &body,
             ) {
@@ -283,7 +294,7 @@ pub(super) async fn process_product(
                     );
                     if let Err(e) = work_db.upsert_external_tracker_attention(
                         work_item_id,
-                        "external_tracker_removed_upstream",
+                        EXTERNAL_TRACKER_REMOVED_UPSTREAM_ATTENTION_KIND,
                         &title,
                         &body,
                     ) {
@@ -375,7 +386,7 @@ pub(super) async fn process_product(
                 );
                 if let Err(e) = work_db.upsert_external_tracker_attention(
                     &candidate.work_item_id,
-                    "external_tracker_permission_denied",
+                    EXTERNAL_TRACKER_PERMISSION_DENIED_ATTENTION_KIND,
                     &title,
                     &body,
                 ) {

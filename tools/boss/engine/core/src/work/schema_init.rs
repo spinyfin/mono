@@ -239,6 +239,7 @@ impl WorkDb {
                 created_at TEXT NOT NULL,
                 resolved_at TEXT,
                 converted_task_id TEXT,
+                last_raised_at TEXT,
                 CHECK (
                     (execution_id IS NOT NULL AND work_item_id IS NULL)
                     OR (execution_id IS NULL AND work_item_id IS NOT NULL)
@@ -321,6 +322,7 @@ impl WorkDb {
         migrate_backfill_blocked_reason_dependency(conn)?;
         migrate_work_attention_items_work_item_id(conn)?;
         migrate_work_attention_items_converted_task_id(conn)?;
+        migrate_work_attention_items_last_raised_at(conn)?;
         migrate_tasks_effort_and_model_columns(conn)?;
         migrate_products_default_model(conn)?;
         migrate_task_blocked_signals_table(conn)?;

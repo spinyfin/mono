@@ -273,16 +273,16 @@ status is otherwise left unchanged for re-dispatch or manual review."
 
         // Deduplicate: only one open attention item of this kind per
         // execution, so repeated Stops after the breaker trips don't
-        // pile up identical items.
+        // pile up identical items. Deduping *stamps* the existing row's
+        // `last_raised_at` rather than merely observing it: the kind is
+        // `ClearedBy::WorkResumed`, and a breaker that trips again while its
+        // first row is still open must not then be resolved by a run that
+        // started before the current trip.
         let already_filed = self
             .work_db
-            .list_attention_items(&execution.id)
-            .map(|items| {
-                items
-                    .iter()
-                    .any(|i| i.kind == NUDGE_BREAKER_ATTENTION_KIND && i.status != "resolved")
-            })
-            .unwrap_or(false);
+            .reraise_open_execution_attention(&execution.id, NUDGE_BREAKER_ATTENTION_KIND)
+            .unwrap_or(None)
+            .is_some();
         if !already_filed
             && let Err(err) = self
                 .file_execution_attention(

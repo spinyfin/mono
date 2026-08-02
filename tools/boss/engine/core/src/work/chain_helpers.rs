@@ -520,23 +520,20 @@ pub(crate) fn block_pending_revisions_on_parent_close(
 /// Idempotent per open item: a revision is only archived once per chain
 /// event, so this simply avoids piling up duplicates if the archival path
 /// is re-entered (e.g. a retried transaction after a crash).
+///
+/// Binds [`REVISION_ARCHIVED_ATTENTION_KIND`] rather than re-spelling the
+/// kind string, so the registry and the producer cannot drift apart.
+///
+/// [`REVISION_ARCHIVED_ATTENTION_KIND`]: crate::attention_lifecycle::REVISION_ARCHIVED_ATTENTION_KIND
 pub(crate) fn record_revision_archived_attention(
     conn: &Connection,
     revision_id: &str,
     title_suffix: &str,
     body: &str,
 ) -> Result<()> {
-    let already_open: i64 = conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM work_attention_items
-             WHERE work_item_id = ?1
-               AND kind = 'revision_archived'
-               AND status = 'open'
-         )",
-        [revision_id],
-        |row| row.get(0),
-    )?;
-    if already_open != 0 {
+    let kind = crate::attention_lifecycle::REVISION_ARCHIVED_ATTENTION_KIND;
+    warn_if_lifecycle_undeclared(kind);
+    if reraise_open_work_item_attention(conn, revision_id, kind)?.is_some() {
         return Ok(());
     }
     let id = next_id("attn");
@@ -544,9 +541,10 @@ pub(crate) fn record_revision_archived_attention(
     let title = format!("Revision {revision_id} auto-archived: {title_suffix}");
     conn.execute(
         "INSERT INTO work_attention_items (
-            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-         ) VALUES (?1, NULL, ?2, 'revision_archived', 'open', ?3, ?4, ?5, NULL)",
-        params![id, revision_id, title, body, now],
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+            last_raised_at
+         ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
+        params![id, revision_id, kind, title, body, now],
     )?;
     Ok(())
 }

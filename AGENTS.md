@@ -38,6 +38,9 @@ root-cause rule as the section below.
 - Worker liveness contract (what the agent indicator derives from; how the
   engine converges when it has lost track of a live worker):
   [`tools/boss/docs/worker-liveness-contract.md`](tools/boss/docs/worker-liveness-contract.md)
+- Failure-signal lifecycle (what raises an attention item / the card's
+  "Failed to start" banner, and what specifically lowers it again):
+  [`tools/boss/docs/attention-lifecycle.md`](tools/boss/docs/attention-lifecycle.md)
 - Post-crash orphan recovery:
   [`tools/boss/docs/post-crash-recovery.md`](tools/boss/docs/post-crash-recovery.md)
 - Crash watchdog (why an abort always kills the app, and

@@ -77,10 +77,19 @@ fn list_tasks_kind_filter_sql() -> String {
 /// stamps a `worker_proposals` row and its produced attention item
 /// atomically in one transaction (`Transaction` derefs to `Connection`, so
 /// passing `&tx` here just works).
+/// Insert one `work_attention_items` row from `input`.
+///
+/// This is the execution-scoped filing path — the completion handlers, the
+/// spawn-ack sweep, readoption and the review-result handlers all reach the
+/// table through here — so it runs [`warn_if_lifecycle_undeclared`] just as
+/// [`WorkDb::upsert_work_item_attention`] does. The guard belongs on every
+/// filer, not only the most convenient one: the premise is that kinds added
+/// later are the ones that get forgotten, and this is the busiest filer.
 pub(crate) fn insert_attention_item_row(
     conn: &Connection,
     input: &CreateAttentionItemInput,
 ) -> Result<WorkAttentionItem> {
+    warn_if_lifecycle_undeclared(&input.kind);
     let (execution_id, work_item_id) = attention_target_from_input(conn, input)?;
 
     let id = next_id("attn");
@@ -90,8 +99,9 @@ pub(crate) fn insert_attention_item_row(
 
     conn.execute(
         "INSERT INTO work_attention_items (
-            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+            last_raised_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?8)",
         params![
             id,
             execution_id,
@@ -160,6 +170,18 @@ impl WorkDb {
     /// Create an external-tracker attention item for `work_item_id` unless one
     /// with the same `kind` is already open. Idempotent: repeated reconciler
     /// ticks for the same failure do not pile up rows.
+    ///
+    /// Also the filer behind [`Self::file_churn_guard_parked_attention`], so
+    /// the dedup branch goes through [`reraise_open_work_item_attention`]:
+    /// `churn_guard_parked` is a [`ClearedBy::WorkResumed`] kind, and a guard
+    /// that re-trips onto its own still-open row must not then be cleared by a
+    /// run that started before the current trip. That filer re-files on every
+    /// sweep pass with a refreshed failure count, so each pass advances
+    /// `last_raised_at` — intentionally: the guard stops re-filing only once
+    /// it redispatches, so the next run start still clears the row against
+    /// the most recent trip, not a stale earlier one.
+    ///
+    /// [`ClearedBy::WorkResumed`]: crate::attention_lifecycle::ClearedBy::WorkResumed
     pub fn upsert_external_tracker_attention(
         &self,
         work_item_id: &str,
@@ -167,26 +189,18 @@ impl WorkDb {
         title: &str,
         body_markdown: &str,
     ) -> Result<()> {
+        warn_if_lifecycle_undeclared(kind);
         let mut conn = self.connect()?;
         let tx = conn.transaction()?;
         let _ = product_id_for_work_item(&tx, work_item_id)?;
-        let already_open: i64 = tx.query_row(
-            "SELECT EXISTS(
-                 SELECT 1 FROM work_attention_items
-                 WHERE work_item_id = ?1
-                   AND kind = ?2
-                   AND status = 'open'
-             )",
-            params![work_item_id, kind],
-            |row| row.get(0),
-        )?;
-        if already_open == 0 {
+        if reraise_open_work_item_attention(&tx, work_item_id, kind)?.is_none() {
             let id = next_id("attn");
             let now = now_string();
             tx.execute(
                 "INSERT INTO work_attention_items (
-                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at
-                 ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL)",
+                    id, execution_id, work_item_id, kind, status, title, body_markdown, created_at, resolved_at,
+                    last_raised_at
+                 ) VALUES (?1, NULL, ?2, ?3, 'open', ?4, ?5, ?6, NULL, ?6)",
                 params![id, work_item_id, kind, title, body_markdown, now],
             )?;
         } else {
