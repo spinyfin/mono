@@ -624,20 +624,18 @@ impl WorkerCompletionHandler {
                     // the reviewer can correct the exact malformation rather than blindly
                     // rewriting the entire JSON.
                     //
-                    // Driver-agnostic on purpose: this used to say "write it to this file
-                    // with the Write tool", which is Claude's tool name and also assumes
-                    // the artifact path is always writable. Neither holds for a Codex
-                    // reviewer — `--sandbox read-only` (`WorkerKind::Reviewer`'s posture,
-                    // `codex_sandbox_for_worker_kind`) denies writes to every path,
-                    // including the engine-owned artifact path outside the workspace
-                    // (confirmed empirically: `--add-dir` is itself rejected under
-                    // `read-only` — "Switch to workspace-write or danger-full-access to
-                    // allow them" — so there is no writable-root carve-out to grant). A
-                    // Codex reviewer's *only* actionable channel is restating the JSON in
-                    // its final message, which the primary prompt already asks for as a
-                    // fallback (`pr-review/src/render.rs`'s "Also (fallback)" section) —
-                    // the probe must offer that path explicitly rather than repeat an
-                    // instruction only some drivers can follow.
+                    // Driver-agnostic on purpose: the probe must not name a driver-specific
+                    // tool, and must not assume the artifact path is writable. A
+                    // `WorkerKind::Reviewer` Codex worker runs under `--sandbox read-only`
+                    // (`codex_sandbox_for_worker_kind`), which denies writes to every path
+                    // including the engine-owned artifact path outside the workspace;
+                    // `--add-dir` is itself rejected under `read-only` ("Switch to
+                    // workspace-write or danger-full-access to allow them"), so there is no
+                    // writable-root carve-out to grant. The probe therefore offers the
+                    // fenced-JSON-in-final-message channel that the primary prompt already
+                    // names as a fallback (`pr-review/src/render.rs`'s "Also (fallback)"
+                    // section) — `CodexDriver::structured_output_fallback` recovers that
+                    // fenced JSON on the next finalize pass (`driver/src/codex.rs`).
                     let probe = if let Some(ref parse_err) = parse_error {
                         format!(
                             "Your review did not produce a valid ReviewResult. The JSON was \

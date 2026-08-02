@@ -1012,6 +1012,58 @@ async fn pr_review_pass_no_result_reprompts_instead_of_silently_advancing() {
         "probe must name the artifact path; got: {}",
         probes[0].1,
     );
+    assert!(
+        !probes[0].1.contains("Write tool"),
+        "probe must stay driver-agnostic: not every worker driver has a Write tool"
+    );
+    assert!(
+        probes[0].1.contains("fenced"),
+        "probe must offer the fenced-JSON channel; got: {}",
+        probes[0].1,
+    );
+}
+
+/// Same driver-agnostic-wording assertions as
+/// `pr_review_pass_no_result_reprompts_instead_of_silently_advancing`, but for
+/// the `parse_error.is_some()` probe branch — the two `format!` arms in
+/// `finalize_pr_review_pass` are edited independently, so each needs its own
+/// regression guard.
+#[tokio::test]
+async fn pr_review_pass_malformed_result_reprompt_stays_driver_agnostic() {
+    let workspace = tempdir().unwrap();
+    // A transcript with a fenced JSON block that fails to validate as a
+    // ReviewResult (missing every required field) drives the finalizer into
+    // the `parse_error.is_some()` probe arm.
+    let (_dir, db, _product_id, _chore_id, pr_review_exec_id, _pr_url) =
+        pr_review_exec_fixture(workspace.path(), Some(r#"{"not_a_review_result": true}"#));
+    let out_dir = tempdir().unwrap();
+    let probe_queuer = Arc::new(RecordingProbeQueuer::default());
+
+    let handler = WorkerCompletionHandler::new(
+        db.clone(),
+        StubPrDetector::ok(None),
+        Arc::new(StubCubeClient::default()),
+        Arc::new(RecordingPublisher::default()),
+        Arc::new(RecordingPaneReleaser::default()),
+        probe_queuer.clone(),
+    )
+    .with_pr_state_checker(open_pr_checker())
+    .with_structured_output_dir(out_dir.path().to_path_buf())
+    .with_max_unproductive_nudges(2);
+
+    let _ = handler.on_stop(&pr_review_exec_id).await;
+
+    let probes = probe_queuer.snapshot();
+    assert_eq!(probes.len(), 1, "exactly one probe must be queued");
+    assert!(
+        !probes[0].1.contains("Write tool"),
+        "malformed-result probe must stay driver-agnostic: not every worker driver has a Write tool"
+    );
+    assert!(
+        probes[0].1.contains("fenced"),
+        "malformed-result probe must offer the fenced-JSON channel; got: {}",
+        probes[0].1,
+    );
 }
 
 /// After the auto-nudge breaker trips (the reviewer kept failing to write a
