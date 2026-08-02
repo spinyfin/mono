@@ -291,6 +291,10 @@ pub fn sanitize_event_for_worker(event: FrontendEvent) -> FrontendEvent {
         | FrontendEvent::DecisionCreated { .. }
         | FrontendEvent::DecisionResult { .. }
         | FrontendEvent::DecisionsList { .. }
-        | FrontendEvent::DecisionUpdated { .. }) => passthrough,
+        | FrontendEvent::DecisionUpdated { .. }
+        | FrontendEvent::BoothbyPassesList { .. }
+        | FrontendEvent::BoothbyState { .. }
+        | FrontendEvent::BoothbyPassStarted { .. }
+        | FrontendEvent::BoothbyActivity { .. }) => passthrough,
     }
 }

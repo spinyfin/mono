@@ -114,6 +114,40 @@ impl WorkDb {
             .map_err(|_| anyhow::anyhow!("boothby action context lock poisoned"))?
             .clone())
     }
+
+    /// Register the event-trigger queue [`WorkDb::create_attention_item`]
+    /// arms on a Boothby-trigger attention kind. Called once at boot
+    /// (`app.rs`), after both the `WorkDb` and the queue exist. Every
+    /// `WorkDb` clone shares the same queue (`Arc<Mutex<...>>>`), so
+    /// registering on one handle makes it visible from every other.
+    pub fn set_boothby_event_queue(&self, queue: Arc<crate::boothby_events::BoothbyEventQueue>) {
+        *self
+            .boothby_event_queue
+            .lock()
+            .expect("boothby event queue lock poisoned") = Some(queue);
+    }
+
+    /// Arm the registered event-trigger queue for `kind` if it is one of
+    /// [`crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS`] and a
+    /// queue is registered. Inert (no-op) otherwise — an unregistered queue
+    /// or a non-trigger kind are both the common case, not an error.
+    pub(crate) fn maybe_arm_boothby_for_attention_kind(&self, kind: &str) {
+        if !crate::boothby_events::BOOTHBY_TRIGGER_ATTENTION_KINDS.contains(&kind) {
+            return;
+        }
+        let queue = self
+            .boothby_event_queue
+            .lock()
+            .expect("boothby event queue lock poisoned")
+            .clone();
+        if let Some(queue) = queue {
+            let now = boss_engine_utils::epoch_time::now_epoch_secs();
+            queue.arm(
+                now,
+                &format!("{}{kind}", crate::boothby_events::BOOTHBY_EVENT_TRIGGER_PREFIX),
+            );
+        }
+    }
 }
 
 /// `true` when this mutation is Boothby's. The single gate that keeps the
