@@ -38,10 +38,10 @@ use crate::merge_when_ready;
 use crate::protocol::{
     EngineToAppError, EngineToAppRequest, EngineToAppResponse, FocusWorkerPaneInput, FrontendEvent,
     FrontendEventEnvelope, FrontendRequest, FrontendRequestEnvelope, GitHubAuthStateDto, HostedPaneEntry,
-    InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState, ReleaseWorkerPaneInput,
-    RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH, TOPIC_GITHUB_AUTH,
-    TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic, editorial_actions_topic,
-    execution_topic, probe_topic, work_product_topic,
+    HostedPaneState, HostedPaneStatus, InterruptWorkerPaneInput, ListHostedPanesInput, OpenDocumentInput, OrgAuthState,
+    ReleaseWorkerPaneInput, RequestExecutionInput, RevealWorkItemInput, SendToPaneInput, TOPIC_ENGINE_HEALTH,
+    TOPIC_GITHUB_AUTH, TOPIC_WORK_PRODUCTS, TOPIC_WORKER_LIVE_STATES, TopicEventPayload, comment_topic,
+    editorial_actions_topic, execution_topic, probe_topic, work_product_topic,
 };
 use crate::repo_slug;
 use crate::work::{
@@ -2231,7 +2231,7 @@ async fn handle_frontend_connection(
             r @ FrontendRequest::ListExecutions { .. } => executions::handle_list_executions(ctx, r).await,
             r @ FrontendRequest::ListFeatureFlags => engine_meta::handle_list_feature_flags(ctx, r).await,
             r @ FrontendRequest::ListHosts => hosts::handle_list_hosts(ctx, r).await,
-            r @ FrontendRequest::ListHuskPanes => panes::handle_list_husk_panes(ctx, r).await,
+            r @ FrontendRequest::ListHostedPaneStatuses => panes::handle_list_hosted_pane_statuses(ctx, r).await,
             r @ FrontendRequest::ListLiveStatusDisabledSlots => {
                 live_status::handle_list_live_status_disabled_slots(ctx, r).await
             }

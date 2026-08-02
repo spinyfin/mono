@@ -419,10 +419,10 @@ pub enum FrontendEvent {
     PaneRetired {
         slot_id: u8,
     },
-    /// Reply to [`FrontendRequest::ListHuskPanes`]. Empty when the app
-    /// has no panes the engine isn't already tracking as live.
-    HuskPanesList {
-        panes: Vec<HostedPaneEntry>,
+    /// Reply to [`FrontendRequest::ListHostedPaneStatuses`]. Empty when
+    /// the app hosts no panes at all.
+    HostedPaneStatusList {
+        panes: Vec<HostedPaneStatus>,
     },
     /// Trailing transcript chunk for a run. `lines` are the raw JSONL
     /// lines the engine read off the recorded transcript path

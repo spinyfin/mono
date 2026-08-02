@@ -543,19 +543,29 @@ async fn list_husk_panes_still_retires_a_lingering_shell_under_a_cancelled_run()
 }
 
 /// The break-glass verb must inherit the same durable guard the classifier
-/// got. `bossctl agents retire-pane <slot>` is a slot-keyed kill with no run
-/// id, so before this it had literally nothing to check for a slot the engine
-/// tracked nothing in — the operator's own recovery tool could destroy the
-/// in-flight work of a worker the engine had merely lost track of.
+/// got — but where the classifier's evidence corroborates a still-running
+/// process for an execution the engine tracks nothing about, `retire_pane`
+/// no longer dead-ends in a refusal that points the operator at a second
+/// command. This is precisely the shape `bossctl agents stop` already
+/// reaps via durable state (`release_worker_pane`'s durable fallback), so
+/// `retire_pane` now performs that same teardown and completes the
+/// retirement — the verb the operator reached for handles the case
+/// instead of a two-verb trial-and-error dance (2026-08-01).
 #[tokio::test]
-async fn retire_pane_refuses_an_untracked_slot_whose_durable_process_is_alive() {
+async fn retire_pane_reaps_an_untracked_slot_whose_durable_process_is_alive() {
     use crate::test_support::*;
 
     let (server_state, _dir) = test_server_state();
     let db = server_state.work_db.as_ref();
     let product_id = create_product(db);
     let work_item_id = create_active_chore(db, &product_id, "test chore");
-    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(std::process::id()));
+
+    // A REAL child process in its own process group — never the test
+    // process's own pid — so the teardown this test exercises can
+    // actually signal it without touching the test runner itself.
+    let mut child = spawn_group_leader_sleeper();
+    let pid = child.id() as i32;
+    let execution_id = create_spawned_execution(db, &work_item_id, i64::from(pid));
     db.mark_execution_orphaned(&execution_id, "presumed dead").unwrap();
 
     let sink = make_session_sink();
@@ -566,38 +576,90 @@ async fn retire_pane_refuses_an_untracked_slot_whose_durable_process_is_alive() 
     let server_clone = server_state.clone();
     let retire = tokio::spawn(async move { server_clone.retire_pane(4).await });
 
+    // Guard 3's own liveness probe: "what does the app host in slot 4?"
     let probe = sink.next().await.expect("an EngineRequest event should be enqueued");
-    let probe_id = match probe.payload {
+    match probe.payload {
         FrontendEvent::EngineRequest { request_id, request } => {
             assert!(
                 matches!(request, EngineToAppRequest::ListHostedPanes(_)),
                 "expected the liveness probe, got {request:?}"
             );
-            request_id
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::ListHostedPanes {
+                        result: Ok(crate::protocol::ListHostedPanesResult {
+                            panes: vec![hosted(4, &execution_id)],
+                        }),
+                    },
+                )
+                .await;
         }
         other => panic!("expected EngineRequest, got {other:?}"),
-    };
-    server_state
-        .deliver_app_response(
-            "session-app",
-            &probe_id,
-            EngineToAppResponse::ListHostedPanes {
-                result: Ok(crate::protocol::ListHostedPanesResult {
-                    panes: vec![hosted(4, &execution_id)],
-                }),
-            },
-        )
-        .await;
+    }
+
+    // The durable teardown's own reverse lookup ("which slot hosts this
+    // run?", shared with `agents stop`'s fallback) — same question, asked
+    // again since the engine has no bookkeeping to read it from.
+    let reverse_lookup = sink.next().await.expect("a second EngineRequest should be enqueued");
+    match reverse_lookup.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(request, EngineToAppRequest::ListHostedPanes(_)),
+                "expected the reverse hosted-pane lookup, got {request:?}"
+            );
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::ListHostedPanes {
+                        result: Ok(crate::protocol::ListHostedPanesResult {
+                            panes: vec![hosted(4, &execution_id)],
+                        }),
+                    },
+                )
+                .await;
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    }
+
+    // Then the actual slot-keyed teardown request.
+    let release = sink
+        .next()
+        .await
+        .expect("a ReleaseWorkerPane request should be enqueued");
+    match release.payload {
+        FrontendEvent::EngineRequest { request_id, request } => {
+            assert!(
+                matches!(
+                    request,
+                    EngineToAppRequest::ReleaseWorkerPane(ReleaseWorkerPaneInput { slot_id: 4, .. })
+                ),
+                "expected ReleaseWorkerPane for slot 4, got {request:?}"
+            );
+            server_state
+                .deliver_app_response(
+                    "session-app",
+                    &request_id,
+                    EngineToAppResponse::ReleaseWorkerPane {
+                        result: Ok(crate::protocol::ReleaseWorkerPaneResult {}),
+                    },
+                )
+                .await;
+        }
+        other => panic!("expected EngineRequest, got {other:?}"),
+    }
 
     let result = retire.await.expect("retire task");
+    assert!(result.is_ok(), "expected retirement to succeed, got {result:?}");
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .expect("join wait task")
+        .expect("wait on child");
     assert!(
-        matches!(result, Err(RetirePaneError::LiveProcessCorroborated { .. })),
-        "a live untracked worker must not be retired: {result:?}"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), sink.next())
-            .await
-            .is_err(),
-        "no ReleaseWorkerPane may be sent once the guard has refused",
+        !status.success(),
+        "the untracked worker's process tree must actually go down",
     );
 }

@@ -35,9 +35,9 @@ mod stream_integrity;
 use boss_engine::dispatch_events::DispatchEvent;
 use boss_engine::dispatch_reader;
 use boss_protocol::{
-    FrontendEvent, FrontendRequest, LiveStatusDebugReport, LiveStatusSlotDebug, LiveWorkerState, MetricLiveEntry,
-    ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution, WorkItem, WorkRun, WorkerProposal,
-    WorkspacePoolEntry,
+    FrontendEvent, FrontendRequest, HostedPaneState, HostedPaneStatus, LiveStatusDebugReport, LiveStatusSlotDebug,
+    LiveWorkerState, MetricLiveEntry, ProposalKind, ProposalState, ROSTER, RequestExecutionInput, WorkExecution,
+    WorkItem, WorkRun, WorkerProposal, WorkspacePoolEntry,
 };
 use clap::{Parser, Subcommand};
 
@@ -662,11 +662,14 @@ impl std::fmt::Display for LogSource {
 enum AgentsAction {
     /// List worker sessions and their current state.
     List {
-        /// Also include "husk" panes — slots the app currently hosts
-        /// a session in that the engine has no live-tracked run for
-        /// (crash, terminal-fail path bug, spawn-ack timeout).
-        /// Invisible on the default view; this is what `retire-pane`
-        /// targets, and what causes a `SlotBusy` dispatch rejection.
+        /// Also include every pane the app hosts that isn't a plain
+        /// live-tracked worker: a slot whose live registry entry is
+        /// gone but durable state still corroborates a running process
+        /// (the shape a worker the engine lost track of takes — crash,
+        /// terminal-fail path bug, spawn-ack timeout), and true "husk"
+        /// panes (no live process either). Invisible on the default
+        /// view; this is what `retire-pane` targets, and what causes a
+        /// `SlotBusy` dispatch rejection.
         #[arg(long)]
         all: bool,
     },
@@ -675,8 +678,11 @@ enum AgentsAction {
     /// longer live.
     Status {
         /// Worker reference: run id, slot id, or crew name (e.g.
-        /// `Riker`). Crew names resolve only over currently-live
-        /// slots; case-insensitive.
+        /// `Riker`; case-insensitive). Resolved first against the
+        /// live-worker registry, then against the engine's durable
+        /// pane state, so a name still resolves after the engine drops
+        /// its live registry entry (crash, terminal-fail path,
+        /// spawn-ack timeout).
         agent: String,
     },
     /// Bring a worker pane to the front.
@@ -740,8 +746,12 @@ enum AgentsAction {
     /// lines). Pass `--lines N` to tail only the last N lines.
     Transcript {
         /// Worker reference: run id (`run_*`), execution id (`exec_*`),
-        /// slot id, or crew name. For completed executions, pass the
-        /// execution id shown by `bossctl agents status <exec_id>`.
+        /// slot id, or crew name. Resolved first against the
+        /// live-worker registry, then against the engine's durable
+        /// pane state, so a name still resolves for a worker the
+        /// engine has lost live-track of. For a completed execution
+        /// with no trace in either, pass the execution id shown by
+        /// `bossctl agents status <exec_id>`.
         agent: String,
         /// Number of lines to return from the end of the transcript.
         /// 0 (the default) returns the entire transcript.
@@ -765,14 +775,20 @@ enum AgentsAction {
     /// the run as live — the engine's startup probe misses these
     /// when the cube lease is still within its TTL.
     ///
-    /// The run id MUST be passed explicitly (no slot-id / crew-name
-    /// fallback): the live-worker registry is the source for the
-    /// fallbacks and an orphaned worker is by definition not in it.
+    /// Accepts a run/execution id, slot id, or crew name — resolved
+    /// the same way every other `agents` verb resolves a worker
+    /// reference: first against the live-worker registry, then against
+    /// the engine's durable pane state, so an orphaned worker with no
+    /// live registry entry still resolves by name or slot. A reference
+    /// that misses both but has the shape of a run/execution id is
+    /// still forwarded raw, for a pane already torn down everywhere
+    /// but its own DB row.
     Reap {
-        /// Execution / run id of the orphaned worker (e.g.
-        /// `exec_18ad6336fedcb190_12`). Look this up with `bossctl
-        /// workspace summary` or `boss chore show`.
-        run_id: String,
+        /// Worker reference: run/execution id (e.g.
+        /// `exec_18ad6336fedcb190_12`), slot id, or crew name. Look up
+        /// a bare id with `bossctl workspace summary` or `boss chore
+        /// show`.
+        agent: String,
     },
     /// Show each worker pool's (main, automation, review) capacity,
     /// idle count, and every currently-claimed slot with its holding
@@ -787,22 +803,33 @@ enum AgentsAction {
     /// workers" without manually diffing `agents list` against
     /// `dispatch.jsonl` rejections.
     Pools,
-    /// Break-glass: tear down a "husk" pane — a worker pane the app
-    /// still hosts that the engine has NO live-tracked run for (crash,
-    /// terminal-fail path bug, spawn-ack timeout). Neither `stop` nor
-    /// `reap` can reach this case: both resolve a run id through the
-    /// live-worker registry, and the engine has already dropped that
-    /// mapping for a husk — `stop` fails client-side with "no live
-    /// worker matches" before it ever talks to the engine.
+    /// Break-glass: tear down a pane the engine has NO live-tracked run
+    /// for — a worker pane the app still hosts that the engine has
+    /// already forgotten (crash, terminal-fail path bug, spawn-ack
+    /// timeout).
+    ///
+    /// Accepts a slot id, crew name, or run id — resolved the same way
+    /// every other `agents` verb resolves a worker reference: first
+    /// against the live-worker registry, then against the engine's
+    /// durable pane state. A bare number is always accepted directly
+    /// as a slot id with no lookup, so a slot invisible to both the
+    /// live registry and the app can still be targeted by number.
     ///
     /// Refuses if the engine's own live-worker registry still shows a
-    /// live run in the slot — that pane is not a husk; use `agents
-    /// stop` for it instead. Use `agents list --all` to see which
-    /// slots are husks before retiring one.
+    /// live (or terminal-but-contradicted-by-real-activity) run in the
+    /// slot — that pane is not safe to tear down blind; use `agents
+    /// stop` for it instead. When there is no live registry entry at
+    /// all but durable state corroborates a still-running process for
+    /// an inferred-terminal execution (the shape a worker the engine
+    /// lost track of takes), this no longer refuses: it reaps the
+    /// process the same way `agents stop` would, then completes the
+    /// retirement. Use `agents list --all` to see every hosted pane's
+    /// state before retiring one.
     RetirePane {
-        /// Slot id to retire (1-indexed, matches the app's Workers
-        /// grid numbering and `agents list --all` output).
-        slot_id: u8,
+        /// Worker reference: slot id (1-indexed, matches the app's
+        /// Workers grid numbering and `agents list --all` output),
+        /// crew name, or run id.
+        agent: String,
     },
 }
 
@@ -1226,14 +1253,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 },
         } => agents::agents_transcript(&cli.socket_path, cli.json, agent, lines, format, no_tools).await,
         Command::Agents {
-            action: AgentsAction::Reap { run_id },
-        } => agents::agents_reap(&cli.socket_path, cli.json, run_id).await,
+            action: AgentsAction::Reap { agent },
+        } => agents::agents_reap(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
             action: AgentsAction::Pools,
         } => agents::agents_pools(&cli.socket_path, cli.json).await,
         Command::Agents {
-            action: AgentsAction::RetirePane { slot_id },
-        } => agents::agents_retire_pane(&cli.socket_path, cli.json, slot_id).await,
+            action: AgentsAction::RetirePane { agent },
+        } => agents::agents_retire_pane(&cli.socket_path, cli.json, agent).await,
         Command::Agents {
             action:
                 AgentsAction::Launch {

@@ -161,22 +161,32 @@ async fn resolve_tnnn_to_live_worker<'a>(
 }
 
 /// Resolve `reference` to a live worker's run id, accepting run ids,
-/// slot ids, crew names, and friendly work-item ids (T42, P7). Falls
-/// back to the original `resolve_agent_ref` error when no match is found.
+/// slot ids, crew names, and friendly work-item ids (T42, P7). Falls back,
+/// in order, to the engine's durable/hosted-pane roster (a worker the live
+/// registry has dropped — crash, terminal-fail path, spawn-ack timeout —
+/// but the app and durable state still account for) and then to a
+/// friendly work-item id. Errors with a combined candidate list (live AND
+/// durable-tracked-but-not-live) when nothing matches at all.
+///
+/// Shared by every `agents` verb whose engine RPC takes a bare run id and
+/// has no raw-passthrough escape hatch of its own (`stop`/`reap` layer
+/// their own on top — see [`agents_stop`]/[`agents_reap`]).
 async fn resolve_agent_ref_or_work_item(
     client: &mut BossClient,
     reference: &str,
     states: &[LiveWorkerState],
 ) -> Result<String> {
-    match resolve_agent_ref(reference, states) {
-        Ok(state) => Ok(state.run_id.clone()),
-        Err(agent_err) => {
-            if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
-                return Ok(state.run_id.clone());
-            }
-            Err(agent_err)
-        }
+    if let Ok(state) = resolve_agent_ref(reference, states) {
+        return Ok(state.run_id.clone());
     }
+    let hosted = fetch_hosted_pane_statuses(client).await?;
+    if let Some(pane) = resolve_hosted_pane_ref(reference, &hosted)? {
+        return Ok(pane.run_id.clone());
+    }
+    if let Some(state) = resolve_tnnn_to_live_worker(client, reference, states).await? {
+        return Ok(state.run_id.clone());
+    }
+    Err(no_worker_matches_error(reference, states, &hosted))
 }
 
 pub(crate) async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<LiveWorkerState>> {
@@ -190,6 +200,112 @@ pub(crate) async fn fetch_live_states(client: &mut BossClient) -> Result<Vec<Liv
             bail!("engine rejected list: {message}")
         }
         other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Fetch every pane the app hosts, classified against the engine's live
+/// registry and durable state (live / terminal-entry-with-live-process /
+/// husk) — see [`HostedPaneState`]. This is the durable-state fallback
+/// every `agents` verb consults once a plain live-registry lookup misses,
+/// so a crew name or slot id the operator can see in the app still
+/// resolves after the engine drops the live registry entry.
+pub(crate) async fn fetch_hosted_pane_statuses(client: &mut BossClient) -> Result<Vec<HostedPaneStatus>> {
+    match client
+        .send_request(&FrontendRequest::ListHostedPaneStatuses)
+        .await
+        .context("sending ListHostedPaneStatuses")?
+    {
+        FrontendEvent::HostedPaneStatusList { panes } => Ok(panes),
+        FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
+            bail!("engine rejected list: {message}")
+        }
+        other => bail!("engine returned unexpected response: {other:?}"),
+    }
+}
+
+/// Resolve `reference` against the durable/hosted-pane roster: exact
+/// `run_id`, then numeric `slot_id`, then case-insensitive `crew_name` —
+/// the same tier order as [`resolve_agent_ref`]. Returns `Ok(None)` on a
+/// total miss (callers chain further fallbacks), and errors only when
+/// `reference` matches more than one pane in the same tier.
+pub(crate) fn resolve_hosted_pane_ref<'a>(
+    reference: &str,
+    panes: &'a [HostedPaneStatus],
+) -> Result<Option<&'a HostedPaneStatus>> {
+    let by_run: Vec<&HostedPaneStatus> = panes.iter().filter(|p| p.run_id == reference).collect();
+    if !by_run.is_empty() {
+        return pick_unique_pane(reference, by_run).map(Some);
+    }
+    if let Ok(slot) = reference.parse::<u8>() {
+        let by_slot: Vec<&HostedPaneStatus> = panes.iter().filter(|p| p.slot_id == slot).collect();
+        if !by_slot.is_empty() {
+            return pick_unique_pane(reference, by_slot).map(Some);
+        }
+    }
+    let by_name: Vec<&HostedPaneStatus> = panes
+        .iter()
+        .filter(|p| p.crew_name.eq_ignore_ascii_case(reference))
+        .collect();
+    if !by_name.is_empty() {
+        return pick_unique_pane(reference, by_name).map(Some);
+    }
+    Ok(None)
+}
+
+fn pick_unique_pane<'a>(reference: &str, matches: Vec<&'a HostedPaneStatus>) -> Result<&'a HostedPaneStatus> {
+    if matches.len() == 1 {
+        return Ok(matches[0]);
+    }
+    bail!(
+        "`{reference}` matches multiple tracked panes: {}",
+        matches
+            .iter()
+            .map(|p| format!(
+                "slot {} ({}) run {} [{}]",
+                p.slot_id,
+                p.crew_name,
+                p.run_id,
+                pane_state_label(&p.state)
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
+fn pane_state_label(state: &HostedPaneState) -> &'static str {
+    match state {
+        HostedPaneState::Live => "live",
+        HostedPaneState::LiveProcessNoRegistry { .. } => "terminal entry, live process",
+        HostedPaneState::Husk => "husk",
+    }
+}
+
+/// Build the "no worker matches" error for a reference that resolved in
+/// neither the live registry nor the durable/hosted-pane roster, listing
+/// both so the operator can see what was actually searched — not just the
+/// live crew (mirrors what `live_candidates_summary` alone used to show).
+fn no_worker_matches_error(reference: &str, states: &[LiveWorkerState], hosted: &[HostedPaneStatus]) -> anyhow::Error {
+    let live = live_candidates_summary(states);
+    let non_live: Vec<String> = hosted
+        .iter()
+        .filter(|p| !matches!(p.state, HostedPaneState::Live))
+        .map(|p| {
+            format!(
+                "slot {} ({}) run {} [{}]",
+                p.slot_id,
+                p.crew_name,
+                p.run_id,
+                pane_state_label(&p.state)
+            )
+        })
+        .collect();
+    if non_live.is_empty() {
+        anyhow::anyhow!("no worker matches `{reference}`. {live}")
+    } else {
+        anyhow::anyhow!(
+            "no worker matches `{reference}`. {live}. Also tracked (not live): {}",
+            non_live.join(", "),
+        )
     }
 }
 /// Show live runtime status for the worker referenced by `agent`
@@ -210,8 +326,20 @@ pub(crate) async fn agents_status(socket_path: &Option<String>, json: bool, agen
             print_live_state(json, state);
             return Ok(());
         }
-        Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
-        Err(_) => {}
+        Err(_) => {
+            // Durable-state fallback: a crew name or slot id the operator can
+            // see in the app must resolve even after the engine has dropped
+            // the live registry entry (crash, terminal-fail path, spawn-ack
+            // timeout).
+            let hosted = fetch_hosted_pane_statuses(&mut client).await?;
+            if let Some(pane) = resolve_hosted_pane_ref(&agent, &hosted)? {
+                print_hosted_pane_status(json, pane);
+                return Ok(());
+            }
+            if looks_like_name_or_slot(&agent) {
+                return Err(no_worker_matches_error(&agent, &states, &hosted));
+            }
+        }
     }
 
     // Not a live worker. If the reference resolves to a work item (T42,
@@ -430,18 +558,8 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
 
-    let husk_panes = if all {
-        let response = client
-            .send_request(&FrontendRequest::ListHuskPanes)
-            .await
-            .context("sending ListHuskPanes")?;
-        match response {
-            FrontendEvent::HuskPanesList { panes } => panes,
-            FrontendEvent::Error { message, .. } | FrontendEvent::WorkError { message } => {
-                bail!("engine rejected list-husk-panes: {message}")
-            }
-            other => bail!("engine returned unexpected response: {other:?}"),
-        }
+    let hosted = if all {
+        fetch_hosted_pane_statuses(&mut client).await?
     } else {
         Vec::new()
     };
@@ -451,26 +569,44 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
             "{}",
             serde_json::json!({
                 "live_worker_states": states,
-                "husk_panes": husk_panes,
+                "hosted_pane_statuses": hosted,
             })
         );
+        return Ok(());
+    }
+
+    if states.is_empty() {
+        println!("no active workers");
     } else {
-        if states.is_empty() {
-            println!("no active workers");
-        } else {
-            for state in &states {
-                print_live_state_short(state);
-            }
+        for state in &states {
+            print_live_state_short(state);
         }
-        if all {
-            if husk_panes.is_empty() {
-                println!("no husk panes");
-            } else {
-                for pane in &husk_panes {
-                    println!(
-                        "slot {}  run={}  HUSK (app-hosted, no engine-tracked run — retire with `bossctl agents retire-pane {}`)",
-                        pane.slot_id, pane.run_id, pane.slot_id,
-                    );
+    }
+    if all {
+        // Panes already shown above via `states` are `Live`-classified here
+        // too — only render the ones the primary live list can't show:
+        // a worker the engine lost live-track of but durable state still
+        // corroborates (`LiveProcessNoRegistry`), and true husks.
+        let additional: Vec<&HostedPaneStatus> = hosted
+            .iter()
+            .filter(|p| !matches!(p.state, HostedPaneState::Live))
+            .collect();
+        if additional.is_empty() {
+            println!("no additional hosted panes (no terminal-entry-with-live-process panes or husks)");
+        } else {
+            for pane in &additional {
+                match &pane.state {
+                    HostedPaneState::LiveProcessNoRegistry { evidence } => println!(
+                        "slot {}  {}  run={}  TERMINAL ENTRY, LIVE PROCESS ({evidence}) — \
+                         `bossctl agents stop {}` or `bossctl agents retire-pane {}` to reap it",
+                        pane.slot_id, pane.crew_name, pane.run_id, pane.run_id, pane.slot_id,
+                    ),
+                    HostedPaneState::Husk => println!(
+                        "slot {}  {}  run={}  HUSK (app-hosted, no engine-tracked run, no live process — \
+                         retire with `bossctl agents retire-pane {}`)",
+                        pane.slot_id, pane.crew_name, pane.run_id, pane.slot_id,
+                    ),
+                    HostedPaneState::Live => unreachable!("filtered out above"),
                 }
             }
         }
@@ -478,8 +614,34 @@ pub(crate) async fn agents_list_live(socket_path: &Option<String>, json: bool, a
     Ok(())
 }
 
-pub(crate) async fn agents_retire_pane(socket_path: &Option<String>, json: bool, slot_id: u8) -> Result<()> {
+/// Resolve `agent` (run id, slot id, or crew name) to the slot to retire.
+/// A bare numeric reference is always accepted directly as a slot id with
+/// no lookup — retire-pane's break-glass contract has never required the
+/// slot to be resolvable client-side (the engine handles an unknown or
+/// never-allocated slot idempotently), and preserving that means a slot
+/// invisible to both the live registry and the hosted-pane roster (e.g.
+/// the app itself is unreachable) can still be targeted by number. A crew
+/// name or run id, which are never bare numbers, always goes through
+/// resolution against the live registry and then the durable/hosted-pane
+/// roster — the fix this verb exists for.
+async fn resolve_retire_pane_slot(client: &mut BossClient, agent: &str) -> Result<u8> {
+    if let Ok(slot) = agent.parse::<u8>() {
+        return Ok(slot);
+    }
+    let states = fetch_live_states(client).await?;
+    if let Ok(state) = resolve_agent_ref(agent, &states) {
+        return Ok(state.slot_id);
+    }
+    let hosted = fetch_hosted_pane_statuses(client).await?;
+    if let Some(pane) = resolve_hosted_pane_ref(agent, &hosted)? {
+        return Ok(pane.slot_id);
+    }
+    Err(no_worker_matches_error(agent, &states, &hosted))
+}
+
+pub(crate) async fn agents_retire_pane(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let slot_id = resolve_retire_pane_slot(&mut client, &agent).await?;
     let response = client
         .send_request(&FrontendRequest::RetirePane { slot_id })
         .await
@@ -508,31 +670,35 @@ pub(crate) async fn agents_retire_pane(socket_path: &Option<String>, json: bool,
 
 /// True when `reference` has the shape of an execution id (`exec_…`).
 ///
-/// Used only by `agents stop` to decide whether a resolver miss should still
-/// be forwarded to the engine — see [`agents_stop`] for why. Deliberately
-/// narrow: a crew name or slot number that misses must still fail loudly with
-/// the live-candidate list rather than being posted to the engine as a run id.
+/// Used by `agents stop`/`agents reap` to decide whether a resolver miss
+/// should still be forwarded to the engine raw — see [`agents_stop`] for
+/// why. Deliberately narrow: a crew name or slot number that misses must
+/// still fail loudly with the candidate list rather than being posted to
+/// the engine as a run id.
 fn looks_like_execution_id(reference: &str) -> bool {
     reference.starts_with("exec_")
 }
 
 /// Stop the worker referenced by `agent`.
 ///
-/// Resolution normally goes through the live-worker list, but `stop` — alone
-/// among the agent verbs — must also work for a worker the engine has LOST
-/// TRACK of. That is not a hypothetical: a run whose execution was wrongly
-/// terminalized has its `LiveWorkerState` cleared while its process keeps
-/// running, so on 2026-07-28 `bossctl agents stop <exec-id>` answered `no live
-/// worker matches` for all six stranded workers and an operator had to `kill`
+/// Resolution goes through the live-worker list, then the engine's
+/// durable/hosted-pane roster (`resolve_agent_ref_or_work_item`) — which
+/// covers a worker the engine has LOST TRACK of. That is not a
+/// hypothetical: a run whose execution was wrongly terminalized has its
+/// `LiveWorkerState` cleared while its process keeps running, so on
+/// 2026-07-28 `bossctl agents stop <exec-id>` answered `no live worker
+/// matches` for all six stranded workers and an operator had to `kill`
 /// them by pid. Being unable to reap a running worker is its own defect,
 /// independent of how it got stranded.
 ///
-/// So an `exec_…` reference that misses the live list is forwarded to the
-/// engine anyway. The engine's stop path resolves the worker from durable
-/// state (`work_runs.shell_pid`) and reaps both the app-hosted pane and the OS
-/// process tree, which is precisely the case the live list cannot see. Other
-/// reference forms (crew name, slot id) still fail with the candidate list —
-/// a typo'd name must not be posted to the engine as a run id.
+/// As a last resort, an `exec_…` reference that misses BOTH the live list
+/// and the durable/hosted-pane roster (a pane already torn down
+/// everywhere but the DB row) is forwarded to the engine raw. The
+/// engine's stop path resolves the worker from durable state
+/// (`work_runs.shell_pid`) and reaps both the app-hosted pane and the OS
+/// process tree. Other reference forms (crew name, slot id) still fail
+/// with the candidate list — a typo'd name must not be posted to the
+/// engine as a run id.
 pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
@@ -540,8 +706,9 @@ pub(crate) async fn agents_stop(socket_path: &Option<String>, json: bool, agent:
         Ok(run_id) => run_id,
         Err(_) if looks_like_execution_id(&agent) => {
             eprintln!(
-                "warning: {agent} is not in the engine's live-worker list; stopping it from \
-                 durable state instead (this is the shape a worker the engine lost track of takes)"
+                "warning: {agent} is not tracked live or in durable pane state; forwarding it to the \
+                 engine as a raw run id anyway (this is the shape a pane torn down everywhere but its \
+                 own DB row takes)"
             );
             agent.clone()
         }
@@ -1166,20 +1333,28 @@ pub(crate) async fn agents_transcript(
     let mut client = connect(socket_path).await?;
     let states = fetch_live_states(&mut client).await?;
 
-    // For live workers resolve via the registry. For completed/terminal
-    // executions the live registry has no entry — fall through and let
-    // the engine query work_runs.transcript_path from the DB. The
-    // engine's resolve_transcript_for_tail handles both the exec_* and
-    // run_* namespaces, so passing the raw ref works for either id form.
-    // Friendly ids (T42) are tried as live-worker references first.
+    // For live workers resolve via the registry. For a worker the engine has
+    // lost live-track of but durable state / the app still account for,
+    // resolve via the hosted-pane roster — this needs no liveness at all,
+    // since TailRunTranscript reads `work_runs.transcript_path` from the DB
+    // regardless of whether the process is still running. For completed/
+    // terminal executions absent from both, fall through and let the engine
+    // query the DB directly. The engine's resolve_transcript_for_tail
+    // handles both the exec_* and run_* namespaces, so passing the raw ref
+    // works for either id form. Friendly ids (T42) are tried as live-worker
+    // references first.
     let run_id = match resolve_agent_ref(&agent, &states) {
         Ok(state) => state.run_id.clone(),
-        Err(err) if looks_like_name_or_slot(&agent) => return Err(err),
-        Err(_) => {
+        Err(err) => {
             if let Some(state) = resolve_tnnn_to_live_worker(&mut client, &agent, &states).await? {
                 state.run_id.clone()
             } else {
-                agent.clone()
+                let hosted = fetch_hosted_pane_statuses(&mut client).await?;
+                match resolve_hosted_pane_ref(&agent, &hosted)? {
+                    Some(pane) => pane.run_id.clone(),
+                    None if looks_like_name_or_slot(&agent) => return Err(err),
+                    None => agent.clone(),
+                }
             }
         }
     };
@@ -1268,8 +1443,25 @@ pub(crate) async fn agents_transcript(
     }
 }
 
-pub(crate) async fn agents_reap(socket_path: &Option<String>, json: bool, run_id: String) -> Result<()> {
+/// Mark the execution behind `agent` as `orphaned` (terminal) without
+/// releasing its cube workspace lease.
+///
+/// Resolves `agent` (run id, slot id, or crew name) the same way every
+/// other `agents` verb does: the live-worker list, then the engine's
+/// durable/hosted-pane roster — the fix this whole change is about, since
+/// `reap` exists precisely for a worker the live registry has already
+/// lost. As a last resort, a reference that misses both but has the
+/// shape of a run/execution id is forwarded to the engine raw (mirrors
+/// `agents stop`) — a pane already torn down everywhere but its own DB
+/// row has no name or slot left to resolve by.
+pub(crate) async fn agents_reap(socket_path: &Option<String>, json: bool, agent: String) -> Result<()> {
     let mut client = connect(socket_path).await?;
+    let states = fetch_live_states(&mut client).await?;
+    let run_id = match resolve_agent_ref_or_work_item(&mut client, &agent, &states).await {
+        Ok(run_id) => run_id,
+        Err(_) if looks_like_execution_id(&agent) => agent.clone(),
+        Err(err) => return Err(err),
+    };
     let response = client
         .send_request(&FrontendRequest::ReapRun { run_id: run_id.clone() })
         .await
@@ -1408,6 +1600,56 @@ fn print_live_state(json: bool, state: &LiveWorkerState) {
 
 fn print_live_state_short(state: &LiveWorkerState) {
     println!("{}", format_live_state_short(state));
+}
+
+/// Render a [`HostedPaneStatus`] resolved from the durable/hosted-pane
+/// roster — reached only when the live-registry lookup already missed
+/// (see [`agents_status`]), so this covers exactly the case the live
+/// `LiveWorkerState` detail (model, activity, current tool) isn't
+/// available for.
+fn print_hosted_pane_status(json: bool, pane: &HostedPaneStatus) {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "slot_id": pane.slot_id,
+                "run_id": pane.run_id,
+                "crew_name": pane.crew_name,
+                "state": pane.state,
+                "summary": pane.summary,
+                "task_title": pane.task_title,
+            })
+        );
+        return;
+    }
+    println!("slot {} ({}) — run {}", pane.slot_id, pane.crew_name, pane.run_id);
+    match &pane.state {
+        HostedPaneState::Live => {
+            // Reachable only if the worker went live in the gap between the
+            // `ListWorkerLiveStates` and `ListHostedPaneStatuses` round
+            // trips — vanishingly rare, and harmless: the caller just
+            // re-runs the command a moment later for full live detail.
+            println!("  state: live (just resolved via durable state; re-run for full live detail)");
+        }
+        HostedPaneState::LiveProcessNoRegistry { evidence } => {
+            println!("  state: terminal entry, live process ({evidence})");
+            println!("  the engine has no live run tracked for this worker, but its process is still running.");
+            println!(
+                "  `bossctl agents stop {}` or `bossctl agents retire-pane {}` will reap it.",
+                pane.run_id, pane.slot_id
+            );
+        }
+        HostedPaneState::Husk => {
+            println!("  state: husk (app-hosted, no engine-tracked run, no live process)");
+            println!("  retire with `bossctl agents retire-pane {}`", pane.slot_id);
+        }
+    }
+    if let Some(title) = &pane.task_title {
+        println!("  work_item:     {title}");
+    }
+    if let Some(summary) = &pane.summary {
+        println!("  summary:       {summary}");
+    }
 }
 
 /// One-line `agents list` row for a live worker. Pure so tests can pin
@@ -1718,6 +1960,103 @@ mod tests {
         // Deliberately out of slot order on input to prove the sort.
         let states = [worker(2, "exec_def", "Data"), worker(1, "exec_abc", "Riker")];
         assert_eq!(live_candidates_summary(&states), "Live: slot 1 (Riker), slot 2 (Data)");
+    }
+
+    // ---- resolve_hosted_pane_ref / no_worker_matches_error -----------------
+
+    fn hosted_pane(slot_id: u8, run_id: &str, crew_name: &str, state: HostedPaneState) -> HostedPaneStatus {
+        HostedPaneStatus {
+            slot_id,
+            run_id: run_id.to_owned(),
+            crew_name: crew_name.to_owned(),
+            summary: None,
+            task_title: None,
+            state,
+        }
+    }
+
+    /// The exact incident shape: a crew name the operator can see in the
+    /// app, backing a run the live registry has dropped entirely, must
+    /// still resolve — by name, by slot, and by run id.
+    #[test]
+    fn resolves_terminal_entry_live_process_pane_by_name_slot_and_run_id() {
+        let panes = [hosted_pane(
+            1,
+            "exec_riker",
+            "Riker",
+            HostedPaneState::LiveProcessNoRegistry {
+                evidence: "durably-recorded shell pid 33112 is alive".to_owned(),
+            },
+        )];
+        let by_name = resolve_hosted_pane_ref("riker", &panes)
+            .expect("no ambiguity")
+            .expect("name should resolve");
+        assert_eq!(by_name.run_id, "exec_riker");
+        let by_slot = resolve_hosted_pane_ref("1", &panes)
+            .expect("no ambiguity")
+            .expect("slot should resolve");
+        assert_eq!(by_slot.crew_name, "Riker");
+        let by_run = resolve_hosted_pane_ref("exec_riker", &panes)
+            .expect("no ambiguity")
+            .expect("run id should resolve");
+        assert_eq!(by_run.slot_id, 1);
+    }
+
+    #[test]
+    fn resolve_hosted_pane_ref_misses_return_none_not_error() {
+        let panes = [hosted_pane(1, "exec_riker", "Riker", HostedPaneState::Husk)];
+        assert!(
+            resolve_hosted_pane_ref("nonesuch", &panes)
+                .expect("a miss is not an error")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_hosted_pane_ref_bails_on_ambiguous_name() {
+        let panes = [
+            hosted_pane(1, "exec_a", "Data", HostedPaneState::Husk),
+            hosted_pane(2, "exec_b", "Data", HostedPaneState::Husk),
+        ];
+        let err = resolve_hosted_pane_ref("data", &panes).expect_err("two panes share a name");
+        let msg = err.to_string();
+        assert!(msg.contains("matches multiple tracked panes"), "message was: {msg}");
+    }
+
+    /// Requirement: a total miss must list what was searched, including
+    /// the non-live candidates — not only the live crew.
+    #[test]
+    fn no_worker_matches_error_lists_non_live_candidates_too() {
+        let states = [worker(2, "exec_data", "Data")];
+        let hosted = [
+            hosted_pane(2, "exec_data", "Data", HostedPaneState::Live),
+            hosted_pane(
+                1,
+                "exec_riker",
+                "Riker",
+                HostedPaneState::LiveProcessNoRegistry {
+                    evidence: "durably-recorded shell pid 33112 is alive".to_owned(),
+                },
+            ),
+            hosted_pane(3, "exec_worf", "Worf", HostedPaneState::Husk),
+        ];
+        let err = no_worker_matches_error("nonesuch", &states, &hosted);
+        let msg = err.to_string();
+        assert!(msg.contains("Live: slot 2 (Data)"), "message was: {msg}");
+        assert!(msg.contains("Also tracked (not live)"), "message was: {msg}");
+        assert!(
+            msg.contains("slot 1 (Riker) run exec_riker [terminal entry, live process]"),
+            "message was: {msg}"
+        );
+        assert!(msg.contains("slot 3 (Worf) run exec_worf [husk]"), "message was: {msg}");
+        // The Live-classified pane is not double-listed in the "not live" tail.
+        assert!(!msg.contains("slot 2 (Data) run exec_data ["), "message was: {msg}");
+    }
+
+    #[test]
+    fn no_worker_matches_error_omits_tail_when_nothing_non_live() {
+        let err = no_worker_matches_error("nonesuch", &[], &[]);
+        assert_eq!(err.to_string(), "no worker matches `nonesuch`. no live workers");
     }
 
     // ---- looks_like_name_or_slot ------------------------------------------
