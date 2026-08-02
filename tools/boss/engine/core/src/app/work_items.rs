@@ -1010,6 +1010,12 @@ pub(super) async fn handle_get_work_tree(ctx: Dispatch, req: FrontendRequest) {
         }
         Err(err) => {
             // Error path: drop the trace (no serialize/write to attribute).
+            // A decode failure here (e.g. an out-of-enum `status` column)
+            // blanks this product's entire board and kills its dispatch
+            // reconciliation until the bad row is fixed — log it loudly so
+            // the next occurrence is diagnosable from the trace rather than
+            // from a screenshot of the resulting "Work Error" modal.
+            tracing::error!(product_id = %product_id, error = %err, "get_work_tree failed: product board unavailable");
             send_work_error(&sink, &request_id, &err);
         }
     }

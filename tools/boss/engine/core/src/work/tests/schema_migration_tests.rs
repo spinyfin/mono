@@ -728,3 +728,108 @@ fn migrate_backfill_resolve_stale_dead_review_attentions_resolves_only_when_late
     drop(conn2);
     let _ = std::fs::remove_file(path);
 }
+
+/// Regression test for the incident that motivated
+/// `migrate_repair_invalid_project_status`: the auto-unblock cascade's
+/// pre-fix untyped shared writer let the `TaskStatus` literal `"todo"`
+/// land in `projects.status`, which `ProjectStatus` doesn't accept. Seed
+/// exactly that shape via raw SQL (bypassing the engine's typed write
+/// paths, which can no longer produce it — see
+/// `write_engine_project_status`/`write_engine_task_status`) and confirm
+/// re-opening the DB repairs the row to `planned`, restamps `updated_at`
+/// and `last_status_actor` (rather than leaving them pointing at the
+/// corrupt write, as the incident's live hand-repair did), and leaves the
+/// row decodable via `query_project`.
+#[test]
+fn migration_repairs_out_of_enum_project_status() {
+    let (_dir, path) = disk_db_path("repair-invalid-project-status");
+    // Seed the corrupt row directly against a pre-migration legacy schema —
+    // a fresh `WorkDb::open` already carries the new `CHECK` constraint
+    // added by `migrate_projects_tasks_status_check`, so a `status = 'todo'`
+    // project row can no longer be written through it at all. Matches this
+    // incident's real path: the bad write landed on an existing database
+    // that predated both the fix and the constraint.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    LegacySchema::new(4)
+        .products(NO_EXTRA_COLUMNS)
+        .projects(PROJECTS_V4_COLUMNS)
+        .tasks(TASKS_V4_COLUMNS)
+        .seed(&legacy_product_seed("prod_legacy", "Legacy", "legacy"))
+        .seed(
+            // Stamped exactly like the pre-fix cascade wrote it:
+            // `last_status_actor = 'engine'`, `updated_at` from the bad write.
+            "INSERT INTO projects(id, product_id, name, slug, status, priority, last_status_actor, created_at, updated_at)
+             VALUES ('proj_legacy', 'prod_legacy', 'Corrupted', 'corrupted', 'todo', 'medium', 'engine', '1700000000', '1700000000');",
+        )
+        .create(&conn);
+    drop(conn);
+
+    // Re-open re-runs the full migration chain, including the repair.
+    let db = WorkDb::open(path.clone()).unwrap();
+    let conn2 = db.connect().unwrap();
+
+    let (status, last_status_actor, updated_at): (String, String, String) = conn2
+        .query_row(
+            "SELECT status, last_status_actor, updated_at FROM projects WHERE id = 'proj_legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "planned", "out-of-enum status must be repaired to planned");
+    assert_eq!(last_status_actor, "engine");
+    assert_ne!(
+        updated_at, "1700000000",
+        "the repair must restamp updated_at rather than leave the corrupt write's timestamp in place"
+    );
+
+    let repaired = query_project(&conn2, "proj_legacy")
+        .unwrap()
+        .expect("project must still exist");
+    assert_eq!(repaired.status, ProjectStatus::Planned);
+
+    drop(conn2);
+    let _ = std::fs::remove_file(path);
+}
+
+/// After the schema-init migration chain runs, both `projects.status` and
+/// `tasks.status` must be constrained by the new `CHECK` — not just the
+/// application-level `ProjectStatus`/`TaskStatus` parsers used by the typed
+/// write paths. A raw SQL write of a value valid in the *other* table's
+/// vocabulary (`"todo"` for projects, `"planned"` for tasks) must now fail
+/// outright rather than silently land, which is exactly the failure mode
+/// `migrate_projects_tasks_status_check` closes.
+#[test]
+fn status_check_constraint_rejects_out_of_enum_values_on_both_tables() {
+    let path = temp_db_path("status-check-constraint");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@github.com:test/repo.git"));
+    let project = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "P".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+        })
+        .unwrap();
+    let chore = create_test_chore(&db, product.id.clone(), "C");
+
+    let conn = db.connect().unwrap();
+    let project_err = conn
+        .execute("UPDATE projects SET status = 'todo' WHERE id = ?1", [&project.id])
+        .unwrap_err();
+    assert!(
+        project_err.to_string().to_lowercase().contains("constraint"),
+        "expected a CHECK constraint violation, got: {project_err}"
+    );
+
+    let task_err = conn
+        .execute("UPDATE tasks SET status = 'planned' WHERE id = ?1", [&chore.id])
+        .unwrap_err();
+    assert!(
+        task_err.to_string().to_lowercase().contains("constraint"),
+        "expected a CHECK constraint violation, got: {task_err}"
+    );
+    let _ = std::fs::remove_file(path);
+}
