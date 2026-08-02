@@ -221,6 +221,72 @@ pub struct BoothbyCursor {
     pub updated_at: String,
 }
 
+/// One `boothby.act` call: Boothby asking the executor to perform one
+/// catalogue verb against one target.
+///
+/// Deliberately narrow. The verb's own inputs ride in `params` as opaque
+/// JSON rather than as typed fields, because the catalogue spans verbs with
+/// nothing in common (`close_stale_task` wants an archive reason;
+/// `gc_recovery_patches` wants a TTL) and a union of every verb's arguments
+/// would be a struct that no single call ever fills in. The executor hands
+/// `params` to the verb's handler, which is the only code that knows the
+/// shape, and journals it verbatim into `boothby_actions.params`.
+///
+/// `rationale` is required rather than optional: the whole point of the
+/// journal is that no autonomous mutation is unexplained, and an `Option`
+/// here would let the caller skip it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BoothbyActInput {
+    /// Catalogue slug, e.g. `close_stale_task`. Unknown slugs are refused —
+    /// the catalogue is fixed in v1.
+    pub verb: String,
+
+    /// The row / execution / lease / path the verb acts on.
+    pub target_id: String,
+
+    /// Why. Journalled verbatim; a mutation with no reason is refused.
+    pub rationale: String,
+
+    /// JSON: the verb's own inputs, interpreted by that verb's handler.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<String>,
+}
+
+/// What the executor did with a [`BoothbyActInput`].
+///
+/// Every non-`Executed` outcome is a *refusal*, and each names the specific
+/// rail that stopped it. Boothby sees the distinction because the right
+/// response differs: `Deferred` means "ask again next pass", `Capped` means
+/// "stop asking this pass", `Refused` means "never ask again". Collapsing
+/// these into one error would make all three look like a transient failure
+/// worth retrying, which for an irreversible verb is exactly wrong.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum BoothbyActOutcome {
+    /// The effect ran and was journalled. `action_id` is the
+    /// `boothby_actions` row.
+    Executed { action_id: String },
+
+    /// Nothing mutated: the verb needs operator approval first, either
+    /// because the install is in `propose` mode or because the catalogue
+    /// marks this verb `propose` even under `auto`.
+    Proposed { reason: String },
+
+    /// Nothing mutated: an I-class verb whose target has not yet been
+    /// confirmed across two passes. Asking again on the next pass is the
+    /// intended response.
+    Deferred { reason: String },
+
+    /// Nothing mutated: a per-verb or global blast-radius cap is spent for
+    /// this pass. The pass ends `capped`.
+    Capped { reason: String },
+
+    /// Nothing mutated, and it never will: a guard rejected the target (live
+    /// work, recent human touch, held lease) or the fingerprint is
+    /// suppressed / previously reversed by a human.
+    Refused { reason: String },
+}
+
 // --- boothby_passes.trigger ------------------------------------------
 
 /// The periodic wake-up.
