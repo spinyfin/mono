@@ -14,8 +14,10 @@ Companion to
 | `evidence/a_notification/*.json`       | Per-probe hook streams (`hook_event`, `notificationType`, `level`, `message`, `toolName`), UUIDs redacted |
 | `evidence/b_leader/measurements.txt`   | Raw `ps` process tables and leader lifecycle measurements (L1–L8)                                         |
 
-Pinned CLI under test: **`grok 0.2.114`** — note this is _newer_ than the
-`PINNED_GROK_VERSION` (`0.2.112`) the driver asserts. See the findings doc.
+CLI under test: **`grok 0.2.114`** — at the time newer than the
+`PINNED_GROK_VERSION` (`0.2.112`) the driver asserted. The version pin was
+removed 2026-08-01 (operator decision: it fired on every automatic Grok
+update). See the findings doc.
 
 ## Apparatus rules
 

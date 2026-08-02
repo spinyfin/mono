@@ -203,14 +203,14 @@ mod tests {
             )
             .unwrap();
         }
-        let state = GrokRuntimeState {
-            grok_home: grok_home.to_path_buf(),
-            process_home: grok_home.with_file_name("process-home"),
-            auth_source_path: PathBuf::from("/tmp/source-auth.json"),
-            session_id: "11111111-1111-4111-8111-111111111111".into(),
-            workspace_path: PathBuf::from("/tmp/ws"),
-        }
-        .to_driver_runtime_state();
+        let state = GrokRuntimeState::builder()
+            .grok_home(grok_home.to_path_buf())
+            .process_home(grok_home.with_file_name("process-home"))
+            .auth_source_path(PathBuf::from("/tmp/source-auth.json"))
+            .session_id("11111111-1111-4111-8111-111111111111")
+            .workspace_path(PathBuf::from("/tmp/ws"))
+            .build()
+            .to_driver_runtime_state();
         db.set_driver_runtime_state(&execution.id, Some(&state)).unwrap();
         execution.id
     }
