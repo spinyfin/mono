@@ -690,7 +690,7 @@ pub(crate) async fn compose_worker_spawn(
             .resolver(&spawn_config.driver)
             .expect("slug validated by resolve_spawn_config_in");
         resolver
-            .check_dispatch(kind)
+            .check_dispatch(kind, Some(&execution.kind))
             .map_err(|e| anyhow::anyhow!("capability gate: {e}"))?;
     }
 

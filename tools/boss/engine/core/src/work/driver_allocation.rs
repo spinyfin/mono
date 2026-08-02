@@ -11,9 +11,10 @@
 //! eligible kinds. For a given row it asks
 //! [`crate::driver::DriverRegistry::eligible_drivers_for_kind`] — i.e. the
 //! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
-//! the kind's `KindRequirements` against each driver's declared
-//! `CapabilitySet` — which of the three drivers may run a work item of that
-//! kind, and renormalises the configured split over exactly that subset
+//! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
+//! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
+//! which of the three drivers may run a work item of that kind, and
+//! renormalises the configured split over exactly that subset
 //! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
 //! driver declared eligible for a kind can receive it, one that is not
 //! cannot, and widening or narrowing eligibility is a `KindRequirements` /
@@ -23,6 +24,17 @@
 //! about capability, and is gone: `reasoning` still selects which *model* a
 //! driver runs (`ModelMenu::model_for_reasoning`) but no longer decides
 //! *which driver*.
+//!
+//! The `ExecutionKind` dimension is why `conflict_resolution` and
+//! `ci_remediation` do not silently become codex/grok-eligible just because
+//! their underlying `tasks.kind` (an ordinary chore/task/revision) clears
+//! every driver's gate on its own: `KindRequirements::for_kind` marks
+//! `Capability::CommandOutcomeObservation` required-strict for those two
+//! execution kinds — neither codex nor grok declares it — so the gate itself
+//! refuses them until that capability is declared elsewhere (see the
+//! Codex/Grok driver design docs' "review and conflict resolution" phase).
+//! This is deliberately expressed at the gate, not as a second hardcoded
+//! kind list here.
 //!
 //! Two things allocation still declines, neither of them a claim about
 //! capability:
@@ -154,9 +166,19 @@ impl DriverDecision {
 /// allocation can only choose between drivers the split actually holds a
 /// share for, and a slug the registry does not recognise is not eligible
 /// (fail closed).
-fn eligible_drivers_for(kind: &TaskKind) -> Vec<&'static str> {
-    crate::driver::DriverRegistry::default()
-        .eligible_drivers_for_kind(kind, &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER)
+///
+/// `execution_kind` is threaded through to the gate alongside `kind` because
+/// some escalations live on the execution rather than the underlying task
+/// row — see [`crate::driver::KindRequirements`]'s doc for
+/// `ConflictResolution` / `CiRemediation`, which is exactly why allocation
+/// must decline those two kinds rather than treating every `tasks`-bound
+/// execution kind as equally eligible.
+fn eligible_drivers_for(kind: &TaskKind, execution_kind: &ExecutionKind) -> Vec<&'static str> {
+    crate::driver::DriverRegistry::default().eligible_drivers_for_kind(
+        kind,
+        Some(execution_kind),
+        &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER,
+    )
 }
 
 /// Deterministic hash of `work_item_id` into `[0, 100)`. SHA-256 rather
@@ -396,7 +418,7 @@ pub(crate) fn decide_execution_driver(
              refusing to allocate a driver for a kind whose capability requirements this engine cannot resolve",
         )
     })?;
-    let eligible = eligible_drivers_for(&task_kind);
+    let eligible = eligible_drivers_for(&task_kind, &kind);
     let split = load_driver_traffic_split_conn(conn)?;
     let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
     Ok(DriverDecision::allocated(driver, split))

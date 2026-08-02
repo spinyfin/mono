@@ -1566,7 +1566,18 @@ pub fn pool_dispatch_policy_for_worker_id(worker_id: &str) -> Option<PoolDispatc
 /// cannot be decided from the kind and is checked against
 /// `tasks.source_automation_id` at the allocation site.
 pub fn kind_always_dispatches_on_pool_driver(kind: &ExecutionKind) -> bool {
-    matches!(kind, ExecutionKind::PrReview | ExecutionKind::AutomationTriage)
+    match kind {
+        ExecutionKind::PrReview | ExecutionKind::AutomationTriage => true,
+        ExecutionKind::AnswerAgent
+        | ExecutionKind::ChoreImplementation
+        | ExecutionKind::CiRemediation
+        | ExecutionKind::ConflictResolution
+        | ExecutionKind::InvestigationImplementation
+        | ExecutionKind::ProductDesign
+        | ExecutionKind::ProjectDesign
+        | ExecutionKind::RevisionImplementation
+        | ExecutionKind::TaskImplementation => false,
+    }
 }
 
 /// Derive the canonical worker-id string for a pane slot id.

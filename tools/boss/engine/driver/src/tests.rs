@@ -56,7 +56,7 @@ fn required_strict_capabilities_refuse_absent_driver() {
     // producing kinds (Phase 2 of the Grok rollout) and share the same
     // required-strict escalation.
     for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
-        let reqs = KindRequirements::for_kind(kind.clone());
+        let reqs = KindRequirements::for_kind(kind.clone(), None);
         let no_caps = CapabilitySet::new([]);
         assert_eq!(
             reqs.resolve_absence_disposition(Capability::StructuredOutput, &no_caps),
@@ -80,7 +80,7 @@ fn required_strict_capabilities_refuse_absent_driver() {
 
 #[test]
 fn non_strict_capability_uses_default_disposition() {
-    let reqs = KindRequirements::for_kind(TaskKind::Design);
+    let reqs = KindRequirements::for_kind(TaskKind::Design, None);
     let no_caps = CapabilitySet::new([]);
 
     // ModelAndEffortMenu is not required-strict for Design; default is Degrade.
@@ -92,7 +92,7 @@ fn non_strict_capability_uses_default_disposition() {
 
 #[test]
 fn provided_capability_resolves_to_none() {
-    let reqs = KindRequirements::for_kind(TaskKind::Design);
+    let reqs = KindRequirements::for_kind(TaskKind::Design, None);
     let all_caps = CapabilitySet::new([Capability::StructuredOutput, Capability::ToolUseInterception]);
 
     assert_eq!(
@@ -128,7 +128,7 @@ fn task_kind_has_no_strict_requirements_by_default() {
         TaskKind::Revision,
         TaskKind::Task,
     ] {
-        let reqs = KindRequirements::for_kind(kind.clone());
+        let reqs = KindRequirements::for_kind(kind.clone(), None);
         assert!(
             !reqs.is_required_strict(Capability::StructuredOutput),
             "{kind:?} should not require-strict StructuredOutput",
@@ -137,6 +137,71 @@ fn task_kind_has_no_strict_requirements_by_default() {
             !reqs.is_required_strict(Capability::ToolUseInterception),
             "{kind:?} should not require-strict ToolUseInterception",
         );
+    }
+}
+
+/// `ExecutionKind::ConflictResolution` and `ExecutionKind::CiRemediation`
+/// require-strict `CommandOutcomeObservation` regardless of the underlying
+/// task kind — the escalation comes from the execution, not the row.
+#[test]
+fn conflict_resolution_and_ci_remediation_require_strict_command_outcome_observation() {
+    for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+        for task_kind in [TaskKind::Chore, TaskKind::Task, TaskKind::Revision] {
+            let reqs = KindRequirements::for_kind(task_kind.clone(), Some(&execution_kind));
+            assert!(
+                reqs.is_required_strict(Capability::CommandOutcomeObservation),
+                "{execution_kind} over {task_kind:?} should require-strict CommandOutcomeObservation",
+            );
+        }
+    }
+}
+
+/// Every other execution kind — and no execution context at all — leaves
+/// `CommandOutcomeObservation` at its ordinary (non-strict) disposition.
+#[test]
+fn ordinary_execution_kinds_do_not_require_strict_command_outcome_observation() {
+    let reqs = KindRequirements::for_kind(TaskKind::Chore, None);
+    assert!(!reqs.is_required_strict(Capability::CommandOutcomeObservation));
+
+    for execution_kind in [
+        ExecutionKind::TaskImplementation,
+        ExecutionKind::ChoreImplementation,
+        ExecutionKind::RevisionImplementation,
+    ] {
+        let reqs = KindRequirements::for_kind(TaskKind::Chore, Some(&execution_kind));
+        assert!(
+            !reqs.is_required_strict(Capability::CommandOutcomeObservation),
+            "{execution_kind} should not require-strict CommandOutcomeObservation",
+        );
+    }
+}
+
+/// Codex and Grok both fail the dispatch gate for conflict resolution / CI
+/// remediation because neither declares `CommandOutcomeObservation`; Claude,
+/// which does declare it, clears the gate. This is the actual mechanism
+/// behind PR #2625's fix — allocation and spawn both go through
+/// `check_dispatch`, so proving it here proves both call sites.
+#[test]
+fn codex_and_grok_refuse_conflict_resolution_and_ci_remediation() {
+    let registry = crate::registry::DriverRegistry::default();
+    for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+        for slug in ["codex", "grok"] {
+            let err = registry
+                .resolver(slug)
+                .unwrap()
+                .check_dispatch(&TaskKind::Chore, Some(&execution_kind))
+                .unwrap_err();
+            assert!(
+                err.refused.contains(&Capability::CommandOutcomeObservation),
+                "{slug} must refuse {execution_kind} for lacking CommandOutcomeObservation: {:?}",
+                err.refused,
+            );
+        }
+        registry
+            .resolver("claude")
+            .unwrap()
+            .check_dispatch(&TaskKind::Chore, Some(&execution_kind))
+            .unwrap_or_else(|e| panic!("claude declares CommandOutcomeObservation and must clear the gate: {e}"));
     }
 }
 
@@ -291,7 +356,7 @@ fn capability_resolver_returns_ok_plan_when_no_refused_caps() {
     let all_caps = CapabilitySet::new(Capability::all());
     let driver = StubDriver::new(stub_descriptor(), all_caps);
     let resolver = CapabilityResolver::new(&driver);
-    let plan = resolver.check_dispatch(&TaskKind::Design).unwrap();
+    let plan = resolver.check_dispatch(&TaskKind::Design, None).unwrap();
     assert!(plan.is_full_fidelity(), "full-capability driver must be full-fidelity");
     assert_eq!(plan.driver_name, "stub");
 }
@@ -306,7 +371,7 @@ fn capability_resolver_refuses_design_task_without_structured_output() {
         let caps = CapabilitySet::new([Capability::Spawn, Capability::PromptComposition]);
         let driver = StubDriver::new(stub_descriptor(), caps);
         let resolver = CapabilityResolver::new(&driver);
-        let err = resolver.check_dispatch(&kind).unwrap_err();
+        let err = resolver.check_dispatch(&kind, None).unwrap_err();
         assert!(
             err.refused.contains(&Capability::StructuredOutput),
             "{kind:?} must refuse StructuredOutput when absent: {:?}",
@@ -326,7 +391,7 @@ fn capability_resolver_refuses_any_kind_without_spawn() {
     let caps = CapabilitySet::new(Capability::all().filter(|c| *c != Capability::Spawn));
     let driver = StubDriver::new(stub_descriptor(), caps);
     let resolver = CapabilityResolver::new(&driver);
-    let err = resolver.check_dispatch(&TaskKind::Chore).unwrap_err();
+    let err = resolver.check_dispatch(&TaskKind::Chore, None).unwrap_err();
     assert!(
         err.refused.contains(&Capability::Spawn),
         "Spawn must be refused when absent: {:?}",
@@ -342,7 +407,7 @@ fn dispatch_plan_degraded_and_synthesized_populated_for_partial_driver() {
     );
     let driver = StubDriver::new(stub_descriptor(), caps);
     let resolver = CapabilityResolver::new(&driver);
-    let plan = resolver.check_dispatch(&TaskKind::Chore).unwrap();
+    let plan = resolver.check_dispatch(&TaskKind::Chore, None).unwrap();
     assert!(!plan.is_full_fidelity());
     assert!(
         plan.degraded.contains(&Capability::ModelAndEffortMenu),

@@ -118,13 +118,25 @@ fn unparseable_or_invalid_persisted_split_falls_back_to_the_default() {
 /// keeps. Asserted against `check_dispatch` itself for every kind, so a
 /// `KindRequirements` or `CapabilitySet` change moves both together or
 /// fails here.
+///
+/// Exercised at `ChoreImplementation` — the execution kind every real
+/// allocation site in this file's other tests actually produces
+/// (`create_ready_chore_execution`) — since it carries no
+/// `ExecutionKind`-level escalation of its own; the escalated kinds
+/// (`ConflictResolution` / `CiRemediation`) are covered separately by
+/// `conflict_resolution_and_ci_remediation_are_never_allocated`.
 #[test]
 fn eligibility_is_exactly_what_the_dispatch_gate_says() {
     let registry = crate::driver::DriverRegistry::default();
+    let execution_kind = ExecutionKind::ChoreImplementation;
     for kind in TaskKind::ALL {
-        let eligible = eligible_drivers_for(kind);
+        let eligible = eligible_drivers_for(kind, &execution_kind);
         for driver in DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER {
-            let gate_ok = registry.resolver(driver).unwrap().check_dispatch(kind).is_ok();
+            let gate_ok = registry
+                .resolver(driver)
+                .unwrap()
+                .check_dispatch(kind, Some(&execution_kind))
+                .is_ok();
             assert_eq!(
                 eligible.contains(&driver),
                 gate_ok,
@@ -165,7 +177,7 @@ fn every_kind_is_allocated_to_a_driver_the_gate_accepts() {
                 registry
                     .resolver(&driver)
                     .expect("allocation must only ever name a registered driver")
-                    .check_dispatch(kind)
+                    .check_dispatch(kind, Some(&ExecutionKind::ChoreImplementation))
                     .unwrap_or_else(|e| {
                         panic!("allocated {driver} for {kind} under {split:?}, but the gate refuses it: {e}")
                     });
@@ -239,6 +251,47 @@ fn pr_review_executions_are_not_allocated() {
     let decision = db.get_execution_driver_decision(&implementation.id).unwrap().unwrap();
     assert_eq!(decision.reason, REASON_ALLOCATION);
     assert_eq!(decision.driver.as_deref(), Some(DRIVER_SLUG_CODEX));
+}
+
+/// Conflict resolution and CI remediation ARE still allocated (unlike a
+/// review, they are not pool-pinned) but the capability gate restricts them
+/// to `claude`: `KindRequirements::for_kind` marks `CommandOutcomeObservation`
+/// required-strict for these two execution kinds, and neither codex nor grok
+/// declares it (mirrors the still-unmet "review and conflict resolution"
+/// Phase 3 in the Codex/Grok driver design docs). Even a split that routes
+/// everything else almost entirely away from claude must still land these on
+/// claude, never codex or grok.
+#[test]
+fn conflict_resolution_and_ci_remediation_stay_on_claude_regardless_of_the_split() {
+    let (_dir, db) = open_db();
+    // grok=50, claude=30, codex=20 — claude is a minority share, so this
+    // proves the restriction is the capability gate, not a split that
+    // happens to favour claude.
+    db.set_driver_traffic_split(DriverTrafficSplit::new(50, 30, 20))
+        .unwrap();
+    let product = create_test_product(&db);
+    for kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+        let chore = create_test_chore(&db, &product.id, format!("{kind} chore"));
+        let execution = db
+            .create_execution(
+                CreateExecutionInput::builder()
+                    .work_item_id(chore.id.clone())
+                    .kind(kind.clone())
+                    .status(ExecutionStatus::Ready)
+                    .build(),
+            )
+            .unwrap();
+        let decision = db.get_execution_driver_decision(&execution.id).unwrap().unwrap();
+        assert_eq!(
+            decision.reason, REASON_ALLOCATION,
+            "{kind} is not pool-pinned, so it must still go through allocation",
+        );
+        assert_eq!(
+            decision.driver.as_deref(),
+            Some(DRIVER_SLUG_CLAUDE),
+            "{kind} must be capability-gated to claude even though claude is the minority share",
+        );
+    }
 }
 
 /// Work that came from an automation runs on the automation pool, which
