@@ -1704,7 +1704,11 @@ const BK_BINARY: &str = "bk";
 /// is inconclusive, the corroborating `trunk-io[bot]` comment.
 ///
 /// - [`TrunkEvictionCause::TestFailure`] → [`crate::ci_watch::on_trunk_queue_eviction_detected`],
-///   unchanged from T605.
+///   which clears the Merging-lane columns itself on a freshly-detected
+///   episode (mirroring [`snap_card_back_to_review`] below, but living
+///   there rather than here because the decision of *whether* this is a
+///   fresh episode — vs. an idempotent repeat, vs. budget-exhausted — is
+///   made inside that call, not before it).
 /// - [`TrunkEvictionCause::HeadConflict`] → the conflict lane (see
 ///   [`hand_eviction_to_conflict_lane`]). No `ci_remediations` row, so no CI
 ///   attempt budget is consumed.

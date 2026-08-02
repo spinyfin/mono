@@ -464,6 +464,76 @@ async fn trunk_eviction_budget_exhaustion_retires_the_intent() {
     assert!(state.is_none(), "the card must leave the Merging lane");
 }
 
+/// The far more common counterpart to `trunk_eviction_budget_exhaustion_retires_the_intent`:
+/// when budget is available and the episode spawns a `fix` revision instead
+/// of exhausting, the Merging-lane columns must ALSO clear so the card
+/// leaves the Merging lane. Before this fix, the clear only existed on the
+/// budget-exhausted exit — the ordinary "eviction spawns a fix revision"
+/// exit left `merge_queue_state` / `merge_queue_detail` stuck at `"queued"`
+/// indefinitely, since a trunk product's regular PR probe deliberately
+/// preserves those columns (`preserve_merge_queue_state`) and nothing else
+/// ever wrote them. Unlike the exhausted case, the Trunk merge intent
+/// itself must stay ACTIVE here: the fix revision is expected to land and
+/// resubmit it, not retire it.
+#[tokio::test]
+async fn trunk_eviction_clears_merge_queue_state_when_spawning_a_fix_revision() {
+    let dir = tempdir().unwrap();
+    let db = WorkDb::open(dir.path().join("boss.db")).unwrap();
+    let pr = "https://github.com/foo/bar/pull/1181";
+    let (product, chore) = make_in_review(&db, "C-trunk-evict-clears-queue", pr);
+    let pub_ = Arc::new(RecordingPublisher::default());
+    let cand = candidate(&product, &chore, pr);
+
+    db.insert_trunk_merge_intent(
+        crate::work::TrunkMergeIntentInsertInput::builder()
+            .work_item_id(chore.clone())
+            .pr_url(pr)
+            .pr_number(1181)
+            .repo("foo/bar")
+            .target_branch("main")
+            .build(),
+    )
+    .unwrap()
+    .unwrap();
+    db.set_task_merge_queue_state(&chore, Some("queued"), Some(r#"{"source":"trunk","state":"testing"}"#))
+        .unwrap();
+
+    let flipped = on_trunk_queue_eviction_detected(
+        &db,
+        pub_.as_ref(),
+        &cand,
+        Some("feature"),
+        "entry-clears-queue",
+        "2026-07-31T22:34:24.000Z",
+        &one_failure(),
+    )
+    .await;
+    assert!(
+        flipped,
+        "eviction detection must flip the chore and spawn a fix revision"
+    );
+
+    let (state, detail) = {
+        let conn = db.connect().unwrap();
+        conn.query_row(
+            "SELECT merge_queue_state, merge_queue_detail FROM tasks WHERE id = ?1",
+            rusqlite::params![&chore],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )
+        .unwrap()
+    };
+    assert!(
+        state.is_none(),
+        "the card must leave the Merging lane on the non-exhausted eviction path too"
+    );
+    assert!(detail.is_none());
+
+    assert!(
+        db.get_active_trunk_merge_intent(&chore).unwrap().is_some(),
+        "unlike budget exhaustion, the intent stays active — the fix revision is expected to resubmit it",
+    );
+}
+
 /// Defence in depth: a **Trunk** queue-side episode carrying no failing
 /// check must not flip the row.
 ///
