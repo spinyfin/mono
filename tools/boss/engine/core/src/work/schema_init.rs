@@ -734,6 +734,14 @@ impl WorkDb {
         // flag gates on must not be trusted the same way a never-absorbed
         // baseline is (mono#2606 revision).
         migrate_work_executions_pr_head_baseline_absorbed(conn)?;
+        // Repair any `projects.status` corrupted by the pre-fix untyped
+        // shared engine-status writer (out-of-enum values like `"todo"`),
+        // then close the gap that let it happen: a `CHECK` constraint on
+        // both `projects.status` and `tasks.status`. The repair MUST run
+        // first — the constraint migration's table rebuild would
+        // otherwise reject any still-corrupt row.
+        migrate_repair_invalid_project_status(conn)?;
+        migrate_projects_tasks_status_check(conn)?;
         conn.execute(
             "INSERT INTO metadata (key, value) VALUES ('schema_version', '31')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",

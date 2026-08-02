@@ -238,7 +238,11 @@ pub(crate) fn maybe_engine_block_dependent(
     if matches!(current.as_str(), "blocked" | "done" | "archived") {
         return Ok(None);
     }
-    write_engine_status(conn, dependent_id, "blocked", now_epoch)?;
+    if dependent_id.starts_with("proj_") {
+        write_engine_project_status(conn, dependent_id, ProjectStatus::Blocked, now_epoch)?;
+    } else if dependent_id.starts_with("task_") {
+        write_engine_task_status(conn, dependent_id, TaskStatus::Blocked, now_epoch)?;
+    }
     // Stamp blocked_reason so the user-override path in
     // request_execution_in_tx_with_live_check can identify and clear
     // stale dependency blocks consistently (the backfill migration
@@ -402,8 +406,8 @@ pub(crate) fn maybe_engine_unblock_dependent(
     // `'human'` / `'boss'`: a Boothby block is a per-row judgement, not
     // cascade bookkeeping, so this sweep must leave it alone exactly as it
     // leaves a human's alone. (In practice the branch is unreachable for
-    // Boothby anyway — `write_engine_status` is the only auto-blocker and
-    // it hardcodes `'engine'`.)
+    // Boothby anyway — `write_engine_project_status` / `write_engine_task_status`
+    // are the only auto-blockers and both hardcode `'engine'`.)
     //
     // An actor outside the known vocabulary fails to parse and is treated
     // as not-engine-owned, preserving the exact behaviour of the `==
@@ -429,7 +433,11 @@ pub(crate) fn maybe_engine_unblock_dependent(
     if !gating.is_empty() {
         return Ok(false);
     }
-    write_engine_status(conn, dependent_id, "todo", now_epoch)?;
+    if dependent_id.starts_with("proj_") {
+        write_engine_project_status(conn, dependent_id, ProjectStatus::Planned, now_epoch)?;
+    } else if dependent_id.starts_with("task_") {
+        write_engine_task_status(conn, dependent_id, TaskStatus::Todo, now_epoch)?;
+    }
     // Clear blocked_reason so it doesn't linger on a todo row.
     if dependent_id.starts_with("task_") {
         conn.execute(
@@ -555,30 +563,50 @@ pub(crate) fn record_merge_order_on_merge(conn: &Connection, merged_id: &str) ->
     Ok(later_count)
 }
 
-/// Internal write that stamps `last_status_actor = 'engine'` on the
-/// row. Used by the auto-block / unblock paths. Returns the new
-/// status.
-pub(crate) fn write_engine_status(
+/// Internal write that stamps `last_status_actor = 'engine'` on a
+/// project row. Used by the auto-block / unblock paths.
+///
+/// Takes a typed [`ProjectStatus`] rather than a bare `&str` — the
+/// engine previously routed both task and project auto-block/unblock
+/// writes through one shared `&str`-typed function keyed off id
+/// prefix, and nothing stopped a `TaskStatus` literal (`"todo"`) from
+/// being handed to the `proj_` branch. That produced a real incident:
+/// `maybe_engine_unblock_dependent` wrote `"todo"` into
+/// `projects.status`, which isn't a valid [`ProjectStatus`], and every
+/// read of that product's projects thereafter hard-failed. Splitting
+/// the writer by table means the *type* passed in is constrained to
+/// the target table's vocabulary at the call site, not just validated
+/// after the fact.
+pub(crate) fn write_engine_project_status(
     conn: &Connection,
-    work_item_id: &str,
-    new_status: &str,
+    project_id: &str,
+    new_status: ProjectStatus,
     now_epoch: &str,
 ) -> Result<()> {
-    if work_item_id.starts_with("proj_") {
-        conn.execute(
-            "UPDATE projects
-             SET status = ?2, last_status_actor = 'engine', updated_at = ?3
-             WHERE id = ?1",
-            params![work_item_id, new_status, now_epoch],
-        )?;
-    } else if work_item_id.starts_with("task_") {
-        conn.execute(
-            "UPDATE tasks
-             SET status = ?2, last_status_actor = 'engine', updated_at = ?3
-             WHERE id = ?1 AND deleted_at IS NULL",
-            params![work_item_id, new_status, now_epoch],
-        )?;
-    }
+    conn.execute(
+        "UPDATE projects
+         SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+         WHERE id = ?1",
+        params![project_id, new_status.as_str(), now_epoch],
+    )?;
+    Ok(())
+}
+
+/// Task-table counterpart of [`write_engine_project_status`]. See that
+/// function's doc comment for why this is split by table and typed by
+/// [`TaskStatus`] rather than a bare `&str`.
+pub(crate) fn write_engine_task_status(
+    conn: &Connection,
+    task_id: &str,
+    new_status: TaskStatus,
+    now_epoch: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE tasks
+         SET status = ?2, last_status_actor = 'engine', updated_at = ?3
+         WHERE id = ?1 AND deleted_at IS NULL",
+        params![task_id, new_status.as_str(), now_epoch],
+    )?;
     Ok(())
 }
 

@@ -759,6 +759,83 @@ fn prereq_regression_does_not_re_block_dependents() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Regression test for the `write_engine_status` type-hole incident: every
+/// other test in this cascade suite exercises `task_`/chore ids exclusively,
+/// which is exactly why a `TaskStatus` literal (`"todo"`) reaching
+/// `projects.status` via the auto-unblock cascade survived review. A
+/// `proj_`-to-`proj_` `blocks` edge must auto-unblock its dependent to
+/// `ProjectStatus::Planned` — never the task vocabulary's `"todo"` — and the
+/// resulting row must still decode cleanly through `query_project` (the
+/// strict `map_project` reader that a corrupt row makes fail loudly).
+#[test]
+fn project_dependent_auto_unblocks_to_planned_not_todo() {
+    let path = temp_db_path("deps-cascade-project-unblock");
+    let db = WorkDb::open(path.clone()).unwrap();
+    let product = create_test_product_with_repo(&db, "Boss", Some("git@example.com:boss.git"));
+    let dependent = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Dependent project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+        })
+        .unwrap();
+    let prereq = db
+        .create_project(CreateProjectInput {
+            product_id: product.id.clone(),
+            name: "Prereq project".to_owned(),
+            description: None,
+            goal: None,
+            autostart: true,
+            no_design_task: true,
+        })
+        .unwrap();
+    db.add_dependency(AddDependencyInput {
+        dependent: dependent.id.clone(),
+        prerequisite: prereq.id.clone(),
+        relation: None,
+    })
+    .unwrap();
+
+    // Sanity: the new gating edge auto-blocked the dependent project.
+    let blocked = db.get_work_item(&dependent.id).unwrap();
+    let WorkItem::Project(p) = blocked else { panic!() };
+    assert_eq!(p.status, ProjectStatus::Blocked);
+    assert_eq!(p.last_status_actor, "engine");
+
+    // Prereq project reaches `done` (a project-valid status, unlike
+    // `archived`'s task counterpart) — the cascade fires.
+    db.update_work_item(
+        &prereq.id,
+        WorkItemPatch {
+            status: Some("done".to_owned()),
+            ..WorkItemPatch::default()
+        },
+    )
+    .unwrap();
+
+    let unblocked = db.get_work_item(&dependent.id).unwrap();
+    let WorkItem::Project(p) = unblocked else { panic!() };
+    assert_eq!(
+        p.status,
+        ProjectStatus::Planned,
+        "a project dependent must auto-unblock to `planned` — `todo` is not a valid ProjectStatus",
+    );
+    assert_eq!(p.last_status_actor, "engine");
+
+    // The row must still decode cleanly through the strict reader —
+    // this is exactly the read that hard-failed for the whole product's
+    // board in the real incident.
+    let conn = db.connect().unwrap();
+    let reread = query_project(&conn, &dependent.id)
+        .unwrap()
+        .expect("project must still exist");
+    assert_eq!(reread.status, ProjectStatus::Planned);
+    let _ = std::fs::remove_file(path);
+}
+
 /// Hardening case (case d in the auto-unblock spec): a cyclic
 /// edge graph (only constructible by bypassing the engine's
 /// `would_create_cycle` check, e.g. raw SQL) must not cause the
