@@ -778,10 +778,11 @@ fn disabled_path_output_is_byte_identical_snapshot() {
 }
 
 #[test]
-fn footer_only_emits_summary_line_for_has_findings() {
-    // On the interactive path the finding bodies stream live, so the trailing
-    // footer is just the summary line — identical to the last line of the
-    // non-interactive output.
+fn footer_recaps_errors_then_summary_for_has_findings() {
+    // On the interactive path the finding bodies stream live into the log area,
+    // which on a long run can scroll far above where a reader (or `tail`) looks.
+    // The footer re-renders error-severity findings as a recap ahead of the
+    // summary line, so the failure is still visible at the end of the log.
     let footer = render_human_footer(
         &snapshot_results(),
         OutputStyle {
@@ -789,7 +790,34 @@ fn footer_only_emits_summary_line_for_has_findings() {
         },
         Duration::from_secs(1),
     );
-    assert_eq!(footer, "summary: 1 error(s), 0 warning(s), 0 info finding(s)\n");
+    assert_eq!(
+        footer,
+        "error[typo]: Found typo.\n  --> a.rs:3:5\n   = to resolve: Fix it.\n\nsummary: 1 error(s), 0 warning(s), 0 info finding(s)\n"
+    );
+}
+
+#[test]
+fn footer_omits_recap_when_no_errors() {
+    // Warning/info-only runs don't need the recap — those findings already
+    // streamed live and there's no failure a reader would be hunting for at
+    // the tail of the log.
+    let warning_only = vec![CheckResult {
+        check_id: "example".to_owned(),
+        findings: vec![Finding {
+            fixable: false,
+            severity: Severity::Warning,
+            message: "Heads up.".to_owned(),
+            location: None,
+            surface: None,
+            remediations: vec![],
+            suggested_fix: None,
+        }],
+    }];
+    let style = OutputStyle {
+        level: ColorLevel::None,
+    };
+    let footer = render_human_footer(&warning_only, style, Duration::from_secs(1));
+    assert_eq!(footer, "summary: 0 error(s), 1 warning(s), 0 info finding(s)\n");
 }
 
 #[test]
