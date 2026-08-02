@@ -1,13 +1,51 @@
 //! Three-way driver traffic allocation (experiment, operator-controlled).
 //!
 //! One persisted [`DriverTrafficSplit`] — three shares summing to exactly
-//! 100 — decides how ordinary, `standard`-reasoning implementation work
-//! (`task_implementation`, `chore_implementation`,
-//! `revision_implementation`) is divided between the `grok`, `claude`, and
-//! `codex` drivers. This generalises the earlier single Codex percentage;
-//! see [`boss_protocol::DriverTrafficSplit`] for why the split is modelled
-//! as three explicit integers with a hard sum constraint rather than an
-//! implied remainder or normalised weights.
+//! 100 — decides how work that dispatches on its own row's driver is divided
+//! between the `grok`, `claude`, and `codex` drivers. This generalises the
+//! earlier single Codex percentage; see [`boss_protocol::DriverTrafficSplit`]
+//! for why the split is modelled as three explicit integers with a hard sum
+//! constraint rather than an implied remainder or normalised weights.
+//!
+//! **Which work that is, is not decided here.** Allocation carries no list of
+//! eligible kinds. For a given row it asks
+//! [`crate::driver::DriverRegistry::eligible_drivers_for_kind`] — i.e. the
+//! dispatch capability gate, `CapabilityResolver::check_dispatch`, resolving
+//! the row's `TaskKind` **and** the execution's own `ExecutionKind` (see
+//! [`eligible_drivers_for`]) against each driver's declared `CapabilitySet` —
+//! which of the three drivers may run a work item of that kind, and
+//! renormalises the configured split over exactly that subset
+//! ([`DriverTrafficSplit::driver_for_bucket_among`]). One source of truth: a
+//! driver declared eligible for a kind can receive it, one that is not
+//! cannot, and widening or narrowing eligibility is a `KindRequirements` /
+//! `CapabilitySet` change that this path picks up with no edit of its own.
+//! The earlier narrow slice (implementation kinds at `standard` reasoning
+//! only) was an artifact of the original Codex experiment, not a statement
+//! about capability, and is gone: `reasoning` still selects which *model* a
+//! driver runs (`ModelMenu::model_for_reasoning`) but no longer decides
+//! *which driver*.
+//!
+//! The `ExecutionKind` dimension is why `conflict_resolution` and
+//! `ci_remediation` do not silently become codex/grok-eligible just because
+//! their underlying `tasks.kind` (an ordinary chore/task/revision) clears
+//! every driver's gate on its own: `KindRequirements::for_kind` marks
+//! `Capability::CommandOutcomeObservation` required-strict for those two
+//! execution kinds — neither codex nor grok declares it — so the gate itself
+//! refuses them until that capability is declared elsewhere (see the
+//! Codex/Grok driver design docs' "review and conflict resolution" phase).
+//! This is deliberately expressed at the gate, not as a second hardcoded
+//! kind list here.
+//!
+//! Two things allocation still declines, neither of them a claim about
+//! capability:
+//!
+//! - **A row with an explicit pin** — see below.
+//! - **An execution whose driver is pinned by the pool it will run on**
+//!   (`pr_review`, `automation_triage`, and any execution whose work item
+//!   came from an automation): those dispatch on
+//!   [`crate::coordinator::pool_dispatch_policy_for_worker_id`]'s fixed
+//!   driver, so an allocation would record a driver the worker never used.
+//!   See [`decide_execution_driver`] for the full reasoning.
 //!
 //! Assignment is a deterministic hash of the work item's own id placed on
 //! the split's `[0, 100)` bucket line — not a coin flip per dispatch
@@ -58,12 +96,16 @@ pub(crate) const METADATA_KEY_CODEX_DISPATCH_PERCENTAGE: &str = "codex_dispatch_
 /// `execution_driver_decisions.reason`: the row (or its product) pinned a
 /// driver; the split was not consulted.
 pub(crate) const REASON_EXPLICIT: &str = "explicit";
-/// `execution_driver_decisions.reason`: an eligible row placed on the
-/// split's bucket line. Recorded whichever driver it landed on, so
-/// "allocated to claude" stays distinguishable from "never eligible".
+/// `execution_driver_decisions.reason`: the row was placed on the split's
+/// bucket line, renormalised over the drivers eligible for its kind.
+/// Recorded whichever driver it landed on, so "allocated to claude" stays
+/// distinguishable from "allocation never ran".
 pub(crate) const REASON_ALLOCATION: &str = "allocation";
-/// `execution_driver_decisions.reason`: ineligible; no override, the row
-/// resolves through the ordinary precedence chain.
+/// `execution_driver_decisions.reason`: allocation did not decide this
+/// execution — it is not bound to a `tasks` row, or its driver comes from
+/// the pool it dispatches on rather than from the row (see
+/// [`decide_execution_driver`]). No override; the row resolves through the
+/// ordinary precedence chain.
 pub(crate) const REASON_DEFAULT: &str = "default";
 
 /// The reason value written by the superseded single-Codex-percentage
@@ -110,15 +152,32 @@ impl DriverDecision {
     }
 }
 
-/// Whether `kind` falls in the narrow eligible slice: ordinary coding work
-/// only. A whitelist, not a blocklist, so a future `ExecutionKind` variant
-/// defaults to ineligible until someone deliberately opts it in — keeping
-/// the experiment's slice from silently widening (design doc: "keep the
-/// slice narrow"). Design rows, investigation rows, and PR reviews stay out.
-fn is_allocation_eligible(kind: ExecutionKind) -> bool {
-    matches!(
+/// The drivers that may take a work item of `kind`, resolved from the
+/// dispatch capability gate and nothing else.
+///
+/// This is the whole of allocation's eligibility rule. It builds the same
+/// [`crate::driver::DriverRegistry`] `runner::worker_spawn` builds and asks
+/// the same `check_dispatch` question the gate asks immediately before a
+/// pane spawns, so allocation cannot choose a driver that the gate would
+/// then refuse — the two agree by construction rather than by keeping two
+/// lists in step.
+///
+/// The candidate set is [`DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER`]:
+/// allocation can only choose between drivers the split actually holds a
+/// share for, and a slug the registry does not recognise is not eligible
+/// (fail closed).
+///
+/// `execution_kind` is threaded through to the gate alongside `kind` because
+/// some escalations live on the execution rather than the underlying task
+/// row — see [`crate::driver::KindRequirements`]'s doc for
+/// `ConflictResolution` / `CiRemediation`, which is exactly why allocation
+/// must decline those two kinds rather than treating every `tasks`-bound
+/// execution kind as equally eligible.
+fn eligible_drivers_for(kind: &TaskKind, execution_kind: &ExecutionKind) -> Vec<&'static str> {
+    crate::driver::DriverRegistry::default().eligible_drivers_for_kind(
         kind,
-        ExecutionKind::TaskImplementation | ExecutionKind::ChoreImplementation | ExecutionKind::RevisionImplementation
+        Some(execution_kind),
+        &DriverTrafficSplit::DRIVERS_IN_BUCKET_ORDER,
     )
 }
 
@@ -257,6 +316,18 @@ pub(crate) fn get_execution_driver_decision_conn(
     .map_err(Into::into)
 }
 
+/// The work-item columns [`decide_execution_driver`] reads: the two pin
+/// levels, the kind whose capability requirements decide eligibility, and
+/// the automation provenance that says the driver comes from a pool instead.
+/// A named row rather than a four-wide tuple so each column is read back by
+/// name at the point it is used.
+struct AllocationRow {
+    explicit_driver: Option<String>,
+    task_kind: String,
+    source_automation_id: Option<String>,
+    product_default_driver: Option<String>,
+}
+
 /// Decide which driver governs a newly-created execution row and why.
 /// Called once, from `insert_execution`, using the same open `Connection`
 /// (never `WorkDb::connect()` — see `load_driver_traffic_split_conn`).
@@ -268,51 +339,127 @@ pub(crate) fn get_execution_driver_decision_conn(
 ///    that expressed no preference. Respecting the product pin is also what
 ///    makes the shipped default split byte-for-byte behaviour-preserving —
 ///    it is not a new per-product override, it is the existing one.
-/// 3. Otherwise, if `kind` is in the eligible slice
-///    ([`is_allocation_eligible`]) and the work item's `reasoning` is
-///    literally `standard` (NULL/legacy rows are NOT treated as eligible —
-///    keeps the slice narrow), place the work item's own id on the current
-///    split's bucket line.
-/// 4. Otherwise, no override — the row falls through to the normal
-///    row → product → engine default resolution.
+/// 3. Otherwise, if the execution's driver comes from a worker pool rather
+///    than from its row, allocation declines (no override). Two shapes:
+///    [`crate::coordinator::kind_always_dispatches_on_pool_driver`] covers
+///    `pr_review` and `automation_triage`; `tasks.source_automation_id`
+///    covers ordinary implementation work that came from an automation and
+///    therefore runs on the automation pool
+///    (`ClaudeCoordinator::execution_targets_automation_pool`). Both pools
+///    pin `pool_dispatch_policy_for_worker_id`'s driver, which overrides the
+///    row's, so allocating them would write a decision record naming a
+///    driver the worker never ran on — and the events-socket resolver
+///    ([`crate::work::driver_lookup`]) would then decode that worker's hook
+///    payloads with the wrong driver's normaliser.
+///
+///    **This is why PR review does not participate in the split.** It is a
+///    decision, not an omission: reviews dispatch on the review pool's fixed
+///    driver at a fixed strong model tier precisely so that who authored a
+///    change cannot determine who reviews it (see
+///    `pool_dispatch_policy_for_worker_id`'s doc). Putting reviews in the
+///    split would either be inert (spawn ignores the allocation) or, if the
+///    pool pin were removed to make it bite, would undo that independence
+///    and the reviewer-model choice with it. Reviews participating is a
+///    change to reviewer dispatch policy — one function, deliberately — not
+///    a change to allocation.
+/// 4. Otherwise, place the work item's own id on the split's bucket line,
+///    renormalised over exactly the drivers eligible for the row's
+///    [`TaskKind`] ([`eligible_drivers_for`]).
+/// 5. Not a `tasks` row at all — no override.
+///
+/// Errors (failing the execution insert) when the row's kind is
+/// unrecognised, or when the eligible drivers hold no share between them.
+/// Both are loud on purpose: the alternative is dispatching to the engine
+/// default driver, which for an eligibility failure means handing the row to
+/// a driver whose gate refuses it, and for a zero-share failure means
+/// overruling an operator who set that driver to 0. Zero means zero.
 pub(crate) fn decide_execution_driver(
     conn: &Connection,
     work_item_id: &str,
     kind: ExecutionKind,
 ) -> Result<DriverDecision> {
-    let row: Option<(Option<String>, Option<String>, Option<String>)> = conn
+    let row = conn
         .query_row(
-            "SELECT t.driver, t.reasoning, p.default_driver
+            "SELECT t.driver, t.kind, t.source_automation_id, p.default_driver
                FROM tasks t
                LEFT JOIN products p ON p.id = t.product_id
               WHERE t.id = ?1",
             params![work_item_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| {
+                Ok(AllocationRow {
+                    explicit_driver: row.get(0)?,
+                    task_kind: row.get(1)?,
+                    source_automation_id: row.get(2)?,
+                    product_default_driver: row.get(3)?,
+                })
+            },
         )
         .optional()?;
-    let Some((explicit_driver, reasoning, product_default_driver)) = row else {
+    let Some(row) = row else {
         // Not a `tasks` row at all (e.g. an `answer_agent` execution bound
         // to a comment id) — nothing to route.
         return Ok(DriverDecision::default_no_override());
     };
-    let pinned = explicit_driver
+    let pinned = row
+        .explicit_driver
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| product_default_driver.filter(|s| !s.trim().is_empty()));
+        .or_else(|| row.product_default_driver.filter(|s| !s.trim().is_empty()));
     if let Some(driver) = pinned {
         return Ok(DriverDecision::explicit(driver));
     }
-    if !is_allocation_eligible(kind) || reasoning.as_deref() != Some("standard") {
+    let automation_sourced = row.source_automation_id.is_some_and(|id| !id.trim().is_empty());
+    if crate::coordinator::kind_always_dispatches_on_pool_driver(&kind) || automation_sourced {
         return Ok(DriverDecision::default_no_override());
     }
+    let task_kind_raw = row.task_kind;
+    let task_kind: TaskKind = task_kind_raw.parse().map_err(|err| {
+        anyhow::anyhow!(
+            "driver_traffic_split: work item {work_item_id} has unrecognised kind {task_kind_raw:?} ({err}); \
+             refusing to allocate a driver for a kind whose capability requirements this engine cannot resolve",
+        )
+    })?;
+    let eligible = eligible_drivers_for(&task_kind, &kind);
     let split = load_driver_traffic_split_conn(conn)?;
-    // `hash_bucket` is in `[0, 100)` and `driver_for_bucket` partitions that
-    // space into three half-open intervals sized exactly by the shares — so
-    // a driver at 0 owns an empty interval and is literally unreachable, no
-    // rounding and no off-by-one leakage.
-    Ok(DriverDecision::allocated(
-        split.driver_for_bucket(hash_bucket(work_item_id)),
-        split,
-    ))
+    let driver = allocate_among(split, work_item_id, &task_kind, &eligible)?;
+    Ok(DriverDecision::allocated(driver, split))
+}
+
+/// Place `work_item_id` on `split`'s bucket line restricted to `eligible`,
+/// or fail loudly.
+///
+/// `hash_bucket` is in `[0, 100)`, and
+/// [`DriverTrafficSplit::driver_for_bucket_among`] partitions that space
+/// into half-open intervals sized by the shares the eligible drivers hold
+/// *relative to each other* — so an eligible driver at 0 owns an empty
+/// interval and is literally unreachable, an ineligible one is not on the
+/// line at all, and there is no rounding gap or off-by-one leakage between
+/// them.
+///
+/// Split out from [`decide_execution_driver`] so the failure paths (nothing
+/// eligible; everything eligible at 0) are exercisable with a restricted
+/// eligible set, which no real work item can currently produce — all three
+/// built-in drivers clear every kind's gate today.
+fn allocate_among(
+    split: DriverTrafficSplit,
+    work_item_id: &str,
+    kind: &TaskKind,
+    eligible: &[&'static str],
+) -> Result<&'static str> {
+    split
+        .driver_for_bucket_among(hash_bucket(work_item_id), eligible)
+        .map_err(|err| {
+            tracing::error!(
+                work_item_id,
+                %kind,
+                ?eligible,
+                ?split,
+                %err,
+                "driver_traffic_split: cannot allocate a driver for this work item",
+            );
+            anyhow::anyhow!(
+                "driver_traffic_split: cannot allocate a driver for work item {work_item_id} (kind {kind}): {err}"
+            )
+        })
 }
 
 /// Persist `decision` for `execution_id`. Called once, right after the

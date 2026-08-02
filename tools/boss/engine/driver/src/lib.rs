@@ -15,7 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use boss_engine_structured_output::StructuredOutputKind;
 use boss_engine_structured_output::fallback::FallbackCandidate;
-use boss_protocol::{EffortLevel, NormalizeError, PaneMonitorSpec, ReasoningMode, StopReason, TaskKind, WorkerEvent};
+use boss_protocol::{
+    EffortLevel, ExecutionKind, NormalizeError, PaneMonitorSpec, ReasoningMode, StopReason, TaskKind, WorkerEvent,
+};
 
 /// Worker posture for the [`Capability::PermissionPolicy`] capability's
 /// deny-rule selection (reviewer read-only, triage no-work, answer-agent
@@ -501,9 +503,11 @@ pub struct DriverDescriptor {
     pub model_menu: ModelMenu,
 }
 
-/// Per-[`TaskKind`] capability escalations. A kind can mark specific
-/// capabilities as *required-strict*, forcing [`AbsenceDisposition::Refuse`]
-/// on absence even when the capability's default is Degrade or Synthesize.
+/// Per-[`TaskKind`] (and, where the [`ExecutionKind`] carries information the
+/// `TaskKind` alone does not, per-[`ExecutionKind`]) capability escalations.
+/// A kind can mark specific capabilities as *required-strict*, forcing
+/// [`AbsenceDisposition::Refuse`] on absence even when the capability's
+/// default is Degrade or Synthesize.
 ///
 /// The document-producing / design-family kinds — `Design`, `Investigation`,
 /// `DesignPostmortem` (the same grouping `ReasoningMode::default_for` calls
@@ -514,15 +518,30 @@ pub struct DriverDescriptor {
 /// kinds without a bespoke per-kind block (agent-driver design doc,
 /// Codex-eligibility Phase 2: "enable the document-producing kinds via
 /// `KindRequirements` once the structured-output contract is proven").
+///
+/// `ExecutionKind::ConflictResolution` and `ExecutionKind::CiRemediation`
+/// mark `CommandOutcomeObservation` required-strict: both need to know
+/// whether a shell command (a rebase, a merge, a build/test run) actually
+/// succeeded, not merely that one started and finished — exactly the
+/// "merge-conflict telemetry path" gap the driver design docs (Codex/Grok
+/// "review and conflict resolution" phase) name as the reason those two
+/// executions are not yet Codex/Grok-eligible. Their underlying `tasks.kind`
+/// is whatever the fixed-up task's own kind is (`Chore`, `Task`, `Revision`,
+/// ...), so the `TaskKind` dimension alone cannot express this — it has to
+/// come from the execution.
 pub struct KindRequirements {
     required_strict: HashSet<Capability>,
 }
 
 impl KindRequirements {
-    /// Required-strict capability set for a given task kind.
-    /// Empty means no escalations beyond per-capability defaults.
-    pub fn for_kind(kind: TaskKind) -> Self {
-        let required_strict = match kind {
+    /// Required-strict capability set for a given task kind, additionally
+    /// escalated by `execution_kind` when the execution itself (not the
+    /// underlying task row) carries a capability requirement. `None` when
+    /// the caller has no execution context (e.g. a `TaskKind`-only check);
+    /// every real dispatch decision has a concrete `ExecutionKind` and should
+    /// pass `Some`.
+    pub fn for_kind(kind: TaskKind, execution_kind: Option<&ExecutionKind>) -> Self {
+        let mut required_strict: HashSet<Capability> = match kind {
             TaskKind::Design | TaskKind::Investigation | TaskKind::DesignPostmortem => {
                 [Capability::StructuredOutput, Capability::ToolUseInterception]
                     .into_iter()
@@ -530,6 +549,12 @@ impl KindRequirements {
             }
             _ => HashSet::new(),
         };
+        if matches!(
+            execution_kind,
+            Some(ExecutionKind::ConflictResolution) | Some(ExecutionKind::CiRemediation)
+        ) {
+            required_strict.insert(Capability::CommandOutcomeObservation);
+        }
         Self { required_strict }
     }
 
@@ -581,20 +606,28 @@ impl<'a> CapabilityResolver<'a> {
         Self { driver }
     }
 
-    /// Check whether this driver can dispatch a work item of `kind`.
+    /// Check whether this driver can dispatch a work item of `kind`, with
+    /// `execution_kind` supplying the execution-level context
+    /// [`KindRequirements::for_kind`] needs for escalations `TaskKind` alone
+    /// cannot express (e.g. conflict resolution / CI remediation). Pass
+    /// `None` only when no execution context exists yet.
     ///
     /// Iterates every [`Capability`], resolves each one's effective
-    /// disposition under `(kind, driver)` using [`KindRequirements`] and
-    /// the driver's [`CapabilitySet`], and:
+    /// disposition under `(kind, execution_kind, driver)` using
+    /// [`KindRequirements`] and the driver's [`CapabilitySet`], and:
     ///
     /// - Returns [`Ok(DispatchPlan)`] if no capability has `Refuse`
     ///   disposition. The plan lists what is provided, synthesized, and
     ///   degraded for observability.
     /// - Returns [`Err(CapabilityGateError)`] listing every refused
     ///   capability with an actionable message if the driver is ineligible.
-    pub fn check_dispatch(&self, kind: &TaskKind) -> Result<DispatchPlan, CapabilityGateError> {
+    pub fn check_dispatch(
+        &self,
+        kind: &TaskKind,
+        execution_kind: Option<&ExecutionKind>,
+    ) -> Result<DispatchPlan, CapabilityGateError> {
         let caps = self.driver.capabilities();
-        let kind_reqs = KindRequirements::for_kind(kind.clone());
+        let kind_reqs = KindRequirements::for_kind(kind.clone(), execution_kind);
         let descriptor = self.driver.descriptor();
 
         let mut provided = Vec::new();

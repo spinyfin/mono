@@ -268,6 +268,43 @@ fn pool_dispatch_policy_for_worker_id_pins_review_and_automation_to_claude_opus(
     }
 }
 
+/// The kind-side companion of the policy above must agree with it: a kind
+/// this reports as pool-pinned really does land on a pool whose worker ids
+/// carry a dispatch policy, and an ordinary implementation kind does not.
+/// Traffic allocation declines the former on the strength of this claim
+/// (`work::driver_allocation::decide_execution_driver`), so the two must not
+/// drift apart.
+#[test]
+fn kind_always_dispatches_on_pool_driver_matches_the_pinned_pools() {
+    for (kind, worker_id) in [
+        (boss_protocol::ExecutionKind::PrReview, "review-1"),
+        (boss_protocol::ExecutionKind::AutomationTriage, "auto-worker-1"),
+    ] {
+        assert!(
+            kind_always_dispatches_on_pool_driver(&kind),
+            "{kind} runs on {worker_id}, whose driver is pinned"
+        );
+        assert!(
+            pool_dispatch_policy_for_worker_id(worker_id).is_some(),
+            "{worker_id} must carry a pinned dispatch policy"
+        );
+    }
+    for kind in [
+        boss_protocol::ExecutionKind::TaskImplementation,
+        boss_protocol::ExecutionKind::ChoreImplementation,
+        boss_protocol::ExecutionKind::RevisionImplementation,
+        boss_protocol::ExecutionKind::InvestigationImplementation,
+        boss_protocol::ExecutionKind::CiRemediation,
+        boss_protocol::ExecutionKind::ConflictResolution,
+    ] {
+        assert!(
+            !kind_always_dispatches_on_pool_driver(&kind),
+            "{kind} dispatches on the main pool, which has no pinned driver"
+        );
+    }
+    assert_eq!(pool_dispatch_policy_for_worker_id("worker-1"), None);
+}
+
 #[tokio::test]
 async fn worker_pool_claims_lowest_free_slot_deterministically() {
     // Claim-release-claim must always return to the lowest free slot —

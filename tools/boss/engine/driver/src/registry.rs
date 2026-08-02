@@ -161,6 +161,41 @@ impl DriverRegistry {
             .ok_or_else(|| UnknownDriverSlug(slug.to_owned()))
     }
 
+    /// The subset of `candidates` that can actually run a work item of
+    /// `kind` (and, when known, `execution_kind`), in the order `candidates`
+    /// gave them.
+    ///
+    /// Eligibility is not a list this crate maintains — it is
+    /// [`CapabilityResolver::check_dispatch`], the same gate
+    /// `runner::worker_spawn` runs immediately before a pane spawns, which
+    /// resolves the kind's [`crate::KindRequirements`] against each driver's
+    /// declared [`crate::CapabilitySet`]. Asking it here is what lets a
+    /// scheduling decision made well before dispatch (traffic allocation)
+    /// agree with the gate by construction instead of by a parallel copy of
+    /// the rules that can drift from it. `execution_kind` is threaded through
+    /// unchanged so an escalation `TaskKind` alone cannot express (e.g.
+    /// conflict resolution / CI remediation needing
+    /// `Capability::CommandOutcomeObservation`) is honoured here exactly as
+    /// it is at spawn.
+    ///
+    /// A slug this registry does not recognise is **not** eligible: an
+    /// unknown driver fails closed, exactly as [`Self::require`] does.
+    pub fn eligible_drivers_for_kind(
+        &self,
+        kind: &boss_protocol::TaskKind,
+        execution_kind: Option<&boss_protocol::ExecutionKind>,
+        candidates: &[&'static str],
+    ) -> Vec<&'static str> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|slug| {
+                self.resolver(slug)
+                    .is_some_and(|resolver| resolver.check_dispatch(kind, execution_kind).is_ok())
+            })
+            .collect()
+    }
+
     /// Build a [`CapabilityResolver`] for the named driver.
     ///
     /// Returns `None` when `slug` is not registered.  An unrecognised slug
@@ -216,7 +251,7 @@ mod tests {
         // Chore is phase-1 eligible; gate must succeed (no Refuse) against
         // Codex's declared set.
         let plan = resolver
-            .check_dispatch(&TaskKind::Chore)
+            .check_dispatch(&TaskKind::Chore, None)
             .expect("Codex CapabilitySet must clear the chore dispatch gate");
         assert_eq!(plan.driver_name, "codex");
         assert!(
@@ -239,7 +274,7 @@ mod tests {
         // Codex provides both, so every document-producing kind clears the gate.
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             resolver
-                .check_dispatch(&kind)
+                .check_dispatch(&kind, None)
                 .unwrap_or_else(|e| panic!("Codex provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
         }
     }
@@ -256,7 +291,7 @@ mod tests {
         // Chore is phase-1 eligible; gate must succeed (no Refuse) against
         // Grok's declared set.
         let plan = resolver
-            .check_dispatch(&TaskKind::Chore)
+            .check_dispatch(&TaskKind::Chore, None)
             .expect("Grok CapabilitySet must clear the chore dispatch gate");
         assert_eq!(plan.driver_name, "grok");
         assert!(
@@ -279,7 +314,7 @@ mod tests {
         // Grok provides both, so every document-producing kind clears the gate.
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             resolver
-                .check_dispatch(&kind)
+                .check_dispatch(&kind, None)
                 .unwrap_or_else(|e| panic!("Grok provides ToolUseInterception + StructuredOutput for {kind:?}: {e}"));
         }
     }
@@ -302,7 +337,7 @@ mod tests {
         let resolver = reg.resolver("grok").expect("grok is registered");
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             let plan = resolver
-                .check_dispatch(&kind)
+                .check_dispatch(&kind, None)
                 .unwrap_or_else(|e| panic!("Grok must clear the {kind:?} dispatch gate: {e}"));
             assert!(
                 plan.provided.contains(&Capability::StructuredOutput),
@@ -341,7 +376,7 @@ mod tests {
         let resolver = reg.resolver("incomplete").expect("incomplete is registered");
         for kind in [TaskKind::Design, TaskKind::Investigation, TaskKind::DesignPostmortem] {
             let err = resolver
-                .check_dispatch(&kind)
+                .check_dispatch(&kind, None)
                 .expect_err("a driver missing StructuredOutput/ToolUseInterception must be refused");
             assert!(
                 err.refused.contains(&Capability::StructuredOutput),
@@ -361,7 +396,7 @@ mod tests {
         // which Chore does not require-strict — is what actually shows the
         // escalation is kind-scoped, not just "this stub fails everything".
         let chore_err = resolver
-            .check_dispatch(&TaskKind::Chore)
+            .check_dispatch(&TaskKind::Chore, None)
             .expect_err("the incomplete stub is missing WorkspaceProvisioning/PermissionPolicy too");
         assert!(
             !chore_err.refused.contains(&Capability::StructuredOutput),
@@ -372,6 +407,125 @@ mod tests {
             !chore_err.refused.contains(&Capability::ToolUseInterception),
             "Chore must not refuse ToolUseInterception (not required-strict for Chore): {:?}",
             chore_err.refused,
+        );
+    }
+
+    /// Eligibility must agree with the dispatch gate for every registered
+    /// driver and every task kind — asserted against `check_dispatch` itself
+    /// rather than a hand-written expectation, so this stays true when a
+    /// `KindRequirements` change lands or a driver's `CapabilitySet` moves.
+    #[test]
+    fn eligible_drivers_for_kind_agrees_with_the_dispatch_gate() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        let candidates: Vec<&'static str> = {
+            let mut slugs: Vec<&'static str> = reg.slugs().collect();
+            slugs.sort_unstable();
+            slugs
+        };
+        for kind in TaskKind::ALL {
+            let eligible = reg.eligible_drivers_for_kind(kind, None, &candidates);
+            for slug in &candidates {
+                let gate_ok = reg.resolver(slug).unwrap().check_dispatch(kind, None).is_ok();
+                assert_eq!(
+                    eligible.contains(slug),
+                    gate_ok,
+                    "{slug} eligibility for {kind:?} must match the dispatch gate",
+                );
+            }
+        }
+    }
+
+    /// An unregistered slug is refused, not assumed eligible: allocation
+    /// must never hand a row to a driver this binary cannot even resolve.
+    #[test]
+    fn eligible_drivers_for_kind_fails_closed_on_an_unknown_slug() {
+        use boss_protocol::TaskKind;
+
+        let reg = DriverRegistry::default();
+        assert_eq!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &["copilot", "claude"]),
+            vec!["claude"],
+        );
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &["copilot"])
+                .is_empty(),
+            "an unknown slug must not be reported eligible",
+        );
+    }
+
+    /// A driver that lacks a capability a kind marks required-strict is
+    /// excluded — the mechanism the document-producing kinds rely on. Uses a
+    /// stub with a deliberately thin `CapabilitySet` so the case is covered
+    /// even while all three built-in drivers happen to clear every gate.
+    #[test]
+    fn eligible_drivers_for_kind_excludes_a_driver_the_kind_refuses() {
+        use boss_protocol::TaskKind;
+
+        let mut descriptor = stub_descriptor();
+        descriptor.name = "thin";
+        // Everything a `Chore` needs (no Refuse-on-absence capability
+        // missing), but no StructuredOutput / ToolUseInterception — which
+        // `Design` marks required-strict.
+        let thin: Arc<dyn AgentDriver> = Arc::new(StubDriver::new(
+            descriptor,
+            CapabilitySet::new([
+                Capability::Spawn,
+                Capability::WorkspaceProvisioning,
+                Capability::PermissionPolicy,
+                Capability::PromptComposition,
+            ]),
+        ));
+        let reg = DriverRegistry::default().with_driver("thin", thin);
+
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &["thin"])
+                .contains(&"thin"),
+            "a chore has no required-strict escalations, so the thin driver clears it",
+        );
+        assert!(
+            reg.eligible_drivers_for_kind(&TaskKind::Design, None, &["thin"])
+                .is_empty(),
+            "Design require-stricts StructuredOutput + ToolUseInterception, which the thin driver lacks",
+        );
+    }
+    /// Conflict resolution and CI remediation are not Codex/Grok-eligible
+    /// today: both driver design docs stage that (Phase 3 — "review and
+    /// conflict resolution") behind the merge-conflict telemetry path, which
+    /// is `Capability::CommandOutcomeObservation` in this crate's vocabulary.
+    /// Neither Codex nor Grok declares it, so both must be excluded once the
+    /// execution kind is known — this is what keeps allocation
+    /// (`boss_engine_core::work::driver_allocation`) from routing these two
+    /// kinds to codex/grok just because their underlying `tasks.kind` (e.g.
+    /// `Chore`) clears every driver's gate on its own.
+    #[test]
+    fn eligible_drivers_for_kind_excludes_codex_and_grok_from_conflict_resolution_and_ci_remediation() {
+        use boss_protocol::{ExecutionKind, TaskKind};
+
+        let reg = DriverRegistry::default();
+        let candidates = ["codex", "claude", "grok"];
+        for execution_kind in [ExecutionKind::ConflictResolution, ExecutionKind::CiRemediation] {
+            // The underlying task row can be any ordinary implementation
+            // kind — the point is that the escalation comes from the
+            // execution, not the task.
+            let eligible = reg.eligible_drivers_for_kind(&TaskKind::Chore, Some(&execution_kind), &candidates);
+            assert_eq!(
+                eligible,
+                vec!["claude"],
+                "{execution_kind} must stay claude-only until CommandOutcomeObservation is declared elsewhere",
+            );
+        }
+        // The same task kind with no execution context (or an execution kind
+        // that carries no escalation) is unaffected — codex/grok still clear
+        // an ordinary chore.
+        assert_eq!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, None, &candidates),
+            vec!["codex", "claude", "grok"],
+        );
+        assert_eq!(
+            reg.eligible_drivers_for_kind(&TaskKind::Chore, Some(&ExecutionKind::ChoreImplementation), &candidates),
+            vec!["codex", "claude", "grok"],
         );
     }
 
